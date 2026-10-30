@@ -2370,15 +2370,14 @@ export function getCliTools(): Promise<CliTool[]> {
 export interface UploadImageResult {
   /** Absolute path of the saved file inside the agent workspace. */
   path: string;
-  /** `[IMAGE:<path>]` marker ready to embed in a chat message. */
-  marker: string;
+  attachment: import('../types/api').AttachmentReference;
 }
 
 /**
  * Upload an image for the given agent's chat. The body is the raw file — the
  * gateway types it by magic bytes (client MIME and filename are never
  * trusted), saves it under the agent workspace, and returns the
- * `[IMAGE:<path>]` marker to embed in the next message.
+ * typed attachment reference to send with the next message.
  */
 export function uploadChatImage(
   agent: string,

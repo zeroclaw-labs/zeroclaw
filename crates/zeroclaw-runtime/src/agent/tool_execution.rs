@@ -177,32 +177,7 @@ fn unavailable_tool_outcome(
 
 // ── Outcome ──────────────────────────────────────────────────────────────
 
-pub struct ToolExecutionOutcome {
-    /// Text handed to the model and persisted to provider history. The
-    /// success path carries raw bytes; the failure paths of `execute_one_tool`
-    /// fold a tool's detailed error body (which can reflect a token or signed
-    /// URL) into this text and credential-scrub it before storing it here.
-    pub output: String,
-    /// Attachments the tool declared for this result (`ToolOutput::attachments`).
-    /// They reach history through the carrier grammar and are never recovered
-    /// by scanning `output`.
-    pub attachments: Vec<zeroclaw_api::media::RenderedMarker>,
-    /// Structured output when the tool declared one (`ToolOutput::data`).
-    /// Feeds SOP step capture and data-flow surfaces; the LLM sees only
-    /// `output`. Stored raw — consumers scrub at their own rendering boundary.
-    pub output_data: Option<serde_json::Value>,
-    pub success: bool,
-    /// Raw, unscrubbed failure text for trusted in-process consumers (SOP step
-    /// capture, data-flow surfaces). Credential scrubbing is a rendering
-    /// concern applied at each human-facing surface (observer events,
-    /// post-execution log line, CLI progress) and, unlike this field, on the
-    /// model-visible `output`.
-    pub error_reason: Option<String>,
-    pub duration: Duration,
-    /// Cryptographic HMAC receipt proving this tool actually executed.
-    /// Present only when tool receipts are enabled in config.
-    pub receipt: Option<String>,
-}
+pub use zeroclaw_kernel::tool_execution::ToolExecutionOutcome;
 
 // ── Single tool execution ────────────────────────────────────────────────
 
@@ -352,20 +327,142 @@ async fn execute_one_tool_with_provenance(
             .await;
     }
 
+    let capture = if zeroclaw_api::session_events::capture::current_tool_admission().is_some() {
+        let id = tool_call_id.ok_or_else(|| anyhow::Error::msg("session_tool_call_id_absent"))?;
+        let prepared = zeroclaw_api::session_events::capture::prepared_tool_for_call(id)
+            .ok_or_else(|| anyhow::Error::msg("session_tool_preparation_absent"))?;
+        // `approved` is a host-only command grant added by the existing
+        // approval owner after resolution; it is not model action input.
+        let mut semantic_arguments = call_arguments.clone();
+        crate::agent::set_runtime_approved_arg(call_name, &mut semantic_arguments, false);
+        prepared
+            .verify_action(call_name, &semantic_arguments)
+            .await?;
+        Some(prepared.start().await?)
+    } else {
+        None
+    };
     let context = ToolExecutionContext::new(cancellation_token.cloned());
-    let execute = context
+    let tool_future = context
         .run(tool.execute_with_context(call_arguments.clone(), &context))
         .instrument(tool_span.clone());
-    let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
+    use futures_util::FutureExt;
+    let execute = std::panic::AssertUnwindSafe(tool_future).catch_unwind();
+    let execute = async {
+        if let Some(port) = &capture {
+            zeroclaw_api::session_events::capture::scope_tool_observation(Arc::clone(port), execute)
+                .await
+        } else {
+            execute.await
+        }
+    };
+    let execution_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
     } else {
         execute.await
     };
-    if tool_result
-        .as_ref()
-        .is_err_and(|error| error.is::<ToolExecutionCancelled>())
+    let tool_result = match execution_result {
+        Ok(result)
+            if !result
+                .as_ref()
+                .is_err_and(|error| error.is::<ToolExecutionCancelled>()) =>
+        {
+            result
+        }
+        stopped => {
+            // Dropping a host future is not evidence that its external action
+            // stopped. A panic payload is untrusted and may contain secrets.
+            let reason = if stopped.is_err() {
+                "tool_adapter_panic"
+            } else {
+                "tool_wait_cancelled"
+            };
+            if let Some(port) = &capture
+                && !port.has_outcome().await?
+            {
+                port.observe(
+                    zeroclaw_api::session_events::EventData::InvocationOutcomeUnknown {
+                        last_observed_event_id: port.started_event_id(),
+                        reason_key: reason.into(),
+                        observed_partial_ref: None,
+                        error_ref: None,
+                    },
+                    vec![],
+                )
+                .await?;
+            }
+            return match stopped {
+                Ok(_) => Err(ToolLoopCancelled.into()),
+                Err(_) => Err(anyhow::Error::msg("tool_adapter_panic")),
+            };
+        }
+    };
+    if let Some(port) = &capture
+        && !port.has_outcome().await?
     {
-        return Err(ToolLoopCancelled.into());
+        use zeroclaw_api::session_events::{EventData, PayloadRecord, StoredPayloadRef};
+        let (data, payloads) = match &tool_result {
+            Ok(result) => {
+                // Freeze the original result before receipt/presentation transformations.
+                let body = serde_json::json!({"output":result.output.as_str(),
+                    "data":result.output.data(),
+                    "attachments":result.output.attachments(),"success":result.success,
+                    "error":result.error.as_deref()});
+                let raw = PayloadRecord::json("session.tool-result/v1", &body)?;
+                if result.success {
+                    (
+                        EventData::ToolEffectCompleted {
+                            result_ref: StoredPayloadRef::from(&raw),
+                            raw_result_ref: None,
+                            transformation_ref: None,
+                            receipt_ref: None,
+                        },
+                        vec![raw],
+                    )
+                } else {
+                    let error = PayloadRecord::json(
+                        "session.error-detail/v1",
+                        &serde_json::json!({
+                        "error_key":"tool_reported_failure","detail":result.error.as_deref().map(str::to_owned)}),
+                    )?;
+                    (
+                        EventData::ToolEffectFailed {
+                            error_ref: StoredPayloadRef::from(&error),
+                            partial_result_ref: Some(StoredPayloadRef::from(&raw)),
+                            receipt_ref: None,
+                        },
+                        vec![raw, error],
+                    )
+                }
+            }
+            Err(error) => {
+                let error = PayloadRecord::json(
+                    "session.error-detail/v1",
+                    &serde_json::json!({
+                    "error_key":"tool_execution_error","detail":format!("{error:#}")}),
+                )?;
+                // An opaque adapter error does not prove that an external
+                // effect failed before taking effect.
+                (
+                    EventData::InvocationOutcomeUnknown {
+                        last_observed_event_id: port.started_event_id(),
+                        reason_key: "tool_external_outcome_unverified".into(),
+                        observed_partial_ref: None,
+                        error_ref: Some(StoredPayloadRef::from(&error)),
+                    },
+                    vec![error],
+                )
+            }
+        };
+        port.observe(data, payloads).await?;
+    }
+
+    if capture.is_some() && tool_result.is_err() {
+        return Err(zeroclaw_api::session_events::capture::capture_stopped(
+            tool_result
+                .err()
+                .ok_or_else(|| anyhow::Error::msg("tool_error_missing"))?,
+        ));
     }
 
     let outcome = {
@@ -725,6 +822,9 @@ pub(crate) async fn execute_tools_sequential(
     slots.resize_with(tool_calls.len(), || None);
     Ok(slots)
 }
+
+#[cfg(test)]
+mod session_events_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1153,7 +1253,7 @@ mod tests {
         }
     }
 
-    fn test_turn_meta() -> crate::agent::turn::TurnMeta<'static> {
+    pub(super) fn test_turn_meta() -> crate::agent::turn::TurnMeta<'static> {
         crate::agent::turn::TurnMeta {
             parent_agent_alias: None,
             agent_alias: None,
@@ -1935,8 +2035,8 @@ mod tests {
     /// Fake tool whose `execute` returns `Err`, exercising the `Err(e)` arm of
     /// `execute_one_tool` (as distinct from `Ok(ToolResult { success: false })`).
     /// A tool error can embed a redirect URL with a signed query string.
-    struct FailingToolReturningErr {
-        message: &'static str,
+    pub(super) struct FailingToolReturningErr {
+        pub(super) message: &'static str,
     }
 
     #[async_trait]
@@ -2250,7 +2350,7 @@ mod tests {
 
     /// End-to-end: a failed tool whose detailed body carries a credential must
     /// reach the model's tool-result message scrubbed, in both the native
-    /// (`role=tool`) and the prompt-mode (`[Tool results]`) history shapes —
+    /// (`role=tool`) and the text-protocol provider history shape —
     /// the actual "text sent to the model / provider history".
     #[tokio::test]
     async fn failed_tool_credential_is_scrubbed_in_provider_history() {
@@ -2319,12 +2419,6 @@ mod tests {
         )
         .expect("collect_tool_results must succeed");
 
-        assert!(
-            !collected.tool_results.contains(secret)
-                && collected.tool_results.contains("[REDACTED]"),
-            "prompt-mode <tool_result> block must be scrubbed: {}",
-            collected.tool_results
-        );
         for result in &collected.individual_results {
             assert!(
                 !result.output.contains(secret) && result.output.contains("[REDACTED]"),
@@ -2337,11 +2431,9 @@ mod tests {
         let mut native_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut native_history,
-            "assistant text".to_string(),
+            ChatMessage::assistant("assistant text"),
             &native_calls,
             &collected.individual_results,
-            &collected.tool_results,
-            true,
         );
         assert!(
             native_history.iter().all(|m| !m.content.contains(secret)),
@@ -2356,27 +2448,27 @@ mod tests {
 
         let prompt_results = vec![ToolRoundResult {
             tool_call_id: None,
+            tool_name: "test_tool".into(),
+            success: true,
             output: collected.individual_results[0].output.clone(),
             attachments: Vec::new(),
         }];
         let mut prompt_history: Vec<ChatMessage> = Vec::new();
         append_tool_round_to_history(
             &mut prompt_history,
-            "assistant text".to_string(),
+            ChatMessage::assistant("assistant text"),
             &native_calls,
             &prompt_results,
-            &collected.tool_results,
-            false,
         );
         assert!(
             prompt_history.iter().all(|m| !m.content.contains(secret)),
-            "no prompt-mode history message may carry the raw credential"
+            "no structured tool history message may carry the raw credential"
         );
         assert!(
             prompt_history
                 .iter()
                 .any(|m| m.content.contains("[REDACTED]")),
-            "the prompt-mode [Tool results] message must carry the scrubbed body"
+            "the tool-result message must carry the scrubbed body"
         );
     }
 

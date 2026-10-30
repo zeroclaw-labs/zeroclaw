@@ -109,17 +109,6 @@ enum WeChatAttachmentKind {
 }
 
 impl WeChatAttachmentKind {
-    fn from_marker(marker: &str) -> Option<Self> {
-        match marker.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::Document),
-            "VIDEO" => Some(Self::Video),
-            "AUDIO" => Some(Self::Audio),
-            "VOICE" => Some(Self::Voice),
-            _ => None,
-        }
-    }
-
     fn default_extension(self) -> &'static str {
         match self {
             Self::Image => "png",
@@ -174,7 +163,7 @@ enum AttachmentDisposition {
     /// directory is configured for downloads). Not a failure.
     None,
     /// Attachment content was built successfully.
-    Ready(String),
+    Ready(zeroclaw_api::media::AttachmentReference),
     /// Building the attachment failed for a condition that may clear up
     /// on its own (see `AttachmentBuildFailure::Retryable`).
     Retryable,
@@ -299,130 +288,6 @@ struct UploadedWeChatMedia {
 
 fn is_remote_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
-}
-
-fn infer_attachment_kind_from_target(target: &str) -> Option<WeChatAttachmentKind> {
-    let normalized = target
-        .split('?')
-        .next()
-        .unwrap_or(target)
-        .split('#')
-        .next()
-        .unwrap_or(target);
-
-    let extension = Path::new(normalized)
-        .extension()
-        .and_then(|ext| ext.to_str())?
-        .to_ascii_lowercase();
-
-    match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Some(WeChatAttachmentKind::Image),
-        "mp4" | "mov" | "mkv" | "avi" | "webm" => Some(WeChatAttachmentKind::Video),
-        "mp3" | "m4a" | "wav" | "flac" => Some(WeChatAttachmentKind::Audio),
-        "ogg" | "oga" | "opus" | "silk" => Some(WeChatAttachmentKind::Voice),
-        "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls"
-        | "xlsx" | "ppt" | "pptx" => Some(WeChatAttachmentKind::Document),
-        _ => None,
-    }
-}
-
-fn find_matching_close(s: &str) -> Option<usize> {
-    let mut depth = 1usize;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn parse_attachment_markers(message: &str) -> (String, Vec<WeChatAttachment>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0usize;
-
-    while cursor < message.len() {
-        let Some(open_rel) = message[cursor..].find('[') else {
-            cleaned.push_str(&message[cursor..]);
-            break;
-        };
-
-        let open = cursor + open_rel;
-        cleaned.push_str(&message[cursor..open]);
-
-        let Some(close_rel) = find_matching_close(&message[open + 1..]) else {
-            cleaned.push_str(&message[open..]);
-            break;
-        };
-
-        let close = open + 1 + close_rel;
-        let marker = &message[open + 1..close];
-
-        let parsed = marker.split_once(':').and_then(|(kind, target)| {
-            let kind = WeChatAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            Some(WeChatAttachment {
-                kind,
-                target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[open..=close]);
-        }
-
-        cursor = close + 1;
-    }
-
-    (cleaned.trim().to_string(), attachments)
-}
-
-fn parse_path_only_attachment(message: &str) -> Option<WeChatAttachment> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() || trimmed.contains('\n') {
-        return None;
-    }
-
-    let candidate = trimmed.trim_matches(|c| matches!(c, '`' | '"' | '\''));
-    if candidate.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
-    let kind = infer_attachment_kind_from_target(candidate)?;
-
-    if !is_remote_url(candidate) && !Path::new(candidate).exists() {
-        return None;
-    }
-
-    Some(WeChatAttachment {
-        kind,
-        target: candidate.to_string(),
-    })
-}
-
-fn format_attachment_content(
-    kind: WeChatAttachmentKind,
-    local_filename: &str,
-    local_path: &Path,
-) -> String {
-    if kind == WeChatAttachmentKind::Image {
-        format!("[IMAGE:{}]", local_path.display())
-    } else {
-        format!("[Document: {}] {}", local_filename, local_path.display())
-    }
 }
 
 fn sanitize_attachment_filename(file_name: &str) -> Option<String> {
@@ -1414,14 +1279,24 @@ impl WeChatChannel {
         message_id: String,
         text: &str,
         timestamp: u64,
-        attachment_content: Option<String>,
+        attachment_content: Option<zeroclaw_api::media::AttachmentReference>,
     ) -> Option<Box<ChannelMessage>> {
-        let content = match (attachment_content, text.is_empty()) {
-            (Some(marker), true) => marker,
-            (Some(marker), false) => format!("{marker}\n\n{text}"),
-            (None, false) => text.to_string(),
-            (None, true) => return None,
-        };
+        if text.is_empty() && attachment_content.is_none() {
+            return None;
+        }
+        let attachments = attachment_content
+            .into_iter()
+            .map(|reference| zeroclaw_api::media::MediaAttachment {
+                file_name: Path::new(&reference.target)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("attachment")
+                    .to_string(),
+                reference: Some(reference),
+                ..Default::default()
+            })
+            .collect();
+        let content = text.to_string();
 
         Some(Box::new(ChannelMessage {
             id: message_id,
@@ -1433,7 +1308,7 @@ impl WeChatChannel {
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
-            attachments: Vec::new(),
+            attachments,
             subject: None,
 
             ..Default::default()
@@ -2089,11 +1964,17 @@ impl WeChatChannel {
             return disposition;
         }
 
-        AttachmentDisposition::Ready(format_attachment_content(
-            spec.kind,
-            &spec.file_name,
-            &local_path,
-        ))
+        AttachmentDisposition::Ready(zeroclaw_api::media::AttachmentReference {
+            target: local_path.display().to_string(),
+            kind: match spec.kind {
+                WeChatAttachmentKind::Image => zeroclaw_api::media::AttachmentKind::Image,
+                WeChatAttachmentKind::Document => zeroclaw_api::media::AttachmentKind::Document,
+                WeChatAttachmentKind::Video => zeroclaw_api::media::AttachmentKind::Video,
+                WeChatAttachmentKind::Audio | WeChatAttachmentKind::Voice => {
+                    zeroclaw_api::media::AttachmentKind::Audio
+                }
+            },
+        })
     }
 
     /// Perform QR-code login flow. Returns (bot_token, account_id, user_id).
@@ -2781,10 +2662,26 @@ impl Channel for WeChatChannel {
             );
         }
 
-        let (text_without_markers, attachments) = parse_attachment_markers(&content);
+        let attachments: Vec<WeChatAttachment> = message
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                let reference = attachment.reference.as_ref()?;
+                let kind = match reference.kind {
+                    zeroclaw_api::media::AttachmentKind::Image => WeChatAttachmentKind::Image,
+                    zeroclaw_api::media::AttachmentKind::Video => WeChatAttachmentKind::Video,
+                    zeroclaw_api::media::AttachmentKind::Audio => WeChatAttachmentKind::Audio,
+                    zeroclaw_api::media::AttachmentKind::Document => WeChatAttachmentKind::Document,
+                };
+                Some(WeChatAttachment {
+                    kind,
+                    target: reference.target.clone(),
+                })
+            })
+            .collect();
         if !attachments.is_empty() {
-            if !text_without_markers.is_empty() {
-                self.send_text(recipient, &text_without_markers, context_token.as_deref())
+            if !content.is_empty() {
+                self.send_text(recipient, &content, context_token.as_deref())
                     .await?;
             }
 
@@ -2793,12 +2690,6 @@ impl Channel for WeChatChannel {
                     .await?;
             }
             return Ok(());
-        }
-
-        if let Some(attachment) = parse_path_only_attachment(&content) {
-            return self
-                .send_attachment(recipient, &attachment, context_token.as_deref())
-                .await;
         }
 
         self.send_text(recipient, &content, context_token.as_deref())
@@ -4136,62 +4027,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_attachment_markers_extracts_multiple_types() {
-        let message = "See this\n[IMAGE:/tmp/a.png]\n[DOCUMENT:https://example.com/a.pdf]";
-        let (cleaned, attachments) = parse_attachment_markers(message);
-
-        assert_eq!(cleaned, "See this");
-        assert_eq!(attachments.len(), 2);
-        assert_eq!(attachments[0].kind, WeChatAttachmentKind::Image);
-        assert_eq!(attachments[0].target, "/tmp/a.png");
-        assert_eq!(attachments[1].kind, WeChatAttachmentKind::Document);
-        assert_eq!(attachments[1].target, "https://example.com/a.pdf");
-    }
-
-    #[test]
-    fn parse_attachment_markers_keeps_invalid_marker_text() {
-        let message = "See [UNKNOWN:/tmp/a.bin]";
-        let (cleaned, attachments) = parse_attachment_markers(message);
-        assert_eq!(cleaned, message);
-        assert!(attachments.is_empty());
-    }
-
-    #[test]
-    fn parse_path_only_attachment_detects_existing_file() {
-        let temp = tempdir().unwrap();
-        let image_path = temp.path().join("photo.png");
-        std::fs::write(&image_path, b"png").unwrap();
-
-        let parsed = parse_path_only_attachment(image_path.to_string_lossy().as_ref())
-            .expect("expected attachment");
-        assert_eq!(parsed.kind, WeChatAttachmentKind::Image);
-        assert_eq!(parsed.target, image_path.to_string_lossy());
-    }
-
-    #[test]
-    fn parse_path_only_attachment_rejects_sentence_text() {
-        assert!(parse_path_only_attachment("saved to /tmp/photo.png").is_none());
-    }
-
-    #[test]
-    fn format_attachment_content_uses_image_marker_for_images() {
-        let path = PathBuf::from("/tmp/workspace/photo.png");
-        assert_eq!(
-            format_attachment_content(WeChatAttachmentKind::Image, "photo.png", &path),
-            "[IMAGE:/tmp/workspace/photo.png]"
-        );
-    }
-
-    #[test]
-    fn format_attachment_content_uses_document_marker_for_non_images() {
-        let path = PathBuf::from("/tmp/workspace/report.pdf");
-        assert_eq!(
-            format_attachment_content(WeChatAttachmentKind::Document, "report.pdf", &path),
-            "[Document: report.pdf] /tmp/workspace/report.pdf"
-        );
-    }
-
     fn test_wechat_channel_with_workspace(workspace_dir: &Path) -> WeChatChannel {
         WeChatChannel::new(
             "wechat_test_alias",
@@ -5508,7 +5343,10 @@ mod tests {
             .expect("timed out waiting for attachment recovery")
             .expect("listener closed before attachment recovery");
         assert_eq!(delivered.sender, "new_user");
-        assert!(delivered.content.contains("[IMAGE:"), "{delivered:?}");
+        assert_eq!(
+            delivered.attachments[0].reference.as_ref().unwrap().kind,
+            zeroclaw_api::media::AttachmentKind::Image
+        );
         assert!(delivered.content.contains("caption after bind"));
         assert_eq!(
             config
@@ -5801,7 +5639,10 @@ mod tests {
             .expect("timed out waiting for attachment recovery")
             .expect("listener closed before attachment recovery");
         assert_eq!(delivered.sender, "new_user");
-        assert!(delivered.content.contains("[IMAGE:"), "{delivered:?}");
+        assert_eq!(
+            delivered.attachments[0].reference.as_ref().unwrap().kind,
+            zeroclaw_api::media::AttachmentKind::Image
+        );
         assert!(delivered.content.contains("caption after bind"));
 
         let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
@@ -6230,7 +6071,7 @@ mod tests {
             .expect("channel closed before the recovered delivery");
         assert_eq!(first.sender, "user_a");
         assert!(
-            first.content.contains("[IMAGE:"),
+            !first.attachments.is_empty(),
             "the recovered pass must carry the attachment, got: {}",
             first.content
         );
@@ -6708,7 +6549,7 @@ mod tests {
             .expect("channel closed before the held batch was redelivered");
         assert_eq!(msg.sender, "user_a");
         assert!(
-            msg.content.contains("[IMAGE:"),
+            !msg.attachments.is_empty(),
             "the restarted pass must carry the attachment, got: {}",
             msg.content
         );
@@ -6861,7 +6702,7 @@ mod tests {
             .expect("channel closed before message B");
         assert_eq!(second.sender, "user_b");
         assert!(
-            second.content.contains("[IMAGE:"),
+            !second.attachments.is_empty(),
             "message B must carry its recovered attachment, got: {}",
             second.content
         );

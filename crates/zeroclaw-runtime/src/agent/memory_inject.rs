@@ -15,7 +15,7 @@
 //! rerank stage (`rerank_enabled`: over-fetched candidate pool, then
 //! recency/importance blend + duplicate collapse + optional MMR + trim,
 //! replacing decay on that arm) -> relevance filter -> skip set (autosave
-//! keys/content, `*_history` keys, `[IMAGE:` markers, `<tool_result`
+//! keys/content, `*_history` keys, `<tool_result`
 //! blocks, optional Conversation-category exclusion) -> budget caps (entry
 //! count, per-entry chars, total chars) -> `[Memory context]` wrapper.
 //! Exactly one `MemoryRecall` observer event is emitted per render,
@@ -239,10 +239,6 @@ fn should_skip_entry(key: &str, content: &str) -> bool {
     }
     // Channel history blobs are session transcripts, not knowledge.
     if key.trim().to_ascii_lowercase().ends_with("_history") {
-        return true;
-    }
-    // Image markers would duplicate the image block already in the request.
-    if content.contains("[IMAGE:") {
         return true;
     }
     // Orphan tool_result blocks recalled into a fresh session present the
@@ -1008,7 +1004,7 @@ mod tests {
         .await;
 
         assert!(!context.contains("transcript blob"));
-        assert!(!context.contains("[IMAGE:"));
+        assert!(context.contains("photo: see [IMAGE:abc123]"));
         assert!(!context.contains("<tool_result"));
         assert!(context.contains("keeper: real knowledge"));
     }

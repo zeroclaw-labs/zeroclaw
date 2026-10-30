@@ -24,6 +24,61 @@ struct RouteIdentity {
     model: String,
 }
 
+pub(crate) fn current_exact_route() -> Option<(String, String)> {
+    let key = ACTIVE_COLLECTOR.try_with(collector_key).ok()?;
+    ROUTE_STACK
+        .try_with(|routes| {
+            routes.borrow().iter().rev().find_map(|(route_key, route)| {
+                (*route_key == key).then(|| (route.provider_ref.clone(), route.model.clone()))
+            })
+        })
+        .ok()
+        .flatten()
+}
+
+fn capture_root(state: &CollectorState, key: usize) -> Option<DispatchNodeId> {
+    let mut id = POLL_STACK
+        .try_with(|stack| {
+            stack
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|(k, id)| (*k == key).then_some(*id))
+        })
+        .ok()
+        .flatten()?;
+    while let Some(parent) = state.nodes.get(id.0)?.parent {
+        id = parent;
+    }
+    Some(id)
+}
+pub(crate) fn capture_route_and_previous() -> (
+    Option<serde_json::Value>,
+    Option<zeroclaw_api::session_events::EventId>,
+) {
+    ACTIVE_COLLECTOR
+        .try_with(|collector| {
+            let state = collector.lock();
+            let Some(root) = capture_root(&state, collector_key(collector)) else {
+                return (None, None);
+            };
+            let node = &state.nodes[root.0];
+            (
+                Some(serde_json::json!({"provider_ref":node.provider_ref,"model":node.model})),
+                state.capture_outcomes.get(&root).cloned(),
+            )
+        })
+        .unwrap_or((None, None))
+}
+pub(crate) fn record_capture_outcome(id: zeroclaw_api::session_events::EventId) {
+    let _ = ACTIVE_COLLECTOR.try_with(|collector| {
+        let mut state = collector.lock();
+        if let Some(root) = capture_root(&state, collector_key(collector)) {
+            state.capture_outcomes.insert(root, id);
+        }
+    });
+}
+
 fn collector_key(collector: &Arc<Mutex<CollectorState>>) -> usize {
     Arc::as_ptr(collector) as usize
 }
@@ -49,7 +104,7 @@ impl Drop for RouteFrame {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct DispatchNodeId(usize);
 
 #[derive(Debug)]
@@ -68,6 +123,10 @@ struct CollectorState {
     closed: bool,
     logical_success: bool,
     nodes: Vec<Node>,
+    // Ephemeral references to durable outcomes, scoped to one logical call.
+    // Canonical history owns the facts; this poll collector only links retries.
+    capture_outcomes:
+        std::collections::HashMap<DispatchNodeId, zeroclaw_api::session_events::EventId>,
 }
 
 #[derive(Clone, Debug, Default)]

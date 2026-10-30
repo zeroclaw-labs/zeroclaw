@@ -67,7 +67,7 @@ product integrations.
 | `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs`, `schedule` | Scheduling affects autonomous execution, ownership, and run history; keep it policy-visible in core. |
 | `spawn_subagent`, `delegate`, `send_message_to_peer` | Delegation is part of the agent execution model and must share risk profiles, tools, memory, and parent/child constraints. |
 | `ask_user`, `escalate_to_human`, `reaction`, `poll`, `channel_room` | These are channel-bridging operator interaction primitives with late-bound channel handles and receipts. |
-| `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send` | Session visibility and history access share the daemon/gateway session backend and agent ownership boundaries. `sessions_send` is a deprecated legacy Chat-history append: it does not notify or run a session. Use `send_message_to_peer` for agent-to-agent messaging. |
+| `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send` | Session inspection uses the current execution port and its authorized history reader. `sessions_send` is retained only to reject older calls with an explicit unsupported-mutation result. Use `send_message_to_peer` for agent-to-agent messaging. |
 | `model_routing_config`, `model_switch`, `proxy_config` | These expose the current model/proxy routing control plane and should not drift from config-source behavior. |
 | `TodoWrite` | Maintains the agent's structured task list inside the runtime tool surface; keep its stable tool name and lifecycle behavior in core. |
 | `read_skill` and skill-defined tools with `kind = "shell"`, `kind = "http"`, or `kind = "builtin"` | Skills are an intended extension surface, but the runtime bridge that turns installed skills into tools is core. |
@@ -209,7 +209,7 @@ keeps constructing them.
 | Agent execution | `spawn_subagent`, `delegate`, `send_message_to_peer` | They start child or peer turns through the runtime's agent loop and carry the caller into them: its security policy and SOP step scope for `spawn_subagent`, its delegation policy and, for bounded targets, its ceilings for `delegate`, and its identity as the peer turn's principal for `send_message_to_peer`. `delegate` owns the parent-tools snapshot, and the tool loop exempts `spawn_subagent` and `delegate` from duplicate-call collapsing by name. |
 | Control plane | `model_switch`, `model_routing_config`, `proxy_config` | The turn-scoped model-switch state that the runtime tool loop installs. The last two mutate config: both rewrite the config file, and `proxy_config` also sets the process-wide runtime proxy that the HTTP request and web fetch tools read. They can be built from the tier-test inputs, so keeping them runtime-owned is a judgment call recorded here. |
 | Channel bridging | `ask_user`, `escalate_to_human`, `reaction`, `poll`, `channel_room`, `send_via`, `git_forge` | Late-bound channel maps that assembly returns to its caller, which fills them afterwards; `reaction` and `git_forge` share one map, `ask_user` and `send_via` share another. |
-| Sessions | `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send` | The ACP session read view, which only the ACP agent path passes; the session backend itself is opened from config. |
+| Sessions | `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send` | The current execution port supplies the authorized history reader. These tools do not open an independent backend or acquire an ACP-specific history view. `sessions_send` is a retired compatibility stub. |
 | SOP | `sop_list`, `sop_execute`, `sop_advance`, `sop_approve`, `sop_status`, `sop_workshop` | The SOP engine and audit logger. |
 | Skills | `read_skill` | The skills loader, and the channel prompt path selects the skills prompt mode by whether `read_skill` is available. |
 | Task list | `TodoWrite` | The runtime emits plan events only for this name, and that is the sole feed of the ZeroCode task tracker. |
@@ -277,9 +277,9 @@ move:
   bridging could then move.
 - `ToolRequest` carries the generation's provider source. `llm_task` could
   then move.
-- The SOP engine and audit logger, the ACP session read view, and the canvas
-  store reach tools through the contract. The SOP, sessions, and canvas
-  families could then move.
+- The SOP engine and audit logger, and the canvas store reach tools through
+  the contract. The SOP and canvas families could then move. Session inspection
+  already uses the execution-scoped history reader in `zeroclaw-tools`.
 - The runtime recognizes the plan, delivery, memory, scheduling, and
   skill-reading tools by a typed identity that it checks together with
   `ToolProvenance::Native`, not by the name string alone, including when it

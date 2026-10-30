@@ -14,13 +14,13 @@ pub(crate) struct ResolvedVisionProvider {
     pub(crate) model: String,
 }
 
-/// The exact `file_read` read ledger for one image-marker path: the
+/// The exact `file_read` read ledger for one image-reference path: the
 /// string-level `is_path_allowed` check first (no filesystem access for a
 /// path it rejects), then the same symlink-aware readability check
 /// `file_read` applies (`resolve_tool_path` + `is_resolved_path_readable`).
 /// This does synchronous filesystem work (symlink resolution, metadata),
 /// so it must only be called from the blocking task inside
-/// `multimodal::count_latest_user_resolvable_image_markers`, never on the
+/// `multimodal::count_latest_user_resolvable_image_attachments`, never on the
 /// async executor thread.
 pub(crate) fn policy_permits_image_path(policy: &SecurityPolicy, path: &std::path::Path) -> bool {
     let path_str = path.to_string_lossy();
@@ -30,7 +30,7 @@ pub(crate) fn policy_permits_image_path(policy: &SecurityPolicy, path: &std::pat
 
 /// Decide this turn's image-input route.
 ///
-/// No image markers in the history, or a primary provider that already
+/// No image references in the history, or a primary provider that already
 /// accepts images (`capabilities_for_model(dispatch_model)`): the primary
 /// serves the turn unchanged, `(None, false)`. A non-vision primary with a
 /// configured `[multimodal] vision_model_provider`: the configured provider
@@ -38,7 +38,7 @@ pub(crate) fn policy_permits_image_path(policy: &SecurityPolicy, path: &std::pat
 /// a configured provider that itself lacks vision is an operator
 /// misconfiguration and surfaces as a `ProviderCapabilityError`.
 ///
-/// `security` governs one thing: which local image-marker references in the
+/// `security` governs one thing: which local image references in the
 /// latest user message count as "resolvable" for the no-vision, no-fallback
 /// refusal. A local reference counts only when it is absolute, the policy's
 /// string-level check admits it, the same symlink-aware read ledger the
@@ -46,10 +46,10 @@ pub(crate) fn policy_permits_image_path(policy: &SecurityPolicy, path: &std::pat
 /// The resolvable count is computed only on that no-vision, no-fallback
 /// branch: a vision-capable primary or a configured vision fallback never
 /// touches the filesystem for this decision, and the work is bounded by the
-/// absolute local-path markers of the latest user message, one message,
+/// absolute local-path attachments of the latest user message, one message,
 /// never the whole history: at most `multimodal::MAX_RESOLVABILITY_CANDIDATES`
 /// (16) of them reach the policy check plus one `std::fs::metadata` probe,
-/// all on a single `spawn_blocking` task off the async executor; markers past
+/// all on a single `spawn_blocking` task off the async executor; attachments past
 /// that bound count as resolvable before any policy call. A path the policy
 /// rejects, a relative reference, a data URI, or a remote URL is never
 /// probed. `None` fails closed: no local path resolves, so a configless
@@ -66,11 +66,12 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
     security: Option<&SecurityPolicy>,
     allowed_provider_refs: Option<&std::collections::HashSet<String>>,
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
-    let image_marker_count = multimodal::count_image_markers(history);
-    let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
+    let image_attachment_count = multimodal::count_image_attachments(history);
+    let latest_user_image_attachment_count =
+        multimodal::count_latest_user_image_attachments(history);
 
     let mut degrade_strip_images = false;
-    let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
+    let vision_model_provider: Option<ResolvedVisionProvider> = if image_attachment_count > 0
         && !model_provider.capabilities_for_model(dispatch_model).vision
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
@@ -153,7 +154,7 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
                 model: vision_model,
             })
         } else {
-            // A local marker reference counts as resolvable only when the
+            // A local attachment reference counts as resolvable only when the
             // agent's filesystem policy would let its file tools read it:
             // the string-level `is_path_allowed` check runs first (no
             // filesystem access at all for a path it rejects), and a
@@ -162,19 +163,19 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
             // `is_resolved_path_readable`). That ledger does synchronous
             // filesystem work (symlink resolution, metadata), so it runs
             // on ONE `spawn_blocking` task inside
-            // `count_latest_user_resolvable_image_markers`, never on the
+            // `count_latest_user_resolvable_image_attachments`, never on the
             // async executor thread.
             //
             // This is the ONLY place the resolvable count is computed: a
             // vision-capable primary or a configured vision fallback never
             // touches the filesystem for this decision. The work is
             // bounded by `multimodal::MAX_RESOLVABILITY_CANDIDATES` (16)
-            // absolute local-path markers of the latest user message (one
-            // message, never the whole history); markers past the bound
+            // absolute local-path attachments of the latest user message (one
+            // message, never the whole history); attachments past the bound
             // are counted as resolvable BEFORE any policy call, so an
             // oversized message fails toward this error rather than a
             // silent degrade, and cannot buy unbounded policy work with
-            // unbounded markers. Without a policy (`None`) no local path
+            // unbounded attachments. Without a policy (`None`) no local path
             // resolves: fail closed to the degrade branch.
             //
             // The policy is cloned once per gate evaluation onto the
@@ -189,18 +190,17 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
                         .as_ref()
                         .is_some_and(|policy| policy_permits_image_path(policy, path))
                 });
-            let latest_user_resolvable_marker_count =
-                multimodal::count_latest_user_resolvable_image_markers(
+            let latest_user_resolvable_attachment_count =
+                multimodal::count_latest_user_resolvable_image_attachments(
                     history,
                     multimodal_config.allow_remote_fetch,
                     path_allowed,
                 )
                 .await;
-            if latest_user_resolvable_marker_count > 0 {
-                // Marker syntax alone must not fail the turn: prose that
-                // discusses marker syntax parses into markers whose references
-                // resolve to nothing (a missing file, a malformed data URI, a
-                // remote URL while remote fetch is off). Only references that
+            if latest_user_resolvable_attachment_count > 0 {
+                // Unloadable attachments do not fail the turn (a missing file,
+                // a malformed data URI, or a remote URL while remote fetch is off).
+                // Only references that
                 // would actually be sent reach this hard error, so the count in
                 // the refusal is the count of loadable attachments; the rest
                 // fall through to the degrade branch and the turn proceeds as
@@ -212,7 +212,7 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
                 // safe to surface without re-deriving primary-vs-fallback from
                 // `provider_name`, whose format is not guaranteed to line up
                 // with the dotted entry name.
-                let marker_count = latest_user_resolvable_marker_count.to_string();
+                let marker_count = latest_user_resolvable_attachment_count.to_string();
                 let message = match model_provider.vision_limited_by(model) {
                     Some(fallback_name) => crate::i18n::get_required_cli_string_with_args(
                         "cli-agent-vision-unsupported-by-fallback",
@@ -240,12 +240,12 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
                             "model_provider": provider_name,
-                            "image_marker_count": image_marker_count,
-                            "latest_user_image_marker_count": latest_user_image_marker_count,
-                            "latest_user_resolvable_marker_count":
-                                latest_user_resolvable_marker_count,
+                            "image_attachment_count": image_attachment_count,
+                            "latest_user_image_attachment_count": latest_user_image_attachment_count,
+                            "latest_user_resolvable_attachment_count":
+                                latest_user_resolvable_attachment_count,
                         })),
-                    "no vision route for image marker(s) that are carried over, tool results, or unresolvable; degrading to text-only (markers stripped)"
+                    "no vision route for image reference(s) that are carried over, tool results, or unresolvable; degrading to text-only (image fields omitted)"
                 );
                 degrade_strip_images = true;
                 None
@@ -327,22 +327,12 @@ pub(super) async fn prepare_messages_with_source_rows(
     }
     let history = sanitized.as_slice();
     let prepared = if degrade_strip_images {
-        // Text-only fallback: replace every media marker with the prose
-        // placeholder so no filesystem path or data URI reaches the
-        // text-only provider, while surrounding text (captions, tool
-        // metadata) survives. Tool-result carriers keep their bodies
-        // verbatim: a carrier's images are its declared attachments, and a
-        // marker in its body text is text. An assistant tool-call envelope
-        // is rewritten field-wise instead: signed thinking
-        // (`reasoning_content`) and tool-call signatures
-        // (`tool_calls[].extra_content`) must replay byte-for-byte, and a
-        // composite provider (the reliable wrapper) reports no vision
-        // whenever one of its fallbacks lacks it — so the primary that
-        // receives this degraded request may be the very provider that
-        // verifies those signatures.
+        // Omit only explicit image fields in this request projection. Literal
+        // body text, other attachment kinds, native tool-call identity and
+        // opaque signed reasoning remain intact.
         let stripped: Vec<ChatMessage> = history
             .iter()
-            .map(multimodal::strip_message_media)
+            .map(multimodal::omit_image_attachments)
             .collect();
         match image_cache {
             Some(cache) => {
@@ -375,16 +365,31 @@ pub(super) async fn prepare_messages_with_source_rows(
 mod tests {
     use super::*;
 
+    fn tool_result(content: impl Into<String>) -> ChatMessage {
+        ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: "call-test".into(),
+            tool_name: "shell".into(),
+            success: Some(true),
+            content: content.into(),
+            attachments: Vec::new(),
+        })
+    }
+
     #[tokio::test]
     async fn preparation_preserves_source_rows_across_sanitization_and_media() {
         let history = vec![
             ChatMessage::system("system"),
             ChatMessage::assistant("orphan call"),
-            ChatMessage::tool("orphan result"),
+            tool_result("orphan result"),
             ChatMessage::user("[Tool results] is literal user text"),
             ChatMessage::assistant("current call"),
             ChatMessage::user("[Tool results]\nresult"),
-            ChatMessage::user("new question [IMAGE:/unread.png]"),
+            ChatMessage::user("new question").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "/unread.png".to_string(),
+                },
+            ]),
         ];
         let (prepared, source_rows) =
             prepare_messages_with_source_rows(&history, &MultimodalConfig::default(), true, None)
@@ -415,10 +420,12 @@ mod tests {
             ],
         )
         .unwrap();
-        let history = vec![ChatMessage::user(format!(
-            "look [IMAGE:{}]",
-            path.display()
-        ))];
+        let history = vec![ChatMessage::user("look").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (path.display()).to_string(),
+            },
+        ])];
         let cfg = MultimodalConfig::default();
 
         let mut cache = multimodal::LocalImageCache::new();
@@ -447,7 +454,7 @@ mod tests {
         let history = vec![
             ChatMessage::system("sys"),
             ChatMessage::assistant("[tool_call] fire"),
-            ChatMessage::tool("result"),
+            tool_result("result"),
             ChatMessage::user("actual user"),
         ];
         let cfg = MultimodalConfig::default();
@@ -465,16 +472,14 @@ mod tests {
         );
     }
 
-    /// The text-only degrade path used to map `strip_media_markers` over
-    /// every message's whole string, rewriting a marker inside an assistant
-    /// envelope's signed reasoning while keeping its signature. The rewrite
-    /// is field-wise for envelopes now, so the reasoning replays
-    /// byte-for-byte even though the provider is text-only. The envelope is
-    /// built with the production `build_native_assistant_history` builder
-    /// the adapters parse back; the `/tmp` paths are literal text only —
-    /// nothing is read from disk on the degrade path.
+    /// The text-only degrade path clears typed attachments while preserving
+    /// every text field, including signed reasoning inside an assistant
+    /// envelope. The envelope is built with the production
+    /// `build_native_assistant_history` builder the adapters parse back; the
+    /// `/tmp` paths are literal text only and nothing is read from disk on the
+    /// degrade path.
     #[tokio::test]
-    async fn degrade_strips_markers_field_wise_in_assistant_envelope() {
+    async fn degrade_omits_fields_and_preserves_literal_media_text_and_signed_reasoning() {
         let path = "/tmp/a.png";
         let marker = format!("[{}:{}]", "IMAGE", path);
         let reasoning =
@@ -492,9 +497,17 @@ mod tests {
             Some(&reasoning),
         );
         let history = vec![
-            ChatMessage::user(format!("look {marker}")),
-            ChatMessage::assistant(envelope),
-            ChatMessage::tool("done"),
+            ChatMessage::user(format!("look {marker}")).with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    target: path.into(),
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                },
+            ]),
+            envelope.with_attachments(vec![zeroclaw_api::media::AttachmentReference {
+                target: path.into(),
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+            }]),
+            tool_result("done"),
         ];
         let cfg = MultimodalConfig::default();
         let prepared = prepare_messages_for_iteration(&history, &cfg, true, None)
@@ -506,45 +519,29 @@ mod tests {
             .iter()
             .find(|m| m.role == "assistant")
             .expect("assistant envelope survives the degrade path");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&assistant_prepared.content).expect("envelope stays valid JSON");
         assert_eq!(
-            parsed["reasoning_content"].as_str(),
-            Some(reasoning.as_str()),
-            "signed thinking must survive the degrade path byte-for-byte"
+            assistant_prepared.reasoning_content.as_deref(),
+            Some(reasoning.as_str())
         );
+        assert_eq!(assistant_prepared.tool_calls.len(), 1);
         assert_eq!(
-            parsed["tool_calls"],
-            serde_json::json!([{
-                "id": "toolu_1",
-                "name": "shell",
-                "arguments": "{}",
-                "extra_content": {"google": {"thought_signature": "sig_gemini"}},
-            }]),
-            "tool calls (including extra_content signatures) must round-trip unchanged"
+            assistant_prepared.tool_calls[0].extra_content,
+            Some(serde_json::json!({"google": {"thought_signature": "sig_gemini"}}))
         );
-        let content = parsed["content"].as_str().expect("content stays a string");
-        assert!(
-            content.contains(multimodal::MEDIA_PLACEHOLDER),
-            "the envelope's content marker is replaced: {content}"
-        );
-        assert!(
-            !content.contains(path),
-            "no raw path may survive in the envelope's content: {content}"
-        );
+        assert!(assistant_prepared.attachments.is_empty());
 
         let user_prepared = prepared
             .messages
             .iter()
             .find(|m| m.role == "user")
             .expect("user message survives the degrade path");
+        assert!(user_prepared.content.contains(&format!("look {marker}")));
         assert!(
             user_prepared
                 .content
-                .contains(multimodal::MEDIA_PLACEHOLDER),
-            "the whole-string rule still applies to other roles: {}",
-            user_prepared.content
+                .contains(multimodal::MEDIA_PLACEHOLDER)
         );
+        assert!(user_prepared.attachments.is_empty());
     }
 
     #[tokio::test]
@@ -567,7 +564,7 @@ mod tests {
         let no_user = vec![
             ChatMessage::system("sys"),
             ChatMessage::assistant("[tool_call] fire"),
-            ChatMessage::tool("result"),
+            tool_result("result"),
         ];
         let err = prepare_messages_for_iteration(&no_user, &cfg, false, None)
             .await
@@ -629,7 +626,12 @@ vision = false
             vision_model_provider: Some("llamacpp.forced_off".to_string()),
             ..Default::default()
         };
-        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+        let history = vec![ChatMessage::user("look").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "/tmp/x.png".to_string(),
+            },
+        ])];
 
         // `.err()` discards the Ok value (`Box<dyn ModelProvider>` is not `Debug`,
         // so `expect_err` will not compile).
@@ -705,10 +707,12 @@ vision = false
             ..SecurityPolicy::default()
         };
         let multimodal = MultimodalConfig::default();
-        let history = vec![ChatMessage::user(format!(
-            "look [IMAGE:{}]",
-            image_path.display()
-        ))];
+        let history = vec![ChatMessage::user("look").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
 
         let err = resolve_vision_provider(
             None,
@@ -775,10 +779,12 @@ vision = false
             ..SecurityPolicy::default()
         };
         let multimodal = MultimodalConfig::default();
-        let history = vec![ChatMessage::user(format!(
-            "look [IMAGE:{}]",
-            image_path.display()
-        ))];
+        let history = vec![ChatMessage::user("look").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
 
         let err = resolve_vision_provider(
             None,
@@ -840,9 +846,18 @@ vision = false
         let multimodal = MultimodalConfig::default();
         let missing = "/definitely/not/a/real/shot.png";
         let malformed_uri = "data:image/png;base64,%%%";
-        let history = vec![ChatMessage::user(format!(
-            "the brief says [IMAGE:{missing}] and [IMAGE:{malformed_uri}] as fixtures"
-        ))];
+        let history = vec![
+            ChatMessage::user("the brief says  and  as fixtures").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: missing.to_string(),
+                },
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: malformed_uri.to_string(),
+                },
+            ]),
+        ];
 
         let (vision_provider, degrade_strip_images) = resolve_vision_provider(
             None,
@@ -906,10 +921,12 @@ vision = false
             ..SecurityPolicy::default()
         };
         let multimodal = MultimodalConfig::default();
-        let history = vec![ChatMessage::user(format!(
-            "look at this [IMAGE:{}]",
-            image_path.display()
-        ))];
+        let history = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
 
         let err = resolve_vision_provider(
             None,
@@ -923,7 +940,7 @@ vision = false
         )
         .await
         .err()
-        .expect("a resolvable image marker on a non-vision provider must fail");
+        .expect("a resolvable image reference on a non-vision provider must fail");
 
         let capability_error = err
             .downcast_ref::<ProviderCapabilityError>()
@@ -931,7 +948,7 @@ vision = false
         assert_eq!(capability_error.model_provider, "primary");
         assert_eq!(capability_error.capability, "vision");
         assert!(
-            capability_error.message.contains("1 image marker(s)"),
+            capability_error.message.contains("1 image reference(s)"),
             "the refusal must count the loadable marker: {capability_error}"
         );
     }
@@ -1025,15 +1042,21 @@ vision = false
         for i in 5..=20 {
             marker_paths.push(workspace.path().join(format!("missing-{i}.png")));
         }
-        let marker_text = marker_paths
+        let attachments = marker_paths
             .iter()
-            .map(|path| format!("[IMAGE: {}]", path.display()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let messages = vec![ChatMessage::user(format!("look at these {marker_text}"))];
+            .map(|path| zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: path.display().to_string(),
+            })
+            .collect();
+        let messages = vec![ChatMessage::user("look at these").with_attachments(attachments)];
         assert_eq!(
-            multimodal::count_latest_user_resolvable_image_markers(&messages, false, path_allowed)
-                .await,
+            multimodal::count_latest_user_resolvable_image_attachments(
+                &messages,
+                false,
+                path_allowed
+            )
+            .await,
             2 + (20 - multimodal::MAX_RESOLVABILITY_CANDIDATES),
             "two existing in-workspace files count; the dangling symlink, the \
              outside file, and the missing files do not; the four overflow \
@@ -1104,12 +1127,14 @@ vision = false
         for i in 3..=20 {
             marker_paths.push(workspace.path().join(format!("missing-{i}.png")));
         }
-        let marker_text = marker_paths
+        let attachments = marker_paths
             .iter()
-            .map(|path| format!("[IMAGE: {}]", path.display()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let history = vec![ChatMessage::user(format!("look at these {marker_text}"))];
+            .map(|path| zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: path.display().to_string(),
+            })
+            .collect();
+        let history = vec![ChatMessage::user("look at these").with_attachments(attachments)];
 
         let err = resolve_vision_provider(
             None,
@@ -1131,7 +1156,7 @@ vision = false
         assert_eq!(capability_error.model_provider, "primary");
         assert_eq!(capability_error.capability, "vision");
         assert!(
-            capability_error.message.contains("6 image marker(s)"),
+            capability_error.message.contains("6 image reference(s)"),
             "the refusal must count the two loadable candidates plus the four \
              unchecked overflow markers: {capability_error}"
         );
@@ -1180,11 +1205,16 @@ vision = false
             ..SecurityPolicy::default()
         };
         let multimodal = MultimodalConfig::default();
-        let history = vec![ChatMessage::user(format!(
-            "see [IMAGE: {}] and [IMAGE: {}]",
-            outside_path.display(),
-            inside_missing.display()
-        ))];
+        let history = vec![ChatMessage::user("see  and").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (outside_path.display()).to_string(),
+            },
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (inside_missing.display()).to_string(),
+            },
+        ])];
 
         let (vision_provider, degrade_strip_images) = resolve_vision_provider(
             None,
@@ -1265,10 +1295,12 @@ vision = false
             ..SecurityPolicy::default()
         };
         let multimodal = MultimodalConfig::default();
-        let history = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let history = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
 
         let err = resolve_vision_provider(
             None,
@@ -1282,7 +1314,7 @@ vision = false
         )
         .await
         .err()
-        .expect("a policy-readable image marker on a non-vision provider must fail");
+        .expect("a policy-readable image reference on a non-vision provider must fail");
 
         let capability_error = err
             .downcast_ref::<ProviderCapabilityError>()
@@ -1290,7 +1322,7 @@ vision = false
         assert_eq!(capability_error.model_provider, "primary");
         assert_eq!(capability_error.capability, "vision");
         assert!(
-            capability_error.message.contains("1 image marker(s)"),
+            capability_error.message.contains("1 image reference(s)"),
             "the refusal must count the loadable marker: {capability_error}"
         );
     }
@@ -1328,10 +1360,12 @@ vision = false
         let image_path = temp.path().join("shot.png");
         std::fs::write(&image_path, b"an existing file nobody vouches for").unwrap();
         let multimodal = MultimodalConfig::default();
-        let history = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let history = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
 
         let (vision_provider, degrade_strip_images) = resolve_vision_provider(
             None,
@@ -1405,10 +1439,12 @@ vision = false
             ..SecurityPolicy::default()
         };
         let multimodal = MultimodalConfig::default();
-        let history = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let history = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
 
         let (vision_provider, degrade_strip_images) = resolve_vision_provider(
             None,
@@ -1485,10 +1521,12 @@ model = "vision-model"
             vision_model_provider: Some("custom.visionroute".to_string()),
             ..Default::default()
         };
-        let history = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let history = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
 
         let (vision_provider, degrade_strip_images) = resolve_vision_provider(
             Some(&config),
@@ -1643,7 +1681,12 @@ model = "vision-model"
             vision_model_provider: Some("custom.myvision".to_string()),
             ..Default::default()
         };
-        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+        let history = vec![ChatMessage::user("look").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "/tmp/x.png".to_string(),
+            },
+        ])];
 
         let (vision_provider, degrade) = resolve_vision_provider(
             Some(&config),
@@ -1715,121 +1758,5 @@ model = "vision-model"
             "multimodal.vision_model must override the provider alias model"
         );
         server.abort();
-    }
-    /// DECISIVE, no-vision route: a tool-result carrier with one declared
-    /// attachment and marker-looking body text. The degrade strips exactly
-    /// the declared attachment; the body — including its literal marker —
-    /// survives byte for byte, so a model reading source that mentions the
-    /// marker syntax still sees what the tool printed.
-    #[tokio::test]
-    async fn no_vision_degrade_strips_carrier_attachments_not_bodies() {
-        struct NonVisionPrimary;
-        #[async_trait::async_trait]
-        impl ModelProvider for NonVisionPrimary {
-            async fn chat_with_system(
-                &self,
-                _system_prompt: Option<&str>,
-                _message: &str,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<String> {
-                Ok(String::new())
-            }
-            fn capabilities_for_model(
-                &self,
-                _model: &str,
-            ) -> zeroclaw_api::model_provider::ProviderCapabilities {
-                zeroclaw_api::model_provider::ProviderCapabilities {
-                    vision: false,
-                    ..Default::default()
-                }
-            }
-        }
-        impl zeroclaw_api::attribution::Attributable for NonVisionPrimary {
-            fn role(&self) -> zeroclaw_api::attribution::Role {
-                zeroclaw_api::attribution::Role::Provider(
-                    zeroclaw_api::attribution::ProviderKind::Model(
-                        zeroclaw_api::attribution::ModelProviderKind::Custom,
-                    ),
-                )
-            }
-            fn alias(&self) -> &str {
-                "NonVisionPrimary"
-            }
-        }
-
-        let body = "the source contains [IMAGE:/tmp/example.png] as literal text";
-        let carrier = ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "tc1",
-                "content": body,
-                "attachments": [{"kind": "image", "target": "/tmp/real.png"}],
-            })
-            .to_string(),
-        );
-        let history = vec![
-            ChatMessage::user("read the multimodal source".to_string()),
-            carrier,
-        ];
-
-        let (vision, degrade) = resolve_vision_provider(
-            None,
-            &NonVisionPrimary,
-            &history,
-            &MultimodalConfig::default(),
-            "primary",
-            "primary-model",
-            "primary-model",
-            None,
-        )
-        .await
-        .expect("no capability error on a plain degrade");
-        assert!(vision.is_none());
-        assert!(degrade, "the declared attachment must trigger the degrade");
-
-        let prepared =
-            prepare_messages_for_iteration(&history, &MultimodalConfig::default(), true, None)
-                .await
-                .expect("degrade preparation succeeds");
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&prepared.messages[1].content)
-                .expect("degraded carrier still parses");
-        assert!(
-            parsed.attachments.is_empty(),
-            "the declared attachment is stripped"
-        );
-        assert_eq!(
-            parsed.text, body,
-            "the carrier body, marker syntax included, survives the degrade"
-        );
-
-        // A carrier whose body only LOOKS like it carries images never
-        // triggers the vision machinery at all: its count is zero.
-        let text_only = ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "tc2",
-                "content": body,
-                "attachments": [],
-            })
-            .to_string(),
-        );
-        let history = vec![
-            ChatMessage::user("read the source again".to_string()),
-            text_only.clone(),
-        ];
-        assert_eq!(multimodal::count_image_markers(&history), 0);
-        let (_, degrade) = resolve_vision_provider(
-            None,
-            &NonVisionPrimary,
-            &history,
-            &MultimodalConfig::default(),
-            "primary",
-            "primary-model",
-            "primary-model",
-            None,
-        )
-        .await
-        .expect("no capability error");
-        assert!(!degrade, "body markers alone must not degrade anything");
     }
 }

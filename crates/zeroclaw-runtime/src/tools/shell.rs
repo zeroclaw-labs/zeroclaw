@@ -375,60 +375,115 @@ impl Tool for ShellTool {
         #[cfg(unix)]
         let group_guard = ChildGroupGuard::new(child.id());
 
+        if let Some(observer) = zeroclaw_api::session_events::capture::current_tool_observation() {
+            use zeroclaw_api::session_events::*;
+            let evidence =
+                PayloadRecord::json("session.evidence/v1", &json!({"process_id":child.id()}))?;
+            let observation = PayloadRecord::json(
+                "session.tool-observation/v1",
+                &ToolObservationPayload {
+                    operations: vec![ToolObservation::ProcessStarted {
+                        origin: ObservationOrigin::RegisteredTool,
+                        execution_evidence_ref: StoredPayloadRef::from(&evidence),
+                    }],
+                },
+            )?;
+            observer
+                .observe(
+                    EventData::ToolEffectProgressObserved {
+                        observation_ref: StoredPayloadRef::from(&observation),
+                    },
+                    vec![evidence, observation],
+                )
+                .await?;
+        }
+
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
+        let (capture_failures, mut failure_notifications) = tokio::sync::mpsc::channel(2);
 
-        let stdout_drain = spawn_drain(stdout_handle, MAX_OUTPUT_BYTES);
-        let stderr_drain = spawn_drain(stderr_handle, MAX_OUTPUT_BYTES);
+        let stdout_drain = spawn_drain(
+            stdout_handle,
+            MAX_OUTPUT_BYTES,
+            zeroclaw_api::session_events::OutputStream::Stdout,
+            capture_failures.clone(),
+        );
+        let stderr_drain = spawn_drain(
+            stderr_handle,
+            MAX_OUTPUT_BYTES,
+            zeroclaw_api::session_events::OutputStream::Stderr,
+            capture_failures,
+        );
 
-        let mut result =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-                Ok(Ok(status)) => {
-                    #[cfg(unix)]
-                    group_guard.disarm();
-                    let (stdout_capture, stderr_capture) =
-                        tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
+        let wait = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()) => result,
+            Some(()) = failure_notifications.recv() => {
+                child.start_kill()?;
+                tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+                anyhow::bail!("shell_output_capture_failed");
+            }
+        };
+        let mut result = match wait {
+            Ok(Ok(status)) => {
+                #[cfg(unix)]
+                group_guard.disarm();
+                let (stdout_capture, stderr_capture) =
+                    tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
+                let stdout_capture = stdout_capture?;
+                let stderr_capture = stderr_capture?;
 
-                    let mut stdout = decode_capture(&stdout_capture);
-                    let mut stderr = decode_capture(&stderr_capture);
+                let mut stdout = decode_capture(&stdout_capture);
+                let mut stderr = decode_capture(&stderr_capture);
 
-                    if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
-                    }
-                    if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
-                    }
-
-                    ToolResult {
-                        success: status.success(),
-                        output: stdout.into(),
-                        error: if stderr.is_empty() {
-                            None
-                        } else {
-                            Some(stderr)
-                        },
-                    }
+                if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
+                    append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
                 }
-                Ok(Err(e)) => {
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!("Failed to execute command: {e}")),
-                    }
+                if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
+                    append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
                 }
-                Err(_) => {
-                    let _ = child.start_kill();
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Command timed out after {timeout_secs}s and was killed"
-                        )),
-                    }
+
+                ToolResult {
+                    success: status.success(),
+                    output: stdout.into(),
+                    error: if stderr.is_empty() {
+                        None
+                    } else {
+                        Some(stderr)
+                    },
                 }
-            };
+            }
+            Ok(Err(e)) => {
+                tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+                return Err(anyhow::Error::new(e).context("shell_process_wait_failed"));
+            }
+            Err(_) => {
+                observe_shell_cleanup(child.id()).await?;
+                // Request group cleanup while the owned child still anchors
+                // its identity; settle only after wait confirms it was reaped.
+                #[cfg(unix)]
+                drop(group_guard);
+                child.start_kill()?;
+                let termination = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+                match termination {
+                    Ok(Ok(status)) => {
+                        if let Some(observer) =
+                            zeroclaw_api::session_events::capture::current_tool_observation()
+                        {
+                            observer.cancel_verified("shell_timeout_process_reaped",serde_json::json!({"source":"host_child_wait","cancellation_scope":"owned_shell_process","exit_status":status.to_string(),"kill_requested":true,"process_reaped":true,"descendant_cleanup":"best_effort_process_group_signal","external_effects_rolled_back":false})).await?;
+                        }
+                    }
+                    _ => anyhow::bail!("shell_termination_unverified_after_timeout"),
+                }
+                ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Command timed out after {timeout_secs}s and was killed"
+                    )),
+                }
+            }
+        };
 
         // The command ran inside an ephemeral workspace: any files it wrote are
         // invisible on the host and discarded at session end
@@ -446,8 +501,9 @@ impl Tool for ShellTool {
 }
 
 struct DrainHandle {
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
     output: Arc<std::sync::Mutex<DrainOutput>>,
+    stop: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Clone, Default)]
@@ -465,39 +521,74 @@ fn decode_capture(capture: &DrainOutput) -> String {
     }
 }
 
-fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
+fn spawn_drain<R>(
+    reader: Option<R>,
+    cap: usize,
+    stream: zeroclaw_api::session_events::OutputStream,
+    failures: tokio::sync::mpsc::Sender<()>,
+) -> DrainHandle
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
     let shared = Arc::clone(&output);
+    let observer = zeroclaw_api::session_events::capture::current_tool_observation();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let stopping = stop.clone();
     let task = zeroclaw_spawn::spawn!(async move {
-        drain_capped_into(reader, cap, shared).await;
+        let result = drain_capped_into_observed(
+            reader,
+            cap,
+            shared,
+            observer.map(|observer| (observer, stream)),
+            stopping,
+        )
+        .await;
+        if result.is_err() {
+            let _ = failures.send(()).await;
+        }
+        result
     });
-    DrainHandle { task, output }
+    DrainHandle { task, output, stop }
 }
 
-async fn finish_drain(mut drain: DrainHandle) -> DrainOutput {
-    if tokio::time::timeout(POST_EXIT_DRAIN, &mut drain.task)
-        .await
-        .is_err()
-    {
-        drain.task.abort();
-        let _ = drain.task.await;
+impl Drop for DrainHandle {
+    fn drop(&mut self) {
+        // A cancelled tool future must not leave capture workers publishing
+        // after the invocation's observation window has been settled.
+        self.stop.cancel();
+        self.task.abort();
     }
+}
 
-    drain
+async fn finish_drain(mut drain: DrainHandle) -> anyhow::Result<DrainOutput> {
+    match tokio::time::timeout(POST_EXIT_DRAIN, &mut drain.task).await {
+        Ok(result) => result.map_err(|error| {
+            anyhow::Error::msg(format!("shell_output_worker_join_failed: {error}"))
+        })??,
+        Err(_) => {
+            // Capture workers may be committing a durable checkpoint. Wait
+            // for their current append to finish; storage failures propagate.
+            drain.stop.cancel();
+            (&mut drain.task).await.map_err(|error| {
+                anyhow::Error::msg(format!("shell_output_worker_join_failed: {error}"))
+            })??;
+        }
+    }
+    let output = drain
         .output
         .lock()
-        .map(|output| output.clone())
-        .unwrap_or_default()
+        .map_err(|_| anyhow::Error::msg("shell_output_capture_poisoned"))?
+        .clone();
+    Ok(output)
 }
 
-async fn abort_drain(drain: DrainHandle) {
+async fn abort_drain(mut drain: DrainHandle) {
     drain.task.abort();
-    let _ = drain.task.await;
+    let _ = (&mut drain.task).await;
 }
 
+#[cfg(test)]
 async fn drain_capped_into<R>(
     reader: Option<R>,
     cap: usize,
@@ -505,36 +596,148 @@ async fn drain_capped_into<R>(
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
+    // The historical drain fixture deliberately injects an I/O error; it
+    // checks the retained prefix, while production errors propagate.
+    let _ = drain_capped_into_observed(
+        reader,
+        cap,
+        output,
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+}
+
+async fn observe_shell_output(
+    observer: &Arc<dyn zeroclaw_api::session_events::capture::ToolObservationPort>,
+    stream: zeroclaw_api::session_events::OutputStream,
+    offset: usize,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    use zeroclaw_api::session_events::*;
+    // Preserve exact observed bytes and their original stream offsets.
+    let bytes = PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), bytes.to_vec())?;
+    let observation = PayloadRecord::json(
+        "session.tool-observation/v1",
+        &ToolObservationPayload {
+            operations: vec![ToolObservation::OutputChunk {
+                origin: ObservationOrigin::RegisteredTool,
+                stream,
+                byte_offset: offset as u64,
+                bytes_ref: StoredPayloadRef::from(&bytes),
+            }],
+        },
+    )?;
+    observer
+        .observe(
+            EventData::ToolEffectProgressObserved {
+                observation_ref: StoredPayloadRef::from(&observation),
+            },
+            vec![bytes, observation],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn observe_shell_cleanup(pid: Option<u32>) -> anyhow::Result<()> {
+    use zeroclaw_api::session_events::*;
+    if let Some(observer) = zeroclaw_api::session_events::capture::current_tool_observation() {
+        let target = PayloadRecord::json("session.evidence/v1", &json!({"process_id":pid}))?;
+        let reason = PayloadRecord::json(
+            "session.evidence/v1",
+            &json!({"reason_key":"shell_timeout","observed":"wait_deadline_elapsed"}),
+        )?;
+        let observation = PayloadRecord::json(
+            "session.tool-observation/v1",
+            &ToolObservationPayload {
+                operations: vec![ToolObservation::CleanupStarted {
+                    origin: ObservationOrigin::RegisteredTool,
+                    target_ref: StoredPayloadRef::from(&target),
+                    reason_evidence_ref: StoredPayloadRef::from(&reason),
+                }],
+            },
+        )?;
+        observer
+            .observe(
+                EventData::ToolEffectProgressObserved {
+                    observation_ref: StoredPayloadRef::from(&observation),
+                },
+                vec![target, reason, observation],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn drain_capped_into_observed<R>(
+    reader: Option<R>,
+    cap: usize,
+    output: Arc<std::sync::Mutex<DrainOutput>>,
+    observer: Option<(
+        Arc<dyn zeroclaw_api::session_events::capture::ToolObservationPort>,
+        zeroclaw_api::session_events::OutputStream,
+    )>,
+    stop: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
-        if let Ok(mut capture) = output.lock() {
-            capture.complete = true;
-        }
-        return;
+        output
+            .lock()
+            .map_err(|_| anyhow::Error::msg("shell_output_capture_poisoned"))?
+            .complete = true;
+        return Ok(());
     };
     let mut chunk = [0u8; 8192];
+    let mut published = 0;
     loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) => {
-                if let Ok(mut capture) = output.lock() {
+        let stopping = stop.is_cancelled();
+        let read = tokio::select! {
+            result = reader.read(&mut chunk) => result,
+            () = stop.cancelled() => Ok(0),
+        };
+        let ended = matches!(read, Ok(0) | Err(_));
+        let (offset, bytes) = {
+            let mut capture = output
+                .lock()
+                .map_err(|_| anyhow::Error::msg("shell_output_capture_poisoned"))?;
+            if let Ok(n) = &read {
+                let remaining = cap.saturating_sub(capture.bytes.len());
+                let take = (*n).min(remaining);
+                capture.bytes.extend_from_slice(&chunk[..take]);
+                capture.truncated |= take < *n;
+                if *n == 0 && !stopping && !stop.is_cancelled() {
                     capture.complete = true;
                 }
-                break;
             }
-            Ok(n) => {
-                let Ok(mut capture) = output.lock() else {
-                    break;
-                };
-                let remaining = cap.saturating_sub(capture.bytes.len());
-                if remaining > 0 {
-                    let take = n.min(remaining);
-                    capture.bytes.extend_from_slice(&chunk[..take]);
-                    capture.truncated |= take < n;
-                } else {
-                    capture.truncated = true;
-                }
-            }
-            Err(_) => break,
+            let end = if ended {
+                capture.bytes.len()
+            } else {
+                capture.bytes[published..]
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map_or(published, |index| published + index + 1)
+            };
+            let offset = published;
+            let bytes = if observer.is_some() {
+                capture.bytes[published..end].to_vec()
+            } else {
+                vec![]
+            };
+            published = end;
+            (offset, bytes)
+        };
+        if let Some((observer, stream)) = &observer
+            && !bytes.is_empty()
+        {
+            observe_shell_output(observer, stream.clone(), offset, &bytes).await?;
+        }
+        match read {
+            Ok(0) => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
         }
     }
 }
@@ -565,6 +768,144 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
 mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    struct OutputObserver {
+        observed: std::sync::Mutex<
+            Vec<(
+                zeroclaw_api::session_events::EventData,
+                Vec<zeroclaw_api::session_events::PayloadRecord>,
+            )>,
+        >,
+        fail: bool,
+    }
+    #[async_trait]
+    impl zeroclaw_api::session_events::capture::ToolObservationPort for OutputObserver {
+        fn started_event_id(&self) -> zeroclaw_api::session_events::EventId {
+            zeroclaw_api::session_events::EventId::from("fixture-start")
+        }
+        async fn observe(
+            &self,
+            data: zeroclaw_api::session_events::EventData,
+            payloads: Vec<zeroclaw_api::session_events::PayloadRecord>,
+        ) -> anyhow::Result<zeroclaw_api::session_events::AppendReceipt> {
+            use zeroclaw_api::session_events::*;
+            if self.fail {
+                anyhow::bail!("fixture_store_unavailable");
+            }
+            self.observed
+                .lock()
+                .expect("observations")
+                .push((data, payloads));
+            let stream = SessionStreamId::from("fixture-stream");
+            Ok(AppendReceipt {
+                first: EventCursor {
+                    stream_id: stream.clone(),
+                    sequence: 1,
+                },
+                last: EventCursor {
+                    stream_id: stream,
+                    sequence: 1,
+                },
+                event_ids: vec![EventId::new()],
+            })
+        }
+    }
+    struct SplitOutput(std::collections::VecDeque<Vec<u8>>);
+    impl tokio::io::AsyncRead for SplitOutput {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(bytes) = self.0.pop_front() {
+                buf.put_slice(&bytes);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn shell_output_observer_preserves_offsets_binary_and_split_credentials() {
+        use zeroclaw_api::session_events::*;
+        let observer = Arc::new(OutputObserver {
+            observed: Default::default(),
+            fail: false,
+        });
+        let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
+        let first = b"token=fixture_secret_value\n";
+        let binary = vec![0xff, 0, 0xc3, 0x28, b'\n'];
+        let source = SplitOutput(std::collections::VecDeque::from([
+            b"token=fixture_".to_vec(),
+            b"secret_value\n".to_vec(),
+            binary.clone(),
+        ]));
+        drain_capped_into_observed(
+            Some(source),
+            1024,
+            output.clone(),
+            Some((observer.clone(), OutputStream::Stdout)),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("drain");
+        let observations = observer.observed.lock().expect("observations");
+        assert_eq!(observations.len(), 2);
+        let mut captured = vec![];
+        for (index, (data, payloads)) in observations.iter().enumerate() {
+            let EventData::ToolEffectProgressObserved { observation_ref } = data else {
+                panic!("progress");
+            };
+            let record = payloads
+                .iter()
+                .find(|payload| payload.payload_id == observation_ref.payload_id)
+                .expect("observation payload");
+            let decoded: ToolObservationPayload =
+                serde_json::from_slice(&record.body).expect("codec");
+            let ToolObservation::OutputChunk {
+                byte_offset,
+                bytes_ref,
+                ..
+            } = &decoded.operations[0]
+            else {
+                panic!("output");
+            };
+            assert_eq!(
+                *byte_offset,
+                if index == 0 { 0 } else { first.len() as u64 }
+            );
+            let bytes = &payloads
+                .iter()
+                .find(|payload| payload.payload_id == bytes_ref.payload_id)
+                .expect("bytes")
+                .body;
+            if index == 1 {
+                assert_eq!(bytes, &binary);
+            }
+            captured.extend_from_slice(bytes);
+        }
+        let mut original = first.to_vec();
+        original.extend_from_slice(&binary);
+        assert_eq!(captured, original);
+        assert_eq!(output.lock().expect("output").bytes, original);
+    }
+    #[tokio::test]
+    async fn shell_output_storage_failure_propagates() {
+        use zeroclaw_api::session_events::OutputStream;
+        let observer = Arc::new(OutputObserver {
+            observed: Default::default(),
+            fail: true,
+        });
+        assert!(
+            drain_capped_into_observed(
+                Some(&b"fixture\n"[..]),
+                1024,
+                Arc::new(std::sync::Mutex::new(DrainOutput::default())),
+                Some((observer, OutputStream::Stderr)),
+                tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+    }
 
     struct ErrorAfterBytes {
         bytes: Option<Vec<u8>>,

@@ -76,6 +76,7 @@ impl SessionStore {
     /// trim breadcrumb. Respects the migration fence: fails if the JSONL
     /// store has been migrated to SQLite.
     pub fn set_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let _guard = self.mutation_guard()?;
         std::fs::write(
             self.trim_breadcrumb_path(session_key),
@@ -174,6 +175,7 @@ impl SessionStore {
 
     /// Append a single message to the session JSONL file.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let _guard = self.mutation_guard()?;
         self.append_unlocked(session_key, message)
     }
@@ -207,6 +209,7 @@ impl SessionStore {
     /// Rewrite approach: load all messages, drop the last, rewrite. This is
     /// O(n) but rollbacks are rare.
     pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let _guard = self.mutation_guard()?;
         let mut messages = self.load(session_key);
         if messages.is_empty() {
@@ -231,6 +234,7 @@ impl SessionStore {
     where
         F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
     {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let _guard = self.mutation_guard()?;
         let mut messages = self.load(session_key);
         let Some(last) = messages.last_mut() else {
@@ -243,6 +247,7 @@ impl SessionStore {
 
     /// Compact a session file by rewriting only valid messages (removes corrupt lines).
     pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let _guard = self.mutation_guard()?;
         validate_jsonl_session_file_path(&self.session_path(session_key))?;
         let messages = self.load(session_key);
@@ -318,6 +323,7 @@ impl SessionStore {
     /// removed the transcript but not its provenance file) must not survive
     /// a `clear_messages` call and be misread by a later restore.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let _guard = self.mutation_guard()?;
         let _ = std::fs::remove_file(self.trim_breadcrumb_path(session_key));
         if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
@@ -336,6 +342,7 @@ impl SessionStore {
     /// file) so stale provenance cannot affect a later session that reuses
     /// the same key.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let _guard = self.mutation_guard()?;
         let path = self.session_path(session_key);
         let crumb_path = self.trim_breadcrumb_path(session_key);
@@ -498,6 +505,10 @@ pub(crate) fn forget_session_directory_migration_state_for_test(
 }
 
 impl SessionBackend for SessionStore {
+    fn require_legacy_access(&self) -> std::io::Result<()> {
+        crate::session_events::installation::legacy_guard(&self.sessions_dir).map(|_| ())
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         self.load(session_key)
     }
@@ -515,6 +526,7 @@ impl SessionBackend for SessionStore {
     }
 
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let _guard = self.mutation_guard()?;
         self.rewrite(session_key, messages)
     }
@@ -537,6 +549,7 @@ impl SessionBackend for SessionStore {
         // new transcript paired with a stale flag — a process that dies
         // between the writes can still leave the pair split, but an
         // in-process failure converges back to the last known-good state.
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let guard = self.mutation_guard()?;
         self.replace_locked(&guard, session_key, messages, breadcrumb_present)
     }
@@ -552,6 +565,7 @@ impl SessionBackend for SessionStore {
         // commit between the probe and the writes: once deletion wins, the
         // post-turn write is a no-op instead of recreating the transcript
         // and sidecar files the delete just removed.
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let guard = self.mutation_guard()?;
         if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
             return Ok(false);

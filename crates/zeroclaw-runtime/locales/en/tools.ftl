@@ -195,14 +195,15 @@ tool-read-skill = Read the full source file for an available skill by name. Use 
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
 tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
-tool-sessions-send = Deprecated legacy compatibility tool. Appends content to an existing Chat session's conversation history as an ordinary 'user' message. This does not notify or run the session and is not live message delivery. Use send_message_to_peer for agent-to-agent messaging.
-tool-sessions-send-param-session-id = The existing Chat session ID whose legacy history should be appended (for example, telegram__user123). Gateway dashboard sessions may be addressed by their dashboard ID or by gw_<id>.
-tool-sessions-send-param-message = Legacy content to append as an ordinary 'user' message; this does not notify or run the session.
-tool-sessions-send-output-appended = Legacy content appended to session '{ $session_id }' as an ordinary 'user' message. No notification, live delivery, or agent execution occurred. Use send_message_to_peer for agent-to-agent messaging.
-tool-sessions-send-output-appended-alias = Legacy content appended to session '{ $session_id }' (requested '{ $requested_id }') as an ordinary 'user' message. No notification, live delivery, or agent execution occurred. Use send_message_to_peer for agent-to-agent messaging.
-tool-sessions-send-error-append = Failed to append content to session history: { $error }
-tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
+tool-sessions-send = Retired compatibility tool. Session history mutations are unsupported. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send-param-session-id = Session ID retained for compatibility with older tool calls.
+tool-sessions-send-param-message = Content retained in the compatibility schema; this tool does not append or deliver it.
 tool-sessions-current-channel = Channel: { $channel }
+tool-sessions-native-empty = No active sessions found.
+tool-sessions-native-reader-unavailable = Native session history is unavailable in this execution context.
+tool-sessions-native-mutation-unsupported = { $tool } cannot mutate native event history. Use an authorized session command.
+tool-sessions-native-history = Session '{ $session_id }': recent messages
+tool-sessions-native-summary = { $session_id }: channel={ $channel }, messages={ $messages }, last_activity={ $last_activity }
 
 tool-screenshot = Capture a screenshot of the current screen. Returns the saved file path.
 tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
@@ -274,3 +275,8 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+# Interactive questions
+tool-ask-user-invalid-timeout = timeout_secs must be at least 1.
+tool-ask-user-choice-outcome = Channel '{ $channel }' structured choice: { $state }.
+tool-ask-user-listener-failed = Channel '{ $channel }' listener failed: { $error }.

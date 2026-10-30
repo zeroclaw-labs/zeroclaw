@@ -36,11 +36,7 @@ fn is_conversation_turn_boundary(msg: &ConversationMessage, is_breadcrumb: bool)
     matches!(
         msg,
         ConversationMessage::Chat(chat)
-            if chat.role == "user"
-                && !chat
-                    .content
-                    .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
-                && !is_breadcrumb
+            if chat.role == "user" && !is_breadcrumb
     )
 }
 
@@ -111,9 +107,6 @@ pub(crate) fn trim_conversation_to_recent_turns(
 
 fn is_turn_boundary(msg: &ChatMessage) -> bool {
     msg.role == "user"
-        && !msg
-            .content
-            .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
 }
 
 fn is_system(msg: &ChatMessage) -> bool {
@@ -424,23 +417,25 @@ mod tests {
     fn asst(c: &str) -> ChatMessage {
         ChatMessage::assistant(c)
     }
-    fn tool(c: &str) -> ChatMessage {
-        ChatMessage::tool(c)
+    fn tool(c: impl Into<ChatMessage>) -> ChatMessage {
+        let mut message = c.into();
+        message.role = "tool".into();
+        message
     }
 
-    /// A declared native tool-result carrier for one image: the envelope the
-    /// runtime writes, with the attachment at the fixed position.
-    fn image_tool_carrier(target: &str) -> String {
-        let attachments = vec![zeroclaw_api::media::RenderedMarker {
-            target: target.to_string(),
-            kind: zeroclaw_api::media::MarkerKind::Image,
-        }];
-        serde_json::json!({
-            "tool_call_id": "call_image",
-            "content": "",
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+    /// A structured tool result owning one image reference.
+    fn image_tool_result(target: &str) -> ChatMessage {
+        ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: ("call_image").to_string(),
+            tool_name: String::new(),
+            content: ("").to_string(),
+            success: None,
+            attachments: Vec::new(),
         })
-        .to_string()
+        .with_attachments(vec![zeroclaw_api::media::AttachmentReference {
+            target: target.to_string(),
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+        }])
     }
 
     fn conversation_system(content: &str) -> ConversationMessage {
@@ -468,6 +463,8 @@ mod tests {
             reasoning_content: None,
         });
         history.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+            success: None,
+            attachments: Vec::new(),
             tool_call_id: id,
             content: format!("result {index}"),
             tool_name: "shell".into(),
@@ -932,7 +929,7 @@ mod tests {
             user(&format!("turn1 {big}")),
             asst("calling tool"),
             tool("tool_use_1 result"),
-            user("[Tool results]\nmore"),
+            tool("more"),
             asst("done1"),
             user("turn2 short"),
             asst("done2"),
@@ -951,14 +948,10 @@ mod tests {
         }
     }
 
-    /// Known limit of prefix provenance: the trimmer identifies a prompt-mode
-    /// tool-result row as a `user` row whose content starts with
-    /// `[Tool results]`, so a genuine user message that happens to begin with
-    /// that prefix is grouped with the preceding assistant turn instead of
-    /// opening a turn of its own. This pins that grouping: the row is dropped
-    /// together with that turn and never counted as an independent turn.
+    /// A user message containing tool-protocol-looking text remains a real
+    /// user turn; only the structured `tool` role is treated as a result.
     #[test]
-    fn user_text_matching_tool_results_prefix_is_dropped_with_its_turn() {
+    fn user_text_matching_old_tool_results_prefix_opens_a_real_turn() {
         let history = vec![
             sys("system"),
             user("old request"),
@@ -973,8 +966,8 @@ mod tests {
 
         assert!(result.trimmed);
         assert_eq!(
-            result.dropped_turns, 1,
-            "the prefix-matching row must not count as a turn of its own"
+            result.dropped_turns, 2,
+            "literal user text must count as its own turn"
         );
         assert_eq!(result.kept_turns, 1);
         assert_eq!(result.dropped_messages, 4);
@@ -1013,16 +1006,26 @@ mod tests {
         use crate::agent::history_pruner::remove_orphaned_tool_messages;
         let big = "q".repeat(3000);
         let asst_call = |id: &str| {
-            asst(
-                &serde_json::json!({
-                    "content": "",
-                    "tool_calls": [{"id": id, "name": "file_read", "arguments": "{}"}]
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: id.into(),
+                    name: "file_read".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
             )
         };
-        let tool_res =
-            |id: &str| tool(&serde_json::json!({"tool_call_id": id, "content": "ok"}).to_string());
+        let tool_res = |id: &str| {
+            ChatMessage::tool_result(ToolResultMessage {
+                tool_call_id: id.into(),
+                tool_name: "file_read".into(),
+                success: Some(true),
+                content: "ok".into(),
+                attachments: Vec::new(),
+            })
+        };
         let h = vec![
             sys("system"),
             user(&format!("turn1 {big}")),
@@ -1047,11 +1050,14 @@ mod tests {
     }
 
     #[test]
-    fn preserves_kept_tool_call_id_envelope_when_trimming_whole_turns() {
+    fn preserves_kept_tool_identity_when_trimming_whole_turns() {
         let old_big = "old ".repeat(2000);
-        let envelope = serde_json::json!({
-            "tool_call_id": "call_1",
-            "content": "raw tool output",
+        let result = ChatMessage::tool_result(ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "file_read".into(),
+            success: Some(true),
+            content: "raw tool output".into(),
+            attachments: Vec::new(),
         });
         let h = vec![
             sys("system"),
@@ -1059,7 +1065,7 @@ mod tests {
             asst("old answer"),
             user("recent"),
             asst("calling tool"),
-            tool(&envelope.to_string()),
+            result,
             asst("done"),
         ];
 
@@ -1072,20 +1078,14 @@ mod tests {
             .iter()
             .find(|msg| msg.role == "tool")
             .expect("recent tool result should be kept");
-        let kept_envelope: serde_json::Value =
-            serde_json::from_str(&kept_tool.content).expect("tool content remains JSON");
         assert_eq!(
-            kept_envelope
-                .get("tool_call_id")
-                .and_then(serde_json::Value::as_str),
+            kept_tool
+                .tool_result
+                .as_ref()
+                .map(|result| result.tool_call_id.as_str()),
             Some("call_1"),
         );
-        assert_eq!(
-            kept_envelope
-                .get("content")
-                .and_then(serde_json::Value::as_str),
-            Some("raw tool output"),
-        );
+        assert_eq!(kept_tool.content, "raw tool output");
     }
 
     #[test]
@@ -1436,7 +1436,7 @@ mod tests {
         })
         .to_string();
 
-        let image_history = |tool_contents: Vec<String>| {
+        let image_history = |tool_contents: Vec<ChatMessage>| {
             vec![
                 sys("system"),
                 user(&format!("old turn {}", "x".repeat(8_000))),
@@ -1445,7 +1445,7 @@ mod tests {
                 asst(&assistant_tool_calls),
             ]
             .into_iter()
-            .chain(tool_contents.into_iter().map(|content| tool(&content)))
+            .chain(tool_contents)
             .collect::<Vec<ChatMessage>>()
         };
 
@@ -1453,7 +1453,7 @@ mod tests {
         // declared carriers, the shape the runtime writes.
         let history = image_history(
             (0..5)
-                .map(|index| image_tool_carrier(&format!("/tmp/slide-{index}.png")))
+                .map(|index| image_tool_result(&format!("/tmp/slide-{index}.png")))
                 .collect(),
         );
         assert!(
@@ -1490,7 +1490,7 @@ mod tests {
         let history = image_history(
             (0..5)
                 .map(|_| {
-                    image_tool_carrier(&format!("data:image/png;base64,{}", "A".repeat(600_000)))
+                    image_tool_result(&format!("data:image/png;base64,{}", "A".repeat(600_000)))
                 })
                 .collect(),
         );
@@ -1527,7 +1527,7 @@ mod tests {
             sys("s"),
             user("u"),
             asst("a"),
-            tool(&markers.join("\n")),
+            tool(markers.join("\n")),
             user("v"),
         ];
 

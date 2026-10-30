@@ -19,6 +19,16 @@ use zeroclaw_providers::traits::{
 };
 use zeroclaw_providers::{ModelProviderRuntimeOptions, create_model_provider_for_alias_with_url};
 
+fn structured_tool_result(content: impl Into<String>) -> ChatMessage {
+    ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+        tool_call_id: "call-test".into(),
+        tool_name: "shell".into(),
+        success: Some(true),
+        content: content.into(),
+        attachments: Vec::new(),
+    })
+}
+
 type Capture = Arc<Mutex<Option<Value>>>;
 type RawCapture = Arc<Mutex<Option<Vec<u8>>>>;
 type HeaderCapture = Arc<Mutex<Option<HeaderMap>>>;
@@ -1711,10 +1721,17 @@ async fn native_hailo_preserves_tool_history_as_plain_messages() {
     let history = vec![
         ChatMessage::system("Use the available tools when needed."),
         ChatMessage::user("Read README.md"),
-        ChatMessage::assistant(
-            r#"{"content":null,"tool_calls":[{"id":"call_1","name":"file_read","arguments":"{\"path\":\"README.md\"}"}]}"#,
+        ChatMessage::assistant_tool_calls(
+            String::new(),
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_1".into(),
+                name: "file_read".into(),
+                arguments: "{\"path\":\"README.md\"}".into(),
+                extra_content: None,
+            }],
+            None,
         ),
-        ChatMessage::tool("file contents"),
+        structured_tool_result("file contents"),
     ];
     hailo_provider(&format!("http://{addr}"))
         .chat_with_history(&history, "qwen3:1.7b", Some(0.2))
@@ -1777,10 +1794,17 @@ async fn native_hailo_fails_closed_when_latest_tool_turn_exceeds_context_budget(
     .expect("valid fake Hailo URL");
     let history = vec![
         ChatMessage::user("Read README.md"),
-        ChatMessage::assistant(
-            r#"{"content":null,"tool_calls":[{"id":"call_1","name":"file_read","arguments":"{\"path\":\"README.md\"}"}]}"#,
+        ChatMessage::assistant_tool_calls(
+            String::new(),
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_1".into(),
+                name: "file_read".into(),
+                arguments: "{\"path\":\"README.md\"}".into(),
+                extra_content: None,
+            }],
+            None,
         ),
-        ChatMessage::tool("LATEST_TOOL_RESULT"),
+        structured_tool_result("LATEST_TOOL_RESULT"),
     ];
 
     let error = provider
@@ -1872,18 +1896,19 @@ async fn native_hailo_preserves_latest_tool_turn_without_message_cap() {
 
     let mut history = vec![ChatMessage::user("Run every requested check")];
     for index in 0..6 {
-        history.push(ChatMessage::assistant(
-            json!({
-                "content": null,
-                "tool_calls": [{
-                    "id": format!("call_{index}"),
-                    "name": "shell",
-                    "arguments": "{\"command\":\"true\"}"
-                }]
-            })
-            .to_string(),
+        history.push(ChatMessage::assistant_tool_calls(
+            String::new(),
+            serde_json::from_value(serde_json::json!([{
+                "id": format!("call_{index}"),
+                "name": "shell",
+                "arguments": "{\"command\":\"true\"}"
+            }]))
+            .unwrap(),
+            None,
         ));
-        history.push(ChatMessage::tool(format!("LATEST_TOOL_RESULT_{index}")));
+        history.push(structured_tool_result(format!(
+            "LATEST_TOOL_RESULT_{index}"
+        )));
     }
 
     hailo_provider(&format!("http://{addr}"))
@@ -1924,10 +1949,17 @@ async fn native_hailo_preserves_complete_tool_history_without_message_cap() {
     let mut history = vec![
         ChatMessage::system("Keep complete tool exchanges."),
         ChatMessage::user("old request"),
-        ChatMessage::assistant(
-            r#"{"content":null,"tool_calls":[{"id":"call_old","name":"file_read","arguments":"{\"path\":\"old\"}"}]}"#,
+        ChatMessage::assistant_tool_calls(
+            String::new(),
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_old".into(),
+                name: "file_read".into(),
+                arguments: "{\"path\":\"old\"}".into(),
+                extra_content: None,
+            }],
+            None,
         ),
-        ChatMessage::tool("orphaned old result"),
+        structured_tool_result("orphaned old result"),
     ];
     for index in 0..5 {
         history.push(ChatMessage::user(format!("fresh user {index}")));
@@ -2048,7 +2080,7 @@ async fn native_hailo_rejects_history_without_a_user_anchor() {
             &[
                 ChatMessage::system("Preserve the real request."),
                 ChatMessage::assistant("orphaned assistant prefill"),
-                ChatMessage::tool("orphaned tool result"),
+                structured_tool_result("orphaned tool result"),
             ],
             "qwen3:1.7b",
             Some(0.2),
@@ -2094,8 +2126,8 @@ async fn native_hailo_accounts_for_merge_separators_in_context_budget() {
     let messages = vec![
         ChatMessage::user("uuu"),
         ChatMessage::assistant("a"),
-        ChatMessage::tool("x"),
-        ChatMessage::tool("x"),
+        structured_tool_result("x"),
+        structured_tool_result("x"),
     ];
 
     let error = provider
@@ -2135,9 +2167,15 @@ async fn native_hailo_preserves_prompt_tool_rounds_without_message_cap() {
         messages.push(ChatMessage::assistant(format!(
             "<tool_call>round {round}</tool_call>"
         )));
-        messages.push(ChatMessage::user(format!(
-            "[Tool results]\n<tool_result>result {round}</tool_result>"
-        )));
+        messages.push(ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: (format!("call-{round}")).to_string(),
+                tool_name: ("shell").to_string(),
+                content: (format!("result {round}")).to_string(),
+                success: None,
+                attachments: Vec::new(),
+            },
+        ));
     }
     provider
         .chat_with_history(&messages, "qwen3:1.7b", Some(0.2))
@@ -2181,10 +2219,15 @@ async fn native_hailo_rejects_prompt_tool_rounds_over_context_budget() {
         messages.push(ChatMessage::assistant(format!(
             "<tool_call>round {round}</tool_call>"
         )));
-        messages.push(ChatMessage::user(format!(
-            "[Tool results]\n<tool_result>{}</tool_result>",
-            "x".repeat(900)
-        )));
+        messages.push(ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: (format!("call-{round}")).to_string(),
+                tool_name: ("shell").to_string(),
+                content: ("x".repeat(900)).to_string(),
+                success: None,
+                attachments: Vec::new(),
+            },
+        ));
     }
     let error = provider
         .chat_with_history(&messages, "qwen3:1.7b", Some(0.2))
@@ -2675,8 +2718,8 @@ async fn native_hailo_allows_default_system_prompt_media_documentation() {
     // default system prompt. It must remain trusted prose, not image input.
     let default_system_prompt = concat!(
         "When responding on Discord:\n",
-        "- For media attachments use markers: [IMAGE:<absolute-path>], ",
-        "[DOCUMENT:<absolute-path>]\n",
+        "- For media attachments use structured attachment fields, including image and document references. ",
+        "Keep ordinary text in the message body.\n",
         "- Keep normal text outside markers."
     );
     let response = hailo_provider(&format!("http://{addr}"))
@@ -2713,9 +2756,14 @@ async fn native_hailo_rejects_image_inputs_instead_of_dropping_them() {
     });
 
     let provider = hailo_provider(&format!("http://{addr}"));
-    let prompt = format!("Describe this [IMAGE:data:image/png;base64,{ONE_PIXEL_RED_PNG_B64}]");
+    let prompt = ChatMessage::user("Describe this").with_attachments(vec![
+        zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: format!("data:image/png;base64,{ONE_PIXEL_RED_PNG_B64}"),
+        },
+    ]);
     let error = provider
-        .simple_chat(&prompt, "qwen3:1.7b", Some(0.2))
+        .chat_with_history(&[prompt], "qwen3:1.7b", Some(0.2))
         .await
         .expect_err("native Hailo image input must fail before HTTP");
     assert!(error.to_string().contains("does not support image inputs"));
@@ -2747,8 +2795,13 @@ async fn native_hailo_rejects_unloadable_image_markers_before_http() {
 
     let provider = hailo_provider(&format!("http://{addr}"));
     let error = provider
-        .simple_chat(
-            "Describe this [IMAGE:missing-image.invalid]",
+        .chat_with_history(
+            &[ChatMessage::user("Describe this").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "missing-image.invalid".into(),
+                },
+            ])],
             "qwen3:1.7b",
             Some(0.2),
         )
@@ -2766,7 +2819,7 @@ async fn native_hailo_rejects_unloadable_image_markers_before_http() {
 }
 
 #[tokio::test]
-async fn native_hailo_rejects_parser_preserved_image_marker_residue_before_http() {
+async fn native_hailo_preserves_literal_media_text() {
     let requests = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -2781,21 +2834,16 @@ async fn native_hailo_rejects_parser_preserved_image_marker_residue_before_http(
             .expect("serve fake Hailo server");
     });
 
-    let error = hailo_provider(&format!("http://{addr}"))
+    let response = hailo_provider(&format!("http://{addr}"))
         .simple_chat(
             "Describe this [IMAGE:missing-image.invalid]",
             "qwen3:1.7b",
             Some(0.2),
         )
         .await
-        .expect_err("parser-preserved image marker residue must fail before HTTP");
-    assert!(error.to_string().contains("does not support image inputs"));
-    assert!(
-        error
-            .chain()
-            .any(|source| source.is::<NonRetryableProviderError>())
-    );
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
+        .expect("literal media syntax is ordinary text");
+    assert_eq!(response, "HAILO_NATIVE_OK");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
 
     server.abort();
 }
@@ -2818,16 +2866,27 @@ async fn native_hailo_rejects_image_marker_residue_in_tool_result_history_before
 
     let history = vec![
         ChatMessage::user("Inspect the generated image"),
-        ChatMessage::assistant(
-            r#"{"content":null,"tool_calls":[{"id":"call_1","name":"image_gen","arguments":"{}"}]}"#,
+        ChatMessage::assistant_tool_calls(
+            String::new(),
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_1".into(),
+                name: "image_gen".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            None,
         ),
-        ChatMessage::tool(
-            json!({
-                "tool_call_id": "call_1",
-                "content": "generated [IMAGE:missing-image.invalid]"
-            })
-            .to_string(),
-        ),
+        ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: ("call_1").to_string(),
+            tool_name: String::new(),
+            content: ("generated").to_string(),
+            success: None,
+            attachments: Vec::new(),
+        })
+        .with_attachments(vec![zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: "missing-image.invalid".into(),
+        }]),
     ];
     let error = hailo_provider(&format!("http://{addr}"))
         .chat_with_history(&history, "qwen3:1.7b", Some(0.2))

@@ -1615,7 +1615,8 @@ mod tests {
             mdns_peer_registry: crate::nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
-            session_backend: None,
+
+            native_sessions: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),

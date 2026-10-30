@@ -12,17 +12,9 @@ pub(crate) fn preflight_history_maintenance(history: &mut Vec<ChatMessage>) {
     // reloading. Without this, model_providers like MiniMax reject the
     // request with "tool result's tool id not found".
     //
-    // Only the orphaned tool-role half is removed here. Repairing the other
-    // half — an assistant tool_call whose result is missing — is deliberately
-    // left to the provider adapters, which have the pairing context this flat,
-    // shared pass lacks: the OpenAI-compatible adapter borrows the preceding
-    // call id for an id-less result, and the Anthropic adapter backfills an
-    // interrupted call. Stripping the assistant call here — on flat provider
-    // JSON that cannot tell a native `AssistantToolCalls` from a model-authored
-    // answer that merely contains a `tool_calls` array — would defeat both and
-    // could rewrite an ordinary assistant answer. Restored ACP transcripts are
-    // instead repaired earlier, while still typed `ConversationMessage` data
-    // (see `repair_incomplete_tool_calls` on the ACP `session/load` path).
+    // Missing results are resolved by the provider adapters, which own the
+    // wire protocol's interrupted-result behavior. This pass only removes
+    // unpaired result messages using explicit call identity.
     let pruned_in_loop = crate::agent::history_pruner::remove_orphaned_tool_messages(history);
     if !pruned_in_loop.is_empty() {
         ::zeroclaw_log::record!(
@@ -49,8 +41,13 @@ mod tests {
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
             role: role.to_string(),
             content: content.to_string(),
+
+            attachments: Vec::new(),
         }
     }
 
@@ -60,12 +57,19 @@ mod tests {
     // reachable — it must not strip the assistant call on this flat history.
     #[test]
     fn preflight_keeps_call_and_idless_result_for_adapter_fallback() {
-        let assistant =
-            r#"{"content":null,"tool_calls":[{"id":"fc_123","name":"shell","arguments":"{}"}]}"#;
-        let idless_result = r#"{"content":"pwd output"}"#;
+        let idless_result = "pwd output";
         let mut history = vec![
             msg("user", "run pwd"),
-            msg("assistant", assistant),
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "fc_123".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
+            ),
             msg("tool", idless_result),
         ];
 
@@ -77,7 +81,7 @@ mod tests {
             "neither the assistant call nor the id-less result may be removed: {history:?}"
         );
         assert!(
-            history[1].content.contains("fc_123"),
+            history[1].tool_calls.iter().any(|call| call.id == "fc_123"),
             "assistant native call must survive for the adapter fallback: {}",
             history[1].content
         );
@@ -91,7 +95,7 @@ mod tests {
     fn preflight_leaves_ordinary_assistant_json_untouched() {
         let assistant_json =
             r#"{"answer":"here","tool_calls":[{"id":"x","name":"noop","arguments":"{}"}]}"#;
-        let mut history = vec![msg("user", "hi"), msg("assistant", assistant_json)];
+        let mut history = vec![msg("user", "hi"), ChatMessage::assistant(assistant_json)];
 
         preflight_history_maintenance(&mut history);
 

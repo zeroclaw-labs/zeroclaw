@@ -5,6 +5,7 @@ import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { ApiError, uploadChatImage } from '@/lib/api';
+import type { AttachmentReference } from '@/types/api';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 import {
@@ -133,10 +134,17 @@ export function AgentChatInner({
   // panes an alias-only key would make both share one draft, so typing in one
   // would overwrite the other's unsent message.
   const draftKey = `${DRAFT_KEY_PREFIX}.${agentAlias}.${sessionId}`;
-  const { draft, saveDraft, clearDraft } = useDraft(draftKey);
+  const { draft, saveDraft, clearDraft, attachments: savedAttachments, updateAttachments } = useDraft(draftKey);
+  const [attachmentDraft, setAttachmentDraft] = useState<{ key: string; items: AttachmentReference[] }>({ key: draftKey, items: savedAttachments });
+  const pendingAttachments = attachmentDraft.key === draftKey ? attachmentDraft.items : savedAttachments;
+  const writeAttachments = useCallback((update: (previous: AttachmentReference[]) => AttachmentReference[]) => {
+    setAttachmentDraft({ key: draftKey, items: updateAttachments(update) });
+  }, [draftKey, updateAttachments]);
+  const conversationKeyRef = useRef(draftKey);
+  conversationKeyRef.current = draftKey;
   const [input, setInput] = useState(draft);
   // Mirror of `input` for writers that run after an await (an attachment
-  // marker landing once the operator has typed more). A functional update
+  // upload landing once the operator has typed more). A functional update
   // against React state alone could not also hand the final value to the draft
   // store, so the updater form of applyInput resolves against this instead.
   const inputValueRef = useRef(input);
@@ -157,7 +165,7 @@ export function AgentChatInner({
 
   /**
    * Single writer for the live composer text. Every change to what the
-   * operator has typed (keystrokes, slash-command completion, a marker
+   * operator has typed (keystrokes, slash-command completion, an attachment
    * appended by a later feature) goes through here so the per-conversation
    * draft store stays in step with the textarea. A bare `setInput` would leave
    * the stored draft behind and lose the change on the next conversation
@@ -309,8 +317,9 @@ export function AgentChatInner({
   }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading]);
 
   const handleSend = () => {
+    if (uploading) return;
     const trimmed = input.trim();
-    if (!trimmed) return;
+    if (!trimmed && pendingAttachments.length === 0) return;
 
     // Slash commands are dispatched BEFORE the connectivity check so purely
     // local commands like /help still work during transient disconnects.
@@ -318,15 +327,17 @@ export function AgentChatInner({
     // reconnect paths inside the context. #7137
     if (isSlashCommand(trimmed)) {
       runCommand(trimmed);
+      saveDraft('');
     } else {
       if (!connected) return;
       // `//` is the documented escape for a literal leading slash (#7223);
       // strip one `/` so `//foo` is sent to the agent as `/foo`.
-      sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
+      sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed, pendingAttachments);
+      writeAttachments(() => []);
+      clearDraft();
     }
     setShowCommandHint(false);
     writeInput('');
-    clearDraft();
     if (inputRef.current) {
       inputRef.current.style.height = 'auto';
       inputRef.current.focus();
@@ -347,8 +358,8 @@ export function AgentChatInner({
   };
 
   // ── Image upload (picker + drag-and-drop) ──────────────────────────────
-  // Both gestures funnel into one helper: upload each file, then append the
-  // returned [IMAGE:<path>] marker to the draft so the user can add context
+  // Both gestures upload files and retain their typed references alongside the draft.
+  // The user can add context
   // before sending. The gateway sniffs the payload by magic bytes; the
   // client-side type filter only spares an obviously wrong file the round
   // trip. Failures surface as chat-local messages (same channel as unknown
@@ -363,6 +374,7 @@ export function AgentChatInner({
   const uploadImages = useCallback(async (files: Iterable<File>) => {
     const list = Array.from(files);
     if (list.length === 0) return;
+    const uploadConversation = draftKey;
     setUploading(true);
     try {
       for (const file of list) {
@@ -372,8 +384,9 @@ export function AgentChatInner({
         }
         try {
           const res = await uploadChatImage(agentAlias, file);
-          applyInput((prev) => `${prev && !prev.endsWith(' ') ? `${prev} ` : prev}${res.marker} `);
+          writeAttachments((previous) => [...previous, res.attachment]);
         } catch (err) {
+          if (conversationKeyRef.current !== uploadConversation) return;
           const message = err instanceof ApiError
             ? err.envelope.message
             : err instanceof Error ? err.message : String(err);
@@ -384,7 +397,7 @@ export function AgentChatInner({
       setUploading(false);
       inputRef.current?.focus();
     }
-  }, [agentAlias, addLocalMessage, applyInput]);
+  }, [agentAlias, addLocalMessage, draftKey, writeAttachments]);
 
   const dragHasFiles = (e: React.DragEvent) => e.dataTransfer.types.includes('Files');
 
@@ -759,6 +772,18 @@ export function AgentChatInner({
             </div>
           </div>
         )}
+        {pendingAttachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 max-w-4xl mx-auto mb-2">
+            {pendingAttachments.map((attachment, index) => (
+              <button key={`${attachment.target}-${index}`} type="button"
+                className="text-xs border rounded px-2 py-1"
+                aria-label={t('common.delete')}
+                onClick={() => writeAttachments((previous) => previous.filter((_, i) => i !== index))}>
+                {attachment.target.split(/[\\/]/).pop()} ×
+              </button>
+            ))}
+          </div>
+        )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
           <input
             ref={fileInputRef}
@@ -820,7 +845,7 @@ export function AgentChatInner({
               variant="primary"
               size="md"
               onClick={handleSend}
-              disabled={!connected || !hydrated || !input.trim()}
+              disabled={!connected || !hydrated || uploading || (!input.trim() && pendingAttachments.length === 0)}
               className="flex-shrink-0 w-10 px-0"
               aria-label={t('agent.send')}
             >
@@ -943,6 +968,14 @@ const MessageItem = memo(function MessageItem({
           ) : (
             <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{cleanContent}</p>
           )}
+          {msg.attachments?.map((attachment, index) => (
+            <p key={index} className="text-xs mt-1 break-all text-pc-text-muted">
+              {attachment.kind}: {attachment.target.startsWith('data:') ? attachment.target.slice(5, attachment.target.indexOf(';')) : attachment.target.split(/[\\/]/).pop()}
+            </p>
+          ))}
+          {msg.fileIds?.map((fileId) => (
+            <p key={fileId} className="text-xs mt-1 break-all text-pc-text-muted">{fileId}</p>
+          ))}
           {!compact && (
             <p className="text-[10px] mt-1.5 text-pc-text-faint">
               {msg.timestamp.toLocaleTimeString()}

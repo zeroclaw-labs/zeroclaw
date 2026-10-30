@@ -6,38 +6,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::media::{
-    MarkerKind, PROVIDER_IMAGE_MIME_TYPES, RenderedMarker, image_mime_from_extension,
+    AttachmentKind, AttachmentReference, PROVIDER_IMAGE_MIME_TYPES, image_mime_from_extension,
     image_mime_from_magic, is_provider_image_mime,
 };
 use zeroclaw_api::model_provider::ChatMessage;
-use zeroclaw_api::tool_carrier::{
-    CarrierKind, CarrierParts, classify, image_refs, is_tool_result_carrier, rebuild_carrier,
-    render_prompt_tool_carrier,
-};
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
-
-pub const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-
-/// Maximum byte length for a single image marker candidate, enforced before any
-/// allocation or owned copy is made.
-///
-/// This is a hard sanity guard enforced in `parse_image_markers` before
-/// `collapse_wrapped_marker` or any other owned-copy operation runs. A marker
-/// candidate whose UTF-8 byte length exceeds this ceiling is classified from
-/// a bounded prefix. Image-shaped spans are replaced with a fixed refusal note,
-/// while ordinary placeholder/prose markers remain verbatim. The oversized
-/// image body never reaches downstream validation or normalization.
-///
-/// The ceiling is deliberately set well above any legitimate configured
-/// `max_image_size_mb` (which clamps at 20 MiB decoded → ~27 MB base64 encoded)
-/// to avoid false rejections while still bounding parser-internal allocations
-/// against pathological input.
-/// Hard sanity ceiling on a single `[IMAGE:...]` marker span. Well above any
-/// legitimate configured `max_image_size_mb` (clamped at 20 MiB decoded),
-/// yet small enough that a pathological marker cannot dominate memory before
-/// a ceiling refuses it. `pub(crate)` so the Anthropic adapter's regressions
-/// can pin tool-result behavior against the same bound.
-pub(crate) const MAX_IMAGE_MARKER_BYTES: usize = 50 * 1024 * 1024; // 50 MiB
 
 /// Bounds for the content-validation decode in
 /// [`validate_image_content_with_projection`].
@@ -67,7 +40,7 @@ const BASE64_LENGTH_SLACK_BYTES: usize = 64;
 /// cover the `data:` scheme prefix, the MIME type, the `;base64` parameter,
 /// the `,` separator, and any insignificant whitespace before the payload.
 /// Together with [`BASE64_LENGTH_SLACK_BYTES`] this keeps the entry-point check
-/// generous enough to never reject a valid marker while still bounding the
+/// generous enough to never reject a valid data URI while still bounding the
 /// source string before any allocation proportional to it occurs.
 const DATA_URI_HEADER_SLACK_BYTES: usize = 256;
 
@@ -92,12 +65,6 @@ tokio::task_local! {
     /// ceiling must fire before this is incremented; if it does not, any
     /// oversized input would arrive here and be charged to this counter.
     static BASE64_DECODE_CALLS: std::sync::atomic::AtomicUsize;
-    /// Counts candidate bytes the parser took ownership of (one add per
-    /// collected `refs` entry). Counting and selection passes must run without
-    /// owning candidate bodies — only the chosen set may materialize — so a
-    /// production-path test can observe this counter to prove no pass before
-    /// the cap decision collected attacker-sized spans.
-    static CANDIDATE_OWNERSHIP_BYTES: std::sync::atomic::AtomicUsize;
 }
 
 /// Records one decode against the ambient counter, if a test installed one.
@@ -113,15 +80,6 @@ fn record_decode_call() {
 fn record_base64_decode_call() {
     let _ = BASE64_DECODE_CALLS.try_with(|calls| {
         calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    });
-}
-
-/// Records `bytes` of candidate ownership against the ambient counter, if a
-/// test installed one.
-#[cfg(test)]
-fn record_candidate_ownership(bytes: usize) {
-    let _ = CANDIDATE_OWNERSHIP_BYTES.try_with(|owned| {
-        owned.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     });
 }
 
@@ -269,8 +227,8 @@ pub enum MultimodalError {
     #[error("multimodal image source not found or unreadable: '{input}'")]
     ImageSourceNotFound { input: String },
 
-    #[error("invalid multimodal image marker '{input}': {reason}")]
-    InvalidMarker { input: String, reason: String },
+    #[error("invalid multimodal image reference '{input}': {reason}")]
+    InvalidReference { input: String, reason: String },
 
     #[error("failed to download remote image '{input}': {reason}")]
     RemoteFetchFailed { input: String, reason: String },
@@ -453,612 +411,117 @@ fn is_standard_base64_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
 }
 
-fn is_loadable_image_reference(candidate: &str) -> bool {
-    candidate.starts_with('/')
-        || candidate.starts_with("http://")
-        || candidate.starts_with("https://")
-        || candidate.starts_with("data:")
-        || is_windows_path(candidate)
-        || is_windows_unc_path(candidate)
-}
-
-const REJECTED_IMAGE_MARKER_NOTE: &str = "[image omitted: image marker exceeds safety limit]";
-
-/// Outcome of classifying a marker span from its bounded collapsed prefix.
-enum MarkerSpanClass {
-    /// A loadable reference shape, decided within the prefix.
-    Loadable,
-    /// Ordinary prose — placeholder markers, relative paths, free text.
-    Prose,
-    /// Image-shaped but not decidable within the prefix: a UNC span whose
-    /// server component pushes the share separator past the prefix limit.
-    /// Only UNC can land here — every other shape is decided by its first
-    /// few bytes. Treated as a rejected reference, never as prose: the
-    /// alternative would forward an attacker-sized image-shaped span
-    /// verbatim into provider-visible text.
-    Undecidable,
-}
-
-/// Classify a marker span without owning its attacker-sized body.
-///
-/// The regular parser collapses line wrapping and trims the collapsed
-/// candidate before classifying it, so the bounded prefix here must follow
-/// the same rules: leading whitespace never consumes prefix budget (it would
-/// be trimmed away by the full check anyway, and a span padded past the limit
-/// would otherwise classify as prose and be forwarded verbatim), and
-/// whitespace after a newline is collapsed. Every supported absolute
-/// reference shape is then identifiable from this bounded prefix. The limit
-/// covers the longest classification decision any legal reference needs — a
-/// UNC path `\\<253-byte DNS hostname>\<share>` requires 257 bytes to decide,
-/// so the prefix is sized with margin rather than exactly.
-///
-/// A span that starts as a UNC reference but is still undecided when the
-/// prefix runs out returns [`MarkerSpanClass::Undecidable`] — the full span
-/// might be a legal reference (the share separator sits past the limit) or
-/// might have no share at all (prose). Deciding it either way would need the
-/// whole span, so the caller refuses it: classifying an image-shaped span as
-/// prose forwards its raw body into provider-visible text, while refusing it
-/// only drops an image no legal configuration could have produced (a server
-/// name beyond any hostname limit).
-fn marker_span_class(raw: &str) -> MarkerSpanClass {
-    const PREFIX_LIMIT: usize = 512;
-
-    let mut prefix = String::with_capacity(PREFIX_LIMIT);
-    let mut skip_ws = false;
-    let mut truncated = false;
-    for ch in raw.chars() {
-        if ch == '\n' || ch == '\r' {
-            skip_ws = true;
-            continue;
-        }
-        if skip_ws {
-            if ch.is_whitespace() {
-                continue;
-            }
-            skip_ws = false;
-        }
-        // Leading whitespace is free: the full check trims the collapsed
-        // candidate, so a span padded past the prefix limit still has to
-        // classify by what follows the padding, not by the padding itself.
-        if prefix.is_empty() && ch.is_whitespace() {
-            continue;
-        }
-        if prefix.len().saturating_add(ch.len_utf8()) > PREFIX_LIMIT {
-            truncated = true;
-            break;
-        }
-        prefix.push(ch);
-    }
-
-    let trimmed = prefix.trim();
-    if is_loadable_image_reference(trimmed) {
-        return MarkerSpanClass::Loadable;
-    }
-    if truncated && trimmed.starts_with(r"\\") {
-        return MarkerSpanClass::Undecidable;
-    }
-    MarkerSpanClass::Prose
-}
-
-/// Returns true for Windows-style absolute paths like `C:\…` or `D:/…`.
-fn is_windows_path(candidate: &str) -> bool {
-    let mut chars = candidate.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphabetic() {
-        return false;
-    }
-    let Some(second) = chars.next() else {
-        return false;
-    };
-    if second != ':' {
-        return false;
-    }
-    matches!(chars.next(), Some('\\') | Some('/'))
-}
-
-fn is_windows_unc_path(candidate: &str) -> bool {
-    let Some(rest) = candidate.strip_prefix(r"\\") else {
-        return false;
-    };
-    if rest.starts_with('?') || rest.starts_with('.') {
-        return false;
-    }
-    let mut parts = rest.splitn(2, ['\\', '/']);
-    let server = parts.next().unwrap_or("");
-    let share = parts.next().unwrap_or("");
-    !server.is_empty() && !share.is_empty()
-}
-
-fn collapse_wrapped_marker(raw: &str) -> Cow<'_, str> {
-    if !raw.contains('\n') && !raw.contains('\r') {
-        return Cow::Borrowed(raw.trim());
-    }
-    let mut out = String::with_capacity(raw.len());
-    let mut skip_ws = false;
-    for ch in raw.chars() {
-        if ch == '\n' || ch == '\r' {
-            skip_ws = true;
-            continue;
-        }
-        if skip_ws {
-            if ch.is_whitespace() {
-                continue;
-            }
-            skip_ws = false;
-        }
-        out.push(ch);
-    }
-    Cow::Owned(trim_string_in_place(out))
-}
-
-fn trim_string_in_place(mut value: String) -> String {
-    let start = value.len() - value.trim_start().len();
-    let end = value.trim_end().len();
-    let start = start.min(end);
-    value.truncate(end);
-    if start > 0 {
-        value.drain(..start);
-    }
-    value
-}
-
-/// True when `content` holds an image marker, terminated or not.
-///
-/// This is how a provider adapter tells *residue of this crate's own marker
-/// normalization* from a data URI the author wrote deliberately. An
-/// Bounded unterminated markers are copied through by
-/// [`parse_image_markers`] verbatim, prefix included, so the prefix is present
-/// in both the input and cleaned output whenever residue is possible. An
-/// over-ceiling unterminated marker is replaced by a fixed note instead.
-pub(crate) fn carries_image_marker(content: &str) -> bool {
-    content.contains(IMAGE_MARKER_PREFIX)
-}
-
-#[derive(Default)]
-struct ParsedImageMarkers {
-    cleaned: String,
-    refs: Vec<String>,
-    loadable_count: usize,
-    rejected_count: usize,
-    /// Bytes retained as text before the cleaned output's outer trim.
-    text_bytes: usize,
-    /// Byte offsets `(marker_start, end)` of each under-ceiling loadable
-    /// marker, in document order. Positions into the borrowed input, not
-    /// owned bodies — they let a caller select a subset of the loadable set
-    /// (the per-image cap trim keeps the newest `k`) without the parser
-    /// having materialized any of them.
-    loadable_spans: Vec<(usize, usize)>,
-}
-
-/// What a [`parse_image_markers_inner`] call may own.
-///
-/// Classification always runs on borrowed spans, so the counting passes in
-/// [`ParseMode::Scan`] never materialize candidate bodies — a message full of
-/// large-but-under-ceiling markers cannot allocate through a count, no matter
-/// how many counting rounds run before the cap is applied. Callers that only
-/// rewrite text (stale-history stripping, age trimming) use
-/// [`ParseMode::RewriteOnly`] for the same reason: the rewritten text carries
-/// no attacker-sized copies either. Only normalization, which must hand the
-/// reference downstream, collects candidates — and by then the cap has
-/// already chosen the surviving set.
-enum ParseMode {
-    /// Count loadable and rejected markers. Builds no text and owns no
-    /// candidate bodies — it records only borrowed span offsets.
-    Scan,
-    /// Rewrite the text — loadable markers removed, over-ceiling markers
-    /// replaced — but collect no candidate bodies.
-    RewriteOnly,
-    /// Rewrite the text and collect the loadable candidate bodies for
-    /// normalization.
-    RewriteAndCollect,
-}
-
-fn retain_marker_text(
-    cleaned: &mut String,
-    materialize: bool,
-    text_bytes: &mut usize,
-    retained_ends_with_whitespace: &mut Option<bool>,
-    text: &str,
-) {
-    if text.is_empty() {
-        return;
-    }
-    if materialize {
-        cleaned.push_str(text);
-    }
-    *text_bytes += text.len();
-    *retained_ends_with_whitespace = text.chars().last().map(char::is_whitespace);
-}
-
-fn push_rejected_image_marker(
-    cleaned: &mut String,
-    materialize: bool,
-    text_bytes: &mut usize,
-    retained_ends_with_whitespace: &mut Option<bool>,
-) {
-    if matches!(retained_ends_with_whitespace, Some(false)) {
-        if materialize {
-            cleaned.push(' ');
-        }
-        *text_bytes += 1;
-    }
-    if materialize {
-        cleaned.push_str(REJECTED_IMAGE_MARKER_NOTE);
-    }
-    *text_bytes += REJECTED_IMAGE_MARKER_NOTE.len();
-    *retained_ends_with_whitespace = Some(false);
-}
-
-fn parse_image_markers_inner(content: &str, mode: ParseMode) -> ParsedImageMarkers {
-    let materialize = !matches!(mode, ParseMode::Scan);
-    let collect_refs = matches!(mode, ParseMode::RewriteAndCollect);
-    let mut refs = Vec::new();
-    // Do not reserve from the complete untrusted message. A rejected marker
-    // can dominate `content.len()`, while the retained output is only the
-    // surrounding prose plus a fixed sentinel.
-    let mut cleaned = String::new();
-    let mut loadable_count = 0usize;
-    let mut rejected_count = 0usize;
-    let mut text_bytes = 0usize;
-    let mut retained_ends_with_whitespace = None;
-    let mut loadable_spans: Vec<(usize, usize)> = Vec::new();
-    let mut cursor = 0usize;
-
-    while let Some(rel_start) = content[cursor..].find(IMAGE_MARKER_PREFIX) {
-        let start = cursor + rel_start;
-        retain_marker_text(
-            &mut cleaned,
-            materialize,
-            &mut text_bytes,
-            &mut retained_ends_with_whitespace,
-            &content[cursor..start],
-        );
-
-        let marker_start = start + IMAGE_MARKER_PREFIX.len();
-        let Some(rel_end) = content[marker_start..].find(']') else {
-            let marker_len = content.len() - marker_start;
-            if marker_len > MAX_IMAGE_MARKER_BYTES {
-                rejected_count += 1;
-                push_rejected_image_marker(
-                    &mut cleaned,
-                    materialize,
-                    &mut text_bytes,
-                    &mut retained_ends_with_whitespace,
-                );
-            } else {
-                retain_marker_text(
-                    &mut cleaned,
-                    materialize,
-                    &mut text_bytes,
-                    &mut retained_ends_with_whitespace,
-                    &content[start..],
-                );
-            }
-            cursor = content.len();
-            break;
-        };
-
-        let end = marker_start + rel_end;
-
-        // Bound the candidate span before it is copied.
-        //
-        // `collapse_wrapped_marker` owns the span (twice, for a line-wrapped
-        // marker: a build buffer plus the trimmed result), and every downstream
-        // ceiling — the data-URI source check, the base64 encoded check, the
-        // decoded-size check — runs on that owned copy. A pathological marker
-        // would therefore be materialized several times over before anything
-        // rejected it. Checking the borrowed span here keeps the parser's own
-        // allocations bounded regardless of what the caller does later.
-        //
-        // A syntactically loadable over-ceiling reference is rejected here and
-        // replaced with fixed text, and so is an undecidable image-shaped one
-        // — preserving either verbatim would forward an attacker-sized body
-        // as provider-visible prose. Placeholder/prose markers retain their
-        // historical literal treatment.
-        if end - marker_start > MAX_IMAGE_MARKER_BYTES {
-            match marker_span_class(&content[marker_start..end]) {
-                MarkerSpanClass::Prose => {
-                    retain_marker_text(
-                        &mut cleaned,
-                        materialize,
-                        &mut text_bytes,
-                        &mut retained_ends_with_whitespace,
-                        &content[start..=end],
-                    );
-                }
-                MarkerSpanClass::Loadable | MarkerSpanClass::Undecidable => {
-                    rejected_count += 1;
-                    push_rejected_image_marker(
-                        &mut cleaned,
-                        materialize,
-                        &mut text_bytes,
-                        &mut retained_ends_with_whitespace,
-                    );
-                }
-            }
-            cursor = end + 1;
-            continue;
-        }
-
-        // Classify on the borrowed span here as well — the same boundary the
-        // over-ceiling check above relies on — so counting and rewriting
-        // never pay for a candidate the cap might not keep. `refs` receives
-        // the collapsed body only when the caller will actually normalize it;
-        // because both decisions share one classifier, a count can never
-        // disagree with the later selection over the same span. An
-        // undecidable image-shaped span is refused with the same fixed note
-        // rather than preserved verbatim: its body is attacker-controlled
-        // text wearing an image marker's shape.
-        match marker_span_class(&content[marker_start..end]) {
-            MarkerSpanClass::Prose => {
-                // Preserve the original marker text (placeholders like
-                // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
-                // rather than triggering a loader error).
-                retain_marker_text(
-                    &mut cleaned,
-                    materialize,
-                    &mut text_bytes,
-                    &mut retained_ends_with_whitespace,
-                    &content[start..=end],
-                );
-            }
-            MarkerSpanClass::Undecidable => {
-                rejected_count += 1;
-                push_rejected_image_marker(
-                    &mut cleaned,
-                    materialize,
-                    &mut text_bytes,
-                    &mut retained_ends_with_whitespace,
-                );
-            }
-            MarkerSpanClass::Loadable => {
-                loadable_count += 1;
-                loadable_spans.push((marker_start, end));
-                if collect_refs {
-                    let candidate = collapse_wrapped_marker(&content[marker_start..end]);
-                    #[cfg(test)]
-                    record_candidate_ownership(candidate.len());
-                    refs.push(candidate.into_owned());
-                }
-            }
-        }
-
-        cursor = end + 1;
-    }
-
-    if cursor < content.len() {
-        retain_marker_text(
-            &mut cleaned,
-            materialize,
-            &mut text_bytes,
-            &mut retained_ends_with_whitespace,
-            &content[cursor..],
-        );
-    }
-
-    ParsedImageMarkers {
-        cleaned: if materialize {
-            trim_string_in_place(cleaned)
-        } else {
-            String::new()
-        },
-        refs,
-        loadable_count,
-        rejected_count,
-        text_bytes,
-        loadable_spans,
-    }
-}
-
-pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
-    let parsed = parse_image_markers_inner(content, ParseMode::RewriteAndCollect);
-    (parsed.cleaned, parsed.refs)
-}
-
-/// Byte count of the non-marker text and the number of loadable references,
-/// computed by the same scanner as `parse_image_markers` without building
-/// the cleaned string or copying references. This is the text-level
-/// primitive: it sees a content string, not a message, so it must never be
-/// pointed at a tool-result carrier, whose images are its declared
-/// attachments rather than marker syntax in its body. Message-level callers
-/// go through [`message_image_summary`], which dispatches on carrier shape
-/// and falls back to this scan for ordinary text.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ImageMarkerSummary {
+/// Text and image cost are computed from explicit fields. Text is never parsed.
+#[derive(Debug, Clone, Copy)]
+pub struct AttachmentSummary {
     pub text_bytes: usize,
     pub image_refs: usize,
 }
 
-pub fn image_marker_summary(content: &str) -> ImageMarkerSummary {
-    let parsed = parse_image_markers_inner(content, ParseMode::Scan);
-    ImageMarkerSummary {
-        text_bytes: parsed.text_bytes,
-        image_refs: parsed.loadable_count,
+pub fn message_image_summary(message: &ChatMessage) -> AttachmentSummary {
+    AttachmentSummary {
+        text_bytes: message.context_text_bytes(),
+        image_refs: count_message_images(message),
     }
 }
 
-/// Byte count of the text a message contributes and the number of images it
-/// contributes, following preparation. A tool-result carrier counts its
-/// declared IMAGE attachments and is never body-scanned, so marker syntax
-/// quoted in a carrier body is text, and a legacy carrier (nothing declared
-/// at the fixed position) contributes no images at all. A carrier's
-/// `text_bytes` is its retained body length: the envelope's `content` string
-/// for a native carrier, and the carrier text with its image attachment
-/// lines lifted (non-image lines retained) for a prompt carrier. That is
-/// what a current-turn dispatch delivers; a stale carrier is priced as its
-/// bytes by the estimator instead (see `ImageMarkerDisposition::Stripped`).
-/// Every other message falls back to the text-level [`image_marker_summary`]
-/// scan of its content.
-pub fn message_image_summary(message: &ChatMessage) -> ImageMarkerSummary {
-    let Some(parts) = classify(&message.role, &message.content) else {
-        return image_marker_summary(&message.content);
-    };
-    if !parts.declared {
-        // Legacy carrier, raw tool text included: the fixed position
-        // declared nothing, so no image is promoted; the body is delivered
-        // as text, markers included.
-        return ImageMarkerSummary {
-            text_bytes: parts.text.len(),
-            image_refs: 0,
-        };
+pub fn message_image_refs(message: &ChatMessage) -> Vec<String> {
+    message
+        .attachments
+        .iter()
+        .filter(|attachment| attachment.kind == AttachmentKind::Image)
+        .map(|attachment| attachment.target.clone())
+        .collect()
+}
+
+/// Final wire projection for attachment kinds without native blocks in these
+/// adapters. The canonical messages retain their typed references; only this
+/// temporary request view describes a file to the model. Image payloads always
+/// use native image blocks, and body text is never parsed as metadata.
+pub(crate) fn project_attachment_metadata(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
+    if !messages.iter().any(|message| {
+        message
+            .attachments
+            .iter()
+            .any(|attachment| attachment.kind != AttachmentKind::Image)
+    }) {
+        return Cow::Borrowed(messages);
     }
-    let image_ref_count = image_refs(&parts).len();
-    match parts.kind {
-        CarrierKind::Native => ImageMarkerSummary {
-            text_bytes: parts.text.len(),
-            image_refs: image_ref_count,
-        },
-        CarrierKind::Prompt => {
-            // The user arm's delivered text: image attachment lines lift out
-            // as image parts, non-image lines stay, and the count header
-            // re-renders with the retained attachments.
-            let retained: Vec<RenderedMarker> = parts
+    let mut projected = messages.to_vec();
+    for message in &mut projected {
+        let descriptions: Vec<String> = message
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.kind != AttachmentKind::Image)
+            .map(|attachment| {
+                let kind = match attachment.kind {
+                    AttachmentKind::Audio => "audio",
+                    AttachmentKind::Video => "video",
+                    AttachmentKind::Document => "document",
+                    AttachmentKind::Image => "image",
+                };
+                if attachment.target.starts_with("data:") {
+                    format!("Attached {kind}: inline data")
+                } else {
+                    format!("Attached {kind}: {}", attachment.target)
+                }
+            })
+            .collect();
+        if !descriptions.is_empty() {
+            message.append_note(&descriptions.join("\n"));
+            message
                 .attachments
-                .iter()
-                .filter(|marker| marker.kind != MarkerKind::Image)
-                .cloned()
-                .collect();
-            ImageMarkerSummary {
-                text_bytes: render_prompt_tool_carrier(&parts.text, &retained).len(),
-                image_refs: image_ref_count,
-            }
+                .retain(|attachment| attachment.kind == AttachmentKind::Image);
         }
     }
+    Cow::Owned(projected)
 }
 
-pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
-    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
-    count_image_markers_with_current_turn_tool_results(messages, &current_turn_tool_indices)
+fn count_message_images(message: &ChatMessage) -> usize {
+    message
+        .attachments
+        .iter()
+        .filter(|attachment| attachment.kind == AttachmentKind::Image)
+        .count()
 }
 
-/// One non-owning pass over the messages the provider would normalize,
-/// returning `(loadable, rejected)` marker counts.
-///
-/// Both counts feed the fast-path decision at the top of
-/// [`prepare_messages_inner`], so they are collected together: two separate
-/// counting rounds would double the parse work on every request for no
-/// benefit. Per message the pair comes from
-/// [`message_image_marker_counts`], the counting twin of
-/// [`count_message_images`]: a carrier counts its declared attachments and
-/// never parses its body, and only a non-carrier message reports the
-/// scanner's rejected count for its text.
-fn scan_image_marker_counts_with_current_turn_tool_results(
-    messages: &[ChatMessage],
-    current_turn_tool_result_indices: &HashSet<usize>,
-) -> (usize, usize) {
+pub fn count_image_attachments(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
-        .enumerate()
-        .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, current_turn_tool_result_indices)
-        })
-        .map(|(_, message)| message_image_marker_counts(message))
-        .fold(
-            (0, 0),
-            |(loadable, rejected), (more_loadable, more_rejected)| {
-                (loadable + more_loadable, rejected + more_rejected)
-            },
-        )
-}
-
-fn count_image_markers_with_current_turn_tool_results(
-    messages: &[ChatMessage],
-    current_turn_tool_result_indices: &HashSet<usize>,
-) -> usize {
-    scan_image_marker_counts_with_current_turn_tool_results(
-        messages,
-        current_turn_tool_result_indices,
-    )
-    .0
-}
-
-pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
-    count_image_markers(messages) > 0
-}
-
-pub fn count_user_image_markers(messages: &[ChatMessage]) -> usize {
-    messages
-        .iter()
-        .filter(|message| {
-            message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
-        })
-        .map(|message| parse_image_markers_inner(&message.content, ParseMode::Scan).loadable_count)
+        .zip(attachment_dispositions(messages))
+        .filter(|(_, disposition)| *disposition == AttachmentDisposition::Normalized)
+        .map(|(message, _)| count_message_images(message))
         .sum()
 }
 
-pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
+pub fn contains_image_attachments(messages: &[ChatMessage]) -> bool {
+    count_image_attachments(messages) > 0
+}
+
+pub fn count_user_image_attachments(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .map(count_message_images)
+        .sum()
+}
+
+pub fn count_latest_user_image_attachments(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
         .rev()
-        .find(|message| {
-            message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
-        })
-        .map(|message| parse_image_markers_inner(&message.content, ParseMode::Scan).loadable_count)
+        .find(|message| message.role == "user")
+        .map(count_message_images)
         .unwrap_or(0)
 }
 
-/// Count image markers in the latest user message whose references would
-/// actually resolve to an attachment: an inline `data:` URI that passes the
-/// shared structural check, a remote `http(s)` URL when `remote_allowed` is
-/// set (counted without any network access), or a local path that the
-/// caller's `path_allowed` predicate accepts and that exists as a file.
-/// Marker syntax alone does not count, so prose that merely looks
-/// like a marker cannot fail a turn on a text-only model.
-///
-/// A local reference counts only when it is absolute AND `path_allowed`
-/// accepts it. Relative references never count: this module has no agent
-/// workspace of its own, and a bare existence check would resolve a relative
-/// reference against the process working directory instead, which is not
-/// where the runtime's file tools resolve relative paths, so there is no
-/// answer this module could give that matches the loader. The predicate
-/// exists because the ledger of who may read a path is the agent's
-/// filesystem policy in the runtime, which this crate cannot depend on;
-/// callers pass the same check their file tools apply, so "resolvable" means
-/// exactly "the agent could read this file".
-///
-/// This touches at most the markers of the latest user message. The
-/// classification pass over them is inline and I/O-free: a `data:`
-/// reference needs only the shared structural check, a remote URL only
-/// the `remote_allowed` flag, a relative reference never counts, and an
-/// absolute reference only appends to a candidate list. For at most
-/// [`MAX_RESOLVABILITY_CANDIDATES`] absolute candidates the caller's
-/// `path_allowed` predicate and one `std::fs::metadata` existence
-/// probe each run inside a single `tokio::task::spawn_blocking` task,
-/// so no policy-resolution or filesystem work runs on the async
-/// executor thread (a predicate may do arbitrary synchronous
-/// filesystem work; the runtime's resolves symlinks). A path the
-/// predicate rejects is never probed, and neither is a relative
-/// reference, a data URI, or a remote URL. It does no network I/O and
-/// no decoding.
-///
-/// The maximum number of absolute local-path markers in the latest user
-/// message for which ANY work runs, policy resolution and the existence
-/// probe alike: at most this many candidates reach the one
-/// [`tokio::task::spawn_blocking`] task inside
-/// [`count_latest_user_resolvable_image_markers`]. Absolute markers past
-/// the bound count as resolvable with NO policy call and NO probe, so the
-/// caller fails toward its loud capability error, never toward silently
-/// degrading away a real attachment (over budget the count can only
-/// grow). The bound sits BEFORE the policy check, so a message cannot buy
-/// unbounded policy work with unbounded markers; this is a semantic
-/// change from the earlier probe-budget shape, which still ran the policy
-/// for overflow markers. The bound exists because no upstream limit bounds
-/// the marker count of a single inbound user message (transport frame
-/// caps operate at megabytes, not markers). `parse_image_markers` remains
-/// the single source of truth for what a marker reference is, and
-/// `split_base64_image_data_uri` for what a valid inline data URI is.
 pub const MAX_RESOLVABILITY_CANDIDATES: usize = 16;
-
-pub async fn count_latest_user_resolvable_image_markers(
+pub async fn count_latest_user_resolvable_image_attachments(
     messages: &[ChatMessage],
     remote_allowed: bool,
     path_allowed: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
 ) -> usize {
-    let Some(message) = messages.iter().rev().find(|message| {
-        message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
-    }) else {
+    let Some(message) = messages.iter().rev().find(|message| message.role == "user") else {
         return 0;
     };
     // Inline, I/O-free classification: `inline` counts references that
@@ -1067,7 +530,7 @@ pub async fn count_latest_user_resolvable_image_markers(
     let mut inline = 0;
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut overflow = 0;
-    for reference in parse_image_markers(&message.content).1 {
+    for reference in message_image_refs(message) {
         if reference.starts_with("data:") {
             if split_base64_image_data_uri(&reference, MAX_ENCODED_IMAGE_PAYLOAD_BYTES).is_ok() {
                 inline += 1;
@@ -1078,12 +541,12 @@ pub async fn count_latest_user_resolvable_image_markers(
             }
         } else if !Path::new(&reference).is_absolute() {
             // Relative references never count: see the doc comment on
-            // `count_latest_user_resolvable_image_markers`.
+            // `count_latest_user_resolvable_image_attachments`.
         } else if candidates.len() < MAX_RESOLVABILITY_CANDIDATES {
             candidates.push(PathBuf::from(reference));
         } else {
             // Over the candidate bound: no policy call, no probe, and
-            // the marker counts as resolvable, so the caller fails
+            // the reference counts as resolvable, so the caller fails
             // toward the loud capability error, never toward silently
             // stripping an attachment that may be real.
             overflow += 1;
@@ -1093,7 +556,7 @@ pub async fn count_latest_user_resolvable_image_markers(
         return inline + overflow;
     }
     let candidate_count = candidates.len();
-    // ONE blocking task per gate evaluation, not one per marker: the
+    // ONE blocking task per gate evaluation, not one per attachment: the
     // predicate and the existence probe do synchronous filesystem work
     // and must stay off the async executor thread. The `Arc` signature
     // exists because `spawn_blocking` needs `'static`.
@@ -1114,468 +577,19 @@ pub async fn count_latest_user_resolvable_image_markers(
     inline + probed + overflow
 }
 
-/// Media-marker kinds this module recognizes. `IMAGE` is the only kind
-/// resolved into provider content parts; [`AUDIO_MARKER_KINDS`] is the strict
-/// subset degraded when a loadable payload would otherwise reach the model as
-/// literal text. Both marker regexes below derive their kind alternation from
-/// these consts so the strip-all and strip-audio paths cannot drift apart on
-/// which kinds exist. The channel grammar (`ATTACHMENT_KINDS` in
-/// `crates/zeroclaw-channels/src/util.rs`) recognizes these same kinds plus
-/// `LOCATION`, which carries coordinates rather than a file reference and has
-/// no provider-side handling; the two lists live in different crates
-/// deliberately (providers cannot depend on channels).
-const MEDIA_MARKER_KINDS: &[&str] = &[
-    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "VOICE", "AUDIO",
-];
-
-/// Marker kinds whose loadable payload must not stay model-visible. No
-/// provider resolves audio into content parts, and an audio path is not
-/// otherwise actionable by the model: asked what it hears, a model handed a
-/// bare path tends to fabricate having played the file. Every other kind in
-/// [`MEDIA_MARKER_KINDS`] keeps its payload — `IMAGE` is resolved for vision
-/// downstream, and `PHOTO`/`DOCUMENT`/`FILE`/`VIDEO` paths stay actionable
-/// (file tools read them, and the channel delivery contract has the model
-/// copy them into outbound reply markers), so stripping those would break
-/// document and file delivery.
-const AUDIO_MARKER_KINDS: &[&str] = &["VOICE", "AUDIO"];
-
-/// Force-compile this module's lazy regexes on the caller's thread.
-///
-/// A cold `regex` compile descends through dozens of `regex_automata` NFA
-/// compiler frames; `strip_media_markers` and the audio-marker checks run
-/// deep inside turn processing, so the registry builder warms both here —
-/// on its own dedicated thread — before any turn stack exists.
-pub fn warm_lazy_regexes() {
-    // Force the fn-local media-marker regex by running one strip; the
-    // result is unused, only the initialization matters.
-    let _ = strip_media_markers("");
-    std::sync::LazyLock::force(&AUDIO_MARKER_RE);
-}
-
-/// Text a degraded media marker is replaced with before the history reaches
-/// a model that cannot consume the payload. The model may echo it verbatim
-/// into a reply, so it is plain prose rather than bracket syntax: it must
-/// never parse as an outbound delivery marker (`[KIND:target]`, which the
-/// channel parsers key on `[` and `:`), and it contains no JSON-special
-/// characters so a marker replaced inside a native tool-result blob leaves
-/// the surrounding object valid.
+/// Note used when the provider projection omits image attachments.
 pub const MEDIA_PLACEHOLDER: &str = "(media attachment omitted)";
 
-/// Degrade one message for a text-only route: a tool-result carrier loses
-/// exactly its declared attachments and keeps its body verbatim (legacy
-/// carriers included — a marker in tool body text is text, and rewriting it
-/// is the incident this contract exists to prevent); every other message has
-/// its media markers replaced with the placeholder as before, through the
-/// model-visible rewrite so signed envelope fields replay byte-for-byte.
-pub fn strip_message_media(message: &ChatMessage) -> ChatMessage {
-    if let Some(parts) = classify(&message.role, &message.content) {
-        if parts.declared {
-            let emptied: Vec<RenderedMarker> = Vec::new();
-            return ChatMessage {
-                role: message.role.clone(),
-                content: rebuild_carrier(&message.role, &message.content, &parts, &emptied),
-            };
-        }
-        // Legacy carrier: the body is text; nothing to degrade.
-        return message.clone();
+pub fn omit_image_attachments(message: &ChatMessage) -> ChatMessage {
+    let mut result = message.clone();
+    let original_count = result.attachments.len();
+    result
+        .attachments
+        .retain(|attachment| attachment.kind != AttachmentKind::Image);
+    if result.attachments.len() != original_count {
+        result.append_note(MEDIA_PLACEHOLDER);
     }
-    ChatMessage {
-        role: message.role.clone(),
-        content: strip_media_markers_model_visible(message),
-    }
-}
-
-pub fn strip_media_markers(text: &str) -> String {
-    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(&format!(
-            r"(?i)\[(?:{}):[^\]]*\]",
-            MEDIA_MARKER_KINDS.join("|")
-        ))
-        .expect("static media-marker regex must compile")
-    });
-    RE.replace_all(text, MEDIA_PLACEHOLDER).into_owned()
-}
-
-/// Matches the audio-kind markers ([`AUDIO_MARKER_KINDS`]), capturing the
-/// payload for the loadable-reference check.
-static AUDIO_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(&format!(
-        r"(?i)\[(?:{}):([^\]]*)\]",
-        AUDIO_MARKER_KINDS.join("|")
-    ))
-    .expect("static audio-marker regex must compile")
-});
-
-/// Replace audio markers (`[AUDIO:...]`, `[VOICE:...]`) whose payload is a
-/// *loadable* reference (absolute path, `http(s)://` URL, or `data:` URI) with
-/// the same [`MEDIA_PLACEHOLDER`] the degrade path uses, returning the
-/// rewritten text and the number of markers replaced.
-///
-/// Non-loadable payloads are left as literal text — placeholders (`[AUDIO:...]`),
-/// prose (`[AUDIO:<clip>]`), and the no-transcription note (`[Audio: attached]`)
-/// are harmless and must survive — mirroring how [`parse_image_markers`]
-/// preserves non-loadable `[IMAGE:...]` markers. Runs over the raw string so it
-/// also cleans a marker embedded in a native tool-result JSON blob
-/// (`{"content":"…[AUDIO:/clip.wav]…"}`); see [`MEDIA_PLACEHOLDER`] for why
-/// the surrounding object stays valid.
-fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
-    let mut stripped = 0usize;
-    let out = AUDIO_MARKER_RE.replace_all(text, |caps: &regex::Captures<'_>| {
-        let payload = collapse_wrapped_marker(&caps[1]);
-        if !payload.is_empty() && is_loadable_image_reference(&payload) {
-            stripped += 1;
-            MEDIA_PLACEHOLDER.to_string()
-        } else {
-            // Preserve placeholder/prose markers verbatim.
-            caps[0].to_string()
-        }
-    });
-    (out.into_owned(), stripped)
-}
-
-/// Apply `rewrite` to the model-visible text of one history message.
-///
-/// An assistant message in native tool-call history is the JSON envelope
-/// built by the runtime (`{"content": …, "tool_calls": […],
-/// "reasoning_content"?: …}`) and parsed back by the provider adapters.
-/// It counts as an envelope only when its `tool_calls` value deserializes
-/// as `Vec<ToolCall>` — the same predicate every provider adapter uses to
-/// decide that an assistant message is a tool-call envelope — so a blob
-/// the adapters would replay as plain text (absent, null, non-array, or
-/// malformed call list) is sanitized as plain text, failing closed to the
-/// whole-string rewrite instead of being protected field-wise.
-///
-/// Only its `content` string is rewritten: `reasoning_content` carries
-/// signed thinking blocks that must replay byte-for-byte, and
-/// `tool_calls[].extra_content` carries provider signatures. The envelope
-/// is re-serialized only when `content` actually changed, so an untouched
-/// envelope stays byte-identical. Every other message is rewritten as a
-/// whole string, which keeps a marker inside a native tool-result blob
-/// cleaned in place (see [`MEDIA_PLACEHOLDER`]).
-///
-/// The protected shape is the intersection every adapter treats as an
-/// envelope. The compatible adapter alone also recognizes a
-/// reasoning-without-calls envelope, but the Anthropic and OpenAI-family
-/// adapters would replay that blob as plain text, so protecting it here
-/// would leak its markers exactly the way a malformed call list does; it
-/// stays under the whole-string rule — a shape the current runtime writer
-/// never produces, since it stores plain text and drops reasoning when
-/// there are no calls.
-fn rewrite_model_visible_text(
-    message: &ChatMessage,
-    rewrite: impl Fn(&str) -> (String, usize),
-) -> (String, usize) {
-    let parsed_envelope = if message.role == "assistant" {
-        serde_json::from_str::<serde_json::Value>(&message.content).ok()
-    } else {
-        None
-    };
-    let Some(mut envelope) = parsed_envelope else {
-        return rewrite(&message.content);
-    };
-    if !envelope.get("tool_calls").is_some_and(|tool_calls| {
-        serde_json::from_value::<Vec<zeroclaw_api::model_provider::ToolCall>>(tool_calls.clone())
-            .is_ok()
-    }) {
-        return rewrite(&message.content);
-    }
-    let Some(content) = envelope.get("content").and_then(serde_json::Value::as_str) else {
-        // A null or absent `content` carries nothing model-visible to
-        // rewrite; the envelope must stay byte-identical.
-        return (message.content.clone(), 0);
-    };
-    let (rewritten, n) = rewrite(content);
-    if n == 0 {
-        // Nothing changed: hand back the original bytes, never a
-        // re-serialization whose key order or escaping could drift.
-        return (message.content.clone(), 0);
-    }
-    envelope["content"] = serde_json::Value::String(rewritten);
-    (envelope.to_string(), n)
-}
-
-/// Strip every media marker from the model-visible text of one message,
-/// for the text-only degrade path: all marker kinds, all roles.
-///
-/// Same contract as [`sanitize_image_markers`] and
-/// [`sanitize_audio_markers`], applied to a single message: an assistant
-/// tool-call envelope is rewritten field-wise (only its `content` string,
-/// through `rewrite_model_visible_text`) so signed `reasoning_content` and
-/// `tool_calls[].extra_content` replay byte-for-byte, and every other
-/// message is rewritten as a whole string. [`strip_media_markers`] stays
-/// the plain-string form for callers that hold text rather than a history
-/// message.
-pub fn strip_media_markers_model_visible(message: &ChatMessage) -> String {
-    rewrite_model_visible_text(message, |text| {
-        let out = strip_media_markers(text);
-        let n = usize::from(out != text);
-        (out, n)
-    })
-    .0
-}
-
-/// Strip loadable audio markers (see `strip_unplayable_audio_markers`)
-/// across every message in `messages`, logging one degradation warning when
-/// any are removed. Returns the input borrowed when no candidate marker is
-/// present (the common, allocation-free path) or an owned rebuilt vector
-/// otherwise.
-///
-/// Assistant messages in native tool-call history are rewritten field-wise —
-/// only their `content` string, through `rewrite_model_visible_text` — so
-/// signed reasoning inside the envelope survives the seam.
-///
-/// This is the shared seam keeping a raw audio path out of provider payloads,
-/// whichever route the history takes:
-/// - the main iteration prep ([`prepare_messages_for_provider`], via
-///   `prepare_messages_inner`), and
-/// - one-shot queries that dispatch history directly without full prep (the
-///   max-iteration graceful summary and the other `run_model_query` callers).
-///
-/// Non-audio media markers pass through untouched; see `AUDIO_MARKER_KINDS`
-/// for why the split falls where it does.
-///
-/// A DECLARED carrier never has its text regex-stripped: its audio
-/// attachments drop from the declared list (the count the strict parser
-/// checks stays consistent, so a mixed declaration cannot degrade to legacy
-/// and lose its images), and its body is verbatim. A LEGACY carrier is
-/// cloned unchanged — its body is text and no seam rewrites it. Ordinary
-/// messages keep the regex strip.
-pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
-    // The gate fires only for messages the pass below can change: an
-    // ordinary message carrying audio marker syntax, or a declared carrier
-    // whose attachment list names an audio kind. A legacy carrier is cloned
-    // unchanged, so it never fires the pass.
-    if !messages
-        .iter()
-        .any(|m| match classify(&m.role, &m.content) {
-            Some(parts) => {
-                parts.declared
-                    && parts
-                        .attachments
-                        .iter()
-                        .any(|marker| marker.kind == MarkerKind::Audio)
-            }
-            None => AUDIO_MARKER_RE.is_match(&m.content),
-        })
-    {
-        return Cow::Borrowed(messages);
-    }
-
-    let mut stripped = 0usize;
-    let rebuilt: Vec<ChatMessage> = messages
-        .iter()
-        .map(|m| {
-            // A declared carrier handles audio as metadata. Its marker lines
-            // are the declaration the strict parser counts: rewriting one
-            // with the regex broke the count, degraded the whole carrier to
-            // legacy, and lost every attachment it declared — image included.
-            // Audio attachments drop from the declared list instead; the
-            // body is never touched, so a body quoting audio syntax stays
-            // verbatim under the attachment-identity contract.
-            if let Some(parts) = classify(&m.role, &m.content) {
-                if !parts.declared {
-                    // A legacy carrier is delivered as its bytes: nothing
-                    // declared, nothing promoted, and no seam rewrites its
-                    // body.
-                    return m.clone();
-                }
-                let retained: Vec<RenderedMarker> = parts
-                    .attachments
-                    .iter()
-                    .filter(|marker| marker.kind != MarkerKind::Audio)
-                    .cloned()
-                    .collect();
-                if retained.len() != parts.attachments.len() {
-                    stripped += parts.attachments.len() - retained.len();
-                    return ChatMessage {
-                        role: m.role.clone(),
-                        content: rebuild_carrier(&m.role, &m.content, &parts, &retained),
-                    };
-                }
-                return m.clone();
-            }
-            let (content, n) = rewrite_model_visible_text(m, strip_unplayable_audio_markers);
-            stripped += n;
-            ChatMessage {
-                role: m.role.clone(),
-                content,
-            }
-        })
-        .collect();
-
-    if stripped > 0 {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "markers_stripped": stripped,
-                })),
-            "multimodal: stripped unplayable audio marker(s) (AUDIO/VOICE); no provider resolves audio into content parts, so a raw path/URL was replaced with a placeholder (or dropped from a declared carrier's attachment list) instead of being sent to the model as text"
-        );
-    }
-
-    Cow::Owned(rebuilt)
-}
-
-/// Matches image markers, capturing the payload for the inline-reference
-/// check. Built from [`IMAGE_MARKER_PREFIX`] so this seam helper and
-/// [`parse_image_markers`] agree on exactly which markers are image markers;
-/// the match is case-sensitive for the same reason.
-static IMAGE_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(&format!(
-        r"{}([^\]]*)\]",
-        regex::escape(IMAGE_MARKER_PREFIX)
-    ))
-    .expect("static image-marker regex must compile")
-});
-
-/// Replace image markers whose payload is a loadable reference other than an
-/// inline `data:` URI (a filesystem path or an `http(s)://` URL) with the same
-/// [`MEDIA_PLACEHOLDER`] the degrade path uses, returning the rewritten text
-/// and the number of markers replaced.
-///
-/// A `data:` URI is inline content: it has either already passed the
-/// normalizer's size and MIME checks or will hit the provider adapter's
-/// structural check, so it stays. Non-loadable payloads are prose and stay
-/// verbatim, mirroring how [`parse_image_markers`] preserves them. Runs over
-/// the raw string so a marker embedded in a native tool-result JSON blob is
-/// cleaned in place; see [`MEDIA_PLACEHOLDER`] for why the surrounding object
-/// stays valid.
-/// An image reference the one-shot dispatch seams cannot deliver: a loadable
-/// filesystem path or `http(s)://` URL, as opposed to inline `data:` content
-/// or non-loadable prose. One definition shared by the legacy body sweep and
-/// the declared-attachment drop below so the two paths cannot drift apart on
-/// what counts as undeliverable.
-fn is_undeliverable_image_reference(payload: &str) -> bool {
-    !payload.is_empty() && is_loadable_image_reference(payload) && !payload.starts_with("data:")
-}
-
-fn strip_undeliverable_image_markers(text: &str) -> (String, usize) {
-    let mut stripped = 0usize;
-    let out = IMAGE_MARKER_RE.replace_all(text, |caps: &regex::Captures<'_>| {
-        let payload = collapse_wrapped_marker(&caps[1]);
-        if is_undeliverable_image_reference(&payload) {
-            stripped += 1;
-            MEDIA_PLACEHOLDER.to_string()
-        } else {
-            // Preserve inline data URIs and non-loadable markers verbatim.
-            caps[0].to_string()
-        }
-    });
-    (out.into_owned(), stripped)
-}
-
-/// Strip image markers that cannot be delivered inline (see
-/// `strip_undeliverable_image_markers`) across every message, logging one
-/// degradation warning when any are removed. Returns the input borrowed when
-/// no message needs the seam (the common, allocation-free path) or an owned
-/// rebuilt vector otherwise.
-///
-/// Assistant messages in native tool-call history are rewritten field-wise —
-/// only their `content` string, through `rewrite_model_visible_text` — so
-/// signed reasoning inside the envelope survives the seam.
-///
-/// This is the fail-closed backstop on one-shot dispatch seams that send
-/// stored history without the full multimodal preparation: a filesystem path
-/// or URL image reference can no longer reach a provider adapter, whichever
-/// route the history took. Inline `data:` URIs and non-loadable prose markers
-/// pass through; callers that want the turn's images delivered run the full
-/// normalizer before they reach this point.
-///
-/// A DECLARED carrier is never body-scanned here: its image attachments that
-/// name a path or URL (not an inline `data:` URI) drop from the declared
-/// list, and its body stays verbatim, so marker syntax a tool quoted in its
-/// output remains text under the attachment-identity contract. A LEGACY
-/// carrier is cloned unchanged: it declared nothing, its body is text, and
-/// this seam does not rewrite it. Ordinary messages keep the regex strip.
-pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
-    // The gate fires only for messages the pass below can change: an
-    // ordinary message carrying marker syntax, or a declared carrier whose
-    // attachment list names an image this seam cannot deliver. A legacy
-    // carrier is cloned unchanged, so it never fires the pass.
-    if !messages
-        .iter()
-        .any(|m| match classify(&m.role, &m.content) {
-            Some(parts) => {
-                parts.declared
-                    && parts.attachments.iter().any(|marker| {
-                        marker.kind == MarkerKind::Image
-                            && is_undeliverable_image_reference(&collapse_wrapped_marker(
-                                &marker.target,
-                            ))
-                    })
-            }
-            None => IMAGE_MARKER_RE.is_match(&m.content),
-        })
-    {
-        return Cow::Borrowed(messages);
-    }
-
-    let mut stripped = 0usize;
-    let rebuilt: Vec<ChatMessage> = messages
-        .iter()
-        .map(|m| {
-            // A declared carrier handles images as metadata, mirroring
-            // `sanitize_audio_markers`: its marker lines are the declaration
-            // the strict parser counts, so sweeping the body with the regex
-            // would rewrite marker syntax a tool quoted as text. Path/URL
-            // image attachments drop from the declared list instead (the
-            // count the parser checks stays consistent); the body is never
-            // touched.
-            if let Some(parts) = classify(&m.role, &m.content) {
-                if !parts.declared {
-                    // A legacy carrier is delivered as its bytes: nothing
-                    // declared, nothing promoted, and no seam rewrites its
-                    // body.
-                    return m.clone();
-                }
-                let retained: Vec<RenderedMarker> = parts
-                    .attachments
-                    .iter()
-                    .filter(|marker| {
-                        marker.kind != MarkerKind::Image
-                            || !is_undeliverable_image_reference(&collapse_wrapped_marker(
-                                &marker.target,
-                            ))
-                    })
-                    .cloned()
-                    .collect();
-                if retained.len() != parts.attachments.len() {
-                    stripped += parts.attachments.len() - retained.len();
-                    return ChatMessage {
-                        role: m.role.clone(),
-                        content: rebuild_carrier(&m.role, &m.content, &parts, &retained),
-                    };
-                }
-                return m.clone();
-            }
-            // Only messages `classify` does not treat as carriers at all
-            // reach the historical body sweep: every carrier shape, legacy
-            // included, returns above with its body untouched, so the sweep
-            // sees ordinary message text only.
-            let (content, n) = rewrite_model_visible_text(m, strip_undeliverable_image_markers);
-            stripped += n;
-            ChatMessage {
-                role: m.role.clone(),
-                content,
-            }
-        })
-        .collect();
-
-    if stripped > 0 {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "markers_stripped": stripped,
-                })),
-            "multimodal: stripped image marker(s) with a path or URL reference on a one-shot dispatch seam; no size or content validation runs there, so the reference was replaced with a placeholder (or dropped from a declared carrier's attachment list) instead of being sent to the model as text"
-        );
-    }
-
-    Cow::Owned(rebuilt)
+    result
 }
 
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
@@ -1593,125 +607,16 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
-/// Count the images a message contributes to the outbound request: a carrier
-/// counts its declared image attachments (its body is never scanned); a user
-/// message counts its text markers; everything else counts zero.
-fn count_message_images(message: &ChatMessage) -> usize {
-    message_image_marker_counts(message).0
-}
-
-/// The `(images, rejected-markers)` pair a message contributes to the counts
-/// [`scan_image_marker_counts_with_current_turn_tool_results`] collects:
-/// the counting twin of [`count_message_images`]. A carrier counts its
-/// declared image attachments (a legacy carrier declares none, so it counts
-/// nothing) and never parses its body, so a marker in a carrier body is text
-/// under the attachment-identity contract and contributes to neither count.
-/// A user message reports the scanner's pair for its text, over-ceiling
-/// markers included (`ParseMode::Scan` owns no candidate bodies); every
-/// other message counts zero.
-fn message_image_marker_counts(message: &ChatMessage) -> (usize, usize) {
-    if let Some(parts) = classify(&message.role, &message.content) {
-        return (image_refs(&parts).len(), 0);
-    }
-    if message.role == "user" {
-        let parsed = parse_image_markers_inner(&message.content, ParseMode::Scan);
-        return (parsed.loadable_count, parsed.rejected_count);
-    }
-    (0, 0)
-}
-
-/// Split user-role content for image lifting: a prompt-mode tool carrier
-/// contributes only its declared image attachment lines (the body is never
-/// scanned, and non-image attachment lines stay in the text); every other
-/// user message lifts text markers exactly as before.
-///
-/// Provider adapters that resolve user content into image parts call this
-/// instead of `parse_image_markers` so a carrier body containing literal
-/// marker syntax cannot smuggle an unintended image into the request.
-pub fn parse_user_message_image_refs(content: &str) -> (String, Vec<String>) {
-    if let Some(parts) = classify("user", content) {
-        // A carrier is never body-scanned: a declared carrier contributes
-        // its image attachment lines (non-image lines stay in the text), and
-        // a legacy carrier contributes nothing at all — its body is text
-        // under the attachment-identity contract.
-        if !parts.declared {
-            return (content.to_string(), Vec::new());
-        }
-        let mut refs = Vec::new();
-        let mut retained = Vec::new();
-        for marker in &parts.attachments {
-            if marker.kind == MarkerKind::Image {
-                refs.push(marker.target.clone());
-            } else {
-                retained.push(marker.clone());
-            }
-        }
-        let text = render_prompt_tool_carrier(&parts.text, &retained);
-        return (text, refs);
-    }
-    parse_image_markers(content)
-}
-
-/// Emit one warning per request when a legacy-shaped carrier body carries
-/// image marker syntax. Under the attachment-identity contract those markers
-/// are text and are never promoted, so third-party or pre-upgrade tools that
-/// still emit them become visible instead of silently losing their images.
-/// No marker text is logged.
-fn warn_on_legacy_carrier_markers(messages: &[ChatMessage]) {
-    let mut native_carriers = 0usize;
-    let mut prompt_carriers = 0usize;
-    let mut marker_count = 0usize;
-    for message in messages {
-        // `classify` folds raw tool text into the legacy native shape, so
-        // every carrier — declared, legacy envelope, or raw text — is
-        // counted through the same open.
-        let Some(parts) = classify(&message.role, &message.content) else {
-            continue;
-        };
-        if parts.declared || !parts.text.contains(IMAGE_MARKER_PREFIX) {
-            continue;
-        }
-        match parts.kind {
-            CarrierKind::Native => native_carriers += 1,
-            CarrierKind::Prompt => prompt_carriers += 1,
-        }
-        marker_count += parse_image_markers(&parts.text).1.len();
-    }
-    if marker_count == 0 {
-        return;
-    }
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_category(::zeroclaw_log::EventCategory::Provider)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({
-                "native_carriers": native_carriers,
-                "prompt_carriers": prompt_carriers,
-                "image_marker_count": marker_count,
-            })),
-        "legacy tool-result carrier body contains image marker syntax; treated as text, not attachments"
-    );
-}
-
-/// Indices of every tool-result carrier in the CURRENT user turn: the
-/// carriers after the most recent user message that is not itself a
-/// prompt-mode tool-result carrier. If no such user message exists, every
-/// tool-result carrier qualifies. Tool images stay live for the user turn
-/// that produced them; they are stripped once the next user message
-/// arrives, so a tool image is never replayed on every later request
-/// forever.
+/// Locate tool results belonging to the most recent user turn.
 fn current_turn_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
-    let current_turn_start = messages.iter().rposition(|message| {
-        message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
-    });
+    let current_turn_start = messages.iter().rposition(|message| message.role == "user");
 
     let mut indices = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
         if current_turn_start.is_some_and(|start| index < start) {
             continue;
         }
-        if is_tool_result_carrier(&message.role, &message.content) {
+        if message.tool_result.is_some() {
             indices.insert(index);
         }
     }
@@ -1723,22 +628,21 @@ fn should_normalize_message_images(
     message: &ChatMessage,
     current_turn_tool_result_indices: &HashSet<usize>,
 ) -> bool {
-    if is_tool_result_carrier(&message.role, &message.content) {
+    if message.tool_result.is_some() {
         return current_turn_tool_result_indices.contains(&index);
     }
 
     message.role == "user"
 }
 
-/// How multimodal preparation will treat the `[IMAGE:...]` markers in a
+/// How multimodal preparation will treat the image attachments in a
 /// message at its position in the history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageMarkerDisposition {
-    /// Loadable markers become provider image blocks: user messages and the
-    /// tool-result carriers in the current user turn. A carrier contributes
-    /// its declared attachments; a legacy carrier contributes none.
+pub enum AttachmentDisposition {
+    /// Loadable attachments become provider image blocks: user messages and
+    /// tool-result carriers in the current user turn.
     Normalized,
-    /// Markers are stripped before dispatch: tool-result carriers before the
+    /// Attachments are stripped before dispatch: tool-result carriers before the
     /// current user turn.
     Stripped,
     /// Content is dispatched verbatim as text: system and assistant messages.
@@ -1746,147 +650,53 @@ pub enum ImageMarkerDisposition {
 }
 
 /// One disposition per message, computed with the same predicates preparation
-/// uses (`is_tool_result_carrier`, `current_turn_tool_result_indices`,
+/// uses (typed tool-result metadata, `current_turn_tool_result_indices`,
 /// `should_normalize_message_images`). Dispositions do not model the
 /// config-dependent image limits (`max_images`, `max_image_turns`), which can
 /// strip or cap images preparation would otherwise dispatch.
-pub fn image_marker_dispositions(messages: &[ChatMessage]) -> Vec<ImageMarkerDisposition> {
+pub fn attachment_dispositions(messages: &[ChatMessage]) -> Vec<AttachmentDisposition> {
     let current_turn_indices = current_turn_tool_result_indices(messages);
     messages
         .iter()
         .enumerate()
         .map(|(index, message)| {
             if should_normalize_message_images(index, message, &current_turn_indices) {
-                ImageMarkerDisposition::Normalized
-            } else if is_tool_result_carrier(&message.role, &message.content) {
-                ImageMarkerDisposition::Stripped
+                AttachmentDisposition::Normalized
+            } else if message.tool_result.is_some() {
+                AttachmentDisposition::Stripped
             } else {
-                ImageMarkerDisposition::Literal
+                AttachmentDisposition::Literal
             }
         })
         .collect()
 }
 
-fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
-    // A declared carrier empties its attachment list at the fixed position;
-    // the body was never scanned, so it stays verbatim. Every other carrier
-    // is legacy and is delivered as its bytes: nothing is stripped from it.
-    // (Non-carriers never reach this helper; the replay path calls it only
-    // for carriers.)
-    let Some(parts) = classify(&message.role, &message.content).filter(|parts| parts.declared)
-    else {
-        return message.clone();
-    };
-    let emptied: Vec<RenderedMarker> = Vec::new();
-    ChatMessage {
-        role: message.role.clone(),
-        content: rebuild_carrier(&message.role, &message.content, &parts, &emptied),
-    }
-}
-
-fn replay_message_without_stale_tool_images(
-    index: usize,
-    message: &ChatMessage,
-    current_turn_tool_result_indices: &HashSet<usize>,
-) -> ChatMessage {
-    if is_tool_result_carrier(&message.role, &message.content)
-        && !current_turn_tool_result_indices.contains(&index)
-    {
-        strip_tool_result_image_markers(message)
-    } else {
-        message.clone()
-    }
-}
-
-/// Normalize a declared carrier's image attachments into data URIs at the
-/// fixed position, keeping the body verbatim (a load-failure note is the only
-/// text ever appended).
-///
-/// `None` when the message is not a carrier that declared image attachments:
-/// legacy carriers and text-only carriers pass through untouched, because
-/// their bodies are text under the attachment-identity contract and are never
-/// scanned.
-async fn normalize_carrier_attachments(
-    message: &ChatMessage,
-    config: &MultimodalConfig,
-    max_bytes: usize,
-    remote_client: &Client,
-    ctx: &ImageNormalizeCtx<'_>,
-    cache: Option<&mut LocalImageCache>,
-    remaining_budget: &mut u64,
-) -> Option<(ChatMessage, bool)> {
-    let parts = classify(&message.role, &message.content)?;
-    if !parts.declared {
-        return None;
-    }
-    let refs = image_refs(&parts);
-    if refs.is_empty() {
-        return None;
-    }
-
-    let normalized = normalize_image_references(
-        &refs,
-        config,
-        max_bytes,
-        remote_client,
-        ctx,
-        cache,
-        remaining_budget,
-    )
-    .await;
-    // Non-image attachments carry through untouched; image entries become the
-    // successfully normalized URIs (in declaration order). Entries that could
-    // not be loaded drop out of the list and are reported in the body note.
-    let mut rebuilt: Vec<RenderedMarker> = parts
-        .attachments
-        .iter()
-        .filter(|marker| marker.kind != MarkerKind::Image)
-        .cloned()
-        .collect();
-    rebuilt.extend(normalized.data_uris.iter().map(|uri| RenderedMarker {
-        target: uri.clone(),
-        kind: MarkerKind::Image,
-    }));
-    let text = if normalized.skipped_count > 0 {
-        append_skipped_image_note(&parts.text, normalized.skipped_count, refs.len())
-    } else {
-        parts.text.clone()
-    };
-    let rebuilt_parts = CarrierParts {
-        text,
-        attachments: rebuilt,
-        declared: true,
-        kind: parts.kind,
-    };
-    Some((
-        ChatMessage {
-            role: message.role.clone(),
-            content: rebuild_carrier(
-                &message.role,
-                &message.content,
-                &rebuilt_parts,
-                &rebuilt_parts.attachments,
-            ),
-        },
-        !normalized.data_uris.is_empty(),
-    ))
+fn trim_message_images(message: &ChatMessage, drop_here: usize) -> ChatMessage {
+    let mut result = message.clone();
+    let mut dropped = 0;
+    result.attachments.retain(|attachment| {
+        if attachment.kind == AttachmentKind::Image && dropped < drop_here {
+            dropped += 1;
+            false
+        } else {
+            true
+        }
+    });
+    result
 }
 
 pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
-) -> anyhow::Result<PreparedMessages> {
+) -> Result<PreparedMessages, MultimodalError> {
     prepare_messages_inner(messages, config, None).await
 }
 
-/// Like [`prepare_messages_for_provider`] but reuses a [`LocalImageCache`]
-/// across calls so each unique local image file is read from disk at most
-/// once per session (or once per modification for mutable files).
 pub async fn prepare_messages_for_provider_cached(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
     cache: &mut LocalImageCache,
-) -> anyhow::Result<PreparedMessages> {
+) -> Result<PreparedMessages, MultimodalError> {
     prepare_messages_inner(messages, config, Some(cache)).await
 }
 
@@ -1894,406 +704,137 @@ async fn prepare_messages_inner(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
     mut cache: Option<&mut LocalImageCache>,
-) -> anyhow::Result<PreparedMessages> {
-    // Strip loadable audio markers before any provider sees the history. Left
-    // in place, an audio path reaches the model as literal text and fails
-    // silently — the model typically hallucinates having played the file,
-    // which is worse than an explicit degradation. `[IMAGE:...]` markers are
-    // handled by the normalization below; other media kinds keep their
-    // payloads for delivery. The shared seam borrows the input untouched when
-    // no audio marker is present, so the common hot path stays allocation-free.
-    let sanitized = sanitize_audio_markers(messages);
-    let messages: &[ChatMessage] = &sanitized;
-
-    let (max_images, max_image_size_mb) = config.effective_limits();
-    let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
-
-    warn_on_legacy_carrier_markers(messages);
-
-    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
-    let (total_images, total_rejected) = scan_image_marker_counts_with_current_turn_tool_results(
-        messages,
-        &current_turn_tool_indices,
-    );
-
-    if total_images == 0 && total_rejected == 0 {
-        return Ok(PreparedMessages {
-            messages: messages
-                .iter()
-                .enumerate()
-                .map(|(index, message)| {
-                    replay_message_without_stale_tool_images(
-                        index,
-                        message,
-                        &current_turn_tool_indices,
-                    )
-                })
-                .collect(),
-            contains_images: false,
-            submitted_image_ids: Vec::new(),
-            newest_user_image_ids: Vec::new(),
-        });
-    }
-
-    // Apply per-request image cap and age trimming *before* normalization to
-    // bound the number of candidates we decode. Full pixel validation is now
-    // CPU and memory intensive (unlike the prior header-only sniff), so
-    // decoding every candidate in a long history would create an unbounded
-    // resource sink even though only `max_images` are sent to the provider.
-    //
-    // Trade-off: a failed newer image can now consume budget and evict an
-    // older valid one. This is acceptable because (1) the aggregate decode
-    // budget further bounds total work, (2) most images that pass the
-    // encoded-byte check will decode successfully, and (3) preventing the
-    // resource exhaustion hazard takes precedence over the marginal UX loss.
-    let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
-    // First pass: apply age-based trimming when configured.
-    let age_trimmed = if config.max_image_turns > 0 {
-        let before = count_image_markers_with_current_turn_tool_results(
-            messages,
-            &current_turn_tool_indices,
-        );
-        let trimmed = trim_images_by_age(messages, config.max_image_turns);
-        let after = count_image_markers_with_current_turn_tool_results(
-            &trimmed,
-            &current_turn_tool_indices,
-        );
-        if after < before {
-            // Indices into the sanitized input list of this preparation,
-            // the list the trims now consume directly, zero-based, system
-            // message included: the span the age trim rewrote in this
-            // request, relative to that same input.
-            let span = trimmed_span(messages, &trimmed);
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "max_image_turns": config.max_image_turns,
-                        "images_before": before,
-                        "images_after": after,
-                        "images_dropped": before - after,
-                        "first_trimmed_index": span.map(|s| s.0),
-                        "last_trimmed_index": span.map(|s| s.1),
-                    })),
-                "multimodal: age-trimmed old images from conversation history"
-            );
-        }
-        trimmed
+) -> Result<PreparedMessages, MultimodalError> {
+    let mut candidates = if config.max_image_turns > 0 {
+        trim_images_by_age(messages, config.max_image_turns)
     } else {
         messages.to_vec()
     };
-
-    // Second pass: apply per-request image cap before normalization.
-    // The trim runs before the event so its attrs can name the span of
-    // messages this request's trim rewrote; see `trimmed_span` for what the
-    // indices mean and how consecutive events relate.
-    let images_before_cap = count_image_markers_with_current_turn_tool_results(
-        &age_trimmed,
-        &current_turn_tool_indices,
-    );
-    let candidate_messages = if images_before_cap > max_images {
-        let trimmed = trim_old_images(&age_trimmed, max_images);
-        // Indices into the sanitized input list of this preparation, the
-        // list the trims now consume directly, zero-based, system message
-        // included: the span the cap trim rewrote in this request, relative
-        // to that same input.
-        let span = trimmed_span(&age_trimmed, &trimmed);
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "images_before_cap": images_before_cap,
-                    "max_images": max_images,
-                    "first_trimmed_index": span.map(|s| s.0),
-                    "last_trimmed_index": span.map(|s| s.1),
-                    "images_evicted": images_before_cap
-                        - count_image_markers_with_current_turn_tool_results(
-                            &trimmed,
-                            &current_turn_tool_indices,
-                        ),
-                })),
-            "multimodal: image cap exceeded, trimming oldest images"
-        );
-        trimmed
-    } else {
-        age_trimmed
-    };
-
-    // Track aggregate decode budget across all normalization in this call.
-    let mut remaining_decode_budget = AGGREGATE_DECODE_BUDGET_BYTES;
-
-    // Walk newest-first so the budget is spent on the most recent images and
-    // exhaustion sheds the oldest ones. Iterating oldest-first would let stale
-    // history consume the budget and drop the image the user just sent, which
-    // also contradicts `trim_old_images`. Message order is restored below;
-    // `index` remains the original position, so the age/tool-replay decisions
-    // keyed on it are unaffected by the traversal direction.
-    let mut normalized_messages = Vec::with_capacity(candidate_messages.len());
-    for (index, message) in candidate_messages.iter().enumerate().rev() {
-        if !should_normalize_message_images(index, message, &current_turn_tool_indices) {
-            normalized_messages.push(replay_message_without_stale_tool_images(
-                index,
-                message,
-                &current_turn_tool_indices,
-            ));
-            continue;
-        }
-
-        if is_tool_result_carrier(&message.role, &message.content) {
-            // Current-turn carrier: normalize the declared attachments at the
-            // fixed position. Legacy and text-only carriers pass through with
-            // the body untouched — a carrier body is never scanned for
-            // markers.
-            match normalize_carrier_attachments(
-                message,
-                config,
-                max_bytes,
-                &remote_client,
-                &ImageNormalizeCtx {
-                    message_index: index,
-                    role: &message.role,
-                },
-                cache.as_deref_mut(),
-                &mut remaining_decode_budget,
-            )
-            .await
-            {
-                Some((prepared, _contains_images)) => {
-                    normalized_messages.push(prepared);
-                }
-                None => normalized_messages.push(message.clone()),
-            }
-            continue;
-        }
-
-        let parsed = parse_image_markers_inner(&message.content, ParseMode::RewriteAndCollect);
-        let cleaned_text = parsed.cleaned;
-        let refs = parsed.refs;
-        if refs.is_empty() {
-            // A message with no loadable marker leaves preparation
-            // byte-for-byte as it arrived, matching the no-image fast path
-            // above: the rewritten text is whitespace-trimmed, and applying
-            // it here would strip leading indentation from user-supplied
-            // code whenever some other message in the history carries an
-            // image. Only a rejected marker changes the text, and that
-            // rewrite must still be dispatched in place of the raw marker.
-            let content = if parsed.rejected_count == 0 {
-                message.content.clone()
-            } else {
-                cleaned_text
-            };
-            normalized_messages.push(ChatMessage {
-                role: message.role.clone(),
-                content,
-            });
-            continue;
-        }
-
-        let normalized = normalize_image_references(
-            &refs,
-            config,
-            max_bytes,
-            &remote_client,
-            &ImageNormalizeCtx {
-                message_index: index,
-                role: &message.role,
-            },
-            cache.as_deref_mut(),
-            &mut remaining_decode_budget,
-        )
-        .await;
-        let content = compose_multimodal_content(
-            &cleaned_text,
-            &normalized.data_uris,
-            normalized.skipped_count,
-            refs.len(),
-        );
-        normalized_messages.push(ChatMessage {
-            role: message.role.clone(),
-            content,
-        });
+    if config.max_images > 0 {
+        candidates = trim_old_images(&candidates, config.max_images);
     }
-
-    // Undo the newest-first traversal: callers require original order.
-    normalized_messages.reverse();
-
-    // No post-normalization trim: both the age trim and the per-request cap
-    // already ran above, before any decode. Normalization emits at most one
-    // marker per *successful* reference, so the marker count can only shrink
-    // from here — re-running either trim would be a guaranteed no-op.
-
-    let submitted_image_ids = provider_image_ids(&normalized_messages);
-    let newest_user_image_ids = normalized_messages
+    let dispositions = attachment_dispositions(&candidates);
+    let max_bytes = config.max_image_size_mb.clamp(1, 20) * 1024 * 1024;
+    let remote_client = build_runtime_proxy_client_with_timeouts("provider.multimodal", 30, 10);
+    let mut remaining_decode_budget = AGGREGATE_DECODE_BUDGET_BYTES;
+    let mut prepared = Vec::with_capacity(candidates.len());
+    for (index, message) in candidates.iter().enumerate().rev() {
+        let mut result = message.clone();
+        match dispositions[index] {
+            AttachmentDisposition::Literal => {}
+            AttachmentDisposition::Stripped => {
+                result = trim_message_images(message, usize::MAX);
+            }
+            AttachmentDisposition::Normalized => {
+                let refs = message_image_refs(message);
+                if !refs.is_empty() {
+                    let normalized = normalize_image_references(
+                        &refs,
+                        config,
+                        max_bytes,
+                        &remote_client,
+                        &ImageNormalizeCtx {
+                            message_index: index,
+                            role: &message.role,
+                        },
+                        cache.as_deref_mut(),
+                        &mut remaining_decode_budget,
+                    )
+                    .await;
+                    result
+                        .attachments
+                        .retain(|attachment| attachment.kind != AttachmentKind::Image);
+                    result
+                        .attachments
+                        .extend(normalized.data_uris.into_iter().map(|target| {
+                            AttachmentReference {
+                                kind: AttachmentKind::Image,
+                                target,
+                            }
+                        }));
+                    if normalized.skipped_count > 0 {
+                        let note =
+                            append_skipped_image_note("", normalized.skipped_count, refs.len());
+                        result.append_note(&note);
+                    }
+                }
+            }
+        }
+        prepared.push(result);
+    }
+    prepared.reverse();
+    let submitted_image_ids = provider_image_ids(&prepared);
+    let newest_user_image_ids = prepared
         .iter()
         .rev()
-        .find(|message| {
-            message.role == "user" && !is_tool_result_carrier(&message.role, &message.content)
-        })
+        .find(|message| message.role == "user")
         .map(provider_image_ids_in_message)
         .unwrap_or_default();
-
     Ok(PreparedMessages {
         contains_images: !submitted_image_ids.is_empty(),
-        messages: normalized_messages,
+        messages: prepared,
         submitted_image_ids,
         newest_user_image_ids,
     })
 }
 
 fn provider_image_ids_in_message(message: &ChatMessage) -> Vec<ProviderImageId> {
-    let references = match classify(&message.role, &message.content) {
-        Some(parts) => image_refs(&parts),
-        None => parse_image_markers(&message.content).1,
-    };
-    references
+    message_image_refs(message)
         .iter()
         .map(|reference| ProviderImageId::from_reference(reference))
         .collect()
 }
 
-/// Return normalized image identities in provider wire order.
 pub fn provider_image_ids(messages: &[ChatMessage]) -> Vec<ProviderImageId> {
-    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
     messages
         .iter()
-        .enumerate()
-        .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, &current_turn_tool_indices)
-        })
-        .flat_map(|(_, message)| provider_image_ids_in_message(message))
+        .zip(attachment_dispositions(messages))
+        .filter(|(_, disposition)| *disposition == AttachmentDisposition::Normalized)
+        .flat_map(|(message, _)| provider_image_ids_in_message(message))
         .collect()
 }
 
-fn omit_provider_image_ids_from_content(content: &str, omitted: &[ProviderImageId]) -> String {
-    let (mut text, references) = parse_image_markers(content);
-    if references.is_empty() {
-        return content.to_string();
-    }
-
-    let retained: Vec<String> = references
-        .iter()
-        .filter(|reference| !omitted.contains(&ProviderImageId::from_reference(reference)))
-        .cloned()
-        .collect();
-    if retained.len() == references.len() {
-        return content.to_string();
-    }
-    if retained.is_empty() && text.trim().is_empty() {
-        text = "[image removed from history]".to_string();
-    }
-    compose_multimodal_message(&text, &retained)
-}
-
-/// Build a provider-only replay view with selected normalized images removed.
-/// The caller retains canonical history unchanged.
 pub fn omit_provider_image_ids(
     messages: &[ChatMessage],
     omitted: &[ProviderImageId],
 ) -> Vec<ChatMessage> {
-    if omitted.is_empty() {
-        return messages.to_vec();
-    }
-
     messages
         .iter()
-        .zip(image_marker_dispositions(messages))
+        .zip(attachment_dispositions(messages))
         .map(|(message, disposition)| {
-            if disposition != ImageMarkerDisposition::Normalized {
-                return message.clone();
+            let mut result = message.clone();
+            if disposition == AttachmentDisposition::Normalized {
+                result.attachments.retain(|attachment| {
+                    attachment.kind != AttachmentKind::Image
+                        || !omitted.contains(&ProviderImageId::from_reference(&attachment.target))
+                });
             }
-
-            if let Some(parts) = classify(&message.role, &message.content) {
-                let retained: Vec<RenderedMarker> = parts
-                    .attachments
-                    .iter()
-                    .filter(|marker| {
-                        marker.kind != MarkerKind::Image
-                            || !omitted.contains(&ProviderImageId::from_reference(&marker.target))
-                    })
-                    .cloned()
-                    .collect();
-                if retained.len() == parts.attachments.len() {
-                    return message.clone();
-                }
-                return ChatMessage {
-                    role: message.role.clone(),
-                    content: rebuild_carrier(&message.role, &message.content, &parts, &retained),
-                };
-            }
-
-            ChatMessage {
-                role: message.role.clone(),
-                content: omit_provider_image_ids_from_content(&message.content, omitted),
-            }
+            result
         })
         .collect()
 }
-/// Strip image markers from user messages older than `max_turns` conversation
-/// turns, where a turn opens at a user message that is not a prompt-mode
-/// tool-result carrier. Carriers never advance the turn count and are never
-/// stripped here; the stale-tool rule and the post-normalization image cap
-/// govern their lifetime, as the `max_image_turns` schema doc documents.
+
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
-    // Count real user turns from the end to find the cutoff index.
-    let mut user_turn_count = 0usize;
-    let mut cutoff = 0usize; // messages at index < cutoff are "too old"
-    for (i, m) in messages.iter().enumerate().rev() {
-        if m.role == "user" && !is_tool_result_carrier(&m.role, &m.content) {
-            user_turn_count += 1;
-            if user_turn_count > max_turns {
-                // Everything up to and including this index is too old.
-                cutoff = i + 1;
-                break;
-            }
-        }
-    }
-
-    if cutoff == 0 {
-        return messages.to_vec();
-    }
-
+    let mut turn_count = 0;
     messages
         .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            if i < cutoff && m.role == "user" && !is_tool_result_carrier(&m.role, &m.content) {
-                let parsed = parse_image_markers_inner(&m.content, ParseMode::RewriteOnly);
-                // An empty candidate list is not "no change": a rejected
-                // marker rewrites the text without ever producing a
-                // candidate.
-                if parsed.loadable_count == 0 && parsed.rejected_count == 0 {
-                    return m.clone();
-                }
-                let text = if parsed.cleaned.trim().is_empty() {
-                    "[image removed from history]".to_string()
-                } else {
-                    parsed.cleaned
-                };
-                ChatMessage {
-                    role: m.role.clone(),
-                    content: text,
-                }
+        .rev()
+        .map(|message| {
+            if message.role == "user" {
+                turn_count += 1;
+            }
+            if turn_count > max_turns && message.role == "user" {
+                trim_message_images(message, usize::MAX)
             } else {
-                m.clone()
+                message.clone()
             }
         })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
         .collect()
 }
 
-/// How many of `total` images survive the per-request cap of `max_images`.
-///
-/// Under the cap every image survives. Past it, eviction drops to a low-water
-/// mark of `max_images - max_images / 2` (4 -> 2, 8 -> 4, 16 -> 8), then lets
-/// the count climb back to the cap before the next eviction. Evicting an image
-/// rewrites the message that held it, which invalidates a provider's cached
-/// prompt prefix from that message on; evicting in batches means a session
-/// past the cap pays that rewrite once every `max_images / 2 + 1` new images
-/// instead of on every one.
-///
-/// The result depends only on `total`, never on earlier requests: while the
-/// count stays within one batch, the same oldest images are evicted and the
-/// earlier messages of the request are unchanged.
 fn images_kept_under_cap(total: usize, max_images: usize) -> usize {
     if total <= max_images {
         return total;
@@ -2303,191 +844,22 @@ fn images_kept_under_cap(total: usize, max_images: usize) -> usize {
     low_water + (total - max_images - 1) % batch
 }
 
-/// Strip image markers from older messages (oldest first) until the total
-/// image count is down to [`images_kept_under_cap`]. Keeps the text content of
-/// each message.
-///
-/// Eviction is per image, not per message: exactly the oldest
-/// `total - images_kept_under_cap(total, max_images)` images are dropped, so a
-/// message holding more images than remain to drop keeps its newest ones
-/// instead of losing all of them.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
-    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
-    // Find which messages (by index) contain images, oldest first.
-    let image_positions: Vec<(usize, usize)> = messages
-        .iter()
-        .enumerate()
-        .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, &current_turn_tool_indices)
-        })
-        .filter_map(|(i, m)| {
-            let count = count_message_images(m);
-            if count > 0 { Some((i, count)) } else { None }
-        })
-        .collect();
-
-    // Determine how many images to drop (from the oldest messages).
-    let total: usize = image_positions.iter().map(|(_, c)| c).sum();
+    let dispositions = attachment_dispositions(messages);
+    let total = count_image_attachments(messages);
     let mut to_drop = total - images_kept_under_cap(total, max_images);
-
-    // Record how many images to drop per message, oldest first. A message is
-    // only partially trimmed when it holds more images than remain to drop:
-    // marking the whole message would evict images the budget still allows and
-    // leave the request under the kept count (a single message holding more
-    // than `max_images` would otherwise lose all of them).
-    let mut drop_counts = std::collections::HashMap::new();
-    for &(idx, count) in &image_positions {
-        if to_drop == 0 {
-            break;
-        }
-        let drop_here = to_drop.min(count);
-        drop_counts.insert(idx, drop_here);
-        to_drop -= drop_here;
-    }
-
     messages
         .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let Some(&drop_here) = drop_counts.get(&i) else {
-                return replay_message_without_stale_tool_images(i, m, &current_turn_tool_indices);
-            };
-
-            trim_message_images(m, drop_here)
+        .zip(dispositions)
+        .map(|(message, disposition)| {
+            if disposition != AttachmentDisposition::Normalized {
+                return message.clone();
+            }
+            let drop_here = to_drop.min(count_message_images(message));
+            to_drop -= drop_here;
+            trim_message_images(message, drop_here)
         })
         .collect()
-}
-
-/// First and last index whose role or content differs between a trim's
-/// stage input and its stage output, or `None` when the trim changed
-/// nothing. Both indices are into this preparation's sanitized input
-/// list, the list the trims now consume directly (the cap trim's stage
-/// input is the age-trimmed view of that list, position for position),
-/// zero-based, system message included: the span names what the trim
-/// rewrote in THIS request, relative to that same request's own untrimmed
-/// input. The comparison never touches the previous request, and the event
-/// itself does not know it. Consecutive events for one conversation can
-/// still be compared by a reader: a `last_trimmed_index` that grew alongside
-/// a grown `images_evicted` marks the request whose new image moved the
-/// eviction frontier, while an unchanged pair means no new rewrite.
-fn trimmed_span(before: &[ChatMessage], after: &[ChatMessage]) -> Option<(usize, usize)> {
-    let differs = |(a, b): (&ChatMessage, &ChatMessage)| a.role != b.role || a.content != b.content;
-    before
-        .iter()
-        .zip(after.iter())
-        .position(differs)
-        .zip(before.iter().zip(after.iter()).rposition(differs))
-}
-
-/// Drop the `drop_here` oldest image markers from `text`, keeping the newest.
-///
-/// The retained set is selected from the borrowed span offsets the rewrite
-/// pass records while stripping every marker from the cleaned text; only the
-/// retained references are then collapsed into owned strings. A message
-/// holding many more images than the budget allows must not materialize the
-/// bodies being evicted — ownership is reserved for the surviving set, the
-/// same contract the counting passes keep.
-fn trim_image_markers(text: &str, drop_here: usize) -> String {
-    let parsed = parse_image_markers_inner(text, ParseMode::RewriteOnly);
-    // Newest images within the message survive, matching the oldest-first
-    // eviction order across messages.
-    let retained_spans = parsed.loadable_spans.get(drop_here..).unwrap_or(&[]);
-    if retained_spans.is_empty() {
-        if parsed.cleaned.trim().is_empty() {
-            "[image removed from history]".to_string()
-        } else {
-            parsed.cleaned
-        }
-    } else {
-        let retained: Vec<String> = retained_spans
-            .iter()
-            .map(|&(start, end)| {
-                let candidate = collapse_wrapped_marker(&text[start..end]);
-                #[cfg(test)]
-                record_candidate_ownership(candidate.len());
-                candidate.into_owned()
-            })
-            .collect();
-        compose_multimodal_message(&parsed.cleaned, &retained)
-    }
-}
-
-/// Apply [`trim_image_markers`] to a message, keeping a native tool-result JSON
-/// envelope intact.
-///
-/// A `role = "tool"` message may carry a serialized `{"tool_call_id": ..,
-/// "content": ..}` object. Trimming the serialized form would strip markers out
-/// of the JSON *and* append the retained ones after the closing brace, leaving
-/// text that no longer parses — the provider serializers then lose
-/// `tool_call_id` and cannot emit a native tool result. Unwrap first, trim the
-/// inner `content`, and re-serialize with the rest of the envelope untouched,
-/// mirroring [`strip_tool_result_image_markers`] and
-/// [`normalize_carrier_attachments`].
-fn trim_message_images(message: &ChatMessage, drop_here: usize) -> ChatMessage {
-    // A declared carrier drops its oldest image attachments at the fixed
-    // position; the body is never touched. Non-image attachments always
-    // survive the image cap.
-    if let Some(parts) = classify(&message.role, &message.content)
-        && parts.declared
-    {
-        let mut dropped = 0usize;
-        let retained: Vec<RenderedMarker> = parts
-            .attachments
-            .iter()
-            .filter(|marker| {
-                if marker.kind == MarkerKind::Image && dropped < drop_here {
-                    dropped += 1;
-                    false
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-        return ChatMessage {
-            role: message.role.clone(),
-            content: rebuild_carrier(&message.role, &message.content, &parts, &retained),
-        };
-    }
-
-    if message.role == "tool"
-        && let Ok(serde_json::Value::Object(mut obj)) =
-            serde_json::from_str::<serde_json::Value>(&message.content)
-        && let Some(serde_json::Value::String(inner)) = obj.get("content").cloned()
-    {
-        let trimmed = trim_image_markers(&inner, drop_here);
-        obj.insert("content".to_string(), serde_json::Value::String(trimmed));
-        return ChatMessage {
-            role: message.role.clone(),
-            content: serde_json::Value::Object(obj).to_string(),
-        };
-    }
-
-    ChatMessage {
-        role: message.role.clone(),
-        content: trim_image_markers(&message.content, drop_here),
-    }
-}
-
-fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
-    let mut content = String::new();
-    let trimmed = text.trim();
-
-    if !trimmed.is_empty() {
-        content.push_str(trimmed);
-        content.push_str("\n\n");
-    }
-
-    for (index, data_uri) in data_uris.iter().enumerate() {
-        if index > 0 {
-            content.push('\n');
-        }
-        content.push_str(IMAGE_MARKER_PREFIX);
-        content.push_str(data_uri);
-        content.push(']');
-    }
-
-    content
 }
 
 struct NormalizedImageReferences {
@@ -2574,7 +946,7 @@ async fn normalize_image_references(
                     "image_source_not_found"
                         | "local_read_failed"
                         | "remote_fetch_failed"
-                        | "invalid_marker"
+                        | "invalid_reference"
                         | "corrupt_image"
                 );
                 if is_tool_role && is_recoverable_load_failure {
@@ -2582,7 +954,7 @@ async fn normalize_image_references(
                         DEBUG,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_attrs(attrs),
-                        "skipping multimodal marker in tool result (likely not a real attachment)"
+                        "skipping tool result attachment that could not be loaded"
                     );
                 } else {
                     ::zeroclaw_log::record!(
@@ -2600,24 +972,6 @@ async fn normalize_image_references(
     NormalizedImageReferences {
         data_uris,
         skipped_count,
-    }
-}
-
-fn compose_multimodal_content(
-    text: &str,
-    data_uris: &[String],
-    skipped_count: usize,
-    total_refs: usize,
-) -> String {
-    if skipped_count == 0 {
-        return compose_multimodal_message(text, data_uris);
-    }
-
-    let text_with_note = append_skipped_image_note(text, skipped_count, total_refs);
-    if data_uris.is_empty() {
-        text_with_note.trim().to_string()
-    } else {
-        compose_multimodal_message(&text_with_note, data_uris)
     }
 }
 
@@ -2658,7 +1012,7 @@ fn multimodal_error_kind(error: &anyhow::Error) -> &'static str {
         Some(MultimodalError::UnsupportedMime { .. }) => "unsupported_mime",
         Some(MultimodalError::RemoteFetchDisabled { .. }) => "remote_fetch_disabled",
         Some(MultimodalError::ImageSourceNotFound { .. }) => "image_source_not_found",
-        Some(MultimodalError::InvalidMarker { .. }) => "invalid_marker",
+        Some(MultimodalError::InvalidReference { .. }) => "invalid_reference",
         Some(MultimodalError::RemoteFetchFailed { .. }) => "remote_fetch_failed",
         Some(MultimodalError::LocalReadFailed { .. }) => "local_read_failed",
         Some(MultimodalError::CorruptImage { .. }) => "corrupt_image",
@@ -2668,7 +1022,7 @@ fn multimodal_error_kind(error: &anyhow::Error) -> &'static str {
 
 fn multimodal_error_reason(error: &anyhow::Error) -> Option<String> {
     match error.downcast_ref::<MultimodalError>() {
-        Some(MultimodalError::InvalidMarker { input, reason })
+        Some(MultimodalError::InvalidReference { input, reason })
         | Some(MultimodalError::RemoteFetchFailed { input, reason })
         | Some(MultimodalError::LocalReadFailed { input, reason }) => {
             Some(reason.replace(input, "<source>"))
@@ -2714,7 +1068,7 @@ async fn normalize_data_uri(
     max_bytes: usize,
     remaining_budget: &mut u64,
 ) -> anyhow::Result<String> {
-    // Bound the marker length before doing anything that allocates from it.
+    // Bound the data URI length before doing anything that allocates from it.
     //
     // Every subsequent branch — `source.find(',')`, header checks,
     // `validate_mime`, and `STANDARD.decode` — can only run on a string that
@@ -2740,7 +1094,7 @@ async fn normalize_data_uri(
     }
 
     let Some(comma_idx) = source.find(',') else {
-        return Err(MultimodalError::InvalidMarker {
+        return Err(MultimodalError::InvalidReference {
             input: "[data URI]".to_string(),
             reason: "expected data URI payload".to_string(),
         }
@@ -2751,7 +1105,7 @@ async fn normalize_data_uri(
     let payload = source[comma_idx + 1..].trim();
 
     if !header.contains(";base64") {
-        return Err(MultimodalError::InvalidMarker {
+        return Err(MultimodalError::InvalidReference {
             input: "[data URI]".to_string(),
             reason: "only base64 data URIs are supported".to_string(),
         }
@@ -2775,7 +1129,7 @@ async fn normalize_data_uri(
     //
     // `STANDARD.decode` allocates its output buffer from the length of the
     // input it is given, so decoding first and size-checking afterwards lets an
-    // oversized marker allocate before any limit applies. This runs on the
+    // oversized data URI allocate before any limit applies. This runs on the
     // async preparation task, outside the `spawn_blocking` boundary that
     // isolates pixel decoding, so it is the one allocation on this path that
     // nothing else bounds.
@@ -2806,7 +1160,7 @@ async fn normalize_data_uri(
 
     let decoded = STANDARD
         .decode(payload)
-        .map_err(|error| MultimodalError::InvalidMarker {
+        .map_err(|error| MultimodalError::InvalidReference {
             input: source.to_string(),
             reason: format!("invalid base64 payload: {error}"),
         })?;
@@ -3340,7 +1694,7 @@ fn jpeg_first_scan(
 /// `ICCChunk` (32 bytes), in a `Vec` whose capacity may have doubled.
 const JPEG_METADATA_SEGMENT_OVERHEAD_BYTES: u64 = 192;
 
-/// The marker context [`jpeg_retained_metadata_allocation`] is in, following
+/// The JPEG marker context [`jpeg_retained_metadata_allocation`] is in, following
 /// zune-jpeg 0.5.15. Which markers carry a length differs between them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JpegWalkContext {
@@ -4458,6 +2812,78 @@ fn normalize_content_type(content_type: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn wire_metadata_projection_keeps_documents_and_tool_identity() {
+        let image = AttachmentReference {
+            kind: AttachmentKind::Image,
+            target: "data:image/png;base64,AAAA".into(),
+        };
+        let document = AttachmentReference {
+            kind: AttachmentKind::Document,
+            target: "/workspace/report.pdf".into(),
+        };
+        let messages = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call-1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "literal [IMAGE:/example]".into(),
+                attachments: Vec::new(),
+            })
+            .with_attachments(vec![image.clone(), document.clone()]),
+        ];
+        let projected = project_attachment_metadata(&messages);
+        let envelope: serde_json::Value =
+            crate::tool_protocol::tool_message_value(&projected[0]).unwrap();
+        assert_eq!(envelope["tool_call_id"], "call-1");
+        assert_eq!(
+            envelope["content"],
+            "literal [IMAGE:/example]\n\nAttached document: /workspace/report.pdf"
+        );
+        assert_eq!(projected[0].attachments, vec![image.clone()]);
+        assert_eq!(messages[0].attachments, vec![image, document]);
+        assert!(matches!(
+            project_attachment_metadata(&projected),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn wire_metadata_projection_never_promotes_literal_markers() {
+        let messages = vec![ChatMessage::user(
+            "[IMAGE:/private.png] [DOCUMENT:/private.pdf]",
+        )];
+        assert!(matches!(
+            project_attachment_metadata(&messages),
+            Cow::Borrowed(_)
+        ));
+        assert!(message_image_refs(&messages[0]).is_empty());
+    }
+
+    #[test]
+    fn text_only_projection_omits_images_but_keeps_other_attachment_fields() {
+        let document = AttachmentReference {
+            kind: AttachmentKind::Document,
+            target: "/workspace/report.pdf".into(),
+        };
+        let original = ChatMessage::user("literal [IMAGE:/example]").with_attachments(vec![
+            AttachmentReference {
+                kind: AttachmentKind::Image,
+                target: "/workspace/photo.png".into(),
+            },
+            document.clone(),
+        ]);
+        let projected = omit_image_attachments(&original);
+        assert_eq!(projected.attachments, vec![document]);
+        assert!(projected.content.starts_with(&original.content));
+        assert!(projected.content.contains(MEDIA_PLACEHOLDER));
+        assert_eq!(original.attachments.len(), 2);
+        assert_eq!(
+            omit_image_attachments(&projected).content,
+            projected.content
+        );
+    }
+
     /// A real 1x1 PNG. Tests that need a *loadable* image must use this: a
     /// bare 8-byte PNG signature passes header sniffing but is not decodable,
     /// which is exactly what `validate_image_content` now rejects.
@@ -4608,288 +3034,52 @@ mod tests {
         out
     }
 
-    // Dispositions and preparation agreement only: this test never calls the
-    // token estimator. The estimator is pinned by
-    // `message_image_summary_counts_declared_carrier_attachments_not_body_markers`
-    // below and by the runtime history tests that charge declared
-    // attachments.
-    #[tokio::test]
-    async fn image_marker_dispositions_match_preparation() {
-        let temp = tempfile::tempdir().unwrap();
-        let marker = |name: &str| {
-            let path = temp.path().join(format!("{name}.png"));
-            std::fs::write(&path, valid_png()).unwrap();
-            format!("[IMAGE:{}]", path.display())
-        };
-
-        // Native shape: the tool carrier before the current user turn is
-        // Stripped, both tool rounds inside the current turn stay Normalized,
-        // and the assistant's marker is Literal (dispatched verbatim). The
-        // first current-turn round declares its image at the fixed position;
-        // the second is a legacy carrier whose body marker is text.
-        let declared_png = {
-            let path = temp.path().join("native-tool-round-one.png");
-            std::fs::write(&path, valid_png()).unwrap();
-            path.display().to_string()
-        };
-        let native = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user(format!("hi {}", marker("native-user-early"))),
-            ChatMessage::assistant(format!("yo {}", marker("native-assistant"))),
-            ChatMessage::tool(format!("early result {}", marker("native-tool-early"))),
-            ChatMessage::user(format!("turn two {}", marker("native-user-current"))),
-            ChatMessage::assistant("calling"),
-            ChatMessage::tool(native_carrier("call-1", "round one", &[declared_png])),
-            ChatMessage::assistant("calling again"),
-            ChatMessage::tool(format!("round two {}", marker("native-tool-round-two"))),
-        ];
-        assert_eq!(
-            image_marker_dispositions(&native),
-            vec![
-                ImageMarkerDisposition::Literal,    // system
-                ImageMarkerDisposition::Normalized, // user message
-                ImageMarkerDisposition::Literal,    // assistant: verbatim text
-                ImageMarkerDisposition::Stripped,   // tool carrier before the current turn
-                ImageMarkerDisposition::Normalized, // user message
-                ImageMarkerDisposition::Literal,    // assistant
-                ImageMarkerDisposition::Normalized, // current turn, first tool round
-                ImageMarkerDisposition::Literal,    // assistant
-                ImageMarkerDisposition::Normalized, // current turn, second tool round
-            ]
-        );
-
-        // Prompt-mode shape: a `[Tool results]` carrier before the current
-        // turn is Stripped, and the same carriers inside the current turn are
-        // Normalized without opening a new turn.
-        let prompt_mode = vec![
-            ChatMessage::user(format!(
-                "[Tool results]\nearly carrier {}",
-                marker("prompt-early")
-            )),
-            ChatMessage::user(format!("turn {}", marker("prompt-user"))),
-            ChatMessage::assistant("called"),
-            ChatMessage::user(format!(
-                "[Tool results]\ncarrier one {}",
-                marker("prompt-carrier-one")
-            )),
-            ChatMessage::user(format!(
-                "[Tool results]\ncarrier two {}",
-                marker("prompt-carrier-two")
-            )),
-        ];
-        assert_eq!(
-            image_marker_dispositions(&prompt_mode),
-            vec![
-                ImageMarkerDisposition::Stripped, // carrier before the current turn
-                ImageMarkerDisposition::Normalized, // the real user message
-                ImageMarkerDisposition::Literal,  // assistant
-                ImageMarkerDisposition::Normalized, // carrier inside the current turn
-                ImageMarkerDisposition::Normalized, // carrier inside the current turn
-            ]
-        );
-
-        // Dispositions do not model the config-dependent cap or age trim, so
-        // the fixture stays under the cap and the age trim stays off; what
-        // preparation does to each message must then match its disposition.
-        let config = MultimodalConfig {
-            max_images: 8,
-            ..Default::default()
-        };
-
-        for (name, history) in [("native", &native), ("prompt_mode", &prompt_mode)] {
-            let dispositions = image_marker_dispositions(history);
-            let prepared = prepare_messages_for_provider(history, &config)
-                .await
-                .unwrap();
-            assert_eq!(prepared.messages.len(), history.len());
-
-            for (index, (original, disposition)) in
-                history.iter().zip(dispositions.iter()).enumerate()
-            {
-                let content = &prepared.messages[index].content;
-                let inline_image = content.contains("data:image/png;base64,");
-                let had_marker = original.content.contains(".png");
-                // Carrier shape through the production predicates: a declared
-                // carrier's images are its attachments, and a legacy
-                // carrier's body markers are text preparation never promotes.
-                let declared_carrier = is_tool_result_carrier(&original.role, &original.content)
-                    && classify(&original.role, &original.content)
-                        .is_some_and(|parts| parts.declared);
-                let legacy_carrier =
-                    is_tool_result_carrier(&original.role, &original.content) && !declared_carrier;
-                match disposition {
-                    ImageMarkerDisposition::Normalized => {
-                        if legacy_carrier {
-                            // Still Normalized: its turn is live. But nothing
-                            // is promoted, so the body markers survive as
-                            // verbatim text and no image block appears.
-                            assert!(
-                                !inline_image,
-                                "{name}[{index}] a legacy carrier never dispatches an image block"
-                            );
-                            assert!(
-                                content.contains(".png"),
-                                "{name}[{index}] a legacy carrier's body markers stay text"
-                            );
-                        } else {
-                            assert!(
-                                inline_image,
-                                "{name}[{index}] Normalized must dispatch an image block"
-                            );
-                            assert!(
-                                !content.contains(".png"),
-                                "{name}[{index}] Normalized must not replay the raw path"
-                            );
-                        }
-                    }
-                    ImageMarkerDisposition::Stripped => {
-                        assert!(
-                            !inline_image,
-                            "{name}[{index}] Stripped must not dispatch an image block"
-                        );
-                        // Both stale carriers in these fixtures are legacy:
-                        // replay delivers the body verbatim, marker and all.
-                        assert!(
-                            content.contains(".png"),
-                            "{name}[{index}] a stale legacy carrier is delivered as its bytes"
-                        );
-                    }
-                    ImageMarkerDisposition::Literal => {
-                        assert!(
-                            !inline_image,
-                            "{name}[{index}] Literal must not dispatch an image block"
-                        );
-                        if had_marker {
-                            assert!(
-                                content.contains(".png"),
-                                "{name}[{index}] Literal must replay the marker verbatim"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn image_marker_summary_matches_parse_image_markers() {
-        let placeholder = "[IMAGE:...]";
-        let content = format!(
-            "  see [IMAGE:/tmp/a.png] plus {placeholder} and [IMAGE:/tmp/wrapped-\nlong.png] ok  "
-        );
-        let (cleaned, refs) = parse_image_markers(&content);
-        let summary = image_marker_summary(&content);
-
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0], "/tmp/a.png");
-        assert_eq!(refs[1], "/tmp/wrapped-long.png");
-        assert_eq!(summary.image_refs, refs.len());
-
-        // Every byte the scanner keeps as text, placeholder included, without
-        // the trim parse applies to its cleaned string.
-        let expected_text = format!("  see  plus {placeholder} and  ok  ");
-        assert_eq!(summary.text_bytes, expected_text.len());
-        assert_eq!(summary.text_bytes, cleaned.len() + 4);
-    }
-
-    #[test]
-    fn message_image_summary_counts_declared_carrier_attachments_not_body_markers() {
-        // The body quotes three marker strings, one a plausible data URI.
-        // Under the attachment-identity contract all three are text: a
-        // carrier's images are its declared attachments, never its body.
-        let body = "quote [IMAGE:/tmp/one.png] and [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUg] and [IMAGE:/tmp/three.png] verbatim";
-
-        // A declared prompt carrier with two image attachments.
-        let prompt_declared = ChatMessage::user(prompt_carrier(
-            body,
-            &[
-                "/tmp/declared-a.png".to_string(),
-                "/tmp/declared-b.png".to_string(),
-            ],
-        ));
-        let summary = message_image_summary(&prompt_declared);
-        assert_eq!(summary.image_refs, 2);
-        // The delivered body is the carrier text with its image attachment
-        // lines lifted, exactly what the user arm hands the provider.
-        let (delivered, lifted) = parse_user_message_image_refs(&prompt_declared.content);
-        assert_eq!(lifted.len(), 2);
-        assert_eq!(summary.text_bytes, delivered.len());
-        assert_eq!(
-            summary.text_bytes,
-            render_prompt_tool_carrier(body, &[]).len()
-        );
-
-        // The same body as a declared native carrier with two attachments:
-        // delivery is the envelope's content string, the body itself.
-        let native_declared = ChatMessage::tool(native_carrier(
-            "tc1",
-            body,
-            &[
-                "/tmp/declared-a.png".to_string(),
-                "/tmp/declared-b.png".to_string(),
-            ],
-        ));
-        let summary = message_image_summary(&native_declared);
-        assert_eq!(summary.image_refs, 2);
-        assert_eq!(summary.text_bytes, body.len());
-
-        // A legacy prompt carrier (results prefix, no count header): its
-        // three body markers are text and nothing is promoted.
-        let legacy_prompt = ChatMessage::user(format!("[Tool results]\n{body}"));
-        assert_eq!(message_image_summary(&legacy_prompt).image_refs, 0);
-
-        // A legacy native carrier (envelope without the attachments key):
-        // same rule, zero promoted images.
-        let legacy_native = ChatMessage::tool(
-            serde_json::json!({"tool_call_id": "tc1", "content": body}).to_string(),
-        );
-        assert_eq!(message_image_summary(&legacy_native).image_refs, 0);
-
-        // An ordinary user message keeps the text-level scan: one marker,
-        // one image.
-        let ordinary = ChatMessage::user("look [IMAGE:/tmp/user.png] now");
-        assert_eq!(message_image_summary(&ordinary).image_refs, 1);
-    }
-
-    fn image_marker(target: impl Into<String>) -> zeroclaw_api::media::RenderedMarker {
-        zeroclaw_api::media::RenderedMarker {
+    fn image_reference(target: impl Into<String>) -> zeroclaw_api::media::AttachmentReference {
+        zeroclaw_api::media::AttachmentReference {
             target: target.into(),
-            kind: zeroclaw_api::media::MarkerKind::Image,
+            kind: zeroclaw_api::media::AttachmentKind::Image,
         }
     }
 
     /// A native tool-result carrier in the shape the runtime writes: call id,
     /// verbatim body, and the attachments array (always present).
-    fn native_carrier(tool_call_id: &str, body: &str, images: &[String]) -> String {
-        let attachments: Vec<_> = images.iter().map(|t| image_marker(t.clone())).collect();
-        serde_json::json!({
-            "tool_call_id": tool_call_id,
-            "content": body,
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+    fn native_carrier(tool_call_id: &str, body: &str, images: &[String]) -> ChatMessage {
+        ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: (tool_call_id).to_string(),
+            tool_name: String::new(),
+            content: (body).to_string(),
+            success: None,
+            attachments: Vec::new(),
         })
-        .to_string()
+        .with_attachments(
+            images
+                .iter()
+                .map(|target| image_reference(target.clone()))
+                .collect(),
+        )
     }
 
-    /// A prompt-mode tool-result carrier: results prefix, count header, marker
-    /// lines, verbatim body.
-    fn prompt_carrier(body: &str, images: &[String]) -> String {
-        let attachments: Vec<_> = images.iter().map(|t| image_marker(t.clone())).collect();
-        zeroclaw_api::tool_carrier::render_prompt_tool_carrier(body, &attachments)
+    /// A structured result with an ID and verbatim body, independent of protocol.
+    fn prompt_carrier(body: &str, images: &[String]) -> ChatMessage {
+        ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+            tool_call_id: ("prompt-call").to_string(),
+            tool_name: String::new(),
+            content: (body).to_string(),
+            success: None,
+            attachments: Vec::new(),
+        })
+        .with_attachments(
+            images
+                .iter()
+                .map(|target| image_reference(target.clone()))
+                .collect(),
+        )
     }
 
     /// The image targets a native carrier declares, read at the fixed
     /// position.
-    fn carrier_image_targets(content: &str) -> Vec<String> {
-        zeroclaw_api::tool_carrier::parse_native_tool_carrier(content)
-            .map(|parsed| {
-                parsed
-                    .attachments
-                    .into_iter()
-                    .filter(|m| m.kind == zeroclaw_api::media::MarkerKind::Image)
-                    .map(|m| m.target)
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn carrier_image_targets(message: &ChatMessage) -> Vec<String> {
+        message_image_refs(message)
     }
 
     #[test]
@@ -4935,12 +3125,12 @@ mod tests {
         let mut cache = LocalImageCache::new();
         let reference = format!("data:image/png;base64,{}", "x".repeat(1024 * 1024));
 
-        assert!(cache.should_report_failure(&reference, "invalid_marker"));
+        assert!(cache.should_report_failure(&reference, "invalid_reference"));
 
         let (stored_reference, stored_kind) = cache.reported_failures.front().unwrap();
         assert_eq!(stored_reference, &image_failure_reference_key(&reference));
         assert_eq!(stored_reference.len(), 32);
-        assert_eq!(*stored_kind, "invalid_marker");
+        assert_eq!(*stored_kind, "invalid_reference");
     }
 
     #[tokio::test]
@@ -4948,7 +3138,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("restored.png");
         let reference = image_path.to_string_lossy().to_string();
-        let messages = vec![ChatMessage::user(format!("Look [IMAGE:{reference}]"))];
+        let messages = vec![ChatMessage::user("Look").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: reference.to_string(),
+            },
+        ])];
         let config = MultimodalConfig::default();
         let mut cache = LocalImageCache::new();
 
@@ -4973,11 +3168,7 @@ mod tests {
             .await
             .unwrap();
         assert!(restored.contains_images);
-        assert!(
-            restored.messages[0]
-                .content
-                .contains("data:image/png;base64,")
-        );
+        assert!(message_image_refs(&restored.messages[0])[0].starts_with("data:image/png;base64,"));
         assert!(cache.reported_failures.is_empty());
 
         std::fs::remove_file(&image_path).unwrap();
@@ -5163,764 +3354,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strip_media_markers_replaces_image_local_path() {
-        let input = "Look at [IMAGE:/zeroclaw-data/workspace/telegram_files/photo_1.jpg]";
-        assert_eq!(
-            strip_media_markers(input),
-            format!("Look at {MEDIA_PLACEHOLDER}")
-        );
-    }
-
-    #[test]
-    fn strip_media_markers_replaces_image_data_uri() {
-        let input = "Inline [IMAGE:data:image/png;base64,abcd]";
-        assert_eq!(
-            strip_media_markers(input),
-            format!("Inline {MEDIA_PLACEHOLDER}")
-        );
-    }
-
-    #[test]
-    fn strip_media_markers_replaces_all_supported_kinds() {
-        // Mirrors `ATTACHMENT_KINDS` in
-        // `crates/zeroclaw-channels/src/util.rs`, which is the source of
-        // truth for which marker spellings inbound channels can produce.
-        let input = "[IMAGE:/a.jpg] [PHOTO:/b.jpg] [DOCUMENT:/c.pdf] [FILE:/d.zip] [VIDEO:/e.mp4] [VOICE:/f.ogg] [AUDIO:/g.wav]";
-        let expected = [MEDIA_PLACEHOLDER; 7].join(" ");
-        assert_eq!(strip_media_markers(input), expected);
-    }
-
-    #[test]
-    fn strip_media_markers_is_case_insensitive() {
-        // Channel parsers uppercase the kind before comparing, so by the time
-        // a marker reaches conversation history it is normally upper-case —
-        // but accept lower/mixed case too so we don't depend on that
-        // invariant downstream.
-        let input = "[image:/a.jpg] [Photo:/b.jpg] [video:/c.mp4]";
-        let expected = [MEDIA_PLACEHOLDER; 3].join(" ");
-        assert_eq!(strip_media_markers(input), expected);
-    }
-
-    #[test]
-    fn strip_media_markers_leaves_plain_text_untouched() {
-        let input = "No markers here, just text with [brackets] and (parens).";
-        assert_eq!(strip_media_markers(input), input);
-    }
-
-    #[test]
-    fn strip_media_markers_preserves_unrelated_brackets() {
-        // Markers that don't match the media kinds are left alone.
-        let input = "Use [TODO:foo] and [NOTE:bar] but replace [IMAGE:/x.jpg]";
-        assert_eq!(
-            strip_media_markers(input),
-            format!("Use [TODO:foo] and [NOTE:bar] but replace {MEDIA_PLACEHOLDER}")
-        );
-    }
-
-    #[test]
-    fn media_placeholder_is_prose_not_a_marker() {
-        // A model may copy the placeholder from its input into a reply, so it
-        // must not be anything the marker grammar recognises: no bracket
-        // span, and nothing the strip paths would rewrite again.
-        assert!(!MEDIA_PLACEHOLDER.contains('['));
-        assert!(!MEDIA_PLACEHOLDER.contains(']'));
-        assert!(!MEDIA_PLACEHOLDER.contains(':'));
-        assert!(!MEDIA_PLACEHOLDER.contains(['"', '\\']));
-        assert_eq!(strip_media_markers(MEDIA_PLACEHOLDER), MEDIA_PLACEHOLDER);
-        assert_eq!(
-            strip_unplayable_audio_markers(MEDIA_PLACEHOLDER),
-            (MEDIA_PLACEHOLDER.to_string(), 0)
-        );
-        assert!(parse_image_markers(MEDIA_PLACEHOLDER).1.is_empty());
-    }
-
-    // ── loadable audio markers degrade; other media kinds keep their paths ──
-
-    #[test]
-    fn strip_unplayable_audio_markers_replaces_loadable_audio_path() {
-        let (out, n) = strip_unplayable_audio_markers("hear this [AUDIO:/tmp/clip.wav] now");
-        assert_eq!(out, format!("hear this {MEDIA_PLACEHOLDER} now"));
-        assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn strip_unplayable_audio_markers_degrades_audio_kinds_only() {
-        // The delivery contract: DOCUMENT/FILE/VIDEO/PHOTO paths stay
-        // model-visible so the agent can hand them to file tools or copy them
-        // into outbound reply markers; only the audio kinds degrade.
-        let input = "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [VOICE:/e.ogg] [AUDIO:/f.wav]";
-        let (out, n) = strip_unplayable_audio_markers(input);
-        assert_eq!(
-            out,
-            format!(
-                "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] \
-                 {MEDIA_PLACEHOLDER} {MEDIA_PLACEHOLDER}"
-            )
-        );
-        assert_eq!(n, 2);
-    }
-
-    #[test]
-    fn audio_marker_kinds_is_subset_of_media_marker_kinds() {
-        for kind in AUDIO_MARKER_KINDS {
-            assert!(
-                MEDIA_MARKER_KINDS.contains(kind),
-                "audio kind {kind} missing from the full marker vocabulary"
-            );
-        }
-    }
-
-    #[test]
-    fn strip_unplayable_audio_markers_leaves_image_marker_untouched() {
-        // `[IMAGE:...]` is handled by `parse_image_markers`; the audio
-        // stripper must never touch it (that would drop a resolvable image).
-        let (out, n) = strip_unplayable_audio_markers("[IMAGE:/a.png] and [AUDIO:/b.wav]");
-        assert_eq!(out, format!("[IMAGE:/a.png] and {MEDIA_PLACEHOLDER}"));
-        assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn strip_unplayable_audio_markers_preserves_non_loadable_payloads() {
-        // Placeholders, prose, a bare filename, and the no-transcription
-        // `[Audio: attached]` note are harmless literal text — keep them.
-        for input in [
-            "[AUDIO:...]",
-            "[VOICE:<clip>]",
-            "[Audio: attached]",
-            "[AUDIO:example.wav]",
-        ] {
-            let (out, n) = strip_unplayable_audio_markers(input);
-            assert_eq!(out, input, "should preserve non-loadable marker: {input}");
-            assert_eq!(
-                n, 0,
-                "non-loadable marker must not count as stripped: {input}"
-            );
-        }
-    }
-
-    #[test]
-    fn strip_unplayable_audio_markers_is_case_insensitive() {
-        let (out, n) = strip_unplayable_audio_markers("[Audio:/tmp/clip.wav]");
-        assert_eq!(out, MEDIA_PLACEHOLDER);
-        assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn strip_unplayable_audio_markers_handles_data_uri_and_url() {
-        let (out, n) = strip_unplayable_audio_markers(
-            "[VOICE:data:audio/ogg;base64,AAAA] and [AUDIO:https://x/y.mp3]",
-        );
-        assert_eq!(out, format!("{MEDIA_PLACEHOLDER} and {MEDIA_PLACEHOLDER}"));
-        assert_eq!(n, 2);
-    }
-
-    // ── seam-level image sanitize: paths/URLs drop, inline data URIs stay ──
-
-    #[test]
-    fn strip_undeliverable_image_markers_replaces_path_and_url() {
-        let (out, n) = strip_undeliverable_image_markers(
-            "see [IMAGE:/tmp/shot.png] and [IMAGE:https://x/y.png]",
-        );
-        assert_eq!(
-            out,
-            format!("see {MEDIA_PLACEHOLDER} and {MEDIA_PLACEHOLDER}")
-        );
-        assert_eq!(n, 2);
-    }
-
-    #[test]
-    fn strip_undeliverable_image_markers_keeps_inline_data_uri() {
-        let (out, n) =
-            strip_undeliverable_image_markers("see [IMAGE:data:image/png;base64,iVBORw0KGgo=]");
-        assert_eq!(out, "see [IMAGE:data:image/png;base64,iVBORw0KGgo=]");
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn strip_undeliverable_image_markers_preserves_non_loadable_payloads() {
-        // Prose and placeholder markers are harmless literal text and must
-        // survive, mirroring `parse_image_markers`.
-        for input in ["[IMAGE:...]", "[IMAGE:<screenshot>]", "[IMAGE:shot.png]"] {
-            let (out, n) = strip_undeliverable_image_markers(input);
-            assert_eq!(out, input, "should preserve non-loadable marker: {input}");
-            assert_eq!(
-                n, 0,
-                "non-loadable marker must not count as stripped: {input}"
-            );
-        }
-    }
-
-    #[test]
-    fn strip_undeliverable_image_markers_is_case_sensitive_like_parse() {
-        // `parse_image_markers` matches the prefix literally, so a lowercase
-        // kind is prose everywhere downstream; the seam helper must agree or
-        // it would rewrite text the in-loop path leaves alone.
-        let (out, n) = strip_undeliverable_image_markers("[image:/tmp/shot.png]");
-        assert_eq!(out, "[image:/tmp/shot.png]");
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn sanitize_image_markers_borrows_clean_input() {
-        let messages = [ChatMessage::user("no markers here")];
-        assert!(matches!(
-            sanitize_image_markers(&messages),
-            Cow::Borrowed(_)
-        ));
-    }
-
-    #[test]
-    fn sanitize_image_markers_borrows_when_only_inline_data_uris_present() {
-        let messages = [ChatMessage::user(
-            "see [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
-        )];
-        let sanitized = sanitize_image_markers(&messages);
-        // Rebuilt (the regex matched) but byte-identical content.
-        assert_eq!(sanitized[0].content, messages[0].content);
-    }
-
-    #[test]
-    fn sanitize_image_markers_rewrites_path_markers_in_place() {
-        // Emits the seam WARN; serialized against the tests that count it.
-        // Ordinary user text: the seam replaces a loadable path marker with
-        // the placeholder. (A legacy carrier's body is never rewritten here;
-        // the legacy-verbatim test pins that.)
-        let _seam_warn_guard = SEAM_WARN_WINDOW.lock().unwrap();
-        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
-        let messages = [
-            ChatMessage::user("look"),
-            ChatMessage::user(format!("saved {marker}")),
-        ];
-        let sanitized = sanitize_image_markers(&messages);
-        assert_eq!(sanitized[0].content, "look");
-        assert_eq!(
-            sanitized[1].content,
-            format!("saved {MEDIA_PLACEHOLDER}"),
-            "the marker in ordinary user text must be replaced"
-        );
-    }
-
-    #[test]
-    fn legacy_carriers_cross_every_seam_as_their_bytes() {
-        // A legacy carrier (nothing declared at the fixed position) is
-        // delivered, replayed, and priced as its bytes: no seam sweeps,
-        // strips, or rewrites its body, marker syntax and data URIs
-        // included.
-        let marker = format!("[{}:{}]", "IMAGE", "/tmp/legacy-shot.png");
-        let data_uri = format!("data:image/png;{}iVBORw0KGgo=", "base64,");
-        let body = format!("saved {marker} and quoted {data_uri} in prose");
-
-        // Legacy native: a pre-upgrade envelope without the attachments key.
-        let legacy_native = ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "tc1",
-                "content": body,
-            })
-            .to_string(),
-        );
-        // Legacy prompt: the results prefix with no count header.
-        let legacy_prompt = ChatMessage::user(format!("[Tool results]\n{body}"));
-
-        for carrier in [&legacy_native, &legacy_prompt] {
-            // The one-shot image seam clones a legacy carrier unchanged; its
-            // gate never even fires, so the input stays borrowed.
-            let messages = [carrier.clone()];
-            match sanitize_image_markers(&messages) {
-                Cow::Borrowed(borrowed) => {
-                    assert_eq!(borrowed[0].content, carrier.content);
-                }
-                _ => panic!("a legacy carrier must not trigger the image seam"),
-            }
-
-            // The stale replay path delivers it verbatim: a history whose
-            // latest user turn is past the carrier, so replay, not
-            // normalization, is the route it takes.
-            let history = vec![
-                ChatMessage::system("s"),
-                ChatMessage::user("u"),
-                ChatMessage::assistant("a"),
-                carrier.clone(),
-                ChatMessage::user("next"),
-            ];
-            let current_turn = current_turn_tool_result_indices(&history);
-            let replayed = replay_message_without_stale_tool_images(3, carrier, &current_turn);
-            assert_eq!(replayed.content, carrier.content);
-            assert_eq!(replayed.role, carrier.role);
-        }
-
-        // Pricing follows the same rule: a legacy carrier contributes no
-        // images, and its summary is its delivered body.
-        let native_summary = message_image_summary(&legacy_native);
-        assert_eq!(native_summary.image_refs, 0);
-        assert_eq!(native_summary.text_bytes, body.len());
-
-        let prompt_summary = message_image_summary(&legacy_prompt);
-        assert_eq!(prompt_summary.image_refs, 0);
-        assert_eq!(prompt_summary.text_bytes, legacy_prompt.content.len());
-    }
-
-    // The assistant history entry for native tool calls is a JSON envelope
-    // (`content` / `tool_calls` / `reasoning_content`). `reasoning_content`
-    // carries signed thinking blocks and `tool_calls[].extra_content` carries
-    // provider signatures; both must replay byte-for-byte, so the seam
-    // rewrites only the envelope's `content` field.
-    #[test]
-    fn sanitize_image_markers_preserves_signed_reasoning_in_assistant_envelope() {
-        // The converted declared-carrier fixture drops an attachment, which
-        // emits the seam WARN: hold the window so the broadcast warning
-        // cannot land in another test's drain window.
-        let _seam_warn_guard = SEAM_WARN_WINDOW.lock().unwrap();
-        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
-        let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
-        let tool_calls = serde_json::json!([{
-            "id": "toolu_1",
-            "name": "shell",
-            "arguments": "{}",
-            "extra_content": {"google": {"thought_signature": "sig_gemini"}},
-        }]);
-        let messages = [
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": format!("saved {marker}"),
-                    "tool_calls": tool_calls.clone(),
-                    "reasoning_content": reasoning.clone(),
-                })
-                .to_string(),
-            ),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "content": "saved",
-                    "tool_call_id": "toolu_1",
-                    "attachments": [{"kind": "image", "target": "/tmp/shot.png"}],
-                })
-                .to_string(),
-            ),
-        ];
-        let sanitized = sanitize_image_markers(&messages);
-        let parsed: serde_json::Value = serde_json::from_str(&sanitized[0].content)
-            .expect("assistant envelope stays valid JSON");
-        assert_eq!(
-            parsed["content"],
-            format!("saved {MEDIA_PLACEHOLDER}"),
-            "the marker in the envelope's content field is replaced"
-        );
-        assert_eq!(
-            parsed["reasoning_content"].as_str(),
-            Some(reasoning.as_str()),
-            "signed thinking must survive the seam byte-for-byte"
-        );
-        assert_eq!(
-            parsed["tool_calls"], tool_calls,
-            "tool calls (including extra_content signatures) must round-trip unchanged"
-        );
-        let tool_parsed: serde_json::Value =
-            serde_json::from_str(&sanitized[1].content).expect("tool JSON stays valid");
-        assert_eq!(
-            tool_parsed["content"], "saved",
-            "a declared carrier's body crosses the seam verbatim"
-        );
-        assert!(
-            tool_parsed["attachments"]
-                .as_array()
-                .is_some_and(|a| a.is_empty()),
-            "the undeliverable declared image attachment is dropped from the list"
-        );
-        assert!(
-            !tool_parsed["content"]
-                .as_str()
-                .is_some_and(|c| c.contains("/tmp/shot.png")),
-            "the raw path must not survive as model-visible text"
-        );
-    }
-
-    // The envelope's only marker lives inside `reasoning_content`, so the
-    // `content` rewrite counts zero and the envelope must come back
-    // byte-identical. The input is a hand-written non-canonical spelling —
-    // `tool_calls` before `content`, a space after a colon, and `\u002f`
-    // escapes inside the marker's path — which serde_json would never
-    // produce: a re-serialization spells the path with `/` and drops the
-    // spaces, so only the zero-rewrite early return can reproduce these
-    // exact bytes.
-    #[test]
-    fn sanitize_image_markers_leaves_assistant_envelope_byte_identical_when_only_reasoning_matches()
-    {
-        let marker = format!("[{}:{}]", "IMAGE", r"\u002ftmp\u002fshot.png");
-        let envelope = format!(
-            r#"{{"tool_calls": [{{"id": "toolu_1", "name": "shell", "arguments": "{{}}", "extra_content": {{"google": {{"thought_signature": "sig_gemini"}}}}}}], "content": "running the tool", "reasoning_content": "{{\"thinking\":\"look at {marker} first\",\"signature\":\"sig_abc\"}}"}}"#
-        );
-        let messages = [ChatMessage::assistant(envelope)];
-        let sanitized = sanitize_image_markers(&messages);
-        assert_eq!(
-            sanitized[0].content, messages[0].content,
-            "an envelope whose content is untouched must not be re-serialized"
-        );
-    }
-
-    // A malformed call list (an element missing `name`/`arguments`) makes
-    // every adapter replay the whole blob as plain assistant text, so the
-    // seam must sanitize it as plain text too: fail-closed whole-string
-    // rewrite, not field-wise protection that would leave a marker inside
-    // `reasoning_content` untouched.
-    #[test]
-    fn sanitize_image_markers_rewrites_whole_string_when_tool_calls_do_not_deserialize() {
-        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
-        let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
-        let envelope = serde_json::json!({
-            "content": "running",
-            "tool_calls": [{"id": "x"}],
-            "reasoning_content": reasoning,
-        })
-        .to_string();
-        let messages = [ChatMessage::assistant(envelope)];
-        let sanitized = sanitize_image_markers(&messages);
-        assert!(
-            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
-            "a malformed call list must fall back to the whole-string rewrite: {}",
-            sanitized[0].content
-        );
-        assert!(
-            !sanitized[0].content.contains("/tmp/shot.png"),
-            "the marker inside the reasoning field must not survive as a raw path: {}",
-            sanitized[0].content
-        );
-    }
-
-    /// Serializes the seam tests that assert on the seam WARN emission: the
-    /// capture subscriber is broadcast, so a warning emitted by one test
-    /// would land in the other's drain window.
-    static SEAM_WARN_WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn sanitize_image_markers_keeps_declared_carrier_bodies_verbatim() {
-        let _seam_warn_guard = SEAM_WARN_WINDOW.lock().unwrap();
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
-        zeroclaw_log::try_install_capture_subscriber();
-        let mut rx = zeroclaw_log::subscribe_or_install();
-        while rx.try_recv().is_ok() {}
-
-        // A tool that read a source file quoting a path marker and declared
-        // no attachments: the body is text under the attachment-identity
-        // contract and must cross the seam byte for byte.
-        let marker = zeroclaw_api::tool_carrier::marker_line(&image_marker("/tmp/example.png"));
-        let body = format!("source: {marker} end");
-
-        // Native declared-zero envelope (empty attachments array).
-        let native = ChatMessage::tool(native_carrier("tc1", &body, &[]));
-        let messages = [native.clone()];
-        let sanitized = sanitize_image_markers(&messages);
-        assert_eq!(
-            sanitized[0].content, native.content,
-            "a declared native carrier's body must pass the seam byte for byte"
-        );
-
-        // Prompt carrier with a real count-zero header.
-        let prompt = ChatMessage::user(prompt_carrier(&body, &[]));
-        let messages = [prompt.clone()];
-        let sanitized = sanitize_image_markers(&messages);
-        assert_eq!(
-            sanitized[0].content, prompt.content,
-            "a declared prompt carrier's body must pass the seam byte for byte"
-        );
-        let parsed = zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&sanitized[0].content)
-            .expect("carrier stays parseable");
-        assert!(parsed.declared);
-        assert!(parsed.attachments.is_empty(), "no rebuild may add lines");
-        assert_eq!(parsed.text, body);
-
-        let mut seam_warnings = 0usize;
-        while let Ok(value) = rx.try_recv() {
-            if let Some(message) = value.get("message").and_then(|v| v.as_str())
-                && message.contains("one-shot dispatch seam")
-            {
-                seam_warnings += 1;
-            }
-        }
-        assert_eq!(
-            seam_warnings, 0,
-            "a verbatim declared carrier must not emit the strip warning"
-        );
-
-        // Legacy control: a legacy native envelope (no attachments key)
-        // with the same quoted marker crosses the seam byte for byte —
-        // its bytes are the delivery, and no seam rewrites them.
-        let legacy = ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "tc2",
-                "content": body.clone(),
-            })
-            .to_string(),
-        );
-        let messages = [legacy.clone()];
-        let sanitized = sanitize_image_markers(&messages);
-        assert_eq!(
-            sanitized[0].content, legacy.content,
-            "a legacy carrier is cloned unchanged, markers and all"
-        );
-    }
-
-    // `null` is not an envelope either: without a call list to deserialize,
-    // the adapters replay the blob as plain text, and the seam must match.
-    #[test]
-    fn sanitize_image_markers_rewrites_whole_string_when_tool_calls_is_not_an_array() {
-        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
-        let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
-        let envelope = serde_json::json!({
-            "content": "running",
-            "tool_calls": null,
-            "reasoning_content": reasoning,
-        })
-        .to_string();
-        let messages = [ChatMessage::assistant(envelope)];
-        let sanitized = sanitize_image_markers(&messages);
-        assert!(
-            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
-            "a null call list must fall back to the whole-string rewrite: {}",
-            sanitized[0].content
-        );
-        assert!(
-            !sanitized[0].content.contains("/tmp/shot.png"),
-            "the marker inside the reasoning field must not survive as a raw path: {}",
-            sanitized[0].content
-        );
-    }
-
-    // Audio twin of the image case: the seam rewrites the envelope's
-    // `content` field and leaves the signed reasoning untouched.
-    #[test]
-    fn sanitize_audio_markers_preserves_signed_reasoning_in_assistant_envelope() {
-        // Same as the image twin: the converted fixture drops a declared
-        // audio attachment and emits the seam WARN, so hold the window.
-        let _seam_warn_guard = SEAM_WARN_WINDOW.lock().unwrap();
-        let marker = format!("[{}:{}]", "AUDIO", "/tmp/clip.wav");
-        let reasoning = format!(
-            r#"{{"thinking":"listen to {marker} before answering","signature":"sig_abc"}}"#
-        );
-        let tool_calls = serde_json::json!([{
-            "id": "toolu_1",
-            "name": "shell",
-            "arguments": "{}",
-            "extra_content": {"google": {"thought_signature": "sig_gemini"}},
-        }]);
-        let messages = [
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": format!("heard {marker}"),
-                    "tool_calls": tool_calls.clone(),
-                    "reasoning_content": reasoning.clone(),
-                })
-                .to_string(),
-            ),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "content": "heard",
-                    "tool_call_id": "toolu_1",
-                    "attachments": [{"kind": "audio", "target": "/tmp/clip.wav"}],
-                })
-                .to_string(),
-            ),
-        ];
-        let sanitized = sanitize_audio_markers(&messages);
-        let parsed: serde_json::Value = serde_json::from_str(&sanitized[0].content)
-            .expect("assistant envelope stays valid JSON");
-        assert_eq!(
-            parsed["content"],
-            format!("heard {MEDIA_PLACEHOLDER}"),
-            "the audio marker in the envelope's content field is replaced"
-        );
-        assert_eq!(
-            parsed["reasoning_content"].as_str(),
-            Some(reasoning.as_str()),
-            "signed thinking must survive the seam byte-for-byte"
-        );
-        assert_eq!(
-            parsed["tool_calls"], tool_calls,
-            "tool calls (including extra_content signatures) must round-trip unchanged"
-        );
-        let tool_parsed: serde_json::Value =
-            serde_json::from_str(&sanitized[1].content).expect("tool JSON stays valid");
-        assert_eq!(
-            tool_parsed["content"], "heard",
-            "a declared carrier's body crosses the seam verbatim"
-        );
-        assert!(
-            tool_parsed["attachments"]
-                .as_array()
-                .is_some_and(|a| a.is_empty()),
-            "the declared audio attachment is dropped from the list"
-        );
-    }
-
-    // Audio twin of the malformed-call-list case: the envelope's call list
-    // does not deserialize, so the adapters replay the blob as plain text
-    // and the seam rewrites it as plain text, marker inside
-    // `reasoning_content` included.
-    #[test]
-    fn sanitize_audio_markers_rewrites_whole_string_when_tool_calls_do_not_deserialize() {
-        let marker = format!("[{}:{}]", "AUDIO", "/tmp/clip.wav");
-        let reasoning = format!(
-            r#"{{"thinking":"listen to {marker} before answering","signature":"sig_abc"}}"#
-        );
-        let envelope = serde_json::json!({
-            "content": "running",
-            "tool_calls": [{"id": "x"}],
-            "reasoning_content": reasoning,
-        })
-        .to_string();
-        let messages = [ChatMessage::assistant(envelope)];
-        let sanitized = sanitize_audio_markers(&messages);
-        assert!(
-            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
-            "a malformed call list must fall back to the whole-string rewrite: {}",
-            sanitized[0].content
-        );
-        assert!(
-            !sanitized[0].content.contains("/tmp/clip.wav"),
-            "the marker inside the reasoning field must not survive as a raw path: {}",
-            sanitized[0].content
-        );
-    }
-
-    #[test]
-    fn sanitize_image_markers_drops_undeliverable_declared_attachments() {
-        let _seam_warn_guard = SEAM_WARN_WINDOW.lock().unwrap();
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
-        zeroclaw_log::try_install_capture_subscriber();
-        let mut rx = zeroclaw_log::subscribe_or_install();
-        while rx.try_recv().is_ok() {}
-
-        // A declared prompt carrier with one path attachment and one inline
-        // data URI: the path reference cannot be validated at this seam, so
-        // it drops from the declaration, the inline attachment stays, and
-        // the body is byte-identical.
-        let path_target = "/tmp/undeclared-shot.png";
-        let inline_target = "data:image/png;base64,iVBORw0KGgo=";
-        let body = "two shots came back";
-        let carrier = ChatMessage::user(prompt_carrier(
-            body,
-            &[path_target.to_string(), inline_target.to_string()],
-        ));
-
-        let messages = [carrier];
-        let sanitized = sanitize_image_markers(&messages);
-        let parsed = zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&sanitized[0].content)
-            .expect("carrier stays parseable");
-        assert!(
-            parsed.declared,
-            "dropping an attachment must not degrade the carrier to legacy"
-        );
-        assert_eq!(
-            parsed.attachments.len(),
-            1,
-            "only the undeliverable path attachment drops"
-        );
-        assert_eq!(parsed.attachments[0].target, inline_target);
-        assert_eq!(
-            parsed.attachments[0].kind,
-            zeroclaw_api::media::MarkerKind::Image
-        );
-        assert_eq!(parsed.text, body, "the body is byte-identical");
-        assert!(
-            sanitized[0]
-                .content
-                .contains(&zeroclaw_api::tool_carrier::marker_line(&image_marker(
-                    inline_target
-                ))),
-            "the retained attachment's line re-renders: {}",
-            sanitized[0].content
-        );
-        assert!(
-            !sanitized[0].content.contains(path_target),
-            "the dropped reference must not survive anywhere: {}",
-            sanitized[0].content
-        );
-
-        let mut seam_warnings = 0usize;
-        while let Ok(value) = rx.try_recv() {
-            if let Some(message) = value.get("message").and_then(|v| v.as_str())
-                && message.contains("one-shot dispatch seam")
-            {
-                seam_warnings += 1;
-            }
-        }
-        assert_eq!(
-            seam_warnings, 1,
-            "dropping a declared path attachment must emit the fail-closed warning"
-        );
-    }
-
     #[tokio::test]
-    async fn prepare_messages_preserves_document_marker_for_delivery() {
-        // A tool result that declares a document and an audio attachment:
-        // the document rides the declared list to the provider — the agent
-        // copies that path into an outbound reply marker to deliver the
-        // file, and file tools read it on request — while the audio
-        // attachment drops, because no provider resolves audio into parts
-        // and a bare audio path is not actionable. (A legacy carrier's
-        // body keeps its bytes verbatim, audio markers included.)
-        let attachments = vec![
-            zeroclaw_api::media::RenderedMarker {
-                target: "/tmp/report.pdf".to_string(),
-                kind: zeroclaw_api::media::MarkerKind::Document,
-            },
-            zeroclaw_api::media::RenderedMarker {
-                target: "/tmp/note.wav".to_string(),
-                kind: zeroclaw_api::media::MarkerKind::Audio,
-            },
-        ];
-        let envelope = serde_json::json!({
-            "tool_call_id": "tc1",
-            "content": "generated",
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
-        })
-        .to_string();
-        let history = vec![
-            ChatMessage::user("send me the report"),
-            ChatMessage::tool(envelope),
-        ];
-        let cfg = MultimodalConfig::default();
-        let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
-        let tool_msg = prepared
-            .messages
-            .iter()
-            .find(|m| m.role == "tool")
-            .expect("tool message survives prep");
-        let parsed = zeroclaw_api::tool_carrier::parse_native_tool_carrier(&tool_msg.content)
-            .expect("carrier stays parseable");
-        assert!(parsed.declared);
-        assert_eq!(
-            parsed.attachments.len(),
-            1,
-            "only the audio attachment drops: {:?}",
-            parsed.attachments
-        );
-        assert_eq!(
-            parsed.attachments[0].kind,
-            zeroclaw_api::media::MarkerKind::Document
-        );
-        assert_eq!(parsed.text, "generated", "the body is verbatim");
-        assert!(
-            !tool_msg.content.contains("/tmp/note.wav"),
-            "the audio path must not reach the provider: {}",
-            tool_msg.content
-        );
-        assert!(
-            tool_msg.content.contains("/tmp/report.pdf"),
-            "the document path stays declared and model-visible: {}",
-            tool_msg.content
-        );
-    }
-    #[tokio::test]
-    async fn prepare_messages_strips_audio_but_keeps_image_marker() {
+    async fn prepare_messages_normalizes_images_and_preserves_other_attachments() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("shot.png");
         std::fs::write(&path, valid_png()).unwrap();
-        let history = vec![ChatMessage::user(format!(
-            "look [IMAGE:{}] and hear [AUDIO:/tmp/clip.wav]",
-            path.display()
-        ))];
+        let history = vec![ChatMessage::user("look  and hear").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (path.display()).to_string(),
+            },
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Audio,
+                target: "/tmp/clip.wav".to_string(),
+            },
+        ])];
         let cfg = MultimodalConfig::default();
         let prepared = prepare_messages_for_provider(&history, &cfg).await.unwrap();
         let content = &prepared.messages[0].content;
@@ -5928,48 +3376,13 @@ mod tests {
             !content.contains("/tmp/clip.wav"),
             "audio path must be stripped: {content}"
         );
-        assert!(content.contains(MEDIA_PLACEHOLDER));
-        // The image marker is still normalized to a data URI alongside it.
+        assert!(prepared.messages[0].attachments.iter().any(|attachment| {
+            attachment.kind == zeroclaw_api::media::AttachmentKind::Audio
+                && attachment.target == "/tmp/clip.wav"
+        }));
+        assert_eq!(content, &history[0].content);
+        // The image reference is still normalized to a data URI alongside it.
         assert!(prepared.contains_images, "image still inlined: {content}");
-    }
-
-    #[test]
-    fn parse_image_markers_extracts_multiple_markers() {
-        let input = "Check this [IMAGE:/tmp/a.png] and this [IMAGE:https://example.com/b.jpg]";
-        let (cleaned, refs) = parse_image_markers(input);
-
-        assert_eq!(cleaned, "Check this  and this");
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0], "/tmp/a.png");
-        assert_eq!(refs[1], "https://example.com/b.jpg");
-    }
-
-    #[test]
-    fn is_windows_unc_path_accepts_shares_and_rejects_others() {
-        assert!(is_windows_unc_path(r"\\server\share\pic.png"));
-        assert!(is_windows_unc_path(r"\\server\share\sub\pic.png"));
-        // Verbatim / device prefixes are not plain shares.
-        assert!(!is_windows_unc_path(r"\\?\C:\Users\me\a.png"));
-        assert!(!is_windows_unc_path(r"\\?\UNC\server\share\a.png"));
-        assert!(!is_windows_unc_path(r"\\.\PhysicalDrive0"));
-        // Needs both a server and a further segment.
-        assert!(!is_windows_unc_path(r"\\server"));
-        assert!(!is_windows_unc_path(r"\\"));
-        // Non-UNC inputs.
-        assert!(!is_windows_unc_path("/home/me/a.png"));
-        assert!(!is_windows_unc_path(r"C:\Users\me\a.png"));
-    }
-
-    #[test]
-    fn parse_image_markers_extracts_unc_path() {
-        // Regression for theWindows follow-up: `image_info` unwraps the
-        // verbatim-UNC prefix (`\\?\UNC\…`) to a plain `\\server\share\…`
-        // path, which must be treated as a loadable image reference (not left
-        // as literal text) so the image reaches vision models.
-        let input = r"File: [IMAGE:\\server\share\pic.png]";
-        let (_, refs) = parse_image_markers(input);
-        assert_eq!(refs.len(), 1, "UNC marker should be extracted as a ref");
-        assert_eq!(refs[0], r"\\server\share\pic.png");
     }
 
     #[test]
@@ -6124,7 +3537,7 @@ mod tests {
                 bytes.truncate(bytes.len() - 4);
                 bytes
             }),
-            ("standalone marker before the scan", {
+            ("standalone attachment before the scan", {
                 let mut bytes = jpeg_sof_header(17, 9, &SAMPLING_420);
                 bytes.extend_from_slice(&[0xff, 0x01]);
                 bytes.extend_from_slice(
@@ -6514,7 +3927,7 @@ mod tests {
         assert!(jpeg_frame_header(&ordinary).is_some());
 
         let mut bytes = jpeg_with_declared_dimensions(3000, 3000);
-        // TEM is a standalone marker. zune-jpeg does not treat it like the
+        // TEM is a standalone attachment. zune-jpeg does not treat it like the
         // projection's lengthless-marker path, so a fake one-component SOF
         // after TEM could otherwise undercharge the real frame that follows.
         bytes.splice(
@@ -6591,222 +4004,6 @@ mod tests {
         validate_within_budget("sibling.png", "image/png", &valid_png(), &mut budget)
             .await
             .expect("a valid sibling must remain admissible");
-    }
-
-    #[tokio::test]
-    async fn oversized_data_uri_is_refused_before_base64_decoding() {
-        // `STANDARD.decode` sizes its output buffer from the input length, so
-        // decoding first and size-checking afterwards lets an oversized marker
-        // allocate before any limit applies — on the async preparation task,
-        // outside the `spawn_blocking` boundary that isolates pixel decoding.
-        //
-        // The assertion here is deliberately on the *base64* seam, not the
-        // pixel-decode counter. An oversized data URI never reaches the pixel
-        // decoder either way: the old ordering decoded the base64, then failed
-        // in `validate_size`, so a `DECODE_CALLS == 0` assertion holds both
-        // before and after this fix and proves nothing. `BASE64_DECODE_CALLS`
-        // is incremented immediately before `STANDARD.decode`, so it is zero
-        // only if the encoded-length ceiling refused the payload first.
-        // `effective_limits()` returns `(max_images, max_image_size_mb)` — the
-        // second value is MEGABYTES, not bytes.
-        let cfg = MultimodalConfig::default();
-        let (_, max_mb) = cfg.effective_limits();
-        let max_bytes = max_mb * 1024 * 1024;
-
-        // Comfortably above `ceil(max_bytes / 3) * 4 + slack`. All-`A` is valid
-        // base64, so the old path would have decoded it successfully and only
-        // then failed the size check — exactly the allocation being prevented.
-        let oversized = "A".repeat(max_bytes / 3 * 4 + 4096);
-        let uri = format!("[IMAGE:data:image/png;base64,{oversized}]");
-
-        let (result, base64_decodes) = counting_base64_decodes(async {
-            prepare_messages_for_provider(&[ChatMessage::user(uri)], &cfg)
-                .await
-                .expect("provider preparation does not hard-fail on a refused image")
-        })
-        .await;
-
-        assert!(
-            !result.contains_images,
-            "the oversized data URI must be skipped; it reached the prepared payload instead"
-        );
-        assert_eq!(
-            base64_decodes, 0,
-            "the encoded-length ceiling must refuse the payload before `STANDARD.decode` runs"
-        );
-
-        // A payload inside the ceiling must still decode, so the guard is not
-        // simply rejecting everything.
-        let valid_uri = format!(
-            "[IMAGE:data:image/png;base64,{}]",
-            STANDARD.encode(valid_png())
-        );
-        let (ok_result, ok_base64_decodes) = counting_base64_decodes(async {
-            prepare_messages_for_provider(&[ChatMessage::user(valid_uri)], &cfg)
-                .await
-                .expect("a within-ceiling data URI is accepted")
-        })
-        .await;
-        assert!(
-            ok_result.contains_images,
-            "a data URI within the ceiling must still reach the provider"
-        );
-        assert_eq!(
-            ok_base64_decodes, 1,
-            "the within-ceiling payload must actually be base64-decoded"
-        );
-    }
-
-    #[tokio::test]
-    async fn over_ceiling_marker_is_refused_on_the_production_path() {
-        // The parser-boundary counterpart to the test above.
-        //
-        // That one drives a ~28 MB marker, which is past the configured
-        // encoded ceiling but *below* `MAX_IMAGE_MARKER_BYTES`, so it proves
-        // the `normalize_data_uri` guard. This one drives a marker past the
-        // parser ceiling, which is refused earlier still — before
-        // `collapse_wrapped_marker` owns the span at all.
-        //
-        // Both allocation shapes are covered because they take different paths
-        // inside `collapse_wrapped_marker`: the single-line branch copies once,
-        // the wrapped branch allocates a build buffer *and* a trimmed copy.
-        // Driving them through `prepare_messages_for_provider` rather than the
-        // parser directly is what makes this a production-path proof: every
-        // counting, trimming, and normalization pass runs.
-        let cfg = MultimodalConfig::default();
-        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
-
-        for (label, marker_body, terminated) in [
-            ("single-line", payload.clone(), true),
-            // Newlines force the wrapped branch, the costlier of the two.
-            ("wrapped", format!("{payload}\n  continued"), true),
-            // The no-closing-bracket path must apply the same bound without
-            // copying the complete remainder into the cleaned output.
-            ("unterminated", payload.clone(), false),
-        ] {
-            let message = if terminated {
-                format!("before [IMAGE:data:image/png;base64,{marker_body}] after")
-            } else {
-                format!("before [IMAGE:data:image/png;base64,{marker_body}")
-            };
-
-            let ((result, base64_decodes), pixel_decodes) = counting_decodes(async {
-                counting_base64_decodes(async {
-                    prepare_messages_for_provider(&[ChatMessage::user(message.clone())], &cfg)
-                        .await
-                        .expect("preparation does not hard-fail on a refused marker")
-                })
-                .await
-            })
-            .await;
-
-            assert!(
-                !result.contains_images,
-                "{label}: an over-ceiling marker must not reach the provider"
-            );
-            assert_eq!(
-                base64_decodes, 0,
-                "{label}: rejection must happen before `STANDARD.decode` runs"
-            );
-            assert_eq!(
-                pixel_decodes, 0,
-                "{label}: rejection must happen before any pixel decode"
-            );
-
-            // The surrounding prose survives, but the attacker-controlled
-            // marker body is replaced with the same fixed refusal note for
-            // every over-ceiling image-shaped candidate.
-            let content = &result.messages[0].content;
-            assert!(
-                content.starts_with("before "),
-                "{label}: surrounding prose must survive the refusal"
-            );
-            assert!(
-                content.contains(REJECTED_IMAGE_MARKER_NOTE),
-                "{label}: the refusal must leave a fixed provider-visible note"
-            );
-            assert!(
-                !content.contains("data:image") && !content.contains(&payload[..128]),
-                "{label}: the raw marker must not reach provider-visible content"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn counting_and_cap_selection_do_not_materialize_uncalled_candidates() {
-        // Production-path counterpart of the scan tests: every counting,
-        // trimming, and selection pass runs, and the ownership counter
-        // observes exactly what those passes own. Three under-ceiling markers
-        // with a one-image cap means only the newest message's candidate may
-        // ever be materialized — the counts, the cap trim, and the
-        // stale-replay strip must all classify on borrowed spans.
-        //
-        // The payloads are over the (clamped, ≤ 20 MiB) encoded ceiling, so
-        // the surviving candidate is refused at the normalize entry guard:
-        // the test observes ownership, not decode work.
-        let payload_bytes = 30 * 1024 * 1024;
-        let payload = "A".repeat(payload_bytes);
-        let config = MultimodalConfig {
-            max_images: 1,
-            ..MultimodalConfig::default()
-        };
-        let messages: Vec<ChatMessage> = (0..3)
-            .map(|i| {
-                ChatMessage::user(format!(
-                    "message {i} [IMAGE:data:image/png;base64,{payload}]"
-                ))
-            })
-            .collect();
-
-        let (((result, base64_decodes), pixel_decodes), owned_bytes) =
-            counting_candidate_ownership(async {
-                counting_base64_decodes(async {
-                    counting_decodes(async {
-                        prepare_messages_for_provider(&messages, &config)
-                            .await
-                            .expect("preparation does not hard-fail on refused candidates")
-                    })
-                    .await
-                })
-                .await
-            })
-            .await;
-
-        assert_eq!(
-            base64_decodes, 0,
-            "the encoded ceiling must refuse before base64 decoding"
-        );
-        assert_eq!(pixel_decodes, 0, "nothing reaches a pixel decode");
-        // No pass before or during selection owned more than the one chosen
-        // candidate body. Before the counting paths went non-owning, the
-        // first count alone owned all three.
-        assert!(
-            owned_bytes < 2 * payload_bytes,
-            "counting and cap selection must not materialize every candidate \
-             (owned {owned_bytes} bytes for {payload_bytes}-byte payloads)"
-        );
-
-        // The chosen-set semantics are visible in the output: the two oldest
-        // messages were stripped as units and keep only their prose, the
-        // newest kept its prose plus the refusal note, and no raw marker
-        // survives anywhere.
-        assert!(!result.contains_images);
-        for (index, message) in result.messages.iter().enumerate() {
-            assert!(
-                !message.content.contains("data:image")
-                    && !message.content.contains(&payload[..128]),
-                "message {index}: the raw marker must not reach provider-visible content"
-            );
-        }
-        assert!(
-            result.messages[0].content.contains("message 0"),
-            "the trimmed messages keep their text, losing only the image"
-        );
-        assert!(
-            result.messages[2].content.contains("message 2")
-                && result.messages[2].content.contains("could not be loaded"),
-            "the surviving candidate is refused by the encoded ceiling, not dropped silently"
-        );
     }
 
     #[tokio::test]
@@ -6907,10 +4104,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("truncated.png");
         std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-        let history = vec![ChatMessage::user(format!(
-            "what is in this? [IMAGE:{}]",
-            path.display()
-        ))];
+        let history = vec![ChatMessage::user("what is in this?").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (path.display()).to_string(),
+            },
+        ])];
 
         let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
             .await
@@ -6938,11 +4137,16 @@ mod tests {
         let bad = temp.path().join("bad.png");
         std::fs::write(&good, valid_png()).unwrap();
         std::fs::write(&bad, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-        let history = vec![ChatMessage::user(format!(
-            "compare [IMAGE:{}] and [IMAGE:{}]",
-            good.display(),
-            bad.display()
-        ))];
+        let history = vec![ChatMessage::user("compare  and").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (good.display()).to_string(),
+            },
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (bad.display()).to_string(),
+            },
+        ])];
 
         let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
             .await
@@ -6968,10 +4172,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("bomb.png");
         std::fs::write(&path, png_bomb(60_000, 60_000)).unwrap();
-        let history = vec![ChatMessage::user(format!(
-            "describe [IMAGE:{}]",
-            path.display()
-        ))];
+        let history = vec![ChatMessage::user("describe").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (path.display()).to_string(),
+            },
+        ])];
 
         let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
             .await
@@ -7005,18 +4211,24 @@ mod tests {
         for i in 0..12 {
             let path = temp.path().join(format!("bomb_{i}.png"));
             std::fs::write(&path, png_bomb(40_000, 40_000)).unwrap();
-            history.push(ChatMessage::user(format!(
-                "old {i} [IMAGE:{}]",
-                path.display()
-            )));
+            history.push(
+                ChatMessage::user(format!("old {i} ")).with_attachments(vec![
+                    zeroclaw_api::media::AttachmentReference {
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
+                        target: (path.display()).to_string(),
+                    },
+                ]),
+            );
             history.push(ChatMessage::assistant("ack"));
         }
         let good = temp.path().join("good.png");
         std::fs::write(&good, valid_png()).unwrap();
-        history.push(ChatMessage::user(format!(
-            "newest [IMAGE:{}]",
-            good.display()
-        )));
+        history.push(ChatMessage::user("newest ").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (good.display()).to_string(),
+            },
+        ]));
 
         let config = MultimodalConfig {
             max_images: 1,
@@ -7051,40 +4263,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn aggregate_decode_budget_bounds_total_work_per_normalization_call() {
-        // Each image is individually under both the size and dimension caps,
-        // so only the aggregate budget bounds the total decode cost of one
-        // normalization call. Preparation must still succeed and still inline
-        // whatever fits inside the budget.
-        let temp = tempfile::tempdir().unwrap();
-        let mut markers = String::new();
-        for i in 0..4 {
-            let path = temp.path().join(format!("ok_{i}.png"));
-            std::fs::write(&path, valid_png()).unwrap();
-            markers.push_str(&format!(" [IMAGE:{}]", path.display()));
-        }
-        let history = vec![ChatMessage::user(format!("batch{markers}"))];
-
-        let config = MultimodalConfig {
-            max_images: 4,
-            ..MultimodalConfig::default()
-        };
-        let prepared = prepare_messages_for_provider(&history, &config)
-            .await
-            .expect("a batch within budget must prepare cleanly");
-
-        let content = &prepared.messages[0].content;
-        assert!(
-            prepared.contains_images,
-            "valid batch must be inlined: {content}"
-        );
-        assert!(
-            !content.contains("could not be loaded"),
-            "nothing in a within-budget batch should be skipped: {content}"
-        );
-    }
-
     /// Runs `body` with a fresh [`DECODE_CALLS`] counter scoped to it, and
     /// returns `(body's value, decodes observed)`.
     ///
@@ -7100,52 +4278,6 @@ mod tests {
                 let value = body.await;
                 let count =
                     DECODE_CALLS.with(|calls| calls.load(std::sync::atomic::Ordering::Relaxed));
-                (value, count)
-            })
-            .await
-    }
-
-    /// Runs `body` with a fresh [`BASE64_DECODE_CALLS`] counter scoped to it,
-    /// and returns `(body's value, base64 decodes observed)`.
-    ///
-    /// Distinct from [`counting_decodes`]: that counter only observes the
-    /// *pixel* decoder, which an oversized data URI never reaches whether it is
-    /// rejected before or after `STANDARD.decode`. This one observes the base64
-    /// decode itself, which is the allocation the encoded-length ceiling exists
-    /// to prevent.
-    async fn counting_base64_decodes<F, T>(body: F) -> (T, usize)
-    where
-        F: std::future::Future<Output = T>,
-    {
-        let counter = std::sync::atomic::AtomicUsize::new(0);
-        BASE64_DECODE_CALLS
-            .scope(counter, async move {
-                let value = body.await;
-                let count = BASE64_DECODE_CALLS
-                    .with(|calls| calls.load(std::sync::atomic::Ordering::Relaxed));
-                (value, count)
-            })
-            .await
-    }
-
-    /// Runs `body` with a fresh [`CANDIDATE_OWNERSHIP_BYTES`] counter scoped
-    /// to it, and returns `(body's value, candidate bytes owned)`.
-    ///
-    /// Distinct from the decode counters: those observe work the ceilings
-    /// exist to prevent; this one observes *ownership* — the parser taking a
-    /// marker span into an owned `String`. A production-path run whose
-    /// counting passes stay non-owning can only accumulate bytes for the
-    /// candidates the cap actually chose.
-    async fn counting_candidate_ownership<F, T>(body: F) -> (T, usize)
-    where
-        F: std::future::Future<Output = T>,
-    {
-        let counter = std::sync::atomic::AtomicUsize::new(0);
-        CANDIDATE_OWNERSHIP_BYTES
-            .scope(counter, async move {
-                let value = body.await;
-                let count = CANDIDATE_OWNERSHIP_BYTES
-                    .with(|owned| owned.load(std::sync::atomic::Ordering::Relaxed));
                 (value, count)
             })
             .await
@@ -7245,8 +4377,18 @@ mod tests {
         std::fs::write(&new_path, real_png(512, 512)).unwrap();
 
         let history = vec![
-            ChatMessage::user(format!("old [IMAGE:{}]", old_path.display())),
-            ChatMessage::user(format!("new [IMAGE:{}]", new_path.display())),
+            ChatMessage::user("old").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (old_path.display()).to_string(),
+                },
+            ]),
+            ChatMessage::user("new").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (new_path.display()).to_string(),
+                },
+            ]),
         ];
 
         let (prepared, decodes) = counting_decodes(async {
@@ -7406,11 +4548,16 @@ mod tests {
         // Put the corrupt GIF first so it reaches the shared budget before the
         // valid PNG. A generic "GIF error closes the budget" rule would discard
         // the valid sibling as collateral damage.
-        let history = vec![ChatMessage::user(format!(
-            "compare [IMAGE:{}] with [IMAGE:{}]",
-            bad.display(),
-            good.display()
-        ))];
+        let history = vec![ChatMessage::user("compare  with").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (bad.display()).to_string(),
+            },
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (good.display()).to_string(),
+            },
+        ])];
         let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
             .await
             .expect("a corrupt animation must be skipped without failing preparation");
@@ -7489,8 +4636,18 @@ mod tests {
         // therefore still pass validation despite the GIF having been rejected
         // before it.
         let history = vec![
-            ChatMessage::user(format!("here is [IMAGE:{}]", old_png.display())),
-            ChatMessage::user(format!("check this [IMAGE:{}]", new_gif.display())),
+            ChatMessage::user("here is").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (old_png.display()).to_string(),
+                },
+            ]),
+            ChatMessage::user("check this").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (new_gif.display()).to_string(),
+                },
+            ]),
         ];
         let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
             .await
@@ -9026,8 +6183,18 @@ mod tests {
         std::fs::write(&new_webp, oversized_canvas_webp(true)).unwrap();
 
         let history = vec![
-            ChatMessage::user(format!("photo [IMAGE:{}]", old_png.display())),
-            ChatMessage::user(format!("check this [IMAGE:{}]", new_webp.display())),
+            ChatMessage::user("photo").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (old_png.display()).to_string(),
+                },
+            ]),
+            ChatMessage::user("check this").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (new_webp.display()).to_string(),
+                },
+            ]),
         ];
         let (prepared, decodes) = counting_decodes(prepare_messages_for_provider(
             &history,
@@ -9144,9 +6311,12 @@ mod tests {
     #[tokio::test]
     async fn corrupt_data_uri_is_skipped() {
         let b64 = STANDARD.encode([0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']);
-        let history = vec![ChatMessage::user(format!(
-            "look [IMAGE:data:image/png;base64,{b64}]"
-        ))];
+        let history = vec![ChatMessage::user("look").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: format!("data:image/png;base64,{b64}").to_string(),
+            },
+        ])];
 
         let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
             .await
@@ -9154,573 +6324,6 @@ mod tests {
 
         assert!(!prepared.contains_images);
         assert!(prepared.messages[0].content.contains("could not be loaded"));
-    }
-
-    #[test]
-    fn parse_image_markers_collapses_line_wrapped_path() {
-        // Terminal-wrapped paste: a long path split across two rows with
-        // leading indentation should be recovered into the original path.
-        let input = "from the logs whether the agent emits\n  [IMAGE:/home/zeroclaw_user/.zeroclaw/workspace/signal_i\n  nbound/attachment.jpg] (which the\n  channel resolves)";
-        let (_, refs) = parse_image_markers(input);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(
-            refs[0],
-            "/home/zeroclaw_user/.zeroclaw/workspace/signal_inbound/attachment.jpg"
-        );
-    }
-
-    #[test]
-    fn parse_image_markers_leaves_placeholder_markers_as_literal_text() {
-        // Illustrative markdown like `[IMAGE:...]` or `[IMAGE:<path>]`
-        // (e.g. in agent-authored prose the user quotes back) is not a
-        // loadable reference and must stay as literal text — otherwise the
-        // multimodal loader errors every turn the conversation replays.
-        let input = "example: `[IMAGE:...]` or `[IMAGE:<path>]` or `[IMAGE:example.png]`";
-        let (cleaned, refs) = parse_image_markers(input);
-        assert!(
-            refs.is_empty(),
-            "no placeholder should be treated as a loadable ref, got: {refs:?}"
-        );
-        assert!(cleaned.contains("[IMAGE:...]"));
-        assert!(cleaned.contains("[IMAGE:<path>]"));
-        assert!(cleaned.contains("[IMAGE:example.png]"));
-    }
-
-    #[test]
-    fn parse_image_markers_preserves_spaces_in_path() {
-        // Spaces within a single-line marker are legitimate (paths can
-        // contain spaces) and must survive unchanged.
-        let input = "look at [IMAGE:/tmp/my photos/beetle.png] please";
-        let (_, refs) = parse_image_markers(input);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0], "/tmp/my photos/beetle.png");
-    }
-
-    #[test]
-    fn parse_image_markers_keeps_invalid_empty_marker() {
-        let input = "hello [IMAGE:] world";
-        let (cleaned, refs) = parse_image_markers(input);
-
-        assert_eq!(cleaned, "hello [IMAGE:] world");
-        assert!(refs.is_empty());
-    }
-
-    #[test]
-    fn parse_image_markers_refuses_over_ceiling_marker_without_owning_it() {
-        // The parser copies a candidate span (twice, for a line-wrapped marker)
-        // before any downstream ceiling can see it, so the span itself has to be
-        // bounded here. A loadable over-ceiling marker is replaced by fixed
-        // text and never becomes a candidate.
-        //
-        // Both shapes are covered because they take different paths inside
-        // `collapse_wrapped_marker`: the single-line path allocates once, the
-        // wrapped path allocates a build buffer *and* a trimmed copy.
-        let oversized_payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
-
-        for (label, payload) in [
-            ("single-line", oversized_payload.clone()),
-            // Newlines force the wrapped branch, which is the costlier one.
-            ("wrapped", format!("{oversized_payload}\n  continued")),
-        ] {
-            let input = format!("before [IMAGE:data:image/png;base64,{payload}] after");
-            let (cleaned, refs) = parse_image_markers(&input);
-
-            assert!(
-                refs.is_empty(),
-                "{label}: an over-ceiling marker must never become a candidate"
-            );
-            assert!(
-                cleaned.contains(REJECTED_IMAGE_MARKER_NOTE),
-                "{label}: an over-ceiling marker must become a bounded note"
-            );
-            assert!(
-                !cleaned.contains("data:image") && !cleaned.contains(&oversized_payload[..128]),
-                "{label}: the cleaned output must not retain the raw marker"
-            );
-        }
-
-        let unterminated = format!("before [IMAGE:data:image/png;base64,{oversized_payload}");
-        let (cleaned, refs) = parse_image_markers(&unterminated);
-        assert!(refs.is_empty());
-        assert!(cleaned.contains(REJECTED_IMAGE_MARKER_NOTE));
-        assert!(!cleaned.contains("data:image"));
-
-        // A marker at the ceiling is still accepted, so the guard rejects only
-        // what is genuinely past it.
-        let at_ceiling = "A".repeat(MAX_IMAGE_MARKER_BYTES - "data:image/png;base64,".len());
-        let input = format!("[IMAGE:data:image/png;base64,{at_ceiling}]");
-        let (_, refs) = parse_image_markers(&input);
-        assert_eq!(
-            refs.len(),
-            1,
-            "a marker exactly at the ceiling must still be extracted"
-        );
-    }
-
-    #[test]
-    fn scan_mode_counts_under_ceiling_markers_without_owning_them() {
-        // The over-ceiling test above proves a single oversized span is
-        // refused before `collapse_wrapped_marker` runs. This one pins the
-        // other half of the ownership boundary: markers *under* the ceiling
-        // stay unowned while counting, so several large-but-legal markers
-        // cannot allocate through a count — only the later, cap-chosen
-        // normalization pass may own them.
-        let payload = "A".repeat(30 * 1024 * 1024);
-        let input = format!(
-            "one [IMAGE:data:image/png;base64,{payload}] two [IMAGE:data:image/png;base64,{payload}]"
-        );
-
-        let scanned = parse_image_markers_inner(&input, ParseMode::Scan);
-        assert_eq!(scanned.loadable_count, 2, "both markers count as loadable");
-        assert_eq!(
-            scanned.rejected_count, 0,
-            "neither marker is over the ceiling"
-        );
-        assert!(
-            scanned.refs.is_empty(),
-            "the scan must not own any candidate body"
-        );
-        assert!(
-            scanned.cleaned.is_empty(),
-            "the scan must not build cleaned text"
-        );
-
-        // The collecting mode owns exactly the loadable set, and its count
-        // agrees with what was collected — counting can never disagree with
-        // selection because both read the same classifier.
-        let collected = parse_image_markers_inner(&input, ParseMode::RewriteAndCollect);
-        assert_eq!(collected.loadable_count, collected.refs.len());
-        assert_eq!(collected.refs.len(), 2);
-
-        // Rewriting without collecting (stale-history strips) owns nothing
-        // either, while still removing the markers from the text.
-        let rewritten = parse_image_markers_inner(&input, ParseMode::RewriteOnly);
-        assert_eq!(rewritten.loadable_count, 2);
-        assert!(rewritten.refs.is_empty());
-        assert!(
-            !rewritten.cleaned.contains("data:image"),
-            "the rewrite must remove the loadable markers"
-        );
-    }
-
-    #[test]
-    fn marker_span_classification_matches_the_collapsed_reference() {
-        // `marker_span_class` decides from a bounded collapsed prefix so no
-        // mode ever owns a span just to classify it. That is sound only while
-        // every *legal* reference shape is decided within the prefix limit —
-        // the longest is a UNC path with a maximal-length (253-byte) DNS
-        // hostname, which needs 257 bytes to find the share delimiter. Pin
-        // the equivalence for that boundary and the common shapes.
-        let mut shapes: Vec<String> = [
-            "/absolute/path.png",
-            "http://example.com/a.png",
-            "https://example.com/b.webp",
-            "data:image/png;base64,iVBORw0KGgo=",
-            "C:\\Users\\share\\c.png",
-            "D:/data/d.png",
-            "not a reference",
-            "relative/path.png",
-            "   ",
-            "",
-        ]
-        .iter()
-        .map(|shape| shape.to_string())
-        .collect();
-        shapes.push(format!(r"\\{}\share\e.png", "s".repeat(253)));
-        shapes.push(format!(r"\\{}\share", "s".repeat(253)));
-        shapes.push(format!(r"\\{}\share\f.png", "s".repeat(15)));
-        for shape in &shapes {
-            assert_eq!(
-                matches!(marker_span_class(shape), MarkerSpanClass::Loadable),
-                is_loadable_image_reference(&collapse_wrapped_marker(shape)),
-                "span classification must match the collapsed reference for {shape:?}"
-            );
-        }
-
-        // Beyond the prefix limit a UNC-shaped span is *undecidable*: the
-        // full collapsed check would accept it as a reference (the server
-        // name has no length limit there), but deciding that from the span
-        // itself would mean owning it. The classifier refuses instead of
-        // guessing prose — the divergence can never forward an
-        // image-shaped body as provider-visible text, and the equivalence
-        // above covers every legal shape, so only an absurd one (a server
-        // name beyond any hostname limit) can land here.
-        let absurd_unc = format!(r"\\{}\share\g.png", "s".repeat(600));
-        assert!(matches!(
-            marker_span_class(&absurd_unc),
-            MarkerSpanClass::Undecidable
-        ));
-        assert!(is_loadable_image_reference(&collapse_wrapped_marker(
-            &absurd_unc
-        )));
-
-        // A short UNC span with no share is decided, not undecidable: the
-        // whole span fits in the prefix, so the full-check answer is
-        // available — it is prose.
-        let short_serverless = format!(r"\\{}", "s".repeat(20));
-        assert!(matches!(
-            marker_span_class(&short_serverless),
-            MarkerSpanClass::Prose
-        ));
-        assert!(!is_loadable_image_reference(&collapse_wrapped_marker(
-            &short_serverless
-        )));
-
-        // A line-wrapped marker classifies through the collapse-equivalent
-        // prefix path, not the raw text with the newline still in it.
-        let wrapped = "data:image/png;base64,iVBO\n  Rw0KGgo=";
-        assert!(matches!(
-            marker_span_class(wrapped),
-            MarkerSpanClass::Loadable
-        ));
-        assert_eq!(
-            matches!(marker_span_class(wrapped), MarkerSpanClass::Loadable),
-            is_loadable_image_reference(&collapse_wrapped_marker(wrapped))
-        );
-
-        // Leading whitespace never consumes prefix budget: the full check
-        // trims the collapsed candidate, so a span padded past the limit must
-        // still classify by what follows the padding. Before this rule the
-        // prefix filled with spaces, trimmed to empty, and classified as
-        // prose — forwarding a valid reference verbatim and, for an
-        // image-shaped oversized span, its whole body.
-        let short_padded_unc = format!(r"\\{}\share\h.png", "s".repeat(15));
-        for padded in [
-            format!("{}{}", " ".repeat(600), "/padded/absolute.png"),
-            format!(
-                "{}{}",
-                " ".repeat(600),
-                "data:image/png;base64,iVBORw0KGgo="
-            ),
-            format!("{}{}", " ".repeat(600), short_padded_unc),
-        ] {
-            assert!(matches!(
-                marker_span_class(&padded),
-                MarkerSpanClass::Loadable
-            ));
-            assert!(is_loadable_image_reference(&collapse_wrapped_marker(
-                &padded
-            )));
-        }
-        // Padding in front of an undecidable UNC still lands on the refusal
-        // path, not on prose: the spaces are skipped before the `\\` shape
-        // is examined.
-        let absurd_unc = format!(r"\\{}\share\g.png", "s".repeat(600));
-        let padded_absurd_unc = format!("{}{}", " ".repeat(600), absurd_unc);
-        assert!(matches!(
-            marker_span_class(&padded_absurd_unc),
-            MarkerSpanClass::Undecidable
-        ));
-    }
-
-    #[tokio::test]
-    async fn undecidable_unc_markers_never_reach_provider_text() {
-        // Regression for the ambiguous-UNC bypass: a marker whose server
-        // component pushes the share separator past the classifier's bounded
-        // prefix used to classify as prose, and prose markers are preserved
-        // verbatim — so an image-shaped span of nearly `MAX_IMAGE_MARKER_BYTES`
-        // was forwarded into provider-visible text while the scan counted
-        // neither a loadable nor a rejected image, letting the no-image fast
-        // path return the raw body untouched. Both the over-ceiling and the
-        // under-ceiling shape must land on the fixed refusal note instead,
-        // with nothing spent on decoding.
-        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
-        let oversized_marker = format!(r"[IMAGE:\\{}\share\a.png{}]", "s".repeat(600), payload);
-        let under_ceiling_marker = format!(r"[IMAGE:\\{}\share\b.png]", "s".repeat(600));
-
-        let messages = vec![ChatMessage::user(format!(
-            "screenshot {oversized_marker} and {under_ceiling_marker}"
-        ))];
-
-        let ((result, base64_decodes), pixel_decodes) = counting_base64_decodes(async {
-            counting_decodes(async {
-                prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-                    .await
-                    .expect("preparation must not hard-fail on refused markers")
-            })
-            .await
-        })
-        .await;
-
-        let content = &result.messages[0].content;
-        assert!(
-            content.contains("screenshot"),
-            "surrounding prose must survive"
-        );
-        assert_eq!(
-            content.matches(REJECTED_IMAGE_MARKER_NOTE).count(),
-            2,
-            "both undecidable UNC markers must be replaced by the refusal note"
-        );
-        assert!(
-            !content.contains(r"\share\"),
-            "no part of the undecidable UNC bodies may survive: {content}"
-        );
-        assert!(
-            !content.contains("data:image") && !content.contains(&payload[..128]),
-            "the raw oversized body must not reach provider-visible content"
-        );
-        assert_eq!(base64_decodes, 0, "nothing is base64-decoded");
-        assert_eq!(pixel_decodes, 0, "no decode budget is consumed");
-    }
-
-    #[tokio::test]
-    async fn space_padded_references_classify_by_content_not_padding() {
-        // Regression for the leading-whitespace bypass: the bounded prefix
-        // classifier used to let leading spaces consume its budget, so a
-        // reference padded past the prefix limit classified as prose — a
-        // valid image was forwarded verbatim instead of normalized, and an
-        // oversized image-shaped span took the same prose path with its whole
-        // body. Padding is now free: the padded valid reference normalizes,
-        // and the padded oversized marker lands on the refusal note.
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("padded.png");
-        std::fs::write(&image_path, valid_png()).unwrap();
-        let padding = " ".repeat(600);
-
-        let valid_marker = format!("[IMAGE:{padding}{}]", image_path.display());
-        let valid_messages = vec![ChatMessage::user(format!("look {valid_marker}"))];
-        let prepared = prepare_messages_for_provider(&valid_messages, &MultimodalConfig::default())
-            .await
-            .expect("a padded but valid reference must prepare normally");
-        assert!(
-            prepared.contains_images,
-            "the padded reference must normalize rather than pass through as prose"
-        );
-        assert!(
-            prepared.messages[0]
-                .content
-                .contains("data:image/png;base64,"),
-            "the image must reach the provider as a data URI: {}",
-            prepared.messages[0].content
-        );
-
-        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
-        let oversized_marker = format!("[IMAGE:{padding}/tmp/{payload}.png]");
-        let oversized_messages = vec![ChatMessage::user(format!("shot {oversized_marker}"))];
-
-        let ((result, base64_decodes), pixel_decodes) = counting_base64_decodes(async {
-            counting_decodes(async {
-                prepare_messages_for_provider(&oversized_messages, &MultimodalConfig::default())
-                    .await
-                    .expect("preparation must not hard-fail on a refused marker")
-            })
-            .await
-        })
-        .await;
-
-        let content = &result.messages[0].content;
-        assert!(content.contains("shot"), "surrounding prose must survive");
-        assert!(
-            content.contains(REJECTED_IMAGE_MARKER_NOTE),
-            "the padded oversized marker must land on the refusal note: {content}"
-        );
-        assert!(
-            !content.contains("data:image") && !content.contains(&payload[..128]),
-            "the raw padded body must not reach provider-visible content"
-        );
-        assert_eq!(base64_decodes, 0, "nothing is base64-decoded");
-        assert_eq!(pixel_decodes, 0, "no decode budget is consumed");
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_normalizes_local_image_to_data_uri() {
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("sample.png");
-
-        // Minimal PNG signature bytes are enough for MIME detection.
-        std::fs::write(&image_path, valid_png()).unwrap();
-
-        let messages = vec![ChatMessage::user(format!(
-            "Please inspect this screenshot [IMAGE:{}]",
-            image_path.display()
-        ))];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-
-        assert!(prepared.contains_images);
-        assert_eq!(prepared.messages.len(), 1);
-
-        let (cleaned, refs) = parse_image_markers(&prepared.messages[0].content);
-        assert_eq!(cleaned, "Please inspect this screenshot");
-        assert_eq!(refs.len(), 1);
-        assert!(refs[0].starts_with("data:image/png;base64,"));
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_keeps_marker_free_user_text_verbatim_beside_an_image() {
-        // An image anywhere in the history sends every user message through
-        // full preparation. Messages without a loadable marker must still
-        // leave it unchanged: leading indentation of pasted code and
-        // trailing newlines are content.
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("sample.png");
-        std::fs::write(&image_path, valid_png()).unwrap();
-
-        let pasted_code = "    fn indented() {\n        body();\n    }\n\n";
-        let placeholder = format!("  see {IMAGE_MARKER_PREFIX}<path>] in the docs  \n");
-        let messages = vec![
-            ChatMessage::user(pasted_code),
-            ChatMessage::user(placeholder.clone()),
-            ChatMessage::user(format!(
-                "and this {IMAGE_MARKER_PREFIX}{}]",
-                image_path.display()
-            )),
-        ];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-
-        assert!(prepared.contains_images, "the real image must survive");
-        assert_eq!(prepared.messages.len(), 3);
-        assert_eq!(prepared.messages[0].content, pasted_code);
-        assert_eq!(prepared.messages[1].content, placeholder);
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_rewrites_rejected_marker_in_user_text_beside_an_image() {
-        // The verbatim pass-through covers text without a refused marker
-        // only. A user message whose sole marker is refused still dispatches
-        // the rewrite, never the raw marker body.
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("sample.png");
-        std::fs::write(&image_path, valid_png()).unwrap();
-
-        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
-        let data_uri_head = concat!("data:image/png", ";base64,");
-        let messages = vec![
-            ChatMessage::user(format!(
-                "  look {IMAGE_MARKER_PREFIX}{data_uri_head}{payload}]"
-            )),
-            ChatMessage::user(format!(
-                "and this {IMAGE_MARKER_PREFIX}{}]",
-                image_path.display()
-            )),
-        ];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .expect("a refused marker must not fail preparation");
-
-        assert!(prepared.contains_images, "the real image must survive");
-        let rewritten = &prepared.messages[0].content;
-        assert!(rewritten.contains("look"));
-        assert!(rewritten.contains(REJECTED_IMAGE_MARKER_NOTE));
-        assert!(!rewritten.contains(&payload[..128]));
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_normalizes_tool_message_local_image_to_data_uri() {
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("tool-sample.png");
-
-        std::fs::write(&image_path, valid_png()).unwrap();
-
-        let body = "<tool_result name=\"image_gen\">\nGenerated image\n</tool_result>".to_string();
-        let messages = vec![ChatMessage::tool(native_carrier(
-            "tc1",
-            &body,
-            &[image_path.display().to_string()],
-        ))];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-
-        assert!(prepared.contains_images);
-        assert_eq!(prepared.messages.len(), 1);
-        assert_eq!(prepared.messages[0].role, "tool");
-
-        let refs = carrier_image_targets(&prepared.messages[0].content);
-        assert_eq!(refs.len(), 1);
-        assert!(refs[0].starts_with("data:image/png;base64,"));
-        // The body survives normalization byte for byte.
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&prepared.messages[0].content)
-                .expect("prepared carrier must parse");
-        assert_eq!(parsed.text, body);
-        assert!(!parsed.text.contains("data:image/png;base64,"));
-        assert!(!parsed.text.contains("tool-sample.png"));
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_keeps_native_tool_result_json_valid_when_over_the_image_cap() {
-        // Regression: partial trimming used to parse markers out of the whole
-        // serialized envelope and append the retained ones after the closing
-        // brace, so the tool result stopped being JSON and the provider
-        // serializers lost `tool_call_id`. Five images against the default cap
-        // of four is enough to force a partial trim.
-        let temp = tempfile::tempdir().unwrap();
-        let mut marker_paths = Vec::new();
-        for index in 0..5 {
-            let image_path = temp.path().join(format!("shot-{index}.png"));
-            // A real decodable PNG: content validation rejects bytes that
-            // only carry the magic signature, so the retained images must
-            // actually load for the assertions below to hold.
-            std::fs::write(&image_path, valid_png()).unwrap();
-            marker_paths.push(image_path.display().to_string());
-        }
-
-        let attachments: Vec<_> = marker_paths
-            .iter()
-            .map(|t| image_marker(t.clone()))
-            .collect();
-        let native_tool_content = serde_json::json!({
-            "tool_call_id": "tc-overflow",
-            "tool_name": "screenshot",
-            "content": "captured five screenshots",
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
-        })
-        .to_string();
-
-        let config = MultimodalConfig::default();
-        let prepared =
-            prepare_messages_for_provider(&[ChatMessage::tool(native_tool_content)], &config)
-                .await
-                .expect("preparation should succeed for an over-cap native tool result");
-
-        assert_eq!(prepared.messages[0].role, "tool");
-        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
-            .expect("an over-cap tool result must still be valid JSON");
-
-        assert_eq!(
-            value.get("tool_call_id").and_then(|v| v.as_str()),
-            Some("tc-overflow"),
-            "tool_call_id must survive trimming so the provider can emit a native tool result"
-        );
-        assert_eq!(
-            value.get("tool_name").and_then(|v| v.as_str()),
-            Some("screenshot"),
-            "other envelope metadata must survive trimming"
-        );
-
-        let inner = value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .expect("content must remain a JSON string");
-        assert!(
-            inner.contains("captured five"),
-            "surrounding text must survive trimming"
-        );
-        assert_eq!(
-            inner, "captured five screenshots",
-            "the body is never rewritten by normalization or trimming"
-        );
-
-        let refs = carrier_image_targets(&prepared.messages[0].content);
-        assert_eq!(
-            refs.len(),
-            images_kept_under_cap(5, config.max_images),
-            "exactly the budgeted images are retained, in the attachments array"
-        );
-        assert!(
-            refs.iter()
-                .all(|reference| reference.starts_with("data:image/png;base64,")),
-            "retained images stay normalized data URIs"
-        );
     }
 
     #[tokio::test]
@@ -9732,7 +6335,7 @@ mod tests {
         let native_tool_content =
             native_carrier("tc1", "see attached", &[image_path.display().to_string()]);
 
-        let messages = vec![ChatMessage::tool(native_tool_content)];
+        let messages = vec![native_tool_content];
 
         let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
             .await
@@ -9742,8 +6345,8 @@ mod tests {
         assert_eq!(prepared.messages.len(), 1);
         assert_eq!(prepared.messages[0].role, "tool");
 
-        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
-            .expect("prepared tool message must remain valid JSON");
+        let value: serde_json::Value =
+            crate::tool_protocol::tool_message_value(&prepared.messages[0]).unwrap();
 
         assert_eq!(
             value.get("tool_call_id").and_then(|v| v.as_str()),
@@ -9759,7 +6362,7 @@ mod tests {
             inner, "see attached",
             "the body must survive normalization byte for byte"
         );
-        let refs = carrier_image_targets(&prepared.messages[0].content);
+        let refs = carrier_image_targets(&prepared.messages[0]);
         assert_eq!(refs.len(), 1);
         assert!(
             refs[0].starts_with("data:image/png;base64,"),
@@ -9768,45 +6371,6 @@ mod tests {
         assert!(
             !inner.contains("native-tool-result.png"),
             "raw local path must not leak into the body"
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_preserves_native_tool_json_when_image_is_skipped() {
-        let native_tool_content = native_carrier(
-            "tc1",
-            "generated screenshot",
-            &["https://example.com/missing.png".to_string()],
-        );
-
-        let prepared = prepare_messages_for_provider(
-            &[ChatMessage::tool(native_tool_content)],
-            &MultimodalConfig::default(),
-        )
-        .await
-        .expect("skipped native tool image should not fail message preparation");
-
-        assert!(!prepared.contains_images);
-        assert_eq!(prepared.messages.len(), 1);
-
-        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
-            .expect("native tool result must remain valid JSON");
-        assert_eq!(
-            value.get("tool_call_id").and_then(|v| v.as_str()),
-            Some("tc1")
-        );
-
-        let inner = value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .expect("content should remain a JSON string");
-        assert!(inner.contains("generated screenshot"));
-        assert!(inner.contains("1 attached image(s) could not be loaded"));
-        assert!(!inner.contains("[IMAGE:"));
-        assert!(!inner.contains("https://example.com/missing.png"));
-        assert!(
-            carrier_image_targets(&prepared.messages[0].content).is_empty(),
-            "the skipped entry drops out of the attachments array"
         );
     }
 
@@ -9825,18 +6389,16 @@ mod tests {
             ],
         );
 
-        let prepared = prepare_messages_for_provider(
-            &[ChatMessage::tool(native_tool_content)],
-            &MultimodalConfig::default(),
-        )
-        .await
-        .expect("valid native tool image should survive while bad ref is skipped");
+        let prepared =
+            prepare_messages_for_provider(&[native_tool_content], &MultimodalConfig::default())
+                .await
+                .expect("valid native tool image should survive while bad ref is skipped");
 
         assert!(prepared.contains_images);
         assert_eq!(prepared.messages.len(), 1);
 
-        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
-            .expect("native tool result must remain valid JSON");
+        let value: serde_json::Value =
+            crate::tool_protocol::tool_message_value(&prepared.messages[0]).unwrap();
         assert_eq!(
             value.get("tool_call_id").and_then(|v| v.as_str()),
             Some("tc1")
@@ -9850,300 +6412,11 @@ mod tests {
             inner, "generated\n\nNote: 1 of 2 attached image(s) could not be loaded.",
             "the body keeps its text and gains the load-failure note"
         );
-        let refs = carrier_image_targets(&prepared.messages[0].content);
+        let refs = carrier_image_targets(&prepared.messages[0]);
         assert_eq!(refs.len(), 1);
         assert!(refs[0].starts_with("data:image/png;base64,"));
         assert!(!inner.contains("mixed-native-tool-result.png"));
         assert!(!inner.contains("https://example.com/missing.png"));
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_strips_stale_native_tool_result_images() {
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("stale-native-tool-result.png");
-        std::fs::write(&image_path, valid_png()).unwrap();
-
-        let native_tool_content = native_carrier(
-            "tc1",
-            "generated screenshot",
-            &[image_path.display().to_string()],
-        );
-
-        let messages = vec![
-            ChatMessage::tool(native_tool_content),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "I generated the screenshot.".to_string(),
-            },
-            ChatMessage::user("What happened next?".to_string()),
-        ];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .expect("preparation should strip stale tool images without loading them");
-
-        assert!(
-            !prepared.contains_images,
-            "stale tool-result images should not keep the request in vision mode"
-        );
-
-        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
-            .expect("stale native tool result should remain valid JSON");
-        assert_eq!(
-            value.get("tool_call_id").and_then(|v| v.as_str()),
-            Some("tc1")
-        );
-
-        let inner = value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .expect("content should remain a JSON string");
-        assert_eq!(inner, "generated screenshot");
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&prepared.messages[0].content)
-                .expect("stripped carrier must still parse");
-        assert!(parsed.declared);
-        assert!(
-            parsed.attachments.is_empty(),
-            "the stale strip empties the attachments array at the fixed position"
-        );
-        assert!(!inner.contains("data:image"));
-        assert!(!inner.contains("stale-native-tool-result.png"));
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_strips_stale_prompt_tool_result_images() {
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("stale-prompt-tool-result.png");
-        std::fs::write(&image_path, valid_png()).unwrap();
-
-        let body = "<tool_result name=\"image_gen\">Generated</tool_result>";
-        let messages = vec![
-            ChatMessage::user(prompt_carrier(body, &[image_path.display().to_string()])),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "I generated the screenshot.".to_string(),
-            },
-            ChatMessage::user("Continue.".to_string()),
-        ];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .expect("preparation should strip stale prompt-mode tool images");
-
-        assert!(!prepared.contains_images);
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&prepared.messages[0].content)
-                .expect("stripped prompt carrier must still parse");
-        assert!(parsed.declared);
-        assert!(
-            parsed.attachments.is_empty(),
-            "the stale strip rewrites the count header to zero"
-        );
-        assert_eq!(parsed.text, body, "the body survives the stale strip");
-        assert!(!prepared.messages[0].content.contains("data:image"));
-        assert!(
-            !prepared.messages[0]
-                .content
-                .contains("stale-prompt-tool-result.png")
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_native_tool_result_replays_without_over_ceiling_attachment() {
-        // Regression for the stale-replay bypass, on the attachment-identity
-        // contract: an oversized image reference can only arrive as a
-        // DECLARED attachment (a marker in a legacy carrier body is text and
-        // replays verbatim by design). The stale replay empties the declared
-        // list without touching the body, so the oversized target must not
-        // survive, and no decode of it may ever run.
-        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
-        let oversized_uri = format!("data:image/png;base64,{payload}");
-        let native_tool_content = native_carrier("tc1", "screenshot", &[oversized_uri]);
-
-        // The later plain user turn makes the tool result stale and leaves
-        // the history with no counted image, so preparation takes the
-        // no-image fast path — exactly the route that used to forward the
-        // raw marker.
-        let messages = vec![
-            ChatMessage::tool(native_tool_content),
-            ChatMessage::user("What did you see?".to_string()),
-        ];
-
-        let ((result, base64_decodes), pixel_decodes) = counting_base64_decodes(async {
-            counting_decodes(async {
-                prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-                    .await
-                    .expect("preparation must not hard-fail on a refused attachment")
-            })
-            .await
-        })
-        .await;
-
-        let value: serde_json::Value = serde_json::from_str(&result.messages[0].content)
-            .expect("stale native tool result should remain valid JSON");
-        let inner = value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .expect("content should remain a JSON string");
-        assert!(
-            inner.contains("screenshot"),
-            "surrounding prose must survive"
-        );
-        assert!(
-            carrier_image_targets(&result.messages[0].content).is_empty(),
-            "the oversized attachment must not survive the stale replay"
-        );
-        assert!(
-            !result.messages[0].content.contains(&payload[..128]),
-            "the raw oversized payload must not survive the stale replay"
-        );
-        assert_eq!(
-            base64_decodes, 0,
-            "rejection must happen before base64 decoding"
-        );
-        assert_eq!(
-            pixel_decodes, 0,
-            "rejection must happen before any pixel decode"
-        );
-    }
-
-    #[tokio::test]
-    async fn native_tool_result_preserves_envelope_when_image_is_rejected() {
-        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
-        let oversized_uri = format!("data:image/png;base64,{payload}");
-        let native_tool_content = native_carrier("tc-envelope", "screenshot", &[oversized_uri]);
-
-        let prepared = prepare_messages_for_provider(
-            &[ChatMessage::tool(native_tool_content)],
-            &MultimodalConfig::default(),
-        )
-        .await
-        .expect("rejected image should degrade without failing preparation");
-
-        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
-            .expect("native tool-result envelope must remain valid JSON");
-        assert_eq!(
-            value.get("tool_call_id").and_then(|v| v.as_str()),
-            Some("tc-envelope")
-        );
-        let inner = value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .expect("content should remain a JSON string");
-        assert!(inner.contains("screenshot"));
-        assert!(
-            inner.contains("could not be loaded"),
-            "the refusal note must reach the model: {inner}"
-        );
-        assert!(
-            !inner.contains("data:image"),
-            "a rejected attachment yields no image block"
-        );
-        assert!(
-            !prepared.messages[0].content.contains(&payload[..128]),
-            "the raw oversized payload must not survive the rejection"
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_prompt_tool_result_replays_without_over_ceiling_attachment_in_full_preparation()
-    {
-        // The in-loop replay branch strips stale carriers on the *full*
-        // preparation path too: the second route to the same helper, on the
-        // prompt shape. A later user image keeps that path live while the
-        // stale prompt carrier declares the oversized attachment; the replay
-        // empties its declared list, so the raw target never reaches a
-        // provider.
-        let temp = tempfile::tempdir().unwrap();
-        let fresh_path = temp.path().join("fresh-user-image.png");
-        std::fs::write(&fresh_path, valid_png()).unwrap();
-
-        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
-        let oversized_uri = format!("data:image/png;base64,{payload}");
-        let messages = vec![
-            ChatMessage::user(prompt_carrier("Generated", &[oversized_uri])),
-            ChatMessage::user(format!(
-                "and here is a fresh one [IMAGE:{}]",
-                fresh_path.display()
-            )),
-        ];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .expect("preparation must not hard-fail on a refused attachment");
-
-        assert!(
-            prepared.contains_images,
-            "the fresh valid image must survive"
-        );
-        let stale = &prepared.messages[0].content;
-        assert!(
-            stale.contains("Generated"),
-            "the stale carrier keeps its prose"
-        );
-        assert!(
-            !stale.contains(&payload[..128]),
-            "the oversized attachment must not survive the stale replay"
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_strips_stale_tool_image_while_normalizing_current_user_image() {
-        let temp = tempfile::tempdir().unwrap();
-        let stale_path = temp.path().join("stale-tool-result.png");
-        let fresh_path = temp.path().join("fresh-user-image.png");
-        let png = valid_png();
-        std::fs::write(&stale_path, &png).unwrap();
-        std::fs::write(&fresh_path, &png).unwrap();
-
-        let native_tool_content = native_carrier(
-            "tc1",
-            "generated screenshot",
-            &[stale_path.display().to_string()],
-        );
-
-        let messages = vec![
-            ChatMessage::tool(native_tool_content),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "I generated the screenshot.".to_string(),
-            },
-            ChatMessage::user(format!(
-                "Now inspect this [IMAGE:{}]",
-                fresh_path.display().to_string()
-            )),
-        ];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .expect("preparation should strip stale tool images and normalize current user image");
-
-        assert!(prepared.contains_images);
-
-        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
-            .expect("stale native tool result should remain valid JSON");
-        let inner = value
-            .get("content")
-            .and_then(|v| v.as_str())
-            .expect("content should remain a JSON string");
-        assert_eq!(inner, "generated screenshot");
-        assert!(
-            carrier_image_targets(&prepared.messages[0].content).is_empty(),
-            "the stale tool image is stripped from the attachments array"
-        );
-        assert!(!inner.contains("data:image"));
-        assert!(!inner.contains("stale-tool-result.png"));
-
-        let (cleaned, refs) = parse_image_markers(&prepared.messages[2].content);
-        assert_eq!(cleaned, "Now inspect this");
-        assert_eq!(refs.len(), 1);
-        assert!(refs[0].starts_with("data:image/png;base64,"));
-        assert!(
-            !prepared.messages[2]
-                .content
-                .contains("fresh-user-image.png")
-        );
     }
 
     #[tokio::test]
@@ -10161,26 +6434,24 @@ mod tests {
 
         let messages = vec![
             ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([
+                    {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
+                ]))
+                .unwrap(),
+                None,
             ),
-            ChatMessage::tool(image_tool_content),
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "tc_weather", "name": "weather", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
+            image_tool_content,
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([
+                    {"id": "tc_weather", "name": "weather", "arguments": "{}"}
+                ]))
+                .unwrap(),
+                None,
             ),
-            ChatMessage::tool(weather_tool_content),
+            weather_tool_content,
         ];
 
         let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
@@ -10192,8 +6463,8 @@ mod tests {
             "an image tool result followed by an unrelated tool result in the same turn must stay normalized"
         );
 
-        let value: serde_json::Value = serde_json::from_str(&prepared.messages[2].content)
-            .expect("tool result should remain valid JSON");
+        let value: serde_json::Value =
+            crate::tool_protocol::tool_message_value(&prepared.messages[2]).unwrap();
         assert_eq!(
             value.get("tool_call_id").and_then(|v| v.as_str()),
             Some("tc_image")
@@ -10205,7 +6476,7 @@ mod tests {
         assert_eq!(inner, "generated screenshot");
         // The declared attachment is rewritten to a data URI in place, so the
         // raw filesystem path is gone from the whole message.
-        let refs = carrier_image_targets(&prepared.messages[2].content);
+        let refs = carrier_image_targets(&prepared.messages[2]);
         assert_eq!(refs.len(), 1);
         assert!(refs[0].starts_with("data:image/png;base64,"));
         assert!(
@@ -10231,26 +6502,24 @@ mod tests {
 
         let messages = vec![
             ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([
+                    {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
+                ]))
+                .unwrap(),
+                None,
             ),
-            ChatMessage::tool(image_tool_content),
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "tc_weather", "name": "weather", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
+            image_tool_content,
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([
+                    {"id": "tc_weather", "name": "weather", "arguments": "{}"}
+                ]))
+                .unwrap(),
+                None,
             ),
-            ChatMessage::tool(weather_tool_content),
+            weather_tool_content,
             ChatMessage::user("What did you find?".to_string()),
         ];
 
@@ -10263,8 +6532,8 @@ mod tests {
             "once the next user message arrives the turn's tool images are stale"
         );
 
-        let value: serde_json::Value = serde_json::from_str(&prepared.messages[2].content)
-            .expect("stale native tool result should remain valid JSON");
+        let value: serde_json::Value =
+            crate::tool_protocol::tool_message_value(&prepared.messages[2]).unwrap();
         assert_eq!(
             value.get("tool_call_id").and_then(|v| v.as_str()),
             Some("tc_image")
@@ -10275,63 +6544,18 @@ mod tests {
             .expect("content should remain a JSON string");
         assert_eq!(inner, "generated screenshot");
         assert!(
-            carrier_image_targets(&prepared.messages[2].content).is_empty(),
+            carrier_image_targets(&prepared.messages[2]).is_empty(),
             "the turn's tool images are stale once the next user message arrives"
         );
         assert!(!inner.contains("data:image"));
         assert!(!inner.contains("same-turn-tool-result.png"));
 
-        let weather_value: serde_json::Value = serde_json::from_str(&prepared.messages[4].content)
-            .expect("the text-only tool result should remain valid JSON");
+        let weather_value: serde_json::Value =
+            crate::tool_protocol::tool_message_value(&prepared.messages[4]).unwrap();
         assert_eq!(
             weather_value.get("content").and_then(|v| v.as_str()),
             Some("Sunny, 25C")
         );
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_keeps_prompt_mode_tool_images_within_turn() {
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("same-turn-prompt-tool-result.png");
-        std::fs::write(&image_path, valid_png()).unwrap();
-
-        let body = "<tool_result name=\"image_gen\">Generated</tool_result>";
-        let messages = vec![
-            ChatMessage::user("Compare these two.".to_string()),
-            ChatMessage::user(prompt_carrier(body, &[image_path.display().to_string()])),
-            ChatMessage::user(prompt_carrier(
-                "<tool_result name=\"weather\">Sunny, 25C</tool_result>",
-                &[],
-            )),
-        ];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .expect("prompt-mode tool images stay live for the user turn that produced them");
-
-        assert!(
-            prepared.contains_images,
-            "an earlier prompt-mode tool-result carrier in the same turn must stay normalized"
-        );
-
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&prepared.messages[1].content)
-                .expect("prepared prompt carrier must parse");
-        assert_eq!(parsed.text, body);
-        let refs: Vec<String> = parsed
-            .attachments
-            .into_iter()
-            .filter(|m| m.kind == zeroclaw_api::media::MarkerKind::Image)
-            .map(|m| m.target)
-            .collect();
-        assert_eq!(refs.len(), 1);
-        assert!(refs[0].starts_with("data:image/png;base64,"));
-        assert!(
-            !prepared.messages[1]
-                .content
-                .contains("same-turn-prompt-tool-result.png")
-        );
-        assert!(prepared.messages[2].content.contains("Sunny, 25C"));
     }
 
     #[tokio::test]
@@ -10343,33 +6567,32 @@ mod tests {
         std::fs::write(&tool_image_path, valid_png()).unwrap();
 
         let messages = vec![
-            ChatMessage::user(format!(
-                "Inspect the attached image, then check session information\n[IMAGE:{}]",
-                user_image_path.display()
-            )),
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "tc_image", "name": "image_tool", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
+            ChatMessage::user("Inspect the attached image, then check session information")
+                .with_attachments(vec![zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (user_image_path.display()).to_string(),
+                }]),
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([
+                    {"id": "tc_image", "name": "image_tool", "arguments": "{}"}
+                ]))
+                .unwrap(),
+                None,
             ),
-            ChatMessage::user(prompt_carrier(
+            (prompt_carrier(
                 "<tool_result name=\"image_tool\">Generated</tool_result>",
                 &[tool_image_path.display().to_string()],
             )),
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": "",
-                    "tool_calls": [
-                        {"id": "tc_session", "name": "session_info", "arguments": "{}"}
-                    ]
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                ("").to_string(),
+                serde_json::from_value(serde_json::json!([
+                    {"id": "tc_session", "name": "session_info", "arguments": "{}"}
+                ]))
+                .unwrap(),
+                None,
             ),
-            ChatMessage::user(prompt_carrier(
+            (prompt_carrier(
                 "<tool_result name=\"session_info\">session id: abc-123</tool_result>",
                 &[],
             )),
@@ -10395,23 +6618,17 @@ mod tests {
                 .content
                 .contains("Inspect the attached image, then check session information")
         );
-        assert!(
-            prepared.messages[0]
-                .content
-                .contains("data:image/png;base64,")
-        );
+        assert!(message_image_refs(&prepared.messages[0])[0].starts_with("data:image/png;base64,"));
         assert!(
             !prepared.messages[0]
                 .content
                 .contains("age-limit-user-attachment.png")
         );
-        assert!(prepared.messages[2].content.contains("[Tool results]"));
+        assert_eq!(prepared.messages[2].role, "tool");
         assert!(prepared.messages[2].content.contains("Generated"));
         assert!(
-            prepared.messages[2]
-                .content
-                .contains("data:image/png;base64,"),
-            "the normalized attachment rides the carrier's marker lines"
+            message_image_refs(&prepared.messages[2])[0].starts_with("data:image/png;base64,"),
+            "the normalized attachment remains in the carrier's structured fields"
         );
         assert!(
             !prepared.messages[2]
@@ -10422,47 +6639,30 @@ mod tests {
     }
 
     #[test]
-    fn trim_images_by_age_still_strips_real_user_images_past_the_limit() {
-        let messages = vec![
-            ChatMessage::user("[IMAGE:/old/user-image.png]".to_string()),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "Done.".to_string(),
-            },
-            ChatMessage::user("Next question".to_string()),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "Answered.".to_string(),
-            },
-            ChatMessage::user("Follow-up".to_string()),
-        ];
-
-        let trimmed = trim_images_by_age(&messages, 1);
-
-        assert_eq!(trimmed[0].content, "[image removed from history]");
-        assert_eq!(trimmed[1].content, "Done.");
-        assert_eq!(trimmed[2].content, "Next question");
-        assert_eq!(trimmed[3].content, "Answered.");
-        assert_eq!(trimmed[4].content, "Follow-up");
-    }
-
-    #[test]
     fn trim_images_by_age_ignores_prompt_mode_carriers_when_counting() {
         let messages = vec![
             ChatMessage::user("Inspect this screenshot.".to_string()),
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "assistant".to_string(),
                 content: "On it.".to_string(),
             },
-            ChatMessage::user(prompt_carrier(
+            (prompt_carrier(
                 "<tool_result name=\"image_gen\">Generated</tool_result>",
                 &["/tmp/tool-image.png".to_string()],
             )),
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "assistant".to_string(),
                 content: "Checked.".to_string(),
             },
-            ChatMessage::user(prompt_carrier(
+            (prompt_carrier(
                 "<tool_result name=\"weather\">Sunny, 25C</tool_result>",
                 &[],
             )),
@@ -10476,106 +6676,66 @@ mod tests {
     }
 
     #[test]
-    fn count_image_markers_ignores_stale_tool_results() {
+    fn count_image_attachments_ignores_stale_tool_results() {
         let messages = vec![
-            ChatMessage::tool(native_carrier(
-                "tc1",
-                "Generated",
-                &["/tmp/stale-tool.png".to_string()],
-            )),
+            (native_carrier("tc1", "Generated", &["/tmp/stale-tool.png".to_string()])),
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "assistant".to_string(),
                 content: "Done.".to_string(),
             },
             ChatMessage::user("Next question".to_string()),
         ];
 
-        assert_eq!(count_image_markers(&messages), 0);
+        assert_eq!(count_image_attachments(&messages), 0);
 
         let messages = vec![
             ChatMessage::user("Create an image".to_string()),
-            ChatMessage::tool(native_carrier(
-                "tc1",
-                "Generated",
-                &["/tmp/latest-tool.png".to_string()],
-            )),
+            (native_carrier("tc1", "Generated", &["/tmp/latest-tool.png".to_string()])),
         ];
 
-        assert_eq!(count_image_markers(&messages), 1);
+        assert_eq!(count_image_attachments(&messages), 1);
     }
 
     #[test]
-    fn count_image_markers_counts_tool_images_within_turn() {
+    fn count_image_attachments_counts_tool_images_within_turn() {
         // The image tool result sits before a later, text-only tool result in
         // the same user turn; the vision gate must still see its image.
         let messages = vec![
             ChatMessage::user("Create an image, then check the weather.".to_string()),
-            ChatMessage::tool(native_carrier(
-                "tc1",
-                "Generated",
-                &["/tmp/same-turn-tool.png".to_string()],
-            )),
+            (native_carrier("tc1", "Generated", &["/tmp/same-turn-tool.png".to_string()])),
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "assistant".to_string(),
                 content: "Checking the weather next.".to_string(),
             },
-            ChatMessage::tool(native_carrier("tc2", "Sunny, 25C", &[])),
+            (native_carrier("tc2", "Sunny, 25C", &[])),
         ];
 
-        assert_eq!(count_image_markers(&messages), 1);
-    }
-
-    #[test]
-    fn count_latest_user_image_markers_scopes_to_newest_user_message() {
-        // No user messages at all -> zero.
-        assert_eq!(count_latest_user_image_markers(&[]), 0);
-
-        // The newest user message carries the image -> counted (the user just
-        // sent it; the vision router surfaces a capability error).
-        let just_sent = vec![
-            ChatMessage::user("hi".to_string()),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "hello".to_string(),
-            },
-            ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string()),
-        ];
-        assert_eq!(count_latest_user_image_markers(&just_sent), 1);
-
-        // An earlier user message carried an image, but the newest user message
-        // is plain text -> zero. This is the poison-prevention case: the carried
-        // over marker must NOT keep re-triggering the capability error.
-        let carried_over = vec![
-            ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string()),
-            ChatMessage::user("what is WAL?".to_string()),
-        ];
-        assert_eq!(count_latest_user_image_markers(&carried_over), 0);
-        // The history-wide count still sees the carried-over marker, which is
-        // why the router must distinguish the two.
-        assert_eq!(count_user_image_markers(&carried_over), 1);
-
-        // A trailing tool-result carrier does not mask the real latest user
-        // message (its markers are not user-sent and must not be counted here).
-        let trailing_tool_result = vec![
-            ChatMessage::user("inspect [IMAGE:/tmp/a.png]".to_string()),
-            ChatMessage::tool(native_carrier(
-                "tc1",
-                "Generated",
-                &["/tmp/tool.png".to_string()],
-            )),
-        ];
-        assert_eq!(count_latest_user_image_markers(&trailing_tool_result), 1);
+        assert_eq!(count_image_attachments(&messages), 1);
     }
 
     #[tokio::test]
     async fn resolvable_count_ignores_missing_path() {
-        let messages = vec![ChatMessage::user(format!(
-            "look at this [IMAGE:{}]",
-            "/definitely/not/a/real/screenshot.png"
-        ))];
+        let messages = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: ("/definitely/not/a/real/screenshot.png").to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &messages,
+                false,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             0
         );
     }
@@ -10585,13 +6745,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
         std::fs::write(&image_path, b"not a real png; existence is all that counts").unwrap();
-        let messages = vec![ChatMessage::user(format!(
-            "look at this [IMAGE:{}]",
-            image_path.display()
-        ))];
+        let messages = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &messages,
+                false,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             1
         );
     }
@@ -10599,10 +6765,19 @@ mod tests {
     #[tokio::test]
     async fn resolvable_count_accepts_structurally_valid_data_uri() {
         let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
-        let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
+        let messages = vec![ChatMessage::user("inline").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: uri.to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &messages,
+                false,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             1
         );
     }
@@ -10610,10 +6785,19 @@ mod tests {
     #[tokio::test]
     async fn resolvable_count_rejects_malformed_data_uri() {
         let uri = "data:image/png;base64,%%%";
-        let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
+        let messages = vec![ChatMessage::user("inline").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: uri.to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &messages,
+                false,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             0
         );
     }
@@ -10621,15 +6805,28 @@ mod tests {
     #[tokio::test]
     async fn resolvable_count_remote_follows_flag() {
         let reference = "https://example.com/cat.png";
-        let messages = vec![ChatMessage::user(format!("see [IMAGE:{reference}]"))];
+        let messages = vec![ChatMessage::user("see").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: reference.to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &messages,
+                false,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             0
         );
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, true, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &messages,
+                true,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             1
         );
     }
@@ -10640,12 +6837,21 @@ mod tests {
         let image_path = temp.path().join("older.png");
         std::fs::write(&image_path, b"an older turn's real image").unwrap();
         let messages = vec![
-            ChatMessage::user(format!("look [IMAGE:{}]", image_path.display())),
+            ChatMessage::user("look").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: (image_path.display()).to_string(),
+                },
+            ]),
             ChatMessage::user("what is WAL?".to_string()),
         ];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &messages,
+                false,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             0
         );
     }
@@ -10655,12 +6861,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
         std::fs::write(&image_path, b"not a real png; existence is all that counts").unwrap();
-        let messages = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let messages = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(
+            count_latest_user_resolvable_image_attachments(
                 &messages,
                 false,
                 Arc::new(|_: &Path| false)
@@ -10670,8 +6878,12 @@ mod tests {
             "a local path the policy rejects must never count, file or no file"
         );
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &messages,
+                false,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             1,
             "the same message with an accepting policy counts the existing file"
         );
@@ -10686,25 +6898,37 @@ mod tests {
             b"relative references must not resolve against the process cwd",
         )
         .unwrap();
-        let messages = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            "rel.png"
-        ))];
+        let messages = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: ("rel.png").to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &messages,
+                false,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             0,
             "a relative reference never counts, even when the predicate accepts everything"
         );
         // Contrast: the same file reached by its absolute path does count, so
         // the zero above comes from relativity, not from a missing file.
-        let absolute = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let absolute = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&absolute, false, Arc::new(|_: &Path| true))
-                .await,
+            count_latest_user_resolvable_image_attachments(
+                &absolute,
+                false,
+                Arc::new(|_: &Path| true)
+            )
+            .await,
             1
         );
     }
@@ -10726,13 +6950,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let left = temp.path().join("left.png");
         let right = temp.path().join("right.png");
-        let messages = vec![ChatMessage::user(format!(
-            "compare [IMAGE: {}] with [IMAGE: {}]",
-            left.display(),
-            right.display()
-        ))];
+        let messages = vec![ChatMessage::user("compare  with").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (left.display()).to_string(),
+            },
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (right.display()).to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, path_allowed.clone())
+            count_latest_user_resolvable_image_attachments(&messages, false, path_allowed.clone())
                 .await,
             0
         );
@@ -10744,85 +6973,25 @@ mod tests {
         // A structurally valid data URI in the same message resolves without
         // the predicate being consulted for it.
         let data_uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
-        let with_data_uri = vec![ChatMessage::user(format!(
-            "compare [IMAGE: {}] with [IMAGE: {}]",
-            data_uri,
-            right.display()
-        ))];
+        let with_data_uri = vec![ChatMessage::user("compare  with").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (data_uri).to_string(),
+            },
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (right.display()).to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&with_data_uri, false, path_allowed).await,
+            count_latest_user_resolvable_image_attachments(&with_data_uri, false, path_allowed)
+                .await,
             1
         );
         assert_eq!(
             probed.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "only the local markers consulted the predicate; the data URI did not"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolvable_count_stops_all_work_after_candidate_budget() {
-        let probed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let probed_for_predicate = std::sync::Arc::clone(&probed);
-        let path_allowed: Arc<dyn Fn(&Path) -> bool + Send + Sync> =
-            Arc::new(move |_: &Path| -> bool {
-                probed_for_predicate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                true
-            });
-        let temp = tempfile::tempdir().unwrap();
-        // 20 accepted absolute markers, all naming missing files. Only the
-        // first MAX_RESOLVABILITY_CANDIDATES get any work (predicate plus
-        // probe, all missing); the rest count as resolvable with no policy
-        // call and no probe. The returned count is exactly the overflow
-        // remainder, which pins the bound at 16: a bound of 15 would give
-        // count 5 and predicate calls 15; a bound of 17 gives 3 and 17.
-        let markers: Vec<String> = (0..20)
-            .map(|i| {
-                format!(
-                    "[IMAGE: {}]",
-                    temp.path().join(format!("missing-{i}.png")).display()
-                )
-            })
-            .collect();
-        let messages = vec![ChatMessage::user(format!(
-            "look at these {}",
-            markers.join(" ")
-        ))];
-        assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, path_allowed).await,
-            20 - MAX_RESOLVABILITY_CANDIDATES,
-            "markers beyond the candidate bound count as resolvable with no work at all"
-        );
-        assert_eq!(
-            probed.load(std::sync::atomic::Ordering::SeqCst),
-            MAX_RESOLVABILITY_CANDIDATES,
-            "the predicate runs only for candidates; overflow markers get no policy call"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolvable_count_probes_all_markers_at_or_below_budget() {
-        let temp = tempfile::tempdir().unwrap();
-        // 16 accepted absolute markers, all missing: every one is probed, so
-        // none counts as resolvable. If the last marker had been
-        // short-circuited by the budget, the count would be 1.
-        let markers: Vec<String> = (0..MAX_RESOLVABILITY_CANDIDATES)
-            .map(|i| {
-                format!(
-                    "[IMAGE: {}]",
-                    temp.path().join(format!("missing-{i}.png")).display()
-                )
-            })
-            .collect();
-        let messages = vec![ChatMessage::user(format!(
-            "look at these {}",
-            markers.join(" ")
-        ))];
-        assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
-                .await,
-            0,
-            "at or below the budget every accepted marker is probed, so missing files count 0"
         );
     }
 
@@ -10880,12 +7049,14 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         });
-        let messages = vec![ChatMessage::user(format!(
-            "look at this [IMAGE: {}]",
-            image_path.display()
-        ))];
+        let messages = vec![ChatMessage::user("look at this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
         assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, path_allowed).await,
+            count_latest_user_resolvable_image_attachments(&messages, false, path_allowed).await,
             1,
             "the existing file resolves through the blocking task"
         );
@@ -10894,105 +7065,6 @@ mod tests {
             "the runtime-thread watcher observed the predicate and released it, \
              so the predicate ran off the executor thread"
         );
-    }
-
-    /// Fail toward refusal when the blocking task dies: a predicate that
-    /// panics surfaces as a `JoinError`, and every candidate must then
-    /// count as resolvable so the caller errors loudly instead of
-    /// silently degrading. The panic unwinds on the blocking thread and
-    /// is caught by `spawn_blocking`; test profiles keep unwinding
-    /// (`panic = "abort"` is release-only), so the process does not
-    /// abort. The panic message may appear in captured test output; that
-    /// noise is expected.
-    #[tokio::test]
-    async fn resolvable_count_counts_all_candidates_resolvable_when_blocking_task_panics() {
-        let temp = tempfile::tempdir().unwrap();
-        let path_allowed: Arc<dyn Fn(&Path) -> bool + Send + Sync> =
-            Arc::new(|_: &Path| -> bool { panic!("predicate died") });
-        let markers: Vec<String> = (0..3)
-            .map(|i| {
-                format!(
-                    "[IMAGE: {}]",
-                    temp.path().join(format!("missing-{i}.png")).display()
-                )
-            })
-            .collect();
-        let messages = vec![ChatMessage::user(format!(
-            "look at these {}",
-            markers.join(" ")
-        ))];
-        assert_eq!(
-            count_latest_user_resolvable_image_markers(&messages, false, path_allowed).await,
-            3,
-            "a dead blocking task counts every candidate as resolvable, failing toward refusal"
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_trims_excess_images_from_older_messages() {
-        // 3 messages, each with 1 image — max is 2.
-        // Past the cap the count drops to the low-water mark of 1, so the two
-        // oldest images are stripped.
-        let messages = vec![
-            ChatMessage::user("[IMAGE:/tmp/old.png]\nOld caption".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/mid.png]\nMid caption".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/new.png]\nNew caption".to_string()),
-        ];
-
-        // Should not error — instead trims oldest. (Will error on
-        // normalize_image_reference for the surviving image since
-        // /tmp/new.png doesn't exist, but the trimming itself should
-        // succeed.)
-        let trimmed = trim_old_images(&messages, 2);
-        assert_eq!(trimmed.len(), 3);
-
-        // Oldest message should have image stripped
-        let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty(), "oldest image should be stripped");
-        assert!(trimmed[0].content.contains("Old caption"));
-
-        // The middle image goes in the same batch; only the newest survives.
-        let (_, refs1) = parse_image_markers(&trimmed[1].content);
-        assert!(refs1.is_empty(), "middle image should be stripped");
-        assert!(trimmed[1].content.contains("Mid caption"));
-        let (_, refs2) = parse_image_markers(&trimmed[2].content);
-        assert_eq!(refs2.len(), 1);
-    }
-
-    #[test]
-    fn trim_old_images_replaces_image_only_message() {
-        // A message with only an image and no text should get a placeholder.
-        let messages = vec![
-            ChatMessage::user("[IMAGE:/tmp/old.png]".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/new.png]\nKeep this".to_string()),
-        ];
-
-        let trimmed = trim_old_images(&messages, 1);
-        assert_eq!(trimmed[0].content, "[image removed from history]");
-        assert!(trimmed[1].content.contains("[IMAGE:/tmp/new.png]"));
-    }
-
-    #[test]
-    fn trim_old_images_partially_trims_a_multi_image_message() {
-        // A single message has 3 images and the budget is 1, so exactly 2 must
-        // be dropped. Evicting the message as a unit would remove all three and
-        // leave zero images, spending none of the budget the operator allowed.
-        let messages = vec![
-            ChatMessage::user(
-                "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nThree pics"
-                    .to_string(),
-            ),
-            ChatMessage::user("Just text, no images".to_string()),
-        ];
-
-        let trimmed = trim_old_images(&messages, 1);
-        assert_eq!(trimmed.len(), 2);
-        // The newest image in the message survives; the two older ones go.
-        let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert_eq!(refs0, vec!["/tmp/c.png".to_string()]);
-        assert!(trimmed[0].content.contains("Three pics"));
-        // Second message unchanged
-        assert_eq!(trimmed[1].content, "Just text, no images");
     }
 
     #[test]
@@ -11019,179 +7091,9 @@ mod tests {
     }
 
     #[test]
-    fn trim_old_images_keeps_exactly_the_low_water_count() {
-        // Whatever the per-message distribution, the survivors equal
-        // `images_kept_under_cap`: the trim neither overshoots nor undershoots
-        // the batch rule.
-        let messages = vec![
-            ChatMessage::user("[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\nPair".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/c.png]\nSingle".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/d.png]\n[IMAGE:/tmp/e.png]\nAnother pair".to_string()),
-        ];
-
-        for (max_images, expected) in [(1, 1), (2, 1), (3, 3), (4, 2), (5, 5)] {
-            let trimmed = trim_old_images(&messages, max_images);
-            assert_eq!(
-                count_image_markers(&trimmed),
-                expected,
-                "max_images={max_images} over five images must keep {expected}"
-            );
-        }
-    }
-
-    #[test]
-    fn trim_old_images_keeps_the_newest_images_across_messages() {
-        // Four images against a cap of 3 drop to the mark of 2: the two oldest
-        // go, one of them partway through the first message.
-        let messages = vec![
-            ChatMessage::user(
-                "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nOld".to_string(),
-            ),
-            ChatMessage::user("[IMAGE:/tmp/d.png]\nNew".to_string()),
-        ];
-
-        let trimmed = trim_old_images(&messages, 3);
-
-        let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert_eq!(refs0, vec!["/tmp/c.png".to_string()]);
-        let (_, refs1) = parse_image_markers(&trimmed[1].content);
-        assert_eq!(refs1, vec!["/tmp/d.png".to_string()]);
-    }
-
-    #[test]
-    fn trim_old_images_skips_assistant_messages() {
-        // Assistant messages with image markers should not be counted or stripped.
-        let messages = vec![
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "[IMAGE:/tmp/assistant.png]\nAssistant generated".to_string(),
-            },
-            ChatMessage::user("[IMAGE:/tmp/user1.png]\nFirst".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/user2.png]\nSecond".to_string()),
-        ];
-
-        let trimmed = trim_old_images(&messages, 1);
-        // Assistant message untouched (not counted toward limit)
-        assert!(trimmed[0].content.contains("[IMAGE:/tmp/assistant.png]"));
-        // Oldest user image stripped
-        let (_, refs1) = parse_image_markers(&trimmed[1].content);
-        assert!(refs1.is_empty());
-        assert!(trimmed[1].content.contains("First"));
-        // Newest user image kept
-        let (_, refs2) = parse_image_markers(&trimmed[2].content);
-        assert_eq!(refs2.len(), 1);
-    }
-
-    #[test]
-    fn trim_old_images_counts_latest_tool_messages() {
-        let messages = vec![
-            ChatMessage::user("[IMAGE:/tmp/user-old.png]\nOldest".to_string()),
-            ChatMessage::tool(native_carrier(
-                "tc1",
-                "Generated",
-                &["/tmp/tool-new.png".to_string()],
-            )),
-        ];
-
-        let trimmed = trim_old_images(&messages, 1);
-        let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty(), "oldest user image should be stripped");
-        assert!(trimmed[0].content.contains("Oldest"));
-
-        assert_eq!(
-            carrier_image_targets(&trimmed[1].content),
-            vec!["/tmp/tool-new.png".to_string()],
-            "the newest image, on a carrier, survives the cap"
-        );
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&trimmed[1].content).unwrap();
-        assert_eq!(parsed.text, "Generated", "the carrier body is untouched");
-    }
-
-    #[test]
-    fn trim_old_images_no_trimming_when_under_limit() {
-        let messages = vec![
-            ChatMessage::user("[IMAGE:/tmp/a.png]\nCaption A".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/b.png]\nCaption B".to_string()),
-        ];
-
-        let trimmed = trim_old_images(&messages, 5);
-        // Nothing should change — both images are under the limit
-        assert_eq!(trimmed[0].content, messages[0].content);
-        assert_eq!(trimmed[1].content, messages[1].content);
-    }
-
-    #[test]
-    fn trim_old_images_no_trimming_when_exactly_at_limit() {
-        let messages = vec![
-            ChatMessage::user("[IMAGE:/tmp/a.png]\nA".to_string()),
-            ChatMessage::user("[IMAGE:/tmp/b.png]\nB".to_string()),
-        ];
-
-        let trimmed = trim_old_images(&messages, 2);
-        assert_eq!(trimmed[0].content, messages[0].content);
-        assert_eq!(trimmed[1].content, messages[1].content);
-    }
-
-    #[test]
     fn trim_old_images_empty_messages() {
         let trimmed = trim_old_images(&[], 4);
         assert!(trimmed.is_empty());
-    }
-
-    #[test]
-    fn trim_old_images_interleaved_roles() {
-        // Realistic conversation: user sends image, assistant replies, user sends
-        // another image, etc. Only user messages should be candidates for trimming.
-        let messages = vec![
-            ChatMessage::user("[IMAGE:/tmp/1.png]\nLook at this".to_string()),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "I see a photo.".to_string(),
-            },
-            ChatMessage::user("[IMAGE:/tmp/2.png]\nWhat about this?".to_string()),
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "That's a chart.".to_string(),
-            },
-            ChatMessage::user("[IMAGE:/tmp/3.png]\nAnd this one".to_string()),
-        ];
-
-        let trimmed = trim_old_images(&messages, 2);
-        assert_eq!(trimmed.len(), 5);
-        // Three images against a cap of 2 drop to the mark of 1: both older
-        // user images stripped, their text kept.
-        let (_, refs0) = parse_image_markers(&trimmed[0].content);
-        assert!(refs0.is_empty());
-        assert!(trimmed[0].content.contains("Look at this"));
-        let (_, refs2) = parse_image_markers(&trimmed[2].content);
-        assert!(refs2.is_empty());
-        assert!(trimmed[2].content.contains("What about this?"));
-        // Assistant messages untouched
-        assert_eq!(trimmed[1].content, "I see a photo.");
-        assert_eq!(trimmed[3].content, "That's a chart.");
-        // Newest user image kept
-        let (_, refs4) = parse_image_markers(&trimmed[4].content);
-        assert_eq!(refs4.len(), 1);
-    }
-
-    #[test]
-    fn trim_old_images_strips_multiple_oldest_messages() {
-        // 5 user images, max 1 — should strip the first 4 messages' images.
-        let messages: Vec<ChatMessage> = (1..=5)
-            .map(|i| ChatMessage::user(format!("[IMAGE:/tmp/{i}.png]\nCaption {i}")))
-            .collect();
-
-        let trimmed = trim_old_images(&messages, 1);
-        assert_eq!(trimmed.len(), 5);
-        for (i, msg) in trimmed.iter().enumerate().take(4) {
-            let (_, refs) = parse_image_markers(&msg.content);
-            assert!(refs.is_empty(), "message {i} should have images stripped");
-            assert!(msg.content.contains(&format!("Caption {}", i + 1)));
-        }
-        // Only the last message keeps its image
-        let (_, refs_last) = parse_image_markers(&trimmed[4].content);
-        assert_eq!(refs_last.len(), 1);
     }
 
     #[tokio::test]
@@ -11207,9 +7109,24 @@ mod tests {
         }
 
         let messages = vec![
-            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display().to_string())),
-            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display().to_string())),
-            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display().to_string())),
+            ChatMessage::user("Old").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: paths[0].display().to_string(),
+                },
+            ]),
+            ChatMessage::user("Mid").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: paths[1].display().to_string(),
+                },
+            ]),
+            ChatMessage::user("New").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: paths[2].display().to_string(),
+                },
+            ]),
         ];
 
         let config = MultimodalConfig {
@@ -11226,12 +7143,12 @@ mod tests {
         assert!(result.contains_images);
         assert_eq!(result.messages.len(), 3);
         // First message should have image stripped, text preserved
-        assert!(!result.messages[0].content.contains("data:image"));
+        assert!(message_image_refs(&result.messages[0]).is_empty());
         assert!(result.messages[0].content.contains("Old"));
         // Second goes in the same batch; only the third is base64-encoded
-        assert!(!result.messages[1].content.contains("data:image"));
+        assert!(message_image_refs(&result.messages[1]).is_empty());
         assert!(result.messages[1].content.contains("Mid"));
-        assert!(result.messages[2].content.contains("data:image"));
+        assert!(message_image_refs(&result.messages[2])[0].starts_with("data:image"));
     }
 
     #[tokio::test]
@@ -11244,10 +7161,14 @@ mod tests {
         for i in 0..9 {
             let p = temp.path().join(format!("img{i}.png"));
             std::fs::write(&p, &png_data).unwrap();
-            messages.push(ChatMessage::user(format!(
-                "[IMAGE:{}]\nImage {i}",
-                p.display()
-            )));
+            messages.push(
+                ChatMessage::user(format!("\nImage {i}")).with_attachments(vec![
+                    zeroclaw_api::media::AttachmentReference {
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
+                        target: (p.display()).to_string(),
+                    },
+                ]),
+            );
         }
 
         let config = MultimodalConfig {
@@ -11267,7 +7188,7 @@ mod tests {
         let surviving = result
             .messages
             .iter()
-            .filter(|m| m.content.contains("data:image"))
+            .filter(|m| !message_image_refs(m).is_empty())
             .count();
         assert_eq!(surviving, 3, "output should keep the batch-rule count");
         assert_eq!(
@@ -11284,306 +7205,17 @@ mod tests {
         for (i, m) in result.messages.iter().enumerate() {
             if i < 6 {
                 assert!(
-                    !m.content.contains("data:image"),
+                    message_image_refs(m).is_empty(),
                     "oldest message {i} should be capped out"
                 );
                 assert!(m.content.contains(&format!("Image {i}")));
             } else {
                 assert!(
-                    m.content.contains("data:image"),
+                    !message_image_refs(m).is_empty(),
                     "newest message {i} should survive the cap"
                 );
             }
         }
-    }
-
-    /// Past the cap, a new image evicts down to the low-water mark in one
-    /// bounded mutation of the oldest image-bearing messages; an image-free
-    /// follow-up produces a byte-identical provider view; the next two new
-    /// images change no earlier message; the one after that evicts the next
-    /// batch. With `max_images = 4` that is one cache rewrite per three new
-    /// images. This pins the deterministic eviction the cap events report, for
-    /// persistent user images with age trimming disabled and no tool-result
-    /// images. Outside that scope, a current-turn tool image going stale
-    /// lowers the count on the next turn and can restore an evicted user
-    /// image, and `max_image_turns` can age out an image on an image-free
-    /// turn.
-    #[tokio::test]
-    async fn image_cap_eviction_is_bounded_and_prefix_stable() {
-        let temp = tempfile::tempdir().unwrap();
-        let png_data = valid_png();
-        let config = MultimodalConfig {
-            max_images: 4,
-            max_image_size_mb: 5,
-            allow_remote_fetch: false,
-            max_image_turns: 0,
-            ..Default::default()
-        };
-        let img = |i: usize| {
-            let p = temp.path().join(format!("img{i}.png"));
-            std::fs::write(&p, &png_data).unwrap();
-            p
-        };
-        // Four image turns (one image-only, three with captions), each answered.
-        let mut history = vec![ChatMessage::system("sys")];
-        for i in 0..4 {
-            let p = img(i);
-            let content = if i == 1 {
-                format!("[IMAGE:{}]", p.display())
-            } else {
-                format!("[IMAGE:{}]\ncaption {i}", p.display())
-            };
-            history.push(ChatMessage::user(content));
-            history.push(ChatMessage::assistant(format!("saw {i}")));
-        }
-        let p0 = prepare_messages_for_provider(&history, &config)
-            .await
-            .unwrap();
-
-        // Fifth image arrives: the count drops to the mark of two in one
-        // mutation of the three oldest image messages. Captioned ones keep
-        // their caption; the image-only one becomes the removal placeholder.
-        history.push(ChatMessage::user(format!(
-            "[IMAGE:{}]\ncaption 4",
-            img(4).display()
-        )));
-        let p1 = prepare_messages_for_provider(&history, &config)
-            .await
-            .unwrap();
-        // The fixtures must decode: a rejected image would still be trimmed by
-        // marker count but never reach the provider, and the contract below
-        // would pass without a single image block in play.
-        let inlined = |p: &PreparedMessages| {
-            p.messages
-                .iter()
-                .filter(|m| m.content.contains("data:image"))
-                .count()
-        };
-        assert_eq!(inlined(&p0), 4, "all four fixtures inline before the cap");
-        assert_eq!(inlined(&p1), 2, "the cap evicts down to the mark of two");
-        let changed1: Vec<usize> = p0
-            .messages
-            .iter()
-            .zip(p1.messages.iter())
-            .enumerate()
-            .filter(|(_, (x, y))| x.content != y.content)
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(
-            changed1,
-            vec![1, 3, 5],
-            "fifth image mutates only the three oldest image messages"
-        );
-        assert!(p1.messages[1].content.contains("caption 0"));
-        assert!(!p1.messages[1].content.contains("data:image"));
-        assert_eq!(p1.messages[3].content, "[image removed from history]");
-        assert!(p1.messages[5].content.contains("caption 2"));
-        assert!(!p1.messages[5].content.contains("data:image"));
-
-        // Following image-free request: the provider view is byte-stable.
-        history.push(ChatMessage::assistant("saw 4"));
-        history.push(ChatMessage::user("no image this time"));
-        let p2 = prepare_messages_for_provider(&history, &config)
-            .await
-            .unwrap();
-        let prefix_equal = p1
-            .messages
-            .iter()
-            .zip(p2.messages.iter())
-            .all(|(x, y)| x.role == y.role && x.content == y.content);
-        assert!(prefix_equal, "image-free follow-up must be byte-stable");
-
-        // Sixth and seventh images fit under the cap again: neither changes
-        // an earlier message.
-        history.push(ChatMessage::assistant("ok"));
-        history.push(ChatMessage::user(format!(
-            "[IMAGE:{}]\ncaption 5",
-            img(5).display()
-        )));
-        let p3 = prepare_messages_for_provider(&history, &config)
-            .await
-            .unwrap();
-        assert_eq!(inlined(&p3), 3);
-        assert_eq!(
-            trimmed_span(&p2.messages, &p3.messages),
-            None,
-            "sixth image changes no earlier message"
-        );
-        history.push(ChatMessage::assistant("saw 5"));
-        history.push(ChatMessage::user(format!(
-            "[IMAGE:{}]\ncaption 6",
-            img(6).display()
-        )));
-        let p4 = prepare_messages_for_provider(&history, &config)
-            .await
-            .unwrap();
-        assert_eq!(inlined(&p4), 4);
-        assert_eq!(
-            trimmed_span(&p3.messages, &p4.messages),
-            None,
-            "seventh image changes no earlier message"
-        );
-
-        // Eighth image takes the count past the cap again: the next batch,
-        // images 3, 4 and 5, is evicted in one mutation.
-        history.push(ChatMessage::assistant("saw 6"));
-        history.push(ChatMessage::user(format!(
-            "[IMAGE:{}]\ncaption 7",
-            img(7).display()
-        )));
-        let p5 = prepare_messages_for_provider(&history, &config)
-            .await
-            .unwrap();
-        assert_eq!(inlined(&p5), 2);
-        assert_eq!(
-            trimmed_span(&p4.messages, &p5.messages),
-            Some((7, 13)),
-            "eighth image evicts the next batch, from image 3 to image 5"
-        );
-    }
-
-    #[tokio::test]
-    async fn image_cap_eviction_event_names_the_rewritten_message() {
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
-        zeroclaw_log::try_install_capture_subscriber();
-        let mut rx = zeroclaw_log::subscribe_or_install();
-        while rx.try_recv().is_ok() {}
-
-        // A failing assertion must not skip the hook cleanup, so the clear
-        // lives in a drop guard rather than a trailing call.
-        struct HookCleanup;
-        impl Drop for HookCleanup {
-            fn drop(&mut self) {
-                zeroclaw_log::clear_broadcast_hook();
-            }
-        }
-        let _cleanup = HookCleanup;
-
-        let temp = tempfile::tempdir().unwrap();
-        let png_data = valid_png();
-        let img = |i: usize| {
-            let p = temp.path().join(format!("img{i}.png"));
-            std::fs::write(&p, &png_data).unwrap();
-            p
-        };
-        // One image-only turn (i == 1), captioned turns otherwise, each
-        // answered; the image-only message becomes the removal placeholder
-        // once its image is evicted.
-        let history_with = |turns: usize| {
-            let mut history = vec![ChatMessage::system("sys")];
-            for i in 0..turns {
-                let content = if i == 1 {
-                    format!("[IMAGE:{}]", img(i).display())
-                } else {
-                    format!("[IMAGE:{}]\ncaption {i}", img(i).display())
-                };
-                history.push(ChatMessage::user(content));
-                history.push(ChatMessage::assistant(format!("saw {i}")));
-            }
-            history
-        };
-
-        // Scenario 1: four images against `max_images: 3`. The
-        // (`max_images`, `images_before_cap`) pair (3, 4) is
-        // unique to this invocation among the crate's tests, so another
-        // test's frame can never be selected here.
-        let config = MultimodalConfig {
-            max_images: 3,
-            max_image_size_mb: 5,
-            allow_remote_fetch: false,
-            max_image_turns: 0,
-            ..Default::default()
-        };
-        let history = history_with(4);
-        let _ = prepare_messages_for_provider(&history, &config)
-            .await
-            .unwrap();
-
-        // Other tests in this process emit into the same channel; select on
-        // the message text plus both values, never just the first frame.
-        let mut found = None;
-        while let Ok(value) = rx.try_recv() {
-            let attrs = &value["attributes"];
-            if value["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("image cap exceeded"))
-                && value["severity_text"] == "WARN"
-                && attrs["max_images"] == 3
-                && attrs["images_before_cap"] == 4
-            {
-                found = Some(value);
-                break;
-            }
-        }
-        let frame = found.expect("cap WARN frame with max_images 3 and images_before_cap 4");
-        // Four images against a cap of 3 drop to the mark of 2: the two oldest
-        // image messages are rewritten.
-        assert_eq!(frame["attributes"]["first_trimmed_index"], 1);
-        assert_eq!(frame["attributes"]["last_trimmed_index"], 3);
-        assert_eq!(frame["attributes"]["images_evicted"], 2);
-
-        // Scenario 2: five images against `max_images: 2` evicts several
-        // images in one trim; the pair (2, 5) is likewise unique to this
-        // invocation.
-        let config = MultimodalConfig {
-            max_images: 2,
-            max_image_size_mb: 5,
-            allow_remote_fetch: false,
-            max_image_turns: 0,
-            ..Default::default()
-        };
-        let history = history_with(5);
-        let _ = prepare_messages_for_provider(&history, &config)
-            .await
-            .unwrap();
-
-        let mut found = None;
-        while let Ok(value) = rx.try_recv() {
-            let attrs = &value["attributes"];
-            if value["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("image cap exceeded"))
-                && value["severity_text"] == "WARN"
-                && attrs["max_images"] == 2
-                && attrs["images_before_cap"] == 5
-            {
-                found = Some(value);
-                break;
-            }
-        }
-        let frame = found.expect("cap WARN frame with max_images 2 and images_before_cap 5");
-        // The span covers every message the trim rewrote: first is the
-        // oldest image message, last the newest evicted one. Five images
-        // against a cap of 2 keep 1 + (5 - 3) % 2 = 1, so four go.
-        assert_eq!(frame["attributes"]["first_trimmed_index"], 1);
-        assert_eq!(frame["attributes"]["last_trimmed_index"], 7);
-        assert_eq!(frame["attributes"]["images_evicted"], 4);
-    }
-
-    #[tokio::test]
-    async fn prepare_messages_skips_remote_url_when_disabled() {
-        let messages = vec![ChatMessage::user(
-            "Look [IMAGE:https://example.com/img.png]".to_string(),
-        )];
-
-        let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .expect("disabled remote image should be skipped");
-
-        assert!(!result.contains_images);
-        assert_eq!(result.messages.len(), 1);
-        assert!(result.messages[0].content.contains("Look"));
-        assert!(
-            result.messages[0]
-                .content
-                .contains("1 attached image(s) could not be loaded")
-        );
-        assert!(
-            !result.messages[0]
-                .content
-                .contains("https://example.com/img.png")
-        );
     }
 
     #[tokio::test]
@@ -11594,10 +7226,12 @@ mod tests {
         let bytes = vec![0u8; 1024 * 1024 + 1];
         std::fs::write(&image_path, bytes).unwrap();
 
-        let messages = vec![ChatMessage::user(format!(
-            "[IMAGE:{}]",
-            image_path.display()
-        ))];
+        let messages = vec![ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+        ])];
         let config = MultimodalConfig {
             max_images: 4,
             max_image_size_mb: 1,
@@ -11629,21 +7263,23 @@ mod tests {
         let image_path = temp.path().join("ok.png");
         std::fs::write(&image_path, valid_png()).unwrap();
 
-        let messages = vec![ChatMessage::user(format!(
-            "Look [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
-            image_path.display()
-        ))];
+        let messages = vec![ChatMessage::user("Look  and").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (image_path.display()).to_string(),
+            },
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "https://example.com/missing.png".to_string(),
+            },
+        ])];
 
         let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
             .await
             .expect("valid local image should survive while remote image is skipped");
 
         assert!(result.contains_images);
-        assert!(
-            result.messages[0]
-                .content
-                .contains("data:image/png;base64,")
-        );
+        assert!(message_image_refs(&result.messages[0])[0].starts_with("data:image/png;base64,"));
         assert!(
             result.messages[0]
                 .content
@@ -11656,79 +7292,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn failed_images_consume_budget_under_pre_normalization_trim() {
-        // BEHAVIOR CHANGE: the per-request image cap is now applied
-        // *before* normalization, so a newer image that fails to load does
-        // consume budget and can evict an older valid one.
-        //
-        // Rationale: full pixel validation is CPU/memory intensive, unlike the
-        // prior header-only sniff. Normalizing every candidate in a long
-        // history before capping created an unbounded resource sink — a
-        // history of N images forced N full decodes even though only
-        // `max_images` are ever sent. Bounding decode work takes precedence
-        // over preserving an older image when a newer reference is broken.
-        //
-        // The aggregate decode budget (`AGGREGATE_DECODE_BUDGET_BYTES`)
-        // provides the second bound for images that survive the cap.
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("older-valid.png");
-        std::fs::write(&image_path, valid_png()).unwrap();
-
-        let messages = vec![
-            ChatMessage::user(format!(
-                "Older valid image [IMAGE:{}]",
-                image_path.display()
-            )),
-            ChatMessage::user(
-                "Newer broken image [IMAGE:https://example.com/missing.png]".to_string(),
-            ),
-        ];
-        let config = MultimodalConfig {
-            max_images: 1,
-            max_image_size_mb: 5,
-            allow_remote_fetch: false,
-            ..Default::default()
-        };
-
-        let result = prepare_messages_for_provider(&messages, &config)
-            .await
-            .expect("a broken newer image must not fail the whole turn");
-
-        // The cap kept only the newest marker, which then failed to load, so
-        // no image survives — but the turn still succeeds and the model is
-        // told what happened.
-        assert!(
-            !result.contains_images,
-            "newest marker failed to load, so no image should be inlined: {:?}",
-            result.messages
-        );
-        assert!(result.submitted_image_ids.is_empty());
-        assert!(result.newest_user_image_ids.is_empty());
-        assert!(
-            result.messages[0].content.contains("Older valid image"),
-            "older message text must survive the cap"
-        );
-        assert!(
-            !result.messages[0]
-                .content
-                .contains("data:image/png;base64,"),
-            "older image was capped out before normalization"
-        );
-        assert!(result.messages[1].content.contains("Newer broken image"));
-        assert!(
-            result.messages[1]
-                .content
-                .contains("1 attached image(s) could not be loaded")
-        );
-        assert!(
-            !result.messages[1]
-                .content
-                .contains("https://example.com/missing.png"),
-            "raw URL must not leak to the model"
-        );
-    }
-
     #[test]
     fn extract_ollama_image_payload_supports_data_uris() {
         let payload = extract_ollama_image_payload("data:image/png;base64,abcd==")
@@ -11737,194 +7300,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_image_markers_strips_markers_leaving_caption() {
-        let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";
-        let (cleaned, refs) = parse_image_markers(input);
-        assert_eq!(cleaned, "Describe this screenshot");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0], "/tmp/photo.jpg");
-    }
-
-    #[test]
-    fn parse_image_markers_image_only_message_becomes_empty() {
-        let input = "[IMAGE:/tmp/photo.jpg]";
-        let (cleaned, refs) = parse_image_markers(input);
-        assert!(
-            cleaned.is_empty(),
-            "expected empty string, got: {cleaned:?}"
-        );
-        assert_eq!(refs.len(), 1);
-    }
-    #[test]
     fn provider_image_filter_removes_only_selected_identity() {
         let first = "data:image/png;base64,AAAA";
         let second = "data:image/png;base64,BBBB";
-        let messages = vec![ChatMessage::user(format!(
-            "compare [IMAGE:{first}] with [IMAGE:{second}]"
-        ))];
+        let messages = vec![ChatMessage::user("compare  with").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: first.to_string(),
+            },
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: second.to_string(),
+            },
+        ])];
         let ids = provider_image_ids(&messages);
 
         let filtered = omit_provider_image_ids(&messages, &ids[1..]);
 
         assert_eq!(provider_image_ids(&filtered), vec![ids[0]]);
-        assert!(filtered[0].content.contains(first));
-        assert!(!filtered[0].content.contains(second));
+        assert_eq!(message_image_refs(&filtered[0]), vec![first]);
         assert!(filtered[0].content.contains("compare"));
-    }
-
-    #[test]
-    fn provider_image_filter_preserves_literal_roles_and_tool_arguments() {
-        let marker = "[IMAGE:data:image/png;base64,AAAA]";
-        let assistant = serde_json::json!({
-            "reasoning_content": format!("signed literal {marker}"),
-            "signature": "signed-reasoning",
-            "tool_calls": [{"function": {"arguments": format!("{{\"literal\":\"{marker}\"}}")}}],
-        })
-        .to_string();
-        let old_tool = serde_json::json!({"content": format!("old {marker}")}).to_string();
-        let current_tool = serde_json::json!({
-            "tool_call_id": "call-1",
-            "content": format!("new {marker}"),
-            "attachments": [{"kind": "image", "target": "data:image/png;base64,AAAA"}],
-        })
-        .to_string();
-        let messages = vec![
-            ChatMessage::system(format!("system literal {marker}")),
-            ChatMessage::user("first turn"),
-            ChatMessage::tool(old_tool),
-            ChatMessage::user(format!("inspect {marker}")),
-            ChatMessage::assistant(assistant),
-            ChatMessage::tool(current_tool),
-        ];
-        let omitted = provider_image_ids(&[ChatMessage::user(marker)]);
-
-        let filtered = omit_provider_image_ids(&messages, &omitted);
-
-        assert_eq!(filtered[0].content, messages[0].content);
-        assert_eq!(filtered[2].content, messages[2].content);
-        assert_eq!(filtered[4].content, messages[4].content);
-        assert!(!filtered[3].content.contains(marker));
-        let tool: serde_json::Value = serde_json::from_str(&filtered[5].content).unwrap();
-        assert_eq!(tool["tool_call_id"], "call-1");
-        assert_eq!(tool["content"], format!("new {marker}"));
-        assert_eq!(tool["attachments"], serde_json::json!([]));
-        assert!(provider_image_ids(&filtered).is_empty());
-    }
-
-    #[test]
-    fn provider_image_filter_preserves_carrier_bodies_and_other_attachments() {
-        let first = "data:image/png;base64,AAAA";
-        let second = "data:image/png;base64,BBBB";
-        let body = format!("quoted [IMAGE:{first}] and [IMAGE:{second}]\n  keep indentation\n");
-        let audio = RenderedMarker {
-            kind: MarkerKind::Audio,
-            target: "/tmp/clip.wav".to_string(),
-        };
-        let attachments = vec![image_marker(first), image_marker(second), audio.clone()];
-        let native = serde_json::json!({
-            "tool_call_id": "call-1",
-            "content": body,
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
-            "data": null,
-            "extra": {"preserve": true},
-        })
-        .to_string();
-        let messages = vec![
-            ChatMessage::user("inspect"),
-            ChatMessage::tool(native),
-            ChatMessage::user(render_prompt_tool_carrier(&body, &attachments)),
-        ];
-        let ids = provider_image_ids(&messages);
-        assert_eq!(
-            ids.len(),
-            4,
-            "only declarations count, never the quoted body"
-        );
-        assert_eq!(ids[0], ids[2]);
-        assert_eq!(ids[1], ids[3]);
-
-        let filtered = omit_provider_image_ids(&messages, &[ids[0]]);
-        assert_eq!(provider_image_ids(&filtered), vec![ids[1], ids[1]]);
-        for message in &filtered[1..] {
-            let parts = classify(&message.role, &message.content).unwrap();
-            assert_eq!(parts.text, body);
-            assert_eq!(parts.attachments, vec![image_marker(second), audio.clone()]);
-        }
-        let envelope: serde_json::Value = serde_json::from_str(&filtered[1].content).unwrap();
-        assert_eq!(envelope["tool_call_id"], "call-1");
-        assert!(envelope.get("data").unwrap().is_null());
-        assert_eq!(envelope["extra"], serde_json::json!({"preserve": true}));
-        assert_eq!(
-            serde_json::to_value(omit_provider_image_ids(&messages, &[])).unwrap(),
-            serde_json::to_value(&messages).unwrap()
-        );
-        assert_eq!(
-            classify("tool", &messages[1].content).unwrap().attachments,
-            attachments
-        );
-    }
-
-    #[test]
-    fn provider_image_filter_leaves_legacy_and_empty_carriers_inert() {
-        let reference = "data:image/png;base64,AAAA";
-        let body = format!("quoted [IMAGE:{reference}]");
-        let messages = vec![
-            ChatMessage::user("inspect"),
-            ChatMessage::tool(body.clone()),
-            ChatMessage::tool(serde_json::json!({"content": body}).to_string()),
-            ChatMessage::tool(serde_json::json!({"content": body, "attachments": []}).to_string()),
-            ChatMessage::user(format!("[Tool results]\n{body}")),
-            ChatMessage::user(render_prompt_tool_carrier(&body, &[])),
-        ];
-        assert!(provider_image_ids(&messages).is_empty());
-        let omitted = [ProviderImageId::from_reference(reference)];
-        assert_eq!(
-            serde_json::to_value(omit_provider_image_ids(&messages, &omitted)).unwrap(),
-            serde_json::to_value(&messages).unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn provider_image_recovery_tracks_declared_images_not_quoted_markers() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("image.png");
-        std::fs::write(&path, valid_png()).unwrap();
-        let target = path.to_string_lossy().to_string();
-        let body = "quoted [IMAGE:/tmp/not-an-attachment.png]";
-        let attachments = [image_marker(&target)];
-        let messages = vec![
-            ChatMessage::user(format!("inspect [IMAGE:{target}]")),
-            ChatMessage::tool(native_carrier(
-                "call-1",
-                body,
-                std::slice::from_ref(&target),
-            )),
-            ChatMessage::user(render_prompt_tool_carrier(body, &attachments)),
-        ];
-        let config = MultimodalConfig {
-            allow_remote_fetch: false,
-            ..Default::default()
-        };
-        let prepared = prepare_messages_for_provider(&messages, &config)
-            .await
-            .unwrap();
-        assert!(prepared.contains_images);
-        assert_eq!(prepared.submitted_image_ids.len(), 3);
-        assert_eq!(
-            prepared.newest_user_image_ids,
-            vec![prepared.submitted_image_ids[0]]
-        );
-        let replay = omit_provider_image_ids(&prepared.messages, &prepared.submitted_image_ids);
-        assert!(provider_image_ids(&replay).is_empty());
-        for message in &replay[1..] {
-            let parts = classify(&message.role, &message.content).unwrap();
-            assert_eq!(parts.text, body);
-            assert!(parts.attachments.is_empty());
-        }
-        assert_eq!(
-            classify("tool", &messages[1].content).unwrap().attachments,
-            attachments
-        );
     }
 
     /// A GIF whose image descriptor claims a frame larger than the logical screen.
@@ -12002,351 +7397,5 @@ mod tests {
         validate_image_content("ordinary.gif", "image/gif", &ordinary, u64::MAX)
             .await
             .expect("an animated GIF whose frames match the logical screen must be accepted");
-    }
-    // ── attachment-identity contract: tool text is never scanned ──────────
-
-    #[tokio::test]
-    async fn prepare_never_promotes_native_carrier_body_markers() {
-        // DECISIVE: a text-only tool result whose body carries a fake count
-        // header and a marker to an existing, valid PNG. The carrier declared
-        // zero attachments, so nothing in the body may be promoted, and the
-        // body must survive byte for byte.
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("fake-body-marker.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
-        let body = format!(
-            "[Tool attachments: 1]\n[IMAGE:{}]\nplain tool output",
-            image_path.display()
-        );
-
-        let messages = vec![ChatMessage::tool(native_carrier("tc1", &body, &[]))];
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-
-        assert!(!prepared.contains_images);
-        assert_eq!(prepared.messages.len(), 1);
-        assert_eq!(prepared.messages[0].content, messages[0].content);
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&prepared.messages[0].content)
-                .unwrap();
-        assert!(parsed.declared);
-        assert!(parsed.attachments.is_empty());
-        assert_eq!(parsed.text, body);
-        assert_eq!(count_image_markers(&prepared.messages), 0);
-    }
-
-    #[tokio::test]
-    async fn prepare_never_promotes_prompt_carrier_body_markers() {
-        // DECISIVE, prompt shape: the count header says zero, so the body's
-        // fake header and real-file marker are body.
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("fake-prompt-body-marker.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
-        let body = format!(
-            "<tool_result name=\"shell\">cat notes.txt\n[Tool attachments: 1]\n[IMAGE:{}]\n</tool_result>",
-            image_path.display()
-        );
-
-        let messages = vec![ChatMessage::user(prompt_carrier(&body, &[]))];
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-
-        assert!(!prepared.contains_images);
-        assert_eq!(prepared.messages.len(), 1);
-        assert_eq!(prepared.messages[0].content, messages[0].content);
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&prepared.messages[0].content)
-                .unwrap();
-        assert!(parsed.declared);
-        assert!(parsed.attachments.is_empty());
-        assert_eq!(parsed.text, body);
-    }
-
-    #[tokio::test]
-    async fn prepare_warns_once_on_legacy_carrier_body_markers() {
-        // Observability: a pre-upgrade or third-party carrier with marker
-        // syntax in its body is visible as one WARN per request, with counts
-        // only — never marker text.
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
-        zeroclaw_log::try_install_capture_subscriber();
-        let mut rx = zeroclaw_log::subscribe_or_install();
-        while rx.try_recv().is_ok() {}
-
-        let body = format!(
-            "saw a marker in source: [IMAGE:/tmp/source-example.png]\n{}",
-            "x".repeat(80)
-        );
-        let messages = vec![
-            ChatMessage::user("read the file".to_string()),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "tool_call_id": "tc1",
-                    "content": body,
-                })
-                .to_string(),
-            ),
-        ];
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-        assert!(!prepared.contains_images);
-        assert_eq!(
-            prepared.messages[1].content, messages[1].content,
-            "a legacy carrier passes through untouched"
-        );
-
-        let record = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match rx.recv().await {
-                    Ok(value)
-                        if value.get("message").and_then(|v| v.as_str())
-                            == Some(
-                                "legacy tool-result carrier body contains image marker syntax; treated as text, not attachments",
-                            ) =>
-                    {
-                        break value
-                    }
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        panic!("broadcast closed before the legacy-carrier warning arrived")
-                    }
-                }
-            }
-        })
-        .await
-        .expect("legacy-carrier warning should arrive");
-
-        let attrs = record.get("attributes").expect("record carries attributes");
-        assert_eq!(
-            attrs.get("image_marker_count").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        assert_eq!(
-            attrs.get("native_carriers").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        assert!(
-            !serde_json::to_string(&record)
-                .unwrap()
-                .contains("/tmp/source-example.png"),
-            "the warning must not carry marker text"
-        );
-
-        // C6: exactly ONE matching record for one preparation. The original
-        // assertion stopped at the first match, so a second emission would
-        // have passed unnoticed. Emission is synchronous inside
-        // `prepare_messages_for_provider`, so anything beyond the first is
-        // already buffered here.
-        let mut extra_matches = 0usize;
-        while let Ok(value) = rx.try_recv() {
-            if value.get("message").and_then(|v| v.as_str())
-                == Some(
-                    "legacy tool-result carrier body contains image marker syntax; treated as text, not attachments",
-                )
-            {
-                extra_matches += 1;
-            }
-        }
-        assert_eq!(
-            extra_matches, 0,
-            "one preparation must emit the legacy-carrier warning exactly once"
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_carrier_warns_once_per_preparation_not_once_per_request() {
-        // C6: a runtime-to-compatible request prepares the same history
-        // twice — the runtime's vision-route preparation, then the
-        // compatible provider's `normalize_messages_for_upstream` — so a
-        // surviving current-turn legacy body warns once per preparation,
-        // twice per request. Two is accepted and pinned here: the layers
-        // share no per-request state, and gating the second emission would
-        // mean threading a "already warned" flag through message values, a
-        // wider change than the log noise it removes.
-        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
-        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
-        zeroclaw_log::try_install_capture_subscriber();
-        let mut rx = zeroclaw_log::subscribe_or_install();
-        while rx.try_recv().is_ok() {}
-
-        let marker =
-            zeroclaw_api::tool_carrier::marker_line(&image_marker("/tmp/source-example.png"));
-        let body = format!("saw a marker in source: {marker}\n{}", "x".repeat(80));
-        let messages = vec![
-            ChatMessage::user("read the file".to_string()),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "tool_call_id": "tc1",
-                    "content": body,
-                })
-                .to_string(),
-            ),
-        ];
-
-        // The runtime pass (vision_route.rs), then the compatible pass
-        // (normalize_messages_for_upstream) over the first pass's output.
-        let first = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-        let second = prepare_messages_for_provider(&first.messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            second.messages[1].content, messages[1].content,
-            "the legacy carrier survives both passes untouched"
-        );
-
-        let mut matches = 0usize;
-        while let Ok(value) = rx.try_recv() {
-            if value.get("message").and_then(|v| v.as_str())
-                == Some(
-                    "legacy tool-result carrier body contains image marker syntax; treated as text, not attachments",
-                )
-            {
-                matches += 1;
-            }
-        }
-        assert_eq!(
-            matches, 2,
-            "once per preparation invocation, twice for the runtime-then-compatible request shape"
-        );
-    }
-
-    #[test]
-    fn strip_message_media_keeps_carrier_bodies_verbatim() {
-        // No-vision degrade: a carrier with marker-looking body text keeps the
-        // body byte for byte; only declared attachments drop.
-        let body = "the source contains [IMAGE:/tmp/example.png] as literal text";
-        let declared = ChatMessage::tool(native_carrier(
-            "tc1",
-            body,
-            &["/tmp/real-attachment.png".to_string()],
-        ));
-        let stripped = strip_message_media(&declared);
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&stripped.content).unwrap();
-        assert!(parsed.declared);
-        assert!(parsed.attachments.is_empty());
-        assert_eq!(parsed.text, body);
-
-        // Legacy carrier: nothing to degrade, nothing to rewrite.
-        let legacy = ChatMessage::tool(
-            serde_json::json!({
-                "tool_call_id": "tc1",
-                "content": body,
-            })
-            .to_string(),
-        );
-        assert_eq!(strip_message_media(&legacy).content, legacy.content);
-
-        // User messages still degrade their markers as before.
-        let user = ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string());
-        assert_eq!(
-            strip_message_media(&user).content,
-            format!("look at this {MEDIA_PLACEHOLDER}")
-        );
-    }
-
-    #[test]
-    fn parse_user_message_image_refs_lifts_only_carrier_attachments() {
-        // Declared carrier: image lines lift, other lines stay, body verbatim.
-        let content = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
-            "<tool_result name=\"shell\">ls\n</tool_result>",
-            &[
-                image_marker("/tmp/a.png"),
-                zeroclaw_api::media::RenderedMarker {
-                    target: "/tmp/clip.ogg".to_string(),
-                    kind: zeroclaw_api::media::MarkerKind::Audio,
-                },
-            ],
-        );
-        let (text, refs) = parse_user_message_image_refs(&content);
-        assert_eq!(refs, vec!["/tmp/a.png".to_string()]);
-        // The image line lifts; the audio line stays as a carried, non-image
-        // attachment line, and the header count reflects what is left.
-        let audio_line =
-            zeroclaw_api::tool_carrier::marker_line(&zeroclaw_api::media::RenderedMarker {
-                target: "/tmp/clip.ogg".to_string(),
-                kind: zeroclaw_api::media::MarkerKind::Audio,
-            });
-        assert_eq!(
-            text.lines().take(3).collect::<Vec<_>>(),
-            vec![
-                zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX,
-                "[Tool attachments: 1]",
-                audio_line.as_str(),
-            ]
-        );
-        assert!(text.contains("<tool_result name=\"shell\">"));
-
-        // Legacy carrier: no refs, text untouched.
-        let legacy = "[Tool results]\nbody mentions [IMAGE:/tmp/fake.png]";
-        let (text, refs) = parse_user_message_image_refs(legacy);
-        assert!(refs.is_empty());
-        assert_eq!(text, legacy);
-
-        // Plain user text keeps the marker-lifting behavior.
-        let user_text = "see [IMAGE:/tmp/a.png] now";
-        let (text, refs) = parse_user_message_image_refs(user_text);
-        assert_eq!(refs, vec!["/tmp/a.png".to_string()]);
-        // Marker lifting keeps the surrounding spaces, exactly as before.
-        assert_eq!(text, "see  now");
-    }
-
-    #[tokio::test]
-    async fn prepare_keeps_image_when_audio_attachment_drops_from_declared_carrier() {
-        // C1: the audio sanitizer used to run before carriers were parsed, so
-        // a declared carrier's audio marker line was rewritten, the count no
-        // longer matched, and the strict parser degraded the whole carrier to
-        // legacy — the image was lost with it. Audio now drops from the
-        // declared list: the image lifts, the body stays verbatim, and the
-        // carrier never falls back to legacy.
-        let temp = tempfile::tempdir().unwrap();
-        let image_path = temp.path().join("mixed.png");
-        std::fs::write(&image_path, valid_png()).unwrap();
-        let attachments = vec![
-            image_marker(image_path.display().to_string()),
-            zeroclaw_api::media::RenderedMarker {
-                target: "/tmp/clip.ogg".to_string(),
-                kind: zeroclaw_api::media::MarkerKind::Audio,
-            },
-        ];
-        let body = "tool text body";
-        let content = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(body, &attachments);
-        let messages = vec![ChatMessage::user(content)];
-
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
-            .await
-            .unwrap();
-
-        assert!(
-            prepared.contains_images,
-            "the image must survive the audio drop"
-        );
-        assert_eq!(prepared.messages.len(), 1);
-        let parsed =
-            zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&prepared.messages[0].content)
-                .expect("still a carrier, never legacy");
-        assert!(parsed.declared, "the carrier must not degrade to legacy");
-        assert_eq!(parsed.text, body, "the body stays verbatim");
-        // The image attachment is normalized to a data URI and survives; the
-        // audio attachment is gone from the declared list.
-        assert_eq!(parsed.attachments.len(), 1);
-        assert_eq!(
-            parsed.attachments[0].kind,
-            zeroclaw_api::media::MarkerKind::Image
-        );
-        assert!(parsed.attachments[0].target.starts_with("data:image/"));
     }
 }

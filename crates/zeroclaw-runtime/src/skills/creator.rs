@@ -109,6 +109,9 @@ impl SkillCreator {
                     .with_context(|| format!("Failed to write {}", md_path.display()))?;
             }
             Err(err) => {
+                if zeroclaw_api::session_events::capture::is_capture_stopped(&err) {
+                    return Err(err);
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -569,87 +572,26 @@ fn extract_frontmatter_block(raw: &str) -> String {
     text.to_string()
 }
 
-/// Extract `ToolCallRecord`s from the agent conversation history.
-/// Scans assistant messages for tool call patterns (both JSON and XML formats)
-/// and returns records for each unique tool invocation.
+/// Extract typed `ToolCallRecord`s from the agent conversation history.
+/// Visible assistant text is never parsed as a tool protocol.
 pub fn extract_tool_calls_from_history(
     history: &[zeroclaw_providers::ChatMessage],
 ) -> Vec<ToolCallRecord> {
     let mut records = Vec::new();
-
-    for msg in history {
-        if msg.role != "assistant" {
+    for message in history {
+        if message.role != "assistant" {
             continue;
         }
-
-        // Try parsing as JSON (native tool_calls format).
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
-            && let Some(tool_calls) = value.get("tool_calls").and_then(|v| v.as_array())
-        {
-            for call in tool_calls {
-                if let Some(function) = call.get("function") {
-                    let name = function
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let args_str = function
-                        .get("arguments")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("{}");
-                    let args = serde_json::from_str(args_str).unwrap_or_default();
-                    if !name.is_empty() {
-                        records.push(ToolCallRecord { name, args });
-                    }
-                }
-            }
-        }
-
-        // Also try XML tool call format: <tool_name>...</tool_name>
-        // Simple extraction for `<shell>{"command":"..."}</shell>` style tags.
-        let content = &msg.content;
-        let mut pos = 0;
-        while pos < content.len() {
-            if let Some(start) = content[pos..].find('<') {
-                let abs_start = pos + start;
-                if let Some(end) = content[abs_start..].find('>') {
-                    let tag = &content[abs_start + 1..abs_start + end];
-                    // Skip closing tags and meta tags.
-                    if tag.starts_with('/') || tag.starts_with('!') || tag.starts_with('?') {
-                        pos = abs_start + end + 1;
-                        continue;
-                    }
-                    let tag_name = tag.split_whitespace().next().unwrap_or(tag);
-                    let close_tag = format!("</{tag_name}>");
-                    if let Some(close_pos) = content[abs_start + end + 1..].find(&close_tag) {
-                        let inner = &content[abs_start + end + 1..abs_start + end + 1 + close_pos];
-                        let args: serde_json::Value =
-                            serde_json::from_str(inner.trim()).unwrap_or_default();
-                        // Only add if it looks like a tool call (not HTML/formatting tags).
-                        if tag_name != "tool_result"
-                            && tag_name != "tool_results"
-                            && !tag_name.contains(':')
-                            && args.is_object()
-                            && !args.as_object().is_none_or(|o| o.is_empty())
-                        {
-                            records.push(ToolCallRecord {
-                                name: tag_name.to_string(),
-                                args,
-                            });
-                        }
-                        pos = abs_start + end + 1 + close_pos + close_tag.len();
-                    } else {
-                        pos = abs_start + end + 1;
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                break;
+        for call in &message.tool_calls {
+            let args = serde_json::from_str(&call.arguments).unwrap_or_default();
+            if !call.name.is_empty() {
+                records.push(ToolCallRecord {
+                    name: call.name.clone(),
+                    args,
+                });
             }
         }
     }
-
     records
 }
 
@@ -1135,6 +1077,31 @@ tags = ["auto-generated"]
         let history = vec![ChatMessage::user("hello"), ChatMessage::user("world")];
         let records = extract_tool_calls_from_history(&history);
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn extract_uses_typed_calls_and_keeps_protocol_examples_inert() {
+        use zeroclaw_providers::{ChatMessage, ToolCall};
+        let history = vec![
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"function":{"name":"fake","arguments":"{}"}}]}"#,
+            ),
+            ChatMessage::assistant(r#"<shell>{"command":"example"}</shell>"#),
+            ChatMessage::assistant_tool_calls(
+                "visible narration",
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"pwd"}"#.into(),
+                    extra_content: None,
+                }],
+                None,
+            ),
+        ];
+        let records = extract_tool_calls_from_history(&history);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "shell");
+        assert_eq!(records[0].args, serde_json::json!({"command":"pwd"}));
     }
 
     // ── Fuzz-like tests for slug ─────────────────────────────────

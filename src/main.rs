@@ -7724,7 +7724,10 @@ mod wss_client_auth_tests {
                 "relay.example.test".to_string(),
             ]
         );
-        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]).is_empty());
+        assert_eq!(
+            wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -8075,7 +8078,7 @@ mod wss_client_auth_tests {
         .unwrap();
         assert_eq!(sans, vec!["localhost", "127.0.0.1", "zero.tail1234.ts.net"]);
         // Default config, nothing known: empty keeps the default leaf path.
-        assert!(
+        assert_eq!(
             effective_server_sans(
                 dir.path(),
                 &wss_with_sans(&[]),
@@ -8083,8 +8086,8 @@ mod wss_client_auth_tests {
                     hostname_override: None
                 },
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            Vec::<String>::new()
         );
     }
 
@@ -10170,7 +10173,22 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
-            Box::pin(agent::run(
+            let authority = standalone_authority
+                .as_ref()
+                .ok_or_else(|| anyhow::Error::msg("CLI config ownership was not acquired"))?;
+            let session_execution = zeroclaw::session_events::open_cli_session(
+                &config.data_dir,
+                &config.channels.session_backend,
+                &agent_alias,
+                authority.execution_capability(),
+                session_state_file.as_deref(),
+            )
+            .await?;
+            let session_source: Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource> =
+                Arc::new(zeroclaw::session_events::NativeSessionHub::new(
+                    authority.execution_capability().config_handle(),
+                ));
+            let execution = Box::pin(agent::run(
                 config,
                 &agent_alias,
                 message,
@@ -10188,7 +10206,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         .map(|authority| authority.execution_capability()),
                     ..Default::default()
                 },
-            ))
+            ));
+            zeroclaw_api::session_events::capture::scope_session_execution(
+                session_execution,
+                zeroclaw_kernel::session::engine::scope_engine_session_source(
+                    session_source,
+                    execution,
+                ),
+            )
             .await
             .map(|_| ())
         }
@@ -10219,26 +10244,43 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 if let Some(timeout) = session_timeout {
                     acp_config.session_timeout_secs = timeout;
                 }
-                let store =
-                    zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
-                        .map(std::sync::Arc::new)
-                        .inspect_err(|e| {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                                "Failed to open ACP session store"
-                            );
-                        })
-                        .ok();
+                let source: std::sync::Arc<
+                    dyn zeroclaw_kernel::session::engine::EngineSessionSource,
+                > = std::sync::Arc::new(zeroclaw::session_events::NativeSessionHub::new(
+                    authority.live_handle(),
+                ));
+                source.families().await?;
+                let store = Some(std::sync::Arc::new(
+                    zeroclaw_infra::session_repository::SessionRepository::for_namespace(
+                        &config.data_dir,
+                        "acp_",
+                    )?,
+                ));
                 let server = channels::acp_server::AcpServer::new_stdio_with_authority(
                     &authority, acp_config, store,
                 )
                 .with_connection_default_agent(agent);
+                let capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
+                    authority.live_handle(),
+                    authority.agent_lifecycle().clone(),
+                );
+                let server = server.with_session_history(
+                    source,
+                    std::sync::Arc::new(move |alias, stream| {
+                        Ok(std::sync::Arc::new(
+                            zeroclaw_runtime::live_config_authority::AgentHistoryAuthority {
+                                admission: capability.admit(alias)?.into(),
+                                actor: zeroclaw_api::session_events::EventActor::Principal {
+                                    principal_id:
+                                        zeroclaw_api::principal::PrincipalId::shared_operator().0,
+                                },
+                                stream,
+                                origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
+                                parent_alias: None,
+                            },
+                        ))
+                    }),
+                );
                 std::sync::Arc::new(server).run().await
             }
             #[cfg(not(feature = "channel-acp-server"))]
@@ -10663,11 +10705,21 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
                 // operator opts in by setting a directory.
+                let native_sessions: Arc<
+                    dyn zeroclaw_kernel::session::engine::EngineSessionSource,
+                > = Arc::new(zeroclaw::session_events::NativeSessionHub::new(
+                    authority.live_handle(),
+                ));
+                let registry_history = native_sessions.clone();
+                registry.register_session_source(Box::new(move |_| registry_history.clone()));
                 let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
-                    let sop_adapters = build_sop_adapters(&current_config);
+                    let sop_adapters = build_sop_adapters(
+                        &current_config,
+                        Some((native_sessions.clone(), authority.execution_capability())),
+                    );
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
                         current_config.sop.clone(),
                         &current_config.decision_models,
@@ -10807,7 +10859,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     let sop_a = sop_audit.clone();
                     let sop_ds = sop_driver_sink.clone();
                     let plugin_webhooks = channel_plugin_webhooks.clone();
-                    move |authority, cancel| {
+                    move |authority, cancel, native_sessions| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -10815,7 +10867,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let plugin_webhooks = plugin_webhooks.clone();
                         Box::pin(async move {
                             Box::pin(
-                                zeroclaw_channels::orchestrator::start_channels_with_authority_and_plugin_webhooks(
+                                zeroclaw_channels::orchestrator::start_channels_with_history(
                                     authority,
                                     Some(canvas_store),
                                     cancel,
@@ -10823,6 +10875,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                     sop_audit,
                                     plugin_webhooks,
                                     sop_driver_sink,
+                                    native_sessions,
                                 ),
                             )
                             .await
@@ -12222,10 +12275,17 @@ Add pricing to the active provider profile or supply a catalog entry."
                     let _ = tokio::signal::ctrl_c().await;
                     ctrlc_cancel.cancel();
                 });
+                let history_source: Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource> =
+                    Arc::new(zeroclaw::session_events::NativeSessionHub::new(
+                        authority.live_handle(),
+                    ));
                 let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
-                    let sop_adapters = build_sop_adapters(&config);
+                    let sop_adapters = build_sop_adapters(
+                        &config,
+                        Some((history_source.clone(), authority.execution_capability())),
+                    );
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
                         config.sop.clone(),
                         &config.decision_models,
@@ -12268,13 +12328,19 @@ Add pricing to the active provider profile or supply a catalog entry."
                 // Standalone channel mode owns the live-pricing refresher.
                 zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
 
-                let result = Box::pin(channels::start_channels_with_authority(
+                let native_sessions = config
+                    .channels
+                    .session_persistence
+                    .then_some(history_source);
+                let result = Box::pin(channels::start_channels_with_history(
                     authority,
                     None,
                     cancel,
                     sop_engine,
                     sop_audit,
+                    None,
                     sop_driver_sink,
+                    native_sessions,
                 ))
                 .await;
 
@@ -15830,7 +15896,13 @@ fn gate_security_posture(
 /// `Handle::current()` so the sync, under-the-engine-lock adapter calls can bridge
 /// to the async channel/provider calls.
 #[cfg(feature = "agent-runtime")]
-fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapters {
+fn build_sop_adapters(
+    config: &Config,
+    history: Option<(
+        Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>,
+        zeroclaw_runtime::AgentExecutionCapability,
+    )>,
+) -> zeroclaw_runtime::sop::SopEngineAdapters {
     // `llm.generate` runs on the DEFAULT agent's resolved model provider — the
     // daemon-level model of record. No resolvable provider = fail-closed.
     let llm: Option<std::sync::Arc<dyn zeroclaw_runtime::sop::capability::LlmGenerateAdapter>> =
@@ -15870,12 +15942,9 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                     }
                 };
                 let model = entry.model.clone().unwrap_or_else(|| "default".to_string());
-                Some(std::sync::Arc::new(
-                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
-                        std::sync::Arc::from(provider),
-                        model,
-                    ),
-                ) as _)
+                let adapter=zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(std::sync::Arc::from(provider),model);
+                let adapter=if let Some((source,capability))=&history {adapter.with_session_history(source.clone(),capability.clone())} else {adapter};
+                Some(std::sync::Arc::new(adapter) as _)
             });
 
     let channels = zeroclaw_channels::orchestrator::build_channel_map(config);
@@ -16521,8 +16590,31 @@ async fn run_gateway_if_enabled(
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
-    let result = Box::pin(gateway::run_gateway(
-        host, port, config, event_bus, None, None, None, None, None, None, None, readiness,
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
+    let mut supervision = gateway::GatewaySupervision::new(
+        readiness,
+        Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::default()),
+        authority.clone(),
+        None,
+    );
+    if config.gateway.session_persistence {
+        let source = Arc::new(zeroclaw::session_events::NativeSessionHub::new(
+            authority.live_handle(),
+        ));
+        supervision = supervision.with_history(source);
+    }
+    let result = Box::pin(gateway::run_gateway_with_plugin_webhooks(
+        host,
+        port,
+        config,
+        event_bus,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        supervision,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -19686,8 +19778,8 @@ mod tests {
             } => {
                 assert!(estop_command.is_none());
                 assert!(level.is_none());
-                assert!(domains.is_empty());
-                assert!(tools.is_empty());
+                assert_eq!(domains, [] as [String; 0]);
+                assert_eq!(tools, [] as [String; 0]);
             }
             other => panic!("expected estop command, got {other:?}"),
         }
@@ -20547,7 +20639,7 @@ mod tests {
             assert_eq!(supervisor.drivers.lock().unwrap().len(), 1);
             let teardown = supervisor.shutdown().await;
             assert!(teardown.still_running.is_empty());
-            assert!(teardown.unsettled_runs.is_empty());
+            assert_eq!(teardown.unsettled_runs, [] as [String; 0]);
             assert_eq!(store.claim_counts(name).unwrap().0, 1);
 
             let reopened =
@@ -21894,7 +21986,7 @@ mod tests {
 
         // Clean posture: no gate, no nag.
         let clean = Config::default();
-        assert!(clean.degraded_security.is_empty());
+        assert_eq!(clean.degraded_security, [] as [String; 0]);
         let handle = gate_security_posture(&clean, false).expect("clean posture must pass");
         assert!(handle.is_none(), "clean posture must not spawn a nag");
 

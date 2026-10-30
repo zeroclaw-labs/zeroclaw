@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::media::AttachmentKind;
 
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
@@ -36,7 +37,7 @@ enum QQMediaFileType {
     File = 4,
 }
 
-/// A parsed media attachment from `[TYPE:target]` markers.
+/// An outbound media attachment adapted to QQ's native file types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QQMediaAttachment {
     kind: QQMediaFileType,
@@ -51,6 +52,7 @@ struct QQVoiceDedupPart {
 
 struct QQComposedMessage {
     content: String,
+    attachments: Vec<zeroclaw_api::media::MediaAttachment>,
     voice_dedup_parts: Vec<QQVoiceDedupPart>,
 }
 
@@ -108,107 +110,17 @@ fn voice_wav_filename(url: &str) -> String {
     }
 }
 
-/// Map a `[TYPE:target]` marker kind string to `QQMediaFileType`.
-/// For AUDIO/VOICE types, the target's extension determines whether it's
-/// sent as `Voice` (native formats only) or degrades to `File`.
-fn marker_kind_to_qq_file_type(marker: &str, target: &str) -> Option<QQMediaFileType> {
-    match marker.trim().to_ascii_uppercase().as_str() {
-        "IMAGE" | "PHOTO" => Some(QQMediaFileType::Image),
-        "DOCUMENT" | "FILE" => Some(QQMediaFileType::File),
-        "VIDEO" => Some(QQMediaFileType::Video),
-        "AUDIO" | "VOICE" => {
-            let ext = Path::new(target.split('?').next().unwrap_or(target))
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            if is_native_voice_ext(ext) {
-                Some(QQMediaFileType::Voice)
-            } else {
-                Some(QQMediaFileType::File)
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Find the matching closing bracket, handling nested brackets.
-fn find_matching_close(s: &str) -> Option<usize> {
-    let mut depth = 1usize;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Parse `[TYPE:target]` attachment markers from message content.
-/// Returns the cleaned text (markers removed) and a list of parsed attachments.
-/// Uses the same bracket-matching logic as `telegram.rs::parse_attachment_markers`.
-fn parse_qq_attachment_markers(content: &str) -> (String, Vec<QQMediaAttachment>) {
-    let mut cleaned = String::with_capacity(content.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0;
-
-    while cursor < content.len() {
-        let Some(open_rel) = content[cursor..].find('[') else {
-            cleaned.push_str(&content[cursor..]);
-            break;
-        };
-
-        let open = cursor + open_rel;
-        cleaned.push_str(&content[cursor..open]);
-
-        let Some(close_rel) = find_matching_close(&content[open + 1..]) else {
-            cleaned.push_str(&content[open..]);
-            break;
-        };
-
-        let close = open + 1 + close_rel;
-        let marker = &content[open + 1..close];
-
-        let parsed = marker.split_once(':').and_then(|(kind, target)| {
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            let file_type = marker_kind_to_qq_file_type(kind, target)?;
-            Some(QQMediaAttachment {
-                kind: file_type,
-                target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&content[open..=close]);
-        }
-
-        cursor = close + 1;
-    }
-
-    (cleaned.trim().to_string(), attachments)
-}
-
-/// Infer attachment type marker from content_type or filename.
-fn infer_attachment_marker(content_type: &str, filename: &str) -> &'static str {
+/// Infer the transport attachment kind from content_type or filename.
+fn infer_attachment_kind(content_type: &str, filename: &str) -> AttachmentKind {
     let ct = content_type.to_ascii_lowercase();
     if ct.starts_with("image/") {
-        return "IMAGE";
+        return AttachmentKind::Image;
     }
     if ct.starts_with("audio/") || ct.contains("voice") {
-        return "VOICE";
+        return AttachmentKind::Audio;
     }
     if ct.starts_with("video/") {
-        return "VIDEO";
+        return AttachmentKind::Video;
     }
 
     // Fallback to extension
@@ -223,7 +135,7 @@ fn infer_attachment_marker(content_type: &str, filename: &str) -> &'static str {
         || lower.ends_with(".heif")
         || lower.ends_with(".svg")
     {
-        return "IMAGE";
+        return AttachmentKind::Image;
     }
     if lower.ends_with(".mp3")
         || lower.ends_with(".wav")
@@ -232,7 +144,7 @@ fn infer_attachment_marker(content_type: &str, filename: &str) -> &'static str {
         || lower.ends_with(".flac")
         || lower.ends_with(".m4a")
     {
-        return "VOICE";
+        return AttachmentKind::Audio;
     }
     if lower.ends_with(".mp4")
         || lower.ends_with(".mov")
@@ -240,9 +152,9 @@ fn infer_attachment_marker(content_type: &str, filename: &str) -> &'static str {
         || lower.ends_with(".avi")
         || lower.ends_with(".webm")
     {
-        return "VIDEO";
+        return AttachmentKind::Video;
     }
-    "DOCUMENT"
+    AttachmentKind::Document
 }
 
 /// Fix QQ attachment URLs that start with `//` (missing scheme).
@@ -717,8 +629,10 @@ impl QQChannel {
     }
 
     fn is_voice_attachment(content_type: &str, filename: &str) -> bool {
-        let marker_type = infer_attachment_marker(content_type, filename);
-        content_type == "voice" || content_type.starts_with("audio/") || marker_type == "VOICE"
+        let kind = infer_attachment_kind(content_type, filename);
+        content_type == "voice"
+            || content_type.starts_with("audio/")
+            || kind == AttachmentKind::Audio
     }
 
     fn normalized_voice_source_id(url: &str) -> String {
@@ -1071,7 +985,7 @@ impl QQChannel {
             .unwrap_or("")
             .trim();
 
-        let mut markers: Vec<String> = Vec::new();
+        let mut media = Vec::new();
         let mut voice_transcripts: Vec<String> = Vec::new();
         let mut voice_dedup_parts: Vec<QQVoiceDedupPart> = Vec::new();
 
@@ -1091,7 +1005,7 @@ impl QQChannel {
                     .and_then(|f| f.as_str())
                     .unwrap_or("attachment");
 
-                let marker_type = infer_attachment_marker(content_type, filename);
+                let kind = infer_attachment_kind(content_type, filename);
 
                 // For voice attachments, prefer voice_wav_url (WAV format) over
                 // the default url (AMR/SILK). QQ provides this for direct use
@@ -1142,11 +1056,19 @@ impl QQChannel {
                     (url.clone(), None)
                 };
 
+                media.push(zeroclaw_api::media::MediaAttachment {
+                    file_name: save_filename.clone(),
+                    reference: Some(zeroclaw_api::media::AttachmentReference {
+                        kind,
+                        target: location,
+                    }),
+                    ..Default::default()
+                });
                 if is_voice {
                     // For voice: include ASR transcription text (aligned with
                     // openclaw-qqbot format: "[语音消息] transcribed text")
                     // Also keep the file path marker for future multimodal support
-                    markers.push(format!("[{marker_type}:{location}]"));
+
                     let voice_transcript = if let Some(asr_text) = att
                         .get("asr_refer_text")
                         .and_then(|t| t.as_str())
@@ -1172,27 +1094,11 @@ impl QQChannel {
                             });
                         }
                     };
-                } else {
-                    markers.push(format!("[{marker_type}:{location}]"));
                 }
             }
         }
 
-        // Voice ASR transcription uses angle brackets to distinguish from
-        // [TYPE:target] media markers (which use square brackets)
-        let voice_text = match voice_transcripts.len() {
-            0 => String::new(),
-            1 => format!(
-                "<VOICE_TRANSCRIPTION>{}</VOICE_TRANSCRIPTION>",
-                voice_transcripts[0]
-            ),
-            _ => voice_transcripts
-                .iter()
-                .enumerate()
-                .map(|(i, t)| format!("<VOICE_TRANSCRIPTION_{i}>{t}</VOICE_TRANSCRIPTION_{i}>"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        };
+        let voice_text = voice_transcripts.join("\n");
 
         let mut parts: Vec<&str> = Vec::new();
         if !text.is_empty() {
@@ -1201,17 +1107,13 @@ impl QQChannel {
         if !voice_text.is_empty() {
             parts.push(&voice_text);
         }
-        let markers_joined = markers.join("\n");
-        if !markers_joined.is_empty() {
-            parts.push(&markers_joined);
-        }
-
-        if parts.is_empty() {
+        if parts.is_empty() && media.is_empty() {
             return None;
         }
 
         Some(QQComposedMessage {
             content: parts.join("\n"),
+            attachments: media,
             voice_dedup_parts,
         })
     }
@@ -1340,24 +1242,43 @@ impl Channel for QQChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let (cleaned_text, attachments) = parse_qq_attachment_markers(&message.content);
+        let attachments: Vec<QQMediaAttachment> = message
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                let reference = attachment.reference.as_ref()?;
+                let kind = match reference.kind {
+                    zeroclaw_api::media::AttachmentKind::Image => QQMediaFileType::Image,
+                    zeroclaw_api::media::AttachmentKind::Audio => {
+                        let target = reference
+                            .target
+                            .split(['?', '#'])
+                            .next()
+                            .unwrap_or(&reference.target);
+                        let extension = Path::new(target)
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .unwrap_or_default();
+                        if is_native_voice_ext(extension) {
+                            QQMediaFileType::Voice
+                        } else {
+                            QQMediaFileType::File
+                        }
+                    }
+                    zeroclaw_api::media::AttachmentKind::Video => QQMediaFileType::Video,
+                    zeroclaw_api::media::AttachmentKind::Document => QQMediaFileType::File,
+                };
+                Some(QQMediaAttachment {
+                    kind,
+                    target: reference.target.clone(),
+                })
+            })
+            .collect();
 
-        if attachments.is_empty() {
-            // No media markers — send as markdown (original path)
-            return self
-                .send_text_markdown(
-                    &message.recipient,
-                    &message.content,
-                    message.in_reply_to.as_deref(),
-                )
-                .await;
-        }
-
-        // Send cleaned text first (if non-empty)
-        if !cleaned_text.is_empty() {
+        if !message.content.is_empty() {
             self.send_text_markdown(
                 &message.recipient,
-                &cleaned_text,
+                &message.content,
                 message.in_reply_to.as_deref(),
             )
             .await?;
@@ -1707,7 +1628,7 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 interruption_scope_id: None,
-                    attachments: vec![],
+                    attachments: composed.attachments,
                                 subject: None,
 
                                 ..Default::default()};
@@ -1780,7 +1701,7 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 interruption_scope_id: None,
-                    attachments: vec![],
+                    attachments: composed.attachments,
                                 subject: None,
 
                                 ..Default::default()};
@@ -1996,7 +1917,7 @@ mod tests {
             }]
         });
         let ordinary_text = json!({
-            "content": "<VOICE_TRANSCRIPTION>哈喽哈喽，你在干嘛？</VOICE_TRANSCRIPTION>"
+            "content": "哈喽哈喽，你在干嘛？"
         });
 
         assert!(
@@ -2097,127 +2018,6 @@ allowed_users = ["user1"]
         assert_eq!(group.channel, "qq");
         let peers: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(peers, vec!["user1"]);
-    }
-
-    // --- Marker parsing tests ---
-
-    #[test]
-    fn test_parse_qq_markers_single_image() {
-        let (text, atts) = parse_qq_attachment_markers("Hello [IMAGE:/tmp/a.png] world");
-        assert_eq!(text, "Hello  world");
-        assert_eq!(atts.len(), 1);
-        assert_eq!(atts[0].kind, QQMediaFileType::Image);
-        assert_eq!(atts[0].target, "/tmp/a.png");
-    }
-
-    #[test]
-    fn test_parse_qq_markers_multiple() {
-        let (text, atts) =
-            parse_qq_attachment_markers("[IMAGE:/a.png] text [VIDEO:https://example.com/v.mp4]");
-        assert_eq!(text, "text");
-        assert_eq!(atts.len(), 2);
-        assert_eq!(atts[0].kind, QQMediaFileType::Image);
-        assert_eq!(atts[1].kind, QQMediaFileType::Video);
-    }
-
-    #[test]
-    fn test_parse_qq_markers_no_markers() {
-        let (text, atts) = parse_qq_attachment_markers("Just plain text");
-        assert_eq!(text, "Just plain text");
-        assert!(atts.is_empty());
-    }
-
-    #[test]
-    fn test_parse_qq_markers_case_insensitive() {
-        let (_, atts) = parse_qq_attachment_markers("[image:/a.png]");
-        assert_eq!(atts.len(), 1);
-        assert_eq!(atts[0].kind, QQMediaFileType::Image);
-
-        let (_, atts) = parse_qq_attachment_markers("[Image:/a.png]");
-        assert_eq!(atts.len(), 1);
-        assert_eq!(atts[0].kind, QQMediaFileType::Image);
-    }
-
-    #[test]
-    fn test_parse_qq_markers_invalid_preserved() {
-        let (text, atts) = parse_qq_attachment_markers("Keep [UNKNOWN:foo] here");
-        assert_eq!(text, "Keep [UNKNOWN:foo] here");
-        assert!(atts.is_empty());
-    }
-
-    #[test]
-    fn test_parse_qq_markers_mixed_text_and_markers() {
-        let (text, atts) =
-            parse_qq_attachment_markers("Before [DOCUMENT:/doc.pdf] middle [PHOTO:/p.jpg] after");
-        assert_eq!(text, "Before  middle  after");
-        assert_eq!(atts.len(), 2);
-        assert_eq!(atts[0].kind, QQMediaFileType::File);
-        assert_eq!(atts[0].target, "/doc.pdf");
-        assert_eq!(atts[1].kind, QQMediaFileType::Image);
-        assert_eq!(atts[1].target, "/p.jpg");
-    }
-
-    // --- marker_kind_to_qq_file_type tests ---
-
-    #[test]
-    fn test_marker_kind_image() {
-        assert_eq!(
-            marker_kind_to_qq_file_type("IMAGE", "/a.png"),
-            Some(QQMediaFileType::Image)
-        );
-        assert_eq!(
-            marker_kind_to_qq_file_type("PHOTO", "/a.png"),
-            Some(QQMediaFileType::Image)
-        );
-    }
-
-    #[test]
-    fn test_marker_kind_document() {
-        assert_eq!(
-            marker_kind_to_qq_file_type("DOCUMENT", "/a.pdf"),
-            Some(QQMediaFileType::File)
-        );
-        assert_eq!(
-            marker_kind_to_qq_file_type("FILE", "/a.zip"),
-            Some(QQMediaFileType::File)
-        );
-    }
-
-    #[test]
-    fn test_marker_kind_video() {
-        assert_eq!(
-            marker_kind_to_qq_file_type("VIDEO", "/v.mp4"),
-            Some(QQMediaFileType::Video)
-        );
-    }
-
-    #[test]
-    fn test_marker_kind_voice_native() {
-        assert_eq!(
-            marker_kind_to_qq_file_type("VOICE", "/a.mp3"),
-            Some(QQMediaFileType::Voice)
-        );
-        assert_eq!(
-            marker_kind_to_qq_file_type("AUDIO", "/a.wav"),
-            Some(QQMediaFileType::Voice)
-        );
-        assert_eq!(
-            marker_kind_to_qq_file_type("VOICE", "/a.silk"),
-            Some(QQMediaFileType::Voice)
-        );
-    }
-
-    #[test]
-    fn test_marker_kind_voice_non_native_degrades() {
-        // .ogg is not a natively supported QQ voice format — degrades to File
-        assert_eq!(
-            marker_kind_to_qq_file_type("VOICE", "/a.ogg"),
-            Some(QQMediaFileType::File)
-        );
-        assert_eq!(
-            marker_kind_to_qq_file_type("AUDIO", "/a.flac"),
-            Some(QQMediaFileType::File)
-        );
     }
 
     // --- Upload/send body construction tests ---
@@ -2392,9 +2192,11 @@ allowed_users = ["user1"]
                 "url": "https://cdn.example.com/a.jpg"
             }]
         });
+        let message = ch.compose_qq_message(&payload).await.unwrap();
+        assert!(message.content.is_empty());
         assert_eq!(
-            composed_content(&ch, &payload).await,
-            Some("[IMAGE:https://cdn.example.com/a.jpg]".to_string())
+            message.attachments[0].reference_target(),
+            Some("https://cdn.example.com/a.jpg")
         );
     }
 
@@ -2413,12 +2215,18 @@ allowed_users = ["user1"]
                 { "filename": "b.jpeg", "url": "https://cdn.example.com/b.jpeg" }
             ]
         });
+        let message = ch.compose_qq_message(&payload).await.unwrap();
+        assert_eq!(message.content, "Here is an image");
         assert_eq!(
-            composed_content(&ch, &payload).await,
-            Some(
-                "Here is an image\n[IMAGE:https://cdn.example.com/a.png]\n[IMAGE:https://cdn.example.com/b.jpeg]"
-                    .to_string()
-            )
+            message
+                .attachments
+                .iter()
+                .map(|attachment| attachment.reference_target().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://cdn.example.com/a.png",
+                "https://cdn.example.com/b.jpeg"
+            ]
         );
     }
 
@@ -2439,11 +2247,21 @@ allowed_users = ["user1"]
                 { "content_type": "application/pdf", "url": "https://cdn.example.com/d.pdf" }
             ]
         });
-        let result = composed_content(&ch, &payload).await.unwrap();
-        assert!(result.contains("[IMAGE:"));
-        assert!(result.contains("[VOICE:"));
-        assert!(result.contains("[VIDEO:"));
-        assert!(result.contains("[DOCUMENT:"));
+        let message = ch.compose_qq_message(&payload).await.unwrap();
+        assert!(message.content.is_empty());
+        assert_eq!(
+            message
+                .attachments
+                .iter()
+                .map(|attachment| attachment.reference.as_ref().unwrap().kind)
+                .collect::<Vec<_>>(),
+            vec![
+                AttachmentKind::Image,
+                AttachmentKind::Audio,
+                AttachmentKind::Video,
+                AttachmentKind::Document
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2491,13 +2309,13 @@ allowed_users = ["user1"]
             }]
         });
 
-        let result = composed_content(&ch, &payload).await.unwrap();
-        assert!(
-            result.contains("<VOICE_TRANSCRIPTION>configured transcript</VOICE_TRANSCRIPTION>")
-        );
-        assert!(result.contains("[VOICE:"));
-        assert!(result.contains("qq_files/download_"));
-        assert!(result.contains(".wav]"));
+        let message = ch.compose_qq_message(&payload).await.unwrap();
+        let result = &message.content;
+        assert!(result.contains("configured transcript"));
+        let reference = message.attachments[0].reference.as_ref().unwrap();
+        assert_eq!(reference.kind, AttachmentKind::Audio);
+        assert!(reference.target.contains("qq_files/download_"));
+        assert!(reference.target.ends_with(".wav"));
     }
 
     #[tokio::test]
@@ -2528,7 +2346,7 @@ allowed_users = ["user1"]
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            composed_content(&ch, &payload),
+            ch.compose_qq_message(&payload),
         )
         .await
         .expect("declared oversize must be rejected before reading the body")
@@ -2536,8 +2354,8 @@ allowed_users = ["user1"]
         server.abort();
 
         assert!(
-            result.contains(&format!("[IMAGE:{remote_url}]")),
-            "unexpected composed content: {result:?}"
+            result.attachments[0].reference_target() == Some(remote_url.as_str()),
+            "oversized attachment retains its remote reference"
         );
         let mut files = tokio::fs::read_dir(workspace.path().join("qq_files"))
             .await
@@ -2590,7 +2408,7 @@ allowed_users = ["user1"]
         });
 
         let result = composed_content(&ch, &payload).await.unwrap();
-        assert!(result.contains("<VOICE_TRANSCRIPTION>platform transcript</VOICE_TRANSCRIPTION>"));
+        assert!(result.contains("platform transcript"));
         assert!(!result.contains("fallback"));
     }
 
@@ -2609,10 +2427,11 @@ allowed_users = ["user1"]
                 "url": "//cdn.example.com/a.png"
             }]
         });
-        let result = composed_content(&ch, &payload).await.unwrap();
-        assert!(result.contains("https://cdn.example.com/a.png"));
-        // Ensure the raw `//` prefix was replaced with `https:`
-        assert!(!result.starts_with("[IMAGE://"));
+        let result = ch.compose_qq_message(&payload).await.unwrap();
+        assert_eq!(
+            result.attachments[0].reference_target(),
+            Some("https://cdn.example.com/a.png")
+        );
     }
 
     #[tokio::test]
@@ -2632,8 +2451,12 @@ allowed_users = ["user1"]
                 "url": "https://cdn.example.com/report.pdf"
             }]
         });
-        let result = composed_content(&ch, &payload).await.unwrap();
-        assert!(result.contains("[DOCUMENT:https://cdn.example.com/report.pdf]"));
+        let result = ch.compose_qq_message(&payload).await.unwrap();
+        assert_eq!(result.content, "text");
+        assert_eq!(
+            result.attachments[0].reference_target(),
+            Some("https://cdn.example.com/report.pdf")
+        );
     }
 
     #[tokio::test]
@@ -2715,18 +2538,33 @@ allowed_users = ["user1"]
     }
 
     #[test]
-    fn test_infer_attachment_marker() {
-        assert_eq!(infer_attachment_marker("image/png", "a.png"), "IMAGE");
-        assert_eq!(infer_attachment_marker("audio/mpeg", "a.mp3"), "VOICE");
-        assert_eq!(infer_attachment_marker("video/mp4", "a.mp4"), "VIDEO");
+    fn test_infer_attachment_kind() {
         assert_eq!(
-            infer_attachment_marker("application/pdf", "doc.pdf"),
-            "DOCUMENT"
+            infer_attachment_kind("image/png", "a.png"),
+            AttachmentKind::Image
         );
-        assert_eq!(infer_attachment_marker("", "photo.jpg"), "IMAGE");
-        assert_eq!(infer_attachment_marker("", "song.mp3"), "VOICE");
-        assert_eq!(infer_attachment_marker("", "clip.mp4"), "VIDEO");
-        assert_eq!(infer_attachment_marker("", "unknown.xyz"), "DOCUMENT");
+        assert_eq!(
+            infer_attachment_kind("audio/mpeg", "a.mp3"),
+            AttachmentKind::Audio
+        );
+        assert_eq!(
+            infer_attachment_kind("video/mp4", "a.mp4"),
+            AttachmentKind::Video
+        );
+        assert_eq!(
+            infer_attachment_kind("application/pdf", "doc.pdf"),
+            AttachmentKind::Document
+        );
+        assert_eq!(
+            infer_attachment_kind("", "photo.jpg"),
+            AttachmentKind::Image
+        );
+        assert_eq!(infer_attachment_kind("", "song.mp3"), AttachmentKind::Audio);
+        assert_eq!(infer_attachment_kind("", "clip.mp4"), AttachmentKind::Video);
+        assert_eq!(
+            infer_attachment_kind("", "unknown.xyz"),
+            AttachmentKind::Document
+        );
     }
 
     // --- Upload cache tests ---

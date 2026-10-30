@@ -1,7 +1,7 @@
 //! REST API handlers for the web dashboard.
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
-use super::{AppState, GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key};
+use super::{AppState, gateway_cancel_key};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -693,14 +693,19 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
+    let execution = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
         &config,
         &job,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
         Some(selection),
-    )
-    .await;
+    );
+    let result = match state.native_sessions.clone() {
+        Some(source) => {
+            zeroclaw_kernel::session::engine::scope_engine_session_source(source, execution).await
+        }
+        None => execution.await,
+    };
 
     Json(serde_json::json!({
         "status": result.status,
@@ -1769,88 +1774,21 @@ pub async fn handle_api_sessions_list(
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
-        return Json(serde_json::json!({
-            "sessions": [],
-            "message": "Session persistence is disabled"
-        }))
-        .into_response();
-    };
-
-    // Include every session that's attributable (agent_alias stamped,
-    // or a channel_id that resolves to an owning agent).
-    // Pre-migration rows with neither set are skipped as orphans.
-    let config = state.config.read().clone();
-    let all_metadata = backend.list_sessions_with_metadata();
-    let sessions: Vec<serde_json::Value> = all_metadata
-        .into_iter()
-        .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
-        .map(|meta| {
-            // Resolve owning agent: prefer the stamped alias, otherwise
-            // reverse-look-up via channel_id (= `<type>.<alias>`) against
-            // each agent's `channels` list.
-            let agent_alias = meta.agent_alias.clone().or_else(|| {
-                meta.channel_id
-                    .as_deref()
-                    .and_then(|c| config.agent_for_channel(c))
-                    .map(str::to_string)
-            });
-            // Drop the gw_ prefix for display; channel keys stay as-is so
-            // the frontend can show the channel context inline.
-            let session_id = meta
-                .key
-                .strip_prefix("gw_")
-                .map(str::to_string)
-                .unwrap_or_else(|| meta.key.clone());
-            let mut entry = serde_json::json!({
-                // Display form: `gw_` stripped for gateway sessions, full
-                // composite for channel-driven sessions.
-                "session_id": session_id,
-                // Full DB key for API operations (delete, messages, abort).
-                "session_key": meta.key.clone(),
-                "created_at": meta.created_at.to_rfc3339(),
-                "last_activity": meta.last_activity.to_rfc3339(),
-                "message_count": meta.message_count,
-                "agent_alias": agent_alias,
-                "channel_id": meta.channel_id,
-            });
-            if let Some(name) = meta.name {
-                entry["name"] = serde_json::Value::String(name);
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(
+            async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                crate::session_history::list(&state, subject.as_deref(), false).await
             }
-            entry
-        })
-        .collect();
-
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
-}
-
-/// Resolve a path `{id}` to the persisted session key.
-///
-/// `GET /api/sessions` advertises both a display `session_id` (`gw_` stripped
-/// for gateway sessions) and the full DB `session_key` for API operations.
-/// Accept either form so callers that reuse `session_key` do not get a doubled
-/// `gw_` prefix (`gw_gw_<id>`).
-///
-/// Resolution prefers **key existence** over punctuation heuristics (WebSocket
-/// clients may pick display ids that contain `_`, e.g. `team_alpha` →
-/// `gw_team_alpha`):
-/// 1. exact `id` if it already exists as a session key
-/// 2. raw `gw_{id}` if it already exists
-/// 3. the canonical sanitized gateway key
-/// 4. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise use the
-///    canonical sanitized gateway key
-fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> String {
-    if exists(id) {
-        return id.to_string();
+            .await,
+        );
     }
-    if !id.starts_with("gw_") {
-        let legacy_key = format!("{GW_SESSION_PREFIX}{id}");
-        if exists(&legacy_key) {
-            return legacy_key;
-        }
-        return gateway_session_key(id);
-    }
-    id.to_string()
+
+    Json(serde_json::json!({
+        "sessions": [],
+        "message": "Session persistence is disabled"
+    }))
+    .into_response()
 }
 
 /// Resolve an API session id to a live process-local cancellation key.
@@ -1886,32 +1824,20 @@ pub async fn handle_api_session_messages(
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
-        return Json(serde_json::json!({
-            "session_id": id,
-            "messages": [],
-            "session_persistence": false,
-        }))
-        .into_response();
-    };
-
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    let msgs = backend.load_with_timestamps(&session_key);
-    let messages: Vec<serde_json::Value> = msgs
-        .into_iter()
-        .map(|m| {
-            serde_json::json!({
-                "role": m.message.role,
-                "content": m.message.content,
-                "created_at": m.created_at.map(|dt| dt.to_rfc3339()),
-            })
-        })
-        .collect();
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                let native = crate::session_history::query(&state, &family, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
+                let messages = native.query.messages(native.stream.clone()).await?.into_iter().map(|message| serde_json::json!({"message_id":message.message_id,"role":message.role,"content":message.text,"created_at":message.created_at.and_then(chrono::DateTime::from_timestamp_millis).map(|time| time.to_rfc3339()),"files":message.files,"attachments":message.attachments,"unavailable_parts":message.unavailable_parts})).collect::<Vec<_>>();
+                Ok(serde_json::json!({"session_id":id,"messages":messages,"session_persistence":true}))
+        }.await);
+    }
 
     Json(serde_json::json!({
         "session_id": id,
-        "messages": messages,
-        "session_persistence": true,
+        "messages": [],
+        "session_persistence": false,
     }))
     .into_response()
 }
@@ -1935,75 +1861,23 @@ pub async fn handle_api_session_message_post(
             .into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "Session persistence is disabled"})),
-        )
-            .into_response();
-    };
-
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    if !backend.session_exists(&session_key) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response();
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                let port = crate::session_history::command(&state, &family, subject.as_deref()).await?;
+                let message_id = port.append_assistant(&body.content).await?;
+                let display_id = gateway_display_session_id(&family);
+                let _ = state.event_tx.send(serde_json::json!({"type":"message","session_id":display_id,"role":"assistant","content":body.content,"source":"api"}));
+                Ok(serde_json::json!({"status":"ok","session_id":display_id,"message_id":message_id,"message":{"role":"assistant","content":body.content},"session_persistence":true}))
+        }.await);
     }
 
-    let _session_guard = match state.session_queue.acquire(&session_key).await {
-        Ok(guard) => guard,
-        Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Session queue is full"})),
-            )
-                .into_response();
-        }
-        Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
-            return (
-                StatusCode::REQUEST_TIMEOUT,
-                Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
-            )
-                .into_response();
-        }
-    };
-
-    let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
-    if let Err(e) = backend.append(&session_key, &message) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to append session message: {e}")})),
-        )
-            .into_response();
-    }
-    state.session_queue.advance_generation(&session_key);
-
-    // Match WS `?session_id=` / `event_matches_session` (display id), not the
-    // path string — callers that pass the full `session_key` must still notify
-    // the connected WebSocket.
-    let display_session_id = gateway_display_session_id(&session_key);
-    let event = serde_json::json!({
-        "type": "message",
-        "session_id": display_session_id,
-        "role": "assistant",
-        "content": body.content.clone(),
-        "source": "api",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-    let _ = state.event_tx.send(event);
-
-    Json(serde_json::json!({
-        "status": "ok",
-        "session_id": display_session_id,
-        "message": {
-            "role": "assistant",
-            "content": message.content,
-        },
-        "session_persistence": true,
-    }))
-    .into_response()
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "Session persistence is disabled"})),
+    )
+        .into_response()
 }
 
 /// DELETE /api/sessions/{id} — delete a gateway session
@@ -2016,77 +1890,38 @@ pub async fn handle_api_session_delete(
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session persistence is disabled"})),
-        )
-            .into_response();
-    };
-
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-
-    let cancellation = {
-        let mut tokens = state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned");
-        resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key))
-            .and_then(|cancel_key| tokens.remove(&cancel_key).map(|token| (cancel_key, token)))
-    };
-    if let Some((cancel_key, token)) = cancellation {
-        token.cancel();
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "session_key": session_key,
-                    "cancel_key": cancel_key,
-                })
-            ),
-            "cancelled in-flight turn for deleted session"
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(
+            async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                let port =
+                    crate::session_history::command(&state, &family, subject.as_deref()).await?;
+                port.request_cancellation(None, &family, "gateway_session_delete")
+                    .await?;
+                let cancellation = {
+                    let tokens = state
+                        .cancel_tokens
+                        .lock()
+                        .map_err(|_| anyhow::Error::msg("gateway_cancellation_lock_poisoned"))?;
+                    resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key))
+                        .and_then(|key| tokens.get(&key).cloned())
+                };
+                if let Some(token) = cancellation {
+                    token.cancel();
+                }
+                port.close("gateway_session_delete").await?;
+                Ok(serde_json::json!({"deleted":true,"session_id":id,"history_retained":true}))
+            }
+            .await,
         );
     }
 
-    // Take the same permit turns hold. The cancel above makes a running turn
-    // unwind; waiting here means neither a turn nor a reconnecting socket's
-    // history refresh can straddle the delete.
-    let _session_guard = match state.session_queue.acquire(&session_key).await {
-        Ok(guard) => guard,
-        Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Session queue is full"})),
-            )
-                .into_response();
-        }
-        Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
-            return (
-                StatusCode::REQUEST_TIMEOUT,
-                Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
-            )
-                .into_response();
-        }
-    };
-
-    match backend.delete_session(&session_key) {
-        Ok(true) => {
-            // A connection still holding the deleted conversation must not
-            // mistake a recreation under the same key for its own history.
-            state.session_queue.advance_generation(&session_key);
-            Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
-        }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
-        )
-            .into_response(),
-    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Session persistence is disabled"})),
+    )
+        .into_response()
 }
 
 /// PUT /api/sessions/{id} — rename a gateway session
@@ -2099,43 +1934,35 @@ pub async fn handle_api_session_rename(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-
-    let Some(ref backend) = state.session_backend else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session persistence is disabled"})),
-        )
-            .into_response();
-    };
-
     let name = body["name"].as_str().unwrap_or("").trim();
     if name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "name is required"})),
+            Json(serde_json::json!({"error":"name is required"})),
         )
             .into_response();
     }
 
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-
-    // Verify the session exists before renaming
-    if !backend.session_exists(&session_key) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response();
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(
+            async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                crate::session_history::command(&state, &family, subject.as_deref())
+                    .await?
+                    .rename(name)
+                    .await?;
+                Ok(serde_json::json!({"session_id":id,"name":name}))
+            }
+            .await,
+        );
     }
 
-    match backend.set_session_name(&session_key, name) {
-        Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
-        )
-            .into_response(),
-    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Session persistence is disabled"})),
+    )
+        .into_response()
 }
 
 /// GET /api/sessions/running — list sessions currently in "running" state
@@ -2147,29 +1974,21 @@ pub async fn handle_api_sessions_running(
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
-        return Json(serde_json::json!({
-            "sessions": [],
-            "message": "Session persistence is disabled"
-        }))
-        .into_response();
-    };
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(
+            async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                crate::session_history::list(&state, subject.as_deref(), true).await
+            }
+            .await,
+        );
+    }
 
-    let running = backend.list_running_sessions();
-    let sessions: Vec<serde_json::Value> = running
-        .into_iter()
-        .filter_map(|meta| {
-            let session_id = meta.key.strip_prefix("gw_")?;
-            Some(serde_json::json!({
-                "session_id": session_id,
-                "created_at": meta.created_at.to_rfc3339(),
-                "last_activity": meta.last_activity.to_rfc3339(),
-                "message_count": meta.message_count,
-            }))
-        })
-        .collect();
-
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+    Json(serde_json::json!({
+        "sessions": [],
+        "message": "Session persistence is disabled"
+    }))
+    .into_response()
 }
 
 /// GET /api/sessions/{id}/state — get session state
@@ -2182,40 +2001,24 @@ pub async fn handle_api_session_state(
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session persistence is disabled"})),
-        )
-            .into_response();
-    };
-
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    match backend.get_session_state(&session_key) {
-        Ok(Some(ss)) => {
-            let mut resp = serde_json::json!({
-                "session_id": id,
-                "state": ss.state,
-            });
-            if let Some(turn_id) = ss.turn_id {
-                resp["turn_id"] = serde_json::Value::String(turn_id);
-            }
-            if let Some(started) = ss.turn_started_at {
-                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
-            }
-            Json(resp).into_response()
-        }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
-        )
-            .into_response(),
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(async {
+                use zeroclaw_api::session_events::projection::TurnStatus;
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                let native = crate::session_history::query(&state, &family, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
+                let history = native.query.project_history(native.stream).await?;
+                let active = history.turns.iter().find(|(_, turn)| matches!(turn.status, TurnStatus::Queued|TurnStatus::Running));
+                let unknown = history.turns.values().max_by_key(|turn| turn.accepted_sequence).is_some_and(|turn| turn.status == TurnStatus::Unknown);
+                Ok(serde_json::json!({"session_id":id,"state":if active.is_some(){"running"}else if unknown{"unknown"}else{"idle"},"turn_id":active.map(|(id,_)| id.to_string()),"source_cursor":history.source_cursor}))
+        }.await);
     }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Session persistence is disabled"})),
+    )
+        .into_response()
 }
 
 // ── Session abort endpoint ────────────────────────────────────────
@@ -2244,6 +2047,20 @@ pub async fn handle_api_session_abort(
     };
 
     if let (Some(cancel_key), Some(token)) = (cancel_key, token) {
+        if state.native_sessions.is_some() {
+            let recorded = async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                crate::session_history::command(&state, &family, subject.as_deref())
+                    .await?
+                    .request_cancellation(None, &cancel_key, "gateway_operator_abort")
+                    .await
+            }
+            .await;
+            if let Err(error) = recorded {
+                return crate::session_history::response(Err(error));
+            }
+        }
         token.cancel();
         ::zeroclaw_log::record!(
             INFO,
@@ -2300,9 +2117,6 @@ pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use zeroclaw_infra::session_backend::SessionBackend;
-    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
-    use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
@@ -2508,7 +2322,8 @@ pub(crate) mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
-            session_backend: None,
+
+            native_sessions: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
             pending_pairings: None,
@@ -3530,246 +3345,6 @@ pub(crate) mod tests {
         assert!(channel["readiness"].get("health").is_none());
     }
 
-    fn test_state_with_session_backend(
-        config: zeroclaw_config::schema::Config,
-        backend: Arc<dyn SessionBackend>,
-    ) -> AppState {
-        let mut state = test_state(config);
-        state.session_backend = Some(backend);
-        state
-    }
-
-    #[tokio::test]
-    async fn session_message_post_persists_and_broadcasts_to_session() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        backend
-            .append(
-                "gw_operator-1",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend.clone());
-        let mut rx = state.event_tx.subscribe();
-
-        let response = handle_api_session_message_post(
-            State(state.clone()),
-            HeaderMap::new(),
-            Path("operator-1".to_string()),
-            Json(
-                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
-                    "content": "deploy finished"
-                }))
-                .expect("body should deserialize"),
-            ),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let json = response_json(response).await;
-        assert_eq!(json["status"], "ok");
-        assert_eq!(json["session_id"], "operator-1");
-        assert_eq!(json["message"]["role"], "assistant");
-        assert_eq!(json["message"]["content"], "deploy finished");
-        assert!(json.get("message_count").is_none());
-
-        let messages = backend.load("gw_operator-1");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[1].content, "deploy finished");
-
-        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("broadcast event")
-            .expect("broadcast value");
-        assert_eq!(event["type"], "message");
-        assert_eq!(event["session_id"], "operator-1");
-        assert_eq!(event["role"], "assistant");
-        assert_eq!(event["content"], "deploy finished");
-
-        let history = state.event_buffer.snapshot();
-        assert!(
-            history.is_empty(),
-            "session-scoped chat messages stay out of global event history"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_message_post_rejects_empty_content() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        let state = test_state_with_session_backend(config, backend);
-
-        let response = handle_api_session_message_post(
-            State(state),
-            HeaderMap::new(),
-            Path("operator-1".to_string()),
-            Json(
-                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
-                    "content": "   "
-                }))
-                .expect("body should deserialize"),
-            ),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let json = response_json(response).await;
-        assert_eq!(json["error"], "content is required");
-    }
-
-    #[tokio::test]
-    async fn session_message_post_rejects_unknown_session_without_creating_it() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        let state = test_state_with_session_backend(config, backend.clone());
-
-        let response = handle_api_session_message_post(
-            State(state),
-            HeaderMap::new(),
-            Path("operator-1".to_string()),
-            Json(
-                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
-                    "content": "deploy finished"
-                }))
-                .expect("body should deserialize"),
-            ),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let json = response_json(response).await;
-        assert_eq!(json["error"], "Session not found");
-        assert!(backend.load("gw_operator-1").is_empty());
-    }
-
-    #[tokio::test]
-    async fn session_message_post_waits_for_session_queue_before_append() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        backend
-            .append(
-                "gw_operator-1",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend.clone());
-        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
-
-        let response_fut = handle_api_session_message_post(
-            State(state),
-            HeaderMap::new(),
-            Path("operator-1".to_string()),
-            Json(
-                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
-                    "content": "queued notification"
-                }))
-                .expect("body should deserialize"),
-            ),
-        );
-        tokio::pin!(response_fut);
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
-                .await
-                .is_err(),
-            "POST should wait behind the active session queue guard"
-        );
-        assert_eq!(backend.load("gw_operator-1").len(), 1);
-
-        drop(session_guard);
-        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
-            .await
-            .expect("queued POST should complete")
-            .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let messages = backend.load("gw_operator-1");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].content, "queued notification");
-    }
-
-    #[test]
-    fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
-        let none = |_key: &str| false;
-        assert_eq!(
-            resolve_gateway_session_key("operator-1", none),
-            "gw_operator-1"
-        );
-        assert_eq!(
-            resolve_gateway_session_key("gw_operator-1", none),
-            "gw_operator-1"
-        );
-        // Underscore-bearing display ids must still map into the gw_ namespace
-        // when no exact key exists (punctuation is not a session namespace).
-        assert_eq!(
-            resolve_gateway_session_key("team_alpha", none),
-            "gw_team_alpha"
-        );
-
-        let gateway_only = |key: &str| key == "gw_team_alpha";
-        assert_eq!(
-            resolve_gateway_session_key("team_alpha", gateway_only),
-            "gw_team_alpha"
-        );
-        assert_eq!(
-            resolve_gateway_session_key("gw_team_alpha", gateway_only),
-            "gw_team_alpha"
-        );
-
-        let channel_only = |key: &str| key == "discord.clamps_room";
-        assert_eq!(
-            resolve_gateway_session_key("discord.clamps_room", channel_only),
-            "discord.clamps_room"
-        );
-
-        // Exact match wins when both the bare id and gw_ form exist.
-        let both = |key: &str| key == "team_alpha" || key == "gw_team_alpha";
-        assert_eq!(
-            resolve_gateway_session_key("team_alpha", both),
-            "team_alpha"
-        );
-
-        let legacy_dotted = |key: &str| key == "gw_team.alpha";
-        assert_eq!(
-            resolve_gateway_session_key("team.alpha", legacy_dotted),
-            "gw_team.alpha",
-            "existing raw gateway keys remain addressable"
-        );
-        assert_eq!(
-            resolve_gateway_session_key("team.alpha", none),
-            "gw_team_alpha",
-            "new dotted display ids use the canonical sanitized gateway key"
-        );
-    }
-
     #[test]
     fn resolve_gateway_cancel_key_accepts_display_and_full_ids_without_collisions() {
         let dotted = |key: &str| key == "gw_team.alpha";
@@ -3993,312 +3568,6 @@ pub(crate) mod tests {
             "aborted"
         );
         assert!(underscored_token.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn session_delete_cancels_full_dotted_session_key() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> =
-            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
-        backend
-            .append(
-                "gw_team.alpha",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend.clone());
-        let token = tokio_util::sync::CancellationToken::new();
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock")
-            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
-
-        let response = handle_api_session_delete(
-            State(state),
-            HeaderMap::new(),
-            Path("gw_team.alpha".to_string()),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(token.is_cancelled());
-        assert!(
-            !backend.session_exists("gw_team.alpha"),
-            "deletion must target the persisted dotted session key"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_delete_cancels_raw_dotted_turn_for_sanitized_persistence_key() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> =
-            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
-        // This is the persistence identity used by the streamed webhook
-        // path. The live cancellation identity must remain the raw dotted
-        // display id, so deletion has to resolve the two independently.
-        backend
-            .append(
-                "gw_team_alpha",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend.clone());
-        let token = tokio_util::sync::CancellationToken::new();
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock")
-            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
-
-        let response = handle_api_session_delete(
-            State(state),
-            HeaderMap::new(),
-            Path("team.alpha".to_string()),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            token.is_cancelled(),
-            "deletion must cancel the raw dotted turn even when persistence is sanitized"
-        );
-        assert!(!backend.session_exists("gw_team_alpha"));
-    }
-
-    #[tokio::test]
-    async fn session_message_post_accepts_full_session_key() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        backend
-            .append(
-                "gw_operator-1",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend.clone());
-        let mut rx = state.event_tx.subscribe();
-
-        let response = handle_api_session_message_post(
-            State(state),
-            HeaderMap::new(),
-            Path("gw_operator-1".to_string()),
-            Json(
-                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
-                    "content": "via session_key"
-                }))
-                .expect("body should deserialize"),
-            ),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let json = response_json(response).await;
-        assert_eq!(json["status"], "ok");
-        assert_eq!(
-            json["session_id"], "operator-1",
-            "API response should use the display session id"
-        );
-        let messages = backend.load("gw_operator-1");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].content, "via session_key");
-
-        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("broadcast event")
-            .expect("broadcast value");
-        assert_eq!(event["type"], "message");
-        assert_eq!(
-            event["session_id"], "operator-1",
-            "broadcast must use display id so the WS filter accepts it"
-        );
-        assert_eq!(event["content"], "via session_key");
-    }
-
-    #[tokio::test]
-    async fn session_message_post_accepts_underscore_display_session_id() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        backend
-            .append(
-                "gw_team_alpha",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend.clone());
-        let mut rx = state.event_tx.subscribe();
-
-        let response = handle_api_session_message_post(
-            State(state),
-            HeaderMap::new(),
-            Path("team_alpha".to_string()),
-            Json(
-                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
-                    "content": "underscore display id"
-                }))
-                .expect("body should deserialize"),
-            ),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let messages = backend.load("gw_team_alpha");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].content, "underscore display id");
-
-        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("broadcast event")
-            .expect("broadcast value");
-        assert_eq!(event["session_id"], "team_alpha");
-    }
-
-    #[tokio::test]
-    async fn session_rename_accepts_full_session_key() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        backend
-            .append(
-                "gw_operator-1",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend.clone());
-
-        let response = handle_api_session_rename(
-            State(state),
-            HeaderMap::new(),
-            Path("gw_operator-1".to_string()),
-            Json(serde_json::json!({ "name": "ops" })),
-        )
-        .await
-        .into_response();
-
-        // Master doubles the prefix (`gw_gw_operator-1`) and returns 404.
-        assert_eq!(response.status(), StatusCode::OK);
-        let json = response_json(response).await;
-        assert_eq!(json["name"], "ops");
-        assert!(
-            backend.list_sessions().iter().any(|k| k == "gw_operator-1"),
-            "rename must target the real session key, not a doubled gw_ prefix"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_rename_accepts_underscore_display_session_id() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
-        backend
-            .append(
-                "gw_team_alpha",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend);
-
-        let response = handle_api_session_rename(
-            State(state),
-            HeaderMap::new(),
-            Path("team_alpha".to_string()),
-            Json(serde_json::json!({ "name": "alpha desk" })),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let json = response_json(response).await;
-        assert_eq!(json["name"], "alpha desk");
-    }
-
-    #[tokio::test]
-    async fn session_state_accepts_full_session_key_and_underscore_display_id() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = zeroclaw_config::schema::Config {
-            data_dir: tmp.path().join("workspace"),
-            config_path: tmp.path().join("config.toml"),
-            ..zeroclaw_config::schema::Config::default()
-        };
-        std::fs::create_dir_all(&config.data_dir).unwrap();
-        // File SessionStore does not persist turn state; SQLite does.
-        let backend: Arc<dyn SessionBackend> =
-            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
-        backend
-            .append(
-                "gw_team_alpha",
-                &zeroclaw_providers::ChatMessage::assistant("existing"),
-            )
-            .unwrap();
-        backend
-            .set_session_state("gw_team_alpha", "running", Some("turn-1"))
-            .unwrap();
-        let state = test_state_with_session_backend(config, backend);
-
-        let full_key_response = handle_api_session_state(
-            State(state.clone()),
-            HeaderMap::new(),
-            Path("gw_team_alpha".to_string()),
-        )
-        .await
-        .into_response();
-        assert_eq!(full_key_response.status(), StatusCode::OK);
-        let full_key_json = response_json(full_key_response).await;
-        assert_eq!(full_key_json["state"], "running");
-        assert_eq!(full_key_json["turn_id"], "turn-1");
-
-        let display_response = handle_api_session_state(
-            State(state),
-            HeaderMap::new(),
-            Path("team_alpha".to_string()),
-        )
-        .await
-        .into_response();
-        assert_eq!(display_response.status(), StatusCode::OK);
-        let display_json = response_json(display_response).await;
-        assert_eq!(
-            display_json["state"], "running",
-            "state handler must accept underscore display ids from the sessions list"
-        );
-        assert_eq!(display_json["turn_id"], "turn-1");
     }
 
     #[tokio::test]

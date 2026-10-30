@@ -144,19 +144,47 @@ struct NativeToolCall {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     function: NativeFunctionCall,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct NativeFunctionCall {
     name: String,
     arguments: String,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawNativeChatResponse")]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
     #[serde(default)]
     usage: Option<UsageInfo>,
+}
+#[derive(Debug, Deserialize)]
+struct RawNativeChatResponse {
+    choices: Vec<NativeChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+    #[serde(default)]
+    model: Option<String>,
+}
+impl From<RawNativeChatResponse> for NativeChatResponse {
+    fn from(mut raw: RawNativeChatResponse) -> Self {
+        if let Some(model) = raw.model {
+            for choice in &mut raw.choices {
+                choice.message.output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                    metadata: serde_json::json!({"kind":"served_attribution", "protocol":"chat_completions", "model":model, "source":"provider_response"}),
+                });
+            }
+        }
+        Self {
+            choices: raw.choices,
+            usage: raw.usage,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,16 +198,84 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct NativeChoice {
     message: NativeResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+impl NativeChoice {
+    fn into_message(mut self) -> NativeResponseMessage {
+        if let Some(reason) = self.finish_reason {
+            self.message.output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"chat_completions", "finish_reason":reason}),
+            });
+        }
+        self.message
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawNativeResponseMessage")]
 struct NativeResponseMessage {
-    #[serde(default)]
     content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<NativeToolCall>>,
+    output_blocks: Vec<zeroclaw_api::model_provider::ProviderOutputBlock>,
+}
+#[derive(Debug, Deserialize)]
+struct RawNativeResponseMessage {
+    #[serde(default)]
+    content: Option<serde_json::Value>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
+}
+impl From<RawNativeResponseMessage> for NativeResponseMessage {
+    fn from(raw: RawNativeResponseMessage) -> Self {
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
+        let (content, mut output_blocks) = crate::output::assistant_content(raw.content.as_ref());
+        if let Some(reasoning) = &raw.reasoning_content {
+            output_blocks.insert(
+                0,
+                ProviderOutputBlock::Reasoning {
+                    representation: "reasoning_content".into(),
+                    bytes: reasoning.to_owned().into_bytes(),
+                    replay_requirement: "provider_defined".into(),
+                },
+            );
+        }
+        if let Some(calls) = &raw.tool_calls {
+            for call in calls {
+                output_blocks.extend(crate::output::chat_tool_metadata(
+                    call.id.as_deref(),
+                    &call.extensions,
+                    Some(&call.function.extensions),
+                ));
+            }
+        }
+        for (name, content) in raw.extensions {
+            if name == "role" {
+                continue;
+            }
+            if name == "audio" {
+                output_blocks.extend(crate::output::content_blocks(
+                    &serde_json::json!({"type":"audio","source":content}),
+                ));
+            } else {
+                output_blocks.push(ProviderOutputBlock::Other {
+                    type_name: format!("assistant.{name}"),
+                    content,
+                });
+            }
+        }
+        Self {
+            content,
+            reasoning_content: raw.reasoning_content,
+            tool_calls: raw.tool_calls,
+            output_blocks,
+        }
+    }
 }
 
 impl NativeResponseMessage {
@@ -393,11 +489,13 @@ impl AzureOpenAiModelProvider {
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+        let projected = crate::multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         messages
             .iter()
             .map(|m| {
                 if m.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
@@ -407,9 +505,11 @@ impl AzureOpenAiModelProvider {
                         .map(|tc| {
                             let name = tc.name;
                             NativeToolCall {
+                                extensions: Default::default(),
                                 id: Some(tc.id),
                                 kind: Some("function".to_string()),
                                 function: NativeFunctionCall {
+                                    extensions: Default::default(),
                                     arguments: crate::compatible::sanitize_tool_arguments(
                                         &name,
                                         &tc.arguments,
@@ -434,7 +534,7 @@ impl AzureOpenAiModelProvider {
                 }
 
                 if m.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                 {
                     let tool_call_id = value
                         .get("tool_call_id")
@@ -479,7 +579,15 @@ impl AzureOpenAiModelProvider {
             })
             .collect::<Vec<_>>();
 
+        let mut output_blocks = message.output_blocks;
+        output_blocks.extend(
+            tool_calls
+                .iter()
+                .cloned()
+                .map(|call| zeroclaw_api::model_provider::ProviderOutputBlock::ToolCall { call }),
+        );
         ProviderChatResponse {
+            output_blocks,
             text,
             tool_calls,
             usage: None,
@@ -654,7 +762,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
+            .map(NativeChoice::into_message)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -728,7 +836,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
+            .map(NativeChoice::into_message)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -766,6 +874,25 @@ impl ::zeroclaw_api::attribution::Attributable for AzureOpenAiModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_plain_reasoning_is_preserved_without_inferring_signed_content() {
+        let reasoning =
+            r#"{"thinking":"ordinary token=fixture-token","signature":"sk-fixture-signature"}"#;
+        let message: NativeResponseMessage = serde_json::from_value(serde_json::json!({
+            "content":"answer", "reasoning_content":reasoning,
+        }))
+        .expect("native response");
+        assert_eq!(message.reasoning_content.as_deref(), Some(reasoning));
+        let zeroclaw_api::model_provider::ProviderOutputBlock::Reasoning { bytes, .. } =
+            &message.output_blocks[0]
+        else {
+            panic!("typed reasoning");
+        };
+        assert_eq!(bytes, reasoning.to_owned().as_bytes());
+        assert!(String::from_utf8_lossy(bytes).contains("fixture-token"));
+        assert!(String::from_utf8_lossy(bytes).contains("sk-fixture-signature"));
+    }
 
     #[test]
     fn url_construction_default_version() {
@@ -1509,11 +1636,16 @@ mod tests {
         // covered in `compatible::tests::sanitize_tool_arguments_*`.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "trying",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_bad".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"rm -rf".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let native = AzureOpenAiModelProvider::convert_messages(&messages);
         let tool_calls = native[0].tool_calls.as_ref().unwrap();
@@ -1528,11 +1660,16 @@ mod tests {
         // Companion regression: valid JSON must round-trip byte-for-byte.
         use zeroclaw_api::model_provider::ChatMessage;
 
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "using",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_ok".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"pwd\"}".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let native = AzureOpenAiModelProvider::convert_messages(&messages);
         let tool_calls = native[0].tool_calls.as_ref().unwrap();

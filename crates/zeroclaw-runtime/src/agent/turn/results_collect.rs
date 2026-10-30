@@ -7,10 +7,9 @@ use crate::agent::loop_detector::LoopDetector;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
 use std::collections::HashSet;
-use std::fmt::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use zeroclaw_api::media::RenderedMarker;
+use zeroclaw_api::media::AttachmentReference;
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::ChatMessage;
@@ -18,24 +17,22 @@ use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// One tool result of a round as it reaches history: the call id, the
 /// verbatim model-facing text, and the attachments the tool declared for it.
-/// Nothing is inferred from the text: a bare image path a tool printed is
-/// text, not an attachment — the attachment-identity boundary, nothing in
-/// tool text promoted unless the tool declared it.
+/// Nothing is inferred from the text: a bare image path a tool printed remains
+/// text unless the tool explicitly declared an attachment.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolRoundResult {
     pub(crate) tool_call_id: Option<String>,
+    pub(crate) tool_name: String,
+    pub(crate) success: bool,
     pub(crate) output: String,
-    pub(crate) attachments: Vec<RenderedMarker>,
+    pub(crate) attachments: Vec<AttachmentReference>,
 }
 
 /// One round's collected tool results.
 pub(crate) struct CollectedResults {
-    /// Per-call results so native-mode history can emit one `role=tool`
-    /// message per call with the correct ID, and prompt-mode history can
-    /// aggregate the round's attachments into one count header.
+    /// Per-call results so canonical history can emit one structured result
+    /// per call with the correct ID and attachments.
     pub(crate) individual_results: Vec<ToolRoundResult>,
-    /// XML `<tool_result>` blocks for prompt-mode history.
-    pub(crate) tool_results: String,
     /// Concatenated non-ignored outputs feeding the identical-output hash.
     pub(crate) detection_relevant_output: String,
 }
@@ -58,7 +55,6 @@ pub(crate) fn collect_tool_results(
     iteration: usize,
     turn_id: &str,
 ) -> Result<CollectedResults> {
-    let mut tool_results = String::new();
     let mut individual_results: Vec<ToolRoundResult> = Vec::new();
     let mut detection_relevant_output = String::new();
     // Use enumerate *before* filter_map so result_index stays aligned with
@@ -178,19 +174,15 @@ pub(crate) fn collect_tool_results(
         }
         individual_results.push(ToolRoundResult {
             tool_call_id,
-            output: result_output.clone(),
+            tool_name,
+            success: outcome.success,
+            output: result_output,
             attachments,
         });
-        let _ = writeln!(
-            tool_results,
-            "<tool_result name=\"{}\">\n{}\n</tool_result>",
-            tool_name, result_output
-        );
     }
 
     Ok(CollectedResults {
         individual_results,
-        tool_results,
         detection_relevant_output,
     })
 }
@@ -502,12 +494,7 @@ mod tests {
             "a bare image path in tool text must not become an attachment"
         );
         assert_eq!(result.output, output, "the tool text stays verbatim");
-        assert!(
-            collected
-                .tool_results
-                .contains(&image.display().to_string()),
-            "the path stays visible to the model as text"
-        );
+        assert!(result.output.contains(&image.display().to_string()));
     }
 
     #[test]

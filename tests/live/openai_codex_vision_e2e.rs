@@ -58,16 +58,21 @@ async fn provider_vision_support() -> Result<()> {
         println!("✓ Created test image at {}", test_image);
     }
 
-    // Prepare message with image marker
-    let user_message = format!("What is in this image? [IMAGE:{}]", test_image);
+    // Prepare message with typed image attachment
+    let user_message = ChatMessage::user("What is in this image?").with_attachments(vec![
+        zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: test_image.to_string(),
+        },
+    ]);
 
-    println!("Sending message with image marker...");
-    println!("Message: {}", user_message);
+    println!("Sending message with typed image attachment...");
+    println!("Message: {:?}", user_message);
 
     // Build chat request
     let messages = vec![
         ChatMessage::system("You are a helpful assistant that can analyze images."),
-        ChatMessage::user(user_message.clone()),
+        user_message.clone(),
     ];
 
     let request = ChatRequest {
@@ -174,16 +179,21 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         println!("✓ Created test image at {}", test_image);
     }
 
-    // Prepare message with image marker
-    let user_message = format!("What is in this image? [IMAGE:{}]", test_image);
+    // Prepare message with typed image attachment
+    let user_message = ChatMessage::user("What is in this image?").with_attachments(vec![
+        zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: test_image.to_string(),
+        },
+    ]);
 
-    println!("Sending message with image marker...");
-    println!("Message: {}", user_message);
+    println!("Sending message with typed image attachment...");
+    println!("Message: {:?}", user_message);
 
     // Build chat request
     let messages = vec![
         ChatMessage::system("You are a helpful assistant that can analyze images."),
-        ChatMessage::user(user_message.clone()),
+        user_message.clone(),
     ];
 
     let request = ChatRequest {

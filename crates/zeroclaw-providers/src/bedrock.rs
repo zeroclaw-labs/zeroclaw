@@ -661,6 +661,8 @@ struct ConverseResponse {
     output: Option<ConverseOutput>,
     #[serde(default)]
     usage: Option<BedrockUsage>,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,20 +694,22 @@ enum ResponseContentBlock {
     Other(serde_json::Value),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReasoningContentWrapper {
     reasoning_content: ReasoningContentBlock,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReasoningContentBlock {
     #[serde(default)]
     reasoning_text: Option<ReasoningTextField>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ReasoningTextField {
     #[serde(default)]
     text: Option<String>,
@@ -945,6 +949,8 @@ impl BedrockModelProvider {
     fn convert_messages(
         messages: &[ChatMessage],
     ) -> (Option<Vec<SystemBlock>>, Vec<ConverseMessage>) {
+        let projected = crate::multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         let mut system_blocks = Vec::new();
         let mut converse_messages = Vec::new();
 
@@ -958,7 +964,7 @@ impl BedrockModelProvider {
                     }
                 }
                 "assistant" => {
-                    if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content) {
+                    if let Some(blocks) = Self::parse_assistant_tool_call_message(msg) {
                         converse_messages.push(ConverseMessage {
                             role: "assistant".to_string(),
                             content: blocks,
@@ -980,42 +986,18 @@ impl BedrockModelProvider {
                     }
                 }
                 "tool" => {
-                    let tool_result_msg = Self::parse_tool_result_message(&msg.content)
-                        .unwrap_or_else(|| {
-                            // Fallback: always emit a toolResult block so the
-                            // Bedrock API contract (every toolUse needs a matching
-                            // toolResult) is never violated.
-                            let tool_use_id = Self::extract_tool_call_id(&msg.content)
-                                .or_else(|| Self::last_pending_tool_use_id(&converse_messages))
-                                .unwrap_or_else(|| "unknown".to_string());
-
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!(
-                                    "Failed to parse tool result message, creating error \
-                                 toolResult for tool_use_id={}",
-                                    tool_use_id
-                                )
-                            );
-
-                            ConverseMessage {
-                                role: "user".to_string(),
-                                content: vec![ContentBlock::ToolResult(ToolResultWrapper {
-                                    tool_result: ToolResultBlock {
-                                        tool_use_id,
-                                        content: vec![ToolResultContent {
-                                            text: msg.content.clone(),
-                                        }],
-                                        status: "error".to_string(),
-                                    },
-                                })],
-                            }
-                        });
+                    let Some(tool_result_msg) = Self::parse_tool_result_message(msg) else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            "bedrock: structured tool result identity is missing; dropping message"
+                        );
+                        continue;
+                    };
 
                     // Merge consecutive tool results into a single user message.
                     // Bedrock requires all toolResult blocks for a multi-tool-call
@@ -1033,23 +1015,9 @@ impl BedrockModelProvider {
                     converse_messages.push(tool_result_msg);
                 }
                 _ => {
-                    // A prompt-mode tool-result carrier reads through its
-                    // declaration, never its body: the declared image
-                    // attachments become image blocks and the carrier text
-                    // survives verbatim as one text block, through the same
-                    // `parse_user_message_image_refs` seam every other
-                    // adapter uses. Ordinary user messages keep the marker
-                    // behavior unchanged.
-                    let content_blocks = if zeroclaw_api::tool_carrier::classify(
-                        &msg.role,
-                        &msg.content,
-                    )
-                    .is_some()
-                    {
-                        Self::parse_prompt_carrier_content_blocks(&msg.content)
-                    } else {
-                        Self::parse_user_content_blocks(&msg.content)
-                    };
+                    // Image blocks come only from explicit attachments;
+                    // ordinary message and tool-result text stays verbatim.
+                    let content_blocks = Self::parse_user_content_blocks(msg);
                     converse_messages.push(ConverseMessage {
                         role: "user".to_string(),
                         content: content_blocks,
@@ -1120,139 +1088,13 @@ impl BedrockModelProvider {
         }
     }
 
-    /// Try to extract a tool_call_id from partially-valid JSON content.
-    fn extract_tool_call_id(content: &str) -> Option<String> {
-        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        value
-            .get("tool_call_id")
-            .or_else(|| value.get("tool_use_id"))
-            .or_else(|| value.get("toolUseId"))
-            .and_then(serde_json::Value::as_str)
-            .map(String::from)
-    }
-
-    fn last_pending_tool_use_id(converse_messages: &[ConverseMessage]) -> Option<String> {
-        let last_assistant = converse_messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")?;
-
-        let tool_use_ids: Vec<&str> = last_assistant
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::ToolUse(wrapper) => Some(wrapper.tool_use.tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        let answered_ids: Vec<&str> = converse_messages
-            .iter()
-            .rev()
-            .take_while(|m| m.role == "user")
-            .flat_map(|m| m.content.iter())
-            .filter_map(|b| match b {
-                ContentBlock::ToolResult(wrapper) => Some(wrapper.tool_result.tool_use_id.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        tool_use_ids
-            .into_iter()
-            .find(|id| !answered_ids.contains(id))
-            .map(String::from)
-    }
-
-    /// Parse user message content, extracting [IMAGE:data:...] markers into image blocks.
-    fn parse_user_content_blocks(content: &str) -> Vec<ContentBlock> {
-        let mut blocks: Vec<ContentBlock> = Vec::new();
-        let mut remaining = content;
-        let has_image = content.contains("[IMAGE:");
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!(
-                "parse_user_content_blocks called, len={}, has_image={}",
-                content.len(),
-                has_image
-            )
+    /// Build user-role blocks from explicit image attachments and verbatim text.
+    /// Only normalized data URI references become image blocks; text is never parsed.
+    fn parse_user_content_blocks(message: &ChatMessage) -> Vec<ContentBlock> {
+        let (text, image_refs) = (
+            message.content.clone(),
+            crate::multimodal::message_image_refs(message),
         );
-
-        while let Some(start) = remaining.find("[IMAGE:") {
-            // Add any text before the marker
-            let text_before = &remaining[..start];
-            if !text_before.trim().is_empty() {
-                blocks.push(ContentBlock::Text(TextBlock {
-                    text: text_before.to_string(),
-                }));
-            }
-
-            let after = &remaining[start + 7..]; // skip "[IMAGE:"
-            if let Some(end) = after.find(']') {
-                let src = &after[..end];
-                remaining = &after[end + 1..];
-
-                // Only handle data URIs (base64 encoded images)
-                if let Some(rest) = src.strip_prefix("data:")
-                    && let Some(semi) = rest.find(';')
-                {
-                    let mime = &rest[..semi];
-                    let after_semi = &rest[semi + 1..];
-                    if let Some(b64) = after_semi.strip_prefix("base64,") {
-                        let format = Self::image_format_for_mime(mime);
-                        blocks.push(ContentBlock::Image(ImageWrapper {
-                            image: ImageBlock {
-                                format: format.to_string(),
-                                source: ImageSource {
-                                    bytes: b64.to_string(),
-                                },
-                            },
-                        }));
-                        continue;
-                    }
-                }
-                // Non-data-uri image: just include as text reference
-                blocks.push(ContentBlock::Text(TextBlock {
-                    text: format!("[image: {}]", src),
-                }));
-            } else {
-                // No closing bracket, treat rest as text
-                blocks.push(ContentBlock::Text(TextBlock {
-                    text: remaining.to_string(),
-                }));
-                break;
-            }
-        }
-
-        // Add any remaining text
-        if !remaining.trim().is_empty() {
-            blocks.push(ContentBlock::Text(TextBlock {
-                text: remaining.to_string(),
-            }));
-        }
-
-        if blocks.is_empty() {
-            let fallback = if content.trim().is_empty() {
-                "(empty)".to_string()
-            } else {
-                content.to_string()
-            };
-            blocks.push(ContentBlock::Text(TextBlock { text: fallback }));
-        }
-
-        blocks
-    }
-
-    /// Build user-role blocks for a prompt-mode tool-result carrier: the
-    /// declared image attachments become image blocks, and the carrier text
-    /// `parse_user_message_image_refs` returns (the rebuilt carrier without
-    /// its image attachment lines) becomes one verbatim text block that is
-    /// never scanned for markers. The Bedrock counterpart of the seam every
-    /// other adapter routes user-role carriers through, so a carrier body
-    /// quoting marker syntax stays text instead of smuggling an image into
-    /// the request.
-    fn parse_prompt_carrier_content_blocks(content: &str) -> Vec<ContentBlock> {
-        let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
         let mut blocks = Vec::new();
 
         for image_ref in &image_refs {
@@ -1278,9 +1120,9 @@ impl BedrockModelProvider {
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({
                                 "error": format!("{reason}"),
-                                "error_key": "bedrock_image_marker_malformed_data_uri",
+                                "error_key": "bedrock_image_reference_malformed_data_uri",
                             })),
-                            "dropping image marker: data URI failed the structural check"
+                            "dropping image reference: data URI failed the structural check"
                         );
                         continue;
                     }
@@ -1293,7 +1135,7 @@ impl BedrockModelProvider {
                         .with_attrs(::serde_json::json!({
                             "error_key": "bedrock_image_source_missing",
                         })),
-                    "dropping image marker: source is neither a data URI nor an existing file"
+                    "dropping image reference: source is neither a data URI nor an existing file"
                 );
                 // The multimodal normalizer is the only component allowed to
                 // turn a file reference into inline image content, so a
@@ -1332,11 +1174,15 @@ impl BedrockModelProvider {
     }
 
     /// Parse assistant message containing structured tool calls.
-    fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<ContentBlock>> {
-        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        let tool_calls = value
-            .get("tool_calls")
-            .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
+    fn parse_assistant_tool_call_message(message: &ChatMessage) -> Option<Vec<ContentBlock>> {
+        let value = crate::tool_protocol::tool_message_value(message)?;
+        let tool_calls: Vec<ProviderToolCall> = serde_json::from_value(
+            value
+                .get("tool_calls")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )
+        .ok()?;
 
         let mut blocks = Vec::new();
 
@@ -1396,37 +1242,25 @@ impl BedrockModelProvider {
     }
 
     /// Parse tool result message into a user message with ToolResult block.
-    fn parse_tool_result_message(content: &str) -> Option<ConverseMessage> {
-        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
-        let tool_use_id = value
-            .get("tool_call_id")
-            .or_else(|| value.get("tool_use_id"))
-            .or_else(|| value.get("toolUseId"))
-            .and_then(serde_json::Value::as_str)?
-            .to_string();
-        let result = value
-            .get("content")
-            .map(Self::tool_result_content_text)
-            .unwrap_or_default();
+    fn parse_tool_result_message(message: &ChatMessage) -> Option<ConverseMessage> {
+        let result = message.tool_result.as_ref()?;
         Some(ConverseMessage {
             role: "user".to_string(),
             content: vec![ContentBlock::ToolResult(ToolResultWrapper {
                 tool_result: ToolResultBlock {
-                    tool_use_id,
-                    content: vec![ToolResultContent { text: result }],
-                    status: "success".to_string(),
+                    tool_use_id: result.tool_call_id.clone(),
+                    content: vec![ToolResultContent {
+                        text: message.content.clone(),
+                    }],
+                    status: if result.success == Some(false) {
+                        "error"
+                    } else {
+                        "success"
+                    }
+                    .into(),
                 },
             })],
         })
-    }
-
-    // Bedrock toolResult content is text-only. Preserve string tool output as-is;
-    // encode structured output compactly so object/array results are not dropped.
-    fn tool_result_content_text(value: &serde_json::Value) -> String {
-        value
-            .as_str()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| value.to_string())
     }
 
     // ── Tool conversion ─────────────────────────────────────────
@@ -1457,6 +1291,8 @@ impl BedrockModelProvider {
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut output_blocks = Vec::new();
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
 
         let usage = response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
@@ -1471,12 +1307,22 @@ impl BedrockModelProvider {
             for block in message.content {
                 match block {
                     ResponseContentBlock::Text(tb) => {
+                        output_blocks.push(ProviderOutputBlock::Text {
+                            text: tb.text.clone(),
+                        });
                         let trimmed = tb.text.trim().to_string();
                         if !trimmed.is_empty() {
                             text_parts.push(trimmed);
                         }
                     }
                     ResponseContentBlock::ReasoningContent(wrapper) => {
+                        // Closed serializable content types plus JSON extension
+                        // values cannot fail encoding; no transport metadata.
+                        output_blocks.push(ProviderOutputBlock::Reasoning {
+                            representation: "bedrock.reasoningContent/v1".into(),
+                            bytes: serde_json::json!(&wrapper).to_string().into_bytes(),
+                            replay_requirement: "provider_defined".into(),
+                        });
                         if let Some(reasoning_text) = wrapper.reasoning_content.reasoning_text {
                             // Store as JSON with signature for round-tripping.
                             let block = serde_json::json!({
@@ -1488,19 +1334,34 @@ impl BedrockModelProvider {
                     }
                     ResponseContentBlock::ToolUse(wrapper) => {
                         if !wrapper.tool_use.name.is_empty() {
-                            tool_calls.push(ProviderToolCall {
+                            let call = ProviderToolCall {
                                 id: wrapper.tool_use.tool_use_id,
                                 name: wrapper.tool_use.name,
                                 arguments: wrapper.tool_use.input.to_string(),
                                 extra_content: None,
-                            });
+                            };
+                            output_blocks
+                                .push(ProviderOutputBlock::ToolCall { call: call.clone() });
+                            tool_calls.push(call);
                         }
                     }
-                    ResponseContentBlock::Other(value) => drop(value),
+                    ResponseContentBlock::Other(value) => {
+                        output_blocks.push(ProviderOutputBlock::Other {
+                            type_name: "bedrock.contentBlock".into(),
+                            content: value,
+                        })
+                    }
                 }
             }
         }
 
+        if let Some(stop_reason) = response.stop_reason {
+            output_blocks.push(ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({
+                    "kind": "finish", "protocol": "bedrock_converse", "stop_reason": stop_reason,
+                }),
+            });
+        }
         let reasoning_content = if thinking_parts.is_empty() {
             None
         } else {
@@ -1508,6 +1369,7 @@ impl BedrockModelProvider {
         };
 
         ProviderChatResponse {
+            output_blocks,
             text: if text_parts.is_empty() {
                 None
             } else {
@@ -1684,7 +1546,7 @@ impl ModelProvider for BedrockModelProvider {
 
         let mut messages = vec![ConverseMessage {
             role: "user".to_string(),
-            content: Self::parse_user_content_blocks(message),
+            content: Self::parse_user_content_blocks(&ChatMessage::user(message)),
         }];
         Self::sanitize_empty_content_blocks(&mut messages);
 
@@ -2185,10 +2047,7 @@ mod tests {
     }
 
     fn image_marker(target: &str) -> String {
-        zeroclaw_api::tool_carrier::marker_line(&zeroclaw_api::media::RenderedMarker {
-            target: target.to_string(),
-            kind: zeroclaw_api::media::MarkerKind::Image,
-        })
+        format!("[IMAGE:{target}]")
     }
 
     /// A count-zero carrier whose body quotes a data-URI marker and a path
@@ -2203,7 +2062,7 @@ mod tests {
             image_marker("data:image/png;base64,QUJD"),
             image_marker("/tmp/quoted.png")
         );
-        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let carrier = body.to_string();
         let messages = vec![ChatMessage::user(carrier.clone())];
         let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
@@ -2237,14 +2096,13 @@ mod tests {
             "source example: {} in prose",
             image_marker("data:image/png;base64,QUJD")
         );
-        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
-            &body,
-            &[zeroclaw_api::media::RenderedMarker {
-                target: declared.to_string(),
-                kind: zeroclaw_api::media::MarkerKind::Image,
-            }],
-        );
-        let messages = vec![ChatMessage::user(carrier)];
+        let carrier = body.to_string();
+        let messages = vec![ChatMessage::user(carrier).with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: declared.into(),
+            },
+        ])];
         let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         let images: Vec<&ImageBlock> = msgs[0]
@@ -2270,7 +2128,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let expected = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let expected = body.to_string();
         assert_eq!(
             text, expected,
             "the body text is verbatim in the rebuilt count-zero carrier"
@@ -2281,16 +2139,15 @@ mod tests {
         );
     }
 
-    /// Control for the carrier branch: a plain user message whose text carries
-    /// one data-URI marker still lifts it into exactly one image block, the
-    /// pre-carrier behavior of `parse_user_content_blocks` unchanged.
+    /// A plain user message carries image content through its attachment field.
     #[test]
-    fn convert_messages_user_text_marker_still_builds_image_block() {
-        let content = format!(
-            "look {}",
-            image_marker("data:image/png;base64,iVBORw0KGgo=")
-        );
-        let messages = vec![ChatMessage::user(content)];
+    fn convert_messages_user_attachment_builds_image_block() {
+        let messages = vec![ChatMessage::user("look").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,iVBORw0KGgo=".into(),
+            },
+        ])];
         let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         let images: Vec<&ImageBlock> = msgs[0]
@@ -2301,15 +2158,22 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(images.len(), 1, "the user-text marker still lifts");
+        assert_eq!(images.len(), 1, "the attachment becomes an image block");
         assert_eq!(images[0].source.bytes, "iVBORw0KGgo=");
         assert_eq!(images[0].format, "png");
     }
 
     #[test]
     fn convert_messages_tool_role_to_tool_result() {
-        let tool_json = r#"{"tool_call_id": "call_123", "content": "Result data"}"#;
-        let messages = vec![ChatMessage::tool(tool_json)];
+        let messages = vec![ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_123".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "Result data".into(),
+                attachments: Vec::new(),
+            },
+        )];
         let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
@@ -2318,8 +2182,16 @@ mod tests {
 
     #[test]
     fn convert_messages_assistant_tool_calls_parsed() {
-        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
-        let messages = vec![ChatMessage::assistant(tool_call_json)];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "Let me check",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_1".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"ls\"}".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
         let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "assistant");
@@ -2333,8 +2205,16 @@ mod tests {
         // Belt-and-suspenders: if an orphaned tool_use slips past the runtime
         // history pruner, the Bedrock converter must strip it so AWS doesn't
         // reject with "Expected toolResult blocks at messages.N.content".
-        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_ORPHAN", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
-        let messages = vec![ChatMessage::assistant(tool_call_json)];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "Let me check",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_ORPHAN".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"ls\"}".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
         let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
         // Pre-condition: the converter produced an (orphaned) ToolUse block.
         assert!(
@@ -2360,11 +2240,24 @@ mod tests {
 
     #[test]
     fn strip_orphaned_tool_uses_retains_answered_tool_use() {
-        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_OK", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
-        let tool_result_json = r#"{"content":"ls output","tool_call_id":"call_OK"}"#;
         let messages = vec![
-            ChatMessage::assistant(tool_call_json),
-            ChatMessage::tool(tool_result_json),
+            ChatMessage::assistant_tool_calls(
+                "Let me check",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "call_OK".into(),
+                    name: "shell".into(),
+                    arguments: "{\"command\":\"ls\"}".into(),
+                    extra_content: None,
+                }],
+                None,
+            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_OK".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "ls output".into(),
+                attachments: Vec::new(),
+            }),
         ];
         let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
         BedrockModelProvider::strip_orphaned_tool_uses(&mut msgs);
@@ -2421,8 +2314,13 @@ mod tests {
         let mut messages = vec![ChatMessage::system("System")];
         for i in 0..5 {
             messages.push(ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("Message {i}"),
+
+                attachments: Vec::new(),
             });
         }
         assert!(BedrockModelProvider::should_cache_conversation(&messages));
@@ -2615,6 +2513,37 @@ mod tests {
     }
 
     #[test]
+    fn converse_response_preserves_actual_stop_reason_without_inventing_one() {
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
+        for reason in [
+            Some("end_turn"),
+            Some("max_tokens"),
+            Some("content_filtered"),
+            Some("guardrail_intervened"),
+            Some("tool_use"),
+            Some("future_reason"),
+            None,
+        ] {
+            let wire = serde_json::json!({
+                "output":{"message":{"content":[{"text":"answer"}]}},
+                "stopReason":reason,
+            });
+            let response = BedrockModelProvider::parse_converse_response(
+                serde_json::from_value(wire).unwrap(),
+            );
+            let finish = response.output_blocks.iter().find_map(|block| match block {
+                ProviderOutputBlock::ProtocolMetadata { metadata } => Some(metadata),
+                _ => None,
+            });
+            assert_eq!(
+                finish.map(|value| value["stop_reason"].as_str()),
+                reason.map(Some)
+            );
+            assert_eq!(response.text.as_deref(), Some("answer"));
+        }
+    }
+
+    #[test]
     fn converse_response_deserializes_tool_use() {
         let json = r#"{
             "output": {
@@ -2737,62 +2666,42 @@ mod tests {
         assert!(resp.usage.is_none());
     }
 
-    // ── Tool result fallback & merge tests ───────────────────────
-
-    #[test]
-    fn fallback_tool_result_emits_tool_result_block_not_text() {
-        // When tool message content is not valid JSON, we should still get
-        // a toolResult block (not a plain text user message).
-        let messages = vec![
-            ChatMessage::user("do something"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"tool_1","name":"shell","arguments":"{}"}]}"#,
-            ),
-            ChatMessage {
-                role: "tool".to_string(),
-                content: "not valid json".to_string(),
-            },
-        ];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
-        let tool_msg = &msgs[2];
-        assert_eq!(tool_msg.role, "user");
-        assert!(
-            matches!(&tool_msg.content[0], ContentBlock::ToolResult(_)),
-            "Expected ToolResult block, got {:?}",
-            tool_msg.content[0]
-        );
-    }
-
-    #[test]
-    fn fallback_recovers_tool_use_id_from_assistant() {
-        let messages = vec![
-            ChatMessage::user("run it"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"tool_abc","name":"shell","arguments":"{}"}]}"#,
-            ),
-            ChatMessage {
-                role: "tool".to_string(),
-                content: "raw output with no json".to_string(),
-            },
-        ];
-        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
-        if let ContentBlock::ToolResult(ref wrapper) = msgs[2].content[0] {
-            assert_eq!(wrapper.tool_result.tool_use_id, "tool_abc");
-            assert_eq!(wrapper.tool_result.status, "error");
-        } else {
-            panic!("Expected ToolResult block");
-        }
-    }
-
     #[test]
     fn consecutive_tool_results_merged_into_single_message() {
         let messages = vec![
             ChatMessage::user("do two things"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"t1","name":"a","arguments":"{}"},{"id":"t2","name":"b","arguments":"{}"}]}"#,
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![
+                    zeroclaw_api::model_provider::ToolCall {
+                        id: "t1".into(),
+                        name: "a".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                    zeroclaw_api::model_provider::ToolCall {
+                        id: "t2".into(),
+                        name: "b".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                None,
             ),
-            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"result 1"}"#),
-            ChatMessage::tool(r#"{"tool_call_id":"t2","content":"result 2"}"#),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "t1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "result 1".into(),
+                attachments: Vec::new(),
+            }),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "t2".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "result 2".into(),
+                attachments: Vec::new(),
+            }),
         ];
         let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         // Should be: user, assistant, user (merged tool results)
@@ -2808,43 +2717,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_tool_call_id_tries_multiple_field_names() {
-        assert_eq!(
-            BedrockModelProvider::extract_tool_call_id(r#"{"tool_call_id":"a"}"#),
-            Some("a".to_string())
-        );
-        assert_eq!(
-            BedrockModelProvider::extract_tool_call_id(r#"{"tool_use_id":"b"}"#),
-            Some("b".to_string())
-        );
-        assert_eq!(
-            BedrockModelProvider::extract_tool_call_id(r#"{"toolUseId":"c"}"#),
-            Some("c".to_string())
-        );
-        assert_eq!(
-            BedrockModelProvider::extract_tool_call_id("not json at all"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_tool_result_accepts_alternate_id_fields() {
-        let msg = BedrockModelProvider::parse_tool_result_message(
-            r#"{"tool_use_id":"x","content":"ok"}"#,
-        );
-        assert!(msg.is_some());
-        if let ContentBlock::ToolResult(ref wrapper) = msg.unwrap().content[0] {
-            assert_eq!(wrapper.tool_result.tool_use_id, "x");
-            assert_eq!(wrapper.tool_result.content[0].text, "ok");
-        } else {
-            panic!("Expected ToolResult");
-        }
-    }
-
-    #[test]
     fn parse_tool_result_preserves_structured_content_as_json_text() {
         let object_msg = BedrockModelProvider::parse_tool_result_message(
-            r#"{"tool_call_id":"obj","content":{"ok":true,"count":2}}"#,
+            &ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "obj".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "{\"count\":2,\"ok\":true}".into(),
+                attachments: Vec::new(),
+            }),
         )
         .expect("object content should parse");
         if let ContentBlock::ToolResult(ref wrapper) = object_msg.content[0] {
@@ -2857,9 +2738,15 @@ mod tests {
             panic!("Expected ToolResult");
         }
 
-        let array_msg = BedrockModelProvider::parse_tool_result_message(
-            r#"{"tool_call_id":"arr","content":["alpha",{"beta":1}]}"#,
-        )
+        let array_msg = BedrockModelProvider::parse_tool_result_message(&ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "arr".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "[\"alpha\",{\"beta\":1}]".into(),
+                attachments: Vec::new(),
+            },
+        ))
         .expect("array content should parse");
         if let ContentBlock::ToolResult(ref wrapper) = array_msg.content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "arr");
@@ -2910,6 +2797,10 @@ mod tests {
         let messages = vec![
             ChatMessage::user("Hello"),
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "assistant".to_string(),
                 content: String::new(),
             },

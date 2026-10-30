@@ -503,11 +503,6 @@ impl LeakDetector {
         static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
         let url_re = URL_PATTERN
             .get_or_init(|| Regex::new(r"https?://\S+").expect("static URL regex must compile"));
-        static MEDIA_MARKER_PATTERN: OnceLock<Regex> = OnceLock::new();
-        let media_re = MEDIA_MARKER_PATTERN.get_or_init(|| {
-            Regex::new(r"\[(IMAGE|VIDEO|VOICE|AUDIO|DOCUMENT|FILE):[^\]]*\]")
-                .expect("static media-marker regex must compile")
-        });
         // Tool receipts (zc-receipt-...) are runtime-generated HMAC tokens that
         // intentionally appear in output. Strip them before entropy scanning so
         // they are not redacted as leaked credentials.
@@ -517,7 +512,6 @@ impl LeakDetector {
         });
         let mut entropy_protected = protected_spans.to_vec();
         collect_regex_spans(content, url_re, &mut entropy_protected);
-        collect_regex_spans(content, media_re, &mut entropy_protected);
         collect_regex_spans(content, receipt_re, &mut entropy_protected);
         let entropy_protected = merge_spans(entropy_protected);
 
@@ -1002,14 +996,15 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     #[test]
-    fn media_markers_not_redacted_as_high_entropy() {
+    fn literal_media_syntax_has_no_entropy_scan_exemption() {
         let detector = LeakDetector::new();
-        let content = "Here is the image: [IMAGE:/Users/matt/.zeroclaw/workspace/skills/image-gen/images/20260324_135911.png]";
-        let result = detector.scan(content);
-        assert!(
-            matches!(result, LeakResult::Clean),
-            "Local media markers should not be redacted"
-        );
+        for kind in ["IMAGE", "VIDEO", "VOICE", "AUDIO", "DOCUMENT", "FILE"] {
+            let content = format!("[{kind}:aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG]");
+            assert!(matches!(
+                detector.scan(&content),
+                LeakResult::Detected { .. }
+            ));
+        }
     }
 
     #[test]
@@ -1200,24 +1195,24 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     #[test]
-    fn media_marker_image_path_not_redacted() {
+    fn literal_media_syntax_does_not_bypass_high_entropy_detection() {
         let detector = LeakDetector::new();
         let content = "Here is your image: [IMAGE:/Users/matt/.zeroclaw/workspace/skills/image-gen/images/20260324_135911.png]";
         let result = detector.scan(content);
         assert!(
-            matches!(result, LeakResult::Clean),
-            "Media marker image paths should not trigger high-entropy detection"
+            matches!(result, LeakResult::Detected { .. }),
+            "literal media syntax must use the normal leak detector"
         );
     }
 
     #[test]
-    fn media_marker_video_not_redacted() {
+    fn literal_video_syntax_does_not_bypass_high_entropy_detection() {
         let detector = LeakDetector::new();
-        let content = "Attached: [VIDEO:/path/to/long/video/file/name123456.mp4]";
+        let content = "Attached: [VIDEO:/aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG.mp4]";
         let result = detector.scan(content);
         assert!(
-            matches!(result, LeakResult::Clean),
-            "Media marker video paths should not trigger high-entropy detection"
+            matches!(result, LeakResult::Detected { .. }),
+            "literal media syntax must use the normal leak detector"
         );
     }
 

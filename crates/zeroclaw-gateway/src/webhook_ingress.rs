@@ -624,23 +624,48 @@ async fn process_verified_message(
             .await;
     }
 
-    match Box::pin(run_gateway_chat_with_tools(
-        state,
-        &msg.content,
-        Some(&session_id),
-        agent_override,
-    ))
+    let proof = crate::session_history::IngressProof::Channel {
+        kind: spec.channel.into(),
+        alias: alias.into(),
+        sender: msg.sender.clone(),
+        platform_sender: msg.platform_sender_id.clone(),
+    };
+    match crate::session_history::scope_ingress(
+        proof,
+        Box::pin(run_gateway_chat_with_tools(
+            state,
+            &msg.content,
+            Some(&session_id),
+            agent_override,
+        )),
+    )
     .await
     {
-        Ok(GatewayChatOutcome { response, .. }) => {
+        Ok(GatewayChatOutcome { response, delivery }) => {
             #[cfg(test)]
             if suppress_reply_send {
                 return;
             }
-            if let Err(e) = channel
-                .send(&SendMessage::new(response, &msg.reply_target))
-                .await
-            {
+            let message = SendMessage::new(&response, &msg.reply_target);
+            let sent = async {
+                channel.send(&message).await?;
+                Ok(serde_json::json!({"boundary":"channel_adapter_acceptance"}))
+            };
+            let sent = match delivery {
+                Some(delivery) => {
+                    delivery
+                        .observe(
+                            spec.channel,
+                            &msg.reply_target,
+                            &response,
+                            "channel_adapter_acceptance",
+                            sent,
+                        )
+                        .await
+                }
+                None => sent.await.map(|_| ()),
+            };
+            if let Err(e) = sent {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -682,9 +707,29 @@ async fn process_verified_message(
             if suppress_reply_send {
                 return;
             }
-            let _ = channel
-                .send(&SendMessage::new(reply, &msg.reply_target))
-                .await;
+            let send = SendMessage::new(&reply, &msg.reply_target);
+            let effect = async {
+                channel.send(&send).await?;
+                Ok(serde_json::json!({"boundary":"channel_adapter_acceptance"}))
+            };
+            let result = match crate::session_history::failure_delivery(&e) {
+                Some(delivery) => {
+                    delivery
+                        .observe(
+                            channel.name(),
+                            &msg.reply_target,
+                            &reply,
+                            "channel_adapter_acceptance",
+                            effect,
+                        )
+                        .await
+                }
+                None => effect.await.map(|_| ()),
+            };
+            if let Err(error) = result {
+                ::zeroclaw_log::record!(WARN,::zeroclaw_log::Event::new(module_path!(),::zeroclaw_log::Action::Fail)
+                    .with_attrs(serde_json::json!({"error":zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error)})),"webhook_error_delivery_unresolved");
+            }
         }
     }
 }
@@ -1012,15 +1057,18 @@ mod tests {
         }
     }
 
-    /// Every gateway source file that mentions the shared agent chat entry
-    /// point, with the number of expected mentions. The funnel in this
-    /// module is the only permitted webhook-side caller; the others are
-    /// operator-authenticated surfaces with their own auth (bearer pairing
-    /// for the generic webhook API, agent-card auth for agent-to-agent).
+    /// Pin the callers and definitions of the text, structured-part and native
+    /// agent chat entry points. The funnel in this module is the only permitted
+    /// channel-webhook caller; the generic webhook and A2A task surfaces apply
+    /// their own request authentication and bind it to the native ingress proof.
     #[test]
     fn agent_chat_dispatch_callsites_are_pinned_to_authenticated_surfaces() {
-        let needle: String = ["run_gateway_chat_with_tools", "("].concat();
-        let mut counts: Vec<(String, usize)> = Vec::new();
+        let entry_points = [
+            "run_gateway_chat_with_tools",
+            "run_gateway_chat_with_parts",
+            "run_native_gateway_turn",
+        ];
+        let mut counts: Vec<(String, &str, usize)> = Vec::new();
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stack = vec![src_root.clone()];
         while let Some(dir) = stack.pop() {
@@ -1030,25 +1078,33 @@ mod tests {
                     stack.push(path);
                 } else if path.extension().is_some_and(|ext| ext == "rs") {
                     let source = std::fs::read_to_string(&path).expect("readable source file");
-                    let hits = source.match_indices(&needle).count();
-                    if hits > 0 {
-                        let rel = path
-                            .strip_prefix(&src_root)
-                            .expect("source path under src root")
-                            .to_string_lossy()
-                            .into_owned();
-                        counts.push((rel, hits));
+                    for entry_point in entry_points {
+                        let needle = [entry_point, "("].concat();
+                        let hits = source.match_indices(&needle).count();
+                        if hits > 0 {
+                            let rel = path
+                                .strip_prefix(&src_root)
+                                .expect("source path under src root")
+                                .to_string_lossy()
+                                .into_owned();
+                            counts.push((rel, entry_point, hits));
+                        }
                     }
                 }
             }
         }
         counts.sort();
 
-        let expected: Vec<(String, usize)> = vec![
-            ("a2a.rs".to_string(), 1),
-            ("lib.rs".to_string(), 2),
-            ("webhook_ingress.rs".to_string(), 1),
-        ];
+        let expected: Vec<(String, &str, usize)> = [
+            ("a2a.rs", "run_gateway_chat_with_parts", 1),
+            ("lib.rs", "run_gateway_chat_with_parts", 2),
+            ("lib.rs", "run_gateway_chat_with_tools", 2),
+            ("lib.rs", "run_native_gateway_turn", 3),
+            ("webhook_ingress.rs", "run_gateway_chat_with_tools", 1),
+        ]
+        .into_iter()
+        .map(|(file, entry_point, hits)| (file.to_string(), entry_point, hits))
+        .collect();
         assert_eq!(
             counts, expected,
             "agent chat dispatch callsites changed. Channel webhook handlers \

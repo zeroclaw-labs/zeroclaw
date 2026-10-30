@@ -77,6 +77,10 @@ impl ModelPinnedProvider {
 
 #[async_trait]
 impl ModelProvider for ModelPinnedProvider {
+    fn is_dispatch_composite(&self) -> bool {
+        true
+    }
+
     fn supports_exact_request_replay(&self, request: ChatRequest<'_>, _model: &str) -> bool {
         self.inner
             .supports_exact_request_replay(request, &self.pinned_model)
@@ -442,6 +446,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,

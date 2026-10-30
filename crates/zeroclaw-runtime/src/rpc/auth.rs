@@ -575,7 +575,11 @@ impl RpcInboundAuth {
         // consult the pairing set, never the reverse.
         let state = self.state.read();
         let pairings = self.pairing.hold_paired_tokens();
-        AuthorityLease { state, pairings }
+        AuthorityLease {
+            state,
+            pairings,
+            accepted_revision: &self.accepted_revision,
+        }
     }
 }
 
@@ -584,9 +588,27 @@ impl RpcInboundAuth {
 pub struct AuthorityLease<'a> {
     state: parking_lot::RwLockReadGuard<'a, Arc<AcceptedAuthState>>,
     pairings: zeroclaw_config::pairing::HeldPairedTokens<'a>,
+    accepted_revision: &'a AtomicU64,
+}
+
+/// Authorization-local revisions, interpreted within the execution binding's
+/// existing config authority epoch rather than as process-independent IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct AuthPolicyRevision {
+    generation: u64,
+    accepted_revision: u64,
 }
 
 impl AuthorityLease<'_> {
+    /// Read both canonical revisions while publication is excluded by the
+    /// held state lock. The result describes checks made under this lease.
+    pub(crate) fn policy_revision(&self) -> AuthPolicyRevision {
+        AuthPolicyRevision {
+            generation: self.state.resolver.generation(),
+            accepted_revision: self.accepted_revision.load(Ordering::Acquire),
+        }
+    }
+
     /// [`RpcInboundAuth::current_grants`] answered from the held state: the
     /// credential is unexpired and still paired, and the grants resolve under
     /// the policy that stays in force until the lease is dropped.
@@ -907,6 +929,58 @@ mod tests {
         let generation = auth.refresh_from_config(&base_config()).unwrap();
         let lease = auth.hold_authority();
         assert_eq!(lease.state.resolver.generation(), generation);
+    }
+
+    #[tokio::test]
+    async fn lease_policy_revision_stays_with_the_authorized_generation() {
+        let config = base_config();
+        let auth = Arc::new(auth_for(&config, &[]));
+        let connection = auth
+            .authenticate(TransportKind::Local, Credential::None, None, None)
+            .await
+            .expect("local binding");
+        let generation = auth.publish_accepted(&config, 5).expect("publish");
+        let lease = auth.hold_authority();
+        lease
+            .current_grants(&connection)
+            .expect("current authority");
+        let held = AuthPolicyRevision {
+            generation,
+            accepted_revision: 5,
+        };
+        assert_eq!(lease.policy_revision(), held);
+        let publisher = {
+            let auth = Arc::clone(&auth);
+            let config = config.clone();
+            std::thread::spawn(move || auth.publish_accepted(&config, 6).expect("publish"))
+        };
+        wait_until_queued(|| auth.publication_queued_behind_a_lease(), &publisher);
+        lease.current_grants(&connection).expect("held authority");
+        assert_eq!(lease.policy_revision(), held);
+        drop(lease);
+        assert_eq!(publisher.join().expect("publisher"), generation);
+        let lease = auth.hold_authority();
+        lease.current_grants(&connection).expect("fresh authority");
+        assert_eq!(
+            lease.policy_revision(),
+            AuthPolicyRevision {
+                generation,
+                accepted_revision: 6,
+            }
+        );
+        drop(lease);
+        auth.refresh_from_config(&config).expect("refresh");
+        let lease = auth.hold_authority();
+        lease
+            .current_grants(&connection)
+            .expect("refreshed authority");
+        assert_eq!(
+            lease.policy_revision(),
+            AuthPolicyRevision {
+                generation: generation + 1,
+                accepted_revision: 6,
+            }
+        );
     }
 
     #[tokio::test]

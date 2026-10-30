@@ -16,7 +16,7 @@ use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::skills::SkillsService;
 
-use crate::{AppState, api::require_auth, run_gateway_chat_with_tools};
+use crate::{AppState, api::require_auth};
 
 /// A2A protocol version advertised on per-alias interfaces.
 const A2A_PROTOCOL_VERSION: &str = "1.0";
@@ -599,8 +599,53 @@ async fn handle_alias_task(
             .into_response();
     }
 
+    // Keep the accepted protocol's original part order. Unsupported media
+    // remains an opaque observation; the text executor does not fetch URLs
+    // or pretend to execute semantics it cannot support.
+    let parts = params
+        .message
+        .parts
+        .iter()
+        .map(|part| {
+            if let Some(text) = part.as_text() {
+                Ok(zeroclaw_api::session_events::capture::EngineInputPart::Text(text.to_owned()))
+            } else {
+                serde_json::to_value(part).map(|body| {
+                    zeroclaw_api::session_events::capture::EngineInputPart::Opaque {
+                        type_name: "a2a.part/v1".into(),
+                        body,
+                    }
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let parts = match parts {
+        Ok(parts) => parts,
+        Err(error) => {
+            return (
+                StatusCode::OK,
+                Json(jsonrpc_error(req.id, -32603, &error.to_string())),
+            )
+                .into_response();
+        }
+    };
     let session_id = format!("a2a_{alias}_{}", Uuid::new_v4());
-    match run_gateway_chat_with_tools(&state, &prompt, Some(&session_id), Some(&alias)).await {
+    let proof = match crate::session_history::header_subject(&state, &headers) {
+        Ok(subject) => crate::session_history::IngressProof::Paired { subject },
+        Err(error) => return crate::session_history::response(Err(error)),
+    };
+    match crate::session_history::scope_ingress(
+        proof,
+        crate::run_gateway_chat_with_parts(
+            &state,
+            &prompt,
+            Some(&session_id),
+            Some(&alias),
+            Some(parts),
+        ),
+    )
+    .await
+    {
         Ok(outcome) => {
             // v1.0 wire: Task uses TaskState enum (SCREAMING_SNAKE_CASE) and
             // flattened Part (no `kind`); the SendMessage result is a
@@ -622,25 +667,21 @@ async fn handle_alias_task(
                 history: vec![],
                 metadata: None,
             };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
+            crate::session_history::json_response(
+                serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": req.id,
                     "result": SendMessageResponse::Task { task },
-                })),
+                }),
+                outcome.delivery,
+                "a2a_http",
             )
-                .into_response()
         }
-        Err(e) => (
-            StatusCode::OK,
-            Json(jsonrpc_error(
-                req.id,
-                -32000,
-                &format!("Agent task failed: {e}"),
-            )),
-        )
-            .into_response(),
+        Err(e) => crate::session_history::json_response(
+            jsonrpc_error(req.id, -32000, &format!("Agent task failed: {e}")),
+            crate::session_history::failure_delivery(&e),
+            "a2a_http",
+        ),
     }
 }
 

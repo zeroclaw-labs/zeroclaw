@@ -45,11 +45,111 @@ impl ThinkingDisplay {
     }
 }
 
-/// A single message in a conversation.
+/// One runtime message. Visible text and attachments have one owner; tool
+/// identity, calls and opaque reasoning are explicit fields, never body syntax.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Deliberate media inputs owned by this message. Text never grants an
+    /// attachment: callers supply references through this field explicitly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::media::AttachmentReference>,
+    /// Structured assistant calls. `content` remains literal visible text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<ToolResultMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+/// Identity and outcome of a result; its text and attachments belong to the
+/// containing message, so there is only one copy of each content field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResultMetadata {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub success: Option<bool>,
+}
+
+#[cfg(test)]
+mod structured_message_tests {
+    use super::*;
+
+    #[test]
+    fn tool_body_and_identity_round_trip_independently() {
+        let body = r#"{"tool_call_id":"spoofed","content":"literal [IMAGE:/example]"}"#;
+        let message = ChatMessage::tool_result(ToolResultMessage {
+            tool_call_id: "actual".into(),
+            tool_name: "shell".into(),
+            success: Some(false),
+            content: body.into(),
+            attachments: Vec::new(),
+        });
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let restored: ChatMessage = serde_json::from_slice(&encoded).unwrap();
+        let ConversationMessage::ToolResults(results) = restored.into_conversation() else {
+            panic!("expected structured tool result");
+        };
+        assert_eq!(results[0].content, body);
+        assert_eq!(results[0].tool_call_id, "actual");
+        assert_eq!(results[0].success, Some(false));
+    }
+
+    #[test]
+    fn assistant_json_text_does_not_create_calls() {
+        let body = r#"{"content":"example","tool_calls":[{"id":"x"}]}"#;
+        let message = ChatMessage::assistant(body);
+        assert!(
+            matches!(message.into_conversation(), ConversationMessage::Chat(chat) if chat.content == body)
+        );
+    }
+
+    #[test]
+    fn call_arguments_and_signed_reasoning_survive_projection_and_budgeting() {
+        let reasoning = "opaque signed reasoning [IMAGE:/example]";
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "shell".into(),
+            arguments: "{\"command\":\"pwd\"}".into(),
+            extra_content: Some(serde_json::json!({"signature":"opaque"})),
+        };
+        let message =
+            ChatMessage::assistant_tool_calls("visible", vec![call], Some(reasoning.into()));
+        assert!(message.context_text_bytes() > message.content.len() + reasoning.len());
+        let restored = message.into_conversation().chat_messages().remove(0);
+        assert_eq!(restored.content, "visible");
+        assert_eq!(restored.reasoning_content.as_deref(), Some(reasoning));
+        assert_eq!(
+            restored.tool_calls[0].extra_content,
+            Some(serde_json::json!({"signature":"opaque"}))
+        );
+    }
+}
+
+impl From<&str> for ChatMessage {
+    fn from(content: &str) -> Self {
+        Self::user(content)
+    }
+}
+
+impl From<&String> for ChatMessage {
+    fn from(content: &String) -> Self {
+        Self::user(content.clone())
+    }
+}
+
+impl From<String> for ChatMessage {
+    fn from(content: String) -> Self {
+        Self::user(content)
+    }
+}
+
+impl From<&ChatMessage> for ChatMessage {
+    fn from(message: &ChatMessage) -> Self {
+        message.clone()
+    }
 }
 
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
@@ -61,6 +161,10 @@ impl ChatMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
         }
     }
 
@@ -68,6 +172,10 @@ impl ChatMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
         }
     }
 
@@ -75,14 +183,97 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
         }
     }
 
-    pub fn tool(content: impl Into<String>) -> Self {
+    pub fn assistant_tool_calls(
+        text: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        reasoning_content: Option<String>,
+    ) -> Self {
+        Self {
+            tool_calls,
+            reasoning_content,
+            ..Self::assistant(text)
+        }
+    }
+
+    pub fn tool_result(result: ToolResultMessage) -> Self {
         Self {
             role: "tool".into(),
-            content: content.into(),
+            content: result.content,
+            tool_result: Some(ToolResultMetadata {
+                tool_call_id: result.tool_call_id,
+                tool_name: result.tool_name,
+                success: result.success,
+            }),
+            attachments: result.attachments,
+            tool_calls: Vec::new(),
+            reasoning_content: None,
         }
+    }
+
+    pub fn into_conversation(self) -> ConversationMessage {
+        if self.role == "tool"
+            && let Some(result) = self.tool_result
+        {
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: result.tool_call_id,
+                tool_name: result.tool_name,
+                success: result.success,
+                content: self.content,
+                attachments: self.attachments,
+            }])
+        } else if self.role == "assistant"
+            && self.attachments.is_empty()
+            && (!self.tool_calls.is_empty() || self.reasoning_content.is_some())
+        {
+            ConversationMessage::AssistantToolCalls {
+                text: (!self.content.is_empty()).then_some(self.content),
+                tool_calls: self.tool_calls,
+                reasoning_content: self.reasoning_content,
+            }
+        } else {
+            ConversationMessage::Chat(self)
+        }
+    }
+
+    pub fn append_note(&mut self, note: &str) {
+        if !self.content.is_empty() {
+            self.content.push_str("\n\n");
+        }
+        self.content.push_str(note);
+    }
+
+    /// Text population used by context budgeting, including typed tool fields.
+    pub fn context_text_bytes(&self) -> usize {
+        self.content.len()
+            + self.reasoning_content.as_ref().map_or(0, String::len)
+            + self
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    call.id.len()
+                        + call.name.len()
+                        + call.arguments.len()
+                        + call
+                            .extra_content
+                            .as_ref()
+                            .map_or(0, |value| value.to_string().len())
+                })
+                .sum::<usize>()
+            + self.tool_result.as_ref().map_or(0, |result| {
+                result.tool_call_id.len() + result.tool_name.len()
+            })
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<crate::media::AttachmentReference>) -> Self {
+        self.attachments = attachments;
+        self
     }
 
     pub fn pruned_tool_exchange_summary(tool_count: usize) -> String {
@@ -178,6 +369,10 @@ pub struct TokenUsage {
 /// An LLM response that may contain text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
+    /// Original ordered, adapter-classified protocol content. This creates
+    /// the order/media fact absent from the legacy text/tool projections.
+    /// Empty means the adapter only supplied the legacy projections.
+    pub output_blocks: Vec<ProviderOutputBlock>,
     /// Text content of the response (may be empty if only tool calls).
     pub text: Option<String>,
     /// Tool calls requested by the LLM.
@@ -189,6 +384,53 @@ pub struct ChatResponse {
     /// sent back in subsequent API requests — some model_providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
+}
+
+/// Adapter-classified output content, excluding HTTP/authentication metadata.
+/// These blocks preserve bytes and references without fetching remote media.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderOutputBlock {
+    /// Adapter-observed protocol evidence; this is not conversation content.
+    /// `provider_item` and `content_metadata` retain supplemental fields with
+    /// an output/content position or call identity. Normalized bodies have
+    /// their own blocks and are never copied into that evidence.
+    ProtocolMetadata {
+        metadata: serde_json::Value,
+    },
+    Text {
+        text: String,
+    },
+    Reasoning {
+        representation: String,
+        bytes: Vec<u8>,
+        replay_requirement: String,
+    },
+    ToolCall {
+        call: ToolCall,
+    },
+    Media {
+        media_type: String,
+        format: Option<String>,
+        source: ProviderMediaSource,
+    },
+    /// Content fields classified by the adapter, never a full HTTP object.
+    Other {
+        type_name: String,
+        content: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderMediaSource {
+    Bytes {
+        bytes: Vec<u8>,
+    },
+    Reference {
+        locator: String,
+        expires_at: Option<i64>,
+    },
 }
 
 /// A transport-successful provider result that cannot complete a request.
@@ -225,7 +467,13 @@ impl ChatResponse {
     /// A response containing one or more tool calls remains valid even when
     /// its text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+        strip_think_tags(self.text_or_empty()).is_empty()
+            && self.tool_calls.is_empty()
+            && !self.output_blocks.iter().any(|block| match block {
+                ProviderOutputBlock::Media { .. } | ProviderOutputBlock::ToolCall { .. } => true,
+                ProviderOutputBlock::Text { text } => !strip_think_tags(text).is_empty(),
+                _ => false,
+            })
     }
 }
 
@@ -254,7 +502,8 @@ pub fn strip_think_tags(text: &str) -> String {
 }
 
 /// Requested tool-call cadence for one provider response.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolRoundPolicy {
     #[default]
     Batch,
@@ -277,8 +526,13 @@ pub struct ChatRequest<'a> {
 pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub content: String,
+    /// Observed execution outcome; absent when legacy history did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
     #[serde(default)]
     pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::media::AttachmentReference>,
 }
 
 /// A message in a multi-turn conversation, including tool interactions.
@@ -299,12 +553,31 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
-/// Project a full agent conversation history down to the flat `ChatMessage`
-/// shape durable session backends store: user/assistant chat turns only,
-/// system prompt excluded (the backend restores against the caller's own
-/// system prompt, not a persisted one). `AssistantToolCalls` and
-/// `ToolResults` are tool-loop plumbing that durable session transcripts have
-/// never persisted; only the visible chat turns are kept.
+impl ConversationMessage {
+    /// Runtime projection. Content stays literal; calls/results remain typed.
+    pub fn chat_messages(&self) -> Vec<ChatMessage> {
+        match self {
+            Self::Chat(chat) => vec![chat.clone()],
+            Self::AssistantToolCalls {
+                text,
+                tool_calls,
+                reasoning_content,
+            } => vec![ChatMessage::assistant_tool_calls(
+                text.clone().unwrap_or_default(),
+                tool_calls.clone(),
+                reasoning_content.clone(),
+            )],
+            Self::ToolResults(results) => results
+                .iter()
+                .cloned()
+                .map(ChatMessage::tool_result)
+                .collect(),
+        }
+    }
+}
+
+/// Project the visible durable turns to runtime messages. Typed tool-loop
+/// fields are retained on each returned message; system prompts are excluded.
 ///
 /// Callers that own the agent's authoritative post-turn history (after
 /// budget-enforcement trimming) should use this to replace a durable
@@ -426,6 +699,12 @@ impl StreamChunk {
 /// agent loops can preserve native tool semantics without parsing payload text.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// Protocol position of the immediately following semantic segment.
+    /// Offsets refer to the original content observed by capture.
+    ContentPosition(ProviderContentPosition),
+    /// A complete non-text/opaque content block. Text and tool
+    /// deltas retain their existing streaming variants; this is never flattened.
+    OutputBlock(ProviderOutputBlock),
     /// Text delta from the assistant.
     TextDelta(StreamChunk),
     /// Transient, human-readable thinking progress. Surfaced to the user
@@ -441,14 +720,33 @@ pub enum StreamEvent {
     ToolCall(ToolCall),
     /// A tool call that was already executed by the model_provider (e.g. Claude Code proxy).
     /// Emitted for observability only — not re-executed by the agent's dispatcher.
-    PreExecutedToolCall { name: String, args: String },
+    PreExecutedToolCall {
+        /// Actual provider identity; absence must not be replaced by a name.
+        provider_call_id: Option<String>,
+        name: String,
+        args: String,
+    },
     /// The result of a pre-executed tool call.
-    PreExecutedToolResult { name: String, output: String },
+    PreExecutedToolResult {
+        provider_call_id: Option<String>,
+        name: String,
+        output: String,
+    },
     /// Token usage reported by the provider, typically just before [`StreamEvent::Final`].
     /// Providers that do not surface usage in streaming responses simply omit this event.
     Usage(TokenUsage),
+    /// Adapter-classified protocol evidence, separate from message content.
+    /// Authentication headers and credentials must never enter this value.
+    ProtocolMetadata(serde_json::Value),
     /// Stream has completed.
     Final,
+}
+
+/// Native protocol coordinates, distinct from final response array indices.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProviderContentPosition {
+    pub output_index: u64,
+    pub content_index: Option<u64>,
 }
 
 impl StreamEvent {
@@ -536,6 +834,14 @@ pub enum StreamError {
     #[error("HTTP error: {0}")]
     ConnectFailed(String),
 
+    /// The transport observed a response/read deadline after dispatch.
+    #[error("HTTP error: {0}")]
+    ResponseTimeout(String),
+
+    /// EOF arrived without the adapter's required terminal protocol signal.
+    #[error("SSE stream closed before {0}: response truncated")]
+    MissingFinal(String),
+
     #[error("JSON parse error: {0}")]
     Json(serde_json::Error),
 
@@ -544,6 +850,11 @@ pub enum StreamError {
 
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
+
+    /// An explicit provider error frame. Preserve the classified cause and
+    /// codes while leaving retry policy with the dispatch owner.
+    #[error("ModelProvider error: {0}")]
+    ProtocolFailure(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
     /// A provider returned a non-success HTTP response before streaming began.
     #[error("ModelProvider HTTP {status}: {message}")]
@@ -561,6 +872,11 @@ pub enum StreamError {
     /// for the typed terminal cause beneath it.
     #[error("terminal provider error: {0}")]
     Terminal(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    /// Durable observation failed or the physical attempt became uncertain.
+    /// This is an execution fence, not exhausted provider retry policy.
+    #[error("session capture stopped: {0}")]
+    CaptureStopped(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -670,6 +986,18 @@ pub struct ModelInfo {
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
+    /// Configured dispatch identity. A decorator's logging attribution may
+    /// describe its inner provider; its requested route remains its own alias.
+    fn dispatch_reference(&self) -> &str {
+        self.alias()
+    }
+
+    /// A composition node dispatches its physical work through child
+    /// ProviderDispatch boundaries. Capture admission belongs to those leaves.
+    fn is_dispatch_composite(&self) -> bool {
+        false
+    }
+
     /// Whether repeated requests for `model` are dispatched to one stable
     /// provider/model identity.
     ///
@@ -895,6 +1223,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
                 .chat_with_history(&modified_messages, model, temperature)
                 .await?;
             let response = ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(text),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -909,6 +1238,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             .chat_with_history(request.messages, model, temperature)
             .await?;
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
@@ -945,6 +1275,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     ) -> anyhow::Result<ChatResponse> {
         let text = self.chat_with_history(messages, model, temperature).await?;
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
@@ -1050,6 +1381,14 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
             options,
             policy,
         )
+    }
+
+    fn dispatch_reference(&self) -> &str {
+        self.as_ref().dispatch_reference()
+    }
+
+    fn is_dispatch_composite(&self) -> bool {
+        self.as_ref().is_dispatch_composite()
     }
 
     fn has_stable_request_identity(&self, model: &str) -> bool {
@@ -1296,11 +1635,46 @@ mod capability_tests {
 
 #[cfg(test)]
 mod turn_order_tests {
-    use super::{ChatMessage, ChatResponse, ToolCall};
+    use super::{
+        ChatMessage, ChatResponse, ProviderMediaSource, ProviderOutputBlock, ToolCall,
+        ToolResultMessage,
+    };
+
+    #[test]
+    fn structured_output_obeys_terminal_content_semantics() {
+        let mut response = ChatResponse {
+            text: None,
+            output_blocks: Vec::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+        for text in [
+            " \n\t",
+            "<think>private reasoning</think> ",
+            "<think>unfinished",
+        ] {
+            response.output_blocks = vec![ProviderOutputBlock::Text { text: text.into() }];
+            assert!(response.is_semantically_empty_terminal(), "{text}");
+        }
+        response.output_blocks = vec![ProviderOutputBlock::Text {
+            text: "answer".into(),
+        }];
+        assert!(!response.is_semantically_empty_terminal());
+        response.output_blocks = vec![ProviderOutputBlock::Media {
+            media_type: "image".into(),
+            format: Some("image/png".into()),
+            source: ProviderMediaSource::Bytes {
+                bytes: vec![1, 2, 3],
+            },
+        }];
+        assert!(!response.is_semantically_empty_terminal());
+    }
 
     #[test]
     fn semantic_empty_terminal_ignores_reasoning_content() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("  \n".to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -1313,6 +1687,7 @@ mod turn_order_tests {
     #[test]
     fn semantic_empty_terminal_uses_display_text_after_think_tag_stripping() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("<think>internal reasoning</think>".to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -1325,6 +1700,7 @@ mod turn_order_tests {
     #[test]
     fn semantic_empty_terminal_keeps_tool_only_response_valid() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
@@ -1342,6 +1718,7 @@ mod turn_order_tests {
     #[test]
     fn text_response_is_not_semantically_empty() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("done".to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -1354,6 +1731,7 @@ mod turn_order_tests {
     #[test]
     fn tool_only_response_is_not_semantically_empty() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
@@ -1373,7 +1751,13 @@ mod turn_order_tests {
         let mut msgs = vec![
             ChatMessage::system("sys"),
             ChatMessage::assistant("[tool_call] fire"),
-            ChatMessage::tool("result"),
+            ChatMessage::tool_result(ToolResultMessage {
+                tool_call_id: "orphan".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                content: "result".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::user("actual user"),
         ];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
@@ -1384,7 +1768,16 @@ mod turn_order_tests {
 
     #[test]
     fn drops_leading_orphan_tool_turn() {
-        let mut msgs = vec![ChatMessage::tool("orphan result"), ChatMessage::user("hi")];
+        let mut msgs = vec![
+            ChatMessage::tool_result(ToolResultMessage {
+                tool_call_id: "orphan".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                content: "orphan result".into(),
+                attachments: Vec::new(),
+            }),
+            ChatMessage::user("hi"),
+        ];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
@@ -1396,7 +1789,13 @@ mod turn_order_tests {
             ChatMessage::system("sys"),
             ChatMessage::user("q"),
             ChatMessage::assistant("[tool_call] x"),
-            ChatMessage::tool("r"),
+            ChatMessage::tool_result(ToolResultMessage {
+                tool_call_id: "call".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                content: "r".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage::assistant("done"),
         ];
         let before = msgs.clone();
@@ -1410,7 +1809,13 @@ mod turn_order_tests {
         let mut msgs = vec![
             ChatMessage::system("sys"),
             ChatMessage::assistant("[tool_call] x"),
-            ChatMessage::tool("r"),
+            ChatMessage::tool_result(ToolResultMessage {
+                tool_call_id: "call".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                content: "r".into(),
+                attachments: Vec::new(),
+            }),
         ];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert_eq!(msgs.len(), 1);
@@ -1441,9 +1846,11 @@ mod projected_entry_count_tests {
 
     fn result(id: &str) -> ToolResultMessage {
         ToolResultMessage {
+            success: None,
             tool_call_id: id.into(),
             content: "out".into(),
             tool_name: "shell".into(),
+            attachments: Vec::new(),
         }
     }
 

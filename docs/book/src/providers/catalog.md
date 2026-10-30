@@ -73,7 +73,7 @@ only ZeroClaw control is the shared per-alias config field `vision`.
 | Layer | Behavior on `0.2.118` |
 | ----- | --------------------- |
 | ACP advertise | `promptCapabilities.image = false` |
-| Default `grok_cli` | `vision` unset → ZeroClaw treats the alias as non-vision; image markers stay text |
+| Default `grok_cli` | `vision` unset → ZeroClaw treats the alias as non-vision; typed image input follows the shared non-vision gate |
 | `vision = true` | ZeroClaw reports vision on the alias and **sends** ACP `{type: image, data, mimeType}` blocks (does not change Grok's advertise) |
 | Model recognition | Live probe: image blocks are accepted by `session/prompt` (no protocol error) but the agent answered as if **no image was received** |
 

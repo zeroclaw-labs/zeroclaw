@@ -342,7 +342,8 @@ impl Tool for DeliverFileTool {
 
         Ok(ToolResult {
             success: true,
-            output: ToolOutput::json_with_text(data, summary),
+            output: ToolOutput::json_with_text(data, summary)
+                .with_attachment(materialized.reference),
             error: None,
         })
     }

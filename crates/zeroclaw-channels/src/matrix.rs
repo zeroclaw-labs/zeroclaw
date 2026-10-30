@@ -29,108 +29,12 @@ use matrix_sdk::{
 };
 
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
-    DraftProgressKind, RoomCreationOptions, RoomVisibility, SendMessage,
+    ApprovalPromptOutcome, Channel, ChannelApprovalRequest, ChannelApprovalResponse,
+    ChannelMessage, DraftProgress, DraftProgressKind, RoomCreationOptions, RoomVisibility,
+    SendMessage, await_approval_prompt_send,
 };
 use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
 use zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER;
-
-// ─── markers ───────────────────────────────────────────────────────────────
-mod markers {
-    //! Parse `[image:url]`, `[audio:url]`, `[video:url]`, `[file:url]`, `[voice:url]`
-    //! markers from outbound text. Strips them from the body and returns the kinds
-    //! + targets so the caller can upload the corresponding media.
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(super) enum MarkerKind {
-        Image,
-        Audio,
-        Video,
-        File,
-        Voice,
-    }
-
-    impl MarkerKind {
-        fn from_keyword(kw: &str) -> Option<Self> {
-            match kw.to_ascii_lowercase().as_str() {
-                "image" | "img" | "photo" => Some(Self::Image),
-                "audio" => Some(Self::Audio),
-                "video" => Some(Self::Video),
-                "file" | "document" | "doc" => Some(Self::File),
-                "voice" => Some(Self::Voice),
-                _ => None,
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub(super) struct Marker {
-        pub kind: MarkerKind,
-        pub target: String,
-    }
-
-    /// Scan `text` for marker substrings. Returns the cleaned text and any markers.
-    /// Malformed/unknown markers are left in the text untouched.
-    pub(super) fn parse(text: &str) -> (String, Vec<Marker>) {
-        let mut out = String::with_capacity(text.len());
-        let mut markers = Vec::new();
-        let mut chars = text.char_indices().peekable();
-
-        while let Some((start, ch)) = chars.next() {
-            if ch != '[' {
-                out.push(ch);
-                continue;
-            }
-
-            let rest = &text[start + 1..];
-            let Some(close_rel) = rest.find(']') else {
-                out.push(ch);
-                continue;
-            };
-            if rest[..close_rel].contains('\n') {
-                out.push(ch);
-                continue;
-            }
-            let inner = &rest[..close_rel];
-            let Some(colon) = inner.find(':') else {
-                out.push(ch);
-                continue;
-            };
-            let kw = &inner[..colon];
-            let target = inner[colon + 1..].trim();
-
-            let Some(kind) = MarkerKind::from_keyword(kw) else {
-                out.push(ch);
-                continue;
-            };
-            if target.is_empty() {
-                out.push(ch);
-                continue;
-            }
-
-            markers.push(Marker {
-                kind,
-                target: target.to_string(),
-            });
-            let consume_until = start + 1 + close_rel + 1;
-            while let Some(&(idx, _)) = chars.peek() {
-                if idx >= consume_until {
-                    break;
-                }
-                chars.next();
-            }
-        }
-
-        // Tidy whitespace left behind by stripped markers.
-        let cleaned = out
-            .lines()
-            .map(|l| l.trim_end().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        (cleaned.trim().to_string(), markers)
-    }
-}
 
 // ─── mention ───────────────────────────────────────────────────────────────
 mod mention {
@@ -415,7 +319,7 @@ mod streaming {
         DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, is_thinking_status_text, thinking_status_round,
     };
 
-    use super::{DraftProgress, DraftProgressKind, MatrixStreamMode, markers};
+    use super::{DraftProgress, DraftProgressKind, MatrixStreamMode};
 
     const MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
 
@@ -658,8 +562,7 @@ mod streaming {
     }
 
     pub(super) fn partial_visible_text(text: &str) -> Option<String> {
-        let (cleaned, _) = markers::parse(text);
-        let cleaned = cleaned.trim();
+        let cleaned = text.trim();
         if cleaned.is_empty() {
             None
         } else {
@@ -952,14 +855,14 @@ mod streaming {
             return format!("{REASONING_FULL_PREFIX}{alert}");
         }
         let text = unit.text.trim_end();
-        if let Some((marker, subject)) = text.split_once(' ')
-            && matches!(marker, "⏳" | "✅" | "❌")
+        if let Some((attachment, subject)) = text.split_once(' ')
+            && matches!(attachment, "⏳" | "✅" | "❌")
         {
             let subject = subject
                 .split_once("\\:")
                 .map_or(subject, |(tool, _)| tool)
                 .trim();
-            return format!("{marker} {subject}: {alert}");
+            return format!("{attachment} {subject}: {alert}");
         }
         format!("⚠️ {alert}")
     }
@@ -2300,11 +2203,17 @@ mod inbound {
             && crate::util::resolve_pending_approval(
                 &ctx.pending_approvals,
                 &token,
-                response,
+                crate::util::ApprovalReply {
+                    response,
+                    actor: zeroclaw_api::session_events::EventActor::ChannelResponder {
+                        channel: format!("matrix.{}", ctx.alias),
+                        responder_id: sender.into(),
+                    },
+                },
                 sender_allowed && room_allowed,
                 room_id,
             )
-            .await
+            .await?
             .suppresses_message()
         {
             return Ok(());
@@ -2456,6 +2365,7 @@ mod inbound {
             .as_ref()
             .is_some_and(|info| matches!(info.kind, MediaCategory::Voice));
 
+        let mut attachments = Vec::new();
         if let Some(info) = media_kind {
             content = attach_media(
                 &room,
@@ -2464,6 +2374,7 @@ mod inbound {
                 &body,
                 content,
                 ctx.transcription.as_ref(),
+                &mut attachments,
             )
             .await;
         } else if let Some(reply_id) = reply_target.as_ref() {
@@ -2482,6 +2393,7 @@ mod inbound {
                             "",
                             content,
                             ctx.transcription.as_ref(),
+                            &mut attachments,
                         )
                         .await;
                     }
@@ -2491,7 +2403,6 @@ mod inbound {
                 }
             }
         }
-        let attachments: Vec<MediaAttachment> = Vec::new();
 
         let outbound_anchor =
             resolve_outbound_anchor(thread_id.as_ref(), &ev.event_id, ctx.config.reply_in_thread);
@@ -2649,23 +2560,33 @@ mod inbound {
         body_hint: &str,
         content: String,
         transcription: Option<&super::TranscriptionResolver>,
+        attachments: &mut Vec<MediaAttachment>,
     ) -> String {
         let mut content = content;
         match save_media_to_workspace(room, info, workspace_dir).await {
             Ok(Some(path)) => {
-                let marker = format_media_marker(info, &path);
-                let placeholder = matches!(body_hint, "[image]" | "[file]" | "[audio]" | "[video]");
-                content = if body_hint.is_empty() {
-                    if content.is_empty() {
-                        marker
-                    } else {
-                        format!("{content}\n\n{marker}")
+                let kind = match info.kind {
+                    MediaCategory::Image => zeroclaw_api::media::AttachmentKind::Image,
+                    MediaCategory::Video => zeroclaw_api::media::AttachmentKind::Video,
+                    MediaCategory::Audio | MediaCategory::Voice => {
+                        zeroclaw_api::media::AttachmentKind::Audio
                     }
-                } else if placeholder || body_hint == info.file_name || content == body_hint {
-                    marker
-                } else {
-                    format!("{content}\n\n{marker}")
+                    MediaCategory::File => zeroclaw_api::media::AttachmentKind::Document,
                 };
+                attachments.push(MediaAttachment {
+                    file_name: info.file_name.clone(),
+                    data: Vec::new(),
+                    mime_type: info.mime.clone(),
+                    reference: Some(zeroclaw_api::media::AttachmentReference {
+                        kind,
+                        target: path.display().to_string(),
+                    }),
+                });
+                if body_hint == info.file_name
+                    || matches!(body_hint, "[image]" | "[file]" | "[audio]" | "[video]")
+                {
+                    content.clear();
+                }
 
                 if should_transcribe(&info.kind)
                     && let Some(resolver) = transcription
@@ -2674,7 +2595,7 @@ mod inbound {
                         transcription_safe_filename(&info.file_name, info.mime.as_deref());
                     match transcribe_from_disk(resolver, &path, &transcribe_name).await {
                         Ok(Some(text)) if !text.trim().is_empty() => {
-                            content = format!("[voice transcript]: {text}\n\n{content}");
+                            content = format!("Voice transcript: {text}\n\n{content}");
                         }
                         Ok(_) => {}
                         Err(e) => ::zeroclaw_log::record!(
@@ -2924,23 +2845,6 @@ mod inbound {
         }
     }
 
-    fn format_media_marker(info: &MediaInfo, path: &std::path::Path) -> String {
-        match info.kind {
-            MediaCategory::Image => format!("[IMAGE:{}]", path.display()),
-            _ => {
-                let display_name = if info.file_name.trim().is_empty() {
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("attachment")
-                        .to_string()
-                } else {
-                    info.file_name.clone()
-                };
-                format!("[Document: {display_name}] {}", path.display())
-            }
-        }
-    }
-
     /// Resolves the manager from live config before touching the filesystem.
     /// `Ok(None)` means transcription is currently disabled.
     async fn transcribe_from_disk(
@@ -3059,7 +2963,7 @@ mod outbound {
     use std::time::Duration;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
-    use super::{client, context as ctx_mod, markers};
+    use super::{client, context as ctx_mod};
     use zeroclaw_api::{channel::SendMessage, media::MediaAttachment};
 
     pub(super) type ReactionKey = (OwnedRoomId, OwnedEventId, String);
@@ -3077,7 +2981,7 @@ mod outbound {
     }
 
     /// What `outbound::send` should do once all attachment uploads are done
-    /// and the marker-stripped text is in hand. Extracted as a small enum so
+    /// and the attachment-stripped text is in hand. Extracted as a small enum so
     /// the empty-text-with-attachments contract can be unit-tested without
     /// the SDK in the loop.
     #[derive(Debug, PartialEq, Eq)]
@@ -3135,7 +3039,7 @@ mod outbound {
         }
     }
 
-    /// Apply an explicitly selected Matrix response budget after markers and
+    /// Apply an explicitly selected Matrix response budget after attachments and
     /// attachments have been processed. The limit is checked against the
     /// serialized Markdown event, not merely the Markdown source; a large
     /// `formatted_body` must not escape the configured budget.
@@ -3174,25 +3078,25 @@ mod outbound {
         .map(|serialized| serialized.len())
     }
 
-    /// Decide what `outbound::send` should do given the post-marker-strip
+    /// Decide what `outbound::send` should do given the post-attachment-strip
     /// text and whether at least one attachment landed. Pure function.
     pub(super) fn decide_send_outcome(
-        text_is_empty_after_strip: bool,
+        text_is_empty: bool,
         any_attachment_landed: bool,
     ) -> SendOutcome {
-        match (text_is_empty_after_strip, any_attachment_landed) {
+        match (text_is_empty, any_attachment_landed) {
             (false, _) => SendOutcome::SendText,
             (true, true) => SendOutcome::ReturnAttachment,
             (true, false) => SendOutcome::EmptyError,
         }
     }
 
-    /// Why a marker upload didn't reach the room. Drives both the textual
+    /// Why a attachment upload didn't reach the room. Drives both the textual
     /// "(note: I couldn't deliver…)" line and the emoji reactions on the
     /// agent's outgoing message so a chatter sees a hard refusal at a glance.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum MarkerFailure {
-        /// Trust-boundary refusal: `validate_marker_target` rejected the
+    pub(super) enum AttachmentFailure {
+        /// Trust-boundary refusal: `validate_attachment_target` rejected the
         /// target (path escapes workspace, disallowed scheme, etc.). The bot
         /// deliberately did not attempt the fetch.
         Refused,
@@ -3205,42 +3109,51 @@ mod outbound {
     pub(super) struct AttachmentDelivery {
         pub text: String,
         pub last_attachment_id: Option<OwnedEventId>,
-        pub failed_markers: Vec<(String, MarkerFailure)>,
+        pub failed_attachments: Vec<(String, AttachmentFailure)>,
     }
 
     impl AttachmentDelivery {
-        pub(super) fn failure_kinds(&self) -> Vec<MarkerFailure> {
-            self.failed_markers.iter().map(|(_, kind)| *kind).collect()
+        pub(super) fn failure_kinds(&self) -> Vec<AttachmentFailure> {
+            self.failed_attachments
+                .iter()
+                .map(|(_, kind)| *kind)
+                .collect()
         }
     }
 
     /// Pick the emoji reactions to apply to the agent's outgoing text/event
-    /// based on which kinds of marker failures occurred. 🚫 means the bot
+    /// based on which kinds of attachment failures occurred. 🚫 means the bot
     /// refused for safety; ⚠️ means it tried and didn't make it. Both can
     /// fire on the same message when a batch mixes refusals and failures.
-    pub(super) fn decide_reactions(failures: &[MarkerFailure]) -> Vec<&'static str> {
+    pub(super) fn decide_reactions(failures: &[AttachmentFailure]) -> Vec<&'static str> {
         let mut out = Vec::new();
-        if failures.iter().any(|f| matches!(f, MarkerFailure::Refused)) {
+        if failures
+            .iter()
+            .any(|f| matches!(f, AttachmentFailure::Refused))
+        {
             out.push("🚫");
         }
-        if failures.iter().any(|f| matches!(f, MarkerFailure::Failed)) {
+        if failures
+            .iter()
+            .any(|f| matches!(f, AttachmentFailure::Failed))
+        {
             out.push("⚠️");
         }
         out
     }
 
-    /// 8 MiB cap on the body of an HTTP marker fetch. Matches WebFetchTool's
+    /// 8 MiB cap on the body of an HTTP attachment fetch. Matches WebFetchTool's
     /// streaming-cap pattern in `crates/zeroclaw-tools/src/web_fetch.rs`.
-    const MAX_MARKER_BYTES: usize = 8 * 1024 * 1024;
-    /// 30-second connect+request timeout for HTTP marker fetches. Bounds the
+    const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+    /// 30-second connect+request timeout for HTTP attachment fetches. Bounds the
     /// agent-driven fetch path so a hung target cannot stall the channel.
-    const MARKER_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+    const ATTACHMENT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Resolved marker fetch target after sandboxing. `Local` paths are
+    /// Resolved attachment fetch target after sandboxing. `Local` paths are
     /// canonicalised and proven to live within the configured `workspace_dir`.
     /// `Http` URLs have an explicit `http`/`https` scheme.
     #[derive(Debug)]
-    pub(super) enum MarkerTarget {
+    pub(super) enum AttachmentTarget {
         Local(PathBuf),
         Http(reqwest::Url),
     }
@@ -3266,21 +3179,21 @@ mod outbound {
     }
 
     impl ValidateError {
-        pub(super) fn as_marker_failure(&self) -> MarkerFailure {
+        pub(super) fn as_attachment_failure(&self) -> AttachmentFailure {
             match self {
-                ValidateError::Refused(_) => MarkerFailure::Refused,
-                ValidateError::NotFound(_) => MarkerFailure::Failed,
+                ValidateError::Refused(_) => AttachmentFailure::Refused,
+                ValidateError::NotFound(_) => AttachmentFailure::Failed,
             }
         }
     }
 
-    pub(super) fn validate_marker_target(
+    pub(super) fn validate_attachment_target(
         target: &str,
         workspace_dir: Option<&Path>,
-    ) -> std::result::Result<MarkerTarget, ValidateError> {
+    ) -> std::result::Result<AttachmentTarget, ValidateError> {
         if target.starts_with("http://") || target.starts_with("https://") {
             let url = reqwest::Url::parse(target)
-                .with_context(|| format!("parse marker URL {target}"))
+                .with_context(|| format!("parse attachment URL {target}"))
                 .map_err(ValidateError::Refused)?;
             let host_str = url.host_str().unwrap_or("");
             if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(host_str) {
@@ -3293,14 +3206,14 @@ mod outbound {
                             "host": host_str,
                             "reason": "ssrf_private_host",
                         })),
-                    "matrix: marker target points to a private/local host"
+                    "matrix: attachment target points to a private/local host"
                 );
                 return Err(ValidateError::Refused(anyhow::Error::msg(format!(
-                    "matrix: marker target {target} resolves to a private or local host ({host_str}); refusing for SSRF safety. \
+                    "matrix: attachment target {target} resolves to a private or local host ({host_str}); refusing for SSRF safety. \
                      Use a public URL or attach the file from workspace_dir directly."
                 ))));
             }
-            return Ok(MarkerTarget::Http(url));
+            return Ok(AttachmentTarget::Http(url));
         }
         if target.contains("://") {
             let scheme = target.split("://").next().unwrap_or("?");
@@ -3312,10 +3225,10 @@ mod outbound {
                         "scheme": scheme,
                         "target": target,
                     })),
-                "matrix: marker target uses disallowed scheme"
+                "matrix: attachment target uses disallowed scheme"
             );
             return Err(ValidateError::Refused(anyhow::Error::msg(format!(
-                "matrix: marker target uses disallowed scheme {scheme:?}; only http/https and workspace-relative paths are accepted"
+                "matrix: attachment target uses disallowed scheme {scheme:?}; only http/https and workspace-relative paths are accepted"
             ))));
         }
         if target.starts_with("data:") || target.starts_with("file:") {
@@ -3326,10 +3239,10 @@ mod outbound {
                     .with_attrs(::serde_json::json!({
                         "target": target,
                     })),
-                "matrix: marker target uses disallowed data: or file: scheme"
+                "matrix: attachment target uses disallowed data: or file: scheme"
             );
             return Err(ValidateError::Refused(anyhow::Error::msg(
-                "matrix: marker target uses disallowed scheme; only http/https and workspace-relative paths are accepted",
+                "matrix: attachment target uses disallowed scheme; only http/https and workspace-relative paths are accepted",
             )));
         }
 
@@ -3342,10 +3255,10 @@ mod outbound {
                         "target": target,
                         "reason": "no_workspace_dir",
                     })),
-                "matrix: marker target is local path but channel has no workspace_dir"
+                "matrix: attachment target is local path but channel has no workspace_dir"
             );
             ValidateError::Refused(anyhow::Error::msg(format!(
-                "matrix: marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
+                "matrix: attachment target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
             )))
         })?;
         let workspace_canon = std::fs::canonicalize(workspace)
@@ -3369,15 +3282,16 @@ mod outbound {
                             "target": target,
                             "reason": "not_found",
                         })),
-                    "matrix: marker target not found on disk"
+                    "matrix: attachment target not found on disk"
                 );
                 return Err(ValidateError::NotFound(anyhow::Error::msg(format!(
-                    "matrix: marker target {target} not found on disk"
+                    "matrix: attachment target {target} not found on disk"
                 ))));
             }
             Err(e) => {
                 return Err(ValidateError::Refused(
-                    anyhow::Error::from(e).context(format!("canonicalize marker target {target}")),
+                    anyhow::Error::from(e)
+                        .context(format!("canonicalize attachment target {target}")),
                 ));
             }
         };
@@ -3393,30 +3307,30 @@ mod outbound {
                         "workspace_canon": workspace_canon.display().to_string(),
                         "reason": "outside_workspace",
                     })),
-                "matrix: marker target escapes workspace_dir"
+                "matrix: attachment target escapes workspace_dir"
             );
             return Err(ValidateError::Refused(anyhow::Error::msg(format!(
-                "matrix: marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
+                "matrix: attachment target {target} resolves to {} which is outside workspace_dir {}; refusing",
                 target_canon.display(),
                 workspace_canon.display(),
             ))));
         }
-        Ok(MarkerTarget::Local(target_canon))
+        Ok(AttachmentTarget::Local(target_canon))
     }
 
-    /// Maximum number of redirects to follow on a marker HTTP fetch. The
+    /// Maximum number of redirects to follow on a attachment HTTP fetch. The
     /// `Policy::custom` closure below rejects any redirect target whose host
     /// is private/local, so the cap mainly bounds the worst-case public-→-public
     /// chain an attacker can construct.
-    const MAX_MARKER_REDIRECTS: usize = 10;
+    const MAX_ATTACHMENT_REDIRECTS: usize = 10;
 
     fn marker_http_client() -> &'static reqwest::Client {
         static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
         CLIENT.get_or_init(|| {
             let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= MAX_MARKER_REDIRECTS {
+                if attempt.previous().len() >= MAX_ATTACHMENT_REDIRECTS {
                     return attempt.error(std::io::Error::other(format!(
-                        "Too many marker redirects (max {MAX_MARKER_REDIRECTS})"
+                        "Too many attachment redirects (max {MAX_ATTACHMENT_REDIRECTS})"
                     )));
                 }
                 // `attempt.url()` borrows the attempt, so we copy out the
@@ -3434,12 +3348,12 @@ mod outbound {
                                 "host": host,
                                 "reason": "ssrf_redirect_to_private_host",
                             })),
-                        "matrix: marker redirect targets a private/local host"
+                        "matrix: attachment redirect targets a private/local host"
                     );
                     return attempt.error(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!(
-                            "Blocked marker redirect to private or local host ({host}); \
+                            "Blocked attachment redirect to private or local host ({host}); \
                              refusing for SSRF safety. Use a public URL or attach the file \
                              from workspace_dir directly."
                         ),
@@ -3449,7 +3363,7 @@ mod outbound {
             });
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 reqwest::Client::builder()
-                    .timeout(MARKER_HTTP_TIMEOUT)
+                    .timeout(ATTACHMENT_HTTP_TIMEOUT)
                     .redirect(redirect_policy)
                     .user_agent("zeroclaw-matrix/1.0"),
                 "channel.matrix",
@@ -3465,17 +3379,19 @@ mod outbound {
             .get(url.clone())
             .send()
             .await
-            .with_context(|| format!("fetch marker URL {url}"))?;
+            .with_context(|| format!("fetch attachment URL {url}"))?;
         let status = resp.status();
         if !status.is_success() {
-            bail!("matrix: marker URL {url} returned HTTP status {status}");
+            bail!("matrix: attachment URL {url} returned HTTP status {status}");
         }
         let mut stream = resp.bytes_stream();
         let mut buf = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("stream chunk from {url}"))?;
-            if buf.len().saturating_add(chunk.len()) > MAX_MARKER_BYTES {
-                bail!("matrix: marker URL {url} exceeded {MAX_MARKER_BYTES}-byte cap; refusing");
+            if buf.len().saturating_add(chunk.len()) > MAX_ATTACHMENT_BYTES {
+                bail!(
+                    "matrix: attachment URL {url} exceeded {MAX_ATTACHMENT_BYTES}-byte cap; refusing"
+                );
             }
             buf.extend_from_slice(&chunk);
         }
@@ -3501,52 +3417,68 @@ mod outbound {
         outbox: &Outbox<'_>,
         room: &Room,
         mut text: String,
-        markers: &[markers::Marker],
         attachments: &[MediaAttachment],
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<AttachmentDelivery> {
         let mut last_attachment_id: Option<OwnedEventId> = None;
-        for att in attachments {
-            let id = upload_attachment(room, att, AttachmentKind::Auto, thread_anchor).await?;
+        for att in attachments
+            .iter()
+            .filter(|attachment| !attachment.data.is_empty())
+        {
+            let kind = match att.reference.as_ref().map(|reference| reference.kind) {
+                Some(zeroclaw_api::media::AttachmentKind::Image) => AttachmentKind::Image,
+                Some(zeroclaw_api::media::AttachmentKind::Audio) => AttachmentKind::Audio,
+                Some(zeroclaw_api::media::AttachmentKind::Video) => AttachmentKind::Video,
+                Some(zeroclaw_api::media::AttachmentKind::Document) => AttachmentKind::File,
+                None => AttachmentKind::Auto,
+            };
+            let id = upload_attachment(room, att, kind, thread_anchor).await?;
             last_attachment_id = Some(id);
         }
 
-        // Track each failed marker with the reason: Refused (trust-boundary
-        // rejection by validate_marker_target) vs Failed (everything else —
+        // Track each failed attachment with the reason: Refused (trust-boundary
+        // rejection by validate_attachment_target) vs Failed (everything else —
         // fetch error, upload rejection). Drives both the textual note and
         // the emoji reactions fired below.
-        let mut failed_markers: Vec<(String, MarkerFailure)> = Vec::new();
-        for marker in markers {
-            let kind = match marker.kind {
-                markers::MarkerKind::Image => AttachmentKind::Image,
-                markers::MarkerKind::Audio => AttachmentKind::Audio,
-                markers::MarkerKind::Video => AttachmentKind::Video,
-                markers::MarkerKind::File => AttachmentKind::File,
-                markers::MarkerKind::Voice => AttachmentKind::Voice,
+        let mut failed_attachments: Vec<(String, AttachmentFailure)> = Vec::new();
+        for attachment in attachments
+            .iter()
+            .filter(|attachment| attachment.data.is_empty())
+            .filter_map(|attachment| attachment.reference.as_ref())
+        {
+            let kind = match attachment.kind {
+                zeroclaw_api::media::AttachmentKind::Image => AttachmentKind::Image,
+                zeroclaw_api::media::AttachmentKind::Audio => AttachmentKind::Audio,
+                zeroclaw_api::media::AttachmentKind::Video => AttachmentKind::Video,
+                zeroclaw_api::media::AttachmentKind::Document => AttachmentKind::File,
             };
-            let resolved = match validate_marker_target(&marker.target, outbox.workspace_dir) {
-                Ok(t) => t,
-                Err(e) => {
-                    let kind = e.as_marker_failure();
-                    let label = match kind {
-                        MarkerFailure::Refused => "trust boundary",
-                        MarkerFailure::Failed => "not found",
-                    };
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            let resolved =
+                match validate_attachment_target(&attachment.target, outbox.workspace_dir) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let kind = e.as_attachment_failure();
+                        let label = match kind {
+                            AttachmentFailure::Refused => "trust boundary",
+                            AttachmentFailure::Failed => "not found",
+                        };
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        &format!(
-                            "matrix: skipping outbound marker for {} ({label}): {e}",
-                            marker.target
-                        )
-                    );
-                    failed_markers.push((marker.target.clone(), kind));
-                    continue;
-                }
-            };
+                            &format!(
+                                "matrix: skipping outbound attachment for {} ({label}): {e}",
+                                attachment.target
+                            )
+                        );
+                        failed_attachments.push((attachment.target.clone(), kind));
+                        continue;
+                    }
+                };
             let bytes = match resolved {
-                MarkerTarget::Local(path) => match tokio::fs::read(&path).await {
+                AttachmentTarget::Local(path) => match tokio::fs::read(&path).await {
                     Ok(b) => b,
                     Err(e) => {
                         ::zeroclaw_log::record!(
@@ -3557,15 +3489,16 @@ mod outbound {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                             &format!(
-                                "matrix: skipping outbound marker for {} (read failed): {e}",
-                                marker.target
+                                "matrix: skipping outbound attachment for {} (read failed): {e}",
+                                attachment.target
                             )
                         );
-                        failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
+                        failed_attachments
+                            .push((attachment.target.clone(), AttachmentFailure::Failed));
                         continue;
                     }
                 },
-                MarkerTarget::Http(url) => match fetch_http(url).await {
+                AttachmentTarget::Http(url) => match fetch_http(url).await {
                     Ok(b) => b,
                     Err(e) => {
                         ::zeroclaw_log::record!(
@@ -3576,22 +3509,23 @@ mod outbound {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                             &format!(
-                                "matrix: skipping outbound marker for {} (http failed): {e}",
-                                marker.target
+                                "matrix: skipping outbound attachment for {} (http failed): {e}",
+                                attachment.target
                             )
                         );
-                        failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
+                        failed_attachments
+                            .push((attachment.target.clone(), AttachmentFailure::Failed));
                         continue;
                     }
                 },
             };
-            let file_name = derive_file_name(&marker.target);
+            let file_name = derive_file_name(&attachment.target);
             let mime = mime_for(&file_name, &kind);
             let att = MediaAttachment {
                 file_name,
                 data: bytes,
                 mime_type: Some(mime),
-                marker: None,
+                reference: None,
             };
             match upload_attachment(room, &att, kind, thread_anchor).await {
                 Ok(id) => last_attachment_id = Some(id),
@@ -3601,17 +3535,17 @@ mod outbound {
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         &format!(
-                            "matrix: skipping outbound marker for {} (upload failed): {e}",
-                            marker.target
+                            "matrix: skipping outbound attachment for {} (upload failed): {e}",
+                            attachment.target
                         )
                     );
-                    failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
+                    failed_attachments.push((attachment.target.clone(), AttachmentFailure::Failed));
                 }
             }
         }
 
-        if !failed_markers.is_empty() {
-            let targets: Vec<&str> = failed_markers.iter().map(|(t, _)| t.as_str()).collect();
+        if !failed_attachments.is_empty() {
+            let targets: Vec<&str> = failed_attachments.iter().map(|(t, _)| t.as_str()).collect();
             let note = if targets.len() == 1 {
                 format!("(note: I couldn't deliver the file at {}.)", targets[0])
             } else {
@@ -3628,7 +3562,7 @@ mod outbound {
         Ok(AttachmentDelivery {
             text,
             last_attachment_id,
-            failed_markers,
+            failed_attachments,
         })
     }
 
@@ -3636,7 +3570,7 @@ mod outbound {
         let room =
             resolve_joined_room(outbox.client, outbox.alias_cache, &message.recipient).await?;
 
-        let (text, ms) = markers::parse(&message.content);
+        let text = message.content.clone();
 
         // Build the thread anchor used by both attachment uploads and the
         // text reply, so attachments live in the same thread instead of
@@ -3647,14 +3581,13 @@ mod outbound {
             outbox,
             &room,
             text,
-            &ms,
             &message.attachments,
             thread_anchor.as_ref(),
         )
         .await?;
 
         // Decide whether to send the text, return the last attachment's
-        // event_id, or surface an error. Marker-only messages used to error
+        // event_id, or surface an error. Attachment-only messages used to error
         // here even though their attachment had landed; the runtime would
         // see Err and could retry, producing duplicate uploads.
         match decide_send_outcome(
@@ -3711,13 +3644,13 @@ mod outbound {
     }
 
     /// Best-effort: apply 🚫 / ⚠️ reactions to the bot's just-sent message
-    /// based on which kinds of marker failures occurred. Reaction send
+    /// based on which kinds of attachment failures occurred. Reaction send
     /// failures are logged but never propagated — the primary message
     /// already landed.
     pub(super) async fn emit_failure_reactions(
         room: &Room,
         event_id: &OwnedEventId,
-        failures: &[MarkerFailure],
+        failures: &[AttachmentFailure],
     ) {
         for emoji in decide_reactions(failures) {
             let content =
@@ -4167,7 +4100,7 @@ mod outbound {
                 });
             }
 
-            // `u64::MAX` is the "granule not known for this page" marker.
+            // `u64::MAX` is the "granule not known for this page" attachment.
             if granule != u64::MAX {
                 last_granule = Some(granule);
             }
@@ -4266,7 +4199,7 @@ mod outbound {
             file_name: VOICE_NOTE_FILE_NAME.to_string(),
             data: audio,
             mime_type: Some(VOICE_NOTE_MIME.to_string()),
-            marker: None,
+            reference: None,
         };
         upload_attachment(room, &att, AttachmentKind::Voice, thread_anchor).await
     }
@@ -4419,7 +4352,7 @@ impl MatrixChannel {
 
     /// Configure the workspace directory used to persist downloaded media so
     /// the agent's vision/document pipelines can read inbound files via
-    /// `[IMAGE:path]` / `[Document: name] path` markers.
+    /// structured image and document references.
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
         self.workspace_dir = Some(Arc::new(dir));
         self
@@ -4552,9 +4485,9 @@ impl MatrixChannel {
                 return Ok(None);
             };
             let manager = manager?;
-            // Speak the reply the reader sees: file markers are rendered as
+            // Speak the reply the reader sees: file attachments are rendered as
             // attachments, not read aloud.
-            let spoken = markers::parse(text).0;
+            let spoken = text.to_string();
             if spoken.trim().is_empty() {
                 return Ok(None);
             }
@@ -5103,12 +5036,11 @@ impl Channel for MatrixChannel {
                 if let Some(draft) = draft {
                     let room =
                         outbound::resolve_joined_room(client, &self.alias_cache, recipient).await?;
-                    let (cleaned_text, markers) = markers::parse(text);
+                    let cleaned_text = text.to_string();
                     let delivery = outbound::deliver_attachments(
                         &self.outbox(client),
                         &room,
                         cleaned_text,
-                        &markers,
                         &[],
                         draft.thread_anchor.as_ref(),
                     )
@@ -5482,24 +5414,30 @@ impl Channel for MatrixChannel {
             request.position_counter(),
         );
 
-        let (tx, rx) = oneshot::channel();
-        self.pending_approvals.lock().await.insert(
-            token.clone(),
-            crate::util::PendingApproval {
-                sender: tx,
-                destination,
-                tool_name: request.tool_name.clone(),
-            },
-        );
-        let mut guard = crate::util::PendingApprovalGuard::new(
+        let (tx, mut rx) = oneshot::channel();
+        let mut guard = crate::util::register_pending_approval(
             Arc::clone(&self.pending_approvals),
             token.clone(),
-        );
+            tx,
+            destination,
+            request.tool_name.clone(),
+        )
+        .await?;
 
         let send_msg = approval::build_prompt_message(prompt, recipient);
-        if let Err(e) = self.send(&send_msg).await {
-            guard.remove().await;
-            return Err(e);
+        match await_approval_prompt_send(self.send(&send_msg), &mut rx).await {
+            Ok(ApprovalPromptOutcome::Sent(())) => {}
+            Ok(ApprovalPromptOutcome::Replied(response)) => {
+                guard.remove().await;
+                return Ok(Some(response));
+            }
+            Err(e) if zeroclaw_api::session_events::capture::is_capture_stopped(&e) => {
+                return Err(e);
+            }
+            Err(e) => {
+                guard.remove().await;
+                return Err(e);
+            }
         }
 
         let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
@@ -5509,9 +5447,7 @@ impl Channel for MatrixChannel {
         match result {
             Ok(Ok(resp)) => {
                 guard.disarm();
-                Ok(Some(
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
-                ))
+                Ok(Some(resp?))
             }
             Ok(Err(_)) => {
                 guard.remove().await;
@@ -7046,69 +6982,6 @@ mod tests {
             assert_eq!(&wav[8..12], b"WAVE");
         }
 
-        #[tokio::test]
-        async fn direct_voice_note_inserts_transcript_and_keeps_real_filename() {
-            let wav = build_wav();
-
-            let matrix = MatrixMockServer::new().await;
-            let client = matrix.client_builder().build().await;
-            matrix.sync_joined_room(&client, test_room()).await;
-            mount_media_download(&matrix, &wav).await;
-
-            let stt = stt_server().await;
-            let workspace = tempfile::tempdir().unwrap();
-            let (tx, mut rx) = mpsc::channel(4);
-            let ctx = handler_ctx(
-                &format!("{}/v1/transcribe", stt.uri()),
-                workspace.path(),
-                tx,
-            );
-
-            // The production handlers, registered exactly as `run_sync_loop`
-            // does; the event arrives through the real sync-dispatch pipeline.
-            let _guards = register_event_handlers(&client, &ctx);
-            let json = voice_event_json("$audio1:localhost");
-            matrix
-                .sync_room(
-                    &client,
-                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
-                )
-                .await;
-
-            let msg = recv_forwarded(&mut rx).await;
-            assert!(
-                msg.content
-                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
-                "transcript must be inserted into the inbound content: {}",
-                msg.content
-            );
-            assert!(
-                msg.content.contains("voice.wav"),
-                "marker must keep the real filename: {}",
-                msg.content
-            );
-
-            let media_dir = workspace.path().join("matrix_files");
-            let saved: Vec<_> = std::fs::read_dir(&media_dir)
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            assert_eq!(saved.len(), 1, "exactly one saved media file");
-            let saved_path = saved[0].path();
-            assert!(
-                saved_path
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .ends_with("voice.wav"),
-                "saved file keeps the real-name-derived filename: {saved_path:?}"
-            );
-            assert_eq!(std::fs::read(&saved_path).unwrap(), wav);
-
-            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
-        }
-
         /// A voice note arriving on a *really configured* Matrix channel must
         /// reach the STT server the owning agent's `transcription_provider`
         /// names — not merely "some" registered provider.
@@ -7230,7 +7103,7 @@ mod tests {
             let msg = recv_forwarded(&mut rx).await;
             assert!(
                 msg.content
-                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                    .contains(&format!("Voice transcript: {TRANSCRIPT}")),
                 "transcript from the routed provider must land in the inbound content: {}",
                 msg.content
             );
@@ -7242,71 +7115,6 @@ mod tests {
             );
             wanted.verify().await;
             decoy.verify().await;
-        }
-
-        #[tokio::test]
-        async fn reply_to_voice_note_inserts_parent_transcript() {
-            let wav = build_wav();
-
-            let matrix = MatrixMockServer::new().await;
-            let client = matrix.client_builder().build().await;
-            matrix.sync_joined_room(&client, test_room()).await;
-            mount_media_download(&matrix, &wav).await;
-
-            // Parent-event fetch: /rooms/{roomId}/event/{eventId} returns the
-            // parent m.audio event verbatim.
-            let parent = voice_event_json("$parentaudio:localhost");
-            Mock::given(method("GET"))
-                .and(path_regex(
-                    r"^/_matrix/client/v3/rooms/.*/event/\$parentaudio:localhost$",
-                ))
-                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
-                .mount(matrix.server())
-                .await;
-
-            let stt = stt_server().await;
-            let workspace = tempfile::tempdir().unwrap();
-            let (tx, mut rx) = mpsc::channel(4);
-            let ctx = handler_ctx(
-                &format!("{}/v1/transcribe", stt.uri()),
-                workspace.path(),
-                tx,
-            );
-
-            let _guards = register_event_handlers(&client, &ctx);
-            let json = serde_json::json!({
-                "type": "m.room.message",
-                "event_id": "$reply1:localhost",
-                "sender": "@alice:localhost",
-                "origin_server_ts": 1_000_001u64,
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "what does this say?",
-                    "m.relates_to": {
-                        "m.in_reply_to": { "event_id": "$parentaudio:localhost" }
-                    }
-                }
-            });
-            matrix
-                .sync_room(
-                    &client,
-                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
-                )
-                .await;
-
-            let msg = recv_forwarded(&mut rx).await;
-            assert!(
-                msg.content
-                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
-                "parent transcript must be inserted: {}",
-                msg.content
-            );
-            assert!(
-                msg.content.contains("voice.wav"),
-                "marker must keep the parent's real filename: {}",
-                msg.content
-            );
-            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
 
         /// `voice_origin` is the event's own MSC3245 flag, forwarded so the
@@ -7360,7 +7168,7 @@ mod tests {
             let json = text_parent_event(
                 "$text-origin:localhost",
                 "@alice:localhost",
-                "[voice transcript]: not actually a voice note",
+                "Voice transcript: not actually a voice note",
             );
             matrix
                 .sync_room(
@@ -7413,7 +7221,7 @@ mod tests {
             let msg = recv_forwarded(&mut rx).await;
             assert!(
                 msg.content
-                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                    .contains(&format!("Voice transcript: {TRANSCRIPT}")),
                 "the parent transcript is still inserted: {}",
                 msg.content
             );
@@ -7421,94 +7229,6 @@ mod tests {
                 !msg.voice_origin,
                 "a text reply to a voice note is text-origin"
             );
-        }
-
-        // Encrypted-media variant: the event carries an E2EE `file` source;
-        // the homeserver serves ciphertext and the client decrypts during
-        // download, so the saved copy and the STT request must contain the
-        // original plaintext WAV.
-        #[tokio::test]
-        async fn encrypted_voice_note_decrypts_and_inserts_transcript() {
-            use std::io::Read as _;
-
-            use matrix_sdk::ruma::OwnedMxcUri;
-            use matrix_sdk::ruma::events::room::EncryptedFile;
-            use matrix_sdk_base::crypto::AttachmentEncryptor;
-
-            let wav = build_wav();
-            let mut reader = wav.as_slice();
-            let mut encryptor = AttachmentEncryptor::new(&mut reader);
-            let mut ciphertext = Vec::new();
-            encryptor.read_to_end(&mut ciphertext).unwrap();
-            let keys = encryptor.finish();
-            let file = EncryptedFile::new(
-                OwnedMxcUri::from("mxc://localhost/encryptedaudioblob"),
-                keys.encryption_info,
-                keys.hashes,
-            );
-
-            let matrix = MatrixMockServer::new().await;
-            let client = matrix.client_builder().build().await;
-            matrix.sync_joined_room(&client, test_room()).await;
-            mount_media_download(&matrix, &ciphertext).await;
-
-            let stt = stt_server().await;
-            let workspace = tempfile::tempdir().unwrap();
-            let (tx, mut rx) = mpsc::channel(4);
-            let ctx = handler_ctx(
-                &format!("{}/v1/transcribe", stt.uri()),
-                workspace.path(),
-                tx,
-            );
-
-            let _guards = register_event_handlers(&client, &ctx);
-            let json = serde_json::json!({
-                "type": "m.room.message",
-                "event_id": "$encaudio1:localhost",
-                "sender": "@alice:localhost",
-                "origin_server_ts": 1_000_002u64,
-                "content": {
-                    "msgtype": "m.audio",
-                    "body": "Voice message",
-                    "filename": "voice.wav",
-                    "file": serde_json::to_value(&file).unwrap(),
-                    "org.matrix.msc3245.voice": {},
-                    "info": { "mimetype": "audio/wav" }
-                }
-            });
-            matrix
-                .sync_room(
-                    &client,
-                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
-                )
-                .await;
-
-            let msg = recv_forwarded(&mut rx).await;
-            assert!(
-                msg.content
-                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
-                "transcript must be inserted for encrypted media: {}",
-                msg.content
-            );
-            assert!(
-                msg.content.contains("voice.wav"),
-                "marker must keep the real filename: {}",
-                msg.content
-            );
-
-            let media_dir = workspace.path().join("matrix_files");
-            let saved: Vec<_> = std::fs::read_dir(&media_dir)
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            assert_eq!(saved.len(), 1, "exactly one saved media file");
-            assert_eq!(
-                std::fs::read(saved[0].path()).unwrap(),
-                wav,
-                "saved copy must be the decrypted plaintext"
-            );
-
-            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
 
         fn mention_only_handler_ctx(
@@ -7691,7 +7411,7 @@ mod tests {
             let msg = recv_forwarded(&mut rx).await;
             assert!(
                 msg.content
-                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                    .contains(&format!("Voice transcript: {TRANSCRIPT}")),
                 "admitted reply must still attach parent media once: {}",
                 msg.content
             );
@@ -7728,6 +7448,8 @@ mod tests {
                 approvals.insert(
                     "AUTH0001".into(),
                     crate::util::PendingApproval {
+                        registration_id: uuid::Uuid::new_v4(),
+                        audit: crate::util::ApprovalAudit::current(),
                         sender: approved_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
@@ -7736,6 +7458,8 @@ mod tests {
                 approvals.insert(
                     "WRONG001".into(),
                     crate::util::PendingApproval {
+                        registration_id: uuid::Uuid::new_v4(),
+                        audit: crate::util::ApprovalAudit::current(),
                         sender: wrong_tx,
                         destination: "!other:localhost".into(),
                         tool_name: "tool".to_string(),
@@ -7744,6 +7468,8 @@ mod tests {
                 approvals.insert(
                     "OTHER001".into(),
                     crate::util::PendingApproval {
+                        registration_id: uuid::Uuid::new_v4(),
+                        audit: crate::util::ApprovalAudit::current(),
                         sender: unauthorized_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
@@ -7787,7 +7513,9 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), approved_rx)
                     .await
                     .expect("sync ingress should resolve the authorized approval")
-                    .expect("sync ingress should resolve the authorized approval"),
+                    .expect("sync ingress should resolve the authorized approval")
+                    .expect("approval capture should succeed")
+                    .response,
                 ChannelApprovalResponse::Approve
             );
             assert!(
@@ -7800,93 +7528,227 @@ mod tests {
             assert!(approvals.contains_key("WRONG001"));
             assert!(approvals.contains_key("OTHER001"));
         }
-    }
 
-    mod markers {
-        use super::super::markers::{MarkerKind, parse};
+        #[tokio::test]
+        async fn direct_voice_note_inserts_transcript_and_keeps_real_filename() {
+            let wav = build_wav();
 
-        #[test]
-        fn empty_text_yields_no_markers() {
-            let (text, ms) = parse("");
-            assert_eq!(text, "");
-            assert!(ms.is_empty());
-        }
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
 
-        #[test]
-        fn plain_text_passthrough() {
-            let (text, ms) = parse("hello world");
-            assert_eq!(text, "hello world");
-            assert!(ms.is_empty());
-        }
-
-        #[test]
-        fn single_image_marker_extracted() {
-            let (text, ms) = parse("[image:https://example.com/cat.jpg]");
-            assert_eq!(text, "");
-            assert_eq!(ms.len(), 1);
-            assert_eq!(ms[0].kind, MarkerKind::Image);
-            assert_eq!(ms[0].target, "https://example.com/cat.jpg");
-        }
-
-        #[test]
-        fn voice_marker_distinct_from_audio() {
-            let (_, ms) = parse("[voice:/tmp/note.ogg] [audio:/tmp/song.mp3]");
-            assert_eq!(ms.len(), 2);
-            assert_eq!(ms[0].kind, MarkerKind::Voice);
-            assert_eq!(ms[1].kind, MarkerKind::Audio);
-        }
-
-        #[test]
-        fn echoed_media_placeholder_delivered_as_prose() {
-            // A text-only model sees the degradation placeholder in its
-            // history and may repeat it; the reply must reach the room as
-            // readable text, not as a marker or a stray bracket span.
-            let reply = format!(
-                "I can't view that, it shows as {}.",
-                zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
             );
-            let (text, ms) = parse(&reply);
-            assert_eq!(text, reply);
-            assert!(ms.is_empty());
-            assert!(!text.contains('['));
+
+            // The production handlers, registered exactly as `run_sync_loop`
+            // does; the event arrives through the real sync-dispatch pipeline.
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = voice_event_json("$audio1:localhost");
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("Voice transcript: {TRANSCRIPT}")),
+                "transcript must be inserted into the inbound content: {}",
+                msg.content
+            );
+            assert!(
+                msg.attachments
+                    .iter()
+                    .any(|attachment| attachment.file_name.ends_with("voice.wav")),
+                "attachment must keep the real filename: {:?}",
+                msg.attachments
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            let saved_path = saved[0].path();
+            assert!(
+                saved_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .ends_with("voice.wav"),
+                "saved file keeps the real-name-derived filename: {saved_path:?}"
+            );
+            assert_eq!(std::fs::read(&saved_path).unwrap(), wav);
+
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
 
-        #[test]
-        fn multiple_markers_with_text_in_between() {
-            let (text, ms) =
-                parse("before [image:https://x/y.jpg] middle [file:/tmp/doc.pdf] after");
-            assert_eq!(text, "before  middle  after");
-            assert_eq!(ms.len(), 2);
-            assert_eq!(ms[0].kind, MarkerKind::Image);
-            assert_eq!(ms[1].kind, MarkerKind::File);
+        #[tokio::test]
+        async fn reply_to_voice_note_inserts_parent_transcript() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            // Parent-event fetch: /rooms/{roomId}/event/{eventId} returns the
+            // parent m.audio event verbatim.
+            let parent = voice_event_json("$parentaudio:localhost");
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/v3/rooms/.*/event/\$parentaudio:localhost$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+                .mount(matrix.server())
+                .await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$reply1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "what does this say?",
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": "$parentaudio:localhost" }
+                    }
+                }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("Voice transcript: {TRANSCRIPT}")),
+                "parent transcript must be inserted: {}",
+                msg.content
+            );
+            assert!(
+                msg.attachments
+                    .iter()
+                    .any(|attachment| attachment.file_name.ends_with("voice.wav")),
+                "attachment must keep the parent's real filename: {:?}",
+                msg.attachments
+            );
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
 
-        #[test]
-        fn malformed_marker_left_in_text() {
-            let (text, ms) = parse("foo [image: bar");
-            assert_eq!(text, "foo [image: bar");
-            assert!(ms.is_empty());
-        }
+        // Encrypted-media variant: the event carries an E2EE `file` source;
+        // the homeserver serves ciphertext and the client decrypts during
+        // download, so the saved copy and the STT request must contain the
+        // original plaintext WAV.
+        #[tokio::test]
+        async fn encrypted_voice_note_decrypts_and_inserts_transcript() {
+            use std::io::Read as _;
 
-        #[test]
-        fn unknown_keyword_left_in_text() {
-            let (text, ms) = parse("[banana:fruit]");
-            assert_eq!(text, "[banana:fruit]");
-            assert!(ms.is_empty());
-        }
+            use matrix_sdk::ruma::OwnedMxcUri;
+            use matrix_sdk::ruma::events::room::EncryptedFile;
+            use matrix_sdk_base::crypto::AttachmentEncryptor;
 
-        #[test]
-        fn empty_target_left_in_text() {
-            let (text, ms) = parse("[image:]");
-            assert_eq!(text, "[image:]");
-            assert!(ms.is_empty());
-        }
+            let wav = build_wav();
+            let mut reader = wav.as_slice();
+            let mut encryptor = AttachmentEncryptor::new(&mut reader);
+            let mut ciphertext = Vec::new();
+            encryptor.read_to_end(&mut ciphertext).unwrap();
+            let keys = encryptor.finish();
+            let file = EncryptedFile::new(
+                OwnedMxcUri::from("mxc://localhost/encryptedaudioblob"),
+                keys.encryption_info,
+                keys.hashes,
+            );
 
-        #[test]
-        fn marker_with_newline_inside_left_in_text() {
-            let (text, ms) = parse("[image:a\nb]");
-            assert!(text.contains("[image:a"));
-            assert!(ms.is_empty());
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &ciphertext).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$encaudio1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_002u64,
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.wav",
+                    "file": serde_json::to_value(&file).unwrap(),
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/wav" }
+                }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("Voice transcript: {TRANSCRIPT}")),
+                "transcript must be inserted for encrypted media: {}",
+                msg.content
+            );
+            assert!(
+                msg.attachments
+                    .iter()
+                    .any(|attachment| attachment.file_name.ends_with("voice.wav")),
+                "attachment must keep the real filename: {:?}",
+                msg.attachments
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            assert_eq!(
+                std::fs::read(saved[0].path()).unwrap(),
+                wav,
+                "saved copy must be the decrypted plaintext"
+            );
+
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
     }
 
@@ -7906,6 +7768,8 @@ mod tests {
             pending.lock().await.insert(
                 "APPROVAL".to_string(),
                 crate::util::PendingApproval {
+                    registration_id: uuid::Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::current(),
                     sender: tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
@@ -7928,7 +7792,8 @@ mod tests {
                         ),
                         "!origin:example.invalid",
                     )
-                    .await,
+                    .await
+                    .unwrap(),
                     crate::util::PendingApprovalResolution::Rejected,
                 );
                 assert!(pending.lock().await.contains_key("APPROVAL"));
@@ -7945,7 +7810,8 @@ mod tests {
                     ),
                     "!other:example.invalid",
                 )
-                .await,
+                .await
+                .unwrap(),
                 crate::util::PendingApprovalResolution::Rejected,
             );
             assert!(pending.lock().await.contains_key("APPROVAL"));
@@ -7961,15 +7827,21 @@ mod tests {
                     ),
                     "!origin:example.invalid",
                 )
-                .await,
+                .await
+                .unwrap(),
                 crate::util::PendingApprovalResolution::Resolved,
             );
-            assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+            assert_eq!(
+                rx.await.unwrap().unwrap().response,
+                ChannelApprovalResponse::AlwaysApprove
+            );
 
             let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
             pending.lock().await.insert(
                 "APPROVE2".to_string(),
                 crate::util::PendingApproval {
+                    registration_id: uuid::Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::current(),
                     sender: approve_tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
@@ -7986,10 +7858,14 @@ mod tests {
                     ),
                     "!origin:example.invalid",
                 )
-                .await,
+                .await
+                .unwrap(),
                 crate::util::PendingApprovalResolution::Resolved,
             );
-            assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+            assert_eq!(
+                approve_rx.await.unwrap().unwrap().response,
+                ChannelApprovalResponse::Approve
+            );
         }
 
         #[test]
@@ -8749,19 +8625,6 @@ mod tests {
                 now,
                 Duration::from_millis(500)
             ));
-        }
-
-        #[test]
-        fn partial_visible_text_strips_attachment_markers() {
-            assert_eq!(
-                partial_visible_text("Report ready [DOCUMENT:report.pdf]").as_deref(),
-                Some("Report ready")
-            );
-        }
-
-        #[test]
-        fn partial_visible_text_skips_marker_only_updates() {
-            assert_eq!(partial_visible_text("[DOCUMENT:report.pdf]"), None);
         }
 
         #[test]
@@ -9774,14 +9637,6 @@ mod tests {
         }
 
         #[test]
-        fn marker_only_partial_finalize_redacts_placeholder_after_upload() {
-            assert_eq!(
-                decide_partial_finalize_action(true, true),
-                PartialFinalizeAction::RedactDraft
-            );
-        }
-
-        #[test]
         fn text_partial_finalize_keeps_editing_draft_after_upload() {
             assert_eq!(
                 decide_partial_finalize_action(false, true),
@@ -10022,6 +9877,30 @@ mod tests {
             assert_ne!(first, second);
             assert!(first.starts_with("multi_message_synthetic:"));
             assert!(second.starts_with("multi_message_synthetic:"));
+        }
+
+        #[test]
+        fn partial_visible_text_preserves_literal_attachment_syntax() {
+            assert_eq!(
+                partial_visible_text("Report ready [DOCUMENT:report.pdf]").as_deref(),
+                Some("Report ready [DOCUMENT:report.pdf]")
+            );
+        }
+
+        #[test]
+        fn partial_visible_text_keeps_literal_bracketed_text() {
+            assert_eq!(
+                partial_visible_text("[DOCUMENT:report.pdf]").as_deref(),
+                Some("[DOCUMENT:report.pdf]")
+            );
+        }
+
+        #[test]
+        fn attachment_only_partial_finalize_redacts_placeholder_after_upload() {
+            assert_eq!(
+                decide_partial_finalize_action(true, true),
+                PartialFinalizeAction::RedactDraft
+            );
         }
     }
 
@@ -10603,68 +10482,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn access_token_whoami_uses_discovered_delegated_homeserver() {
-            let root = MockServer::start().await;
-            let delegated = MockServer::start().await;
-
-            Mock::given(method("GET"))
-                .and(path("/.well-known/matrix/client"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "m.homeserver": { "base_url": delegated.uri() }
-                })))
-                .expect(1)
-                .mount(&root)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/_matrix/client/versions"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "versions": ["v1.1"],
-                    "unstable_features": {}
-                })))
-                .mount(&delegated)
-                .await;
-            Mock::given(method("GET"))
-                .and(path(WHOAMI_PATH))
-                .and(header("authorization", "Bearer secret-token"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "user_id": "@bot:example.org",
-                    "device_id": "DEVICE42"
-                })))
-                .expect(1)
-                .mount(&delegated)
-                .await;
-
-            let server_name =
-                matrix_sdk::ruma::ServerName::parse(root.address().to_string()).unwrap();
-            let client = matrix_sdk::Client::builder()
-                .insecure_server_name_no_tls(&server_name)
-                .build()
-                .await
-                .unwrap();
-            assert_eq!(
-                client.homeserver().as_str().trim_end_matches('/'),
-                delegated.uri()
-            );
-
-            let identity = resolve_access_token_identity(
-                &access_token_cfg(server_name.to_string()),
-                &client.homeserver(),
-            )
-            .await
-            .unwrap();
-
-            assert_eq!(identity.user_id, "@bot:example.org");
-            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
-            assert!(
-                root.received_requests()
-                    .await
-                    .unwrap()
-                    .iter()
-                    .all(|request| request.url.path() != WHOAMI_PATH)
-            );
-        }
-
-        #[tokio::test]
         async fn access_token_whoami_preserves_direct_homeserver_url_and_base_path() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -10821,6 +10638,68 @@ mod tests {
                 "{err}"
             );
         }
+
+        #[tokio::test]
+        async fn access_token_whoami_uses_discovered_delegated_homeserver() {
+            let root = MockServer::start().await;
+            let delegated = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/.well-known/matrix/client"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "m.homeserver": { "base_url": delegated.uri() }
+                })))
+                .expect(1)
+                .mount(&root)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/_matrix/client/versions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["v1.1"],
+                    "unstable_features": {}
+                })))
+                .mount(&delegated)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(WHOAMI_PATH))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org",
+                    "device_id": "DEVICE42"
+                })))
+                .expect(1)
+                .mount(&delegated)
+                .await;
+
+            let server_name =
+                matrix_sdk::ruma::ServerName::parse(root.address().to_string()).unwrap();
+            let client = matrix_sdk::Client::builder()
+                .insecure_server_name_no_tls(&server_name)
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(
+                client.homeserver().as_str().trim_end_matches('/'),
+                delegated.uri()
+            );
+
+            let identity = resolve_access_token_identity(
+                &access_token_cfg(server_name.to_string()),
+                &client.homeserver(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(identity.user_id, "@bot:example.org");
+            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
+            assert!(
+                root.received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.url.path() != WHOAMI_PATH)
+            );
+        }
     }
 
     mod voice {
@@ -10907,6 +10786,27 @@ mod tests {
         }
 
         #[test]
+        fn mentions_user_ids_extracted() {
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hi",
+                    "m.mentions": { "user_ids": ["@a:b", "@c:d"] }
+                }
+            }));
+            let ids = extract_mentions_user_ids(&r).expect("some");
+            assert_eq!(ids, vec!["@a:b", "@c:d"]);
+        }
+
+        #[test]
+        fn no_mentions_field_returns_none() {
+            let r = raw(serde_json::json!({
+                "content": { "msgtype": "m.text", "body": "hi" }
+            }));
+            assert!(extract_mentions_user_ids(&r).is_none());
+        }
+
+        #[test]
         fn root_inbound_starts_new_thread_when_reply_in_thread_enabled() {
             let event_id = "$root:server".parse().expect("event id");
             assert_eq!(
@@ -10979,27 +10879,6 @@ mod tests {
                 interruption_scope_from_anchor(outbound.as_deref(), &event_id),
                 None
             );
-        }
-
-        #[test]
-        fn mentions_user_ids_extracted() {
-            let r = raw(serde_json::json!({
-                "content": {
-                    "msgtype": "m.text",
-                    "body": "hi",
-                    "m.mentions": { "user_ids": ["@a:b", "@c:d"] }
-                }
-            }));
-            let ids = extract_mentions_user_ids(&r).expect("some");
-            assert_eq!(ids, vec!["@a:b", "@c:d"]);
-        }
-
-        #[test]
-        fn no_mentions_field_returns_none() {
-            let r = raw(serde_json::json!({
-                "content": { "msgtype": "m.text", "body": "hi" }
-            }));
-            assert!(extract_mentions_user_ids(&r).is_none());
         }
     }
 
@@ -11303,158 +11182,17 @@ mod tests {
     }
 
     mod outbound_sandbox {
-        //! Trust-boundary tests for `outbound::validate_marker_target`. The
-        //! marker target string comes from agent text and is therefore
+        //! Trust-boundary tests for `outbound::validate_attachment_target`. The
+        //! attachment target string comes from agent text and is therefore
         //! untrusted; the sandbox must keep local reads inside `workspace_dir`
         //! and refuse non-http(s) schemes outright.
 
-        use super::super::outbound::{MarkerTarget, validate_marker_target};
+        use super::super::outbound::{AttachmentTarget, validate_attachment_target};
         use tempfile::TempDir;
-
-        #[test]
-        fn accepts_workspace_path() {
-            let workspace = TempDir::new().unwrap();
-            let inside = workspace.path().join("photo.jpg");
-            std::fs::write(&inside, b"x").unwrap();
-            let result = validate_marker_target(inside.to_str().unwrap(), Some(workspace.path()));
-            match result.expect("validate") {
-                MarkerTarget::Local(p) => {
-                    assert!(p.starts_with(std::fs::canonicalize(workspace.path()).unwrap()));
-                }
-                _ => panic!("expected Local"),
-            }
-        }
-
-        #[test]
-        fn accepts_relative_workspace_path() {
-            let workspace = TempDir::new().unwrap();
-            let inside = workspace.path().join("photo.jpg");
-            std::fs::write(&inside, b"x").unwrap();
-            // Relative-to-workspace target — no `./` prefix; mimics the form
-            // an agent emits when it knows the workspace as cwd.
-            let result = validate_marker_target("photo.jpg", Some(workspace.path()));
-            match result.expect("validate") {
-                MarkerTarget::Local(_) => {}
-                _ => panic!("expected Local"),
-            }
-        }
-
-        #[test]
-        fn rejects_absolute_outside_workspace() {
-            let workspace = TempDir::new().unwrap();
-            let outside = tempfile::NamedTempFile::new().unwrap();
-            let result =
-                validate_marker_target(outside.path().to_str().unwrap(), Some(workspace.path()));
-            assert!(result.is_err(), "expected Err for outside target");
-            let msg = result.unwrap_err().to_string();
-            assert!(
-                msg.contains("outside workspace_dir"),
-                "expected 'outside workspace_dir' in error, got: {msg}"
-            );
-        }
-
-        #[test]
-        fn rejects_dotdot_traversal() {
-            let workspace = TempDir::new().unwrap();
-            let parent = workspace.path().parent().unwrap();
-            let outside_dir = parent.join("zeroclaw-test-outside");
-            let _ = std::fs::create_dir(&outside_dir);
-            let outside_file = outside_dir.join("secret");
-            std::fs::write(&outside_file, b"x").unwrap();
-            let traversal = format!(
-                "../{}/secret",
-                outside_dir.file_name().unwrap().to_str().unwrap()
-            );
-            let result = validate_marker_target(&traversal, Some(workspace.path()));
-            let _ = std::fs::remove_file(&outside_file);
-            let _ = std::fs::remove_dir(&outside_dir);
-            assert!(
-                result.is_err(),
-                "expected Err for `..` traversal escaping workspace"
-            );
-        }
-
-        #[test]
-        fn rejects_file_scheme() {
-            let workspace = TempDir::new().unwrap();
-            let result = validate_marker_target("file:///etc/hostname", Some(workspace.path()));
-            let msg = result.unwrap_err().to_string();
-            assert!(
-                msg.contains("disallowed scheme"),
-                "expected scheme rejection, got: {msg}"
-            );
-        }
-
-        #[test]
-        fn rejects_data_scheme() {
-            let workspace = TempDir::new().unwrap();
-            let result =
-                validate_marker_target("data:text/plain;base64,aGk=", Some(workspace.path()));
-            let msg = result.unwrap_err().to_string();
-            assert!(
-                msg.contains("disallowed scheme"),
-                "expected scheme rejection, got: {msg}"
-            );
-        }
-
-        #[test]
-        fn rejects_unknown_scheme() {
-            let workspace = TempDir::new().unwrap();
-            let result = validate_marker_target("ftp://example.com/x", Some(workspace.path()));
-            let msg = result.unwrap_err().to_string();
-            assert!(
-                msg.contains("disallowed scheme"),
-                "expected scheme rejection, got: {msg}"
-            );
-        }
-
-        #[test]
-        fn accepts_http_url() {
-            let workspace = TempDir::new().unwrap();
-            let result =
-                validate_marker_target("http://example.com/photo.jpg", Some(workspace.path()));
-            match result.expect("validate") {
-                MarkerTarget::Http(u) => assert_eq!(u.scheme(), "http"),
-                _ => panic!("expected Http"),
-            }
-        }
-
-        #[test]
-        fn accepts_https_url() {
-            let workspace = TempDir::new().unwrap();
-            let result =
-                validate_marker_target("https://example.com/photo.jpg", Some(workspace.path()));
-            match result.expect("validate") {
-                MarkerTarget::Http(u) => assert_eq!(u.scheme(), "https"),
-                _ => panic!("expected Http"),
-            }
-        }
-
-        #[test]
-        fn local_path_without_workspace_is_refused() {
-            // Operator forgot to wire `with_workspace_dir`. Local marker
-            // cannot be safely resolved — refuse rather than fall back to
-            // process cwd (which would be the daemon working dir, not the
-            // workspace).
-            let result = validate_marker_target("photo.jpg", None);
-            let msg = result.unwrap_err().to_string();
-            assert!(
-                msg.contains("without a workspace_dir"),
-                "expected workspace_dir-not-configured error, got: {msg}"
-            );
-        }
-
-        #[test]
-        fn http_url_works_without_workspace() {
-            // HTTP URLs don't depend on a workspace — they should succeed
-            // even when workspace_dir is None.
-            let result = validate_marker_target("https://example.com/x.jpg", None);
-            assert!(matches!(result, Ok(MarkerTarget::Http(_))));
-        }
 
         fn assert_ssr_refused(target: &str) {
             let workspace = TempDir::new().unwrap();
-            let result = validate_marker_target(target, Some(workspace.path()));
+            let result = validate_attachment_target(target, Some(workspace.path()));
             let msg = result
                 .expect_err(&format!("expected SSRF refusal for {target}"))
                 .to_string();
@@ -11551,16 +11289,160 @@ mod tests {
         }
 
         #[test]
+        fn accepts_workspace_path() {
+            let workspace = TempDir::new().unwrap();
+            let inside = workspace.path().join("photo.jpg");
+            std::fs::write(&inside, b"x").unwrap();
+            let result =
+                validate_attachment_target(inside.to_str().unwrap(), Some(workspace.path()));
+            match result.expect("validate") {
+                AttachmentTarget::Local(p) => {
+                    assert!(p.starts_with(std::fs::canonicalize(workspace.path()).unwrap()));
+                }
+                _ => panic!("expected Local"),
+            }
+        }
+
+        #[test]
+        fn accepts_relative_workspace_path() {
+            let workspace = TempDir::new().unwrap();
+            let inside = workspace.path().join("photo.jpg");
+            std::fs::write(&inside, b"x").unwrap();
+            // Relative-to-workspace target — no `./` prefix; mimics the form
+            // an agent emits when it knows the workspace as cwd.
+            let result = validate_attachment_target("photo.jpg", Some(workspace.path()));
+            match result.expect("validate") {
+                AttachmentTarget::Local(_) => {}
+                _ => panic!("expected Local"),
+            }
+        }
+
+        #[test]
+        fn rejects_absolute_outside_workspace() {
+            let workspace = TempDir::new().unwrap();
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            let result = validate_attachment_target(
+                outside.path().to_str().unwrap(),
+                Some(workspace.path()),
+            );
+            assert!(result.is_err(), "expected Err for outside target");
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("outside workspace_dir"),
+                "expected 'outside workspace_dir' in error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_dotdot_traversal() {
+            let workspace = TempDir::new().unwrap();
+            let parent = workspace.path().parent().unwrap();
+            let outside_dir = parent.join("zeroclaw-test-outside");
+            let _ = std::fs::create_dir(&outside_dir);
+            let outside_file = outside_dir.join("secret");
+            std::fs::write(&outside_file, b"x").unwrap();
+            let traversal = format!(
+                "../{}/secret",
+                outside_dir.file_name().unwrap().to_str().unwrap()
+            );
+            let result = validate_attachment_target(&traversal, Some(workspace.path()));
+            let _ = std::fs::remove_file(&outside_file);
+            let _ = std::fs::remove_dir(&outside_dir);
+            assert!(
+                result.is_err(),
+                "expected Err for `..` traversal escaping workspace"
+            );
+        }
+
+        #[test]
+        fn rejects_file_scheme() {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_attachment_target("file:///etc/hostname", Some(workspace.path()));
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("disallowed scheme"),
+                "expected scheme rejection, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_data_scheme() {
+            let workspace = TempDir::new().unwrap();
+            let result =
+                validate_attachment_target("data:text/plain;base64,aGk=", Some(workspace.path()));
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("disallowed scheme"),
+                "expected scheme rejection, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_scheme() {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_attachment_target("ftp://example.com/x", Some(workspace.path()));
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("disallowed scheme"),
+                "expected scheme rejection, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn accepts_http_url() {
+            let workspace = TempDir::new().unwrap();
+            let result =
+                validate_attachment_target("http://example.com/photo.jpg", Some(workspace.path()));
+            match result.expect("validate") {
+                AttachmentTarget::Http(u) => assert_eq!(u.scheme(), "http"),
+                _ => panic!("expected Http"),
+            }
+        }
+
+        #[test]
+        fn accepts_https_url() {
+            let workspace = TempDir::new().unwrap();
+            let result =
+                validate_attachment_target("https://example.com/photo.jpg", Some(workspace.path()));
+            match result.expect("validate") {
+                AttachmentTarget::Http(u) => assert_eq!(u.scheme(), "https"),
+                _ => panic!("expected Http"),
+            }
+        }
+
+        #[test]
+        fn local_path_without_workspace_is_refused() {
+            // Operator forgot to wire `with_workspace_dir`. Local attachment
+            // cannot be safely resolved — refuse rather than fall back to
+            // process cwd (which would be the daemon working dir, not the
+            // workspace).
+            let result = validate_attachment_target("photo.jpg", None);
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("without a workspace_dir"),
+                "expected workspace_dir-not-configured error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn http_url_works_without_workspace() {
+            // HTTP URLs don't depend on a workspace — they should succeed
+            // even when workspace_dir is None.
+            let result = validate_attachment_target("https://example.com/x.jpg", None);
+            assert!(matches!(result, Ok(AttachmentTarget::Http(_))));
+        }
+
+        #[test]
         fn accepts_public_host() {
             // Sanity: a normal public-looking host must still pass through.
             for h in ["example.com", "cdn.example.com", "1.1.1.1", "8.8.8.8"] {
                 let workspace = TempDir::new().unwrap();
-                let result = validate_marker_target(
+                let result = validate_attachment_target(
                     &format!("https://{h}/photo.jpg"),
                     Some(workspace.path()),
                 );
                 assert!(
-                    matches!(result, Ok(MarkerTarget::Http(_))),
+                    matches!(result, Ok(AttachmentTarget::Http(_))),
                     "public host {h} must be accepted, got: {result:?}"
                 );
             }
@@ -11575,6 +11457,18 @@ mod tests {
 
         fn private_redirect_body(location: &str) -> ResponseTemplate {
             ResponseTemplate::new(302).insert_header("Location", location)
+        }
+
+        #[tokio::test]
+        async fn follows_public_redirect_target() {
+            assert!(
+                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("example.com"),
+                "public hostnames must not be classified as private by the per-hop guard"
+            );
+            assert!(
+                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("cdn.example.com"),
+                "public subdomains must not be classified as private"
+            );
         }
 
         #[tokio::test]
@@ -11644,18 +11538,6 @@ mod tests {
             );
             server.verify().await;
         }
-
-        #[tokio::test]
-        async fn follows_public_redirect_target() {
-            assert!(
-                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("example.com"),
-                "public hostnames must not be classified as private by the per-hop guard"
-            );
-            assert!(
-                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("cdn.example.com"),
-                "public subdomains must not be classified as private"
-            );
-        }
     }
 
     mod transcription_gate {
@@ -11719,7 +11601,7 @@ mod tests {
 
     mod outbound_send_outcome {
         //! Decision logic for what `outbound::send` does after attachment
-        //! uploads complete. Marker-only messages used to error even though
+        //! uploads complete. Attachment-only messages used to error even though
         //! the attachment had landed; this captures the new contract.
 
         use super::super::outbound::{SendOutcome, decide_send_outcome};
@@ -11735,19 +11617,19 @@ mod tests {
         }
 
         #[test]
+        fn empty_text_without_attachment_is_error() {
+            // True empty-message case: nothing to deliver, surface the error.
+            assert_eq!(decide_send_outcome(true, false), SendOutcome::EmptyError);
+        }
+
+        #[test]
         fn empty_text_with_attachment_returns_attachment() {
-            // The bug fix: marker-only sends must surface the attachment's
+            // The bug fix: attachment-only sends must surface the attachment's
             // event_id, not an error.
             assert_eq!(
                 decide_send_outcome(true, true),
                 SendOutcome::ReturnAttachment
             );
-        }
-
-        #[test]
-        fn empty_text_without_attachment_is_error() {
-            // True empty-message case: nothing to deliver, surface the error.
-            assert_eq!(decide_send_outcome(true, false), SendOutcome::EmptyError);
         }
     }
 
@@ -11761,7 +11643,7 @@ mod tests {
                 file_name: file_name.to_string(),
                 data: vec![0; len],
                 mime_type: Some(mime_type.to_string()),
-                marker: None,
+                reference: None,
             }
         }
 
@@ -11787,7 +11669,7 @@ mod tests {
         }
 
         #[test]
-        fn media_markers_use_type_specific_matrix_info_with_size() {
+        fn media_attachments_use_type_specific_matrix_info_with_size() {
             let cases = [
                 (
                     AttachmentKind::Image,
@@ -12353,7 +12235,7 @@ mod tests {
                 file_name: "voice.ogg".to_string(),
                 data,
                 mime_type: Some("audio/ogg".to_string()),
-                marker: None,
+                reference: None,
             }
         }
 

@@ -52,6 +52,7 @@ fn mem_none(workspace: &Path) -> Arc<dyn Memory> {
 
 pub(super) fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(text.into()),
         tool_calls: vec![],
         usage: None,
@@ -70,6 +71,7 @@ pub(super) fn tool_call(id: &str, name: &str) -> ToolCall {
 
 pub(super) fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(String::new()),
         tool_calls: calls,
         usage: None,
@@ -3146,7 +3148,12 @@ async fn usage_event_coherent_tuple_vision_route() {
         let img_path = std::env::temp_dir()
             .join(format!("matrix_vision_{vision_window:?}.png").replace(['(', ')', ' '], "_"));
         std::fs::write(&img_path, b"fake-png-data").expect("write temp image");
-        let prompt = format!("Analyze this image: [IMAGE:{}]", img_path.display());
+        let prompt = ChatMessage::user("Analyze this image:").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: (img_path.display()).to_string(),
+            },
+        ]);
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
         let mut capture_agent = agent;
         let handle = zeroclaw_spawn::spawn!(async move {

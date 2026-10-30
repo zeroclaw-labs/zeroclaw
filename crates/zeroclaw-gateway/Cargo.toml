@@ -10,6 +10,8 @@ publish = true
 
 [dependencies]
 # Internal workspace crates
+zeroclaw-kernel.workspace = true
+zeroclaw-session-host.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
@@ -86,6 +88,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 libc = "0.2"
 
 [dev-dependencies]
+zeroclaw-infra = { workspace = true, features = ["test-util"] }
 # A plain HTTP/2 (h2c) client for the connection-drain tests.
 h2 = "0.4"
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }
