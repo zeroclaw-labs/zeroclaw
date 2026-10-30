@@ -8697,6 +8697,8 @@ mod tests {
                 !policy.is_resolved_path_allowed(&alias),
                 "{name:?} alias to {target:?} must not be writable"
             );
+            // Case variants can share one entry on case-insensitive Unix filesystems.
+            std::fs::remove_file(&alias).unwrap();
         }
 
         // A bare foreign spelling gains nothing from its name: it is resolved

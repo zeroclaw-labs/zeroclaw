@@ -27,6 +27,9 @@ pub struct SteeringPosture {
     /// Remove nested entry points that do not yet carry a principal's
     /// selectors (see `Agent::disable_principal_unaware_nested_tools`).
     pub disable_principal_unaware_nested_tools: bool,
+    /// Withhold session-data and headless tools that do not carry the
+    /// caller's ownership boundary, including aliases and delegate children.
+    pub withhold_principal_unaware_session_tools: bool,
 }
 
 /// Re-resolves a steering sender's authority. Called when the message is
