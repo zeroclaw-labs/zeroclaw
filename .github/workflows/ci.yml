@@ -2143,6 +2143,9 @@ jobs:
       - name: Run permission and catalog regressions
         working-directory: web
         run: npm run test:permissions
+      - name: Run config draft Save all regression
+        working-directory: web
+        run: npm run test:config-draft-save-all
       - name: Run turn-stream regressions
         working-directory: web
         run: npm run test:contexts
