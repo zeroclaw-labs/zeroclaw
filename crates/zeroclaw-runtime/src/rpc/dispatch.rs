@@ -4458,9 +4458,7 @@ impl RpcDispatcher {
                             )
                             .with_category(::zeroclaw_log::EventCategory::Session)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                serde_json::json!({ "code": error.code, "reason": error.message })
-                            ),
+                            .with_attrs(serde_json::json!({ "code": error.code })),
                             "Deferred RPC approval-channel installation refused"
                         );
                     }
@@ -22920,6 +22918,7 @@ mod tests {
             for (own, demoted) in [(false, true), (true, true), (false, false)] {
                 let tmp = tempfile::TempDir::new().unwrap();
                 let config = two_user_config_with_administrator_alice(&tmp);
+                std::fs::create_dir_all(config.agent_workspace_dir("test-agent")).unwrap();
                 let data_dir = config.data_dir.clone();
                 let (fixture, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
                 let ctx = Arc::clone(&fixture.ctx);
