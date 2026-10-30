@@ -3544,11 +3544,13 @@ mod tests {
         // Seed a real (but provider-mismatched) credential and model onto the
         // alias through a separate write, so the tool's own runtime snapshot
         // never observes it — mirroring the "saved config the process hasn't
-        // seen yet" scenario the probe must read from.
+        // seen yet" scenario the probe must read from. The seeding agent is
+        // not `default`, which is reserved and cannot be created, so the
+        // update below names its alias.
         let seed = tool
             .execute(json!({
                 "action": "upsert_agent",
-                "name": "default",
+                "name": "seeded",
                 "model_provider": "openai",
                 "model": "placeholder",
                 "api_key": "sk-ant-not-an-openai-key"
@@ -3556,13 +3558,13 @@ mod tests {
             .await
             .unwrap();
         assert!(seed.success, "{:?}", seed.error);
-        let before = read_saved_provider_entry(&cfg_path, "openai", "default")
+        let before = read_saved_provider_entry(&cfg_path, "openai", "seeded")
             .expect("precondition: the alias must exist before set_default updates it");
 
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "model_provider": "openai",
+                "model_provider": "openai.seeded",
                 "model": "gpt-test-model"
             }))
             .await
@@ -3572,7 +3574,7 @@ mod tests {
             !result.success,
             "a provider-construction failure must not pass model validation: {result:?}"
         );
-        let after = read_saved_provider_entry(&cfg_path, "openai", "default")
+        let after = read_saved_provider_entry(&cfg_path, "openai", "seeded")
             .expect("a pre-existing alias must survive rollback");
         assert_eq!(
             after.model, before.model,
