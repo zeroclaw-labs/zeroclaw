@@ -1201,7 +1201,16 @@ mod tests {
             &v(&["b.example.com", "a.example.com"]),
             &v(&["a.example.com", "b.example.com", "a.example.com"]),
         );
-        assert!(diff.is_empty(), "same set, different order/dupes: {diff:?}");
+        assert_eq!(
+            diff,
+            EgressDeclarationDiff {
+                declared: v(&["a.example.com", "b.example.com"]),
+                granted: v(&["a.example.com", "b.example.com"]),
+                declared_not_granted: Vec::new(),
+                granted_not_declared: Vec::new(),
+            },
+            "same set, different order/dupes"
+        );
         assert!(!should_report_diff(&diff));
     }
 
@@ -1549,7 +1558,7 @@ mod tests {
         };
         assert_eq!(legacy_row, "weather-tool");
         assert_eq!(missing, v(&["api2.example.com"]));
-        assert!(invalid.is_empty());
+        assert_eq!(invalid, Vec::<String>::new());
         assert_eq!(rejected, None, "a valid row is not refused");
         assert_eq!(
             repair_incomplete, None,
@@ -1837,7 +1846,11 @@ mod tests {
         else {
             panic!("expected a migrate plan: {plan:?}");
         };
-        assert!(missing.is_empty(), "the hosts cover the declaration");
+        assert_eq!(
+            missing,
+            Vec::<String>::new(),
+            "the hosts cover the declaration"
+        );
         assert!(
             rejected
                 .expect("the runtime refuses the row")
