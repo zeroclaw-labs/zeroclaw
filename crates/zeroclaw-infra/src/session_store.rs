@@ -683,6 +683,15 @@ mod tests {
         assert_eq!(messages[1].content, "hi there");
     }
 
+    /// One line per message with no transaction around them: a failure part
+    /// way can leave part of an exchange behind, so the store promises nothing.
+    #[test]
+    fn append_exchange_is_not_declared_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        assert!(!store.append_exchange_is_atomic());
+    }
+
     #[test]
     fn trim_breadcrumb_round_trips_and_survives_reopen() {
         let tmp = TempDir::new().unwrap();

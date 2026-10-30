@@ -28,6 +28,7 @@ pub use store::{
     reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
     sync_declarative_jobs, update_job, update_job_for_agent,
 };
+pub(crate) use store::{add_agent_job_bound, job_conversation_binding};
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     deserialize_maybe_stringified,

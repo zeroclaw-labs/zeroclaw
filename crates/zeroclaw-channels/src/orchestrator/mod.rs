@@ -4162,12 +4162,15 @@ fn channel_history_cap(ctx: &ChannelRuntimeContext) -> usize {
 /// serialized write, so no concurrent turn lands between its messages.
 ///
 /// Unlike [`append_sender_turn`], a failed durable write is an error: the
-/// caller records whether the exchange was persisted. The exchange lands
-/// whole or not at all: when the store rejects a message part-way, the
-/// messages it had already accepted are taken back, under the same lock,
-/// before anything reaches the cache. If even that fails, what the store
-/// kept is mirrored into the cache, so the two never disagree, and the error
-/// says how much of the exchange stayed behind.
+/// caller records whether the exchange was persisted. The store is asked to
+/// land the exchange whole or not at all (`append_exchange`: one transaction
+/// on SQLite, best effort elsewhere). A store that declares the write atomic
+/// (`append_exchange_is_atomic`) kept nothing when it reports a failure, so
+/// nothing is read and nothing is mirrored. Otherwise the durable transcript
+/// is read back on a failure, and its growth since the read taken just before
+/// the write says how much of the exchange landed; the cache mirrors exactly
+/// that. A transcript that cannot be read back is evicted from the cache, so
+/// the next turn rehydrates instead of building on a guess.
 fn append_bound_exchange(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
@@ -4180,25 +4183,53 @@ fn append_bound_exchange(
         anyhow::bail!("conversation history exists but could not be verified");
     }
 
-    let mut kept = messages.len();
-    let mut failure = None;
-    if let Some(ref store) = ctx.session_store {
-        kept = 0;
-        for message in messages {
-            if let Err(e) = store.append(sender_key, message) {
-                failure = Some(e);
-                break;
-            }
-            kept += 1;
-        }
-        if failure.is_some() {
-            // The persist lock is held, so the rows just written are still
-            // the last ones of this history.
-            while kept > 0 && matches!(store.remove_last(sender_key), Ok(true)) {
-                kept -= 1;
-            }
-        }
-    }
+    // The transcript's length before the write is the only sound baseline
+    // for what a failed write leaves behind: the cache is capped shorter than
+    // the transcript, and a cron exchange can repeat an earlier one word for
+    // word, so neither the cache's length nor the transcript's tail can say
+    // what this write added. The persist lock is held from here to the end,
+    // so no other writer moves the baseline. An atomic store needs none.
+    let atomic = ctx
+        .session_store
+        .as_ref()
+        .is_some_and(|store| store.append_exchange_is_atomic());
+    let durable_before = match ctx.session_store {
+        Some(ref store) if !atomic => store
+            .try_load(sender_key)
+            .map_err(|error| {
+                anyhow::Error::new(error)
+                    .context("conversation history could not be read before the write")
+            })?
+            .len(),
+        _ => 0,
+    };
+
+    let (kept, failure) = match ctx.session_store {
+        None => (messages.len(), None),
+        Some(ref store) => match store.append_exchange(sender_key, messages) {
+            Ok(()) => (messages.len(), None),
+            Err(error) if atomic => (0, Some(anyhow::Error::new(error))),
+            Err(error) => match store.try_load(sender_key) {
+                Ok(durable) => (
+                    durable
+                        .len()
+                        .saturating_sub(durable_before)
+                        .min(messages.len()),
+                    Some(anyhow::Error::new(error)),
+                ),
+                Err(read_error) => {
+                    ctx.conversation_histories
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pop(sender_key);
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "failed to persist bound exchange, and the transcript could not be \
+                         read back to reconcile ({read_error}); cache evicted"
+                    )));
+                }
+            },
+        },
+    };
 
     if kept > 0 {
         let max_history = channel_history_cap(ctx);
@@ -4214,11 +4245,11 @@ fn append_bound_exchange(
     }
 
     match failure {
-        Some(e) if kept == 0 => {
-            Err(anyhow::Error::new(e).context("failed to persist bound exchange; nothing kept"))
+        Some(error) if kept == 0 => {
+            Err(error.context("failed to persist bound exchange; nothing kept"))
         }
-        Some(e) => Err(anyhow::Error::new(e).context(format!(
-            "failed to persist bound exchange; its first {kept} message(s) could not be taken back"
+        Some(error) => Err(error.context(format!(
+            "failed to persist bound exchange; the store kept its first {kept} message(s)"
         ))),
         None => Ok(()),
     }
@@ -20047,6 +20078,275 @@ fn bound_load_reports_an_unverifiable_history() {
     );
 }
 
+/// A store can fail after it has already changed the transcript. The cache
+/// then mirrors what the transcript holds, learned by reading it back, and
+/// the error says how much stayed. The transcript is longer than the cache
+/// throughout, and the exchange repeats one already recorded, so neither the
+/// cache's length nor the transcript's tail could be the measure.
+#[cfg(test)]
+#[test]
+fn bound_exchange_reconciles_a_failure_after_mutation() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    /// Writes the reply of an exchange, then reports a failure anyway (a
+    /// metadata update failing after the insert). A lone message is refused
+    /// before anything is written.
+    struct MutatesThenFails {
+        messages: StdMutex<Vec<ChatMessage>>,
+    }
+    impl SessionBackend for MutatesThenFails {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            if msg.role == "user" && msg.content.starts_with("[cron:job-2") {
+                return Err(std::io::Error::other("write refused"));
+            }
+            let mut messages = self.messages.lock().unwrap();
+            messages.push(msg.clone());
+            if msg.role == "assistant" {
+                return Err(std::io::Error::other(
+                    "metadata update failed after the insert",
+                ));
+            }
+            Ok(())
+        }
+        fn append_exchange(&self, key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+            // No transaction: the default's take-back is refused too, so
+            // both messages stay although the second reported an error.
+            for message in messages {
+                self.append(key, message)?;
+            }
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Err(std::io::Error::other("delete refused"))
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Ok(Some(false))
+        }
+    }
+
+    fn older_transcript() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("older"),
+            ChatMessage::assistant("older reply"),
+            ChatMessage::user("recent"),
+        ]
+    }
+
+    // The transcript already holds more than the cache does, as it does once
+    // the cache has been capped.
+    let backend = Arc::new(MutatesThenFails {
+        messages: StdMutex::new(older_transcript()),
+    });
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let sender = "bound_exchange_after_mutation_key";
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender.to_string(), vec![ChatMessage::user("recent")]);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender.to_string(), false);
+
+    let result = append_bound_exchange(
+        ctx.as_ref(),
+        sender,
+        &[
+            ChatMessage::user("[cron:job-1 reminder] Remind me"),
+            ChatMessage::assistant("Reminder sent."),
+        ],
+    );
+    let error = result.expect_err("the failure must be reported");
+    assert!(error.to_string().contains("kept its first 2"), "{error:#}");
+
+    let durable = backend.load(sender);
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(sender)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(durable.len(), 5);
+    assert_eq!(
+        cached.len(),
+        3,
+        "the cache gained exactly what the store kept"
+    );
+    assert_eq!(cached[1].content, "[cron:job-1 reminder] Remind me");
+    assert_eq!(cached[2].content, "Reminder sent.");
+
+    // A store that kept nothing of the exchange leaves the cache as it was,
+    // although the transcript is longer than the cache and already ends with
+    // this very exchange, recorded by an earlier firing of the same job.
+    let mut transcript = older_transcript();
+    transcript.push(ChatMessage::user("[cron:job-2 reminder] Remind me"));
+    transcript.push(ChatMessage::assistant("Reminder sent."));
+    let backend = Arc::new(MutatesThenFails {
+        messages: StdMutex::new(transcript),
+    });
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender.to_string(), vec![ChatMessage::user("recent")]);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender.to_string(), false);
+
+    let error = append_bound_exchange(
+        ctx.as_ref(),
+        sender,
+        &[
+            ChatMessage::user("[cron:job-2 reminder] Remind me"),
+            ChatMessage::assistant("Reminder sent."),
+        ],
+    )
+    .expect_err("the failure must be reported");
+    assert!(error.to_string().contains("nothing kept"), "{error:#}");
+    assert_eq!(backend.load(sender).len(), 5);
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(sender)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(cached.len(), 1, "nothing landed, so nothing is mirrored");
+}
+
+/// A store that declares its exchange write atomic is never read around it:
+/// success mirrors the whole exchange, and a failure means nothing landed, so
+/// nothing is mirrored and the error says so.
+#[cfg(test)]
+#[test]
+fn bound_exchange_on_an_atomic_store_skips_the_read_back() {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    /// Lands an exchange whole, or refuses it before writing anything, and
+    /// counts every read of the transcript.
+    struct AtomicStore {
+        messages: StdMutex<Vec<ChatMessage>>,
+        reads: AtomicUsize,
+        refuse: AtomicBool,
+    }
+    impl SessionBackend for AtomicStore {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.messages.lock().unwrap().clone()
+        }
+        fn try_load(&self, _key: &str) -> std::io::Result<Vec<ChatMessage>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.messages.lock().unwrap().clone())
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.messages.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        fn append_exchange(&self, _key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("transaction rolled back"));
+            }
+            self.messages.lock().unwrap().extend_from_slice(messages);
+            Ok(())
+        }
+        fn append_exchange_is_atomic(&self) -> bool {
+            true
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Ok(Some(false))
+        }
+    }
+
+    let backend = Arc::new(AtomicStore {
+        messages: StdMutex::new(vec![
+            ChatMessage::user("older"),
+            ChatMessage::assistant("older reply"),
+            ChatMessage::user("recent"),
+        ]),
+        reads: AtomicUsize::new(0),
+        refuse: AtomicBool::new(false),
+    });
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let sender = "bound_exchange_atomic_store_key";
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender.to_string(), vec![ChatMessage::user("recent")]);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .put(sender.to_string(), false);
+    let durable_len = || backend.messages.lock().unwrap().len();
+    let cached = || {
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender)
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    append_bound_exchange(
+        ctx.as_ref(),
+        sender,
+        &[
+            ChatMessage::user("[cron:job-1 reminder] Remind me"),
+            ChatMessage::assistant("Reminder sent."),
+        ],
+    )
+    .expect("the exchange lands");
+    assert_eq!(backend.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(durable_len(), 5);
+    let mirrored = cached();
+    assert_eq!(mirrored.len(), 3, "the cache mirrors the whole exchange");
+    assert_eq!(mirrored[1].content, "[cron:job-1 reminder] Remind me");
+    assert_eq!(mirrored[2].content, "Reminder sent.");
+
+    backend.refuse.store(true, Ordering::SeqCst);
+    let error = append_bound_exchange(
+        ctx.as_ref(),
+        sender,
+        &[
+            ChatMessage::user("[cron:job-2 reminder] Remind me"),
+            ChatMessage::assistant("Reminder sent."),
+        ],
+    )
+    .expect_err("the failure must be reported");
+    assert!(error.to_string().contains("nothing kept"), "{error:#}");
+    assert_eq!(backend.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(durable_len(), 5);
+    let contents = |messages: &[ChatMessage]| {
+        messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        contents(&cached()),
+        contents(&mirrored),
+        "nothing landed, so nothing is mirrored"
+    );
+}
+
 /// An exchange lands whole or not at all. When the store rejects its second
 /// message, the first is taken back; when even that is impossible, the cache
 /// keeps exactly what the store kept. Either way the failure is reported.
@@ -30237,6 +30537,397 @@ BTC is currently around $65,000 based on latest tool output."#
                 }
             )]
         );
+    }
+
+    /// Plays the model in a channel conversation about a reminder: asks for
+    /// `cron_add` when the user wants one, for `cron_run` when the user wants
+    /// it run now, confirms once a tool has run, and otherwise answers
+    /// plainly. Records every request.
+    #[derive(Default)]
+    struct ReminderConversationProvider {
+        /// The scheduled job, once the test knows it, for `cron_run`.
+        job_id: std::sync::Mutex<Option<String>>,
+        requests: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ReminderConversationProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            let tool_call = |name: &str, arguments: serde_json::Value| {
+                format!(
+                    "<tool_call>\n{}\n</tool_call>",
+                    serde_json::json!({ "name": name, "arguments": arguments })
+                )
+            };
+            let mut user_messages = messages
+                .iter()
+                .rev()
+                .filter(|msg| msg.role == "user")
+                .map(|msg| msg.content.as_str());
+            let last_user = user_messages.next().unwrap_or_default();
+            let schedule = || {
+                tool_call(
+                    "cron_add",
+                    serde_json::json!({
+                        "schedule": { "kind": "every", "every_ms": 2000 },
+                        "job_type": "agent",
+                        "name": "reminder",
+                        "prompt": "Remind me to call Sam",
+                        "session_target": "main",
+                        "uses_memory": false,
+                    }),
+                )
+            };
+            if last_user.contains("[Tool results]") {
+                // The request that led to the tool call is the user message
+                // before the results.
+                let asked = user_messages.next().unwrap_or_default();
+                // The cron store refuses a write that lands while another
+                // connection, here the scheduler's, holds its open-time
+                // recovery lock, and says so with "can be retried". A model
+                // retries that; so does this script.
+                if asked.contains("remind me at five") && last_user.contains("can be retried") {
+                    return Ok(schedule());
+                }
+                return Ok(if asked.contains("run it now") {
+                    "I ran it.".to_string()
+                } else {
+                    "Scheduled.".to_string()
+                });
+            }
+            if last_user.contains("remind me at five") {
+                return Ok(schedule());
+            }
+            if last_user.contains("run it now") {
+                let job_id = self.job_id.lock().unwrap().clone().unwrap_or_default();
+                return Ok(tool_call(
+                    "cron_run",
+                    serde_json::json!({ "job_id": job_id }),
+                ));
+            }
+            Ok("Yes, I reminded you.".to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ReminderConversationProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ReminderConversationProvider"
+        }
+    }
+
+    /// The reported sequence end to end: a reminder is scheduled from a
+    /// channel conversation, the job runs with that conversation as context,
+    /// and the next message in the same conversation sees what the job said.
+    #[test]
+    fn reminder_scheduled_from_a_channel_conversation_is_visible_to_its_next_turn() {
+        run_channel_dispatch_test(|| async {
+            use axum::{Json, Router, routing::post};
+            use zeroclaw_config::schema::{
+                Config, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+                RuntimeProfileConfig,
+            };
+            use zeroclaw_infra::session_backend::SessionBackend;
+            use zeroclaw_infra::session_store::SessionStore;
+            use zeroclaw_runtime::cron;
+
+            const AGENT: &str = "reminder-sequence-agent";
+
+            // The model the scheduled job runs against.
+            let cron_requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let cron_requests_for_handler = Arc::clone(&cron_requests);
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    cron_requests_for_handler.lock().unwrap().push(body);
+                    async {
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "Reminder: call Sam."}}]
+                        }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let mut config = Config {
+                data_dir: tmp.path().join("data"),
+                config_path: tmp.path().join("config.toml"),
+                ..Config::default()
+            };
+            config.memory.backend = "none".to_string();
+            config.memory.auto_save = false;
+            config.reliability.scheduler_retries = 0;
+            config.reliability.scheduler_poll_secs = 5;
+            config.risk_profiles.insert(
+                AGENT.to_string(),
+                RiskProfileConfig {
+                    level: AutonomyLevel::Full,
+                    ..Default::default()
+                },
+            );
+            config
+                .runtime_profiles
+                .insert(AGENT.to_string(), RuntimeProfileConfig::default());
+            config.providers.models.ollama.insert(
+                "reminder".to_string(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("reminder-test-model".to_string()),
+                        timeout_secs: Some(5),
+                        uri: Some(format!("http://{address}")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                AGENT.to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    model_provider: "ollama.reminder".into(),
+                    risk_profile: AGENT.into(),
+                    runtime_profile: AGENT.into(),
+                    ..Default::default()
+                },
+            );
+            tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+            let config = Arc::new(config);
+            let security = Arc::new(SecurityPolicy::for_agent(&config, AGENT).unwrap());
+
+            // The channel conversation, served by the same agent.
+            let backend: Arc<dyn SessionBackend> =
+                Arc::new(SessionStore::new(&tmp.path().join("sessions")).expect("session store"));
+            let provider = Arc::new(ReminderConversationProvider::default());
+            let channel_impl = Arc::new(RecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let mut runtime_ctx = test_channel_ctx_with_backend_channel_and_provider(
+                backend.clone(),
+                channel,
+                provider.clone(),
+                0,
+            );
+            let tool_runtime: Arc<dyn zeroclaw_api::runtime_traits::RuntimeAdapter> = Arc::from(
+                zeroclaw_runtime::platform::create_runtime(&config.runtime)
+                    .expect("default runtime"),
+            );
+            {
+                let ctx = Arc::get_mut(&mut runtime_ctx).expect("context not yet shared");
+                ctx.agent_alias = Arc::new(AGENT.to_string());
+                ctx.tools_registry = Arc::new(
+                    zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                        Box::new(zeroclaw_runtime::tools::CronAddTool::new_with_runtime(
+                            Arc::clone(&config),
+                            Arc::clone(&security),
+                            AGENT,
+                            Arc::clone(&tool_runtime),
+                        )),
+                        Box::new(zeroclaw_runtime::tools::CronRunTool::new_with_runtime(
+                            Arc::clone(&config),
+                            security,
+                            AGENT,
+                            tool_runtime,
+                        )),
+                    ]),
+                );
+                ctx.approval_manager =
+                    Arc::new(ApprovalManager::for_non_interactive(&RiskProfileConfig {
+                        level: AutonomyLevel::Full,
+                        ..Default::default()
+                    }));
+            }
+            let _lease = zeroclaw_infra::conversation_owners::publish_conversation_owner(
+                zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                AGENT,
+                Arc::new(test_conversation_owner(&runtime_ctx)),
+            );
+
+            // The scheduler is already running, as in a daemon. It gets its own
+            // thread and runtime: its future is too deeply nested for this
+            // crate's recursion limit to prove `Send`, and the conversation
+            // owner it resolves is process-wide either way. The thread gets the
+            // same stack the channel dispatch tests use: the job's turn future
+            // exceeds a default thread stack.
+            let stop_scheduler = CancellationToken::new();
+            let scheduler = std::thread::Builder::new()
+                .name("zeroclaw-reminder-scheduler-test".into())
+                .stack_size(16 * 1024 * 1024)
+                .spawn({
+                    let config = (*config).clone();
+                    let stop = stop_scheduler.clone();
+                    move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("scheduler runtime")
+                            .block_on(cron::scheduler::run(config, None, stop))
+                    }
+                })
+                .expect("spawn scheduler thread");
+
+            // Turn 1: the user asks for a reminder and the agent schedules it.
+            // The conversation is this test's own: the shared fixture's ids
+            // are in flight in other tests of this module at the same time.
+            let own_message = |id: &str, content: &str| {
+                let mut message = message_sent_hook_test_message();
+                message.id = id.to_string();
+                message.sender = "reminder-user".to_string();
+                message.reply_target = "reminder-chat".to_string();
+                message.content = content.to_string();
+                message
+            };
+            let ask = own_message("reminder-1", "remind me at five to call Sam");
+            process_channel_message(runtime_ctx.clone(), ask, CancellationToken::new()).await;
+
+            let jobs = cron::list_jobs(&config).unwrap();
+            assert_eq!(
+                jobs.len(),
+                1,
+                "the turn must have scheduled the reminder; provider saw {:?}",
+                provider.requests.lock().unwrap()
+            );
+            let job_id = jobs[0].id.clone();
+            *provider.job_id.lock().unwrap() = Some(job_id.clone());
+            assert_eq!(jobs[0].session_target, cron::SessionTarget::Main);
+            let cron_prompt = format!("[cron:{job_id} reminder] Remind me to call Sam");
+
+            // The reminder comes due and the scheduler runs it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let run = loop {
+                if let Some(run) = cron::list_runs(&config, &job_id, 1)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    break run;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the scheduler never ran the reminder"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            stop_scheduler.cancel();
+            scheduler
+                .join()
+                .expect("scheduler thread")
+                .expect("scheduler stops cleanly");
+            assert_eq!(run.execution.as_deref(), Some("ok"), "{:?}", run.output);
+            assert_eq!(run.persistence.as_deref(), Some("persisted"));
+            let job_request = cron_requests.lock().unwrap()[0]["messages"].to_string();
+            assert!(
+                job_request.contains("remind me at five to call Sam")
+                    && job_request.contains("Scheduled."),
+                "the job must run with the conversation it was created from: {job_request}"
+            );
+
+            // Turn 2: the user asks about it in the same conversation.
+            let mut follow_up = own_message("reminder-2", "");
+            follow_up.content = "did you remind me?".to_string();
+            let history_key = conversation_history_key(&follow_up);
+            process_channel_message(runtime_ctx.clone(), follow_up, CancellationToken::new()).await;
+
+            {
+                let requests = provider.requests.lock().unwrap();
+                let seen = requests.last().expect("the follow-up reached the model");
+                let position = |role: &str, needle: &str| {
+                    seen.iter()
+                        .position(|msg| msg.role == role && msg.content.contains(needle))
+                        .unwrap_or_else(|| {
+                            panic!("{role} message containing {needle:?} in {seen:?}")
+                        })
+                };
+                let ran = position("user", &cron_prompt);
+                let reminded = position("assistant", "Reminder: call Sam.");
+                let asked_again = position("user", "did you remind me?");
+                assert_eq!(reminded, ran + 1, "the run is one contiguous exchange");
+                assert!(reminded < asked_again);
+            }
+
+            // Turn 3: the user asks for the reminder to be run now. `cron_run`
+            // executes inside the turn, from the job's own conversation, so the
+            // run reads and writes the history the turn itself is in the middle
+            // of using.
+            let mut run_now = own_message("reminder-3", "");
+            run_now.content = "run it now please".to_string();
+            process_channel_message(runtime_ctx.clone(), run_now, CancellationToken::new()).await;
+
+            assert!(
+                channel_impl
+                    .sent_messages
+                    .lock()
+                    .await
+                    .last()
+                    .is_some_and(|reply| reply.contains("I ran it.")),
+                "the turn that ran the job must still complete"
+            );
+            let runs = cron::list_runs(&config, &job_id, 10).unwrap();
+            assert_eq!(runs.len(), 2);
+            assert_eq!(runs[0].persistence.as_deref(), Some("persisted"));
+            let manual_request: Vec<(String, String)> =
+                cron_requests.lock().unwrap()[1]["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| {
+                        (
+                            m["role"].as_str().unwrap_or_default().to_string(),
+                            m["content"].as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect();
+            let (job_message, before) = manual_request.split_last().expect("a request");
+            assert!(
+                job_message.1.contains("run it now please") && job_message.1.contains(&cron_prompt),
+                "the job's message joins the turn in progress: {manual_request:?}"
+            );
+            assert_eq!(
+                before.last().map(|(role, _)| role.as_str()),
+                Some("assistant"),
+                "no two user messages in a row: {manual_request:?}"
+            );
+            assert!(
+                before
+                    .iter()
+                    .any(|(_, content)| content.contains("Yes, I reminded you.")),
+                "the run sees the conversation so far: {manual_request:?}"
+            );
+            // Both the manual run and the turn that started it are on record.
+            let durable = backend.load(&history_key);
+            let count = |needle: &str| {
+                durable
+                    .iter()
+                    .filter(|m| m.content.contains(needle))
+                    .count()
+            };
+            assert_eq!(count(&cron_prompt), 2, "{durable:?}");
+            assert_eq!(count("I ran it."), 1, "{durable:?}");
+            server.abort();
+        });
     }
 
     #[tokio::test]

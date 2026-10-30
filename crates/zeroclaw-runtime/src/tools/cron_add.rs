@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use zeroclaw_api::conversation_binding::ConversationBinding;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
@@ -260,7 +261,7 @@ impl Tool for CronAddTool {
                 "session_target": {
                     "type": "string",
                     "enum": ["isolated", "main"],
-                    "description": "Agent session context: 'isolated' starts a fresh session each run, 'main' reuses the primary session"
+                    "description": "Agent session context: 'isolated' starts a fresh session each run; 'main' runs with the conversation this job is created from as context and records each run there (channel conversations only; created anywhere else, a 'main' job runs without conversation context)"
                 },
                 "model": {
                     "type": "string",
@@ -532,7 +533,16 @@ impl Tool for CronAddTool {
                     Err(error) => return Ok(schedule_error_result(error)),
                 };
 
-                cron::add_agent_job(
+                // Only a `main` job is tied to a conversation, and only to
+                // the one this call is being served in. That comes from state
+                // the serving surface scoped around the turn; no argument to
+                // this tool can select it.
+                let conversation_binding = match session_target {
+                    SessionTarget::Main => ConversationBinding::of_current_turn(&self.agent_alias),
+                    SessionTarget::Isolated => None,
+                };
+
+                cron::add_agent_job_bound(
                     &self.config,
                     &self.agent_alias,
                     name,
@@ -544,6 +554,7 @@ impl Tool for CronAddTool {
                     delete_after_run,
                     allowed_tools,
                     uses_memory,
+                    conversation_binding.as_ref(),
                 )
             }
         };
@@ -1194,6 +1205,130 @@ mod tests {
         assert_eq!(
             jobs[0].allowed_tools, None,
             "empty allowed_tools should be stored as None"
+        );
+    }
+
+    fn channel_conversation(
+        agent: &str,
+        key: &str,
+    ) -> Option<zeroclaw_api::conversation_binding::ActiveConversation> {
+        Some(zeroclaw_api::conversation_binding::ActiveConversation {
+            surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+            route: "telegram".to_string(),
+            key: key.to_string(),
+            agent_alias: agent.to_string(),
+        })
+    }
+
+    /// Run `cron_add` for an agent job as a surface serving `conversation`
+    /// would, and return the tool result with the binding stored for the job.
+    async fn add_agent_job_in(
+        cfg: &Arc<Config>,
+        conversation: Option<zeroclaw_api::conversation_binding::ActiveConversation>,
+        mut args: serde_json::Value,
+    ) -> (ToolResult, Option<ConversationBinding>) {
+        args["schedule"] = json!({ "kind": "cron", "expr": "*/5 * * * *" });
+        args["job_type"] = json!("agent");
+        args["prompt"] = json!("remind me to call Sam");
+        let tool = CronAddTool::new(cfg.clone(), test_security(cfg), TEST_AGENT);
+        let result = zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION
+            .scope(conversation, tool.execute(args))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let jobs = cron::list_jobs(cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        let binding = cron::job_conversation_binding(cfg, &jobs[0].id).unwrap();
+        (result, binding)
+    }
+
+    #[tokio::test]
+    async fn main_job_records_the_conversation_it_is_created_from() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+
+        let (result, binding) = add_agent_job_in(
+            &cfg,
+            channel_conversation(TEST_AGENT, "telegram_42_42"),
+            json!({ "session_target": "main" }),
+        )
+        .await;
+
+        assert_eq!(
+            binding,
+            Some(ConversationBinding {
+                surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                route: "telegram".to_string(),
+                key: "telegram_42_42".to_string(),
+            })
+        );
+        // The binding is runtime-internal: neither the tool's answer nor the
+        // job as listed carries the conversation key.
+        assert!(!result.output.contains("telegram_42_42"));
+        let listed = serde_json::to_string(&cron::list_jobs(&cfg).unwrap()).unwrap();
+        assert!(!listed.contains("telegram_42_42"));
+    }
+
+    #[tokio::test]
+    async fn isolated_job_records_no_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+
+        let (_, binding) = add_agent_job_in(
+            &cfg,
+            channel_conversation(TEST_AGENT, "telegram_42_42"),
+            json!({ "session_target": "isolated" }),
+        )
+        .await;
+
+        assert_eq!(binding, None);
+    }
+
+    #[tokio::test]
+    async fn main_job_created_outside_a_conversation_is_unbound() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+
+        let (_, binding) = add_agent_job_in(&cfg, None, json!({ "session_target": "main" })).await;
+
+        assert_eq!(binding, None);
+    }
+
+    #[tokio::test]
+    async fn main_job_does_not_bind_another_agents_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+
+        let (_, binding) = add_agent_job_in(
+            &cfg,
+            channel_conversation("another-agent", "telegram_42_42"),
+            json!({ "session_target": "main" }),
+        )
+        .await;
+
+        assert_eq!(binding, None);
+    }
+
+    #[tokio::test]
+    async fn tool_arguments_cannot_choose_the_bound_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+
+        let (_, binding) = add_agent_job_in(
+            &cfg,
+            channel_conversation(TEST_AGENT, "telegram_42_42"),
+            json!({
+                "session_target": "main",
+                "conversation_binding": { "surface": "channel", "key": "telegram_99_99" },
+                "conversation": "telegram_99_99",
+                "session_key": "telegram_99_99"
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            binding.map(|binding| binding.key).as_deref(),
+            Some("telegram_42_42")
         );
     }
 
