@@ -1657,6 +1657,26 @@ struct UsageFold {
 
 impl UsageFold {
     fn apply(&mut self, event: zeroclaw_api::agent::TurnEvent) {
+        // A trim is emitted after the usage sample that triggered it, and the
+        // web meter otherwise keeps that sample until the terminal `done`
+        // frame. The displayed fill (`last_input_tokens` and the trim budget)
+        // must follow the post-trim snapshot; billing totals stay
+        // provider-measured and are not rewritten here. Message-limit trims
+        // carry no token accounting and leave the displayed fill alone.
+        if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+            token_budget,
+            tokens_after,
+            ..
+        } = event
+        {
+            if let Some(after) = tokens_after {
+                self.last_input_tokens = Some(after);
+                if let Some(budget) = token_budget {
+                    self.last_context_token_budget = Some(budget);
+                }
+            }
+            return;
+        }
         let zeroclaw_api::agent::TurnEvent::Usage {
             input_tokens,
             cached_input_tokens,
@@ -2689,6 +2709,73 @@ mod tests {
             done_frame_context_limits(None, Some(7_200), Some(8_000), Some(fallback)),
             (7_200, Some(8_000)),
         );
+    }
+
+    #[test]
+    fn history_trim_replaces_the_displayed_context_fill() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            Some(180_000),
+            None,
+            Some(64),
+            None,
+            true,
+        ));
+        fold.apply(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+            dropped_messages: 4,
+            dropped_turns: 1,
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+            token_budget: Some(128_000),
+            tokens_before: Some(180_000),
+            tokens_after: Some(90_000),
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            unsatisfiable_floor: None,
+            retained_context: None,
+        });
+
+        assert_eq!(
+            fold.last_input_tokens,
+            Some(90_000),
+            "the done frame must not restore the pre-trim usage sample"
+        );
+        assert_eq!(fold.last_context_token_budget, Some(128_000));
+        // Billing totals describe provider-measured attempts, not the trim.
+        assert_eq!(fold.total_input_tokens, Some(180_000));
+        assert_eq!(fold.total_output_tokens, Some(64));
+    }
+
+    #[test]
+    fn message_limit_trim_leaves_the_displayed_context_fill_alone() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            Some(12_000),
+            None,
+            Some(32),
+            None,
+            true,
+        ));
+        fold.apply(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+            dropped_messages: 2,
+            dropped_turns: 1,
+            kept_turns: 1,
+            reason: "history message limit exceeded".into(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+            retained_context: None,
+        });
+
+        assert_eq!(fold.last_input_tokens, Some(12_000));
+        assert_eq!(fold.last_context_token_budget, None);
     }
 
     #[test]

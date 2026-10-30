@@ -11725,6 +11725,21 @@ impl ChatState {
                 self.entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
+                // The last accepted `context_usage` describes the request that
+                // triggered this trim, and a terminal trim is emitted after
+                // that event with no later usage sample. Adopt the trim's
+                // post-trim count (and the budget that governed it) so the
+                // status bar does not keep displaying the pre-trim snapshot.
+                // Message-limit trims carry no token accounting; leave the
+                // displayed budget alone rather than inventing one. Model
+                // capacity is not re-resolved here.
+                if let Some(after) = tokens_after {
+                    self.context_input_tokens = Some(after);
+                    self.context_input_tokens_source = tokens_after_source;
+                    if let Some(budget) = token_budget {
+                        self.context_max_tokens = Some(budget);
+                    }
+                }
             }
             SessionUpdate::BudgetWarning {
                 current_usd,
@@ -26235,6 +26250,83 @@ mod tests {
                 if text.contains("Earlier conversation history was trimmed")
                     && !text.contains("could not be trimmed")
         ));
+    }
+
+    #[test]
+    fn history_trimmed_refreshes_the_displayed_context_budget() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(180_000),
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(160_000),
+            model_context_window: Some(200_000),
+        });
+
+        // The terminal trim is emitted after the last accepted usage event, so
+        // the bar must adopt the trim's post-trim count and the budget that
+        // governed it. Leaving the pre-trim usage snapshot up is the bug.
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(128_000),
+            tokens_before: Some(180_000),
+            tokens_after: Some(90_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert_eq!(s.context_input_tokens, Some(90_000));
+        assert_eq!(
+            s.context_input_tokens_source.as_deref(),
+            Some("calibrated"),
+            "the bar must describe the post-trim count, not the pre-trim provider sample"
+        );
+        assert_eq!(
+            s.context_max_tokens,
+            Some(128_000),
+            "the displayed trim budget must follow the budget the trim enforced"
+        );
+        assert_eq!(
+            s.context_model_window,
+            Some(200_000),
+            "a trim does not re-resolve model capacity"
+        );
+    }
+
+    #[test]
+    fn history_trimmed_without_token_accounting_leaves_the_displayed_budget_alone() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(12_000),
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(32_000),
+            model_context_window: Some(200_000),
+        });
+
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        assert_eq!(s.context_input_tokens, Some(12_000));
+        assert_eq!(s.context_input_tokens_source.as_deref(), Some("provider"));
+        assert_eq!(s.context_max_tokens, Some(32_000));
+        assert_eq!(s.context_model_window, Some(200_000));
     }
 
     #[test]
