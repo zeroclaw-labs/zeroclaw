@@ -1318,6 +1318,7 @@ turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) 
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
 turn-execution-tree-budget-reached = *Turn stopped: exhausted the execution-tree iteration budget.*
 turn-context-window-exceeded-error = This request exceeds the selected model's context window. Reduce the request or enabled tools, or choose a model with a larger context window.
+turn-context-window-exceeded-unconfigured-error = This request exceeds the { $window }-token context window ZeroClaw assumed for provider "{ $provider }" because that provider has no context_window configured. Set providers.models.{ $provider }.context_window, or raise max_context_tokens in the agent's runtime profile, then retry.
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]

@@ -21008,7 +21008,10 @@ pub(crate) mod tests {
     fn local_capacity_cause_is_not_a_provider_overflow() {
         let error = anyhow::Error::new(zeroclaw_runtime::agent::ContextWindowExceeded {
             estimated_tokens: 65_537,
+            model_provider: "custom.capacity".to_string(),
             model_context_window: 65_536,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
             raw_estimated_tokens: 65_537,
             system_tokens: 0,
             tool_schema_tokens: 0,

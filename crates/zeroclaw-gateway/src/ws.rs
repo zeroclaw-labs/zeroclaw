@@ -1614,6 +1614,7 @@ fn done_frame_context_limits(
                 context_token_budget: 0,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+                has_authoritative_budget: false,
             }),
         ),
     }

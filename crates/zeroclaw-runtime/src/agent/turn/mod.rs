@@ -1015,6 +1015,12 @@ enum PreDispatchOutcome {
 }
 
 fn dispatch_trim_budget(limits: zeroclaw_config::schema::ResolvedContextLimits) -> usize {
+    if !limits.has_authoritative_budget {
+        // Capacity unknown and the operator set no budget: there is no target
+        // to trim to. Trimming to the 32k compatibility stub would discard
+        // history for a model that may be far larger.
+        return 0;
+    }
     if limits.context_token_budget == 0 {
         limits.model_context_window
     } else {
@@ -1062,7 +1068,9 @@ fn context_window_exceeded_error(
     );
     ContextWindowExceeded {
         estimated_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
+        model_provider: provider_name.to_string(),
         model_context_window: limits.model_context_window,
+        model_context_window_source: limits.model_context_window_source,
         raw_estimated_tokens,
         system_tokens,
         tool_schema_tokens,
@@ -2617,7 +2625,12 @@ async fn run_tool_call_loop_impl<'a>(
             );
         }
         let retained_tokens = dispatch_tokens(reported_population_estimated);
-        if retained_tokens > model_context_window as u64 {
+        // A refusal is a claim about the model's real capacity. The 32k
+        // compatibility fallback is not one: without a configured window or an
+        // operator budget, the provider decides, not this guard.
+        if active_context_limits.has_authoritative_budget
+            && retained_tokens > model_context_window as u64
+        {
             return Err(context_window_exceeded_error(
                 (active_model_provider_name, provider_request_model),
                 active_context_limits,
@@ -6312,6 +6325,19 @@ mod trim_budget_tests {
         ]
     }
 
+    /// An unconfigured capacity has no trim target: trimming to the 32k stub
+    /// would discard history for a model that may be far larger.
+    #[test]
+    fn unknown_capacity_has_no_trim_target() {
+        let unknown = zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0);
+        assert!(!unknown.has_authoritative_budget);
+        assert_eq!(dispatch_trim_budget(unknown), 0);
+
+        let budgeted = zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(200_000);
+        assert!(budgeted.has_authoritative_budget);
+        assert_eq!(dispatch_trim_budget(budgeted), 200_000);
+    }
+
     #[test]
     fn dispatch_trim_includes_breadcrumb_in_floor_recount() {
         // System (5) + newest turn (10) fit the 20-token budget, but adding
@@ -8550,6 +8576,7 @@ mod sop_step_reassembly_tests {
                 context_token_budget: 100_000,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                has_authoritative_budget: true,
             },
             None,
             &LoopKnobs::default(),
@@ -9839,6 +9866,9 @@ mod tool_lifecycle_abandonment_tests {
                 max_tool_result_chars: 0,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                     context_token_budget,
+                    // This harness supplies the budget the way a runtime
+                    // profile would, so the limit is operator intent.
+                    has_authoritative_budget: true,
                     ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
                 },
                 context_limits_resolver: None,

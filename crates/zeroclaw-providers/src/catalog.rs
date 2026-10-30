@@ -30,6 +30,10 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "lmstudio" => (Some("lmstudio"), None),
         "kilocli" => (Some("kilo"), None),
         "kilo" => (Some("kilo"), None),
+        // OpenCode's own gateway publishes models under the `opencode-go`
+        // catalog key, so a `providers.models.opencode.*` alias resolves its
+        // context window and pricing without any operator input.
+        "opencode" => (Some("opencode-go"), None),
         // Self-hosted gateway: prices come live from its own /v1/models
         // (PUBLIC_MODEL_LISTING), never from models.dev or OpenRouter.
         "zerorouter" => (None, None),

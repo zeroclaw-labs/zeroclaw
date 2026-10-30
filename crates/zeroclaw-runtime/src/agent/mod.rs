@@ -76,5 +76,61 @@ pub use agent::{Agent, AgentBuilder, TurnEvent};
 #[allow(unused_imports)]
 pub use loop_::{process_message, process_message_with_live_config, run};
 
+/// Resolve the context windows the shared model catalog knows for this config's
+/// routes, and publish them for the process.
+///
+/// The window is model metadata, so an operator never has to supply it. This
+/// runs once, at startup, from the composition root: the turn path only reads
+/// the published snapshot.
+///
+/// Best effort by design. A model the catalog does not know (or a failed fetch)
+/// leaves the route unknown, and unknown means "no local cap", so the cost of a
+/// miss is lost proactive trimming, never a wrong refusal.
+pub async fn publish_catalog_context_windows(config: &zeroclaw_config::schema::Config) {
+    let mut entries = Vec::new();
+    for (alias, agent) in &config.agents {
+        // An explicit window is an override; leave it alone.
+        if config.configured_model_context_window(alias).is_some() {
+            continue;
+        }
+        let provider_ref = agent.model_provider.as_str();
+        let Some((provider_type, _)) = provider_ref.split_once('.') else {
+            continue;
+        };
+        let Some(catalog_key) = zeroclaw_providers::catalog::catalog_source_for(provider_type)
+            .and_then(|(models_dev, _)| models_dev)
+        else {
+            continue;
+        };
+        let Some(model) = config
+            .model_provider_for_agent(alias)
+            .and_then(|provider| provider.model.clone())
+        else {
+            continue;
+        };
+        let Some(tokens) =
+            zeroclaw_providers::models_dev::context_window_for(catalog_key, &model).await
+        else {
+            continue;
+        };
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::System)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "agent": alias,
+                    "model_provider": provider_ref,
+                    "model": model,
+                    "context_window": tokens,
+                    "context_window_source": "discovered",
+                })),
+            "context window discovered from the model catalog"
+        );
+        entries.push((provider_ref.to_string(), model, tokens));
+    }
+    zeroclaw_config::schema::publish_discovered_context_windows(entries);
+}
+
 #[cfg(test)]
 mod tests;

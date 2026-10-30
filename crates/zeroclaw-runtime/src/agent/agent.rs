@@ -10690,6 +10690,7 @@ mod tests {
                 context_token_budget: 160_000,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                has_authoritative_budget: true,
             }
         }));
 
@@ -18145,6 +18146,7 @@ mod tests {
                 context_token_budget: 180_000,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                has_authoritative_budget: true,
             }
         }));
 
@@ -19801,18 +19803,21 @@ model_provider = "custom.only"
                     context_token_budget: 180_000,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                    has_authoritative_budget: true,
                 },
                 ("ollama.small", "small") => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 8_000,
                     context_token_budget: 7_200,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                    has_authoritative_budget: true,
                 },
                 _ => zeroclaw_config::schema::ResolvedContextLimits {
                     model_context_window: 32_000,
                     context_token_budget: 32_000,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+                    has_authoritative_budget: false,
                 },
             }
         }));
@@ -19832,6 +19837,7 @@ model_provider = "custom.only"
                 context_token_budget: 7_200,
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                has_authoritative_budget: true,
             },
             "provider/model and their limits must change as one session state transition"
         );

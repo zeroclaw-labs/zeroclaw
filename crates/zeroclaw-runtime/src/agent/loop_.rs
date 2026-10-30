@@ -4462,6 +4462,7 @@ mod tests {
             context_token_budget,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+            has_authoritative_budget: context_token_budget > 0,
         }
     }
 
@@ -18267,6 +18268,7 @@ Let me check the result."#;
             model_context_window: 32_000,
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            has_authoritative_budget: true,
             context_token_budget: 7_200,
         };
         let recovery_budget = interactive_context_recovery_budget(context_limits);
@@ -18905,6 +18907,7 @@ Let me check the result."#;
                             context_token_budget: 100,
                             model_context_window_source:
                                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                            has_authoritative_budget: true,
                         },
                         context_limits_resolver: None,
                         receipt_generator: None,

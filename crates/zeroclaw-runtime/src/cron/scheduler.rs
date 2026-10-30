@@ -2543,7 +2543,10 @@ mod tests {
     fn agent_job_error_message_preserves_terminal_causes_and_safe_messages() {
         let context = anyhow::Error::new(crate::agent::ContextWindowExceeded {
             estimated_tokens: 65_537,
+            model_provider: "ollama.capacity".to_string(),
             model_context_window: 65_536,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
             raw_estimated_tokens: 65_537,
             system_tokens: 0,
             tool_schema_tokens: 0,
