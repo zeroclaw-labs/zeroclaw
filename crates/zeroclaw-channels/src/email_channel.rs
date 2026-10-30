@@ -502,8 +502,9 @@ impl EmailChannel {
         Ok(results)
     }
 
-    /// Fetch messages with UID >= uid_threshold. Never modifies any flag.
-    /// Returns parsed messages and the new threshold (max fetched UID + 1).
+    /// Fetch messages with UID >= uid_threshold. Returns parsed messages and the
+    /// new threshold (max fetched UID + 1). Flags change only in active mode;
+    /// see [`Self::new_mail_fetch_item`].
     async fn fetch_new(
         &self,
         session: &mut ImapSession,
@@ -537,8 +538,12 @@ impl EmailChannel {
                 .collect::<Vec<_>>()
                 .join(",");
 
-            // BODY.PEEK[] — no implicit \Seen. We do not touch flags at all.
-            let messages = session.uid_fetch(&uid_set, "BODY.PEEK[]").await?;
+            let messages = session
+                .uid_fetch(
+                    &uid_set,
+                    Self::new_mail_fetch_item(self.config.observer_mode),
+                )
+                .await?;
             let messages: Vec<Fetch> = messages.try_collect().await?;
 
             for msg in messages {
@@ -555,6 +560,18 @@ impl EmailChannel {
         }
 
         Ok((results, new_threshold))
+    }
+
+    /// FETCH item for mail that arrives while the channel runs. Active mode
+    /// uses RFC822, which sets `\Seen` like the startup UNSEEN drain does, so a
+    /// restart does not answer the message again. Observer mode peeks and never
+    /// changes a flag.
+    fn new_mail_fetch_item(observer_mode: bool) -> &'static str {
+        if observer_mode {
+            "BODY.PEEK[]"
+        } else {
+            "RFC822"
+        }
     }
 
     /// Run the IDLE loop, returning when a new message arrives or timeout
@@ -1144,6 +1161,14 @@ mod tests {
         // read path; only when explicitly enabled does the channel switch to
         // the uid-threshold, BODY.PEEK, zero-flag-change behavior.
         assert!(!super::EmailConfig::default().observer_mode);
+    }
+
+    #[test]
+    fn new_mail_fetch_marks_seen_only_in_active_mode() {
+        // Active mode must set \Seen (RFC822), or the startup UNSEEN drain
+        // answers the message again after a restart.
+        assert_eq!(EmailChannel::new_mail_fetch_item(false), "RFC822");
+        assert_eq!(EmailChannel::new_mail_fetch_item(true), "BODY.PEEK[]");
     }
 
     fn default_imap_port() -> u16 {
