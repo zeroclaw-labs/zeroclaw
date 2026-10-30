@@ -466,7 +466,9 @@ fn keyed_digest_subkey(key: &[u8]) -> Result<[u8; 32]> {
 //
 // Key creation writes full content to a restrictive-at-creation temp file,
 // then publishes it without replacing an existing target:
-//   - Unix: hard_link(temp, final).
+//   - Android: renameat2(temp, final, RENAME_NOREPLACE). SELinux denies
+//     link(2) to apps, even inside their own data directory.
+//   - Other Unix: hard_link(temp, final).
 //   - Windows: FileRenameInfo on the same exclusive handle.
 // The final path either appears with complete content, or not at all.
 
@@ -637,9 +639,9 @@ fn read_key_file_no_follow(key_path: &Path) -> std::io::Result<String> {
 /// Load the key from `key_path`, creating it if absent.
 ///
 /// Reads go through a no-follow / reparse-point-verified handle.  Creation
-/// uses atomic no-replace publication (write-to-temp then `hard_link` on Unix
-/// / handle-based no-replace rename on Windows) so readers never observe empty or
-/// partial key material.
+/// uses atomic no-replace publication (write-to-temp then `hard_link` on Unix,
+/// `renameat2(RENAME_NOREPLACE)` on Android, handle-based no-replace rename on
+/// Windows) so readers never observe empty or partial key material.
 fn load_or_create_key(key_path: &Path) -> Result<Vec<u8>> {
     let validate_key = |bytes: Vec<u8>| {
         anyhow::ensure!(
@@ -743,25 +745,80 @@ where
 
         sync_parent_dir(&temp_path)?;
         let _ = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600));
-        match std::fs::hard_link(&temp_path, key_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(e)
-                    .context("Key file already exists — another process created it concurrently");
+
+        // The rename moves the temp name away, so nothing is left to remove.
+        #[cfg(target_os = "android")]
+        {
+            match rename_no_replace(&temp_path, key_path) {
+                Ok(()) => temp_guard.disarm(),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(e).context(
+                        "Key file already exists — another process created it concurrently",
+                    );
+                }
+                Err(e) => return Err(e).context("Failed to atomically publish key file"),
             }
-            Err(e) => return Err(e).context("Failed to atomically publish key file"),
-        }
-        // Persist the final link before removing the temp inode's other name.
-        sync_parent_dir(key_path)?;
-        if std::fs::remove_file(&temp_path).is_ok() {
-            temp_guard.disarm();
             sync_parent_dir(key_path)?;
+            Ok(())
         }
-        Ok(())
+
+        #[cfg(not(target_os = "android"))]
+        {
+            match std::fs::hard_link(&temp_path, key_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(e).context(
+                        "Key file already exists — another process created it concurrently",
+                    );
+                }
+                Err(e) => return Err(e).context("Failed to atomically publish key file"),
+            }
+            // Persist the final link before removing the temp inode's other name.
+            sync_parent_dir(key_path)?;
+            if std::fs::remove_file(&temp_path).is_ok() {
+                temp_guard.disarm();
+                sync_parent_dir(key_path)?;
+            }
+            Ok(())
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
     compile_error!("atomic key publication requires a platform no-replace mechanism");
+}
+
+/// Rename `src` to `dst`, failing with `AlreadyExists` instead of replacing an
+/// existing `dst`. Calls the syscall directly because bionic has no
+/// `renameat2` wrapper at every supported API level. A kernel without
+/// `RENAME_NOREPLACE` fails (ENOSYS/EINVAL) rather than falling back to a
+/// rename that could replace the key.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = |p: &Path| {
+        CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))
+    };
+    let (src, dst) = (c_path(src)?, c_path(dst)?);
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Sync the parent directory so the new name is crash-durable.
@@ -1902,6 +1959,28 @@ exit 65
         write_key_file(&key_path, &key).unwrap();
         // Already called during publication; exercise helper directly.
         sync_parent_dir(&key_path).unwrap();
+    }
+
+    // Android publishes the key with this rename; Linux runs the same syscall.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rename_no_replace_publishes_once_and_never_replaces() {
+        let tmp = TempDir::new().unwrap();
+        let (first, second, key_path) = (
+            tmp.path().join("first"),
+            tmp.path().join("second"),
+            tmp.path().join(".secret_key"),
+        );
+        fs::write(&first, "winner").unwrap();
+        fs::write(&second, "loser").unwrap();
+
+        rename_no_replace(&first, &key_path).unwrap();
+        let err = rename_no_replace(&second, &key_path).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&key_path).unwrap(), "winner");
+        assert!(!first.exists());
+        assert!(second.exists());
     }
 
     // ── Symlink rejection on read paths ──────────────────────
