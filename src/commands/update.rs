@@ -226,8 +226,14 @@ pub async fn run(target_version: Option<&str>, force: bool, standard: bool) -> R
         "Phase 1/6: Preflight checks..."
     );
     let update_info = check(target_version, standard).await?;
+    let switching = switches_to_standard(standard);
 
-    if !should_install(update_info.is_newer, force) {
+    if !should_install(
+        &update_info.current_version,
+        &update_info.latest_version,
+        force,
+        switching,
+    ) {
         println!(
             "{}",
             update_already_current_message(&update_info.current_version)
@@ -240,8 +246,10 @@ pub async fn run(target_version: Option<&str>, force: bool, standard: bool) -> R
             "{}",
             update_available_message(&update_info.current_version, &update_info.latest_version)
         );
-    } else {
+    } else if force {
         // --force on a version that is not newer: reinstall or downgrade/pin.
+        // Without it, only a same-version switch to the standard build gets
+        // here, and the switching line below says what happens.
         println!(
             "{}",
             update_forcing_reinstall_message(
@@ -254,7 +262,7 @@ pub async fn run(target_version: Option<&str>, force: bool, standard: bool) -> R
     let download_url = update_info
         .download_url
         .with_context(|| no_release_archive_message(standard))?;
-    if standard && !cfg!(feature = "gateway") {
+    if switching {
         println!("{}", update_switching_to_standard_message());
     }
 
@@ -481,9 +489,19 @@ fn version_is_newer(current: &str, candidate: &str) -> bool {
 /// Decide whether to proceed with the install. A newer version always installs;
 /// a non-newer one (same or older) installs only with `--force`, which enables
 /// reinstalling the current version or downgrading/pinning to a specific
-/// `--version`.
-fn should_install(is_newer: bool, force: bool) -> bool {
-    is_newer || force
+/// `--version`. A CLI-only build switching to the standard build also installs
+/// the same version, because the build changes; it still downgrades only with
+/// `--force`.
+fn should_install(current: &str, latest: &str, force: bool, switching: bool) -> bool {
+    let is_newer = version_is_newer(current, latest);
+    let is_older = version_is_newer(latest, current);
+    is_newer || force || (switching && !is_older)
+}
+
+/// Whether `--standard` switches this build: only a CLI-only build (no
+/// gateway) has another build to switch to.
+fn switches_to_standard(standard: bool) -> bool {
+    standard && !cfg!(feature = "gateway")
 }
 
 /// Download a release asset and unpack it into `staging`.
@@ -1449,11 +1467,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_install_requires_newer_or_force() {
-        assert!(should_install(true, false)); // newer → install
-        assert!(should_install(true, true)); // newer + force → install
-        assert!(!should_install(false, false)); // not newer → skip
-        assert!(should_install(false, true)); // not newer + force → reinstall/downgrade
+    fn should_install_requires_newer_force_or_a_same_version_switch() {
+        // (current, latest, force, switching to the standard build) → install
+        let table = [
+            ("0.9.0", "0.9.1", false, false, true), // newer
+            ("0.9.0", "0.9.1", true, false, true),
+            ("0.9.0", "0.9.1", false, true, true),
+            ("0.9.0", "0.9.1", true, true, true),
+            ("0.9.0", "0.9.0", false, false, false), // same: already up to date
+            ("0.9.0", "0.9.0", true, false, true),   // --force reinstalls
+            ("0.9.0", "0.9.0", false, true, true),   // the switch changes the build
+            ("0.9.0", "0.9.0", true, true, true),
+            ("0.9.0", "0.8.7", false, false, false), // older: only with --force
+            ("0.9.0", "0.8.7", true, false, true),
+            ("0.9.0", "0.8.7", false, true, false), // a switch never downgrades alone
+            ("0.9.0", "0.8.7", true, true, true),
+        ];
+        for (current, latest, force, switching, expected) in table {
+            assert_eq!(
+                should_install(current, latest, force, switching),
+                expected,
+                "{current} -> {latest}, force={force}, switching={switching}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_cli_only_build_switches_with_standard() {
+        assert!(!switches_to_standard(false));
+        assert_eq!(switches_to_standard(true), !cfg!(feature = "gateway"));
     }
 
     #[test]
