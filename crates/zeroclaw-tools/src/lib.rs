@@ -9,6 +9,8 @@ pub mod microsoft365;
 pub mod util_helpers;
 
 pub mod a2a_client;
+#[cfg(feature = "tool-agy-cli")]
+pub mod agy_cli;
 pub mod ask_user;
 pub mod backup_tool;
 #[cfg(feature = "tools-external")]
@@ -125,6 +127,7 @@ pub mod wrappers;
     feature = "tool-claude-code-runner",
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
+    feature = "tool-agy-cli",
     feature = "tool-opencode-cli"
 ))]
 mod coding_agent_budget_tests;

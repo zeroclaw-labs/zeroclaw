@@ -136,6 +136,7 @@ tool-claude-code = ["zeroclaw-tools/tool-claude-code"]
 tool-claude-code-runner = ["zeroclaw-tools/tool-claude-code-runner"]
 tool-codex-cli = ["zeroclaw-tools/tool-codex-cli"]
 tool-gemini-cli = ["zeroclaw-tools/tool-gemini-cli"]
+tool-agy-cli = ["zeroclaw-tools/tool-agy-cli"]
 tool-opencode-cli = ["zeroclaw-tools/tool-opencode-cli"]
 sandbox-bubblewrap = []
 # Exposes test-only helpers (including `ScopedToolRegistry::from_raw_for_test`

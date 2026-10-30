@@ -91,6 +91,7 @@ tool-claude-code = ["zeroclaw-config/tool-claude-code"]
 tool-claude-code-runner = ["zeroclaw-config/tool-claude-code-runner"]
 tool-codex-cli = ["zeroclaw-config/tool-codex-cli"]
 tool-gemini-cli = ["zeroclaw-config/tool-gemini-cli"]
+tool-agy-cli = ["zeroclaw-config/tool-agy-cli"]
 tool-opencode-cli = ["zeroclaw-config/tool-opencode-cli"]
 # Exposes cross-crate test-only constructors (e.g.
 # `McpRegistry::for_test_with_server_count`) so downstream test

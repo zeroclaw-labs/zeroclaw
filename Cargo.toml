@@ -351,6 +351,7 @@ tools-coding-cli = [
     "tool-claude-code-runner",
     "tool-codex-cli",
     "tool-gemini-cli",
+    "tool-agy-cli",
     "tool-opencode-cli",
 ]
 
@@ -366,6 +367,7 @@ tool-claude-code = ["zeroclaw-runtime/tool-claude-code"]
 tool-claude-code-runner = ["zeroclaw-runtime/tool-claude-code-runner", "zeroclaw-gateway?/tool-claude-code-runner"]
 tool-codex-cli = ["zeroclaw-runtime/tool-codex-cli"]
 tool-gemini-cli = ["zeroclaw-runtime/tool-gemini-cli"]
+tool-agy-cli = ["zeroclaw-runtime/tool-agy-cli"]
 tool-opencode-cli = ["zeroclaw-runtime/tool-opencode-cli"]
 
 # Major subsystems — each forwards to exactly ONE crate
