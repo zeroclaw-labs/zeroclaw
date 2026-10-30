@@ -8040,6 +8040,23 @@ fn default_false() -> bool {
     false
 }
 
+/// Built-in acknowledgement emoji added to an inbound message while the agent
+/// works (👀).
+fn default_ack_reaction_in_progress() -> String {
+    "\u{1F440}".to_string()
+}
+
+/// Built-in acknowledgement emoji left on a message once the turn completes
+/// (✅).
+fn default_ack_reaction_done() -> String {
+    "\u{2705}".to_string()
+}
+
+/// Built-in acknowledgement emoji left on a message when the turn fails (⚠️).
+fn default_ack_reaction_error() -> String {
+    "\u{26A0}\u{FE0F}".to_string()
+}
+
 fn default_memory_backend() -> String {
     "sqlite".into()
 }
@@ -16100,6 +16117,23 @@ pub struct ChannelsConfig {
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
     pub ack_reactions: bool,
+    /// Emoji added to an inbound channel message while the agent works. An
+    /// empty string disables the in-progress acknowledgement. Default: 👀.
+    ///
+    /// Channels that carry alias-scoped acknowledgement config (`slack`,
+    /// `matrix`, `lark`) can override this per alias.
+    #[serde(default = "default_ack_reaction_in_progress")]
+    pub ack_reaction_in_progress: String,
+    /// Emoji that replaces the in-progress acknowledgement once the turn
+    /// completes. An empty string withdraws the acknowledgement and adds
+    /// nothing. Default: ✅.
+    #[serde(default = "default_ack_reaction_done")]
+    pub ack_reaction_done: String,
+    /// Emoji that replaces the in-progress acknowledgement when the turn fails.
+    /// An empty string withdraws the acknowledgement and adds nothing.
+    /// Default: ⚠️.
+    #[serde(default = "default_ack_reaction_error")]
+    pub ack_reaction_error: String,
     /// Whether to send tool-call notification messages (e.g. `🔧 web_search_tool: …`)
     /// to channel users. When `false`, tool calls are still logged server-side but
     /// not forwarded as individual channel messages. Default: `false`.
@@ -16574,6 +16608,9 @@ impl Default for ChannelsConfig {
             message_timeout_secs: default_channel_message_timeout_secs(),
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
+            ack_reaction_in_progress: default_ack_reaction_in_progress(),
+            ack_reaction_done: default_ack_reaction_done(),
+            ack_reaction_error: default_ack_reaction_error(),
             show_tool_calls: false,
             model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
@@ -17271,6 +17308,27 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Override for the top-level `[channels].ack_reaction_in_progress`. When
+    /// `None`, the instance falls back to the channels-wide value; an empty
+    /// string disables the in-progress acknowledgement for this instance.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[empty_is_value]
+    pub ack_reaction_in_progress: Option<String>,
+    /// Override for the top-level `[channels].ack_reaction_done`. When `None`,
+    /// the instance falls back to the channels-wide value; an empty string
+    /// withdraws the acknowledgement and adds nothing.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[empty_is_value]
+    pub ack_reaction_done: Option<String>,
+    /// Override for the top-level `[channels].ack_reaction_error`. When `None`,
+    /// the instance falls back to the channels-wide value; an empty string
+    /// withdraws the acknowledgement and adds nothing.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[empty_is_value]
+    pub ack_reaction_error: Option<String>,
     /// Enable progressive draft message streaming via `chat.update`.
     #[tab(Behavior)]
     #[serde(default)]
@@ -17842,6 +17900,27 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub ack_reactions: Option<bool>,
+    /// Override for the top-level `[channels].ack_reaction_in_progress`. When
+    /// `None`, the instance falls back to the channels-wide value; an empty
+    /// string disables the in-progress acknowledgement for this instance.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[empty_is_value]
+    pub ack_reaction_in_progress: Option<String>,
+    /// Override for the top-level `[channels].ack_reaction_done`. When `None`,
+    /// the instance falls back to the channels-wide value; an empty string
+    /// withdraws the acknowledgement and adds nothing.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[empty_is_value]
+    pub ack_reaction_done: Option<String>,
+    /// Override for the top-level `[channels].ack_reaction_error`. When `None`,
+    /// the instance falls back to the channels-wide value; an empty string
+    /// withdraws the acknowledgement and adds nothing.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[empty_is_value]
+    pub ack_reaction_error: Option<String>,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -19345,6 +19424,27 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub ack_reactions: Option<bool>,
+    /// Override for the top-level `[channels].ack_reaction_in_progress`. When
+    /// `None`, the instance falls back to the channels-wide value; an empty
+    /// string disables the in-progress acknowledgement for this instance.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[empty_is_value]
+    pub ack_reaction_in_progress: Option<String>,
+    /// Override for the top-level `[channels].ack_reaction_done`. When `None`,
+    /// the instance falls back to the channels-wide value; an empty string
+    /// withdraws the acknowledgement and adds nothing.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[empty_is_value]
+    pub ack_reaction_done: Option<String>,
+    /// Override for the top-level `[channels].ack_reaction_error`. When `None`,
+    /// the instance falls back to the channels-wide value; an empty string
+    /// withdraws the acknowledgement and adds nothing.
+    #[tab(Behavior)]
+    #[serde(default)]
+    #[empty_is_value]
+    pub ack_reaction_error: Option<String>,
 
     /// Streaming mode for the LLM response: `off` (default) routes every
     /// response through `send()`; `partial` opens a Feishu interactive
@@ -27811,7 +27911,15 @@ fn prune_empty_leaves(value: &mut toml::Value) {
                 let drop = match t.get(&key) {
                     Some(toml::Value::Array(arr)) => arr.is_empty(),
                     Some(toml::Value::Table(inner)) => inner.is_empty(),
-                    Some(toml::Value::String(s)) => s.is_empty(),
+                    Some(toml::Value::String(s)) => {
+                        s.is_empty()
+                            && !matches!(
+                                key.as_str(),
+                                "ack_reaction_in_progress"
+                                    | "ack_reaction_done"
+                                    | "ack_reaction_error"
+                            )
+                    }
                     _ => false,
                 };
                 if drop {
@@ -33781,6 +33889,9 @@ auto_save = true
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
+                ack_reaction_in_progress: default_ack_reaction_in_progress(),
+                ack_reaction_done: default_ack_reaction_done(),
+                ack_reaction_error: default_ack_reaction_error(),
                 cli: true,
                 telegram: HashMap::from([(
                     "default".to_string(),
@@ -35456,6 +35567,9 @@ default_temperature = 0.7
         config.channels.lark.insert(
             "feishu".to_string(),
             LarkConfig {
+                ack_reaction_in_progress: None,
+                ack_reaction_done: None,
+                ack_reaction_error: None,
                 enabled: true,
                 app_id: "cli_feishu_123".into(),
                 app_secret: "feishu-secret".into(),
@@ -35983,6 +36097,9 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
     #[test]
     async fn matrix_config_serde() {
         let mc = MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://matrix.org".into(),
             access_token: Some("syt_token_abc".into()),
@@ -36023,6 +36140,9 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
     #[test]
     async fn matrix_config_toml_roundtrip() {
         let mc = MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://synapse.local:8448".into(),
             access_token: Some("tok".into()),
@@ -36191,6 +36311,9 @@ allowed_users = ["@u:matrix.org"]
     #[test]
     async fn channels_with_imessage_and_matrix() {
         let c = ChannelsConfig {
+            ack_reaction_in_progress: default_ack_reaction_in_progress(),
+            ack_reaction_done: default_ack_reaction_done(),
+            ack_reaction_error: default_ack_reaction_error(),
             cli: true,
             telegram: HashMap::new(),
             discord: HashMap::new(),
@@ -36209,6 +36332,9 @@ allowed_users = ["@u:matrix.org"]
             matrix: HashMap::from([(
                 "default".to_string(),
                 MatrixConfig {
+                    ack_reaction_in_progress: None,
+                    ack_reaction_done: None,
+                    ack_reaction_error: None,
                     enabled: true,
                     homeserver: "https://m.org".into(),
                     access_token: Some("tok".into()),
@@ -36816,6 +36942,9 @@ allowed_numbers = ["+1", "+2"]
     #[test]
     async fn channels_with_whatsapp() {
         let c = ChannelsConfig {
+            ack_reaction_in_progress: default_ack_reaction_in_progress(),
+            ack_reaction_done: default_ack_reaction_done(),
+            ack_reaction_error: default_ack_reaction_error(),
             cli: true,
             telegram: HashMap::new(),
             discord: HashMap::new(),
@@ -38585,6 +38714,9 @@ default_model = "legacy-model"
         config.channels.lark.insert(
             "feishu".to_string(),
             LarkConfig {
+                ack_reaction_in_progress: None,
+                ack_reaction_done: None,
+                ack_reaction_error: None,
                 enabled: true,
                 app_id: "cli_feishu_123".into(),
                 app_secret: "feishu-secret".into(),
@@ -40066,6 +40198,9 @@ api_token = "tok"
     #[test]
     async fn lark_config_serde() {
         let lc = LarkConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             app_id: "cli_123456".into(),
             app_secret: "secret_abc".into(),
@@ -40095,6 +40230,9 @@ api_token = "tok"
     #[test]
     async fn lark_config_toml_roundtrip() {
         let lc = LarkConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             app_id: "cli_123456".into(),
             app_secret: "secret_abc".into(),
@@ -43525,6 +43663,67 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
     }
 
     #[test]
+    async fn channels_ack_reaction_emojis_default_to_current_behavior() {
+        let channels = ChannelsConfig::default();
+        assert_eq!(channels.ack_reaction_in_progress, "\u{1F440}");
+        assert_eq!(channels.ack_reaction_done, "\u{2705}");
+        assert_eq!(channels.ack_reaction_error, "\u{26A0}\u{FE0F}");
+    }
+
+    #[test]
+    async fn channels_ack_reaction_emojis_deserialize_overrides() {
+        let toml_str = r#"
+            ack_reaction_in_progress = "⏳"
+            ack_reaction_done = ""
+        "#;
+        let channels: ChannelsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(channels.ack_reaction_in_progress, "⏳");
+        assert_eq!(channels.ack_reaction_done, "");
+        assert_eq!(
+            channels.ack_reaction_error, "\u{26A0}\u{FE0F}",
+            "an omitted emoji keeps its default"
+        );
+    }
+
+    #[test]
+    async fn slack_config_ack_reaction_emojis_deserialize() {
+        let toml_str = r#"
+            ack_reaction_in_progress = "⏳"
+            ack_reaction_done = ""
+        "#;
+        let cfg: SlackConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reaction_in_progress.as_deref(), Some("⏳"));
+        assert_eq!(cfg.ack_reaction_done.as_deref(), Some(""));
+        assert_eq!(
+            cfg.ack_reaction_error, None,
+            "an omitted override inherits the global value"
+        );
+    }
+
+    #[test]
+    async fn matrix_config_ack_reaction_emojis_deserialize() {
+        let toml_str = r#"
+            homeserver = "https://matrix.example"
+            ack_reaction_in_progress = "⏳"
+        "#;
+        let cfg: MatrixConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reaction_in_progress.as_deref(), Some("⏳"));
+        assert_eq!(cfg.ack_reaction_done, None);
+    }
+
+    #[test]
+    async fn lark_config_ack_reaction_emojis_deserialize() {
+        let toml_str = r#"
+            app_id = "cli_test"
+            app_secret = "secret"
+            ack_reaction_done = ""
+        "#;
+        let cfg: LarkConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reaction_done.as_deref(), Some(""));
+        assert_eq!(cfg.ack_reaction_in_progress, None);
+    }
+
+    #[test]
     async fn google_workspace_allowed_operations_deserialize_from_toml() {
         let toml_str = r#"
             enabled = true
@@ -43865,6 +44064,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn matrix_secret_fields_discovered() {
         let mx = MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
@@ -43904,6 +44106,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn matrix_secret_fields_empty_not_set() {
         let mx = MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: None,
@@ -43948,6 +44153,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_secret_updates_field() {
         let mut mx = MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("old".into()),
@@ -43981,6 +44189,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_secret_unknown_name_fails() {
         let mut mx = MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
@@ -44025,6 +44236,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                ack_reaction_in_progress: None,
+                ack_reaction_done: None,
+                ack_reaction_error: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("mx-tok".into()),
@@ -44068,6 +44282,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                ack_reaction_in_progress: None,
+                ack_reaction_done: None,
+                ack_reaction_error: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("old".into()),
@@ -44116,6 +44333,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                ack_reaction_in_progress: None,
+                ack_reaction_done: None,
+                ack_reaction_error: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("old".into()),
@@ -44232,6 +44452,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut mx = MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
@@ -44276,6 +44499,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut mx = MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
@@ -44316,6 +44542,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), false);
 
         let mut mx = MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
@@ -44351,6 +44580,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     fn test_matrix_config() -> MatrixConfig {
         MatrixConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
@@ -44780,6 +45012,53 @@ stream_tool_arguments = [
         // Empty string clears Option
         mx.set_prop("channels.matrix.user_id", "").unwrap();
         assert!(mx.user_id.is_none());
+    }
+
+    #[test]
+    async fn set_prop_empty_ack_reaction_override_is_preserved() {
+        // The `ack_reaction_*` overrides give the empty string its own
+        // meaning ("withdraw the acknowledgement and add nothing"), so an
+        // explicit empty value must survive `set_prop` instead of clearing the
+        // override back to inheritance. An unset override still falls back to
+        // the channels-wide value.
+        let mut slack = SlackConfig::default();
+        slack
+            .set_prop("channels.slack.ack_reaction_in_progress", "")
+            .unwrap();
+        slack
+            .set_prop("channels.slack.ack_reaction_done", "")
+            .unwrap();
+        slack
+            .set_prop("channels.slack.ack_reaction_error", "")
+            .unwrap();
+        assert_eq!(slack.ack_reaction_in_progress.as_deref(), Some(""));
+        assert_eq!(slack.ack_reaction_done.as_deref(), Some(""));
+        assert_eq!(slack.ack_reaction_error.as_deref(), Some(""));
+
+        let mut matrix = MatrixConfig::default();
+        matrix
+            .set_prop("channels.matrix.ack_reaction_done", "")
+            .unwrap();
+        assert_eq!(matrix.ack_reaction_done.as_deref(), Some(""));
+
+        let mut lark = LarkConfig::default();
+        lark.set_prop("channels.lark.ack_reaction_in_progress", "")
+            .unwrap();
+        assert_eq!(lark.ack_reaction_in_progress.as_deref(), Some(""));
+
+        // The explicit unset sentinel still clears back to inheritance, and a
+        // non-empty value still stores normally.
+        matrix
+            .set_prop(
+                "channels.matrix.ack_reaction_done",
+                crate::traits::UNSET_DISPLAY,
+            )
+            .unwrap();
+        assert_eq!(matrix.ack_reaction_done, None);
+        matrix
+            .set_prop("channels.matrix.ack_reaction_done", "\u{1F389}")
+            .unwrap();
+        assert_eq!(matrix.ack_reaction_done.as_deref(), Some("\u{1F389}"));
     }
 
     #[test]
@@ -47011,6 +47290,80 @@ allowed_users = []
             keys,
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    async fn channel_rename_preserves_empty_ack_reaction_overrides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for channel in ["slack", "matrix", "lark"] {
+            let section = format!("channels.{channel}");
+            let config_path = tmp.path().join(format!("{channel}.toml"));
+            std::fs::write(
+                &config_path,
+                format!("[channels.{channel}.old]\nack_reaction_done = \"\"\n"),
+            )
+            .unwrap();
+            let mut config = Config {
+                config_path: config_path.clone(),
+                loaded_from: Some(config_path),
+                ..Default::default()
+            };
+            match channel {
+                "slack" => {
+                    config.channels.slack.insert(
+                        "old".to_string(),
+                        SlackConfig {
+                            ack_reaction_in_progress: Some(String::new()),
+                            ack_reaction_done: Some(String::new()),
+                            ack_reaction_error: Some(String::new()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                "matrix" => {
+                    config.channels.matrix.insert(
+                        "old".to_string(),
+                        MatrixConfig {
+                            homeserver: "https://matrix.example".to_string(),
+                            user_id: Some("@bot:matrix.example".to_string()),
+                            ack_reaction_in_progress: Some(String::new()),
+                            ack_reaction_done: Some(String::new()),
+                            ack_reaction_error: Some(String::new()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                "lark" => {
+                    config.channels.lark.insert(
+                        "old".to_string(),
+                        LarkConfig {
+                            app_id: "cli_test".to_string(),
+                            app_secret: "test-secret".to_string(),
+                            ack_reaction_in_progress: Some(String::new()),
+                            ack_reaction_done: Some(String::new()),
+                            ack_reaction_error: Some(String::new()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                _ => unreachable!(),
+            };
+            config.rename_map_key(&section, "old", "new").unwrap();
+            config.mark_dirty(&format!("{section}.old"));
+            config.mark_dirty(&format!("{section}.new"));
+            config.save_dirty().await.unwrap();
+
+            let reloaded: Config =
+                toml::from_str(&std::fs::read_to_string(config.config_path).unwrap()).unwrap();
+            let alias = &toml::Value::try_from(reloaded).unwrap()["channels"][channel]["new"];
+            for key in [
+                "ack_reaction_in_progress",
+                "ack_reaction_done",
+                "ack_reaction_error",
+            ] {
+                assert_eq!(alias.get(key).and_then(toml::Value::as_str), Some(""));
+            }
+        }
     }
 
     #[test]
