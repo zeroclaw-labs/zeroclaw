@@ -1135,6 +1135,16 @@ pub async fn run_with_authority(
         None
     };
 
+    // Close remote sessions whose client has been gone for
+    // `wss.orphaned_session_timeout_secs`, so they do not hold the live
+    // session map until a restart.
+    if let Some(ctx) = rpc_ctx.as_ref() {
+        handles.push(crate::rpc::orphans::spawn_orphan_retirement(
+            ctx,
+            channels_cancel.clone(),
+        ));
+    }
+
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = registry.take_socket_start() {
         socket_required = true;
