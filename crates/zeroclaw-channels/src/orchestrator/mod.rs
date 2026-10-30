@@ -130,7 +130,7 @@ use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, is_model_switch_requested, scope_session_key,
+    build_tool_instructions_from_specs, is_model_switch_requested, scope_session_key,
     scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::agent::system_prompt::build_skills_prompt_with_effective_tools;
@@ -10961,30 +10961,6 @@ async fn process_channel_message_body(
                 safeguard_notice.as_ref(),
                 model_notice,
             );
-
-            // Persist intermediate tool-call/result messages from this turn
-            // so the model retains concrete "I used tools" examples in
-            // context, preventing drift toward tool-less responses. How many
-            // turns keep those rows on the provider-facing history is decided
-            // per request by the tool loop (`keep_tool_context_turns` counts
-            // turns there); here the key only gates whether they are stored.
-            //
-            // Skipped when the pre-trim resync above could not confirm the
-            // cache matches what's durable: appending onto an evicted cache
-            // would just recreate an unreconciled entry from this turn's
-            // own working buffer. The reply is still delivered to the user
-            // below; only this turn's contribution to the stored transcript
-            // is dropped, and the next turn reloads from the backend.
-            let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
-            if !history_resync_failed && keep_tool_turns > 0 {
-                // Find tool messages for the current turn: everything after
-                // the last user message up to (but not including) the final
-                // assistant response that matches our delivered text.
-                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
-                for tool_msg in tool_messages {
-                    append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
-                }
-            }
 
             if !history_resync_failed {
                 append_sender_turn(
