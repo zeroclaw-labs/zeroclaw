@@ -129,8 +129,11 @@ Every forwarded request shares the gateway's one RPC connection, and the daemon 
 Route ownership is resolved by the daemon, so while it is unreachable every path answers `503`,
 including paths no plugin owns. The gateway reconnects on its own after the daemon restarts or
 reloads; a refused connection is retried every 30 seconds at first, backing off to every five
-minutes while the refusal lasts. A standalone gateway bound to a public address serves the
-daemon's plugin routes on that listener.
+minutes while the refusal lasts. A connection the daemon stops recognising while it is open,
+because a policy change removed or revoked the gateway's identity, is closed by the gateway at
+the first dispatch refused for that reason and dialed again the same way, so access the operator
+restores is picked up at the next handshake. A standalone gateway bound to a public address
+serves the daemon's plugin routes on that listener.
 
 `zeroclaw gateway restart` first POSTs `/admin/shutdown` to the gateway address in the config it
 runs with, so run it with the standalone gateway's `--config-dir` and `ZEROCLAW_SOCKET`. With the

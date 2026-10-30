@@ -43,6 +43,10 @@ enum Dispatched {
     CoreRefused {
         code: i32,
     },
+    /// The core no longer recognises the connection's identity: a live
+    /// policy change ended its binding, or its credential lapsed. The
+    /// connection was ended here so the link's maintainer dials again.
+    CoreIdentityLost,
     /// The core does not serve plugin webhook dispatch.
     CoreUnsupported,
     /// The core did not answer within the ingress deadline plus a margin.
@@ -127,6 +131,19 @@ fn dispatched_response(dispatched: Dispatched) -> Response {
                         "error_key": "plugin_webhook_core_refused",
                     })),
                 "Core refused the plugin webhook dispatch"
+            );
+            unavailable()
+        }
+        Dispatched::CoreIdentityLost => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "code": AUTH_REQUIRED,
+                        "error_key": "plugin_webhook_core_identity_lost",
+                    })),
+                "Core no longer recognises the gateway's connection; reconnecting"
             );
             unavailable()
         }
@@ -235,7 +252,20 @@ async fn dispatch(core: &CoreRpc, request: PluginWebhookRequest) -> Dispatched {
                 return Dispatched::CoreUnavailable;
             }
             match error.code {
-                AUTH_REQUIRED | FORBIDDEN => Dispatched::CoreRefused { code: error.code },
+                // The connection authenticated at its handshake, so this
+                // answer means the core has since stopped recognising it: a
+                // live policy change ended its binding, or its credential
+                // lapsed. The core keeps the socket open, and the link's
+                // maintainer dials again only once it closes, so end it here.
+                // The next handshake is accepted once access is restored, or
+                // refused into the slow redial backoff while it is not. A
+                // FORBIDDEN answer is about the call, not the connection, and
+                // leaves it in place.
+                AUTH_REQUIRED => {
+                    client.shutdown();
+                    Dispatched::CoreIdentityLost
+                }
+                FORBIDDEN => Dispatched::CoreRefused { code: error.code },
                 METHOD_NOT_FOUND => Dispatched::CoreUnsupported,
                 code => Dispatched::CoreUnexpected {
                     reason: "core returned an error",

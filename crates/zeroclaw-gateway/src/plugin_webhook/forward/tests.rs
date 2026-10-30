@@ -364,6 +364,11 @@ async fn core_failure_records_keep_a_secret_path_out() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     drain(&mut records);
 
+    let unrecognised = forwarding(&capabilities(), core_answer(|_| Some(Err(AUTH_REQUIRED)))).await;
+    let response = send(&unrecognised.router, secret("{}")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drain(&mut records);
+
     // Timing out needs the full ingress deadline, so this one is mapped
     // directly; it has no path to leak either way.
     let response = dispatched_response(Dispatched::CoreTimedOut);
@@ -376,6 +381,7 @@ async fn core_failure_records_keep_a_secret_path_out() {
         "plugin_webhook_core_unsupported",
         "plugin_webhook_core_unexpected",
         "plugin_webhook_core_timeout",
+        "plugin_webhook_core_identity_lost",
     ] {
         assert!(
             seen.iter().any(|seen| seen == key),
@@ -462,12 +468,6 @@ async fn core_rpc_errors_map_to_503() {
     .await;
     for (code, expected) in [
         (FORBIDDEN, Dispatched::CoreRefused { code: FORBIDDEN }),
-        (
-            AUTH_REQUIRED,
-            Dispatched::CoreRefused {
-                code: AUTH_REQUIRED,
-            },
-        ),
         (METHOD_NOT_FOUND, Dispatched::CoreUnsupported),
         (
             INVALID_PARAMS,
@@ -492,6 +492,130 @@ async fn core_rpc_errors_map_to_503() {
             "webhook unavailable",
         )
         .await;
+    }
+    // A refused or unsupported call is about the call: the connection stays.
+    let client = forwarding
+        .core
+        .client()
+        .await
+        .expect("the forwarder is connected");
+    assert_eq!(client.state(), ConnectionState::Connected);
+}
+
+/// `AUTH_REQUIRED` on an established connection means the core has stopped
+/// recognising it, and the core keeps the socket open. The forwarder answers
+/// 503 and ends the connection itself, so the link's maintainer dials again.
+#[tokio::test]
+async fn an_auth_required_answer_ends_the_connection() {
+    let mut forwarding =
+        forwarding(&capabilities(), core_answer(|_| Some(Err(AUTH_REQUIRED)))).await;
+    let client = forwarding
+        .core
+        .client()
+        .await
+        .expect("the forwarder is connected");
+    let request = PluginWebhookRequest::new("fixture", "POST", "", Vec::new(), b"{}".to_vec())
+        .expect("a valid request");
+    assert_eq!(
+        dispatch(&forwarding.core, request).await,
+        Dispatched::CoreIdentityLost
+    );
+    expect_response(
+        dispatched_response(Dispatched::CoreIdentityLost),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "webhook unavailable",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), client.closed())
+        .await
+        .expect("the forwarder ends the connection");
+    assert_ne!(client.state(), ConnectionState::Connected);
+    // The core saw the dispatch, and then its side of the connection ended.
+    next_call(&mut forwarding.fake, DISPATCH).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while forwarding.fake.frames.recv().await.is_some() {}
+    })
+    .await
+    .expect("the core observes the close");
+}
+
+/// Over the daemon's socket, end to end: the core stops recognising the
+/// connection, the link dials again, and once the operator has restored
+/// access the next webhook is served on the new connection.
+#[tokio::test]
+async fn restored_access_serves_webhooks_again_after_an_auth_required_answer() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::net::UnixListener;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let socket = tmp.path().join("daemon.sock");
+    let listener = UnixListener::bind(&socket).expect("bind the fake core");
+    // The first connection's core has stopped recognising the gateway; the
+    // second, dialed after access was restored, serves the dispatch.
+    let (accepted_tx, mut accepted) = mpsc::unbounded_channel();
+    let dials = Arc::new(AtomicUsize::new(0));
+    zeroclaw_spawn::spawn!(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let dial = dials.fetch_add(1, Ordering::SeqCst);
+            let fake = serve_fake_core(
+                stream,
+                &capabilities(),
+                None,
+                core_answer(move |_| {
+                    Some(if dial == 0 {
+                        Err(AUTH_REQUIRED)
+                    } else {
+                        Ok(json!({"outcome": "ack"}))
+                    })
+                }),
+            );
+            if accepted_tx.send(fake).is_err() {
+                break;
+            }
+        }
+    });
+    let core = CoreRpc::default();
+    let stop = CancellationToken::new();
+    let _stop_on_exit = stop.clone().drop_guard();
+    core.attach_local(socket, ConnectOptions::default(), stop);
+    let (router, _state_dir) = router_without_core(core.clone());
+
+    let _first = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
+        .await
+        .expect("the gateway dials the core")
+        .expect("the listener is alive");
+    let first_client = connected_client(&core, None).await;
+    expect_response(
+        send(&router, post("{}")).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "webhook unavailable",
+    )
+    .await;
+
+    let _second = tokio::time::timeout(Duration::from_secs(5), accepted.recv())
+        .await
+        .expect("the gateway dials the core again")
+        .expect("the listener is alive");
+    connected_client(&core, Some(&first_client)).await;
+    expect_response(send(&router, post("{}")).await, StatusCode::OK, "").await;
+}
+
+/// The link's client once it is connected, and not `previous`.
+async fn connected_client(core: &CoreRpc, previous: Option<&Arc<RpcClient>>) -> Arc<RpcClient> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let CoreLink::Connected(client) = core.link().await
+            && previous.is_none_or(|previous| !Arc::ptr_eq(previous, &client))
+        {
+            return client;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the link never connected"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
