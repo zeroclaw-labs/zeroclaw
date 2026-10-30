@@ -80,7 +80,7 @@ pub struct EffectiveSandboxInputs {
 }
 
 impl EffectiveSandboxInputs {
-    /// Resolve canonical-vs-legacy precedence for `profile` against `workspace`.
+    /// Resolve canonical-vs-legacy precedence for `profile`, preserving raw paths.
     ///
     /// Precedence (canonical `sandbox_policy` field wins whenever present):
     /// 1. `deny_read` — `sandbox_policy.deny_read` if `Some` (including
@@ -102,7 +102,7 @@ impl EffectiveSandboxInputs {
     ///    and enforced separately; `guardrail_exceptions` relaxes individual
     ///    guardrail entries per-entry (RFC 6996).
     #[must_use]
-    pub fn from_profile(profile: &RiskProfileConfig, workspace: &Path) -> Self {
+    pub fn from_profile(profile: &RiskProfileConfig) -> Self {
         let sp = &profile.sandbox_policy;
         // Single decision point for the Full-autonomy rule (RFC 6996): at
         // `Full`, `workspace_only` is always treated as `false`, matching the
@@ -132,7 +132,7 @@ impl EffectiveSandboxInputs {
         let allow_write_compat_allowlist = !allow_write_is_explicit
             && !effective_workspace_only
             && !profile.allowed_roots.is_empty();
-        let allow_write = resolve_allow_write(sp, effective_workspace_only, profile, workspace);
+        let allow_write = resolve_allow_write(sp, effective_workspace_only, profile);
         let deny_write = resolve_deny_write(sp);
 
         if !sp.guardrail_exceptions.is_empty() {
@@ -221,7 +221,6 @@ fn resolve_allow_write(
     sp: &SandboxPolicyConfig,
     effective_workspace_only: bool,
     profile: &RiskProfileConfig,
-    workspace: &Path,
 ) -> Vec<String> {
     if let Some(v) = &sp.allow_write {
         return v.clone();
@@ -232,7 +231,9 @@ fn resolve_allow_write(
         // `SecurityPolicy::allowed_roots`); under `workspace_only` it stays
         // one. Dropping it here would silently turn every legacy root
         // read-only, contradicting the documented compat mapping.
-        let mut scoped = vec![workspace.to_string_lossy().into_owned()];
+        // Keep the implicit grant workspace-relative so rebasing resolves it
+        // against the effective workspace, rather than retaining the old root.
+        let mut scoped = vec![".".to_string()];
         for root in &profile.allowed_roots {
             if !scoped.contains(root) {
                 scoped.push(root.clone());
@@ -308,7 +309,7 @@ impl SandboxPolicy {
     /// `SecurityPolicy::from_profiles`), then path-resolves the result.
     #[must_use]
     pub fn from_risk_profile(profile: &RiskProfileConfig, workspace: &Path) -> Self {
-        let effective = EffectiveSandboxInputs::from_profile(profile, workspace);
+        let effective = EffectiveSandboxInputs::from_profile(profile);
         Self::from_effective(&effective, workspace)
     }
 
@@ -688,7 +689,7 @@ mod tests {
         // prefix-matched operator list.
         let mut profile = RiskProfileConfig::default();
         profile.sandbox_policy.deny_write = Some(vec!["/only_this".to_string()]);
-        let effective = EffectiveSandboxInputs::from_profile(&profile, ws());
+        let effective = EffectiveSandboxInputs::from_profile(&profile);
         assert_eq!(effective.deny_write, vec!["/only_this".to_string()]);
     }
 

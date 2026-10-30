@@ -17588,6 +17588,35 @@ target = "memory_recall"
             .expect("bounded same-profile target resolves");
         assert_eq!(target_policy.workspace_dir, caller_workspace);
 
+        let writer = zeroclaw_tools::file_write::FileWriteTool::new(Arc::clone(&target_policy));
+        let stale_target = target_workspace.join("delegate-write.txt");
+        let refused = writer
+            .execute(serde_json::json!({
+                "path": stale_target,
+                "content": "must not reach the old workspace",
+            }))
+            .await
+            .expect("the file tool reports policy refusal");
+        assert!(
+            !refused.success,
+            "the old workspace must lose implicit write access"
+        );
+        assert!(!stale_target.exists(), "refusal must leave no file behind");
+
+        let current_target = caller_workspace.join("delegate-write.txt");
+        let written = writer
+            .execute(serde_json::json!({
+                "path": current_target,
+                "content": "caller workspace remains writable",
+            }))
+            .await
+            .expect("the file tool executes in the inherited workspace");
+        assert!(written.success, "{:?}", written.error);
+        assert_eq!(
+            std::fs::read_to_string(current_target).unwrap(),
+            "caller workspace remains writable"
+        );
+
         assert!(
             !target_policy.is_resolved_path_allowed(&caller_workspace.join(".env")),
             "mandatory deny-write guardrail must protect .env under the effective \

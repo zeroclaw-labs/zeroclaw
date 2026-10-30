@@ -6558,10 +6558,8 @@ impl SecurityPolicy {
         // `effective_workspace_only` (the Full-autonomy ⇒ `false` rule) is
         // decided INSIDE the resolver, not re-derived here, so both surfaces
         // consume the same decision (RFC 6996 single-resolver contract).
-        let sandbox_inputs = crate::sandbox_policy::EffectiveSandboxInputs::from_profile(
-            risk_profile,
-            workspace_dir,
-        );
+        let sandbox_inputs =
+            crate::sandbox_policy::EffectiveSandboxInputs::from_profile(risk_profile);
         let effective_workspace_only = sandbox_inputs.effective_workspace_only;
         let tiers = sandbox_derived_tiers(&sandbox_inputs, workspace_dir);
 
@@ -14419,6 +14417,19 @@ mod tests {
             "the stale (pre-rebase) location is no longer denied since deny_write was \
              re-resolved against the new workspace only"
         );
+    }
+
+    #[test]
+    fn rebase_preserves_explicit_absolute_workspace_write_grant() {
+        let initial = Path::new("/target_ws");
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.allow_write = Some(vec![initial.display().to_string()]);
+        let mut policy = SecurityPolicy::from_risk_profile(&profile, initial);
+
+        policy.rebase_workspace(PathBuf::from("/caller_ws"));
+
+        assert!(policy.is_resolved_path_allowed(&initial.join("notes.txt")));
+        assert!(!policy.is_resolved_path_allowed(Path::new("/caller_ws/notes.txt")));
     }
 
     #[test]
