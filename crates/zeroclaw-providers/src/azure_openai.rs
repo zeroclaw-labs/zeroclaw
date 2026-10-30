@@ -932,6 +932,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5",
@@ -1031,6 +1032,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5",
@@ -1117,6 +1119,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5",
@@ -1204,6 +1207,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5",

@@ -221,12 +221,14 @@ output headroom. The fields have separate owners:
 - `runtime_profiles.astra.max_tool_iterations` limits the agentic tool loop, while `max_history_messages` separately bounds retained complete user turns, including their tool exchanges. The channel sender cache retains its separate row-based limit.
 - `runtime.reasoning_effort` is the global provider-facing reasoning level.
   ZeroClaw currently accepts `minimal`, `low`, `medium`, `high`, and `xhigh`.
-  Astra's public API accepts `low`, `medium`, `high`, `xhigh`, and `max`, so use
-  a shared value until [max reasoning support](https://github.com/zeroclaw-labs/zeroclaw/issues/10705)
-  lands.
+  A runtime profile with `thinking.native_thinking = true` can override it
+  per request, including mapping `max` to the model's highest supported
+  effort. Literal global `max` validation remains separate:
+  [#10705](https://github.com/zeroclaw-labs/zeroclaw/issues/10705).
 
-Do not set provider `temperature` for Astra. The Responses adapter forwards a
-configured value and does not repair unsupported sampling parameters. Keep API
+Do not set provider `temperature` for Astra on the global/default path. That
+path forwards a configured value. A successfully mapped profile reasoning
+effort omits optional temperature when reasoning is enabled. Keep API
 validation errors distinct from account, usage-tier, region, or backend access
 restrictions.
 
@@ -252,6 +254,86 @@ active-response steering in
 programmatic tool calling in
 [#10707](https://github.com/zeroclaw-labs/zeroclaw/issues/10707). These are
 proposals until their ZeroClaw implementations and provider routes are verified.
+
+## Per-profile native reasoning effort (OpenAI)
+
+Use the existing thinking configuration to select native effort per runtime
+profile. No configuration migration is required:
+
+```toml
+[runtime_profiles.fast.thinking]
+default_level = "low"
+native_thinking = true
+
+[runtime_profiles.deep.thinking]
+default_level = "max"
+native_thinking = true
+```
+
+Profiles can share the same `openai` provider alias and endpoint. With native
+thinking enabled, the selected level overrides the global reasoning effort for
+that request. Otherwise, the provider's existing global/default behavior stays
+in effect. Existing CLI and channel selection precedence is inline directive,
+then session override, then profile default. Resetting a channel session restores
+its profile default. Direct Agent/RPC turns use the profile default resolved
+when the Agent is constructed. Recreate or reconnect existing Agent/RPC
+sessions after changing those defaults. This does not add directives or session
+overrides to that surface.
+
+Mapping takes place after routing and fallback select the actual model:
+
+| Profile level | Native effort |
+| --- | --- |
+| `off` | `none`, or the lowest supported effort |
+| `minimal`, `low`, `medium`, `high` | Matching effort, otherwise the next supported higher effort, capped at the maximum |
+| `max` | Highest supported effort |
+
+All six levels propagate independently of token budgets. Existing prompt and
+temperature selection, other providers' native budgets, and configuration
+serialization retain their behavior. On OpenAI wire requests that successfully
+map to enabled reasoning, the adapter omits optional temperature to avoid an
+unsupported sampling parameter. Mapping to `none` preserves temperature.
+
+This applies to the OpenAI family's Responses API, native Chat Completions and
+Codex subscription route, including OpenAI aliases with endpoint overrides.
+Responses sends `reasoning.effort`; Chat Completions sends `reasoning_effort`.
+Azure, `custom`, other compatible providers and other vendors sharing these
+adapters retain their existing behavior and raw-body override precedence.
+
+Capabilities use exact verified model IDs and documented snapshots. Public API
+sets come from the [OpenAI model documentation](https://developers.openai.com/api/docs/models);
+subscription sets come separately from the
+[official Codex catalog](https://github.com/openai/codex/blob/126a0ee92ed2c5e73cd8a8f7e37563e8527552d7/codex-rs/models-manager/models.json).
+They can differ for the same model ID. The client mode `ultra` is never sent as
+native effort. Chat Completions with tools maps only verified combinations;
+models requiring Responses for tool reasoning should use `wire_api = "responses"`.
+Account access is still required independently of the capability mapping.
+
+Unknown/non-reasoning models, undocumented suffixes and unsupported API/tool
+combinations preserve global/default behavior. An INFO diagnostic reports
+`requested_level`, selected provider/model, `effective_effort`, `outcome =
+"unmapped"` and the reason. DEBUG diagnostics report exact/substituted mappings
+and whether a configured global effort was overridden. Diagnostics contain an
+endpoint-override boolean, never the endpoint URL or request content.
+
+The level follows tool rounds, summaries, recovery and streaming requests.
+Independent delegates use their target profile, including its native opt-out;
+bounded delegates inherit the caller level, including background and parallel
+workers. Single-call delegates carry only the level through their existing
+call path. They add no prompt, temperature or token-budget policy. Auxiliary
+one-shot calls do not inherit the turn's native level. Direct Agent response
+caching is bypassed for every explicit native override, including budgetless
+levels, to prevent cross-profile reuse.
+
+To roll back per-profile effort, set `native_thinking = false` on the affected
+profile. This restores the global/default wire behavior without changing the
+profile's configured level. Apply the change through the runtime's existing
+reload or restart lifecycle, including recreating existing Agent/RPC sessions.
+The same toggle controls existing native token budgets for other providers.
+For a mixed-provider profile, revert the feature if those budgets must remain
+enabled while restoring the previous OpenAI behavior.
+Reverting the feature also requires reverting Rust
+request-constructor updates described in the [custom-provider guide](./custom.md#rust-request-construction).
 
 ## Container-friendly overrides
 

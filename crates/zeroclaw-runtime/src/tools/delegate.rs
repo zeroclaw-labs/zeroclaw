@@ -2960,6 +2960,24 @@ impl DelegateTool {
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
+        // Keep legacy single-call dispatch intact while binding the target's
+        // policy independently of auxiliary calls inside an enclosing turn.
+        let native_level = match target_mode {
+            DelegateExecutionMode::Independent => {
+                let runtime = self.resolve_loop_runtime_from_config(
+                    authoritative_config,
+                    agent_name,
+                    agent_config,
+                );
+                crate::agent::thinking::apply_thinking_level_with_config(
+                    runtime.thinking.default_level,
+                    &runtime.thinking,
+                )
+                .native_level
+            }
+            DelegateExecutionMode::Bounded => zeroclaw_api::current_native_thinking_level(),
+        };
+
         // Wrap the model_provider call in a timeout to prevent indefinite blocking
         let timeout_secs = self
             .resolve_delegation_timeout_from_config(
@@ -2980,7 +2998,10 @@ impl DelegateTool {
         }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            zeroclaw_api::ONE_SHOT_NATIVE_THINKING_LEVEL.scope(
+                native_level,
+                dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            ),
         )
         .await;
         if let Some(sink) = self.progress.as_deref() {
@@ -3358,6 +3379,7 @@ impl DelegateTool {
         let supervisor_boot_id = terminal_owner_boot_id.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_native_level = zeroclaw_api::current_native_thinking_level();
         // Receipt continuity for detached work: capture the launching turn's
         // generator so the background sub-loop signs with the same key. The
         // wrapper below pairs it with a fresh collector, never the parent's
@@ -3470,6 +3492,8 @@ impl DelegateTool {
                     DelegateAdmission::Prevalidated,
                     target_execution_admission.clone(),
                 ));
+                let worker = zeroclaw_api::NATIVE_THINKING_LEVEL
+                    .scope(parent_native_level, worker);
 
                 // Race the delegation against cancellation
                 let outcome = tokio::select! {
@@ -3709,6 +3733,7 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_native_level = zeroclaw_api::current_native_thinking_level();
         let parent_budget = ExecutionTreeBudget::current();
         // Captured once here and restored inside every worker: each fan-out
         // target runs on its own spawned task, which does not inherit the SOP
@@ -3853,7 +3878,9 @@ impl DelegateTool {
                                                 DelegateAdmission::Required,
                                                 target_execution_admission,
                                             ));
-                                            worker.await
+                                            zeroclaw_api::NATIVE_THINKING_LEVEL
+                                                .scope(parent_native_level, worker)
+                                                .await
                                         })
                                         .await
                                 }),
@@ -5292,11 +5319,7 @@ impl DelegateTool {
         let execution =
             ExecutionTreeBudget::scope_optional(execution_tree_budget, Box::pin(execution));
         let result = match thinking_params {
-            Some(params) => {
-                zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .scope(params.native_thinking, execution)
-                    .await
-            }
+            Some(params) => crate::agent::thinking::scope_native_thinking(&params, execution).await,
             None => execution.await,
         };
 
@@ -11502,6 +11525,7 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordedThinkingRequest {
+        native_level: Option<ThinkingLevel>,
         thinking_budget: Option<u32>,
         thinking_display: Option<zeroclaw_api::model_provider::ThinkingDisplay>,
         system_prompt: Option<String>,
@@ -11548,6 +11572,7 @@ mod tests {
                 .find(|message| message.role == "system")
                 .map(|message| message.content.clone());
             self.requests.lock().unwrap().push(RecordedThinkingRequest {
+                native_level: request.thinking_level,
                 thinking_budget,
                 thinking_display,
                 system_prompt,
@@ -11638,6 +11663,209 @@ mod tests {
             .with_risk_profiles(config.risk_profiles.clone())
             .with_runtime_profiles(config.runtime_profiles.clone());
         (tool, target)
+    }
+
+    async fn native_openai_delegate_body(
+        mode: DelegateExecutionMode,
+        native: bool,
+        agentic: bool,
+        transport: &str,
+        parent: Option<ThinkingLevel>,
+    ) -> serde_json::Value {
+        let (server, captured) = start_scripted_chat_server(&[json!({
+            "choices": [{"message": {"role": "assistant", "content": "native delegate complete"}}]
+        })])
+        .await;
+        struct StopServer(tokio::task::AbortHandle);
+        impl Drop for StopServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server_guard = StopServer(server._task.abort_handle());
+        let temp = TempDir::new().unwrap();
+        let (mut tool, _) = thinking_delegate_fixture(
+            mode,
+            ThinkingConfig {
+                default_level: ThinkingLevel::Low,
+                native_thinking: native,
+                ..Default::default()
+            },
+        );
+        let mut config = tool.root_config.as_deref().unwrap().clone();
+        config.data_dir = temp.path().join("data");
+        config.config_path = temp.path().join("config.toml");
+        config.reliability.provider_retries = 0;
+        config.providers.models.openai.insert(
+            "native".into(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(server.uri.clone()),
+                    api_key: Some("fixture-key".into()),
+                    model: Some("gpt-5.4".into()),
+                    wire_api: Some(zeroclaw_config::schema::WireApi::ChatCompletions),
+                    timeout_secs: Some(2),
+                    ..Default::default()
+                },
+            },
+        );
+        config
+            .runtime_profiles
+            .get_mut("target-runtime")
+            .unwrap()
+            .agentic = agentic;
+        for agent in config.agents.values_mut() {
+            agent.model_provider = "openai.native".into();
+            agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+        }
+        tool.agents = Arc::new(config.agents.clone());
+        tool.runtime_profiles = Arc::new(config.runtime_profiles.clone());
+        tool = tool
+            .with_root_config(Arc::new(config))
+            .with_workspace_dir(temp.path().join("workspace"));
+        let args = match transport {
+            "sync" => json!({"agent": "target", "prompt": "inspect"}),
+            "background" => json!({"agent": "target", "prompt": "inspect", "background": true}),
+            "parallel" => json!({"parallel": ["target"], "prompt": "inspect"}),
+            _ => panic!("unsupported fixture transport"),
+        };
+        let result = zeroclaw_api::NATIVE_THINKING_LEVEL
+            .scope(parent, tool.execute(args))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        if transport == "background" {
+            let task_id = result
+                .output
+                .lines()
+                .find_map(|line| line.strip_prefix("task_id: "))
+                .unwrap();
+            let terminal = wait_for_terminal_background_result(&tool, task_id).await;
+            assert_eq!(
+                terminal.status,
+                BackgroundTaskStatus::Completed,
+                "{terminal:?}"
+            );
+        }
+        assert_eq!(zeroclaw_api::current_native_thinking_level(), None);
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "delegate must preserve its single-call behavior"
+        );
+        http_request_json(requests[0].as_bytes())
+    }
+
+    #[tokio::test]
+    async fn native_thinking_single_call_delegates_select_target_or_inherited_effort() {
+        for mode in [
+            DelegateExecutionMode::Independent,
+            DelegateExecutionMode::Bounded,
+        ] {
+            for native in [true, false] {
+                for parent in [Some(ThinkingLevel::High), None] {
+                    let body =
+                        native_openai_delegate_body(mode, native, false, "sync", parent).await;
+                    let expected = if mode == DelegateExecutionMode::Independent {
+                        native.then_some("low")
+                    } else {
+                        parent.map(|_| "high")
+                    };
+                    assert_eq!(body["reasoning_effort"].as_str(), expected);
+                    assert_eq!(body["model"], "gpt-5.4");
+                    assert!(body.get("thinking").is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_thinking_delegate_workers_capture_context_before_spawn() {
+        for agentic in [false, true] {
+            for transport in ["background", "parallel"] {
+                for (mode, native, expected) in [
+                    (DelegateExecutionMode::Bounded, false, Some("high")),
+                    (DelegateExecutionMode::Independent, true, Some("low")),
+                    (DelegateExecutionMode::Independent, false, None),
+                ] {
+                    let body = native_openai_delegate_body(
+                        mode,
+                        native,
+                        agentic,
+                        transport,
+                        Some(ThinkingLevel::High),
+                    )
+                    .await;
+                    assert_eq!(
+                        body["reasoning_effort"].as_str(),
+                        expected,
+                        "{mode:?} {agentic} {transport}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_native_level_uses_target_or_caller_without_requiring_a_budget() {
+        for mode in [
+            DelegateExecutionMode::Independent,
+            DelegateExecutionMode::Bounded,
+        ] {
+            for native in [true, false] {
+                let (tool, target) = thinking_delegate_fixture(
+                    mode,
+                    ThinkingConfig {
+                        default_level: ThinkingLevel::Low,
+                        native_thinking: native,
+                        ..ThinkingConfig::default()
+                    },
+                );
+                let provider = ThinkingRecordingModelProvider::default();
+                let parent = crate::agent::thinking::apply_thinking_level_with_config(
+                    ThinkingLevel::High,
+                    &ThinkingConfig {
+                        native_thinking: true,
+                        ..ThinkingConfig::default()
+                    },
+                );
+                crate::agent::thinking::scope_native_thinking(&parent, async {
+                    let result = tool
+                        .execute_agentic(
+                            "target",
+                            &target,
+                            "custom",
+                            "test-model",
+                            &provider,
+                            "inspect",
+                            Some(0.2),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(result.success, "{result:?}");
+                    assert_eq!(
+                        zeroclaw_api::current_native_thinking_level(),
+                        Some(ThinkingLevel::High)
+                    );
+                    assert_eq!(
+                        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                            .try_with(|value| *value)
+                            .unwrap(),
+                        parent.native_thinking
+                    );
+                })
+                .await;
+                let request = provider.request();
+                if mode == DelegateExecutionMode::Independent {
+                    assert_eq!(request.native_level, native.then_some(ThinkingLevel::Low));
+                    assert_eq!(request.thinking_budget, None);
+                } else {
+                    assert_eq!(request.native_level, Some(ThinkingLevel::High));
+                    assert_eq!(request.thinking_budget, Some(10_000));
+                }
+            }
+        }
     }
 
     #[tokio::test]

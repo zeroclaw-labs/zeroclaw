@@ -359,7 +359,9 @@ pub(crate) async fn finish_after_max_iterations(
             }
             let summary_request = zeroclaw_providers::ChatRequest {
                 messages: &messages,
-                tools: None, // No tools — force a text response
+                // No tools — force a text response.
+                tools: None,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
@@ -701,6 +703,80 @@ mod graceful_summary_metering_tests {
 
     async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
         run_summary_with_events(provider, String::new(), None, None).await
+    }
+
+    struct NativeSummaryProvider;
+    impl Attributable for NativeSummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "native-summary-provider"
+        }
+    }
+    #[async_trait]
+    impl ModelProvider for NativeSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("summary must use ChatRequest")
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            assert_eq!(
+                request.thinking_level,
+                zeroclaw_api::current_native_thinking_level()
+            );
+            assert!(request.thinking_level.is_some());
+            assert_eq!(
+                request.thinking,
+                zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(|value| *value)
+                    .unwrap()
+            );
+            Ok(ChatResponse {
+                text: Some("wrap-up summary".into()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_preserves_every_native_thinking_level_and_budget() {
+        use zeroclaw_api::model_provider::ThinkingLevel;
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ] {
+            let params = crate::agent::thinking::apply_thinking_level_with_config(
+                level,
+                &zeroclaw_config::scattered_types::ThinkingConfig {
+                    native_thinking: true,
+                    ..Default::default()
+                },
+            );
+            let summary = crate::agent::thinking::scope_native_thinking(
+                &params,
+                run_summary(&NativeSummaryProvider),
+            )
+            .await
+            .unwrap();
+            assert!(summary.contains("wrap-up summary"));
+        }
     }
 
     // The graceful summary now routes through the metered provider seam: under a

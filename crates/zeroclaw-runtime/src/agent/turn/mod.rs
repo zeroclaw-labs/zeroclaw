@@ -1605,7 +1605,7 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
+) -> impl std::future::Future<Output = Result<String>> + Send + 'a {
     run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard)
 }
 
@@ -1614,13 +1614,13 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
 pub(crate) fn run_tool_call_loop_with_guard<'a>(
     p: ToolLoop<'a>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
+) -> impl std::future::Future<Output = Result<String>> + Send + 'a {
     run_tool_call_loop_impl(p, None, None, repetition_guard)
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
+) -> impl std::future::Future<Output = Result<String>> + Send + '_ {
     run_tool_call_loop_impl(p, None, None, None)
 }
 
@@ -2764,6 +2764,7 @@ async fn run_tool_call_loop_impl<'a>(
             zeroclaw_api::model_provider::ChatRequest {
                 messages: &provider_request_messages,
                 tools: request_tools,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()

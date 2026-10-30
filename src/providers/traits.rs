@@ -328,6 +328,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking_level: None,
             thinking: None,
         };
 
@@ -347,6 +348,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -482,6 +484,7 @@ mod tests {
                 ChatMessage::system("BASE_SYSTEM_PROMPT"),
             ],
             tools: Some(&tools),
+            thinking_level: None,
             thinking: None,
         };
 
@@ -508,6 +511,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking_level: None,
             thinking: None,
         };
 
@@ -534,6 +538,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking_level: None,
             thinking: None,
         };
 
@@ -598,6 +603,7 @@ mod tests {
             ChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "model",

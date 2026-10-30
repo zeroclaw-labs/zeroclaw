@@ -2369,6 +2369,7 @@ if [ "${1-}" = --warm-up ]; then exit 0; fi
             let request = ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             };
             let reply = model_provider

@@ -461,6 +461,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[],
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         for vision in [None, Some(false), Some(true)] {
@@ -553,6 +554,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "served-model",

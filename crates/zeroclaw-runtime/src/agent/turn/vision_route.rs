@@ -1677,6 +1677,7 @@ model = "vision-model"
                 zeroclaw_providers::ChatRequest {
                     messages: &dispatch_messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 &vision_provider.model,
