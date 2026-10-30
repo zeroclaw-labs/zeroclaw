@@ -16,6 +16,42 @@ use zeroclaw_api::tool::{ToolExecutionCancelled, ToolExecutionContext};
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
+/// Where a foreground delegate reports its child's tool calls: the parent
+/// turn's event sender and the parent's delegate tool-call id.
+#[derive(Clone)]
+pub(crate) struct ParentTurnEvents {
+    pub(crate) tx: Sender<TurnEvent>,
+    pub(crate) parent_tool_call_id: String,
+    /// Nesting below the parent's delegate call (0 for its direct child).
+    pub(crate) depth: u32,
+}
+
+tokio::task_local! {
+    /// The parent turn's event sink, scoped around each tool's `execute` when
+    /// the turn streams events. Spawned tasks do not inherit it; the parallel
+    /// fan-out carries it into its workers explicitly, and background
+    /// delegates never see it.
+    static PARENT_TURN_EVENTS: ParentTurnEvents;
+}
+
+/// The event sink of the turn executing the current tool, when that turn
+/// streams events.
+pub(crate) fn current_parent_turn_events() -> Option<ParentTurnEvents> {
+    PARENT_TURN_EVENTS.try_with(Clone::clone).ok()
+}
+
+/// Scope `future` under `events`, so a delegate it executes forwards its
+/// child's tool calls there. `None` runs `future` unscoped.
+pub(crate) async fn scope_parent_turn_events<F: std::future::Future>(
+    events: Option<ParentTurnEvents>,
+    future: F,
+) -> F::Output {
+    match events {
+        Some(events) => PARENT_TURN_EVENTS.scope(events, future).await,
+        None => future.await,
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// If a just-completed tool call was a successful `TodoWrite`, build the
@@ -353,9 +389,19 @@ async fn execute_one_tool_with_provenance(
     }
 
     let context = ToolExecutionContext::new(cancellation_token.cloned());
-    let execute = context
-        .run(tool.execute_with_context(call_arguments.clone(), &context))
-        .instrument(tool_span.clone());
+    let parent_events = event_tx.map(|tx| ParentTurnEvents {
+        tx: tx.clone(),
+        parent_tool_call_id: event_call_id.clone(),
+        depth: 0,
+    });
+    // Boxed so the tool future lives on the heap. Held inline, the scoped
+    // future made the turn future large enough to overflow a 2 MiB test
+    // thread stack (cron_uses_memory_free_8695).
+    let execute = scope_parent_turn_events(
+        parent_events,
+        Box::pin(context.run(tool.execute_with_context(call_arguments.clone(), &context))),
+    )
+    .instrument(tool_span.clone());
     let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
     } else {
@@ -2725,6 +2771,98 @@ mod tests {
         assert!(outcome.success);
         let seen = saw.lock().unwrap();
         seen.expect("the probe ran")
+    }
+
+    /// What a probe saw: `None` until it runs, then the sink's call id and depth.
+    type SeenParentEvents = Arc<Mutex<Option<Option<(String, u32)>>>>;
+
+    struct ParentEventsProbe {
+        seen: SeenParentEvents,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ParentEventsProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-parent-events-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ParentEventsProbe {
+        fn name(&self) -> &str {
+            "parent_events_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records the parent turn's event sink as the tool sees it"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.seen.lock().unwrap() = Some(
+                super::current_parent_turn_events()
+                    .map(|events| (events.parent_tool_call_id, events.depth)),
+            );
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: crate::tools::ToolOutput::from("probed"),
+                error: None,
+            })
+        }
+    }
+
+    async fn probe_parent_events(
+        event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    ) -> Option<(String, u32)> {
+        let seen = Arc::new(Mutex::new(None));
+        let probe: Box<dyn Tool> = Box::new(ParentEventsProbe {
+            seen: Arc::clone(&seen),
+        });
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![probe]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        execute_one_tool(
+            "parent_events_probe",
+            serde_json::json!({}),
+            Some("call-7"),
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            event_tx,
+        )
+        .await
+        .expect("probe executes");
+        seen.lock().unwrap().clone().expect("the probe ran")
+    }
+
+    #[tokio::test]
+    async fn tools_see_the_parent_event_sink_only_in_a_streaming_turn() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        assert_eq!(
+            probe_parent_events(Some(&tx)).await,
+            Some(("call-7".to_string(), 0))
+        );
+        assert_eq!(probe_parent_events(None).await, None);
+        assert!(super::current_parent_turn_events().is_none());
     }
 
     #[tokio::test]

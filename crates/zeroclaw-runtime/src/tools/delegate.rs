@@ -3777,6 +3777,9 @@ impl DelegateTool {
             let memory = self.memory.clone();
             let task_control_plane = Arc::clone(&self.task_control_plane);
             let __zc_delegate_alias = agent_name.clone();
+            // Spawned tasks drop task-locals; carry the parent turn's event
+            // sink so each worker's tool calls still reach it.
+            let parent_turn_events = crate::agent::tool_execution::current_parent_turn_events();
 
             // Build this worker's cost-tracking context BEFORE the detached
             // spawn from the TARGET's resolved policy, and carry it into the
@@ -3830,33 +3833,38 @@ impl DelegateTool {
                         progress: None,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = ExecutionTreeBudget::scope_optional(
-                        inherited_budget,
-                        TOOL_LOOP_THREAD_ID.scope(
-                            thread_scope,
-                            crate::sop::active_scope::with_inherited_headless_step_scope(
-                                step_scope,
-                                scope_delegate_session_key(session_key, async move {
-                                    crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                                        .scope(receipt_scope, async move {
-                                            let worker: std::pin::Pin<
-                                                Box<
-                                                    dyn std::future::Future<
-                                                            Output = anyhow::Result<ToolResult>,
-                                                        > + Send
-                                                        + '_,
-                                                >,
-                                            > = Box::pin(inner.execute_sync_with_target_admission(
-                                                &agent_name,
-                                                &prompt,
-                                                &args_clone,
-                                                DelegateAdmission::Required,
-                                                target_execution_admission,
-                                            ));
-                                            worker.await
-                                        })
-                                        .await
-                                }),
+                    let result = crate::agent::tool_execution::scope_parent_turn_events(
+                        parent_turn_events,
+                        ExecutionTreeBudget::scope_optional(
+                            inherited_budget,
+                            TOOL_LOOP_THREAD_ID.scope(
+                                thread_scope,
+                                crate::sop::active_scope::with_inherited_headless_step_scope(
+                                    step_scope,
+                                    scope_delegate_session_key(session_key, async move {
+                                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                            .scope(receipt_scope, async move {
+                                                let worker: std::pin::Pin<
+                                                    Box<
+                                                        dyn std::future::Future<
+                                                                Output = anyhow::Result<ToolResult>,
+                                                            > + Send
+                                                            + '_,
+                                                    >,
+                                                > = Box::pin(
+                                                    inner.execute_sync_with_target_admission(
+                                                        &agent_name,
+                                                        &prompt,
+                                                        &args_clone,
+                                                        DelegateAdmission::Required,
+                                                        target_execution_admission,
+                                                    ),
+                                                );
+                                                worker.await
+                                            })
+                                            .await
+                                    }),
+                                ),
                             ),
                         ),
                     )
@@ -5167,13 +5175,22 @@ impl DelegateTool {
                 })
             });
         // Background delegations report the loop's events to their progress
-        // sink; every other delegation keeps the inert observer.
-        let loop_observer: &dyn Observer = match self.progress.as_deref() {
-            Some(sink) => {
+        // sink. A foreground delegation inside a turn that streams events
+        // reports its tool calls to that turn; any other keeps the inert
+        // observer. Background work never sees the parent's sink: its turn
+        // may be gone, and `check_result` progress covers it.
+        let parent_turn_events = crate::agent::tool_execution::current_parent_turn_events()
+            .filter(|_| self.progress.is_none());
+        let activity_forwarder = parent_turn_events.clone().map(|parent| {
+            super::delegate_activity::DelegateActivityForwarder::new(parent, agent_name)
+        });
+        let loop_observer: &dyn Observer = match (self.progress.as_deref(), &activity_forwarder) {
+            (Some(sink), _) => {
                 sink.set_timeout_budget(agentic_timeout_secs);
                 sink
             }
-            None => &noop_observer,
+            (None, Some(forwarder)) => forwarder,
+            (None, None) => &noop_observer,
         };
         let receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
             .try_with(Clone::clone)
@@ -5288,6 +5305,21 @@ impl DelegateTool {
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
+        );
+        // A delegate the child runs reports one level deeper, still against
+        // the parent's delegate call. The child loop is type-erased first so
+        // the extra scope does not deepen the `Send` proof for `execute`.
+        let execution: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<anyhow::Result<String>, tokio::time::error::Elapsed>,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(execution);
+        let execution = crate::agent::tool_execution::scope_parent_turn_events(
+            parent_turn_events.map(super::delegate_activity::one_level_deeper),
+            execution,
         );
         let execution =
             ExecutionTreeBudget::scope_optional(execution_tree_budget, Box::pin(execution));
@@ -10937,6 +10969,116 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    fn drain_delegate_activity(
+        rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
+    ) -> Vec<zeroclaw_api::agent::DelegateActivity> {
+        let mut activity = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::DelegateActivity(a) = event {
+                activity.push(a);
+            }
+        }
+        activity
+    }
+
+    #[tokio::test]
+    async fn foreground_agentic_delegate_reports_child_tool_calls_to_the_parent_turn() {
+        use zeroclaw_api::agent::DelegateActivityPhase;
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles_with_approved_echo())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let model_provider = EchoToolResultThenFinalModelProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let parent = crate::agent::tool_execution::ParentTurnEvents {
+            tx,
+            parent_tool_call_id: "parent-delegate-call".into(),
+            depth: 0,
+        };
+        let result = crate::agent::tool_execution::scope_parent_turn_events(
+            Some(parent),
+            tool.execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "delegate failed: {result:?}");
+
+        let activity = drain_delegate_activity(&mut rx);
+        assert_eq!(activity.len(), 2, "one start and one finish: {activity:?}");
+        for a in &activity {
+            assert_eq!(a.parent_tool_call_id, "parent-delegate-call");
+            assert_eq!(a.agent, "agentic");
+            assert_eq!(a.depth, 0);
+            assert_eq!(a.tool_call_id, "call_1");
+            assert_eq!(a.tool_name, "echo_tool");
+        }
+        let DelegateActivityPhase::Started { arguments_summary } = &activity[0].phase else {
+            panic!("first is the start: {activity:?}");
+        };
+        assert!(
+            arguments_summary.starts_with("value: tool-result-limit"),
+            "{arguments_summary}"
+        );
+        let DelegateActivityPhase::Finished {
+            success,
+            output_preview,
+        } = &activity[1].phase
+        else {
+            panic!("second is the finish: {activity:?}");
+        };
+        assert!(*success);
+        assert!(output_preview.contains("echo:"), "{output_preview}");
+    }
+
+    #[tokio::test]
+    async fn background_delegate_does_not_report_to_the_parent_turn() {
+        let config = agentic_agent_config();
+        let mut tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles_with_approved_echo())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        // The rebuilt background tool is the one that carries a progress sink.
+        tool.progress = Some(crate::tools::delegate_progress::DelegateProgressSink::new(
+            None,
+        ));
+        let model_provider = EchoToolResultThenFinalModelProvider::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let parent = crate::agent::tool_execution::ParentTurnEvents {
+            tx,
+            parent_tool_call_id: "parent-delegate-call".into(),
+            depth: 0,
+        };
+        let result = crate::agent::tool_execution::scope_parent_turn_events(
+            Some(parent),
+            tool.execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "delegate failed: {result:?}");
+        assert!(
+            model_provider.tool_message().is_some(),
+            "the child must have run its tool for the absence to mean anything"
+        );
+        assert!(drain_delegate_activity(&mut rx).is_empty());
     }
 
     #[tokio::test]
