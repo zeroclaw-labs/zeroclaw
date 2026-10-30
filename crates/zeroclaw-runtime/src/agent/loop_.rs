@@ -22516,6 +22516,12 @@ Let me check the result."#;
             HookBudgetScenario::PlainToNativeFloor | HookBudgetScenario::SummaryFloor
         );
         let floor = over_soft_budget && !allow_soft_floor;
+        // The fail-closed floor gate counts native tool schemas in the
+        // non-droppable floor, so the PlainToNative soft-floor shape — schema
+        // floor above the operator budget, budget below model capacity — is
+        // now refused before dispatch instead of reaching the provider.
+        let budget_refusal =
+            matches!(scenario, HookBudgetScenario::PlainToNativeFloor) && allow_soft_floor;
         let capacity = if floor { budget } else { 32_768 };
         let hook_calls = Arc::new(AtomicUsize::new(0));
         let mut hooks = HookRunner::new();
@@ -22638,6 +22644,23 @@ Let me check the result."#;
                 exceeded.raw_estimated_tokens <= exceeded.estimated_tokens,
                 "calibration only ever scales the total up"
             );
+        } else if budget_refusal {
+            let error = result.expect_err(
+                "a native-schema floor at the operator budget must fail closed \
+                 before the provider call",
+            );
+            let refusal = error
+                .chain()
+                .find_map(|source| {
+                    source.downcast_ref::<crate::agent::turn::SystemPromptFloorExceedsBudget>()
+                })
+                .expect("the budget refusal must retain its typed cause");
+            assert_eq!(refusal.context_token_budget, budget);
+            assert!(
+                refusal.system_floor_tokens >= budget,
+                "the reported floor must cover the native tool schemas, got {}",
+                refusal.system_floor_tokens
+            );
         } else {
             let text = result.expect("request must fit");
             if summary {
@@ -22652,7 +22675,11 @@ Let me check the result."#;
             "one hook per preparation"
         );
         let captured = requests.lock().unwrap();
-        assert_eq!(captured.len(), if floor { 1 } else { 2 });
+        assert_eq!(
+            captured.len(),
+            if floor || budget_refusal { 1 } else { 2 },
+            "a refused turn must not dispatch the schema-heavy follow-up request"
+        );
         assert_eq!(captured[0].model, first_model);
         for request in captured.iter() {
             let tokens = estimate_history_tokens(&request.messages) + request.schema_tokens;
@@ -22661,7 +22688,7 @@ Let me check the result."#;
                 "an oversized request reached the provider"
             );
         }
-        if !floor {
+        if !floor && !budget_refusal {
             let next = &captured[1];
             assert_eq!(next.model, next_model);
             assert!(
@@ -22749,13 +22776,16 @@ Let me check the result."#;
                 "failed summary must not append a synthetic user turn"
             );
         }
+        // A budget refusal happens at the pre-dispatch gate, before any whole-
+        // turn trim: the older turn stays and no crumb or trim event is
+        // written.
         assert_eq!(
             history
                 .iter()
                 .any(|m| m.content.starts_with("retained older turn")),
-            untrimmed,
+            untrimmed || budget_refusal,
         );
-        assert_eq!(crumb_present, !untrimmed);
+        assert_eq!(crumb_present, !untrimmed && !budget_refusal);
         let mut trims = Vec::new();
         while let Ok(event) = event_rx.try_recv() {
             if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
@@ -22768,7 +22798,7 @@ Let me check the result."#;
                 trims.push((tokens_after, tokens_after_source, unsatisfiable_floor));
             }
         }
-        assert_eq!(trims.len(), usize::from(!untrimmed));
+        assert_eq!(trims.len(), usize::from(!untrimmed && !budget_refusal));
         if let Some((tokens_after, source, unsatisfiable)) = trims.first() {
             assert_eq!(*unsatisfiable, floor.then_some(true));
             assert_eq!(tokens_after.unwrap() > budget as u64, over_soft_budget);
@@ -22828,7 +22858,12 @@ Let me check the result."#;
     }
 
     #[tokio::test]
-    async fn hook_selected_native_schema_soft_floor_still_dispatches() {
+    async fn hook_selected_native_schema_soft_floor_fails_closed_before_dispatch() {
+        // The hook switches the follow-up request to a native-tools model,
+        // pushing the schema-inclusive non-droppable floor over the operator
+        // budget. The pre-dispatch gate must refuse before that request is
+        // sent — the budget is binding (below capacity), so the refusal is
+        // the typed budget error, not the model-window one.
         assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeFloor, true).await;
     }
 
