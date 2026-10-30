@@ -39,7 +39,8 @@ use zeroclaw_api::principal::PrincipalId;
 use zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard;
 use zeroclaw_runtime::rpc::dispatch::RPC_PROTOCOL_VERSION;
 
-/// Bound on daemon startup, until both `/health` and the local socket serve.
+/// Bound on daemon startup, until the local socket serves, and in a build
+/// with the gateway, `/health` too.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on one CLI run, so a CLI that blocks on the daemon fails the test
 /// instead of hanging it.
@@ -244,8 +245,9 @@ impl Daemon {
         daemon
     }
 
-    /// Wait until the gateway answers `/health`, the heartbeat names this
-    /// daemon, and the local socket answers `initialize` as `expected` says.
+    /// Wait until the heartbeat names this daemon, the local socket answers
+    /// `initialize` as `expected` says, and, in a build with the gateway, the
+    /// gateway answers `/health`. A CLI-only build serves no `/health`.
     fn wait_until_serving(&mut self, fixture: &Fixture, expected: Handshake) {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
@@ -255,7 +257,7 @@ impl Daemon {
                     self.output()
                 );
             }
-            if health_ok(fixture.port)
+            if (!cfg!(feature = "gateway") || health_ok(fixture.port))
                 && fixture.heartbeat_names(self.child.id())
                 && let Ok(mut probe) = RpcProbe::connect(&self.socket)
             {
@@ -268,7 +270,7 @@ impl Daemon {
             }
             assert!(
                 Instant::now() < deadline,
-                "the daemon did not serve /health, its heartbeat and {} within {STARTUP_TIMEOUT:?}\n{}",
+                "the daemon did not serve its heartbeat and {} (and, with the gateway, /health) within {STARTUP_TIMEOUT:?}\n{}",
                 self.socket.display(),
                 self.output()
             );
