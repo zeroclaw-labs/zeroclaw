@@ -4117,16 +4117,24 @@ impl RpcDispatcher {
     /// refusal is audited and answered FORBIDDEN. A caller the channel is not
     /// granted to is not told which channel owns the path; the audit record
     /// names it.
+    ///
+    /// The grants are re-resolved here rather than read from the binding this
+    /// spawned handle copied: a credential revoked or a profile narrowed after
+    /// the read loop admitted the request, but before this task ran, refuses
+    /// the delivery.
     fn admit_plugin_webhook(
         &self,
         owner: &zeroclaw_api::webhook::PluginWebhookOwner,
     ) -> Result<(), JsonRpcError> {
         let channel = plugin_webhook_channel(owner);
-        if self
-            .auth
-            .as_ref()
-            .is_some_and(|auth| !auth.grants.may_use_channel(&channel))
-        {
+        let Some(grants) = self.recheck_authority_after_admission(Method::PluginWebhookDispatch)?
+        else {
+            return Err(self.refuse_plugin_webhook(
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+                None,
+            ));
+        };
+        if !grants.may_use_channel(&channel) {
             return Err(self.refuse_plugin_webhook(
                 crate::i18n::get_required_cli_string_with_args(
                     "rpc-plugin-webhook-channel-not-granted-audit",
@@ -16528,6 +16536,75 @@ mod tests {
                 routes.seen.try_recv().is_err(),
                 "the route takes nothing once its binding is gone"
             );
+        }
+
+        /// The read loop admits a dispatch and hands a copy of the caller's
+        /// binding to the task that runs it. Admission must not trust that
+        /// copy: a profile narrowed in between refuses the delivery.
+        #[tokio::test]
+        async fn plugin_webhook_admission_rechecks_the_live_grants() {
+            use zeroclaw_api::grants::{Resource, Verb};
+            let ingress = test_ingress();
+            let _routes = publish(&ingress, &[ack_route()]);
+            let mut config = with_plugin_channels(roster_config(4242), &["fixture-alias"]);
+            let profile = config
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the roster profile exists");
+            profile.grants = HashMap::from([(Resource::Channels, vec![Verb::Execute])]);
+            profile.allowed_channels = vec!["plugin.fixture-alias".into()];
+            let (caller, _rx) = roster_connection(config, Arc::clone(&ingress)).await;
+            let owner = PluginWebhookOwner::new("fixture-plugin", "fixture-alias");
+
+            // The task's handle carries the grants resolved at initialize.
+            let handle = caller.spawn_handle();
+            let copied = handle.auth.as_ref().expect("the roster uid is bound");
+            assert!(copied.grants.may_use_channel("plugin.fixture-alias"));
+            handle
+                .admit_plugin_webhook(&owner)
+                .expect("the granted channel is admitted");
+
+            // Narrow the live profile: the copy still says yes, admission no.
+            let mut narrowed = handle.ctx.config.read().clone();
+            narrowed
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the roster profile exists")
+                .allowed_channels
+                .clear();
+            handle
+                .ctx
+                .auth
+                .refresh_from_config(&narrowed)
+                .expect("the narrowed policy compiles");
+            assert!(copied.grants.may_use_channel("plugin.fixture-alias"));
+            let refused = handle
+                .admit_plugin_webhook(&owner)
+                .expect_err("a channel no longer granted is refused");
+            assert_eq!(refused.code, FORBIDDEN, "{refused:?}");
+            assert!(
+                !refused.message.contains("fixture-alias"),
+                "the refusal names no channel: {}",
+                refused.message
+            );
+
+            // Drop the method grant itself: refused before the selector.
+            let mut revoked = handle.ctx.config.read().clone();
+            revoked
+                .permission_profiles
+                .get_mut("reader")
+                .expect("the roster profile exists")
+                .grants
+                .clear();
+            handle
+                .ctx
+                .auth
+                .refresh_from_config(&revoked)
+                .expect("the revoked policy compiles");
+            let refused = handle
+                .admit_plugin_webhook(&owner)
+                .expect_err("a caller without channels:execute is refused");
+            assert_eq!(refused.code, FORBIDDEN, "{refused:?}");
         }
 
         #[test]
