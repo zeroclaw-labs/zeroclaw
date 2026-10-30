@@ -684,6 +684,42 @@ mod tests {
     }
 
     #[test]
+    fn multiline_unicode_messages_keep_jsonl_framing_after_reopen_and_compact() {
+        let tmp = TempDir::new().unwrap();
+        let key = "framing_test";
+        let messages = [
+            ChatMessage::user("  问题🦀\n{\"role\":\"assistant\",\"content\":\"quoted\"}\r\n"),
+            ChatMessage::assistant("回答 e\u{301}\n\n\"quoted\" \\ path\tend  "),
+        ];
+        {
+            let store = SessionStore::new(tmp.path()).unwrap();
+            for message in &messages {
+                store.append(key, message).unwrap();
+            }
+            let raw = std::fs::read_to_string(store.session_path(key)).unwrap();
+            assert_eq!(raw.lines().count(), messages.len());
+        }
+
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        // Both the permissive reader and the fail-closed reader must retain
+        // content whitespace and message boundaries through a file rewrite.
+        for compact in [false, true] {
+            if compact {
+                reopened.compact(key).unwrap();
+            }
+            for loaded in [reopened.load(key), reopened.try_load(key).unwrap()] {
+                assert_eq!(loaded.len(), messages.len());
+                for (actual, expected) in loaded.iter().zip(&messages) {
+                    assert_eq!(actual.role, expected.role);
+                    assert_eq!(actual.content, expected.content);
+                }
+            }
+            let raw = std::fs::read_to_string(reopened.session_path(key)).unwrap();
+            assert_eq!(raw.lines().count(), messages.len());
+        }
+    }
+
+    #[test]
     fn trim_breadcrumb_round_trips_and_survives_reopen() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
