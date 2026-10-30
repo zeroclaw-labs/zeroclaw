@@ -1624,6 +1624,7 @@ sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+tool-file-read-error-pattern-not-allowed = Path not allowed by file_read allowed patterns: '{ $path }'
 
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
