@@ -435,6 +435,15 @@ impl Memory for RetrievalPipeline {
         self.memory.health_check().await
     }
 
+    async fn recall_for_supersession(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Supersession must not consume cached ordinary search scores.
+        self.memory.recall_for_supersession(query, limit).await
+    }
+
     async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
         let result = self.memory.supersede(superseded_ids, new_id).await;
         // A real supersede (non-empty ids) or an uncertain outcome (error)
