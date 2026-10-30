@@ -11,7 +11,7 @@ use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::process::Stdio;
 use std::str::FromStr;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, all(test, target_os = "linux")))]
 use std::sync::mpsc;
 #[cfg(windows)]
 use std::sync::mpsc::Receiver;
@@ -21,7 +21,9 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use std::time::Instant;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::io::{AsyncRead, AsyncReadExt};
 #[cfg(any(target_os = "linux", target_os = "macos", all(test, not(unix))))]
@@ -46,7 +48,6 @@ const SERVICE_LOG_PENDING_BYTES: usize = 1024 * 1024;
 const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
@@ -4067,28 +4068,19 @@ mod bounded_service_log_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn desktop_capture_reuses_stable_executable_after_atomic_swap() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("logs/desktop-daemon.log");
         let executable = dir.path().join("desktop-child");
         let replacement = dir.path().join("desktop-child.next");
-        fs::write(
-            &replacement,
-            format!(
-                "#!/bin/sh\nprintf 'stable-generation-two:%s\\n' \"$ZEROCLAW_DESKTOP_SUPERVISED\"\n"
-            ),
-        )
-        .expect("write replacement child");
-        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700))
-            .expect("make replacement child executable");
-        fs::write(
-            &executable,
-            "#!/bin/sh\nprintf 'stable-generation-one:%s\\n' \"$ZEROCLAW_DESKTOP_SUPERVISED\"\n: > \"$ZEROCLAW_DESKTOP_RESTART_MARKER\"\nmv \"$(dirname \"$0\")/desktop-child.next\" \"$0\"\nexit 75\n",
-        )
-        .expect("write initial child");
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
-            .expect("make initial child executable");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        // Keep real stable-path replacement without writing executable bytes while
+        // sibling tests may fork and inherit a fixture's writable descriptor.
+        symlink(fixtures.join("desktop-generation-two.sh"), &replacement)
+            .expect("link replacement child");
+        symlink(fixtures.join("desktop-generation-one.sh"), &executable)
+            .expect("link initial child");
 
         run_desktop_capture_with_executable(path.clone(), executable, 0)
             .await
@@ -4718,6 +4710,20 @@ mod service_helper_tests {
             service_log_targets(&stdout_log, &stderr_log),
             vec![stdout_log],
             "a capture file that was never created is not a target"
+        );
+    }
+
+    #[test]
+    fn follow_log_targets_ignores_missing_streams() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stderr_log, "late failure\n").unwrap();
+
+        assert_eq!(
+            follow_log_targets(&stdout_log, &stderr_log),
+            vec![stderr_log],
+            "follow mode should attach only to streams that exist"
         );
     }
 

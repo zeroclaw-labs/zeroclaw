@@ -324,7 +324,7 @@ pub async fn handle_sop_run(
                                 action.as_ref().clone(),
                                 Some(
                                     zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
-                                        std::sync::Arc::clone(&state.config),
+                                        state.config.clone(),
                                         state.agent_lifecycle.clone(),
                                     ),
                                 ),
@@ -338,7 +338,7 @@ pub async fn handle_sop_run(
                                 action.as_ref().clone(),
                                 Some(
                                     zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
-                                        std::sync::Arc::clone(&state.config),
+                                        state.config.clone(),
                                         state.agent_lifecycle.clone(),
                                     ),
                                 ),
@@ -691,7 +691,7 @@ pub async fn handle_sop_decide(
             &outcome,
             Some(
                 zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
-                    std::sync::Arc::clone(&state.config),
+                    state.config.clone(),
                     state.agent_lifecycle.clone(),
                 ),
             ),

@@ -121,6 +121,50 @@ pub struct TaskSnapshot {
     pub task: TaskRecord,
     pub output: Option<String>,
     pub error: Option<String>,
+    /// Latest live progress the running owner recorded, when any.
+    pub progress: Option<TaskProgress>,
+}
+
+/// Bounded live progress a running task's owner records for its readers.
+///
+/// Stored in the task row, so it is gated by the same visibility check as the
+/// terminal output. Carries counts, tool names and receipts only; tool
+/// arguments, tool results, error text and prompt content are never recorded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProgress {
+    /// RFC3339 time of the most recent recorded event.
+    #[serde(default)]
+    pub last_activity_at: Option<String>,
+    /// Model requests the task's loop has issued.
+    #[serde(default)]
+    pub iterations: u32,
+    /// Tool calls that have finished.
+    #[serde(default)]
+    pub tools_completed: u32,
+    /// The tool call most recently started, finished or not.
+    #[serde(default)]
+    pub last_tool: Option<TaskProgressTool>,
+    /// Wall-clock budget the task runs under, when it has one.
+    #[serde(default)]
+    pub timeout_budget_secs: Option<u64>,
+    /// Most recent finished tool calls, oldest first.
+    #[serde(default)]
+    pub recent_tools: Vec<TaskProgressTool>,
+    /// Most recent signed tool receipts, oldest first.
+    #[serde(default)]
+    pub receipt_tail: Vec<String>,
+}
+
+/// One tool call in [`TaskProgress`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProgressTool {
+    pub name: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub success: Option<bool>,
 }
 
 /// A durably recorded terminal transition that has not yet been applied to the
@@ -229,7 +273,20 @@ pub trait TaskRegistry: Send + Sync {
             task,
             output: None,
             error: None,
+            progress: None,
         }))
+    }
+    /// Record live progress for a running task and refresh its heartbeat.
+    /// Only the owning boot can write, and only while the task is running;
+    /// returns `false` when either check fails.
+    async fn record_progress(
+        &self,
+        id: &str,
+        owner_boot_id: &str,
+        progress: &TaskProgress,
+    ) -> anyhow::Result<bool> {
+        let _ = (id, owner_boot_id, progress);
+        anyhow::bail!("task registry does not support progress records")
     }
     async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>>;
     async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>>;

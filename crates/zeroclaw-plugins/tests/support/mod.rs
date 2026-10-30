@@ -24,13 +24,26 @@ pub fn admit_fixture(path: &Path, manifest: &PluginManifest) -> AdmittedComponen
     std::fs::write(plugin_dir.join("manifest.toml"), manifest_toml)
         .expect("write fixture manifest");
 
+    if manifest.capabilities.contains(&PluginCapability::Memory) {
+        // The host lists no memory packages yet, so admit this one the way
+        // `plugin install` admits a source, into a host with nothing installed.
+        let plugins = tempdir().expect("create empty plugins root");
+        let host = PluginHost::from_plugins_dir(plugins.path()).expect("open empty plugin host");
+        let source = plugin_dir.to_str().expect("fixture package path is UTF-8");
+        let admitted = host.admit_source(source).expect("admit fixture package");
+        return admitted
+            .component()
+            .expect("a memory fixture ships a component")
+            .clone();
+    }
+
     let host = PluginHost::from_plugins_dir(root.path()).expect("admit fixture package");
     let details = if manifest.capabilities.contains(&PluginCapability::Tool) {
         host.tool_plugin_details()
     } else if manifest.capabilities.contains(&PluginCapability::Channel) {
         host.channel_plugin_details()
     } else {
-        panic!("fixture helper supports tool and channel components")
+        panic!("fixture helper supports tool, channel, and memory components")
     };
     assert_eq!(details.len(), 1, "fixture package must be admitted once");
     details[0].1.clone()

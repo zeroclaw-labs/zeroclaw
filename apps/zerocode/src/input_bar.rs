@@ -722,6 +722,12 @@ pub(crate) struct InputBarState {
     last_input_area: Rect,
     /// Cached inner width from the most recent render.
     last_inner_width: u16,
+    /// Rect of the autocomplete popup from the most recent render, for
+    /// mouse hit-testing. `None` when the popup was not drawn.
+    last_autocomplete_area: Option<Rect>,
+    /// Index of the first match drawn in the popup. The popup can be shorter
+    /// than the match list; render scrolls this to keep the highlight visible.
+    autocomplete_scroll: usize,
 
     // Phase 4: Text selection
     /// Text selection range as byte offsets (start, end) where start <= end.
@@ -791,6 +797,8 @@ impl InputBarState {
             scroll_offset: 0,
             last_input_area: Rect::default(),
             last_inner_width: 0,
+            last_autocomplete_area: None,
+            autocomplete_scroll: 0,
             selection: None,
             selection_anchor: None,
             autocomplete_matches: Vec::new(),
@@ -892,6 +900,11 @@ impl InputBarState {
         use crate::keymap::InputBarAction as A;
         match A::from_chord(key) {
             Some(A::CopySelection | A::Cut) => self.has_selection(),
+            Some(A::HistoryPrev | A::HistoryNext) => !self.input.is_empty(),
+            // Tab and Esc are completion keys while the popup is open. Esc is
+            // also a chat browse chord, and non-character chords otherwise
+            // bypass the composer.
+            Some(A::AutocompleteAccept | A::AutocompleteCancel) => self.autocomplete_active,
             Some(
                 A::Undo
                 | A::Redo
@@ -1054,7 +1067,19 @@ impl InputBarState {
         self.provider_catalog = providers;
     }
 
+    /// Popup state for tests outside this module: (entry count, highlighted
+    /// index, open).
+    #[cfg(test)]
+    pub(crate) fn autocomplete_snapshot(&self) -> (usize, Option<usize>, bool) {
+        (
+            self.autocomplete_matches.len(),
+            self.autocomplete_index,
+            self.autocomplete_active,
+        )
+    }
+
     fn dismiss_autocomplete(&mut self) {
+        self.autocomplete_scroll = 0;
         self.autocomplete_active = false;
         self.autocomplete_matches.clear();
         self.autocomplete_index = None;
@@ -1084,6 +1109,50 @@ impl InputBarState {
             }
             state.cursor = state.input.len();
         });
+    }
+
+    /// Mouse over the completion popup: a left click on a row fills the
+    /// input with that entry (like Tab), the wheel moves the highlight, and
+    /// anything else inside the popup is swallowed so it can't reach the
+    /// transcript underneath. Returns false when the event is outside it.
+    fn handle_autocomplete_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !self.autocomplete_active {
+            return false;
+        }
+        let Some(area) = self.last_autocomplete_area else {
+            return false;
+        };
+        if !mouse::in_rect(mouse.column, mouse.row, area) {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Row 0 and the last row are the borders.
+                let inner_top = area.y + 1;
+                let inner_bottom = area.y + area.height.saturating_sub(1);
+                if mouse.row >= inner_top && mouse.row < inner_bottom {
+                    let index = self.autocomplete_scroll + usize::from(mouse.row - inner_top);
+                    if let Some(choice) = self.autocomplete_matches.get(index).cloned() {
+                        self.autocomplete_index = Some(index);
+                        self.apply_autocomplete_choice(&choice);
+                        self.dismiss_autocomplete();
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(idx) = self.autocomplete_index {
+                    self.autocomplete_index = Some(idx.saturating_sub(1));
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(idx) = self.autocomplete_index {
+                    let max = self.autocomplete_matches.len().saturating_sub(1);
+                    self.autocomplete_index = Some((idx + 1).min(max));
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     fn accept_completion_on_submit(&mut self) -> InputBarAction {
@@ -1810,6 +1879,10 @@ impl InputBarState {
             return true;
         }
 
+        if self.handle_autocomplete_mouse(mouse) {
+            return true;
+        }
+
         // Input bar interactions.
         if !mouse::in_rect(mouse.column, mouse.row, self.last_input_area) {
             return false;
@@ -2413,7 +2486,8 @@ impl InputBarState {
     }
 
     /// Render the auto-complete popup above the input bar if active.
-    pub fn render_autocomplete_popup(&self, f: &mut Frame) {
+    pub fn render_autocomplete_popup(&mut self, f: &mut Frame) {
+        self.last_autocomplete_area = None;
         if !self.autocomplete_active || self.autocomplete_matches.is_empty() {
             return;
         }
@@ -2442,11 +2516,27 @@ impl InputBarState {
         }
 
         f.render_widget(Clear, popup_rect);
+        self.last_autocomplete_area = Some(popup_rect);
+
+        // A short terminal clips the popup. Scroll so the highlighted entry
+        // stays in view, and draw only the visible slice.
+        let visible = usize::from(popup_rect.height.saturating_sub(2)).max(1);
+        let max_scroll = self.autocomplete_matches.len().saturating_sub(visible);
+        if let Some(idx) = self.autocomplete_index {
+            if idx < self.autocomplete_scroll {
+                self.autocomplete_scroll = idx;
+            } else if idx >= self.autocomplete_scroll + visible {
+                self.autocomplete_scroll = idx + 1 - visible;
+            }
+        }
+        self.autocomplete_scroll = self.autocomplete_scroll.min(max_scroll);
 
         let items: Vec<ListItem> = self
             .autocomplete_matches
             .iter()
             .enumerate()
+            .skip(self.autocomplete_scroll)
+            .take(visible)
             .map(|(i, cmd)| {
                 let style = if Some(i) == self.autocomplete_index {
                     theme::selected_style()
@@ -4339,6 +4429,182 @@ mod tests {
     }
 
     // ── Auto-complete tests ──────────────────────────────────
+
+    /// Draw the bar in the lower rows of a terminal and the completion popup
+    /// above it, the way the chat pane does.
+    fn render_bar_with_popup(bar: &mut InputBarState) {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 16, 60, 4);
+                bar.render(
+                    frame,
+                    area,
+                    false,
+                    false,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+                bar.render_autocomplete_popup(frame);
+            })
+            .expect("draw input bar");
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn composer_claims_completion_keys_only_while_the_popup_is_open() {
+        let mut bar = input_bar_with_shared_commands();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        bar.insert_text("hello");
+        assert!(!bar.autocomplete_active);
+        assert!(!bar.claims_edit_key(&tab));
+        assert!(!bar.claims_edit_key(&esc));
+
+        bar.clear_input();
+        bar.insert_text("/");
+        assert!(bar.autocomplete_active);
+        assert!(bar.claims_edit_key(&tab));
+        assert!(bar.claims_edit_key(&esc));
+    }
+
+    #[test]
+    fn clicking_an_autocomplete_row_fills_that_command() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        assert!(bar.autocomplete_matches.len() >= 2);
+        let second = bar.autocomplete_matches[1].clone();
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+
+        // Row 0 is the top border; row 2 is the second entry.
+        assert!(bar.handle_mouse(left_click(area.x + 2, area.y + 2)));
+
+        assert_eq!(bar.input(), second);
+        assert!(!bar.autocomplete_active);
+    }
+
+    #[test]
+    fn clicking_the_autocomplete_border_keeps_the_popup_open() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+
+        assert!(bar.handle_mouse(left_click(area.x + 2, area.y)));
+
+        assert_eq!(bar.input(), "/");
+        assert!(bar.autocomplete_active);
+    }
+
+    #[test]
+    fn scrolling_over_autocomplete_moves_the_highlight() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+        let scroll = |kind| MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert!(bar.handle_mouse(scroll(MouseEventKind::ScrollDown)));
+        assert_eq!(bar.autocomplete_index, Some(1));
+        assert!(bar.handle_mouse(scroll(MouseEventKind::ScrollUp)));
+        assert_eq!(bar.autocomplete_index, Some(0));
+    }
+
+    /// Draw the bar at the bottom of a short terminal, so the popup is
+    /// clipped to fewer rows than there are matches, and return the buffer.
+    fn render_short_popup(bar: &mut InputBarState) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                bar.render(
+                    frame,
+                    Rect::new(0, 4, 60, 4),
+                    false,
+                    false,
+                    &TurnStatus::Idle,
+                    Instant::now(),
+                    None,
+                );
+                bar.render_autocomplete_popup(frame);
+            })
+            .expect("draw input bar");
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {
+        (area.x..area.right())
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn clipped_autocomplete_scrolls_to_keep_the_highlight_visible() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        let count = bar.autocomplete_matches.len();
+        render_short_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+        let visible = usize::from(area.height - 2);
+        assert!(
+            visible >= 2 && count > visible + 1,
+            "need a clipped popup: {visible} rows for {count} matches"
+        );
+
+        // Move the highlight one past the last row the popup can show.
+        let target = visible;
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        for _ in 0..target {
+            bar.handle_key(down);
+        }
+        assert_eq!(bar.autocomplete_index, Some(target));
+        let buffer = render_short_popup(&mut bar);
+        let selected = bar.autocomplete_matches[target].clone();
+        let last_row = area.y + area.height - 2;
+        let shown = row_text(&buffer, area, last_row);
+        assert!(
+            shown.contains(&format!("{selected} ")) || shown.trim_end().ends_with(&selected),
+            "highlighted {selected:?} must be on the last visible row, got {shown:?}"
+        );
+
+        // A click on the first visible row picks the scrolled-to entry,
+        // not the first match.
+        let first_visible = bar.autocomplete_matches[1].clone();
+        assert!(bar.handle_mouse(left_click(area.x + 2, area.y + 1)));
+        assert_eq!(bar.input(), first_visible);
+    }
+
+    #[test]
+    fn closed_autocomplete_does_not_capture_clicks() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/");
+        render_bar_with_popup(&mut bar);
+        let area = bar.last_autocomplete_area.expect("popup rendered");
+        bar.insert_text(" ");
+        assert!(!bar.autocomplete_active);
+        render_bar_with_popup(&mut bar);
+        assert_eq!(bar.last_autocomplete_area, None);
+
+        assert!(!bar.handle_mouse(left_click(area.x + 2, area.y + 2)));
+        assert_eq!(bar.input(), "/ ");
+    }
 
     #[test]
     fn autocomplete_triggers_on_slash() {

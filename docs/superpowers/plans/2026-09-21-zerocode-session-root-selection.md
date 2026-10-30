@@ -1,6 +1,16 @@
 # ZeroCode Session Root Selection Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use markdown checkbox syntax for tracking; every step below is checked off because this plan has been fully executed — see the final verification note in Task 5.
+> **Historical note, superseded for fresh local roots by #11219 (2026-10-02).**
+> The fresh/restarted local `cwd: null` and agent-workspace default described
+> below caused #11044's launch-project regression. The current contract is in
+> [Running zerocode](../../book/src/zerocode/running.md): fresh/restarted local
+> Chat and Code send the launch directory, explicit selection wins, and capture
+> failure refuses creation while restoring an existing sibling and its notice.
+> Resume still omits `cwd`; WSS Chat uses the daemon workspace and WSS Code uses
+> the daemon-side picker. The original design and completed steps below remain
+> historical evidence, including the superseded local-request test instructions.
+>
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use markdown checkbox syntax for tracking; every step below is checked off because this plan has been fully executed, see the final verification note in Task 5.
 
 **Goal:** Make fresh ZeroCode sessions default to the selected agent workspace while allowing explicit Code directory selection, preserving saved Code roots on resume, and exposing `/change-directory` as a safe new-session transition.
 
@@ -12,14 +22,14 @@
 
 ## File Map
 
-- Modify: `apps/zerocode/src/input_bar.rs` — register and parse `/change-directory`, expose a dedicated input action, and update parser/registry tests.
-- Modify: `apps/zerocode/src/chat.rs` — add the change-directory phase, picker transition, explicit path conversion, default/resume cwd precedence, session restoration, and request-boundary tests.
-- Modify: `apps/zerocode/locales/en/zerocode.ftl` — add English change-directory help and error strings.
-- Modify: `apps/zerocode/locales/es/zerocode.ftl` — add Spanish translations for the same identifiers.
-- Modify: `apps/zerocode/locales/fr/zerocode.ftl` — add French translations for the same identifiers.
-- Modify: `apps/zerocode/locales/ja/zerocode.ftl` — add Japanese translations for the same identifiers.
-- Modify: `apps/zerocode/locales/zh-CN/zerocode.ftl` — add Simplified Chinese translations for the same identifiers.
-- Modify: `docs/book/src/zerocode/running.md` — document agent-workspace defaults, explicit Code roots, Code resume roots, and Chat reattachment wording.
+- Modify: `apps/zerocode/src/input_bar.rs`, register and parse `/change-directory`, expose a dedicated input action, and update parser/registry tests.
+- Modify: `apps/zerocode/src/chat.rs`, add the change-directory phase, picker transition, explicit path conversion, default/resume cwd precedence, session restoration, and request-boundary tests.
+- Modify: `apps/zerocode/locales/en/zerocode.ftl`, add English change-directory help and error strings.
+- Modify: `apps/zerocode/locales/es/zerocode.ftl`, add Spanish translations for the same identifiers.
+- Modify: `apps/zerocode/locales/fr/zerocode.ftl`, add French translations for the same identifiers.
+- Modify: `apps/zerocode/locales/ja/zerocode.ftl`, add Japanese translations for the same identifiers.
+- Modify: `apps/zerocode/locales/zh-CN/zerocode.ftl`, add Simplified Chinese translations for the same identifiers.
+- Modify: `docs/book/src/zerocode/running.md`, document agent-workspace defaults, explicit Code roots, Code resume roots, and Chat reattachment wording.
 
 ---
 
@@ -206,8 +216,8 @@ fn explicit_cwd(
 }
 ```
 
-Both rejections are existing `LocalCodeCwdError` variants — `NotUtf8` and
-`NotAbsolute` — and are reported through the already-localized
+Both rejections are existing `LocalCodeCwdError` variants, `NotUtf8` and
+`NotAbsolute`, and are reported through the already-localized
 `zc-chat-code-cwd-not-utf8` / `zc-chat-code-cwd-not-absolute` keys, so no new
 error text is introduced. `is_absolute_session_root` is transport-aware:
 `Transport::Local` uses the native `Path::is_absolute`, while `Transport::Wss`
@@ -360,7 +370,7 @@ async fn apply_change_directory_selection(
 }
 ```
 
-If `start_session` fails, `restore_change_directory_session` returns to the stashed session and reports the failure as an error-styled `InfoMessage` (replacing the generic session-start notice the restore may already have left), rather than stranding the pane on the error screen. A rejected path is reported the same way without any request being sent, so resume ownership stays untouched. If the picker is cancelled, the stashed state is restored with no `session/new` and no notice — a cancel is not a failure. On success, the old state remains in `background` and the new state becomes active.
+If `start_session` fails, `restore_change_directory_session` returns to the stashed session and reports the failure as an error-styled `InfoMessage` (replacing the generic session-start notice the restore may already have left), rather than stranding the pane on the error screen. A rejected path is reported the same way without any request being sent, so resume ownership stays untouched. If the picker is cancelled, the stashed state is restored with no `session/new` and no notice, a cancel is not a failure. On success, the old state remains in `background` and the new state becomes active.
 
 - [x] **Step 6: Add localized help text**
 
@@ -638,7 +648,7 @@ snippets in Tasks 1–3 have been reconciled with the code that actually landed
 session cap checked before the stash, deferred retained-resume demotion, and
 the `apply_change_directory_selection` confirm path).
 
-**Shipped head:** `2f0bcf0e7` — *fix(zerocode): harden cross-platform session
+**Shipped head:** `2f0bcf0e7`, *fix(zerocode): harden cross-platform session
 roots*, the last implementation commit of this plan.
 
 **Verification at that head:**
@@ -647,12 +657,12 @@ roots*, the last implementation commit of this plan.
 | --- | --- | --- |
 | Formatting | `cargo fmt -p zerocode -- --check` | exit 0, no diffs |
 | Lint | `cargo clippy -p zerocode --all-targets -- -D warnings` | exit 0, no warnings |
-| Tests | `cargo test -p zerocode` | exit 0 — 1238 passed, 0 failed, 3 ignored in the binary target, plus the auxiliary harness targets passing; 0 failures overall |
+| Tests | `cargo test -p zerocode` | exit 0, 1238 passed, 0 failed, 3 ignored in the binary target, plus the auxiliary harness targets passing; 0 failures overall |
 | Docs quality | `scripts/ci/docs_quality_gate.sh` | exit 0, 0 errors |
 | Docs links | `scripts/ci/docs_links_gate.sh` | exit 0, 0 broken links |
 
 **Remaining gap:** no live interactive TUI smoke test was possible in this
-environment — there is no attached terminal or running daemon to drive
+environment, there is no attached terminal or running daemon to drive
 `/change-directory` by hand. The flow is covered at the key-event and JSON-RPC
 request boundaries (`change_directory_cancel_restores_existing_session`,
 `change_directory_invalid_path_restores_existing_session`,

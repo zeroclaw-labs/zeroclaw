@@ -22,6 +22,8 @@
 //! records what it rendered in [`MediaAttachment::marker`], and later stages
 //! defer to that instead of re-deciding.
 
+use serde::{Deserialize, Serialize};
+
 /// Classifies an attachment by MIME type or file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
@@ -41,7 +43,8 @@ pub enum MediaKind {
 ///
 /// [`Image`]: MarkerKind::Image
 /// [`Document`]: MarkerKind::Document
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MarkerKind {
     /// A re-loadable `[IMAGE:<target>]` the multimodal loader accepts.
     Image,
@@ -76,7 +79,7 @@ impl MarkerKind {
 /// disposition cannot say whether the channel rendered an image or a document,
 /// which is exactly the distinction a downstream stage needs to avoid
 /// re-classifying a rendered document as an image.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderedMarker {
     /// The exact target the channel rendered (a saved path or a URL).
     pub target: String,

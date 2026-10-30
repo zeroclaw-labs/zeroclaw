@@ -78,7 +78,7 @@ pub use subscriber::{
 };
 pub use tool_io::{ToolIoCapture, capture_llm_request, capture_tool_input, capture_tool_output};
 pub use writer::{
-    active_log_path, active_log_query_scope, flush_for_test, init_from_config,
+    active_log_path, active_log_query_scope, flush, flush_for_test, init_from_config,
     llm_request_payload_policy, record_event, runtime_trace_path,
 };
 
@@ -103,4 +103,16 @@ pub fn __private_test_writer_lock() -> impl Drop {
 #[must_use]
 pub fn __private_test_hook_lock() -> impl Drop {
     crate::broadcast::HOOK_TEST_LOCK.lock()
+}
+
+/// Test support: whether the dispatcher active on the calling thread
+/// includes [`LogCaptureLayer`]. Capture tests report this when an
+/// expected event is missing, to tell "the layer never saw it" apart
+/// from "the broadcast channel lost it".
+#[doc(hidden)]
+#[must_use]
+pub fn __private_test_capture_layer_active() -> bool {
+    ::tracing::dispatcher::get_default(|dispatch| {
+        dispatch.downcast_ref::<LogCaptureLayer>().is_some()
+    })
 }

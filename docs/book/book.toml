@@ -20,6 +20,9 @@ additional-js = [
 ]
 additional-css = ["theme/pc-themes.css", "theme/custom.css"]
 
+[output.html.redirect]
+"/contributing/multi-agent-setup.html" = "../agents/multi-agent-setup.html"
+
 [output.html.search]
 enable = true
 limit-results = 30
