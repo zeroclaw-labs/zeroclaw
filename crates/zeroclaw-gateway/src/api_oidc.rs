@@ -2176,11 +2176,17 @@ mod tests {
             .mount(&server)
             .await;
         let state = crate::api::tests::test_state(config_with_alias(&server.uri(), "corp"));
-        let config = state.config.clone();
+        let authority = state.config_authority.clone();
         let router = routes().with_state(state);
 
         let flow_state = start_login(&router).await;
-        config.write().oidc.clear();
+        let commit = authority.begin_config_commit().await.unwrap();
+        let mut config = commit.current_config();
+        config.oidc.clear();
+        commit
+            .publish(commit.next_revision().unwrap(), config)
+            .unwrap();
+        drop(commit);
 
         let response = send(
             &router,

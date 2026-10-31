@@ -35,6 +35,7 @@ pub use turn::{
     redact::{is_credential_key, scrub_credentials_value},
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
+pub use turn::{SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture};
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(
