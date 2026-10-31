@@ -514,6 +514,61 @@ impl RuntimeAdapter for NativeRuntime {
 mod tests {
     use super::*;
 
+    /// Per-test PowerShell cache root for Linux/macOS. Parallel nextest workers
+    /// share `$HOME`, and concurrent `pwsh` exits can corrupt
+    /// `~/.cache/powershell/StartupProfileData-NonInteractive` (upstream PowerShell
+    /// startup-profile race). Pin each test's `pwsh` processes to an exclusive
+    /// `XDG_CACHE_HOME` instead. Windows keeps its cache under `LOCALAPPDATA`;
+    /// leave that path alone.
+    struct IsolatedPowershellCache {
+        #[cfg(not(target_os = "windows"))]
+        dir: tempfile::TempDir,
+    }
+
+    impl IsolatedPowershellCache {
+        fn new() -> Self {
+            Self {
+                #[cfg(not(target_os = "windows"))]
+                dir: tempfile::tempdir().expect("powershell test cache tempdir"),
+            }
+        }
+
+        fn apply_std(&self, cmd: &mut std::process::Command) {
+            #[cfg(not(target_os = "windows"))]
+            {
+                cmd.env("XDG_CACHE_HOME", self.dir.path());
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = cmd;
+            }
+        }
+
+        fn apply_tokio(&self, cmd: &mut tokio::process::Command) {
+            #[cfg(not(target_os = "windows"))]
+            {
+                cmd.env("XDG_CACHE_HOME", self.dir.path());
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = cmd;
+            }
+        }
+    }
+
+    fn find_powershell_interpreter(cache: &IsolatedPowershellCache) -> Option<&'static str> {
+        ["pwsh", "powershell"].into_iter().find(|candidate| {
+            let mut probe = std::process::Command::new(candidate);
+            cache.apply_std(&mut probe);
+            probe
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        })
+    }
+
     #[test]
     fn default_candidates_skip_unavailable_login_shell() {
         let selected = first_available(["/missing/login-shell", "bash", "/bin/sh"], |candidate| {
@@ -751,14 +806,8 @@ mod tests {
 
     #[tokio::test]
     async fn powershell_full_scripts_execute_with_native_semantics() {
-        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
-            std::process::Command::new(candidate)
-                .arg("-NoProfile")
-                .arg("-Command")
-                .arg("exit 0")
-                .output()
-                .is_ok()
-        }) else {
+        let cache = IsolatedPowershellCache::new();
+        let Some(interpreter) = find_powershell_interpreter(&cache) else {
             return;
         };
 
@@ -784,10 +833,9 @@ mod tests {
                 "begin-process-end",
             ),
         ] {
-            let output = tokio_powershell_command(interpreter, command)
-                .output()
-                .await
-                .unwrap();
+            let mut process = tokio_powershell_command(interpreter, command);
+            cache.apply_tokio(&mut process);
+            let output = process.output().await.unwrap();
 
             assert!(
                 output.status.success(),
@@ -797,23 +845,16 @@ mod tests {
             assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
         }
 
-        let output = tokio_powershell_command(interpreter, "exit 23")
-            .output()
-            .await
-            .unwrap();
+        let mut process = tokio_powershell_command(interpreter, "exit 23");
+        cache.apply_tokio(&mut process);
+        let output = process.output().await.unwrap();
         assert_eq!(output.status.code(), Some(23));
     }
 
     #[tokio::test]
     async fn powershell_utf8_setup_failure_does_not_block_a_simple_command() {
-        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
-            std::process::Command::new(candidate)
-                .arg("-NoProfile")
-                .arg("-Command")
-                .arg("exit 0")
-                .output()
-                .is_ok()
-        }) else {
+        let cache = IsolatedPowershellCache::new();
+        let Some(interpreter) = find_powershell_interpreter(&cache) else {
             return;
         };
 
@@ -821,7 +862,9 @@ mod tests {
         let constrained = format!(
             "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n{script}"
         );
-        let output = tokio::process::Command::new(interpreter)
+        let mut process = tokio::process::Command::new(interpreter);
+        cache.apply_tokio(&mut process);
+        let output = process
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
@@ -843,14 +886,8 @@ mod tests {
 
     #[tokio::test]
     async fn powershell_command_adaptation_preserves_native_status() {
-        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
-            std::process::Command::new(candidate)
-                .arg("-NoProfile")
-                .arg("-Command")
-                .arg("exit 0")
-                .output()
-                .is_ok()
-        }) else {
+        let cache = IsolatedPowershellCache::new();
+        let Some(interpreter) = find_powershell_interpreter(&cache) else {
             return;
         };
 
@@ -867,7 +904,9 @@ mod tests {
                 true,
             ),
         ] {
-            let raw_status = tokio::process::Command::new(interpreter)
+            let mut raw = tokio::process::Command::new(interpreter);
+            cache.apply_tokio(&mut raw);
+            let raw_status = raw
                 .arg("-NoProfile")
                 .arg("-NonInteractive")
                 .arg("-Command")
@@ -876,11 +915,9 @@ mod tests {
                 .await
                 .unwrap()
                 .status;
-            let adapted_status = tokio_powershell_command(interpreter, &command)
-                .output()
-                .await
-                .unwrap()
-                .status;
+            let mut adapted = tokio_powershell_command(interpreter, &command);
+            cache.apply_tokio(&mut adapted);
+            let adapted_status = adapted.output().await.unwrap().status;
 
             assert_eq!(raw_status.success(), expected_success, "raw: {command}");
             assert_eq!(adapted_status.success(), expected_success, "{command}");
