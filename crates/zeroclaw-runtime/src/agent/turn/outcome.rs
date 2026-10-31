@@ -96,6 +96,12 @@ pub struct ContextWindowExceeded {
     /// Raw estimate of the native tool schemas' share of the request; `0`
     /// when the request carried no native tools.
     pub tool_schema_tokens: usize,
+    /// `true` when `model_context_window` is the unconfigured-model
+    /// compatibility stub (possibly raised to the operator's budget), not a
+    /// configured capacity. The "choose a model with a larger context window"
+    /// advice does not apply then — raising `max_context_tokens` is the
+    /// remediation the operator can actually perform.
+    pub window_is_compatibility_fallback: bool,
 }
 
 impl ContextWindowExceeded {
@@ -139,9 +145,12 @@ impl ContextWindowExceeded {
 
 impl std::fmt::Display for ContextWindowExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&crate::i18n::get_required_cli_string(
-            "turn-context-window-exceeded-error",
-        ))
+        let key = if self.window_is_compatibility_fallback {
+            "turn-context-window-unconfigured-error"
+        } else {
+            "turn-context-window-exceeded-error"
+        };
+        f.write_str(&crate::i18n::get_required_cli_string(key))
     }
 }
 
@@ -150,6 +159,45 @@ impl std::error::Error for ContextWindowExceeded {}
 pub fn context_window_exceeded_from_error(err: &anyhow::Error) -> Option<&ContextWindowExceeded> {
     err.chain()
         .find_map(|source| source.downcast_ref::<ContextWindowExceeded>())
+}
+
+/// The non-droppable request floor meets or exceeds the operator's context
+/// token budget. The floor is the system messages plus the native tool
+/// definitions serialized into the same provider request — no history trim
+/// can remove either share — so the turn is refused before any provider call
+/// instead of dispatching a request the budget already rejects.
+#[derive(Debug)]
+pub struct SystemPromptFloorExceedsBudget {
+    /// The measured floor in tokens: system-prompt messages plus native tool
+    /// schema tokens when the request carries tool definitions.
+    pub system_floor_tokens: usize,
+    pub context_token_budget: usize,
+}
+
+impl std::fmt::Display for SystemPromptFloorExceedsBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::i18n::get_required_cli_string_with_args(
+            "turn-system-floor-exceeds-budget-error",
+            &[
+                ("floor", &self.system_floor_tokens.to_string()),
+                ("budget", &self.context_token_budget.to_string()),
+            ],
+        ))
+    }
+}
+
+impl std::error::Error for SystemPromptFloorExceedsBudget {}
+
+impl SystemPromptFloorExceedsBudget {
+    /// Operator-facing remediation naming the measured floor and the resolved
+    /// budget; the log record and the refusal share this exact wording.
+    #[must_use]
+    pub fn remediation(&self) -> String {
+        crate::agent::history::context_floor_remediation(
+            self.system_floor_tokens,
+            self.context_token_budget,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -323,8 +371,13 @@ fn terminal_completion_error_message_with_renderer(
     agent_name: Option<&str>,
     render: CliStringRenderer,
 ) -> Option<String> {
-    if context_window_exceeded_from_error(err).is_some() {
-        return Some(render("turn-context-window-exceeded-error", &[]));
+    if let Some(exceeded) = context_window_exceeded_from_error(err) {
+        let key = if exceeded.window_is_compatibility_fallback {
+            "turn-context-window-unconfigured-error"
+        } else {
+            "turn-context-window-exceeded-error"
+        };
+        return Some(render(key, &[]));
     }
     // A refusal that is still the final cause sits beneath Reliable's
     // envelopes; it needs safety-specific guidance rather than the generic
@@ -513,6 +566,7 @@ mod tests {
             raw_estimated_tokens: 40_000,
             system_tokens: 6_000,
             tool_schema_tokens: 9_000,
+            window_is_compatibility_fallback: false,
         })
         .context("private prompt and provider diagnostics");
         let exceeded = context_window_exceeded_from_error(&error).expect("typed inner cause");
@@ -534,6 +588,70 @@ mod tests {
         assert!(terminal_completion_error_message(&untyped, None).is_none());
     }
 
+    /// When the refused window is the unconfigured-model compatibility stub,
+    /// the refusal must not advise choosing a larger model: the window number
+    /// was sized from the operator's budget, so raising `max_context_tokens`
+    /// is the remediation that actually helps.
+    #[test]
+    fn context_window_fallback_window_names_budget_remediation() {
+        let error = anyhow::Error::new(ContextWindowExceeded {
+            estimated_tokens: 45_000,
+            model_context_window: 40_000,
+            raw_estimated_tokens: 45_000,
+            system_tokens: 6_000,
+            tool_schema_tokens: 9_000,
+            window_is_compatibility_fallback: true,
+        });
+        let exceeded = context_window_exceeded_from_error(&error).expect("typed inner cause");
+        assert_eq!(
+            exceeded.to_string(),
+            crate::i18n::get_required_cli_string("turn-context-window-unconfigured-error"),
+        );
+        let delivered = terminal_completion_error_message(&error, None)
+            .expect("typed capacity failure must have a safe terminal projection");
+        assert_eq!(
+            delivered,
+            crate::i18n::get_required_cli_string("turn-context-window-unconfigured-error")
+        );
+        assert!(
+            delivered.contains("max_context_tokens"),
+            "the fallback-window remediation must name max_context_tokens: {delivered:?}"
+        );
+    }
+
+    /// The floor refusal must be a typed, user-communicable error: the turn
+    /// stops before the provider call and the delivered text names the
+    /// remediation instead of a raw diagnostic string.
+    #[test]
+    fn prompt_budget_cap_floor_refusal_is_typed_and_localized() {
+        let error = anyhow::Error::new(SystemPromptFloorExceedsBudget {
+            system_floor_tokens: 143_448,
+            context_token_budget: 40_000,
+        });
+        let typed = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<SystemPromptFloorExceedsBudget>())
+            .expect("floor refusal must keep its typed cause");
+        assert_eq!(typed.system_floor_tokens, 143_448);
+        assert_eq!(typed.context_token_budget, 40_000);
+        let delivered = typed.to_string();
+        assert_eq!(
+            delivered,
+            crate::i18n::get_required_cli_string_with_args(
+                "turn-system-floor-exceeds-budget-error",
+                &[("floor", "143448"), ("budget", "40000")],
+            ),
+        );
+        assert!(
+            !delivered.is_empty() && !delivered.contains("Fluent"),
+            "floor refusal must render a real localized message: {delivered:?}"
+        );
+        assert!(
+            delivered.contains("143448") && delivered.contains("40000"),
+            "floor refusal must interpolate the measured floor and budget: {delivered:?}"
+        );
+    }
+
     /// The operator line must say what filled the window. An empty cause is
     /// what made a long-running failure unrecoverable from the journal.
     #[test]
@@ -544,6 +662,7 @@ mod tests {
             raw_estimated_tokens: 132_000,
             system_tokens: 13_400,
             tool_schema_tokens: 11_000,
+            window_is_compatibility_fallback: false,
         };
         let line = exceeded.breakdown();
         for expected in [
@@ -573,6 +692,7 @@ mod tests {
             raw_estimated_tokens: 24_500,
             system_tokens: 13_400,
             tool_schema_tokens: 11_000,
+            window_is_compatibility_fallback: false,
         };
         let line = exceeded.breakdown();
         for expected in [
@@ -596,6 +716,7 @@ mod tests {
             raw_estimated_tokens: 100,
             system_tokens: 80,
             tool_schema_tokens: 80,
+            window_is_compatibility_fallback: false,
         };
         assert!(exceeded.breakdown().contains("conversation ~0"));
     }

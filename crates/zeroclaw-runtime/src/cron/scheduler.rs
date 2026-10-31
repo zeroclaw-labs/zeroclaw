@@ -1082,6 +1082,41 @@ fn agent_job_error_message(error: &anyhow::Error) -> String {
         .unwrap_or_else(|| crate::i18n::get_required_cli_string("cron-agent-job-failed"))
 }
 
+/// Classify a failed agent run for the `cron_agent_job_failed` record. Both
+/// fail-closed refusals stop before any provider call, so they report
+/// `provider_attempted = false` and carry the measured numbers the operator
+/// needs; anything else stays the generic bucket.
+fn cron_job_error_attributes(
+    job_id: &str,
+    agent_alias: &str,
+    error: &anyhow::Error,
+) -> serde_json::Value {
+    let mut error_attributes = ::serde_json::json!({
+        "job_id": job_id,
+        "agent_alias": agent_alias,
+    });
+    if let Some(exceeded) = crate::agent::context_window_exceeded_from_error(error) {
+        error_attributes["error_kind"] = "context_window_exceeded".into();
+        error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
+        error_attributes["model_context_window"] = exceeded.model_context_window.into();
+        error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
+        error_attributes["system_tokens"] = exceeded.system_tokens.into();
+        error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
+        error_attributes["provider_attempted"] = false.into();
+    } else if let Some(floor) = error.chain().find_map(|source| {
+        source.downcast_ref::<crate::agent::turn::SystemPromptFloorExceedsBudget>()
+    }) {
+        error_attributes["error_kind"] = "system_floor_exceeds_budget".into();
+        error_attributes["system_floor_tokens"] = floor.system_floor_tokens.into();
+        error_attributes["context_token_budget"] = floor.context_token_budget.into();
+        error_attributes["provider_attempted"] = false.into();
+    } else {
+        error_attributes["error_kind"] = "agent_error".into();
+        error_attributes["error_bytes"] = error.to_string().len().into();
+    }
+    error_attributes
+}
+
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
@@ -1197,22 +1232,7 @@ async fn run_agent_job(
             },
         ),
         Err(e) => {
-            let mut error_attributes = ::serde_json::json!({
-                "job_id": job.id,
-                "agent_alias": agent_alias,
-            });
-            if let Some(exceeded) = crate::agent::context_window_exceeded_from_error(&e) {
-                error_attributes["error_kind"] = "context_window_exceeded".into();
-                error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
-                error_attributes["model_context_window"] = exceeded.model_context_window.into();
-                error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
-                error_attributes["system_tokens"] = exceeded.system_tokens.into();
-                error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
-                error_attributes["provider_attempted"] = false.into();
-            } else {
-                error_attributes["error_kind"] = "agent_error".into();
-                error_attributes["error_bytes"] = e.to_string().len().into();
-            }
+            let error_attributes = cron_job_error_attributes(&job.id, agent_alias, &e);
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -2540,6 +2560,40 @@ mod tests {
     }
 
     #[test]
+    fn cron_job_error_attributes_classify_fail_closed_refusals_before_dispatch() {
+        let context = anyhow::Error::new(crate::agent::ContextWindowExceeded {
+            estimated_tokens: 65_537,
+            model_context_window: 65_536,
+            raw_estimated_tokens: 65_537,
+            system_tokens: 0,
+            tool_schema_tokens: 0,
+            window_is_compatibility_fallback: false,
+        });
+        let floor = anyhow::Error::new(crate::agent::turn::SystemPromptFloorExceedsBudget {
+            system_floor_tokens: 143_448,
+            context_token_budget: 40_000,
+        });
+        let unknown = anyhow::Error::msg("provider exploded");
+
+        let attrs = cron_job_error_attributes("job-1", "test-agent", &context);
+        assert_eq!(attrs["error_kind"], "context_window_exceeded");
+        assert_eq!(attrs["estimated_tokens"], 65_537);
+        assert_eq!(attrs["provider_attempted"], false);
+        assert_eq!(attrs["job_id"], "job-1");
+        assert_eq!(attrs["agent_alias"], "test-agent");
+
+        let attrs = cron_job_error_attributes("job-1", "test-agent", &floor);
+        assert_eq!(attrs["error_kind"], "system_floor_exceeds_budget");
+        assert_eq!(attrs["system_floor_tokens"], 143_448);
+        assert_eq!(attrs["context_token_budget"], 40_000);
+        assert_eq!(attrs["provider_attempted"], false);
+
+        let attrs = cron_job_error_attributes("job-1", "test-agent", &unknown);
+        assert_eq!(attrs["error_kind"], "agent_error");
+        assert!(attrs.get("provider_attempted").is_none());
+    }
+
+    #[test]
     fn agent_job_error_message_preserves_terminal_causes_and_safe_messages() {
         let context = anyhow::Error::new(crate::agent::ContextWindowExceeded {
             estimated_tokens: 65_537,
@@ -2547,6 +2601,7 @@ mod tests {
             raw_estimated_tokens: 65_537,
             system_tokens: 0,
             tool_schema_tokens: 0,
+            window_is_compatibility_fallback: false,
         })
         .context("maximum context length; https://private.invalid/?key=secret");
         let provider =

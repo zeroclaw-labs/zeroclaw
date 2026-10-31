@@ -1318,6 +1318,11 @@ turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) 
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
 turn-execution-tree-budget-reached = *Turn stopped: exhausted the execution-tree iteration budget.*
 turn-context-window-exceeded-error = This request exceeds the selected model's context window. Reduce the request or enabled tools, or choose a model with a larger context window.
+# Refusal returned when the request exceeds a context window that was assumed,
+# not configured: the model's real window is unknown, so ZeroClaw sized the
+# window from the operator's max_context_tokens and the actionable fix is to
+# raise that budget, not to switch models.
+turn-context-window-unconfigured-error = This request exceeds the context window assumed for the selected model. The model's context window is not configured, so raise [runtime_profiles.<name>] max_context_tokens or reduce the request or enabled tools.
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
@@ -1329,6 +1334,11 @@ history-trim-reason-recovery = context window overflow recovery
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
+# Refusal returned to the user when the non-droppable system floor alone meets
+# or exceeds the context token budget, so the request is not sent to the model
+# at all (2026-10-20 firstcontact context flood: warning-only let a 563K-char
+# system prompt reach the provider against a 40K-token budget).
+turn-system-floor-exceeds-budget-error = This request was not sent: the system prompt and tool definitions alone ({$floor} tokens) exceed this agent's context budget ({$budget} tokens). Raise [runtime_profiles.<name>] max_context_tokens or shrink the system prompt (workspace bootstrap files, enabled tools, skills).
 # Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
 # turn before it reaches the model. Unreachable under the default `Loop` policy
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
