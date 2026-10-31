@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "agent-runtime")]
@@ -134,10 +135,7 @@ fn update_switching_to_standard_message() -> String {
     }
 }
 
-const GITHUB_RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
-const GITHUB_RELEASES_TAG_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/tags";
+const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases";
 
 #[derive(Debug)]
 pub struct UpdateInfo {
@@ -159,6 +157,15 @@ pub struct UpdateInfo {
 /// `standard` is `zeroclaw update --standard`: a CLI-only build then takes the
 /// standard archive (see `stays_cli_only`).
 pub async fn check(target_version: Option<&str>, standard: bool) -> Result<UpdateInfo> {
+    check_from(GITHUB_RELEASES_URL, target_version, standard).await
+}
+
+/// `check` against the releases API at `releases_url`.
+async fn check_from(
+    releases_url: &str,
+    target_version: Option<&str>,
+    standard: bool,
+) -> Result<UpdateInfo> {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
     let client = reqwest::Client::builder()
@@ -173,9 +180,9 @@ pub async fn check(target_version: Option<&str>, standard: bool) -> Result<Updat
             } else {
                 format!("v{v}")
             };
-            format!("{GITHUB_RELEASES_TAG_URL}/{tag}")
+            format!("{releases_url}/tags/{tag}")
         }
-        None => GITHUB_RELEASES_LATEST_URL.to_string(),
+        None => format!("{releases_url}/latest"),
     };
 
     let resp = client
@@ -219,13 +226,32 @@ pub async fn check(target_version: Option<&str>, standard: bool) -> Result<Updat
 }
 
 pub async fn run(target_version: Option<&str>, force: bool, standard: bool) -> Result<()> {
+    run_from(
+        GITHUB_RELEASES_URL,
+        target_version,
+        force,
+        standard,
+        &mut std::io::stdout(),
+    )
+    .await
+}
+
+/// `run` against the releases API at `releases_url`, writing its messages to
+/// `out`.
+async fn run_from(
+    releases_url: &str,
+    target_version: Option<&str>,
+    force: bool,
+    standard: bool,
+    out: &mut (dyn Write + Send),
+) -> Result<()> {
     // Phase 1: Preflight
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         "Phase 1/6: Preflight checks..."
     );
-    let update_info = check(target_version, standard).await?;
+    let update_info = check_from(releases_url, target_version, standard).await?;
     let switching = switches_to_standard(standard);
 
     if !should_install(
@@ -234,36 +260,44 @@ pub async fn run(target_version: Option<&str>, force: bool, standard: bool) -> R
         force,
         switching,
     ) {
-        println!(
+        writeln!(
+            out,
             "{}",
             update_already_current_message(&update_info.current_version)
-        );
+        )?;
+        // A CLI-only build gets the same guidance as for a newer release:
+        // without --standard it never takes the standard build.
+        if stays_cli_only(standard) {
+            writeln!(out, "{}", cli_only_needs_standard_message())?;
+        }
         return Ok(());
     }
 
     if update_info.is_newer {
-        println!(
+        writeln!(
+            out,
             "{}",
             update_available_message(&update_info.current_version, &update_info.latest_version)
-        );
+        )?;
     } else if force {
         // --force on a version that is not newer: reinstall or downgrade/pin.
         // Without it, only a same-version switch to the standard build gets
         // here, and the switching line below says what happens.
-        println!(
+        writeln!(
+            out,
             "{}",
             update_forcing_reinstall_message(
                 &update_info.current_version,
                 &update_info.latest_version
             )
-        );
+        )?;
     }
 
     let download_url = update_info
         .download_url
         .with_context(|| no_release_archive_message(standard))?;
     if switching {
-        println!("{}", update_switching_to_standard_message());
+        writeln!(out, "{}", update_switching_to_standard_message())?;
     }
 
     let current_exe =
@@ -351,8 +385,12 @@ pub async fn run(target_version: Option<&str>, force: bool, standard: bool) -> R
             // the validated main binary is already in place and must not be
             // rolled back if these fail.
             install_companion_artifacts(&staging, &current_exe, &host_dashboard_candidates()).await;
-            println!("{}", update_success_message(&update_info.latest_version));
-            println!("{}", prebuilt_channel_note_message());
+            writeln!(
+                out,
+                "{}",
+                update_success_message(&update_info.latest_version)
+            )?;
+            writeln!(out, "{}", prebuilt_channel_note_message())?;
             Ok(())
         }
         Err(e) => {
@@ -1716,6 +1754,103 @@ mod tests {
         assert_eq!(
             no_release_archive_message(false),
             "no suitable binary found for this platform"
+        );
+    }
+
+    /// A releases API serving release `version` with this host's standard
+    /// archive and `SHA256SUMS`, which answer 404 and may be fetched only
+    /// `downloads` times in all.
+    async fn releases_api_with(version: &str, downloads: u64) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let target = current_target_triple().expect("supported test platform");
+        let release = serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "assets": [
+                {
+                    "name": format!("zeroclaw-{target}.tar.gz"),
+                    "browser_download_url": format!("{}/download/zeroclaw-{target}.tar.gz", server.uri()),
+                },
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": format!("{}/download/SHA256SUMS", server.uri()),
+                },
+            ],
+        });
+        for route in ["/latest".to_string(), format!("/tags/v{version}")] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&release))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path_regex("^/download/"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(downloads)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn run_installs_nothing_from_the_same_or_an_older_release() {
+        let current = env!("CARGO_PKG_VERSION");
+        for (release, target_version) in [(current, None), ("0.0.1", Some("0.0.1"))] {
+            let server = releases_api_with(release, 0).await;
+            let mut out = Vec::new();
+            run_from(&server.uri(), target_version, false, false, &mut out)
+                .await
+                .unwrap_or_else(|e| panic!("v{release}: {e:#}"));
+
+            // Only a CLI-only build adds the guidance, as for a newer release.
+            let mut lines = vec![update_already_current_message(current)];
+            if !cfg!(feature = "gateway") {
+                lines.push(cli_only_needs_standard_message());
+            }
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("{}\n", lines.join("\n")),
+                "v{release}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[tokio::test]
+    async fn run_in_a_cli_only_build_refuses_a_newer_release_without_standard() {
+        let server = releases_api_with("999.0.0", 0).await;
+        let mut out = Vec::new();
+        let err = run_from(&server.uri(), None, false, false, &mut out)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), cli_only_needs_standard_message());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{}\n",
+                update_available_message(env!("CARGO_PKG_VERSION"), "999.0.0")
+            )
+        );
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[tokio::test]
+    async fn run_in_a_cli_only_build_with_standard_downloads_the_same_version() {
+        // The stub's 404 stops the download before anything is replaced.
+        let server = releases_api_with(env!("CARGO_PKG_VERSION"), 1).await;
+        let mut out = Vec::new();
+        let err = run_from(&server.uri(), None, false, true, &mut out)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("download returned 404"), "{err:#}");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{}\n", update_switching_to_standard_message())
         );
     }
 
