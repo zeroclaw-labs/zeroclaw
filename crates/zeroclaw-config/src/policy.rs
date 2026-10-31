@@ -1605,12 +1605,24 @@ fn split_unquoted_segments_checked(
 struct UnreadableHeredoc;
 
 /// Remediation hint appended to allowlist refusals for compound commands
-/// (unquoted `&&`, `||`, `;`, `|`, or `&` chaining several commands).
+/// (unquoted `&&`, `||`, `;`, or `|` chaining several commands). A lone `&`
+/// is not a splitter separator: it stays inside its segment, and such commands
+/// are refused by the background-chaining guard instead.
 fn compound_command_hint() -> String {
     "reason: compound command; hint: one command per invocation - run them \
      separately (e.g. 'git -C <path> <subcmd>' instead of 'cd <path> && git ...')"
         .to_string()
 }
+
+/// Remediation hint for refusals caused by read-only autonomy: the command
+/// itself may be allowlisted, only the autonomy level forbids execution.
+const READ_ONLY_REFUSAL_HINT: &str =
+    "reason: read-only autonomy; hint: raise autonomy level or use a read tool";
+
+/// Remediation hint for PowerShell refusals of `.bat`/`.cmd` invocations,
+/// which policy blocks even when the file name matches the allowlist.
+const BATCH_FILE_REFUSAL_HINT: &str =
+    "reason: batch files are blocked by policy; hint: invoke the underlying tool directly";
 
 fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
     split_unquoted_segments_checked(command, dialect).unwrap_or_default()
@@ -4362,6 +4374,10 @@ impl SecurityPolicy {
     /// when every segment base is allowlisted and the refusal came from
     /// argument-safety rules instead).
     fn refusal_reason_hint(&self, command: &str, dialect: ShellDialect) -> Option<String> {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return Some(READ_ONLY_REFUSAL_HINT.to_string());
+        }
+
         let unknown_base_hint = |base: &str| {
             format!(
                 "reason: '{base}' is not in the allowed command list; \
@@ -4372,20 +4388,50 @@ impl SecurityPolicy {
 
         match dialect {
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                // `tee`, unsafe redirection, and command substitution refuse
+                // segments regardless of the allowlist, so running the parts
+                // separately does not remediate anything.
+                if command.contains('`')
+                    || contains_unquoted_shell_variable_expansion(command)
+                    || contains_unsafe_output_redirect_for_shell(command, dialect)
+                    || contains_unquoted_input_redirect(command, dialect)
+                    || command
+                        .split_whitespace()
+                        .any(|w| w == "tee" || w.ends_with("/tee"))
+                {
+                    return None;
+                }
                 let segments = split_unquoted_segments(command, dialect);
                 if segments.len() > 1 {
-                    return Some(compound_command_hint());
+                    let mut hint = compound_command_hint();
+                    if let Some(base) = self.first_unknown_segment_base(&segments, dialect) {
+                        hint.push_str(&format!("; note: '{base}' is not allowlisted"));
+                    }
+                    return Some(hint);
                 }
                 let base = self.first_unknown_segment_base(&segments, dialect)?;
                 Some(unknown_base_hint(&base))
             }
             ShellDialect::PowerShell => {
                 let segments = split_simple_powershell_pipeline(command)?;
+                let unknown_base = self.first_unknown_segment_base(&segments, dialect);
                 if segments.len() > 1 {
-                    return Some(compound_command_hint());
+                    let mut hint = compound_command_hint();
+                    if let Some(base) = unknown_base {
+                        hint.push_str(&format!("; note: '{base}' is not allowlisted"));
+                    }
+                    return Some(hint);
                 }
-                let base = self.first_unknown_segment_base(&segments, dialect)?;
-                Some(unknown_base_hint(&base))
+                let segment = segments.first()?;
+                let raw_executable =
+                    strip_wrapping_quotes(segment.split_whitespace().next().unwrap_or("")).trim();
+                let base_owned =
+                    command_basename_for_shell(raw_executable, ShellDialect::PowerShell)
+                        .to_ascii_lowercase();
+                if is_powershell_batch_file(&base_owned) {
+                    return Some(BATCH_FILE_REFUSAL_HINT.to_string());
+                }
+                Some(unknown_base_hint(&unknown_base?))
             }
             ShellDialect::None => None,
         }
@@ -4425,7 +4471,13 @@ impl SecurityPolicy {
                 ShellDialect::PowerShell => {
                     let mut words = segment.split_whitespace();
                     let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-                    if raw_executable.is_empty() {
+                    // Variable and quoted-command executables are refused by the
+                    // bounded grammar, not the allowlist, so they must not be
+                    // named as unknown allowlist bases.
+                    if raw_executable.is_empty()
+                        || raw_executable.starts_with('$')
+                        || raw_executable.starts_with(['\'', '"'])
+                    {
                         continue;
                     }
                     let base_owned =
@@ -7804,6 +7856,114 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("reason:"), "{err}");
+    }
+
+    #[test]
+    fn refusal_hint_compound_names_unknown_segment() {
+        // `ls` is allowlisted, but the compound hint must still name the
+        // actually unknown segment instead of implying both parts only need
+        // to be run separately.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("ls && frobnicator", false)
+            .expect_err("compound commands with an unknown segment must stay blocked");
+        assert!(err.contains("compound"), "{err}");
+        assert!(err.contains("'frobnicator' is not allowlisted"), "{err}");
+    }
+
+    #[test]
+    fn refusal_hint_skipped_for_early_safety_gates() {
+        // `tee`, unsafe redirection, and command substitution refuse segments
+        // regardless of the allowlist, so "run them separately" does not
+        // remediate anything and no hint is attached.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["echo".into(), "ls".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "echo secret | tee /etc/crontab",
+            "ls > /tmp/evil && ls",
+            "ls && echo `whoami`",
+            "ls && echo $(whoami)",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("safety-gated commands must stay blocked");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+            assert!(!err.contains("reason:"), "{command}: {err}");
+        }
+    }
+
+    #[test]
+    fn refusal_hint_read_only_autonomy() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            allowed_commands: vec!["ls".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("ls", false)
+            .expect_err("read-only autonomy must refuse even allowlisted commands");
+        assert!(err.contains("read-only autonomy"), "{err}");
+        assert!(err.contains("raise autonomy level"), "{err}");
+    }
+
+    #[test]
+    fn refusal_hint_powershell_compound_and_unknown_base() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["Get-ChildItem".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution_for_shell(
+                "Get-ChildItem | frobnicate",
+                false,
+                ShellDialect::PowerShell,
+            )
+            .expect_err("compound PowerShell pipelines must stay blocked");
+        assert!(err.contains("compound"), "{err}");
+        assert!(err.contains("one command"), "{err}");
+        assert!(err.contains("'frobnicate' is not allowlisted"), "{err}");
+
+        let err = p
+            .validate_command_execution_for_shell("frobnicate -x", false, ShellDialect::PowerShell)
+            .expect_err("unknown PowerShell commands must stay blocked");
+        assert!(err.contains("frobnicate"), "{err}");
+        assert!(err.contains("allowed command list"), "{err}");
+
+        let err = p
+            .validate_command_execution_for_shell("deploy.bat", false, ShellDialect::PowerShell)
+            .expect_err("batch files must stay blocked");
+        assert!(err.contains("batch files are blocked by policy"), "{err}");
+        assert!(err.contains("underlying tool"), "{err}");
+    }
+
+    #[test]
+    fn refusal_hint_windows_cmd_names_unknown_exe_base() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["dir".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution_for_shell(
+                "frobnicator.exe -x",
+                false,
+                ShellDialect::WindowsCmd,
+            )
+            .expect_err("unknown commands must stay blocked");
+        assert!(err.contains("frobnicator"), "{err}");
+        assert!(err.contains("allowed command list"), "{err}");
     }
 
     #[cfg(target_os = "windows")]
