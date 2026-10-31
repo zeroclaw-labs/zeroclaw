@@ -236,7 +236,12 @@ shell_export_syntax() {
 # ── Platform / target triple detection ───────────────────────────
 
 detect_libc() {
-  if [ -e /lib/ld-musl-*.so.1 ] 2>/dev/null || \
+  # A glibc host can also have musl installed for cross-compilation. Prefer
+  # evidence of the system libc before treating an installed loader as musl.
+  if getconf GNU_LIBC_VERSION >/dev/null 2>&1 || \
+     ldd --version 2>&1 | grep -qiE 'glibc|gnu libc'; then
+    echo "gnu"
+  elif [ -e /lib/ld-musl-*.so.1 ] 2>/dev/null || \
      ldd --version 2>&1 | grep -qi musl || \
      { [ -r /etc/os-release ] && grep -qiE 'alpine|postmarket' /etc/os-release; }; then
     echo "musl"
