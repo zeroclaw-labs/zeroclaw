@@ -4,7 +4,7 @@ exclude = ["vendor/crossterm-0.29.0"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.6"
+version = "0.8.7"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
@@ -12,30 +12,30 @@ homepage = "https://www.zeroclaw.com"
 rust-version = "1.96.0"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.6" }
-zeroclaw-buildinfo = { path = "crates/zeroclaw-buildinfo", version = "0.8.6" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.6" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.6", default-features = false }
-zeroclaw-dist = { path = "crates/zeroclaw-dist", version = "0.8.6" }
-zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.6" }
-zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "0.8.6" }
-zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "0.8.6" }
-zerorelay = { path = "apps/zerorelay", version = "0.8.6" }
-zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.6" }
-zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "0.8.6" }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.6" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.6" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.6", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.6" }
-zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.6", default-features = false }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.6", default-features = false }
-zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.6" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.6" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.6" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.6" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.6" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.6" }
-zerocode = { path = "apps/zerocode", version = "0.8.6" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.7" }
+zeroclaw-buildinfo = { path = "crates/zeroclaw-buildinfo", version = "0.8.7" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.7" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.7", default-features = false }
+zeroclaw-dist = { path = "crates/zeroclaw-dist", version = "0.8.7" }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.7" }
+zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "0.8.7" }
+zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "0.8.7" }
+zerorelay = { path = "apps/zerorelay", version = "0.8.7" }
+zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.7" }
+zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "0.8.7" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.7" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.7" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.7", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.7" }
+zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.7", default-features = false }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.7", default-features = false }
+zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.7" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.7" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.7" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.7" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.7" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.7" }
+zerocode = { path = "apps/zerocode", version = "0.8.7" }
 directories = "6.0"
 sys-locale = "0.3"
 hmac = "0.12"
@@ -260,6 +260,16 @@ container_excluded_features = [
     "voice-wake",
 ]
 
+# Features left out of the CLI-only build: the same features as the standard
+# distribution, without the dashboard, the web gateway or the ACP bridge that
+# dials it. The `cli-only` selection is resolved from this list; release
+# workflows, installers and docs never repeat it.
+cli_excluded_features = [
+    "gateway",
+    "embedded-web",
+    "acp-bridge",
+]
+
 # Compatibility exclusions for standard distribution artifacts. Release
 # workflows pass only their target triple; feature policy stays here.
 #
@@ -413,7 +423,7 @@ memory-postgres = ["zeroclaw-memory/memory-postgres"]
 # Backends and platform flags — each forwards to ONE crate
 observability-prometheus = [
     "zeroclaw-runtime/observability-prometheus",
-    "zeroclaw-gateway/observability-prometheus",
+    "zeroclaw-gateway?/observability-prometheus",
 ]
 observability-otel = ["zeroclaw-runtime/observability-otel"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
@@ -433,7 +443,8 @@ plugins-wasm = [
 ]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
-embedded-web = ["zeroclaw-gateway/embedded-web"]
+# Embeds web/dist in the gateway; it has no effect unless `gateway` is enabled.
+embedded-web = ["zeroclaw-gateway?/embedded-web"]
 
 # Backward-compatible aliases
 fantoccini = ["browser-native"]

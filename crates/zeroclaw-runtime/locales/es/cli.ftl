@@ -416,6 +416,8 @@ channel-discord-delivery-failure-note-one = (nota: no pude entregar {$count} arc
 channel-discord-delivery-failure-note-many = (nota: no pude entregar {$count} archivos.)
 channel-whatsapp-web-delivery-failure-note-one = (nota: no pude entregar {$count} archivo multimedia de WhatsApp.)
 channel-whatsapp-web-delivery-failure-note-many = (nota: no pude entregar {$count} archivos multimedia de WhatsApp.)
+channel-signal-delivery-failure-note-one = (nota: no pude entregar {$count} archivo.)
+channel-signal-delivery-failure-note-many = (nota: no pude entregar {$count} archivos.)
 channel-line-bind-success = ✅ ¡Emparejado! Ya puedes chatear.
 channel-line-bind-invalid-code = ❌ Código no válido. Inténtalo de nuevo.
 channel-line-bind-rate-limited = ⏳ Demasiados intentos. Reintenta en { $secs }s.
@@ -453,6 +455,7 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = no establecido (usando detección automática)
 cli-self-test-web-dist-dir-pass-literal = {$path} (ruta literal)
 cli-self-test-web-dist-dir-fail-expansion = ADVERTENCIA: {$path} — {$reason}; gateway.web_dist_dir se lee literalmente, así que expande el valor tú mismo (p. ej., una ruta absoluta)
+cli-self-test-gateway-not-in-build = no incluido en esta compilación (solo CLI)
 cli-service-systemd-linger-disabled-warning = la permanencia de usuario de systemd está deshabilitada. El servicio de usuario de ZeroClaw puede detenerse tras cerrar sesión. Habilítala con: loginctl enable-linger {$user}
 cli-peripherals-none = No hay periféricos configurados.
 cli-peripherals-add-hint = Agregue uno con: zeroclaw peripheral add <board> <path>
@@ -1051,6 +1054,9 @@ cli-plugin-info-load-failed =
     Recompila el complemento con el WIT que incluye este host (consulta wit/v0) y vuelve a instalarlo.
 cli-plugin-info-load-not-applicable = Carga: no aplicable. Es un complemento solo de skill, así que no hay ningún componente que instanciar.
 cli-plugin-info-load-failed-exit = el complemento '{$name}' no se carga en este host
+cli-plugin-info-load-config-refused =
+    Carga: no. El componente se instancia con el mundo WIT de este host, pero el runtime rechaza su configuración: {$error}
+    La configuración es el mapa `config` de la fila [[plugins.entries]] llamada '{$key}'. Ajústala al config_schema del paquete instalado, o elimina sus valores si el paquete no declara ninguno.
 cli-estop-domains-none = {"  "}domain_blocks:  (ninguno)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (ninguno)

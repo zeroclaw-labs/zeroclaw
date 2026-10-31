@@ -414,6 +414,8 @@ channel-discord-delivery-failure-note-one = （注意：{$count}個のファイ�
 channel-discord-delivery-failure-note-many = （注意：{$count}個のファイルを配信できませんでした。）
 channel-whatsapp-web-delivery-failure-note-one = （注意：{$count}件のWhatsAppメディア添付ファイルを配信できませんでした。）
 channel-whatsapp-web-delivery-failure-note-many = （注意：{$count}件のWhatsAppメディア添付ファイルを配信できませんでした。）
+channel-signal-delivery-failure-note-one = （注意：{$count}個のファイルを配信できませんでした。）
+channel-signal-delivery-failure-note-many = （注意：{$count}個のファイルを配信できませんでした。）
 channel-line-bind-success = ✅ ペアリングしました！チャットできるようになりました。
 channel-line-bind-invalid-code = ❌ 無効なコードです。もう一度お試しください。
 channel-line-bind-rate-limited = ⏳ 試行回数が多すぎます。{ $secs }秒後に再試行してください。
@@ -451,6 +453,7 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = 未設定（自動検出を使用）
 cli-self-test-web-dist-dir-pass-literal = {$path}（リテラルパス）
 cli-self-test-web-dist-dir-fail-expansion = 警告: {$path} — {$reason}。gateway.web_dist_dir はそのまま読み込まれるため、値を自分で展開してください（例: 絶対パス）
+cli-self-test-gateway-not-in-build = このビルドには含まれていません（CLI専用）
 cli-service-systemd-linger-disabled-warning = systemd ユーザー linger は無効です。ZeroClaw のユーザーサービスはログアウト後に停止する可能性があります。有効化: loginctl enable-linger {$user}
 cli-peripherals-none = 周辺機器が設定されていません。
 cli-peripherals-add-hint = 次のコマンドで追加します: zeroclaw peripheral add <board> <path>
@@ -1049,6 +1052,9 @@ cli-plugin-info-load-failed =
     このホストに同梱された WIT（wit/v0 を参照）でプラグインを再ビルドし、再インストールしてください。
 cli-plugin-info-load-not-applicable = 読み込み: 対象外。スキルのみのプラグインのため、インスタンス化するコンポーネントはありません。
 cli-plugin-info-load-failed-exit = プラグイン '{$name}' はこのホストで読み込めません
+cli-plugin-info-load-config-refused =
+    読み込み: 不可。コンポーネントはこのホストの WIT ワールドでインスタンス化できますが、ランタイムがその設定を拒否しています: {$error}
+    設定は '{$key}' という名前の [[plugins.entries]] 行の `config` マップです。インストールされたパッケージの config_schema に合わせるか、パッケージが config_schema を宣言していない場合はその値を削除してください。
 cli-estop-domains-none = {"  "}domain_blocks:  (なし)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (なし)
