@@ -192,10 +192,70 @@ limit:
   alternative) for the original model. The substitution happens before
   the request is dispatched.
 
-`allow_override = true` lets a request bypass `block` by passing an
-override token on the CLI (`zeroclaw --override`). Defaults to
-`false`. `warn_at_percent` controls when the gateway surfaces a
-warning banner ahead of the hard limit; defaults to 80%.
+`allow_override = true` (default `false`) lets the operator lift an exceeded
+shared daily or monthly limit without a restart. Before the next model call,
+a turn on an approval-capable channel pauses and asks. A one-time approval
+removes the named shared cap **daemon-wide**, for every user, session,
+delegation, and unattended scheduled or cron job using that tracker. A waiting
+prompt for the same period closes and its turn continues. A channel that
+cannot ask still stops at an enforced limit, but benefits from a grant made
+elsewhere. Other shared limits and per-agent or per-hop ceilings still apply;
+if both daily and monthly limits are exceeded, each needs its own approval.
+
+Grants exist only in memory and end at the next UTC day or month rollover,
+or when the daemon restarts. The tracker neither reads nor writes
+`state/cost-overrides.json`; files left by earlier builds have no authority.
+No persisted grant can restore an override after a restart.
+
+ZeroCode requires **Ctrl+O** to override, or a click on Override. Enter and
+Esc select Stop; the ordinary tool-approval `a` shortcut has no effect.
+ACP and chat prompts offer one-time approval and rejection only. Denial,
+an unavailable channel, or no answer stops only the waiting turn with a
+budget error. The maximum wait is 10 minutes. ACP uses the shorter of that
+and `acp.session_timeout_secs`. Chat channels other than Telegram use the
+shorter of that and their `approval_timeout_secs` (300 seconds by default).
+
+Each new grant emits one structured `Approve` audit event, with spend,
+limit, period, UTC `granted_at`, channel, deciding back-channel
+(`decided_by`), approval source, and the turn's session attribution. Waiting
+sessions released by that grant do not emit another operator-grant event.
+The normal runtime log persistence and retention settings control whether
+this event survives a restart. `decided_by_user` records the responding user's
+channel-native ID when the approval transport provides one. It falls back to
+the answering back-channel when no user identity is available. This is the
+identity observed by the channel, not an independent verification of a person.
+Telegram group overrides require the responder's numeric user ID in
+`channels.telegram.<alias>.cost_override_operators` as well as normal peer
+admission. The list defaults to empty and accepts no wildcard or username.
+An allowed group responder outside this list stops the pending turn when
+attempting an override, with a `cost_override_operator_required` refusal audit.
+The role is read from live config at reply time. Private chats keep normal
+peer-authorized approval behavior.
+
+RPC cost overrides are bound to the exact connection that received the prompt,
+in addition to session ownership. A second connection cannot approve it using
+the request ID, even under the same OS user or session owner. The approving
+connection must have a kernel-reported local peer PID whose visible ancestry
+does not include the daemon process that executes agent turns. The daemon,
+its children and their descendants are refused and the pending turn stops.
+Unknown or incomplete process ancestry also stops the override. Transports
+without this evidence, including WSS and Windows named pipes, cannot grant
+RPC cost overrides. Ordinary tool approvals keep their existing behavior.
+
+This check is not OS isolation. A process reparented before approval can lose
+its visible link to the daemon. An unrelated same-UID process, a compromised
+operator client, a transferred socket, or reuse of a departed peer's PID can
+also escape this ancestry check. Audit identity uses the authenticated
+principal, or the kernel UID when no individual principal is configured.
+These identify an OS account, not necessarily the person at its keyboard.
+Use process and IPC isolation when same-UID hostile code is in scope.
+
+Setting `cost.allow_override = false` through an accepted live RPC
+`config/set` change restores enforcement at the next budget check without a
+restart. Editing `config.toml` alone requires a reload or restart. Disabling
+overrides does not erase the in-memory grant: re-enabling them before rollover
+can reactivate it. Restart the daemon to clear grants immediately.
+`warn_at_percent` sets the warning threshold; defaults to 80%.
 
 Budget comparisons use recorded `cost_usd`, so they cannot account for the
 `unpriced_tokens` subset. A daily or monthly total below its cap is not a safety

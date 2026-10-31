@@ -652,7 +652,11 @@ pub(crate) fn build_yesno_approval_prompt(
     let no_command = format!("{token} {APPROVAL_REPLY_NO}");
     let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
     let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-        "channel-approval-reply-instruction-yesno",
+        if tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL {
+            "channel-cost-override-reply-instruction-yesno"
+        } else {
+            "channel-approval-reply-instruction-yesno"
+        },
         &[
             ("yes_command", yes_command.as_str()),
             ("no_command", no_command.as_str()),
@@ -718,7 +722,11 @@ pub(crate) fn build_approve_deny_approval_prompt(
     let deny_command = format!("{token} {APPROVAL_REPLY_DENY}");
     let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
     let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-        "channel-approval-reply-instruction-approve-deny",
+        if tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL {
+            "channel-cost-override-reply-instruction-approve-deny"
+        } else {
+            "channel-approval-reply-instruction-approve-deny"
+        },
         &[
             ("approve_command", approve_command.as_str()),
             ("deny_command", deny_command.as_str()),
@@ -739,7 +747,8 @@ pub(crate) fn build_approve_deny_approval_prompt(
     test
 ))]
 pub(crate) struct PendingApproval {
-    pub(crate) sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    pub(crate) sender:
+        tokio::sync::oneshot::Sender<zeroclaw_api::channel::AttributedApprovalResponse>,
     pub(crate) destination: String,
     pub(crate) tool_name: String,
 }
@@ -775,13 +784,7 @@ impl PendingApprovalResolution {
     }
 }
 
-#[cfg(any(
-    feature = "channel-discord",
-    feature = "channel-matrix",
-    feature = "channel-signal",
-    feature = "channel-slack",
-    test
-))]
+#[cfg(test)]
 pub(crate) async fn resolve_pending_approval(
     pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
     token: &str,
@@ -800,6 +803,24 @@ pub(crate) async fn resolve_pending_approval(
     .0
 }
 
+#[cfg(test)]
+pub(crate) async fn resolve_pending_approval_with_tool(
+    pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
+    token: &str,
+    response: zeroclaw_api::channel::ChannelApprovalResponse,
+    responder_allowed: bool,
+    destination: &str,
+) -> (PendingApprovalResolution, Option<String>) {
+    resolve_pending_approval_attributed_with_tool(
+        pending_approvals,
+        token,
+        zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+        responder_allowed,
+        destination,
+    )
+    .await
+}
+
 #[cfg(any(
     feature = "channel-discord",
     feature = "channel-matrix",
@@ -808,10 +829,10 @@ pub(crate) async fn resolve_pending_approval(
     feature = "channel-telegram",
     test
 ))]
-pub(crate) async fn resolve_pending_approval_with_tool(
+pub(crate) async fn resolve_pending_approval_attributed_with_tool(
     pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
     token: &str,
-    response: zeroclaw_api::channel::ChannelApprovalResponse,
+    response: zeroclaw_api::channel::AttributedApprovalResponse,
     responder_allowed: bool,
     destination: &str,
 ) -> (PendingApprovalResolution, Option<String>) {
@@ -819,7 +840,15 @@ pub(crate) async fn resolve_pending_approval_with_tool(
     let Some(pending) = pending_approvals.get(token) else {
         return (PendingApprovalResolution::NotFound, None);
     };
-    if !responder_allowed || destination.is_empty() || pending.destination != destination {
+    if !responder_allowed
+        || destination.is_empty()
+        || pending.destination != destination
+        || (pending.tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL
+            && matches!(
+                response.response,
+                zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
+            ))
+    {
         return (PendingApprovalResolution::Rejected, None);
     }
 
@@ -880,6 +909,58 @@ pub(crate) async fn ensure_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_override_text_prompts_do_not_offer_always() {
+        let tool = zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL;
+        let yesno = super::build_yesno_approval_prompt("ab12cd", tool, "limit reached", None);
+        let approve_deny =
+            super::build_approve_deny_approval_prompt("ab12cd", tool, "limit reached", None);
+        assert!(!yesno.contains("ab12cd always"));
+        assert!(!approve_deny.contains("ab12cd always"));
+        assert!(yesno.contains("ab12cd yes") && yesno.contains("ab12cd no"));
+        assert!(approve_deny.contains("ab12cd approve") && approve_deny.contains("ab12cd deny"));
+    }
+
+    #[tokio::test]
+    async fn cost_override_rejects_always_without_consuming_the_prompt() {
+        use super::{PendingApproval, PendingApprovalResolution};
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending.lock().await.insert(
+            "ab12cd".to_string(),
+            PendingApproval {
+                sender: tx,
+                destination: "chat".to_string(),
+                tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+            },
+        );
+        assert_eq!(
+            super::resolve_pending_approval(
+                &pending,
+                "ab12cd",
+                ChannelApprovalResponse::AlwaysApprove,
+                true,
+                "chat"
+            )
+            .await,
+            PendingApprovalResolution::Rejected
+        );
+        assert!(pending.lock().await.contains_key("ab12cd"));
+        assert_eq!(
+            super::resolve_pending_approval(
+                &pending,
+                "ab12cd",
+                ChannelApprovalResponse::Approve,
+                true,
+                "chat"
+            )
+            .await,
+            PendingApprovalResolution::Resolved
+        );
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
+    }
 
     #[cfg(feature = "channel-qq")]
     #[tokio::test]
@@ -1716,7 +1797,10 @@ mod tests {
         .await;
         assert_eq!(resolved, PendingApprovalResolution::Resolved);
         assert!(resolved.suppresses_message());
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(
+            rx.await.unwrap().response,
+            ChannelApprovalResponse::AlwaysApprove
+        );
         assert!(pending.lock().await.is_empty());
 
         let not_found = resolve_pending_approval(

@@ -275,7 +275,7 @@ fn build_approval_card(
         })
     };
 
-    serde_json::json!({
+    let mut card = serde_json::json!({
         "schema": "2.0",
         "config": { "wide_screen_mode": true },
         "header": {
@@ -308,7 +308,13 @@ fn build_approval_card(
                 }
             ]
         }
-    })
+    });
+    if tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL
+        && let Some(columns) = card["body"]["elements"][1]["columns"].as_array_mut()
+    {
+        columns.truncate(2);
+    }
+    card
 }
 
 fn build_resolved_approval_card(
@@ -711,7 +717,7 @@ async fn build_lark_file_upload_form(
 /// Used to (a) wake the awaiting future via `sender` and (b) re-render
 /// the card after the click so the buttons disappear.
 struct PendingApproval {
-    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::AttributedApprovalResponse>,
     destination: String,
     /// `data.message_id` returned by the send-card POST. Empty string is a
     /// sentinel meaning "card was sent but message_id was missing from the
@@ -3527,7 +3533,7 @@ impl LarkChannel {
     /// deny, so the caller does not report an operator refusal nobody made.
     async fn wait_for_decision(
         &self,
-        rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
+        rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse>,
         guard: &mut crate::util::PendingApprovalGuard<PendingApproval>,
     ) -> zeroclaw_api::channel::AttributedApprovalResponse {
         use zeroclaw_api::channel::{
@@ -3536,7 +3542,7 @@ impl LarkChannel {
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
             Ok(Ok(response)) => {
                 guard.disarm();
-                AttributedApprovalResponse::operator(response)
+                response
             }
             Ok(Err(_)) => {
                 guard.remove().await;
@@ -3860,7 +3866,10 @@ impl LarkChannel {
             "Lark: card action received"
         );
 
-        let _ = pending.sender.send(decision.clone());
+        let _ = pending.sender.send(
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(decision.clone())
+                .with_user(Some(responder.to_string())),
+        );
 
         if !pending.message_id.is_empty() {
             self.patch_approval_card_resolved(
@@ -6198,6 +6207,26 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
+    fn cost_override_card_has_no_always_button() {
+        let card = build_approval_card(
+            "test-id",
+            zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL,
+            "limit reached",
+            None,
+        );
+        let columns = card["body"]["elements"][1]["columns"].as_array().unwrap();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(
+            columns[0]["elements"][0]["behaviors"][0]["value"]["decision"],
+            "approve"
+        );
+        assert_eq!(
+            columns[1]["elements"][0]["behaviors"][0]["value"]["decision"],
+            "deny"
+        );
+    }
+
+    #[test]
     fn build_approval_card_contains_all_three_buttons() {
         let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", None);
 
@@ -6513,7 +6542,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("receive {name} decision timed out"))
                 .unwrap_or_else(|e| panic!("receive {name} decision: {e}"));
-            assert_eq!(result, expected, "fixture {name}");
+            assert_eq!(result.response, expected, "fixture {name}");
         }
     }
 
@@ -6553,7 +6582,7 @@ mod tests {
             .await
             .expect("handler ok");
         let result = rx.await.expect("oneshot delivered");
-        assert_eq!(result, ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(result.response, ChannelApprovalResponse::AlwaysApprove);
     }
 
     #[tokio::test]
@@ -6645,7 +6674,8 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), approved_rx)
                 .await
                 .expect("authorized callback should resolve")
-                .expect("approval sender should stay open"),
+                .expect("approval sender should stay open")
+                .response,
             ChannelApprovalResponse::Approve
         );
         let approvals = ch.pending_approvals.lock().await;
@@ -6790,7 +6820,10 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        assert_eq!(approved_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approved_rx.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             channel
                 .pending_approvals
@@ -6868,7 +6901,7 @@ mod tests {
         .await;
         assert_eq!(encrypted_response.status(), StatusCode::OK);
         assert_eq!(
-            encrypted_rx.await.unwrap(),
+            encrypted_rx.await.unwrap().response,
             ChannelApprovalResponse::Approve
         );
     }
@@ -6981,7 +7014,10 @@ mod tests {
             "operator": { "open_id": "ou_testuser123" }
         });
         ch.handle_card_action_event(&authorized).await.unwrap();
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(
+            rx.await.unwrap().response,
+            ChannelApprovalResponse::AlwaysApprove
+        );
         assert!(ch.pending_approvals.lock().await.is_empty());
     }
     async fn mount_lark_token_and_send_mocks(

@@ -14,12 +14,15 @@ use crate::agent::agent::TurnEvent;
 use crate::sop::SopGraphExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_config::cost::override_grant::{
+    CostOverrideAnswer, cost_override_answer, independent_operator_process,
+};
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 
@@ -1125,6 +1128,28 @@ async fn refresh_live_channel_handles_between_configs_detached(
     }
 }
 
+/// Check the actual process tree at decision time. A reparented process may no
+/// longer expose its former ancestry; this is a bounded check, not OS isolation.
+fn cost_override_peer_is_independent(peer: Option<u32>) -> bool {
+    let mut system = sysinfo::System::new();
+    independent_operator_process(
+        peer,
+        std::process::id(),
+        sysinfo::IS_SUPPORTED_SYSTEM,
+        |pid| {
+            let pid = sysinfo::Pid::from_u32(pid);
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            system
+                .process(pid)
+                .and_then(|process| process.parent().map(|parent| parent.as_u32()))
+        },
+    )
+}
+
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
@@ -1149,6 +1174,10 @@ pub struct RpcDispatcher {
     tui_epoch: Option<super::tui_identity::TuiEpoch>,
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
+    /// Kernel-reported local client PID. Unknown transports cannot lift cost caps.
+    peer_process_id: Option<u32>,
+    #[cfg(test)]
+    cost_override_peer_lookup: Option<Arc<dyn Fn(Option<u32>) -> bool + Send + Sync>>,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
     /// Generation token for the transport connection that accepted work.
     /// Every detached prompt is linked to it and drained before teardown.
@@ -1304,6 +1333,9 @@ impl RpcDispatcher {
             tui_id: None,
             tui_epoch: None,
             peer_label,
+            peer_process_id: None,
+            #[cfg(test)]
+            cost_override_peer_lookup: None,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
             connection_cancel,
             owns_connection: true,
@@ -1334,6 +1366,11 @@ impl RpcDispatcher {
     #[must_use]
     pub(crate) fn with_initialize_deadline(mut self, deadline: tokio::time::Instant) -> Self {
         self.initialize_deadline = Some(deadline);
+        self
+    }
+
+    pub(crate) fn with_peer_process_id(mut self, pid: Option<u32>) -> Self {
+        self.peer_process_id = pid;
         self
     }
 
@@ -3075,6 +3112,9 @@ impl RpcDispatcher {
             // teardown; only the owning transport loop does.
             tui_epoch: self.tui_epoch,
             peer_label: self.peer_label.clone(),
+            peer_process_id: self.peer_process_id,
+            #[cfg(test)]
+            cost_override_peer_lookup: self.cost_override_peer_lookup.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
             connection_cancel: self.connection_cancel.clone(),
             owns_connection: false,
@@ -8825,10 +8865,13 @@ impl RpcDispatcher {
         // registered binding), never the client-supplied session_id. An
         // unknown request_id falls through to the no-op resolve below,
         // identically for every caller.
-        if let Some(bound_session) = self.ctx.approval_pending.session_for(&p.request_id) {
-            self.authorize_session_owner(&bound_session, Method::SessionApprove)
-                .await?;
-        }
+        let bound_session = self.ctx.approval_pending.session_for(&p.request_id);
+        let admitted = if let Some(bound_session) = bound_session.as_deref() {
+            self.authorize_session_owner(bound_session, Method::SessionApprove)
+                .await?
+        } else {
+            None
+        };
 
         let response = match p.decision.as_str() {
             "allow_once" => zeroclaw_api::channel::ChannelApprovalResponse::Approve,
@@ -8846,10 +8889,120 @@ impl RpcDispatcher {
             }
         };
 
-        let acknowledged =
-            self.ctx
-                .approval_pending
-                .resolve(&p.request_id, &p.session_id, response);
+        let user = self
+            .auth
+            .as_ref()
+            .and_then(|auth| {
+                (auth.principal.id.0 != zeroclaw_api::principal::PrincipalId::SHARED_OPERATOR)
+                    .then(|| auth.principal.id.0.clone())
+            })
+            .or_else(|| match &self.transport_credential {
+                crate::security::auth_provider::Credential::Peercred { uid } => {
+                    Some(format!("uid:{uid}"))
+                }
+                _ => None,
+            });
+        let cost_override = self
+            .ctx
+            .approval_pending
+            .is_cost_override(&p.request_id, &p.session_id);
+        let approval_authority = if cost_override {
+            let peer_pid = self.peer_process_id;
+            let is_local_transport = self.transport_kind == super::transport::TransportKind::Local;
+            let independent = if is_local_transport {
+                #[cfg(test)]
+                let lookup = self.cost_override_peer_lookup.clone();
+                tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(lookup) = lookup {
+                        return lookup(peer_pid);
+                    }
+                    cost_override_peer_is_independent(peer_pid)
+                })
+                .await
+                .unwrap_or(false)
+            } else {
+                false
+            };
+            let current = self
+                .revalidate_admitted_session(&p.session_id, admitted.as_ref())
+                .await?;
+            // The process lookup and session reads can outlive the caller's
+            // grants. Hold current authority through synchronous delivery so
+            // neither approval nor refusal consumes a prompt after revocation.
+            let lease = self.ctx.auth.hold_authority();
+            let grants = self
+                .auth
+                .as_ref()
+                .map(|auth| {
+                    current_authority_under(&lease, auth, Method::SessionApprove).map_err(
+                        |denied| {
+                            self.audit_auth_denial(Method::SessionApprove, &denied);
+                            rpc_err(denied.code, denied.message)
+                        },
+                    )
+                })
+                .transpose()?;
+            self.require_ownership_under(grants.as_ref(), current.as_ref())?;
+            if self.ctx.approval_pending.session_for(&p.request_id) != bound_session {
+                return to_result(SessionApproveResult {
+                    session_id: p.session_id,
+                    request_id: p.request_id,
+                    acknowledged: false,
+                });
+            }
+            if cost_override_answer(is_local_transport, independent) == CostOverrideAnswer::Refuse {
+                // Stop only if this is the connection the prompt was sent to.
+                // A foreign connection cannot consume someone else's prompt.
+                self.ctx.approval_pending.resolve_from_operator(
+                    &p.request_id,
+                    &p.session_id,
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unavailable,
+                    )
+                    .with_user(user),
+                    &self.rpc,
+                );
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            json!({"request_id": p.request_id, "session_id": p.session_id,
+                            "peer_pid": peer_pid, "reason": "cost_override_untrusted_process"})
+                        ),
+                    "RPC cost override refused: independent operator process required"
+                );
+                return Err(rpc_err(
+                    FORBIDDEN,
+                    crate::i18n::get_required_cli_string("rpc-cost-override-independent-operator"),
+                ));
+            }
+            Some(lease)
+        } else {
+            None
+        };
+        let acknowledged = self.ctx.approval_pending.resolve_from_operator(
+            &p.request_id,
+            &p.session_id,
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(response).with_user(user),
+            &self.rpc,
+        );
+        drop(approval_authority);
+
+        if cost_override && !acknowledged {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        json!({"request_id": p.request_id, "session_id": p.session_id,
+                        "reason": "cost_override_wrong_operator_connection"})
+                    ),
+                "RPC cost override refused: request was not delivered to this connection"
+            );
+        }
 
         to_result(SessionApproveResult {
             session_id: p.session_id,
@@ -22756,7 +22909,7 @@ mod tests {
             .expect("alice creates her session");
 
         let (tx, mut rx) =
-            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::AttributedApprovalResponse>();
         ctx.approval_pending
             .insert("req-appr".to_string(), "alice-appr".to_string(), tx);
 
@@ -22783,7 +22936,7 @@ mod tests {
             .await
             .expect("the owner resolves her own approval");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            rx.try_recv().unwrap().response,
             zeroclaw_api::channel::ChannelApprovalResponse::Approve
         );
     }
@@ -27355,10 +27508,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_approve_cost_override_refuses_own_process_and_stops_the_request() {
+        let dispatcher =
+            make_approval_test_dispatcher().with_peer_process_id(Some(std::process::id()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _guard = dispatcher.ctx.approval_pending.register_attributed(
+            "self-cost".into(),
+            "sess-1".into(),
+            tx,
+            Some(dispatcher.rpc.clone()),
+        );
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1", "request_id": "self-cost", "decision": "allow_once",
+            }))
+            .await;
+        assert_eq!(result.unwrap_err().code, FORBIDDEN);
+        let answer = rx.await.unwrap();
+        assert_eq!(
+            answer.response,
+            zeroclaw_api::channel::ChannelApprovalResponse::Deny
+        );
+        assert!(answer.source.is_runtime_fail_closed());
+    }
+
+    async fn cost_override_approve_during_peer_lookup(revoke: bool) {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::agent::turn::TurnCtx;
+        use crate::agent::turn::provider_call::gate_tool_loop_budget;
+        use crate::cost::CostTracker;
+        use crate::cost::types::{BudgetCheck, TokenUsage};
+        use crate::rpc::approval_channel::RpcApprovalChannel;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{CostConfig, PacingConfig, StreamReasoningMode};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-cost-override-peer-lookup";
+        let (ctx, _backend, _key) = append_review_fixture(&tmp, sid, "user:alice", false).await;
+        let (mut dispatcher, mut rx) = roster_peer(&ctx, 4242).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let lookup_entered = Arc::clone(&entered);
+        dispatcher.cost_override_peer_lookup = Some(Arc::new(move |_| {
+            lookup_entered.notify_one();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("release the paused peer lookup");
+            true
+        }));
+
+        let tracker = Arc::new(
+            CostTracker::new(
+                CostConfig {
+                    enabled: true,
+                    daily_limit_usd: 1.0,
+                    allow_override: true,
+                    ..Default::default()
+                },
+                &tmp.path().join("cost"),
+            )
+            .unwrap(),
+        );
+        tracker
+            .record_usage(TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                3.0,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        assert!(tracker.override_offer().is_some());
+        let channel = RpcApprovalChannel::new(
+            "rpc",
+            sid,
+            Arc::clone(&dispatcher.rpc),
+            Arc::clone(&ctx.approval_pending),
+            Default::default(),
+        );
+        let scope = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::default());
+        let gate = zeroclaw_spawn::spawn!(async move {
+            let observer = crate::observability::NoopObserver;
+            let pacing = PacingConfig::default();
+            let turn = TurnCtx {
+                observer: &observer,
+                provider_name: "stub",
+                model: "stub-model",
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 32_000,
+                    context_token_budget: 32_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                },
+                temperature: None,
+                approval: None,
+                channel_name: "rpc",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                event_tx: None,
+                hooks: None,
+                dedup_exempt_tools: &[],
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                channel: Some(&channel),
+                draft_reasoning: StreamReasoningMode::Status,
+                turn_id: "cost-override-peer-lookup",
+                agent_alias: None,
+                parent_agent_alias: None,
+                serving_provider_name: None,
+                serving_model: None,
+            };
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(scope), gate_tool_loop_budget(&turn))
+                .await
+        });
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("cost prompt arrives")
+            .expect("connection stays open");
+        let notice: Value = serde_json::from_str(&notice).unwrap();
+        assert_eq!(notice["params"]["type"], "approval_request");
+        assert_eq!(
+            notice["params"]["tool_name"],
+            zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL
+        );
+        let request_id = notice["params"]["request_id"].as_str().unwrap();
+        let approve = rpc(
+            &mut dispatcher,
+            &mut rx,
+            1,
+            "session/approve",
+            json!({"session_id": sid, "request_id": request_id, "decision": "allow_once"}),
+        );
+        let change = async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+                .await
+                .expect("initial authorization reaches the peer lookup");
+            assert!(ctx.approval_pending.contains(request_id));
+            assert!(!gate.is_finished(), "the cost prompt is still waiting");
+            if revoke {
+                republish_session_scoped(&ctx, |profile| {
+                    profile.grants.insert(Resource::Sessions, vec![Verb::Read]);
+                });
+            }
+            release_tx.send(()).unwrap();
+        };
+        let (response, ()) = tokio::join!(approve, change);
+        if revoke {
+            assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+            assert!(response.get("result").is_none(), "no acknowledgement");
+            assert_eq!(
+                ctx.approval_pending.session_for(request_id).as_deref(),
+                Some(sid)
+            );
+            assert!(!gate.is_finished(), "the prompt must remain unanswered");
+            assert!(matches!(
+                tracker.check_budget(0.0).unwrap(),
+                BudgetCheck::Exceeded { .. }
+            ));
+            assert!(
+                tracker.override_offer().is_some(),
+                "no override was granted"
+            );
+            gate.abort();
+            assert!(gate.await.unwrap_err().is_cancelled());
+        } else {
+            assert_eq!(response["result"]["acknowledged"], true, "{response}");
+            // The real budget gate accepts only an operator-attributed Approve.
+            tokio::time::timeout(std::time::Duration::from_secs(10), gate)
+                .await
+                .expect("the waiting prompt receives Approve")
+                .expect("budget task completes")
+                .expect("the approved budget gate continues");
+            assert!(!ctx.approval_pending.contains(request_id));
+            assert!(
+                tracker.override_offer().is_none(),
+                "the override was granted"
+            );
+            assert!(!matches!(
+                tracker.check_budget(0.0).unwrap(),
+                BudgetCheck::Exceeded { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cost_override_approve_rechecks_authority_after_peer_lookup() {
+        cost_override_approve_during_peer_lookup(true).await;
+    }
+
+    #[tokio::test]
+    async fn cost_override_approve_accepts_unchanged_authority_after_peer_lookup() {
+        cost_override_approve_during_peer_lookup(false).await;
+    }
+
+    #[tokio::test]
     async fn session_approve_resolves_pending_request() {
         let dispatcher = make_approval_test_dispatcher();
         let (tx, mut rx) =
-            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::AttributedApprovalResponse>();
         dispatcher
             .ctx
             .approval_pending
@@ -27377,7 +27731,7 @@ mod tests {
         assert_eq!(result["request_id"], "req-allow");
         assert_eq!(result["acknowledged"], true);
         assert_eq!(
-            rx.try_recv().unwrap(),
+            rx.try_recv().unwrap().response,
             zeroclaw_api::channel::ChannelApprovalResponse::Approve
         );
         assert!(!dispatcher.ctx.approval_pending.contains("req-allow"));
@@ -27406,7 +27760,7 @@ mod tests {
     async fn session_approve_cannot_resolve_another_sessions_request() {
         let dispatcher = make_approval_test_dispatcher();
         let (tx, mut rx) =
-            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::AttributedApprovalResponse>();
         dispatcher.ctx.approval_pending.insert(
             "req-owner".to_string(),
             "sess-owner".to_string(),
@@ -27436,7 +27790,7 @@ mod tests {
             .unwrap();
         assert_eq!(owner_result["acknowledged"], true);
         assert_eq!(
-            rx.try_recv().unwrap(),
+            rx.try_recv().unwrap().response,
             zeroclaw_api::channel::ChannelApprovalResponse::Deny
         );
     }

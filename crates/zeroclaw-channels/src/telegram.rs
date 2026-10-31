@@ -4268,7 +4268,7 @@ impl TelegramChannel {
     async fn resolve_after_deadline(
         &self,
         approval_id: &str,
-        rx: &mut tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
+        rx: &mut tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse>,
     ) -> zeroclaw_api::channel::AttributedApprovalResponse {
         let claimed = self
             .pending_approvals
@@ -4283,9 +4283,7 @@ impl TelegramChannel {
             );
         }
         match tokio::time::timeout(Self::CALLBACK_CLAIM_GRACE, rx).await {
-            Ok(Ok(response)) => {
-                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
-            }
+            Ok(Ok(response)) => response,
             _ => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                 zeroclaw_api::channel::ChannelApprovalResponse::Deny,
                 zeroclaw_api::channel::ApprovalSource::TimedOut,
@@ -6974,6 +6972,44 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// dismiss the spinner, and rewrite the prompt with the outcome, dropping
     /// the buttons
     /// best-effort rewrite, a stale tap is a no-op
+    /// The existing live-config authority is the only source of operator roles.
+    /// Missing config or private-chat metadata fails closed for this global grant.
+    fn can_override_cost_limit(&self, callback: &serde_json::Value) -> bool {
+        if callback
+            .pointer("/message/chat/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("private")
+            && callback
+                .pointer("/message/chat/id")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|id| id > 0)
+        {
+            return true;
+        }
+        let Some(user_id) = callback
+            .pointer("/from/id")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|id| *id > 0)
+        else {
+            return false;
+        };
+        let Some(authority) = self.persist.as_ref() else {
+            return false;
+        };
+        let handle = authority.live_handle();
+        let config = handle.read();
+        config
+            .channels
+            .telegram
+            .get(&self.alias)
+            .is_some_and(|telegram| {
+                telegram
+                    .cost_override_operators
+                    .iter()
+                    .any(|operator| operator == &user_id.to_string())
+            })
+    }
+
     async fn handle_approval_callback(&self, cb: &serde_json::Value) {
         use crate::util::PendingApprovalResolution;
 
@@ -6993,7 +7029,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return;
         };
 
-        let response = match action {
+        let mut response = match action {
             "approve" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
             "always" => Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove),
             "deny" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
@@ -7012,12 +7048,46 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let has_response = response.is_some();
         let (identities, callback_chat_id) = Self::approval_callback_context(cb);
         let responder_allowed = self.is_any_user_allowed(identities.iter().map(String::as_str));
+        let refused_operator = responder_allowed
+            && response.as_ref().is_some_and(|response| {
+                matches!(
+                    response,
+                    zeroclaw_api::channel::ChannelApprovalResponse::Approve
+                        | zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
+                )
+            })
+            && self
+                .pending_approvals
+                .lock()
+                .await
+                .get(approval_id)
+                .is_some_and(|pending| {
+                    pending.tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL
+                        && Some(pending.destination.as_str()) == callback_chat_id.as_deref()
+                })
+            && !self.can_override_cost_limit(cb);
+        if refused_operator {
+            response = Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny);
+        }
         let (resolution, resolved_tool) = match (response, callback_chat_id.as_deref()) {
             (Some(response), Some(chat_id)) => {
-                crate::util::resolve_pending_approval_with_tool(
+                crate::util::resolve_pending_approval_attributed_with_tool(
                     &self.pending_approvals,
                     approval_id,
-                    response,
+                    (if refused_operator {
+                        zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                            response,
+                            zeroclaw_api::channel::ApprovalSource::Unavailable,
+                        )
+                    } else {
+                        zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                    })
+                    .with_user(
+                        cb.pointer("/from/id")
+                            .and_then(serde_json::Value::as_i64)
+                            .map(|id| id.to_string())
+                            .or_else(|| identities.first().cloned()),
+                    ),
                     responder_allowed,
                     chat_id,
                 )
@@ -7025,6 +7095,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
             _ => (PendingApprovalResolution::NotFound, None),
         };
+
+        if refused_operator && matches!(resolution, PendingApprovalResolution::Resolved) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "approval_id": approval_id,
+                        "tool": zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL,
+                        "decided_by_user": cb.pointer("/from/id"),
+                        "chat_id": callback_chat_id,
+                        "reason": "cost_override_operator_required",
+                    })),
+                "Telegram group cost override refused; stopping the turn"
+            );
+        }
 
         if matches!(resolution, PendingApprovalResolution::Rejected) {
             ::zeroclaw_log::record!(
@@ -7046,7 +7132,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             );
         }
 
-        let answer_text = match (action, resolution) {
+        let effective_action = if refused_operator { "deny" } else { action };
+        let answer_text = match (effective_action, resolution) {
             ("approve", PendingApprovalResolution::Resolved) => format!(
                 "✅ {}",
                 i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
@@ -8805,13 +8892,14 @@ impl TelegramChannel {
              {tap_instruction}",
         );
 
-        let reply_markup = serde_json::json!({
-            "inline_keyboard": [[
-                { "text": format!("✅ {btn_approve}"),  "callback_data": format!("approval:{}:approve", approval_id) },
-                { "text": format!("❌ {btn_deny}"),     "callback_data": format!("approval:{}:deny", approval_id) },
-                { "text": format!("✅✅ {btn_always}"), "callback_data": format!("approval:{}:always", approval_id) },
-            ]]
-        });
+        let mut buttons = vec![
+            serde_json::json!({ "text": format!("✅ {btn_approve}"), "callback_data": format!("approval:{}:approve", approval_id) }),
+            serde_json::json!({ "text": format!("❌ {btn_deny}"), "callback_data": format!("approval:{}:deny", approval_id) }),
+        ];
+        if request.tool_name != zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL {
+            buttons.push(serde_json::json!({ "text": format!("✅✅ {btn_always}"), "callback_data": format!("approval:{}:always", approval_id) }));
+        }
+        let reply_markup = serde_json::json!({ "inline_keyboard": [buttons] });
 
         let mut body = serde_json::json!({
             "chat_id": chat_id,
@@ -8938,9 +9026,7 @@ impl TelegramChannel {
         let result = match wait_result {
             Ok(Ok(response)) => {
                 guard.disarm();
-                Some(zeroclaw_api::channel::AttributedApprovalResponse::operator(
-                    response,
-                ))
+                Some(response)
             }
             Ok(Err(_)) => {
                 // Sender dropped — clean up and deny. Nobody tapped.
@@ -9008,6 +9094,132 @@ mod tests {
         )
         .with_persistence_authority(telegram_alias_config(alias, multi_message_delay_ms))
         .with_streaming(StreamMode::MultiMessage, 750)
+    }
+
+    #[tokio::test]
+    async fn group_cost_override_requires_live_explicit_operator_and_private_is_unchanged() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::{COST_LIMIT_OVERRIDE_APPROVAL, ChannelApprovalResponse};
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut records = zeroclaw_log::subscribe_or_install();
+        let log_dir = tempfile::TempDir::new().unwrap();
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "none".into(),
+                ..Default::default()
+            },
+            log_dir.path(),
+        );
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .channels
+            .telegram
+            .insert("ops".into(), Default::default());
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "ops",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(authority.clone())
+        .with_mock_api_base(server.uri());
+        for (operators, chat_type, chat_id, tool, expected) in [
+            (
+                vec![],
+                "group",
+                -100_i64,
+                COST_LIMIT_OVERRIDE_APPROVAL,
+                ChannelApprovalResponse::Deny,
+            ),
+            (
+                vec!["*"],
+                "supergroup",
+                -100,
+                COST_LIMIT_OVERRIDE_APPROVAL,
+                ChannelApprovalResponse::Deny,
+            ),
+            (
+                vec!["1001"],
+                "supergroup",
+                -100,
+                COST_LIMIT_OVERRIDE_APPROVAL,
+                ChannelApprovalResponse::Approve,
+            ),
+            (
+                vec![],
+                "supergroup",
+                -100,
+                COST_LIMIT_OVERRIDE_APPROVAL,
+                ChannelApprovalResponse::Deny,
+            ),
+            (
+                vec![],
+                "private",
+                1001,
+                COST_LIMIT_OVERRIDE_APPROVAL,
+                ChannelApprovalResponse::Approve,
+            ),
+            (
+                vec![],
+                "group",
+                -100,
+                "shell",
+                ChannelApprovalResponse::Approve,
+            ),
+        ] {
+            let mut config = authority.snapshot_config();
+            config
+                .channels
+                .telegram
+                .get_mut("ops")
+                .unwrap()
+                .cost_override_operators = operators.into_iter().map(str::to_string).collect();
+            authority.publish_for_test(config);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ch.pending_approvals.lock().await.insert(
+                "role-test".into(),
+                crate::util::PendingApproval {
+                    sender: tx,
+                    destination: chat_id.to_string(),
+                    tool_name: tool.into(),
+                },
+            );
+            ch.handle_approval_callback(&serde_json::json!({
+                "id": "role-callback", "from": {"id": 1001},
+                "message": {"message_id": 99, "chat": {"id": chat_id, "type": chat_type}},
+                "data": "approval:role-test:approve",
+            }))
+            .await;
+            let answer = rx.await.unwrap();
+            assert_eq!(answer.response, expected);
+            assert_eq!(answer.decided_by_user.as_deref(), Some("1001"));
+            assert!(
+                ch.pending_approvals.lock().await.is_empty(),
+                "refused approval must stop this turn"
+            );
+        }
+        let mut refusals = Vec::new();
+        while let Ok(record) = records.try_recv() {
+            if record["attributes"]["reason"] == "cost_override_operator_required"
+                && record["attributes"]["approval_id"] == "role-test"
+            {
+                refusals.push(record);
+            }
+        }
+        assert_eq!(refusals.len(), 3);
+        assert!(
+            refusals
+                .iter()
+                .all(|record| record["attributes"]["decided_by_user"] == 1001)
+        );
     }
 
     #[test]
@@ -19652,8 +19864,8 @@ mod tests {
     fn callback_ack_source_region() -> &'static str {
         const SRC: &str = include_str!("telegram.rs");
         let start = SRC
-            .find("let answer_text = match (action, resolution) {")
-            .expect("callback ack arm: `let answer_text = match (action, resolution) {` not found");
+            .find("let answer_text = match (effective_action, resolution) {")
+            .expect("callback ack arm: `let answer_text = match (effective_action, resolution) {` not found");
         let rest = &SRC[start..];
         let end = rest
             .find("let answer_body")
@@ -24009,7 +24221,10 @@ mod tests {
             .await,
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(
+            rx.await.unwrap().response,
+            ChannelApprovalResponse::AlwaysApprove
+        );
 
         let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.lock().await.insert(
@@ -24031,7 +24246,10 @@ mod tests {
             .await,
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approve_rx.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     #[test]
@@ -24255,7 +24473,9 @@ mod tests {
         });
 
         ch.handle_approval_callback(&callback).await;
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        let answer = rx.await.unwrap();
+        assert_eq!(answer.response, ChannelApprovalResponse::Approve);
+        assert_eq!(answer.decided_by_user.as_deref(), Some("1001"));
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -24525,7 +24745,10 @@ mod tests {
 
         let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
         assert!(matches!(outcome, UpdateOutcome::Advanced));
-        assert_eq!(resp_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            resp_rx.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             rx.try_recv().is_err(),
             "a callback_query is terminal: no downstream message may be delivered"
@@ -24828,7 +25051,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(550)).await;
         pending
             .sender
-            .send(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
+            .send(zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            ))
             .expect("claimed callback response receiver must remain live");
 
         let attributed = waiter.await.unwrap().unwrap().unwrap();
@@ -24867,7 +25092,11 @@ mod tests {
         // the callback claims the entry first and its response is already in
         // flight on the channel when the deadline fires
         let pending = ch.pending_approvals.lock().await.remove("a1").unwrap();
-        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+        let _ = pending
+            .sender
+            .send(zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                ChannelApprovalResponse::Approve,
+            ));
 
         let outcome = ch.resolve_after_deadline("a1", &mut rx).await;
         assert_eq!(outcome.response, ChannelApprovalResponse::Approve);
@@ -24967,6 +25196,53 @@ mod tests {
         })
         .await
         .expect("cancelled approval must not leave a live pending token");
+    }
+
+    #[tokio::test]
+    async fn cost_override_keyboard_has_no_always_button() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_id": 1 }
+            })))
+            .mount(&server)
+            .await;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(server.uri())
+        .with_approval_timeout_secs(1);
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+            arguments_summary: "shared limit reached".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let _ = ch.request_approval("12345", &request).await;
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let buttons = body["reply_markup"]["inline_keyboard"][0]
+            .as_array()
+            .unwrap();
+        assert_eq!(buttons.len(), 2);
+        assert!(
+            buttons[0]["callback_data"]
+                .as_str()
+                .unwrap()
+                .ends_with(":approve")
+        );
+        assert!(
+            buttons[1]["callback_data"]
+                .as_str()
+                .unwrap()
+                .ends_with(":deny")
+        );
     }
 
     #[tokio::test]

@@ -15126,7 +15126,10 @@ data: [DONE]\n\n";
         ))
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(decision.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            decision.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             gateway_chat_dispatch_captures_for_test()
                 .iter()

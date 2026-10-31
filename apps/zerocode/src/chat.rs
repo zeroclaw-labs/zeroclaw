@@ -61,6 +61,27 @@ use transcript_layout::{EntryLayoutInput, LinesDirty, TranscriptLayoutCache};
 // Used both in render_approval_overlay and to pad diffs so they aren't covered.
 const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 
+// A fixed modifier chord keeps ordinary typing and tool-approval bindings from
+// granting a daemon-wide budget override. Enter always chooses Stop here.
+const COST_LIMIT_OVERRIDE_CHORD: crate::keymap::Chord = crate::keymap::Chord::ctrl('o');
+
+fn cost_limit_key_decision(key: &KeyEvent) -> Option<ApprovalDecision> {
+    use crossterm::event::{KeyCode, KeyEventKind};
+
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    if COST_LIMIT_OVERRIDE_CHORD.matches(key) {
+        return Some(ApprovalDecision::AllowOnce);
+    }
+    if crate::keymap::Chord::key(KeyCode::Enter).matches(key)
+        || crate::keymap::Chord::key(KeyCode::Esc).matches(key)
+    {
+        return Some(ApprovalDecision::Reject);
+    }
+    None
+}
+
 /// How often the cwd line re-polls the daemon for the current git branch.
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
@@ -4160,6 +4181,20 @@ impl Chat {
             return false;
         };
 
+        // Cost overrides have their own modal controls. Handle them before
+        // composer shortcuts and ordinary tool approvals, which use Enter/a.
+        if state
+            .pending_approval()
+            .is_some_and(PendingApproval::is_cost_limit)
+        {
+            if let Some(decision) = cost_limit_key_decision(&key)
+                && let Some(pa) = state.take_pending_approval()
+            {
+                answer_cost_limit(&self.rpc, state, pa, decision).await;
+            }
+            return false;
+        }
+
         // ── Model / model_provider picker overlay key handling ───
         // Takes priority over all other Active-phase keys while open.
         if state.model_picker.is_open() {
@@ -5459,6 +5494,26 @@ impl Chat {
                 return;
             }
 
+            // The cost-limit notice is the one overlay with buttons: a click on
+            // Override or Stop answers it; any other click is swallowed below.
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+                && let Some(buttons) = state.cost_limit_buttons
+            {
+                let decision = if mouse::in_rect(mouse.column, mouse.row, buttons.override_rect) {
+                    Some(ApprovalDecision::AllowOnce)
+                } else if mouse::in_rect(mouse.column, mouse.row, buttons.stop_rect) {
+                    Some(ApprovalDecision::Reject)
+                } else {
+                    None
+                };
+                if let Some(decision) = decision
+                    && let Some(pa) = state.take_pending_approval()
+                {
+                    answer_cost_limit(&self.rpc, state, pa, decision).await;
+                }
+                return;
+            }
+
             // Approval and elicitation overlays are keyboard-driven but still
             // block clicks from reaching controls rendered beneath them.
             if state.pending_approval().is_some() || state.pending_elicitation().is_some() {
@@ -6090,6 +6145,21 @@ impl crate::widgets::HelpContext for Chat {
                     ));
                     return HelpNode::entries(entries);
                 }
+                if state
+                    .pending_approval()
+                    .is_some_and(PendingApproval::is_cost_limit)
+                {
+                    return HelpNode::entries(vec![
+                        E::new(
+                            [COST_LIMIT_OVERRIDE_CHORD.display()],
+                            crate::i18n::t("zc-chat-cost-limit-override"),
+                        ),
+                        E::new(
+                            cost_limit_stop_key_labels(),
+                            crate::i18n::t("zc-chat-cost-limit-stop"),
+                        ),
+                    ]);
+                }
                 if state.pending_approval().is_some() {
                     use crate::keymap::{ChatTabAction as C, action_key_labels};
                     return HelpNode::entries(vec![
@@ -6530,7 +6600,13 @@ fn render_with_plan_placement(
     state.input_bar.render_autocomplete_popup(f);
     state.input_bar.render_attachment_manager(f, area);
 
-    if state.pending_approval().is_some() {
+    state.cost_limit_buttons = None;
+    if state
+        .pending_approval()
+        .is_some_and(PendingApproval::is_cost_limit)
+    {
+        state.cost_limit_buttons = render_cost_limit_overlay(f, state, area);
+    } else if state.pending_approval().is_some() {
         render_approval_overlay(f, state, area);
     }
 
@@ -8389,6 +8465,164 @@ fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
     );
 }
 
+/// Send the answer to a cost-limit notice. The notice hides while the
+/// answer is in flight. If the daemon refuses it (for example `FORBIDDEN`
+/// after this client lost approval rights), the request is still pending
+/// there, so the notice comes back with the error and the user can answer
+/// again. A failure without a reply (a timeout) is reported, but the notice
+/// is not restored, because the daemon may already have taken the answer.
+/// A refusal that also stopped the turn is cleared by its `TurnComplete`.
+async fn answer_cost_limit(
+    rpc: &RpcClient,
+    state: &mut ChatState,
+    pa: PendingApproval,
+    decision: ApprovalDecision,
+) {
+    state.cost_limit_buttons = None;
+    state.mark_dirty_full();
+    let Err(error) = rpc
+        .session_approve(&state.session_id, &pa.request_id, decision)
+        .await
+    else {
+        return;
+    };
+    let refused = error
+        .downcast_ref::<crate::jsonrpc::JsonRpcError>()
+        .is_some();
+    if refused && state.pending_approval.is_none() {
+        state.pending_approval = Some(pa);
+    }
+    state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+        "zc-chat-cost-limit-answer-failed",
+        &[("error", &format!("{error:#}"))],
+    )));
+}
+
+fn cost_limit_stop_key_labels() -> Vec<String> {
+    use crossterm::event::KeyCode;
+    [KeyCode::Enter, KeyCode::Esc]
+        .into_iter()
+        .map(|code| crate::keymap::Chord::key(code).display())
+        .collect()
+}
+
+/// The daemon paused a turn because a cost limit is reached and asks
+/// whether to override it. Drawn centred, in bold red, above everything in
+/// the pane, with Stop as the default action. Returns the
+/// button rects for the mouse handler.
+fn render_cost_limit_overlay(
+    f: &mut Frame,
+    state: &ChatState,
+    area: Rect,
+) -> Option<CostLimitButtons> {
+    let pa = state.pending_approval()?;
+    let red = theme::status_error_style().add_modifier(Modifier::BOLD);
+    let override_label = format!(
+        " {} ({}) ",
+        crate::i18n::t("zc-chat-cost-limit-override"),
+        COST_LIMIT_OVERRIDE_CHORD.display()
+    );
+    let stop_label = format!(
+        " {} ({}) ",
+        crate::i18n::t("zc-chat-cost-limit-stop"),
+        cost_limit_stop_key_labels().join("/")
+    );
+    let minutes = pa.timeout_secs.div_ceil(60).to_string();
+    let wait = crate::i18n::t_args("zc-chat-cost-limit-wait", &[("minutes", &minutes)]);
+
+    let width = area.width.saturating_sub(4).clamp(20, 76).min(area.width);
+    let body_paragraph = Paragraph::new(vec![
+        Line::from(Span::styled(pa.arguments_summary.clone(), red)),
+        Line::default(),
+        Line::from(Span::styled(wait, theme::dim_style())),
+    ])
+    .wrap(Wrap { trim: true });
+    // Measure the same word wrapping used to render the complete disclosure
+    // and timeout. A character-count estimate can hide their final lines.
+    let body_rows = body_paragraph.line_count(width.saturating_sub(4).max(1));
+    let override_w = crate::display_width::display_width(&override_label) as u16;
+    let stop_w = crate::display_width::display_width(&stop_label) as u16;
+    // Side by side when both labels fit with their gap; otherwise Stop
+    // above Override, so a narrow pane never clips either button.
+    let stacked = stop_w + 3 + override_w > width.saturating_sub(4);
+    let button_rows = if stacked { 2 } else { 1 };
+    let height = body_rows
+        .saturating_add(4 + button_rows)
+        .min(usize::from(area.height)) as u16;
+    let modal = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height,
+    };
+    f.render_widget(Clear, modal);
+
+    let title = format!(" {} ", crate::i18n::t("zc-chat-cost-limit-title"));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Thick)
+        .border_style(red)
+        .title(Span::styled(title, red))
+        .title_alignment(Alignment::Center)
+        .style(theme::fill_style());
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+    let body = Rect {
+        x: inner.x + 1,
+        y: inner.y + 1,
+        width: inner.width.saturating_sub(2),
+        height: inner.height.saturating_sub(2 + button_rows as u16),
+    };
+    f.render_widget(body_paragraph, body);
+
+    let row = inner.y + inner.height.saturating_sub(2);
+    let button_room = inner.width.saturating_sub(2);
+    let stop_rect = Rect {
+        x: inner.x + 1,
+        y: if stacked {
+            row.saturating_sub(1).max(inner.y)
+        } else {
+            row
+        },
+        width: stop_w.min(button_room),
+        height: 1,
+    };
+    let override_rect = if stacked {
+        Rect {
+            x: inner.x + 1,
+            y: row,
+            width: override_w.min(button_room),
+            height: 1,
+        }
+    } else {
+        Rect {
+            x: (stop_rect.x + stop_rect.width + 3).min(inner.x + inner.width),
+            y: row,
+            width: override_w
+                .min((inner.x + inner.width).saturating_sub(stop_rect.x + stop_rect.width + 3)),
+            height: 1,
+        }
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(override_label, red)),
+        override_rect,
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            stop_label,
+            Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(ratatui::style::Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )),
+        stop_rect,
+    );
+    Some(CostLimitButtons {
+        override_rect,
+        stop_rect,
+    })
+}
+
 fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     let pa = match state.pending_approval() {
         Some(p) => p,
@@ -9546,6 +9780,21 @@ pub struct PendingApproval {
     pub timeout_secs: u64,
 }
 
+impl PendingApproval {
+    /// The daemon's budget-override prompt, not a tool call: rendered as the
+    /// red cost-limit notice instead of the tool approval card.
+    pub fn is_cost_limit(&self) -> bool {
+        self.tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL
+    }
+}
+
+/// Click targets of the cost-limit notice from its last draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CostLimitButtons {
+    override_rect: Rect,
+    stop_rect: Rect,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingElicitation {
     /// JSON-RPC request id to respond to. Echoed verbatim.
@@ -9951,6 +10200,9 @@ pub struct ChatState {
     pub info_message: Option<crate::widgets::InfoMessage>,
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
+    /// Buttons of the cost-limit notice from the last draw; `None` when the
+    /// notice is not on screen.
+    cost_limit_buttons: Option<CostLimitButtons>,
     /// Exact close-cell target from the last Todo panel draw.
     #[cfg(test)]
     todo_close_hit_rect: Option<ratatui::layout::Rect>,
@@ -10044,6 +10296,7 @@ impl ChatState {
             queue_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
+            cost_limit_buttons: None,
             #[cfg(test)]
             todo_close_hit_rect: None,
             todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
@@ -11491,6 +11744,7 @@ impl ChatState {
             | SessionUpdate::ToolCall { session_id, .. }
             | SessionUpdate::ToolResult { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
+            | SessionUpdate::ApprovalWithdrawn { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
@@ -11602,6 +11856,20 @@ impl ChatState {
                 });
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::WaitingForApproval;
+                }
+            }
+            SessionUpdate::ApprovalWithdrawn { request_id, .. } => {
+                // Only the prompt it names: a newer prompt stays up.
+                if self
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(|pa| pa.request_id == request_id)
+                {
+                    self.pending_approval = None;
+                    if self.turn_status == TurnStatus::WaitingForApproval {
+                        self.turn_status = TurnStatus::Working;
+                    }
+                    self.mark_dirty_full();
                 }
             }
             SessionUpdate::ContextUsage {
@@ -11774,6 +12042,17 @@ impl ChatState {
                     .is_some_and(|generation| generation != self.turn_generation)
                 {
                     return;
+                }
+                // A cost-limit notice belongs to its turn. One brought back
+                // after a refused answer must not outlive the turn that the
+                // refusal (or anything else) ended.
+                if self
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(PendingApproval::is_cost_limit)
+                {
+                    self.pending_approval = None;
+                    self.cost_limit_buttons = None;
                 }
                 if let Some(message_count) = message_count {
                     self.message_count = message_count;
@@ -27004,6 +27283,22 @@ mod tests {
     }
 
     #[test]
+    fn approval_withdrawn_clears_only_the_named_prompt() {
+        let mut s = state();
+        s.apply_update(cost_limit_request());
+        s.apply_update(SessionUpdate::ApprovalWithdrawn {
+            session_id: "sess-1".to_string(),
+            request_id: "req-other".to_string(),
+        });
+        assert!(s.pending_approval().is_some(), "a different id is ignored");
+        s.apply_update(SessionUpdate::ApprovalWithdrawn {
+            session_id: "sess-1".to_string(),
+            request_id: "req-cost".to_string(),
+        });
+        assert!(s.pending_approval().is_none());
+    }
+
+    #[test]
     fn approval_overlay_uses_theme_background_after_clear() {
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -27039,6 +27334,378 @@ mod tests {
             Some(expected_bg),
             "approval overlay interior must use the active ZeroCode theme background"
         );
+    }
+
+    fn cost_limit_request() -> SessionUpdate {
+        SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-cost".to_string(),
+            tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+            arguments_summary: "Today's cost limit is reached: $3.00 spent of $1.00.".to_string(),
+            timeout_secs: 600,
+        }
+    }
+
+    #[test]
+    fn cost_limit_request_renders_the_red_notice_not_the_tool_card() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        s.apply_update(cost_limit_request());
+        assert!(
+            s.pending_approval()
+                .is_some_and(PendingApproval::is_cost_limit)
+        );
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_with_plan_placement(
+                    frame,
+                    &mut s,
+                    area,
+                    PaneKind::Chat,
+                    PlanPlacement::Legacy,
+                )
+            })
+            .expect("draw chat");
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            text.contains(&crate::i18n::t("zc-chat-cost-limit-title")),
+            "{text}"
+        );
+        assert!(text.contains("$3.00 spent of $1.00"), "{text}");
+        assert!(!text.contains("Approval Required"), "{text}");
+
+        let buttons = s.cost_limit_buttons.expect("buttons recorded at draw");
+        assert!(
+            buttons.stop_rect.x < buttons.override_rect.x,
+            "Stop is the first/default action"
+        );
+        let row = |rect: Rect| -> String {
+            (rect.x..rect.x + rect.width)
+                .map(|x| buffer[(x, rect.y)].symbol().to_string())
+                .collect()
+        };
+        assert!(
+            row(buttons.override_rect).contains(&crate::i18n::t("zc-chat-cost-limit-override"))
+        );
+        assert!(row(buttons.stop_rect).contains(&crate::i18n::t("zc-chat-cost-limit-stop")));
+        assert_eq!(
+            buffer[(buttons.stop_rect.x + 1, buttons.stop_rect.y)]
+                .style()
+                .bg,
+            Some(ratatui::style::Color::Red)
+        );
+    }
+
+    #[test]
+    fn cost_limit_notice_keeps_full_scope_timeout_and_buttons_visible() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for width in [30, 40, 76, 100] {
+            for period in ["day", "month"] {
+                let summary = format!(
+                    "Cost limit is reached: $3.00 spent of $1.00. Override removes the shared \
+                     {period} cap daemon-wide for all users, sessions, delegations and unattended \
+                     scheduled jobs until the next UTC {period} or daemon restart. Other limits \
+                     still apply. Stop ends only this turn. Override?"
+                );
+                let mut s = state();
+                s.apply_update(cost_limit_request());
+                s.pending_approval.as_mut().unwrap().arguments_summary = summary.clone();
+                let area = Rect::new(0, 0, width, 30);
+                let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+                let mut buttons = None;
+                terminal
+                    .draw(|frame| buttons = render_cost_limit_overlay(frame, &s, area))
+                    .expect("draw complete cost disclosure");
+                let buttons = buttons.expect("cost notice buttons");
+                let buffer = terminal.backend().buffer();
+                let modal_width = width.saturating_sub(4).clamp(20, 76);
+                let body_x = width.saturating_sub(modal_width) / 2 + 2;
+                let text = (0..buttons.stop_rect.y)
+                    .map(|y| {
+                        (body_x..body_x + modal_width.saturating_sub(4))
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                            .trim()
+                            .to_string()
+                    })
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    text.contains(&summary),
+                    "full scope at width {width}: {text}"
+                );
+                let wait = crate::i18n::t_args("zc-chat-cost-limit-wait", &[("minutes", "10")]);
+                assert!(text.contains(&wait), "timeout at width {width}: {text}");
+                let full_labels = [
+                    format!(
+                        "{} ({})",
+                        crate::i18n::t("zc-chat-cost-limit-stop"),
+                        cost_limit_stop_key_labels().join("/")
+                    ),
+                    format!(
+                        "{} ({})",
+                        crate::i18n::t("zc-chat-cost-limit-override"),
+                        COST_LIMIT_OVERRIDE_CHORD.display()
+                    ),
+                ];
+                for (rect, expected) in [buttons.stop_rect, buttons.override_rect]
+                    .into_iter()
+                    .zip(&full_labels)
+                {
+                    let label = (rect.x..rect.x + rect.width)
+                        .map(|x| buffer[(x, rect.y)].symbol())
+                        .collect::<String>();
+                    // A label wider than the whole modal can only be cut at
+                    // its end; anything that fits must be shown whole.
+                    let fits = crate::display_width::display_width(expected) as u16 + 2
+                        <= modal_width.saturating_sub(4);
+                    let shown = if fits {
+                        expected.as_str()
+                    } else {
+                        expected
+                            .split(" (")
+                            .next()
+                            .unwrap_or(expected)
+                            .split(' ')
+                            .next()
+                            .unwrap_or(expected)
+                    };
+                    assert!(
+                        label.contains(shown),
+                        "whole button at width {width}: {label}"
+                    );
+                    assert!(rect.x + rect.width <= width, "button inside the pane");
+                }
+                let (stop, over) = (buttons.stop_rect, buttons.override_rect);
+                assert!(
+                    stop.y != over.y || stop.x + stop.width <= over.x,
+                    "buttons overlap at width {width}"
+                );
+                let pair = full_labels
+                    .iter()
+                    .map(|l| crate::display_width::display_width(l) as u16 + 2)
+                    .sum::<u16>()
+                    + 3;
+                assert_eq!(
+                    stop.y != over.y,
+                    pair > modal_width.saturating_sub(4),
+                    "stacked only when the pair cannot share a row (width {width})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cost_limit_keys_require_deliberate_override_and_default_to_stop() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        for (key, expected) in [
+            (
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                "allow_once",
+            ),
+            (KeyEvent::from(KeyCode::Enter), "reject"),
+            (KeyEvent::from(KeyCode::Esc), "reject"),
+        ] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc_out = Arc::new(RpcOutbound::new(tx));
+            let mut chat = Chat::new(
+                Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out))),
+                PaneKind::Chat,
+            );
+            let mut s = state();
+            s.input_bar.insert_text("keep draft");
+            s.apply_update(cost_limit_request());
+            chat.phase = ChatPhase::Active(Box::new(s));
+            let answer = tokio::spawn(async move {
+                let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                    crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                    ratatui::TerminalOptions {
+                        viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                    },
+                )
+                .unwrap();
+                // Tool-approval shortcuts and ordinary typing cannot grant,
+                // dismiss, edit the draft, or submit a follow-up.
+                for ignored in ['a', 'e', 'o', 'x'] {
+                    chat.handle_key(KeyEvent::from(KeyCode::Char(ignored)), &mut term)
+                        .await;
+                    assert!(active_state(&mut chat).pending_approval().is_some());
+                }
+                let mut repeated_override =
+                    KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+                repeated_override.kind = KeyEventKind::Repeat;
+                chat.handle_key(repeated_override, &mut term).await;
+                assert!(active_state(&mut chat).pending_approval().is_some());
+                chat.handle_key(key, &mut term).await;
+                chat
+            });
+            let request = next_rpc_request(&mut rx, "cost notice key must answer").await;
+            assert_eq!(request["method"], method::SESSION_APPROVE);
+            assert_eq!(request["params"]["request_id"], "req-cost");
+            assert_eq!(request["params"]["decision"], expected);
+            respond_ok(&rpc_out, &request, serde_json::json!({}));
+            let mut chat = answer.await.unwrap();
+            assert!(active_state(&mut chat).pending_approval().is_none());
+            assert_eq!(active_state(&mut chat).input_bar.input(), "keep draft");
+            assert!(
+                rx.try_recv().is_err(),
+                "cost notice keys must only answer approval"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_cost_limit_answer_restores_the_notice_and_shows_the_error() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(RpcOutbound::new(tx));
+        let mut chat = Chat::new(
+            Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out))),
+            PaneKind::Chat,
+        );
+        let mut s = state();
+        s.apply_update(cost_limit_request());
+        chat.phase = ChatPhase::Active(Box::new(s));
+        let answer = tokio::spawn(async move {
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+                &mut term,
+            )
+            .await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "override must answer").await;
+        assert_eq!(request["method"], method::SESSION_APPROVE);
+        assert_eq!(request["params"]["decision"], "allow_once");
+        respond_err(
+            &rpc_out,
+            &request,
+            -32012, // the daemon's FORBIDDEN code
+            "approval rights belong to another client",
+        );
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), answer)
+            .await
+            .expect("key handled")
+            .unwrap();
+        let state = active_state(&mut chat);
+        let pending = state
+            .pending_approval()
+            .expect("a refused answer must bring the notice back");
+        assert!(pending.is_cost_limit());
+        assert_eq!(pending.request_id, "req-cost");
+        let notice = state
+            .info_message
+            .as_ref()
+            .expect("a refused answer must say why");
+        assert!(
+            notice
+                .text
+                .contains("approval rights belong to another client"),
+            "{}",
+            notice.text
+        );
+
+        // Some refusals also stop the turn: its end clears the notice.
+        let sid = state.session_id.clone();
+        state.apply_update(turn_complete(
+            &sid,
+            TurnEndOutcome::Failed,
+            "cost override refused",
+        ));
+        assert!(
+            state.pending_approval().is_none(),
+            "a finished turn must not leave its cost-limit notice up"
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_cost_limit_buttons_answers_the_prompt() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        for (override_clicked, expected) in [(true, "allow_once"), (false, "reject")] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc_out = Arc::new(RpcOutbound::new(tx));
+            let mut chat = Chat::new(
+                Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out))),
+                PaneKind::Chat,
+            );
+            let mut s = state();
+            s.apply_update(cost_limit_request());
+            let buttons = CostLimitButtons {
+                override_rect: Rect::new(10, 20, 25, 1),
+                stop_rect: Rect::new(40, 20, 12, 1),
+            };
+            s.cost_limit_buttons = Some(buttons);
+            chat.phase = ChatPhase::Active(Box::new(s));
+            let target = if override_clicked {
+                buttons.override_rect
+            } else {
+                buttons.stop_rect
+            };
+
+            // A click outside both buttons is swallowed and answers nothing.
+            chat.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row: 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::new(0, 0, 100, 30),
+            )
+            .await;
+            assert_no_rpc_request(&mut rx, "a click off the buttons must not answer").await;
+
+            let click = tokio::spawn(async move {
+                chat.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: target.x + 2,
+                        row: target.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    Rect::new(0, 0, 100, 30),
+                )
+                .await;
+                chat
+            });
+            let request = next_rpc_request(&mut rx, "a button click must answer").await;
+            assert_eq!(request["method"], method::SESSION_APPROVE);
+            assert_eq!(request["params"]["request_id"], "req-cost");
+            assert_eq!(request["params"]["decision"], expected);
+            respond_ok(&rpc_out, &request, serde_json::json!({}));
+            let chat = tokio::time::timeout(Duration::from_secs(2), click)
+                .await
+                .expect("click handled")
+                .unwrap();
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            assert!(state.pending_approval().is_none());
+        }
     }
 
     #[test]

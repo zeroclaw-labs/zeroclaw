@@ -1313,6 +1313,10 @@ turn-failed-attachment-omitted = [attachment omitted: the provider rejected it o
 # one requested, so silent model downgrades stay visible on direct-turn
 # surfaces (WS, RPC/ZeroCode, ACP).
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) was unavailable; this reply was served by { $actual_model } ({ $actual_provider }).
+# Budget-override prompt (`cost.allow_override`): shown on the operator's
+# approval surface when a turn would exceed the shared cost limit.
+turn-cost-limit-override-day = Today's cost limit is reached: ${ $spent } spent of ${ $limit }. Override removes the shared daily cap daemon-wide for all users, sessions, delegations and unattended scheduled jobs until the next UTC day or daemon restart. Other limits still apply. Stop ends only this turn. Override?
+turn-cost-limit-override-month = This month's cost limit is reached: ${ $spent } spent of ${ $limit }. Override removes the shared monthly cap daemon-wide for all users, sessions, delegations and unattended scheduled jobs until the next UTC month or daemon restart. Other limits still apply. Stop ends only this turn. Override?
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
@@ -1709,6 +1713,13 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 skill-http-request-timeout = HTTP request timed out
+
+# Cost overrides are explicit one-time decisions, never remembered permissions.
+channel-cost-override-reply-instruction-yesno = Reply: "{ $yes_command }" or "{ $no_command }"
+channel-cost-override-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }`.
+
+# A global spending override requires a separate local operator process.
+rpc-cost-override-independent-operator = Cost override requires an independent local operator process.
 
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.

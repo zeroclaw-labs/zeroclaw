@@ -425,19 +425,21 @@ impl Channel for AcpChannel {
         _recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        let is_cost_limit =
+            request.tool_name == zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL;
         let is_edit_tool = matches!(request.tool_name.as_str(), "file_edit" | "file_write");
-        let mut options = vec![
-            json!({
-                "optionId": "allow-once",
-                "name": i18n::get_required_cli_string("channel-approval-opt-allow-once"),
-                "kind": "allow_once",
-            }),
-            json!({
+        let mut options = vec![json!({
+            "optionId": "allow-once",
+            "name": i18n::get_required_cli_string("channel-approval-opt-allow-once"),
+            "kind": "allow_once",
+        })];
+        if !is_cost_limit {
+            options.push(json!({
                 "optionId": "allow-always",
                 "name": i18n::get_required_cli_string("channel-approval-opt-allow-always"),
                 "kind": "allow_always",
-            }),
-        ];
+            }));
+        }
         if is_edit_tool {
             options.push(json!({
                 "optionId": "reject-with-edit",
@@ -511,6 +513,9 @@ impl Channel for AcpChannel {
                     .and_then(|o| o.get("optionId"))
                     .and_then(|s| s.as_str())
                     .unwrap_or("");
+                if is_cost_limit && !matches!(option_id, "allow-once" | "reject-once") {
+                    anyhow::bail!("ACP returned an unoffered cost override optionId: {option_id}");
+                }
                 // "selected" means the operator picked one of the options we
                 // offered, so every arm here is a genuine operator decision.
                 let response = match option_id {
@@ -1034,6 +1039,48 @@ mod tests {
 
         let result = task.await.unwrap().unwrap();
         assert_eq!(result, Some(ChannelApprovalResponse::Approve));
+    }
+
+    #[tokio::test]
+    async fn cost_override_offers_only_once_and_rejects_remembered_allow() {
+        for selected in ["allow-once", "reject-once", "allow-always"] {
+            let (rpc, mut rx) = make_rpc();
+            let rpc_for_resp = Arc::clone(&rpc);
+            let ch = AcpChannel::new(
+                "acp",
+                "sess-1",
+                rpc,
+                Duration::from_secs(30),
+                ElicitationCapabilities::default(),
+            );
+            let request = ChannelApprovalRequest {
+                tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+                arguments_summary: "shared cost limit reached".to_string(),
+                raw_arguments: None,
+                position: None,
+            };
+            let task =
+                zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
+            let req: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            let options = req["params"]["options"].as_array().unwrap();
+            assert_eq!(options.len(), 2);
+            assert_eq!(options[0]["kind"], "allow_once");
+            assert_eq!(options[1]["kind"], "reject_once");
+            rpc_for_resp.dispatch_response(
+                req["id"].as_str().unwrap(),
+                Some(json!({"outcome": {"outcome": "selected", "optionId": selected}})),
+                None,
+            );
+            let result = task.await.unwrap();
+            match selected {
+                "allow-once" => assert_eq!(result.unwrap(), Some(ChannelApprovalResponse::Approve)),
+                "reject-once" => assert_eq!(result.unwrap(), Some(ChannelApprovalResponse::Deny)),
+                _ => assert!(
+                    result.is_err(),
+                    "an unoffered remembered allow must fail closed"
+                ),
+            }
+        }
     }
 
     #[tokio::test]
