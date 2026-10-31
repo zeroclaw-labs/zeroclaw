@@ -19781,6 +19781,114 @@ Let me check the result."#;
         );
     }
 
+    /// Drives the real `agent::run` entrypoint end to end (the same seam the
+    /// cron scheduler uses) and asserts that the provider record emitted
+    /// inside the run body carries `agent_alias`. That only happens when the
+    /// scope span records the attribution span as its parent — remove
+    /// `parent: &__zc_attribution_span` from the span construction in `run`
+    /// or `process_message_inner` and this test fails.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn run_emitted_provider_record_carries_agent_attribution() {
+        use axum::{Router, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = Router::new().route("/v1/chat/completions", post(respond_with_done));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("run-attribution-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "attribution-run-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let result = super::run(
+            config,
+            "attribution-run-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        server.abort();
+
+        let output = result.expect("run() should complete the scripted turn");
+        assert_eq!(output, "done");
+
+        // The capture subscriber is process-wide, so other tests' provider
+        // records can interleave; scope the assertion to this agent's alias.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut attributed = None;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m == "llm_request")
+                        && value["zeroclaw"]["agent_alias"] == "attribution-run-agent"
+                    {
+                        attributed = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        attributed.expect(
+            "the provider record emitted inside run() must carry agent_alias \
+             (scope span must name the attribution span as its parent)",
+        );
+    }
+
     fn review_test_pricing() -> crate::agent::cost::ModelProviderPricing {
         use std::collections::HashMap;
         let mut model_pricing: HashMap<String, f64> = HashMap::new();
