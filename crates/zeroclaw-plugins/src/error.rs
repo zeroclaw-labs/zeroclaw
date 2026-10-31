@@ -50,6 +50,15 @@ pub enum PluginError {
     )]
     MoveUnsupportedCleanup { path: String, reason: String },
 
+    /// The install source lies inside a hidden `installing` stage of the
+    /// package it names, which install clears before it stages its own copy.
+    /// Install refused before clearing anything, so the stage at `path` is as
+    /// it was.
+    #[error(
+        "nothing was installed: the source is inside {path}, a hidden stage that installing this package clears once no process holds it; copy the package out of that stage and install from the copy"
+    )]
+    SourceInStage { path: String },
+
     #[error("invalid plugin config: {0}")]
     InvalidConfig(String),
 
