@@ -280,6 +280,22 @@ they only relay what the IdP grants after the user approves. Design
 rationale and failure-mode table:
 `docs/security/oidc-browser-pkce-design-8289.md` in the repository.
 
+The gateway browser flow also requires a short-lived `HttpOnly` binding
+cookie from the browser that started it. The cookie grants no session or
+API access. A callback with no matching cookie is refused before code
+exchange and consumes the pending flow; open a new login in the intended
+browser instead of forwarding a callback URL between browsers. Each tab
+has its own flow cookie. A relay-capacity refusal retains a valid flow and
+cookie for retry within the original ten-minute deadline.
+
+Binding cookies use `SameSite=Lax` for the identity provider's top-level
+GET redirect. They have no `Domain` attribute and use `Path=/`, including
+behind a gateway path prefix; HTTPS also uses `Secure` and the `__Host-`
+name prefix. Serve remote enrollment over HTTPS. Plain-HTTP cookie scope
+still spans ports on the same host; this is not isolation from another
+application running on that host. Cookie blocking prevents browser
+enrollment; the device flow remains available.
+
 The rate limiting works in layers. Requests that start a flow
 (`POST /api/oidc/{alias}/device/start`, `GET /oidc/login/{alias}`, and
 `GET /oidc/callback`) count against an enrollment-specific instance of

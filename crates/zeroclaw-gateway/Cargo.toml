@@ -74,6 +74,7 @@ hex = "0.4"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 
 # Misc
+rand = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 parking_lot = "0.12"
 toml = "1.0"
@@ -89,7 +90,6 @@ libc = "0.2"
 # A plain HTTP/2 (h2c) client for the connection-drain tests.
 h2 = "0.4"
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }
-rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
 # Enables deterministic clock and shared-authority helpers for gateway fixtures;
