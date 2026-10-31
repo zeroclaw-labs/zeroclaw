@@ -627,6 +627,7 @@ mod tests {
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
             context_token_budget: 150_000,
+            has_authoritative_budget: true,
         };
         let mut fold = TurnUsageFold::default();
         fold.apply(&usage("a.primary", "m1", None, None, None, true));

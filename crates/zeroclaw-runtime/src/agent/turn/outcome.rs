@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use zeroclaw_config::schema::ModelContextWindowSource;
+
 /// Callback type for checking if model has been switched during tool execution.
 /// Returns Some((model_provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
@@ -87,7 +89,15 @@ pub struct ContextWindowExceeded {
     /// The count the refusal was decided on: the raw estimate, scaled up by
     /// the calibration ratio when provider-reported usage supplied one.
     pub estimated_tokens: usize,
+    /// The provider ref the request was addressed to, as `<type>.<alias>`.
+    /// It is the same ref the config uses, so the remediation can name the
+    /// exact `providers.models.<ref>.context_window` key.
+    pub model_provider: String,
     pub model_context_window: usize,
+    /// Where `model_context_window` came from. A `CompatibilityFallback`
+    /// value is an assumption ZeroClaw made for an unconfigured provider,
+    /// never the model's real capacity.
+    pub model_context_window_source: ModelContextWindowSource,
     /// The same request's raw estimate, before calibration. The shares below
     /// are parts of this total, never of `estimated_tokens`.
     pub raw_estimated_tokens: usize,
@@ -99,11 +109,44 @@ pub struct ContextWindowExceeded {
 }
 
 impl ContextWindowExceeded {
+    /// Localized remediation, selected by where the capacity came from.
+    ///
+    /// A configured window is the model's real limit and keeps the existing
+    /// message. The compatibility fallback is an assumption for an
+    /// unconfigured provider, so it says so and names the key that fixes it:
+    /// calling the stub "the selected model's context window" sent operators
+    /// looking at the conversation instead of the configuration.
+    #[must_use]
+    fn remediation(&self) -> String {
+        self.remediation_with(render_cli_string)
+    }
+
+    fn remediation_with(&self, render: CliStringRenderer) -> String {
+        match self.model_context_window_source {
+            // A discovered window is evidence about the model, so it reads like
+            // a configured one; only the compatibility stub is an assumption.
+            ModelContextWindowSource::Configured | ModelContextWindowSource::Discovered => {
+                render("turn-context-window-exceeded-error", &[])
+            }
+            ModelContextWindowSource::CompatibilityFallback => {
+                let window = self.model_context_window.to_string();
+                render(
+                    "turn-context-window-exceeded-unconfigured-error",
+                    &[
+                        ("provider", self.model_provider.as_str()),
+                        ("window", window.as_str()),
+                    ],
+                )
+            }
+        }
+    }
+
     /// Operator-facing account of what filled the window.
     ///
-    /// The `Display` text is the localized user-facing remediation and
-    /// deliberately carries no numbers, which left the operator's own log line
-    /// empty: the one place the cause should be recoverable said nothing.
+    /// The `Display` text is the localized user-facing remediation; it may
+    /// name the assumed window, but never the shares, which left the operator's
+    /// own log line empty: the one place the cause should be recoverable said
+    /// nothing.
     ///
     /// Every share is in raw-estimate units and the conversation share is the
     /// remainder of the raw total. Calibration against provider-reported usage
@@ -139,9 +182,7 @@ impl ContextWindowExceeded {
 
 impl std::fmt::Display for ContextWindowExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&crate::i18n::get_required_cli_string(
-            "turn-context-window-exceeded-error",
-        ))
+        f.write_str(&self.remediation())
     }
 }
 
@@ -323,8 +364,8 @@ fn terminal_completion_error_message_with_renderer(
     agent_name: Option<&str>,
     render: CliStringRenderer,
 ) -> Option<String> {
-    if context_window_exceeded_from_error(err).is_some() {
-        return Some(render("turn-context-window-exceeded-error", &[]));
+    if let Some(exceeded) = context_window_exceeded_from_error(err) {
+        return Some(exceeded.remediation_with(render));
     }
     // A refusal that is still the final cause sits beneath Reliable's
     // envelopes; it needs safety-specific guidance rather than the generic
@@ -509,7 +550,9 @@ mod tests {
     fn context_window_error_preserves_its_typed_cause_and_localized_projection() {
         let error = anyhow::Error::new(ContextWindowExceeded {
             estimated_tokens: 40_000,
+            model_provider: "custom.assistant".to_string(),
             model_context_window: 32_768,
+            model_context_window_source: ModelContextWindowSource::Configured,
             raw_estimated_tokens: 40_000,
             system_tokens: 6_000,
             tool_schema_tokens: 9_000,
@@ -534,13 +577,64 @@ mod tests {
         assert!(terminal_completion_error_message(&untyped, None).is_none());
     }
 
+    /// An unconfigured capacity is an assumption, not the model's window. The
+    /// operator must be pointed at the key that fixes it instead of being told
+    /// the model itself is too small.
+    #[test]
+    fn unconfigured_capacity_names_the_provider_key_and_the_assumed_window() {
+        let exceeded = ContextWindowExceeded {
+            estimated_tokens: 39_830,
+            model_provider: "opencode.go".to_string(),
+            model_context_window: 32_000,
+            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
+            raw_estimated_tokens: 39_830,
+            system_tokens: 1_200,
+            tool_schema_tokens: 14_900,
+        };
+        let message = exceeded.to_string();
+        for expected in ["32000", "opencode.go", "context_window"] {
+            assert!(
+                message.contains(expected),
+                "missing {expected:?} in {message:?}"
+            );
+        }
+        assert_ne!(
+            message,
+            crate::i18n::get_required_cli_string("turn-context-window-exceeded-error"),
+            "an unconfigured capacity must not reuse the configured-window wording"
+        );
+    }
+
+    /// The channel/terminal projection must carry the same hint, not fall back
+    /// to the generic configured-window text.
+    #[test]
+    fn terminal_projection_keeps_the_unconfigured_capacity_hint() {
+        let error = anyhow::Error::new(ContextWindowExceeded {
+            estimated_tokens: 39_830,
+            model_provider: "opencode.go".to_string(),
+            model_context_window: 32_000,
+            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
+            raw_estimated_tokens: 39_830,
+            system_tokens: 1_200,
+            tool_schema_tokens: 14_900,
+        });
+        let delivered = terminal_completion_error_message(&error, None)
+            .expect("typed capacity failure must have a safe terminal projection");
+        assert!(
+            delivered.contains("context_window"),
+            "terminal projection lost the remediation: {delivered:?}"
+        );
+    }
+
     /// The operator line must say what filled the window. An empty cause is
     /// what made a long-running failure unrecoverable from the journal.
     #[test]
     fn context_window_breakdown_names_every_share_and_the_window() {
         let exceeded = ContextWindowExceeded {
             estimated_tokens: 132_000,
+            model_provider: "custom.assistant".to_string(),
             model_context_window: 131_072,
+            model_context_window_source: ModelContextWindowSource::Configured,
             raw_estimated_tokens: 132_000,
             system_tokens: 13_400,
             tool_schema_tokens: 11_000,
@@ -569,7 +663,9 @@ mod tests {
     fn context_window_breakdown_shows_calibration_apart_from_every_share() {
         let exceeded = ContextWindowExceeded {
             estimated_tokens: 49_000,
+            model_provider: "custom.assistant".to_string(),
             model_context_window: 32_768,
+            model_context_window_source: ModelContextWindowSource::Configured,
             raw_estimated_tokens: 24_500,
             system_tokens: 13_400,
             tool_schema_tokens: 11_000,
@@ -592,7 +688,9 @@ mod tests {
     fn context_window_breakdown_never_underflows() {
         let exceeded = ContextWindowExceeded {
             estimated_tokens: 100,
+            model_provider: "custom.assistant".to_string(),
             model_context_window: 50,
+            model_context_window_source: ModelContextWindowSource::Configured,
             raw_estimated_tokens: 100,
             system_tokens: 80,
             tool_schema_tokens: 80,

@@ -456,6 +456,7 @@ mod tests {
             model_context_window_source:
                 zeroclaw_config::schema::ModelContextWindowSource::Configured,
             context_token_budget,
+            has_authoritative_budget: true,
         }
     }
 

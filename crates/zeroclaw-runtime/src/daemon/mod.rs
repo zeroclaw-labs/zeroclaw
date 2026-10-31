@@ -724,6 +724,9 @@ pub async fn run_with_authority(
     Option<crate::live_config_authority::ConfigOwnershipGuard>,
 )> {
     let config = live_config_authority.snapshot_config();
+    // Model metadata, resolved once from the shared catalog before any turn can
+    // run. Best effort: an unknown model stays unknown (no local cap).
+    crate::agent::publish_catalog_context_windows(&config).await;
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability

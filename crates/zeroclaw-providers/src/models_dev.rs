@@ -105,6 +105,19 @@ pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
     .await
 }
 
+/// The context window the catalog publishes for one model of one provider.
+///
+/// This is model metadata, not configuration: it is the same source the
+/// process already uses for pricing and listings. `None` means the catalog does
+/// not know this model, and callers must treat that as unknown rather than
+/// substituting a default.
+pub async fn context_window_for(provider_key: &str, model_id: &str) -> Option<usize> {
+    let catalog = CACHED_CATALOG.get_or_try_init(fetch_catalog).await.ok()?;
+    context_windows_from_catalog(catalog, provider_key)
+        .get(model_id)
+        .copied()
+}
+
 /// Same listing as [`list_models_for`], each id paired with the context window
 /// the catalog publishes for it. `None` means the catalog has no `limit.context`
 /// for that model — callers surface that as "unknown", never as a default.

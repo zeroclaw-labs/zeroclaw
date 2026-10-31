@@ -3906,8 +3906,48 @@ pub const LEGACY_DEFAULT_CONTEXT_BUDGET: usize = UNCONFIGURED_CONTEXT_WINDOW_FAL
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ModelContextWindowSource {
     Configured,
+    /// Resolved from the shared model catalog at startup: model metadata the
+    /// operator did not have to supply.
+    Discovered,
     #[default]
     CompatibilityFallback,
+}
+
+/// Process-lifetime snapshot of context windows resolved from the shared model
+/// catalog at startup, keyed by `provider_ref\u{1f}model`.
+///
+/// A materialized view of external metadata published once by the composition
+/// root, beside the pricing snapshot. It is not configuration: nothing writes
+/// it to `config.toml`, and an empty snapshot means "not known", never "small".
+static DISCOVERED_CONTEXT_WINDOWS: OnceLock<RwLock<HashMap<String, usize>>> = OnceLock::new();
+
+fn discovered_context_windows() -> &'static RwLock<HashMap<String, usize>> {
+    DISCOVERED_CONTEXT_WINDOWS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn discovered_key(provider_ref: &str, model: &str) -> String {
+    format!("{provider_ref}\u{1f}{model}")
+}
+
+/// Publish the context windows resolved from the model catalog for this
+/// process. Later snapshots replace earlier ones; zero is rejected as
+/// implausible by the provider-side parser already, and again here.
+pub fn publish_discovered_context_windows(
+    entries: impl IntoIterator<Item = (String, String, usize)>,
+) {
+    let map: HashMap<String, usize> = entries
+        .into_iter()
+        .filter(|(_, _, tokens)| *tokens > 0)
+        .map(|(provider, model, tokens)| (discovered_key(&provider, &model), tokens))
+        .collect();
+    if let Ok(mut guard) = discovered_context_windows().write() {
+        *guard = map;
+    }
+}
+
+fn discovered_context_window(provider_ref: &str, model: &str) -> Option<usize> {
+    let guard = discovered_context_windows().read().ok()?;
+    guard.get(&discovered_key(provider_ref, model)).copied()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3925,6 +3965,13 @@ pub struct ResolvedContextLimits {
     pub model_context_window: usize,
     pub model_context_window_source: ModelContextWindowSource,
     pub context_token_budget: usize,
+    /// Whether a local budget policy may act on this route at all.
+    ///
+    /// A capacity the operator configured, or an explicit budget or ratio, is
+    /// evidence-backed. The compatibility fallback alone is not: it exists so
+    /// budget arithmetic has an operand, and must never trim or refuse by
+    /// itself. `false` means "capacity unknown, no local policy".
+    pub has_authoritative_budget: bool,
 }
 
 impl ResolvedContextLimits {
@@ -3957,13 +4004,20 @@ impl ResolvedContextLimits {
     #[must_use]
     pub fn bind_budget(capacity: ResolvedModelContextWindow, budget: usize) -> Self {
         let model_context_window = match capacity.source {
-            ModelContextWindowSource::Configured => capacity.tokens,
+            ModelContextWindowSource::Configured | ModelContextWindowSource::Discovered => {
+                capacity.tokens
+            }
             ModelContextWindowSource::CompatibilityFallback => capacity.tokens.max(budget),
         };
         Self {
             model_context_window,
             model_context_window_source: capacity.source,
             context_token_budget: budget.min(model_context_window),
+            // A caller-supplied budget is operator intent; the stub alone is not.
+            has_authoritative_budget: matches!(
+                capacity.source,
+                ModelContextWindowSource::Configured | ModelContextWindowSource::Discovered
+            ) || budget > 0,
         }
     }
 
@@ -3972,8 +4026,11 @@ impl ResolvedContextLimits {
     /// fallback from known model capacity.
     #[must_use]
     pub fn configured_model_context_window(self) -> Option<usize> {
-        (self.model_context_window_source == ModelContextWindowSource::Configured)
-            .then_some(self.model_context_window)
+        matches!(
+            self.model_context_window_source,
+            ModelContextWindowSource::Configured | ModelContextWindowSource::Discovered
+        )
+        .then_some(self.model_context_window)
     }
 }
 
@@ -4010,12 +4067,14 @@ impl ResolvedRuntime {
         };
 
         // Preserve the established disable sentinel before applying any
-        // ratio, pruning floor, or positive-value normalization.
+        // ratio, pruning floor, or positive-value normalization. The operator
+        // asked for this route explicitly, so capacity still applies.
         if self.max_context_tokens == Some(0) {
             return ResolvedContextLimits {
                 model_context_window,
                 model_context_window_source: self.model_context_window_source,
                 context_token_budget: 0,
+                has_authoritative_budget: true,
             };
         }
 
@@ -4042,10 +4101,19 @@ impl ResolvedRuntime {
         // Capacity is a hard invariant for every positive effective budget.
         // Preserve zero as the explicit proactive-trimming disable sentinel.
         context_token_budget = context_token_budget.min(model_context_window);
+        // An unconfigured capacity and no operator budget or ratio means the
+        // route has no evidence-backed limit at all: the 32k compatibility
+        // stub must not drive trimming or refusal on its own.
+        let has_authoritative_budget = matches!(
+            self.model_context_window_source,
+            ModelContextWindowSource::Configured | ModelContextWindowSource::Discovered
+        ) || self.max_context_tokens.is_some()
+            || ratio.is_some();
         ResolvedContextLimits {
             model_context_window,
             model_context_window_source: self.model_context_window_source,
             context_token_budget,
+            has_authoritative_budget,
         }
     }
 
@@ -4812,10 +4880,18 @@ impl Config {
             .and_then(|provider| provider.context_window)
             .filter(|window| *window > 0);
 
-        configured_window.map_or(
-            ResolvedModelContextWindow {
-                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
-                source: ModelContextWindowSource::CompatibilityFallback,
+        configured_window.map_or_else(
+            || {
+                discovered_context_window(model_provider_ref, selected_model).map_or(
+                    ResolvedModelContextWindow {
+                        tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                        source: ModelContextWindowSource::CompatibilityFallback,
+                    },
+                    |tokens| ResolvedModelContextWindow {
+                        tokens,
+                        source: ModelContextWindowSource::Discovered,
+                    },
+                )
             },
             |tokens| ResolvedModelContextWindow {
                 tokens,
@@ -29555,6 +29631,65 @@ mod tests {
         let limits = r.context_limits();
         assert_eq!(limits.context_token_budget, 16_000);
         assert_eq!(limits.model_context_window, 32_000);
+    }
+
+    #[::core::prelude::v1::test]
+    fn unconfigured_capacity_is_not_an_authoritative_budget() {
+        use super::{ModelContextWindowSource, UNCONFIGURED_CONTEXT_WINDOW_FALLBACK};
+
+        // No window and no operator budget: the 32k stub may not trim or refuse.
+        let limits = ResolvedRuntime::default().context_limits();
+        assert_eq!(
+            limits.model_context_window,
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        );
+        assert!(!limits.has_authoritative_budget);
+
+        // A configured window is evidence.
+        let configured = ResolvedRuntime {
+            model_context_window: 1_000_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            ..ResolvedRuntime::default()
+        };
+        assert!(configured.context_limits().has_authoritative_budget);
+
+        // An explicit budget is operator intent even without a known window.
+        let budgeted = ResolvedRuntime {
+            max_context_tokens: Some(200_000),
+            ..ResolvedRuntime::default()
+        };
+        let limits = budgeted.context_limits();
+        assert!(limits.has_authoritative_budget);
+        assert_eq!(limits.context_token_budget, 200_000);
+    }
+
+    #[::core::prelude::v1::test]
+    fn discovered_catalog_window_needs_no_configuration() {
+        use super::{ModelContextWindowSource, publish_discovered_context_windows};
+
+        // The composition root publishes what the catalog knows; no config entry.
+        publish_discovered_context_windows(vec![(
+            "test.discovered".to_string(),
+            "model-from-catalog".to_string(),
+            1_000_000,
+        )]);
+
+        let resolved = Config::default()
+            .resolved_model_context_window_for_route("test.discovered", "model-from-catalog");
+        assert_eq!(resolved.tokens, 1_000_000);
+        assert_eq!(
+            resolved.source,
+            ModelContextWindowSource::Discovered,
+            "catalog metadata must be reported as discovered, never as configured"
+        );
+
+        // A route the catalog does not cover stays unknown.
+        let unknown = Config::default()
+            .resolved_model_context_window_for_route("test.discovered", "not-in-catalog");
+        assert_eq!(
+            unknown.source,
+            ModelContextWindowSource::CompatibilityFallback
+        );
     }
 
     #[::core::prelude::v1::test]

@@ -181,6 +181,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                     context_token_budget: 100_000,
                     model_context_window_source:
                         zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                    has_authoritative_budget: true,
                 },
                 context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
