@@ -5793,6 +5793,80 @@ mod tests {
         assert_eq!(obj.get("populated"), Some(&serde_json::Value::Bool(true)));
     }
 
+    #[tokio::test]
+    async fn openrouter_balance_settings_are_editable_without_reading_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.providers.models.openrouter.insert(
+            "primary".into(),
+            zeroclaw_config::schema::OpenRouterModelProviderConfig {
+                management_api_key: Some("test-management-credential".into()),
+                ..Default::default()
+            },
+        );
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_list(
+                State(state.clone()),
+                Query(ListQuery {
+                    prefix: Some("providers.models.openrouter.primary".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = json["entries"].as_array().unwrap();
+        let key = entries
+            .iter()
+            .find(|e| e["path"] == "providers.models.openrouter.primary.management_api_key")
+            .unwrap();
+        assert_eq!(key["is_secret"], true);
+        assert_eq!(key["populated"], true);
+        assert_eq!(key["tab"], "Connection");
+        assert!(key.get("value").is_none());
+        assert!(!json.to_string().contains("test-management-credential"));
+        let toggle = entries
+            .iter()
+            .find(|e| e["path"] == "providers.models.openrouter.primary.credit_balance_enabled")
+            .unwrap();
+        assert_eq!(toggle["kind"], "bool");
+        assert_eq!(toggle["value"], "false");
+        assert_eq!(toggle["tab"], "Connection");
+
+        for enabled in [true, false] {
+            let (status, _) = response_json(
+                handle_patch(
+                    State(state.clone()),
+                    None,
+                    HeaderMap::new(),
+                    Json(serde_json::json!([{
+                        "op": "replace",
+                        "path": "providers.models.openrouter.primary.credit_balance_enabled",
+                        "value": enabled
+                    }])),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let saved = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            let saved: toml::Value = toml::from_str(&saved).unwrap();
+            let provider = &saved["providers"]["models"]["openrouter"]["primary"];
+            assert_eq!(provider["credit_balance_enabled"].as_bool(), Some(enabled));
+            assert_ne!(
+                provider["management_api_key"].as_str(),
+                Some("test-management-credential")
+            );
+            assert_eq!(
+                state.config.read().providers.models.openrouter["primary"]
+                    .management_api_key
+                    .as_deref(),
+                Some("test-management-credential")
+            );
+        }
+    }
+
     #[test]
     fn gateway_paired_tokens_is_gateway_managed() {
         // The `Configurable` derive emits prop-field names in the field's
