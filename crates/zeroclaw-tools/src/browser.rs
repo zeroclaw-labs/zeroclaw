@@ -538,7 +538,9 @@ impl BrowserTool {
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
         if self.timeout_secs == 0 {
-            anyhow::bail!("browser.timeout_secs must be > 0");
+            anyhow::bail!(crate::i18n::get_required_tool_string(
+                "tool-browser-error-zero-timeout"
+            ));
         }
 
         let mut cmd = self.agent_browser_command();
@@ -608,10 +610,13 @@ impl BrowserTool {
             .kill_on_drop(true);
         match tokio::time::timeout(deadline, cmd.output()).await {
             Ok(output) => Ok(output?),
-            Err(_) => anyhow::bail!(
-                "agent-browser '{action}' timed out after {}s (browser.timeout_secs); the subprocess was killed",
-                deadline.as_secs()
-            ),
+            Err(_) => anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-error-action-timeout",
+                &[
+                    ("action", action),
+                    ("seconds", &deadline.as_secs().to_string())
+                ],
+            )),
         }
     }
 
@@ -3271,6 +3276,164 @@ mod tests {
     }
 
     // ── bounded subprocess wait tests ───────────────────────────
+
+    #[cfg(unix)]
+    async fn wait_for_test_child_pid(path: &std::path::Path) -> libc::pid_t {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(path)
+                    && let Ok(pid) = contents.trim().parse::<libc::pid_t>()
+                    && pid > 0
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the direct child must report its PID")
+    }
+
+    #[cfg(unix)]
+    async fn assert_test_child_reaped(pid: libc::pid_t) {
+        // Clean up the fixture if this assertion catches a containment regression.
+        let cleanup = scopeguard::guard(pid, |pid| unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // Signal zero observes process existence without sending a signal.
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the direct child must be killed and reaped");
+        scopeguard::ScopeGuard::into_inner(cleanup);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_waits_reap_direct_child_on_timeout_and_cancellation() {
+        for probe in [true, false] {
+            for cancel in [false, true] {
+                let fixture = tempfile::tempdir().unwrap();
+                let pid_path = fixture.path().join("child.pid");
+                let mut command = Command::new("sh");
+                command
+                    .args([
+                        "-c",
+                        "printf '%s' \"$$\" > \"$1\"; exec sleep 60",
+                        "fixture",
+                    ])
+                    .arg(&pid_path);
+                let deadline = Duration::from_secs(if cancel { 60 } else { 1 });
+                let task = zeroclaw_spawn::spawn!(async move {
+                    if probe {
+                        assert!(!BrowserTool::probe_agent_browser(command, deadline).await);
+                    } else {
+                        assert!(
+                            BrowserTool::run_bounded_command(command, "snapshot", deadline)
+                                .await
+                                .is_err()
+                        );
+                    }
+                });
+                let mut task = scopeguard::guard(task, |task| task.abort());
+                let pid = wait_for_test_child_pid(&pid_path).await;
+                assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "child must start");
+                if cancel {
+                    task.abort();
+                    assert!((&mut *task).await.unwrap_err().is_cancelled());
+                } else {
+                    tokio::time::timeout(Duration::from_secs(5), &mut *task)
+                        .await
+                        .expect("the wait must be bounded")
+                        .unwrap();
+                }
+                assert_test_child_reaped(pid).await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_timeout_errors_use_selected_locale() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let locale_dir = fixture.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&locale_dir).unwrap();
+        std::fs::write(fixture.path().join("config.toml"), "locale = 'fr'\n").unwrap();
+        std::fs::write(
+            locale_dir.join("tools.ftl"),
+            "tool-browser-error-zero-timeout = Délai invalide : browser.timeout_secs\n\
+             tool-browser-error-action-timeout = Délai dépassé : { $action }, { $seconds }s (browser.timeout_secs)\n",
+        )
+        .unwrap();
+        let binary = fixture.path().join("agent-browser");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf '%s' \"$$\" > \"$ZEROCLAW_BROWSER_TEST_PID\"\nexec /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Fresh process: the locale OnceLocks and PATH remain isolated from
+        // parallel tests, and the real backend selection and execute path run.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "browser::tests::browser_timeout_locale_child",
+                "--nocapture",
+            ])
+            .env("ZEROCLAW_BROWSER_LOCALE_CHILD", "1")
+            .env("ZEROCLAW_CONFIG_DIR", fixture.path())
+            .env(
+                "ZEROCLAW_BROWSER_TEST_PID",
+                fixture.path().join("child.pid"),
+            )
+            .env("PATH", fixture.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_timeout_locale_child() {
+        if std::env::var_os("ZEROCLAW_BROWSER_LOCALE_CHILD").is_none() {
+            return;
+        }
+        let mut tool = private_host_tool(vec!["*"], vec![]);
+        tool.timeout_secs = 0;
+        let error = tool
+            .execute(json!({"action": "snapshot"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Délai invalide : browser.timeout_secs");
+        tool.timeout_secs = 1;
+        let error = tool
+            .execute(json!({"action": "snapshot"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Délai dépassé : snapshot, 1s (browser.timeout_secs)"
+        );
+        let pid_path =
+            std::path::PathBuf::from(std::env::var_os("ZEROCLAW_BROWSER_TEST_PID").unwrap());
+        assert_test_child_reaped(wait_for_test_child_pid(&pid_path).await).await;
+    }
 
     #[cfg(unix)]
     #[tokio::test]
