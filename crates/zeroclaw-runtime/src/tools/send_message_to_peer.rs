@@ -1859,7 +1859,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_message_to_peer_denied_in_readonly_autonomy() {
-        // Sibling contract of a2a_send_denied_in_readonly_autonomy (#12167):
+        // Sibling contract of a2a_send_denied_in_readonly_autonomy:
         // peer messaging is an Act and must refuse before any delivery.
         use crate::security::{AutonomyLevel, SecurityPolicy};
 
@@ -1897,7 +1897,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_to_peer_readonly_for_agent_creates_no_peer_inbox() {
         // Profile-based path: SecurityPolicy::for_agent(ReadOnly) must refuse
-        // before admit_peer_inbox_task runs (#12167).
+        // before admit_peer_inbox_task runs.
         use crate::control_plane::ControlPlaneHandle;
         use crate::security::{AutonomyLevel, SecurityPolicy};
         use zeroclaw_config::schema::RiskProfileConfig;
