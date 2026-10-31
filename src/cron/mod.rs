@@ -114,12 +114,17 @@ fn cron_update_payload_confirmation(
 
 /// Render terminal control characters as harmless visible text (e.g. `\r`,
 /// `\u{1b}`) so retained output from shell jobs cannot move the cursor, erase
-/// rows, or inject ANSI styling into the operator's terminal. Printable text,
+/// rows, or inject ANSI styling into the operator's terminal. Unicode bidi
+/// formatters (U+202A..=U+202E, U+2066..=U+2069) are escaped too, so retained
+/// output cannot reorder the surrounding terminal text. Printable text,
 /// including backslashes, passes through unchanged.
 fn escape_terminal_controls(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        if ch.is_control() {
+        if ch.is_control()
+            || ('\u{202a}'..='\u{202e}').contains(&ch)
+            || ('\u{2066}'..='\u{2069}').contains(&ch)
+        {
             out.extend(ch.escape_debug());
         } else {
             out.push(ch);
@@ -129,12 +134,16 @@ fn escape_terminal_controls(s: &str) -> String {
 }
 
 /// First line of a run's output, with terminal controls escaped, capped at 80
-/// chars, with a marker when the preview had to drop output. Line structure
-/// is decided on the raw output before escaping, so a control character can
-/// never merge or split preview lines.
+/// chars, with a marker when the preview had to drop output. Blank output
+/// renders as `n/a`, matching a missing output. Line structure is decided on
+/// the raw output before escaping, so a control character can never merge or
+/// split preview lines.
 fn output_preview(output: &str) -> String {
     const PREVIEW_MAX_CHARS: usize = 80;
     let first_line = output.lines().next().unwrap_or("");
+    if first_line.trim().is_empty() {
+        return "n/a".into();
+    }
     let escaped = escape_terminal_controls(first_line);
     let truncated = escaped.chars().count() > PREVIEW_MAX_CHARS || output.lines().nth(1).is_some();
     let preview: String = escaped.chars().take(PREVIEW_MAX_CHARS).collect();
@@ -183,6 +192,35 @@ fn print_delivery_line(job: &CronJob) {
         "{}",
         get_required_cli_string_with_args("cli-cron-delivery", &[("v", &value)])
     );
+}
+
+/// Build the `cron runs` output lines: a localized header followed by one
+/// data row per run, or the localized "none" message when history is empty
+/// (no header then — the count would read as zero total runs). Kept apart
+/// from printing so the row selection and messaging stay directly testable.
+fn cron_runs_lines(config: &Config, job: Option<&str>, limit: u64) -> Result<Vec<String>> {
+    let limit = usize::try_from(limit).unwrap_or(10);
+    let runs = match job {
+        Some(job_id) => list_runs(config, job_id, limit)?,
+        None => list_recent_runs(config, limit)?,
+    };
+    if runs.is_empty() {
+        // With a job filter, empty history is ambiguous: the id may name no
+        // job at all. Resolving the job turns that case into the same
+        // "not found" error `get_job` already defines, while a real job that
+        // simply has not run yet still prints the "none" message.
+        if let Some(job_id) = job {
+            get_job(config, job_id)?;
+        }
+        return Ok(vec![get_required_cli_string("cli-cron-runs-none")]);
+    }
+    let mut lines = Vec::with_capacity(runs.len() + 1);
+    lines.push(get_required_cli_string_with_args(
+        "cli-cron-runs-header",
+        &[("count", &runs.len().to_string())],
+    ));
+    lines.extend(runs.iter().map(format_run_line));
+    Ok(lines)
 }
 
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
@@ -238,24 +276,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             Ok(())
         }
         crate::CronCommands::Runs { job, limit } => {
-            let limit = usize::try_from(limit).unwrap_or(10);
-            let runs = match job.as_deref() {
-                Some(job_id) => list_runs(config, job_id, limit)?,
-                None => list_recent_runs(config, limit)?,
-            };
-            if runs.is_empty() {
-                println!("{}", get_required_cli_string("cli-cron-runs-none"));
-                return Ok(());
-            }
-            println!(
-                "{}",
-                get_required_cli_string_with_args(
-                    "cli-cron-runs-header",
-                    &[("count", &runs.len().to_string())]
-                )
-            );
-            for run in &runs {
-                println!("{}", format_run_line(run));
+            for line in cron_runs_lines(config, job.as_deref(), limit)? {
+                println!("{line}");
             }
             Ok(())
         }
@@ -1566,5 +1588,171 @@ mod tests {
     fn cron_runs_preview_keeps_unicode_and_backslashes_unescaped() {
         let preview = output_preview("Путь C:\\Users\\tmp готов");
         assert_eq!(preview, "Путь C:\\Users\\tmp готов");
+    }
+
+    #[test]
+    fn cron_runs_preview_escapes_bidi_controls() {
+        // Boundary characters of both bidi formatter ranges must render as
+        // visible escapes so retained output cannot reorder the terminal.
+        for ch in ['\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}'] {
+            let preview = output_preview(&format!("a{ch}b"));
+            assert!(!preview.contains(ch), "preview: {preview}");
+            assert!(
+                preview.contains(&ch.escape_debug().to_string()),
+                "preview: {preview}"
+            );
+        }
+
+        let line = format_run_line(&sample_run(Some("a\u{202a}b"), Some(1)));
+        assert!(!line.contains('\u{202a}'), "line: {line}");
+        assert!(line.contains("a\\u{202a}b"), "line: {line}");
+    }
+
+    #[test]
+    fn cron_runs_preview_falls_back_to_n_a_for_blank_output() {
+        assert_eq!(output_preview(""), "n/a");
+        assert_eq!(output_preview("   "), "n/a");
+        assert_eq!(output_preview("\n \n"), "n/a");
+
+        let line = format_run_line(&sample_run(Some(""), Some(1)));
+        assert!(line.contains("n/a"), "line: {line}");
+    }
+
+    fn cli_add_shell_job(config: &Config, command: &str) -> String {
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                agent_alias: "test-agent".into(),
+                tz: None,
+                prompt: false,
+                allowed_tools: vec![],
+                uses_memory: None,
+                delivery: crate::CronDeliveryArgs::default(),
+                command: command.into(),
+            },
+            config,
+        )
+        .unwrap();
+        list_jobs(config)
+            .unwrap()
+            .into_iter()
+            .find(|j| j.command == command)
+            .map(|j| j.id)
+            .expect("added job must be listed")
+    }
+
+    fn record_cli_run(config: &Config, job_id: &str, started_at: &str, output: &str) {
+        let started: chrono::DateTime<chrono::Utc> = started_at.parse().unwrap();
+        record_run(
+            config,
+            job_id,
+            started,
+            started,
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
+                job_source: Some("imperative"),
+            },
+            Some(output),
+            0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_runs_with_job_filter_lists_only_that_jobs_runs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job_a = cli_add_shell_job(&config, "echo a");
+        let job_b = cli_add_shell_job(&config, "echo b");
+        record_cli_run(&config, &job_a, "2026-10-19T08:00:00Z", "out-a");
+        record_cli_run(&config, &job_b, "2026-10-19T09:00:00Z", "out-b");
+
+        let lines = cron_runs_lines(&config, Some(&job_a), 10).unwrap();
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("out-a"), "rendered: {rendered}");
+        assert!(rendered.contains(&job_a), "rendered: {rendered}");
+        assert!(!rendered.contains("out-b"), "rendered: {rendered}");
+        assert!(!rendered.contains(&job_b), "rendered: {rendered}");
+
+        // The full handler path must serve the filtered query too.
+        handle_command(
+            crate::CronCommands::Runs {
+                job: Some(job_a),
+                limit: 10,
+            },
+            &config,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_runs_without_job_filter_lists_newest_first_across_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job_a = cli_add_shell_job(&config, "echo a");
+        let job_b = cli_add_shell_job(&config, "echo b");
+        record_cli_run(&config, &job_a, "2026-10-19T08:00:00Z", "out-a");
+        record_cli_run(&config, &job_b, "2026-10-19T09:00:00Z", "out-b");
+
+        let lines = cron_runs_lines(&config, None, 10).unwrap();
+        let rendered = lines.join("\n");
+        let pos_a = rendered.find("out-a").expect("run a must be listed");
+        let pos_b = rendered.find("out-b").expect("run b must be listed");
+        assert!(pos_b < pos_a, "newest run must come first: {rendered}");
+        assert!(
+            rendered.contains(&get_required_cli_string_with_args(
+                "cli-cron-runs-header",
+                &[("count", "2")]
+            )),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cli_runs_with_empty_history_prints_none_message_without_header() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let lines = cron_runs_lines(&config, None, 10).unwrap();
+        assert_eq!(
+            lines,
+            vec![get_required_cli_string("cli-cron-runs-none")],
+            "empty history must print only the none message, no header"
+        );
+
+        // A real job that simply has not run yet hits the same branch.
+        let job = cli_add_shell_job(&config, "echo quiet");
+        let lines = cron_runs_lines(&config, Some(&job), 10).unwrap();
+        assert_eq!(
+            lines,
+            vec![get_required_cli_string("cli-cron-runs-none")],
+            "a job with no runs must print only the none message"
+        );
+    }
+
+    #[test]
+    fn cli_runs_with_unknown_job_id_reports_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let result = handle_command(
+            crate::CronCommands::Runs {
+                job: Some("no-such-job".into()),
+                limit: 10,
+            },
+            &config,
+        );
+        let err = result.expect_err("unknown job id must not read as empty history");
+        assert!(
+            err.to_string().contains("Cron job 'no-such-job' not found"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -510,6 +510,29 @@ mod tests {
     }
 
     #[test]
+    fn cron_runs_strings_format_in_every_builtin_locale() {
+        // The header interpolates the shown count, so it must format with
+        // the same argument the CLI passes; the none message takes none.
+        let keys: [(&str, &[(&str, &str)]); 2] = [
+            ("cli-cron-runs-header", &[("count", "2")][..]),
+            ("cli-cron-runs-none", &[][..]),
+        ];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, args) in keys {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(!value.trim().is_empty(), "{key} is empty in {locale}");
+            }
+        }
+    }
+
+    #[test]
     fn status_cli_strings_format_dynamic_entries() {
         let keys = [
             (
