@@ -188,8 +188,11 @@ impl TranscriptionError {
 /// HTML error pages; attempting `resp.json()` first would fail with an
 /// untyped parse error and misclassify a permanent payload rejection as a
 /// retryable transient one. When the body happens to be JSON, pull the
-/// vendor error message out of it; otherwise keep the raw body text.
+/// vendor error message out of it; otherwise keep the raw body text. Either
+/// way the detail is capped: error pages can be arbitrarily large, and this
+/// string only exists for the log line and the operator.
 async fn error_body_detail(resp: reqwest::Response) -> String {
+    const MAX_ERROR_DETAIL_CHARS: usize = 512;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     let trimmed = body.trim();
@@ -204,6 +207,7 @@ async fn error_body_detail(resp: reqwest::Response) -> String {
         })
         .filter(|message| !message.is_empty())
         .unwrap_or_else(|| trimmed.to_string());
+    let message: String = message.chars().take(MAX_ERROR_DETAIL_CHARS).collect();
     format!("{status}: {message}")
 }
 
@@ -3431,5 +3435,77 @@ mod channel_builder_tests {
             .unwrap_err();
         assert_eq!(failure_kind(&err), TranscriptionFailure::Permanent);
         assert!(err.to_string().contains("413"));
+    }
+
+    #[tokio::test]
+    async fn google_stt_nested_error_message_stays_readable() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The Google-style envelope nests the vendor message one level deep;
+        // the detail extractor must pull it out instead of dumping the raw
+        // JSON body into the error.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(
+                serde_json::json!({"error": {"message": "upstream model unavailable"}}),
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = GoogleSttProvider {
+            alias: "google".to_string(),
+            api_key: "test-key".to_string(),
+            language_code: "en-US".to_string(),
+            endpoint: server.uri(),
+        };
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("500 Internal Server Error: upstream model unavailable"),
+            "nested vendor message must be extracted, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("\"error\""),
+            "raw JSON envelope must not leak into the error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepgram_error_detail_is_capped_for_large_error_pages() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A proxy/CDN error page can be arbitrarily large; the operator
+        // detail must stay bounded instead of carrying the whole page.
+        let page = format!("<html>{}</html>", "x".repeat(5_000));
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(413).set_body_string(page))
+            .mount(&server)
+            .await;
+
+        let provider = DeepgramProvider {
+            alias: "deepgram".to_string(),
+            api_url: server.uri(),
+            api_key: "test-key".to_string(),
+            model: "nova-2".to_string(),
+            language: None,
+        };
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Permanent);
+        assert!(
+            err.to_string().len() < 600,
+            "error detail must be capped, got {} chars: {err}",
+            err.to_string().len()
+        );
     }
 }

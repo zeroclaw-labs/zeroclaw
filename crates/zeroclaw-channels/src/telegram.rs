@@ -1288,9 +1288,10 @@ pub(crate) enum FileLookupFailure {
 /// A voice note that disappears without a word is indistinguishable, from the
 /// sender's side, from a bot that never heard them: the message was delivered,
 /// no answer came, and no reason was given. Every permanent drop therefore
-/// carries a short human sentence. Transient failures are deliberately absent:
-/// the update is retried from the same offset, so a notice would be sent again
-/// on every attempt.
+/// carries a short human sentence. A transient failure mid-retry is
+/// deliberately silent: the update is retried from the same offset, so a
+/// notice would be sent again on every attempt. Only the exhaustion of the
+/// retry budget is announced - after it, no further attempt will ever happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VoiceDropReason {
     /// The recording is longer than `transcription.max_duration_secs`.
@@ -1304,6 +1305,11 @@ pub(crate) enum VoiceDropReason {
     /// the same bytes would pin the offset forever, so the update
     /// is acknowledged and the sender is told.
     TranscriptionRejected,
+    /// Every transient retry of this recording failed (the endpoint kept
+    /// erroring recoverably) and the bounded attempt budget ran out. The
+    /// update is acknowledged so later updates are not head-of-line blocked,
+    /// and the sender is told - the same contract as the other drops.
+    TranscriptionRetriesExhausted,
 }
 
 impl VoiceDropReason {
@@ -1334,6 +1340,9 @@ impl VoiceDropReason {
             }
             Self::TranscriptionRejected => {
                 i18n::get_required_cli_string("channel-telegram-voice-drop-transcription-rejected")
+            }
+            Self::TranscriptionRetriesExhausted => {
+                i18n::get_required_cli_string("channel-telegram-voice-drop-retries-exhausted")
             }
         }
     }
@@ -7550,16 +7559,46 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // exhaust it: their transient failures keep retrying on every poll
         // so a temporary outage cannot acknowledge a payload that was never
         // delivered.
-        if Self::transient_cap_applies(update)
+        //
+        // The cheap tracker check runs before the JSON walk: a batch with no
+        // tracked transient update skips `transient_cap_applies` entirely.
+        if transient_retry.is_some()
+            && Self::transient_cap_applies(update)
             && Self::transient_retry_exhausted(uid, transient_retry)
         {
+            let attempts = transient_retry
+                .as_ref()
+                .map(|(_, attempts)| *attempts)
+                .unwrap_or_default();
+            // The same contract as every permanent drop inside
+            // `try_parse_voice_message`: an allowed sender is told their
+            // recording is lost. The notice reuses the shared bounded
+            // `notify_voice_drop` path, so a stalled request cannot hold
+            // the offset here either.
+            if let Some(message) = update.get("message") {
+                let identities = Self::authorization_identities(message);
+                if self.is_any_user_allowed(identities.iter().map(String::as_str))
+                    && let Some(chat_id) = message
+                        .get("chat")
+                        .and_then(|chat| chat.get("id"))
+                        .and_then(serde_json::Value::as_i64)
+                        .map(|id| id.to_string())
+                {
+                    self.notify_voice_drop(
+                        &chat_id,
+                        Self::topic_thread_id(message).as_deref(),
+                        VoiceDropReason::TranscriptionRetriesExhausted,
+                    )
+                    .await;
+                }
+            }
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "update_id": uid,
-                        "attempts": Self::MAX_TRANSIENT_UPDATE_ATTEMPTS,
+                        "attempts": attempts,
                     })),
                 "Transient failure budget exhausted; acknowledging the update so \
                  later updates can proceed - this message is lost"
@@ -21056,15 +21095,128 @@ mod tests {
         handle.abort();
     }
 
+    /// End-to-end proof of the exhaustion contract: a voice update whose
+    /// transcription endpoint never recovers (500 on every attempt) is
+    /// retried up to the transient budget, then acknowledged - the offset
+    /// moves past it, the text update behind it is delivered, and the sender
+    /// is told their recording could not be processed. The shrinking retry
+    /// delay keeps the whole ten-attempt sequence well inside the hang guard.
+    #[tokio::test]
+    async fn listen_voice_update_exhausting_transient_budget_is_acknowledged_with_notice() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        let uid_voice = 8_600;
+        let uid_good = 8_601;
+        let voice = telegram_voice_update(uid_voice, 92, 777, "alice", "voice_always_500");
+        let good = telegram_text_update(
+            uid_good,
+            93,
+            777,
+            "alice",
+            "i am behind the exhausted voice",
+        );
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([voice, good])).await;
+        mount_telegram_get_updates(&mock_server, uid_good + 1, serde_json::json!([])).await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_path": "voice/file.ogg"}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 100]))
+            .mount(&mock_server)
+            .await;
+        // The endpoint never recovers: every attempt fails recoverably, so
+        // the update burns through the whole budget.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/transcribe$"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("try again later"))
+            .mount(&mock_server)
+            .await;
+        // The sender is told exactly once why the recording was dropped.
+        mount_telegram_send_message_ok(&mock_server, 1, &["kept failing", "777"]).await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/transcribe", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_mock_api_base(mock_server.uri())
+            .with_transcription(tc)
+            .with_transient_retry_delay(Duration::from_millis(10)),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // The update behind the exhausted voice note must arrive.
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
+            .await
+            .expect("timed out: an exhausted voice update head-of-line blocked the batch")
+            .expect("channel closed before delivering the update behind the exhausted one");
+        assert_eq!(msg.content, "i am behind the exhausted voice");
+
+        // The budget bounded the damage: the endpoint saw exactly
+        // MAX_TRANSIENT_UPDATE_ATTEMPTS attempts before the update was
+        // acknowledged without delivery.
+        let transcribe_calls = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|req| req.url.path().ends_with("/transcribe"))
+            .count();
+        assert_eq!(
+            transcribe_calls,
+            TelegramChannel::MAX_TRANSIENT_UPDATE_ATTEMPTS as usize,
+            "the exhausted update must be acknowledged after exactly the budgeted attempts"
+        );
+
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid_good + 1,
+            LISTEN_HANG_GUARD,
+            "past the exhausted voice update",
+        )
+        .await;
+
+        handle.abort();
+    }
+
     /// A voice update that already exhausted its transient budget is
     /// acknowledged without another parse attempt, so a persistently failing
     /// transcription endpoint can no longer pin the offset forever. The
-    /// budget gate sits ahead of parsing: this update costs no I/O at all.
+    /// budget gate sits ahead of parsing: this update costs no download or
+    /// transcription I/O at all. The sender is told their recording is lost -
+    /// the same announcement contract as every other permanent drop.
     #[tokio::test]
     async fn process_update_acknowledges_voice_update_after_transient_budget_exhausted() {
         use wiremock::MockServer;
 
         let mock_server = MockServer::start().await;
+        // Exactly one notice goes to the update's chat; a stray send with the
+        // wrong chat or text goes unmatched and fails the expectation.
+        mount_telegram_send_message_ok(&mock_server, 1, &["kept failing", "666"]).await;
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
             api_key: Some("test_key".to_string()),
@@ -21095,11 +21247,12 @@ mod tests {
             exhausted, None,
             "the counter resets once the update is given up"
         );
+        let requests = mock_server.received_requests().await.unwrap_or_default();
         assert!(
-            mock_server
-                .received_requests()
-                .await
-                .is_none_or(|requests| requests.is_empty()),
+            requests
+                .iter()
+                .all(|req| !req.url.path().contains("getFile")
+                    && !req.url.path().contains("transcribe")),
             "the exhausted-update gate must sit ahead of every download/transcription attempt"
         );
 
