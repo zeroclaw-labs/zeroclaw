@@ -19241,7 +19241,7 @@ model_provider = "custom.only"
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
                 .unwrap();
         store
-            .create_session("bare-cancel", "agent", "/tmp", None)
+            .create_session("bare-cancel", "test", "agent", "/tmp", None)
             .unwrap();
         store
             .persist_retained_context_seed("bare-cancel", &snapshot.retained_messages, false)
@@ -19477,6 +19477,7 @@ model_provider = "custom.only"
                 let port = source
                     .open(
                         family.into(),
+                        "test",
                         "direct".into(),
                         principal.clone(),
                         Arc::new(AgentHistoryAuthority {
@@ -19621,7 +19622,7 @@ model_provider = "custom.only"
                         budget
                     );
                 }
-                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                     directory.path(),
                     family,
                 )
@@ -19701,6 +19702,7 @@ model_provider = "custom.only"
             let port = source
                 .open(
                     family.into(),
+                    "test",
                     "direct".into(),
                     principal.clone(),
                     Arc::new(AgentHistoryAuthority {
@@ -19777,7 +19779,7 @@ model_provider = "custom.only"
                     "{backend}, rejected={rejected}",
                 );
             }
-            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+            let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 directory.path(),
                 family,
             )
@@ -20555,6 +20557,7 @@ model_provider = "custom.only"
                 let port = source
                     .open(
                         family.into(),
+                        "test",
                         "direct".into(),
                         principal.clone(),
                         Arc::new(AgentHistoryAuthority {
@@ -20672,7 +20675,7 @@ model_provider = "custom.only"
                     3,
                     "both next-turn entrypoints must use the retained provider"
                 );
-                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                     directory.path(),
                     family,
                 )

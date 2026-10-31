@@ -1363,6 +1363,7 @@ async fn run_agent_job_for_occurrence(
                 source
                     .open_system(
                         family,
+                        "cron",
                         agent_alias.into(),
                         "cron_scheduler".into(),
                         authority,
@@ -3171,7 +3172,7 @@ mod tests {
         };
         use zeroclaw_api::session_events::{ContractError, SessionStreamId};
         use zeroclaw_kernel::session::engine::{
-            EngineSessionAuthority, EngineSessionSource, FamilyDescriptor, FamilyQuery,
+            EngineSessionAuthority, EngineSessionSource, SessionDescriptor, SessionReadHandle,
         };
         use zeroclaw_kernel::session::query::SessionAccessPolicy;
 
@@ -3234,15 +3235,16 @@ mod tests {
             ) -> std::result::Result<SessionStreamId, ContractError> {
                 zeroclaw_session_host::NativeSessionHub::stream_id(family)
             }
-            async fn describe(&self, _family: String) -> Result<Option<FamilyDescriptor>> {
+            async fn describe(&self, _family: String) -> Result<Option<SessionDescriptor>> {
                 Ok(None)
             }
-            async fn families(&self) -> Result<Vec<String>> {
+            async fn sessions(&self) -> Result<Vec<String>> {
                 Ok(vec![])
             }
             async fn open(
                 &self,
                 _family: String,
+                _creation_source: &str,
                 _alias: String,
                 _principal: PrincipalId,
                 _authority: Arc<dyn EngineSessionAuthority>,
@@ -3253,12 +3255,14 @@ mod tests {
             async fn open_system(
                 &self,
                 family: String,
+                creation_source: &str,
                 alias: String,
                 component: String,
                 _authority: Arc<dyn EngineSessionAuthority>,
                 _initial: ContextSnapshot,
             ) -> Result<Arc<dyn SessionExecutionPort>> {
                 assert_eq!(family, format!("cron:{TEST_AGENT}:main"));
+                assert_eq!(creation_source, "cron");
                 assert_eq!(alias, TEST_AGENT);
                 assert_eq!(component, "cron_scheduler");
                 Ok(self.0.clone())
@@ -3268,7 +3272,7 @@ mod tests {
                 _family: String,
                 _principal: PrincipalId,
                 _policy: Arc<dyn SessionAccessPolicy>,
-            ) -> Result<Option<FamilyQuery>> {
+            ) -> Result<Option<SessionReadHandle>> {
                 Ok(None)
             }
         }
@@ -3487,7 +3491,7 @@ mod tests {
             );
             let family = format!("cron:{TEST_AGENT}:main");
             let stream = source.stream_id(&family).await.expect("stream");
-            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+            let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 &config.data_dir,
                 &family,
             )

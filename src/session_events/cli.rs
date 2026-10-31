@@ -8,7 +8,7 @@ use zeroclaw_api::session_events::{
     PayloadRecord, SessionEvent, SessionId, SessionStreamId, StoredPayloadRef,
 };
 use zeroclaw_infra::session_events::installation::{
-    InstallationGuard, NativeBackend, family_identity,
+    InstallationGuard, NativeBackend, session_identity,
 };
 use zeroclaw_kernel::session::engine::{EngineSession, EngineSessionAuthority};
 use zeroclaw_kernel::session::query::{SessionAccess, SessionAccessPolicy};
@@ -197,10 +197,10 @@ pub async fn open_cli_session(
     state_file: Option<&Path>,
 ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
     use zeroclaw_infra::session_events::cli_state::{CliStateBinding, CliStateGuard};
-    use zeroclaw_infra::session_events::family::FamilyEventStore;
     use zeroclaw_infra::session_events::import::{
         LegacyImport, LegacySnapshot, import_legacy_snapshot,
     };
+    use zeroclaw_infra::session_events::scoped::ScopedEventStore;
     let data_dir = data_dir.to_owned();
     let alias = alias.to_owned();
     let persistent = state_file.is_some();
@@ -215,31 +215,35 @@ pub async fn open_cli_session(
         std::fs::create_dir_all(&data_dir)?;
         let data_dir = std::fs::canonicalize(&data_dir)?;
         let mut lease = state_file.as_deref().map(CliStateGuard::acquire).transpose()?;
-        let stream = if let Some(lease) = &lease {
-            SessionStreamId::parse(format!("cli-state-{}", Digest::from_bytes(&zeroclaw_api::session_events::canonical_json(
+        let identity = if let Some(lease) = &lease {
+            format!("cli-state-{}", Digest::from_bytes(&zeroclaw_api::session_events::canonical_json(
                 &serde_json::json!({"path":lease.path(),"agent":alias}),
-            )?).as_str()))?
-        } else { SessionStreamId::new() };
+            )?).as_str())
+        } else { SessionStreamId::new().to_string() };
+        let family = format!("cli:{alias}:{identity}");
+        let stream = zeroclaw_infra::session_events::upgrade::stream_id(&family)?;
         let branch = BranchId::parse(format!("branch-{stream}"))?;
         let session_id = SessionId::parse(format!("session-{stream}"))?;
-        let family = format!("cli:{}:{stream}", alias);
         zeroclaw_infra::session_events::upgrade::upgrade_installation(&data_dir, backend, |channel| {
             zeroclaw_session_host::legacy_session_owner(&capability.config_handle().read(), channel)
         })?;
         let published = {
             let installation = InstallationGuard::acquire(&data_dir.join("sessions"))?;
             anyhow::ensure!(installation.active()?.0 == backend, "CLI session backend changed");
-            zeroclaw_infra::session_events::installation::families(&data_dir, backend)?.contains_key(&family)
+            {
+                let store = open_event_store(&data_dir, backend.name())?;
+                store.head(&stream)?.sequence != 0
+            }
         };
         if let Some(lease) = &mut lease {
             anyhow::ensure!(published || !lease.has_backup()?, "CLI backup has no matching family in this installation");
-            lease.bind(CliStateBinding {version:1, data_dir:data_dir.clone(), family:family.clone()})?;
+            lease.bind(CliStateBinding {version:1, data_dir:data_dir.clone(), session_key:family.clone()})?;
         }
         let legacy = !published && lease.as_ref().is_some_and(|lease| lease.path().exists());
         if legacy {
             let state_path = lease.as_ref().ok_or_else(|| anyhow::Error::msg("CLI legacy import lease missing"))?.path().to_owned();
             let imported = import_legacy_snapshot(&data_dir, LegacyImport {
-                family:&family, owning_agent:&alias, target:backend, stream:stream.clone(), branch:branch.clone(),
+                family:&family, creation_source:"cli", owning_agent:&alias, target:backend, stream:stream.clone(), branch:branch.clone(),
                 session:session_id.clone(), source_kind:"cli-state-json",
             }, || {
                 let mut options = std::fs::OpenOptions::new();
@@ -278,7 +282,7 @@ pub async fn open_cli_session(
                     summary_source_refs:vec![], transform_started_event_id:None,
                 }, EventActor::default())?;
                 context.branch_id=Some(branch.clone());
-                let (identity, identity_payload) = family_identity(stream.clone(), &family)?;
+                let (identity, identity_payload) = session_identity(stream.clone(), &family, "cli")?;
                 SessionCoordinator::new(Arc::clone(&store)).append(AppendRequest {
                     stream_id:stream.clone(), expected_head:EventCursor::beginning(stream.clone()), idempotency_key:key.clone(),
                     events:vec![root,identity,context], payloads:vec![context_payload,identity_payload], erasure_reference_commitment:None,
@@ -291,8 +295,8 @@ pub async fn open_cli_session(
             lease.finish_archive()?;
         }
         let store: Arc<dyn SessionEventStore> = match lease {
-            Some(lease) => Arc::new(FamilyEventStore::open_with_cli_lease(&data_dir, &family, Arc::new(lease))?),
-            None => Arc::new(FamilyEventStore::open_with_execution_lease(&data_dir, &family, Arc::new(zeroclaw_infra::session_events::ownership::FamilyExecutionLease::acquire(&data_dir,&family)?))?),
+            Some(lease) => Arc::new(ScopedEventStore::open_with_cli_lease(&data_dir, &family, Arc::new(lease))?),
+            None => Arc::new(ScopedEventStore::open_with_execution_lease(&data_dir, &family, Arc::new(zeroclaw_infra::session_events::ownership::SessionExecutionLease::acquire(&data_dir,&family)?))?),
         };
         let page=store.read_page(&stream,&EventCursor::beginning(stream.clone()),None,4)?;
         anyhow::ensure!(matches!(page.events.first().map(|event|&event.body.data),Some(EventData::SessionStarted {owning_agent,..}) if owning_agent==&alias),"CLI persisted owning agent differs");
@@ -304,7 +308,7 @@ pub async fn open_cli_session(
     if persistent {
         session
             .owner
-            .recover_family(
+            .recover_session(
                 session.authority.stream.clone(),
                 Arc::new(CliOwnershipRecovery),
             )

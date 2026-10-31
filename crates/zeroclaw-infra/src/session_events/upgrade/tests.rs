@@ -6,8 +6,10 @@ fn sqlite_publication_supports_fresh_reopen_and_legacy_upgrade() {
     for legacy in [false, true] {
         let directory = tempfile::tempdir().expect("directory");
         if legacy {
-            let old =
-                crate::session_sqlite::SqliteSessionBackend::new(directory.path()).expect("legacy");
+            let old = crate::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                directory.path(),
+            )
+            .expect("legacy");
             old.append(
                 "gw_legacy",
                 &zeroclaw_api::model_provider::ChatMessage::user("retained input"),
@@ -33,7 +35,7 @@ fn sqlite_publication_supports_fresh_reopen_and_legacy_upgrade() {
                     .is_file()
             );
             assert_eq!(
-                installation::families(directory.path(), NativeBackend::Sqlite)
+                installation::session_keys(directory.path(), NativeBackend::Sqlite)
                     .expect("families")
                     .len(),
                 1
@@ -41,7 +43,9 @@ fn sqlite_publication_supports_fresh_reopen_and_legacy_upgrade() {
         }
     }
 }
-use crate::{session_sqlite::SqliteSessionBackend, session_store::SessionStore};
+use crate::{
+    session_events::upgrade::legacy_sqlite::SqliteSessionBackend, session_store::SessionStore,
+};
 use zeroclaw_api::{
     model_provider::ChatMessage,
     session_events::{EventData, StoredPayloadRef},
@@ -215,6 +219,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         let old = SessionRepository::legacy_fixture(directory.path()).unwrap();
         old.create_session_with_interaction_surface(
             "live",
+            "acp",
             "fixture",
             "/workspace",
             Some("cli"),
@@ -261,7 +266,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         old.begin_turn_checkpoint("live", "interrupted-turn", std::slice::from_ref(&pending))
             .unwrap();
         let before = old.load_session("live").unwrap().unwrap();
-        old.create_session("closed", "fixture", "/closed", None)
+        old.create_session("closed", "acp", "fixture", "/closed", None)
             .unwrap();
         old.mark_session_killed("closed").unwrap();
         upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
@@ -396,7 +401,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
 }
 
 fn imported_count(directory: &Path, target: NativeBackend) -> usize {
-    let catalog = installation::families(directory, target).expect("catalog");
+    let catalog = installation::session_keys(directory, target).expect("catalog");
     let stream = catalog
         .get("gw_fixture")
         .expect("read-visible imported family");
@@ -569,7 +574,7 @@ fn previous_catalog_upgrade_resumes_source_archival_after_identity_publication()
                 .is_file()
         );
         assert_eq!(
-            installation::families(directory.path(), target).expect("families")["fixture"],
+            installation::session_keys(directory.path(), target).expect("families")["fixture"],
             stream
         );
         let store = open_event_store(directory.path(), target.name()).expect("current store");
@@ -596,7 +601,7 @@ fn acp_upgrade_resumes_metadata_history_chunks_and_archived_source_without_locat
         ] {
             let directory = tempfile::tempdir().unwrap();
             let old = SessionRepository::legacy_fixture(directory.path()).unwrap();
-            old.create_session("interrupted", "fixture", "/workspace", Some("owner"))
+            old.create_session("interrupted", "acp", "fixture", "/workspace", Some("owner"))
                 .unwrap();
             let messages: Vec<_> = (0..130)
                 .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("row {index}"))))
@@ -670,7 +675,7 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
         )
         .unwrap();
         root.branch_id = Some(BranchId::parse(format!("branch-{stream}")).unwrap());
-        let (identity, body) = family_identity(stream.clone(), "acp_registration").unwrap();
+        let (identity, body) = session_identity(stream.clone(), "acp_registration", "acp").unwrap();
         let store = open_event_store(directory.path(), target.name()).unwrap();
         store
             .append_batch(AppendRequest {
@@ -689,17 +694,30 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
         assert!(root.workspace_dir.is_empty());
         assert!(
             protocol
-                .create_session("registration", "fixture", "/workspace", Some("other"))
+                .create_session(
+                    "registration",
+                    "acp",
+                    "fixture",
+                    "/workspace",
+                    Some("other")
+                )
                 .is_err()
         );
         assert!(
             protocol
-                .create_session("registration", "other-agent", "/workspace", Some("owner"))
+                .create_session(
+                    "registration",
+                    "acp",
+                    "other-agent",
+                    "/workspace",
+                    Some("owner")
+                )
                 .is_err()
         );
         protocol
             .create_session_with_interaction_surface(
                 "registration",
+                "acp",
                 "fixture",
                 "/workspace",
                 Some("cli"),
@@ -712,7 +730,13 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
         assert_eq!(data.interaction_surface.as_deref(), Some("cli"));
         assert!(
             protocol
-                .create_session("registration", "fixture", "/workspace", Some("owner"))
+                .create_session(
+                    "registration",
+                    "acp",
+                    "fixture",
+                    "/workspace",
+                    Some("owner"),
+                )
                 .is_err()
         );
         assert!(!directory.path().join("sessions/acp-sessions.db").exists());
@@ -728,7 +752,13 @@ fn earlier_native_acp_installation_merges_protocol_data_without_replacing_newer_
         let directory = tempfile::tempdir().unwrap();
         let legacy = SessionRepository::legacy_fixture(directory.path()).unwrap();
         legacy
-            .create_session("existing", "fixture", "/old-workspace", Some("owner"))
+            .create_session(
+                "existing",
+                "acp",
+                "fixture",
+                "/old-workspace",
+                Some("owner"),
+            )
             .unwrap();
         let mut old_history = vec![ConversationMessage::Chat(ChatMessage::user(
             "older message",
@@ -759,7 +789,8 @@ fn earlier_native_acp_installation_merges_protocol_data_without_replacing_newer_
         )
         .unwrap();
         root.branch_id = Some(branch.clone());
-        let (identity, identity_payload) = family_identity(stream.clone(), "acp_existing").unwrap();
+        let (identity, identity_payload) =
+            session_identity(stream.clone(), "acp_existing", "acp").unwrap();
         let messages = vec![ConversationMessage::Chat(ChatMessage::assistant(
             "newer native context",
         ))];

@@ -8,8 +8,8 @@ use zeroclaw_api::model_provider::ChatMessage;
 pub struct SessionMetadata {
     /// Session key (e.g. `telegram_user123`).
     pub key: String,
-    /// Optional human-readable name (e.g. `eyrie-commander-briefing`).
-    pub name: Option<String>,
+    /// Optional human-readable title (e.g. `eyrie-commander-briefing`).
+    pub title: Option<String>,
     /// When the session was first created.
     pub created_at: DateTime<Utc>,
     /// When the last message was appended.
@@ -150,7 +150,7 @@ pub trait SessionBackend: Send + Sync {
                 let messages = self.load(&key);
                 SessionMetadata {
                     key,
-                    name: None,
+                    title: None,
                     created_at: Utc::now(),
                     last_activity: Utc::now(),
                     message_count: messages.len(),
@@ -208,13 +208,13 @@ pub trait SessionBackend: Send + Sync {
         self.get_session_metadata(session_key).is_some()
     }
 
-    /// Set or update the human-readable name for a session.
-    fn set_session_name(&self, _session_key: &str, _name: &str) -> std::io::Result<()> {
+    /// Set or update the human-readable title for a session.
+    fn set_session_title(&self, _session_key: &str, _title: &str) -> std::io::Result<()> {
         Ok(())
     }
 
-    /// Get the human-readable name for a session (if set).
-    fn get_session_name(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+    /// Get the human-readable title for a session (if set).
+    fn get_session_title(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Ok(None)
     }
 
@@ -334,7 +334,7 @@ pub trait SessionBackend: Send + Sync {
         }
         Some(SessionMetadata {
             key: session_key.to_string(),
-            name: self.get_session_name(session_key).ok().flatten(),
+            title: self.get_session_title(session_key).ok().flatten(),
             created_at: Utc::now(),
             last_activity: Utc::now(),
             message_count: messages.len(),
@@ -422,7 +422,7 @@ mod tests {
     fn session_metadata_is_constructible() {
         let meta = SessionMetadata {
             key: "test".into(),
-            name: None,
+            title: None,
             created_at: Utc::now(),
             last_activity: Utc::now(),
             message_count: 5,

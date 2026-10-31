@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Session {
+    /// Protocol identity from the root event. The stream id remains the
+    /// storage coordinate; this is the user-facing session id.
+    pub session_id: Option<SessionId>,
     /// Derived streams have no local owner until an attribution event exists.
     /// Their execution authority is resolved from the committed parent request.
     pub owning_agent: Option<String>,
@@ -18,6 +21,42 @@ pub struct Session {
     pub running: bool,
 }
 
+/// Durable, rebuildable read-model row used to enumerate and filter sessions.
+/// The event stream remains the source of truth; this record only accelerates
+/// session discovery and carries no execution authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIndexRecord {
+    pub stream_id: SessionStreamId,
+    pub session_id: Option<SessionId>,
+    /// Adapter session identity. This is independent of creation provenance.
+    pub session_key: Option<String>,
+    /// Protocol that originally created the session; never a routing key.
+    pub source: Option<String>,
+    pub title: Option<String>,
+    pub created_at: i64,
+    pub last_activity: i64,
+    pub first_user_message_id: Option<MessageId>,
+    pub first_user_preview: Option<String>,
+    pub cwd: Option<String>,
+    pub git_remote: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_commit: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub category: Option<String>,
+    pub project: Option<String>,
+    pub parent_stream_id: Option<SessionStreamId>,
+    pub parent_thread_id: Option<SessionId>,
+    pub parent_agent: Option<String>,
+    pub owning_agent: Option<String>,
+    pub closed: bool,
+    pub deleted: bool,
+    pub head_sequence: u64,
+    pub message_count: usize,
+    pub running: bool,
+    pub metadata: Value,
+}
+
 impl Session {
     pub fn stream(&self) -> &SessionStreamId {
         &self.head.stream_id
@@ -28,8 +67,11 @@ impl Session {
     pub fn channel_id(&self) -> Option<&str> {
         self.fields.get("channel_id").and_then(Value::as_str)
     }
-    pub fn family_key(&self) -> Option<&str> {
-        self.fields.get("family_key").and_then(Value::as_str)
+    pub fn source(&self) -> Option<&str> {
+        self.fields.get("source").and_then(Value::as_str)
+    }
+    pub fn session_key(&self) -> Option<&str> {
+        self.fields.get("session_key").and_then(Value::as_str)
     }
 
     pub fn field<T: serde::de::DeserializeOwned>(
@@ -124,6 +166,10 @@ impl SessionReducer {
             }
             self.record = Some(SessionDetail {
                 session: Session {
+                    session_id: match &event.body.data {
+                        EventData::SessionStarted { session_id, .. } => Some(session_id.clone()),
+                        _ => None,
+                    },
                     owning_agent: owning_agent.map(str::to_owned),
                     fields,
                     closed: false,
@@ -144,7 +190,7 @@ impl SessionReducer {
         let state = &mut detail.session;
         if !self.importing
             && !matches!(&event.actor, EventActor::System {component} if component == "session_upgrade")
-            && !matches!(&event.body.data, EventData::SessionMetadataChanged {field, ..} if field == "family_key")
+            && !matches!(&event.body.data, EventData::SessionMetadataChanged {field, ..} if field == "session_identity")
         {
             state.last_activity = event.committed_at;
             self.last_activity_sequence = event.sequence;
@@ -268,6 +314,22 @@ impl SessionReducer {
             .ok_or_else(|| ReadError::Corrupt("session root missing".into()))?
             .session;
         match field {
+            "session_identity" => {
+                let key = value
+                    .get("session_key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ReadError::Corrupt("session key missing".into()))?;
+                let source = value
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ReadError::Corrupt("session source missing".into()))?;
+                state
+                    .fields
+                    .insert("session_key".into(), Value::String(key.into()));
+                state
+                    .fields
+                    .insert("source".into(), Value::String(source.into()));
+            }
             "created_at" => {
                 state.created_at = value
                     .as_i64()

@@ -459,7 +459,7 @@ fn import_one(
     )?;
     let mut final_context = projection(&stream, &branch, &body, "legacy_acp_context")?;
     final_context.event_id = EventId::parse(format!("legacy-acp-final-{stream}"))?;
-    let (identity, identity_payload) = family_identity(stream.clone(), family)?;
+    let (identity, identity_payload) = session_identity(stream.clone(), family, "acp")?;
     let mut events = Vec::new();
     let mut payloads = vec![body, identity_payload];
     if let Some(checkpoint) = checkpoint {

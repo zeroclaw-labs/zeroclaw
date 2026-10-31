@@ -10249,7 +10249,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 > = std::sync::Arc::new(zeroclaw::session_events::NativeSessionHub::new(
                     authority.live_handle(),
                 ));
-                source.families().await?;
+                source.sessions().await?;
                 let store = Some(std::sync::Arc::new(
                     zeroclaw_infra::session_repository::SessionRepository::for_namespace(
                         &config.data_dir,

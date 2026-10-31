@@ -17019,7 +17019,7 @@ pub async fn start_channels_with_history(
                 config_arc.clone(),
             ))
         });
-        source.families().await?;
+        source.sessions().await?;
         Some(source)
     } else {
         None
@@ -31250,7 +31250,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 }
                 *ctx.runtime_defaults_override.lock().unwrap() = None;
             }
-            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+            let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 directory.path(),
                 &family,
             )
@@ -31532,7 +31532,7 @@ BTC is currently around $65,000 based on latest tool output."#
                             assert!(switched.call_count.load(Ordering::SeqCst) > switched_before);
                         }
                     }
-                    let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                    let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                         directory.path(),
                         &family,
                     )
@@ -36151,7 +36151,7 @@ BTC is currently around $65,000 based on latest tool output."#
         };
         use zeroclaw_api::session_events::{BranchId, ContractError, SessionStreamId};
         use zeroclaw_kernel::session::engine::{
-            EngineSessionAuthority, EngineSessionSource, FamilyDescriptor, FamilyQuery,
+            EngineSessionAuthority, EngineSessionSource, SessionDescriptor, SessionReadHandle,
         };
         use zeroclaw_kernel::session::query::SessionAccessPolicy;
 
@@ -36194,15 +36194,16 @@ BTC is currently around $65,000 based on latest tool output."#
             async fn stream_id(&self, _: &str) -> Result<SessionStreamId, ContractError> {
                 SessionStreamId::parse("channel-recovery-fixture")
             }
-            async fn describe(&self, _: String) -> anyhow::Result<Option<FamilyDescriptor>> {
+            async fn describe(&self, _: String) -> anyhow::Result<Option<SessionDescriptor>> {
                 Ok(None)
             }
-            async fn families(&self) -> anyhow::Result<Vec<String>> {
+            async fn sessions(&self) -> anyhow::Result<Vec<String>> {
                 Ok(vec![])
             }
             async fn open(
                 &self,
                 _: String,
+                _: &str,
                 _: String,
                 _: PrincipalId,
                 _: Arc<dyn EngineSessionAuthority>,
@@ -36215,12 +36216,13 @@ BTC is currently around $65,000 based on latest tool output."#
                 _: String,
                 _: PrincipalId,
                 _: Arc<dyn SessionAccessPolicy>,
-            ) -> anyhow::Result<Option<FamilyQuery>> {
+            ) -> anyhow::Result<Option<SessionReadHandle>> {
                 anyhow::bail!("query_not_expected")
             }
             async fn open_system(
                 &self,
                 family: String,
+                _: &str,
                 _: String,
                 _: String,
                 authority: Arc<dyn EngineSessionAuthority>,
@@ -36477,7 +36479,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 );
                 assert_eq!(provider.main_calls.load(Ordering::SeqCst), 0);
                 assert!(channel.sent_messages.lock().await.is_empty());
-                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                     directory.path(),
                     &family,
                 )
@@ -36562,7 +36564,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 );
                 let family = runtime_conversation_history_key(&ctx, &message);
                 process_channel_message(ctx, message, CancellationToken::new()).await;
-                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                     directory.path(),
                     &family,
                 )

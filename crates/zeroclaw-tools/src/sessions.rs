@@ -72,7 +72,7 @@ fn render_native_summary(summary: &zeroclaw_api::session_events::views::SessionS
             (
                 "session_id",
                 summary
-                    .family_key()
+                    .session_key()
                     .unwrap_or(summary.head.stream_id.as_str()),
             ),
             ("channel", summary.channel_id().unwrap_or("")),
@@ -463,10 +463,11 @@ mod tests {
                 "native_read_revoked"
             );
             Ok(SessionSummary {
+                session_id: None,
                 head: EventCursor::beginning(SessionStreamId::new()),
                 owning_agent: Some("fixture".into()),
                 fields: std::collections::BTreeMap::from([(
-                    "family_key".into(),
+                    "session_key".into(),
                     serde_json::json!("native"),
                 )]),
                 created_at: 1,

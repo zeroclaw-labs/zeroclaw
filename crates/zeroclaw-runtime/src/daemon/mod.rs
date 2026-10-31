@@ -822,7 +822,7 @@ pub async fn run_with_authority(
         },
         |build| build(live_config_authority.live_handle()),
     );
-    source.families().await?;
+    source.sessions().await?;
     let native_sessions = Some(source);
 
     if let Some(gateway_start) = registry.take_gateway_start() {

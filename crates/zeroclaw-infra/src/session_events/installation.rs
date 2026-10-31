@@ -1,4 +1,4 @@
-//! One active format per installation. Family identities live in events;
+//! One active format per installation. Session identities live in events;
 //! this bounded manifest owns only upgrade phase and writer generation.
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -210,20 +210,29 @@ pub(crate) fn legacy_guard(directory: &Path) -> std::io::Result<InstallationGuar
     Ok(guard)
 }
 
-/// This immutable metadata event creates the public family identity. No
-/// routing table or per-family sidecar is persisted alongside the event store.
-pub fn family_identity(
+/// Immutable adapter identity and creation provenance. Source only describes
+/// the initial protocol; it is never a routing or enumeration key.
+pub fn session_identity(
     stream: SessionStreamId,
-    family: &str,
+    key: &str,
+    source: &str,
 ) -> Result<(SessionEvent, PayloadRecord), AppendError> {
-    if family.is_empty() || family.len() > 512 {
-        return Err(AppendError::InvalidReference("invalid family key".into()));
+    if key.is_empty() || key.len() > 512 {
+        return Err(AppendError::InvalidReference("invalid session key".into()));
     }
-    let value = PayloadRecord::json("session.authority/v1", &family)?;
+    if source.is_empty() {
+        return Err(AppendError::InvalidReference(
+            "invalid session creation source".into(),
+        ));
+    }
+    let value = PayloadRecord::json(
+        "session.authority/v1",
+        &serde_json::json!({"session_key":key,"source":source}),
+    )?;
     let event = SessionEvent::typed(
         stream,
         EventData::SessionMetadataChanged {
-            field: "family_key".into(),
+            field: "session_identity".into(),
             new_value_ref: StoredPayloadRef::from(&value),
         },
         EventActor::System {
@@ -233,7 +242,7 @@ pub fn family_identity(
     Ok((event, value))
 }
 
-pub fn families(
+pub fn session_keys(
     data_dir: &Path,
     backend: NativeBackend,
 ) -> Result<BTreeMap<String, SessionStreamId>, AppendError> {
@@ -274,25 +283,30 @@ pub fn families(
                     field,
                     new_value_ref,
                 } = &event.body.data
-                    && field == "family_key"
+                    && field == "session_identity"
                 {
                     let PayloadRead::Present(value) = store
                         .read_payload(&new_value_ref.payload_id)
                         .map_err(|error| AppendError::Corrupt(error.to_string()))?
                     else {
-                        return Err(AppendError::Corrupt("family identity unavailable".into()));
+                        return Err(AppendError::Corrupt("session identity unavailable".into()));
                     };
                     if StoredPayloadRef::from(&value) != *new_value_ref
                         || value.codec != "session.authority/v1"
                     {
                         return Err(AppendError::Corrupt(
-                            "family identity reference mismatch".into(),
+                            "session identity reference mismatch".into(),
                         ));
                     }
-                    let family: String = serde_json::from_slice(&value.body)
+                    let identity: serde_json::Value = serde_json::from_slice(&value.body)
                         .map_err(|error| AppendError::Corrupt(error.to_string()))?;
+                    let family = identity
+                        .get("session_key")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| AppendError::Corrupt("session key missing".into()))?
+                        .to_owned();
                     if result.insert(family, stream.clone()).is_some() {
-                        return Err(AppendError::Corrupt("duplicate family identity".into()));
+                        return Err(AppendError::Corrupt("duplicate session identity".into()));
                     }
                     found = true;
                 }
@@ -303,9 +317,34 @@ pub fn families(
             after.sequence = page
                 .events
                 .last()
-                .ok_or_else(|| AppendError::Corrupt("empty family inventory page".into()))?
+                .ok_or_else(|| AppendError::Corrupt("empty session inventory page".into()))?
                 .sequence;
         }
     }
     Ok(result)
+}
+
+/// Enumerate canonical sessions, including derived sessions. Creation source
+/// and adapter keys do not participate in this inventory.
+pub(crate) fn streams(
+    data_dir: &Path,
+    backend: NativeBackend,
+) -> Result<Vec<SessionStreamId>, AppendError> {
+    match backend {
+        NativeBackend::Sqlite => {
+            let store = SqliteEventStore::open(data_dir)?;
+            let conn = store.conn.lock();
+            let mut statement = conn
+                .prepare("SELECT stream_id FROM session_events WHERE sequence=1 ORDER BY stream_id")
+                .map_err(map_sqlite)?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite)?
+                .map(|row| {
+                    SessionStreamId::parse(row.map_err(map_sqlite)?).map_err(AppendError::from)
+                })
+                .collect()
+        }
+        NativeBackend::Jsonl => JsonlEventStore::open(data_dir)?.session_streams(),
+    }
 }

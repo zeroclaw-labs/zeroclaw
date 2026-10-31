@@ -24,23 +24,27 @@ pub trait EngineSessionAuthority: SessionAccessPolicy + PermissionResolver {
     fn diagnostic(&self, error: &anyhow::Error) -> Option<String>;
 }
 
-/// Application-owned family composition. Hosts supply authenticated scope and
+/// Application-owned source composition. Hosts supply authenticated scope and
 /// current authority; kernel never constructs a physical backend.
 #[async_trait::async_trait]
 pub trait EngineSessionSource: Send + Sync {
     async fn stream_id(&self, family: &str) -> Result<SessionStreamId, ContractError>;
     /// Routing metadata for the trusted authorization resolver. A transport
     /// must authorize before disclosing this descriptor to a caller.
-    async fn describe(&self, family: String) -> anyhow::Result<Option<FamilyDescriptor>>;
-    async fn families(&self) -> anyhow::Result<Vec<String>>;
+    async fn describe(&self, family: String) -> anyhow::Result<Option<SessionDescriptor>>;
+    async fn sessions(&self) -> anyhow::Result<Vec<String>>;
     /// Trusted host retention command. Closing retains the append-only audit
     /// trail; it never erases payloads or expires a running execution.
     async fn archive_stale(&self, _prefix: &str, _before_millis: i64) -> anyhow::Result<usize> {
         anyhow::bail!("session_retention_unsupported")
     }
+    /// `creation_source` records the initial entrance protocol when creating
+    /// a session. Reopening preserves that value; identity and routing use
+    /// only the session key supplied in `family`.
     async fn open(
         &self,
         family: String,
+        creation_source: &str,
         alias: String,
         principal: PrincipalId,
         authority: Arc<dyn EngineSessionAuthority>,
@@ -51,6 +55,7 @@ pub trait EngineSessionSource: Send + Sync {
     async fn open_system(
         &self,
         _family: String,
+        _creation_source: &str,
         _alias: String,
         _component: String,
         _authority: Arc<dyn EngineSessionAuthority>,
@@ -58,24 +63,24 @@ pub trait EngineSessionSource: Send + Sync {
     ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
         anyhow::bail!("system_session_source_unsupported")
     }
-    /// Resolve an existing native family without admission, recovery or write
+    /// Resolve an existing native source without admission, recovery or write
     /// ownership. Read-only callers cannot create a session by querying it.
     async fn query(
         &self,
         family: String,
         principal: PrincipalId,
         policy: Arc<dyn SessionAccessPolicy>,
-    ) -> anyhow::Result<Option<FamilyQuery>>;
+    ) -> anyhow::Result<Option<SessionReadHandle>>;
 }
 
 #[derive(Clone, Debug)]
-pub struct FamilyDescriptor {
+pub struct SessionDescriptor {
     pub stream: SessionStreamId,
     pub owning_agent: String,
     pub owner: Option<String>,
 }
 
-pub struct FamilyQuery {
+pub struct SessionReadHandle {
     pub stream: SessionStreamId,
     pub query: SessionQuery,
 }
@@ -88,11 +93,11 @@ impl views::SessionHistoryReadPort for EngineSession {
 
     async fn list(&self, limit: usize) -> anyhow::Result<Vec<views::SessionSummary>> {
         let current = self.query().summary(self.stream.clone()).await?;
-        let current_key = current.family_key().map(str::to_owned);
+        let current_key = current.session_key().map(str::to_owned);
         let mut summaries = vec![current];
         if let (Some(source), EventActor::Principal { principal_id }) = (&self.source, &self.actor)
         {
-            for family in source.families().await? {
+            for family in source.sessions().await? {
                 if Some(&family) == current_key.as_ref() {
                     continue;
                 }
@@ -139,9 +144,9 @@ impl views::SessionHistoryReadPort for EngineSession {
         limit: usize,
     ) -> anyhow::Result<Option<views::HistoricalMessagePage>> {
         let summary = self.query().summary(self.stream.clone()).await?;
-        if summary.family_key() == Some(family)
+        if summary.session_key() == Some(family)
             || family == self.stream.as_str()
-            || summary.family_key() == Some(format!("gw_{family}").as_str())
+            || summary.session_key() == Some(format!("gw_{family}").as_str())
         {
             return Ok(Some(
                 self.query()

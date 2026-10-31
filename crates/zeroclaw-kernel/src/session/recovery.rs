@@ -28,7 +28,7 @@ pub trait ExecutionLossVerifier: Send + Sync {
 
 impl SessionCoordinator {
     /// Recover a whole session family without replaying any external effect.
-    pub async fn recover_family(
+    pub async fn recover_session(
         self: &Arc<Self>,
         stream: SessionStreamId,
         verifier: Arc<dyn StreamExecutionLossVerifier>,

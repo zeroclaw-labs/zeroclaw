@@ -20060,6 +20060,7 @@ Let me check the result."#;
             let port = source
                 .open(
                     family.into(),
+                    "test",
                     "skill-agent".into(),
                     principal,
                     authority,
@@ -20199,7 +20200,7 @@ Let me check the result."#;
             );
 
             let store =
-                zeroclaw_infra::session_events::family::FamilyEventStore::open(&data_dir, family)
+                zeroclaw_infra::session_events::scoped::ScopedEventStore::open(&data_dir, family)
                     .unwrap();
             let parent = store
                 .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
@@ -20457,6 +20458,7 @@ Let me check the result."#;
                 let port = source
                     .open(
                         family.into(),
+                        "test",
                         "skill-agent".into(),
                         principal,
                         authority,
@@ -20530,7 +20532,7 @@ Let me check the result."#;
                     assert!(is_capture_stopped(&error));
                 }
                 assert!(reflection.is_none() && review.is_none());
-                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                     &data_dir, family,
                 )
                 .unwrap();

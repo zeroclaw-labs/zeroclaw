@@ -21,9 +21,9 @@ pub struct NativeSessionRuntime {
 impl NativeSessionRuntime {
     /// Application admission resolves the current installation format. A
     /// preexisting handle cannot keep writing after its generation is retired.
-    pub fn open_family(data_dir: &Path, family: &str) -> Result<Self, AppendError> {
+    pub fn open_session(data_dir: &Path, family: &str) -> Result<Self, AppendError> {
         let store: Arc<dyn SessionEventStore> = Arc::new(
-            zeroclaw_infra::session_events::family::FamilyEventStore::open(data_dir, family)?,
+            zeroclaw_infra::session_events::scoped::ScopedEventStore::open(data_dir, family)?,
         );
         Ok(Self {
             coordinator: Arc::new(SessionCoordinator::new(store).with_search(Arc::new(

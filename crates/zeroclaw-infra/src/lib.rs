@@ -8,7 +8,6 @@ pub mod session_backend;
 pub mod session_events;
 pub mod session_queue;
 pub mod session_repository;
-pub mod session_sqlite;
 pub mod session_store;
 pub mod stall_watchdog;
 
@@ -130,7 +129,10 @@ pub fn recover_abandoned_session_turns(data_dir: &Path) -> std::io::Result<usize
     {
         return Ok(0);
     }
-    let recovered = session_sqlite::SqliteSessionBackend::recover_abandoned_turns_at(data_dir)?;
+    let recovered =
+        session_events::upgrade::legacy_sqlite::SqliteSessionBackend::recover_abandoned_turns_at(
+            data_dir,
+        )?;
     if recovered > 0 {
         ::zeroclaw_log::record!(
             WARN,
@@ -146,8 +148,8 @@ pub fn recover_abandoned_session_turns(data_dir: &Path) -> std::io::Result<usize
 fn open_sqlite_with_jsonl_import(
     workspace_dir: &Path,
     guard: session_events::installation::InstallationGuard,
-) -> std::io::Result<session_sqlite::SqliteSessionBackend> {
-    let backend = session_sqlite::SqliteSessionBackend::open_locked(&guard)
+) -> std::io::Result<session_events::upgrade::legacy_sqlite::SqliteSessionBackend> {
+    let backend = session_events::upgrade::legacy_sqlite::SqliteSessionBackend::open_locked(&guard)
         .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
     drop(guard);
     match backend
@@ -281,7 +283,8 @@ mod tests {
     #[test]
     fn failed_recovery_is_reported_and_not_retried() {
         let tmp = TempDir::new().unwrap();
-        let db_path = session_sqlite::SqliteSessionBackend::db_path(tmp.path());
+        let db_path =
+            session_events::upgrade::legacy_sqlite::SqliteSessionBackend::db_path(tmp.path());
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         std::fs::write(&db_path, b"not a database").unwrap();
 

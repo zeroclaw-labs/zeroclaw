@@ -476,7 +476,14 @@ writer generation and either `upgrading`, `switching` or `ready` state, with no
 per-session routing records. Before opening execution or history readers, the
 host imports all legacy SQLite/JSONL sessions into the configured native backend.
 Read-only enumeration therefore includes old history before a session is resumed.
-Immutable `family_key` events own family names; catalogs are disposable views.
+The root `session_identity` event records the session key and the protocol that
+created it. Each entrance supplies this marker explicitly, independently of
+the session key; reopening from another entrance preserves the original value.
+The marker is descriptive only. Stream coordinates are derived from the
+session key, and enumeration uses the common session index, a disposable view.
+Channel entrances record their actual protocol name. Legacy SQLite/JSONL
+imports record `legacy` when the original entrance is unknown; ACP and CLI
+imports retain their known protocol. Session-key prefixes never supply source.
 
 Legacy writers, including read-side repairs of old ACP derived columns,
 share the installation publication lock and are fenced before import starts.
@@ -516,7 +523,7 @@ observations share the execution stream's commit lock and recheck current
 authorization; they cannot change identity, ownership or permissions. A failed
 observation cancels execution and propagates after the owned task settles.
 Protocol adapters do not write a competing projection during execution.
-Family resolution reads canonical events on a blocking worker, including any
+Source resolution reads canonical events on a blocking worker, including any
 wait for the installation lock, without blocking the async reactor.
 
 ACP, RPC and CLI use the same API `Session` model. `SessionCatalog` exposes
@@ -528,13 +535,26 @@ an absent owner; execution authority still comes from its parent request.
 Summary reads resolve only each metadata field's last effective assignment
 and structural seed identities. Imported observations fill missing fields;
 they cannot override a value already recorded by native execution. Detail reads attach a context
-reference without duplicating metadata. These reads still scan the fixed event
-prefix; no cache or persistent secondary index is introduced.
+reference without duplicating metadata. Session discovery also maintains a
+rebuildable `session_index` projection: SQLite stores it as a table beside the
+event rows, while JSONL stores the same logical rows in `session-index.jsonl`.
+It contains stream/session identity, title, creation and activity times, first
+user message identity and bounded preview, workspace and Git fields, provider
+and model, category/project, parent thread/agent, lifecycle flags, message
+count and the projected event head. The event stream remains canonical; the
+index is refreshed when the catalog opens or is queried, and a missing or
+stale row is rebuilt from committed events. Full message bodies are resolved
+from payloads rather than copied into the index.
+`title` is the only session title field in native events, projections and
+backend metadata. The upgrader translates the old SQLite `name` column to
+`title`; native reads do not recognize `name` as an alias. Existing RPC `name`
+parameters and response fields are
+converted at the protocol boundary.
 Agent rename, deletion and interrupted-rename residue checks use this standard
-repository across all families. Deletion appends closure events and retains
+repository across all sources. Deletion appends closure events and retains
 historical attribution; these operations never write archived legacy backends.
 
-Production RPC contexts contain only the standard session source. History
+Production RPC contexts use only the standard session model. History
 search, messages, state, rename, append and deletion use its authorized query
 and command ports. The old transcript backend and its fallback behavior are
 compiled only for explicit compatibility fixtures, not daemon execution.
@@ -559,9 +579,9 @@ Gateway TTL retention ends an idle execution window without closing the logical
 session. A later request using the same session id restores the persisted context
 and continues in the same stream. Historical TTL close observations remain audit
 evidence but do not make the logical session terminal. Explicit closure and
-deletion remain terminal. No successor family or locator is created.
+deletion remain terminal. No successor source or locator is created.
 
-CLI and session-host startup share kernel family recovery. After the host proves
+CLI and session-host startup share kernel session recovery. After the host proves
 exclusive ownership, recovery settles descendants before their parent, including
 child requests committed before child stream creation. It preserves uncertain
 outcomes and never replays provider or tool execution.
@@ -592,7 +612,7 @@ permission snapshot. Literal Unicode substring queries preserve transport
 compatibility; short terms use a bounded SQL scan. Kernel rechecks authority
 and rematerializes selected messages against current erasure before returning
 hits. This index is rebuilt per request; it does not claim persistent-index
-latency or global search over unauthorized families.
+latency or global search over unauthorized sources.
 
 Delivery observations name the boundary actually measured. HTTP records body
 production when Hyper polls it, SSE records terminal queue acceptance, and
@@ -636,7 +656,7 @@ Readers already refuse erased content while physical completion is pending.
 JSONL erasure first commits the intent and freezes reads, then removes owned
 content files and synchronizes their directory before publishing confirmation.
 The authorized erasure request returns its original intent receipt only after
-cleanup completes. Family startup resumes existing intents on root and derived
+cleanup completes. Source startup resumes existing intents on root and derived
 streams. Confirmation identities come from those intents, so a retry completes
 the same deletion, including a pending SQLite checkpoint. Ordinary reads never
 trigger deletion, and cleanup cannot create a new erasure authorization.

@@ -12,7 +12,7 @@ fn seed(
     super::super::upgrade::upgrade_installation(dir, backend, |_| "fixture".into())
         .expect("format");
     let store = open_event_store(dir, name).expect("store");
-    let stream = SessionStreamId::new();
+    let stream = super::super::upgrade::stream_id("fixture").expect("stream");
     let branch = BranchId::new();
     let mut event = SessionEvent::typed(
         stream.clone(),
@@ -28,7 +28,8 @@ fn seed(
     .expect("event");
     event.branch_id = Some(branch);
     let (identity, identity_payload) =
-        super::super::installation::family_identity(stream.clone(), "fixture").expect("identity");
+        super::super::installation::session_identity(stream.clone(), "fixture", "test")
+            .expect("identity");
     let request = AppendRequest {
         stream_id: stream.clone(),
         expected_head: EventCursor::beginning(stream.clone()),
@@ -49,7 +50,7 @@ fn native_roundtrip_preserves_raw_bytes_receipts_and_stale_writer_fence() {
     ] {
         let dir = tempfile::TempDir::new().expect("dir");
         let (root, request, store) = seed(dir.path(), source);
-        let old = family::FamilyEventStore::open(dir.path(), "fixture").expect("old handle");
+        let old = scoped::ScopedEventStore::open(dir.path(), "fixture").expect("old handle");
         let before = store
             .read_page(&root, &EventCursor::beginning(root.clone()), None, 100)
             .expect("before");
@@ -59,7 +60,7 @@ fn native_roundtrip_preserves_raw_bytes_receipts_and_stale_writer_fence() {
             old.append_batch(request.clone()).is_err(),
             "old writer must stay fenced even for a retry"
         );
-        let migrated = family::FamilyEventStore::open(dir.path(), "fixture").expect("target");
+        let migrated = scoped::ScopedEventStore::open(dir.path(), "fixture").expect("target");
         let after = migrated
             .read_page(&root, &EventCursor::beginning(root.clone()), None, 100)
             .expect("after");
@@ -81,7 +82,7 @@ fn native_roundtrip_preserves_raw_bytes_receipts_and_stale_writer_fence() {
             "generation fences survive a roundtrip"
         );
         let reopened =
-            family::FamilyEventStore::open(dir.path(), "fixture").expect("roundtrip handle");
+            scoped::ScopedEventStore::open(dir.path(), "fixture").expect("roundtrip handle");
         assert_eq!(
             before.raw_events,
             reopened
@@ -115,9 +116,9 @@ fn frozen_native_migration_resumes_and_rejects_changed_source() {
                 })
                 .expect("freeze");
         }
-        assert!(family::FamilyEventStore::open(dir.path(), "fixture").is_err());
+        assert!(scoped::ScopedEventStore::open(dir.path(), "fixture").is_err());
         migrate_installation(dir.path(), target).expect("resume");
-        assert!(family::FamilyEventStore::open(dir.path(), "fixture").is_ok());
+        assert!(scoped::ScopedEventStore::open(dir.path(), "fixture").is_ok());
     }
 }
 
@@ -125,7 +126,7 @@ fn frozen_native_migration_resumes_and_rejects_changed_source() {
 fn migration_never_takes_over_an_active_executor() {
     let dir = tempfile::TempDir::new().expect("dir");
     seed(dir.path(), NativeBackend::Sqlite);
-    let _lease = ownership::FamilyExecutionLease::acquire(dir.path(), "fixture").expect("lease");
+    let _lease = ownership::SessionExecutionLease::acquire(dir.path(), "fixture").expect("lease");
     assert!(migrate_installation(dir.path(), NativeBackend::Jsonl).is_err());
     assert!(matches!(
         InstallationGuard::acquire(&dir.path().join("sessions"))
@@ -196,7 +197,7 @@ fn native_migration_process_interruption_resumes_exact_frozen_image() {
             );
             if point != "native_migration_published" {
                 assert!(
-                    family::FamilyEventStore::open(dir.path(), "fixture").is_err(),
+                    scoped::ScopedEventStore::open(dir.path(), "fixture").is_err(),
                     "both writers remain frozen"
                 );
             }
@@ -209,7 +210,7 @@ fn native_migration_process_interruption_resumes_exact_frozen_image() {
                     .expect("digest")
             );
             let migrated =
-                family::FamilyEventStore::open(dir.path(), "fixture").expect("target writer");
+                scoped::ScopedEventStore::open(dir.path(), "fixture").expect("target writer");
             assert_eq!(
                 receipt,
                 migrated
@@ -274,7 +275,7 @@ fn frozen_native_migration_rejects_a_changed_source_commitment() {
         migrate_installation(dir.path(), NativeBackend::Jsonl),
         Err(AppendError::Corrupt(_))
     ));
-    assert!(family::FamilyEventStore::open(dir.path(), "fixture").is_err());
+    assert!(scoped::ScopedEventStore::open(dir.path(), "fixture").is_err());
 }
 
 #[test]
@@ -324,7 +325,7 @@ fn migration_preserves_future_event_bytes_and_its_explicit_payload_references() 
         .import_native(&image)
         .expect("future-version source fixture");
     migrate_installation(dir.path(), NativeBackend::Jsonl).expect("migration");
-    let store = family::FamilyEventStore::open(dir.path(), "fixture").expect("target");
+    let store = scoped::ScopedEventStore::open(dir.path(), "fixture").expect("target");
     let page = store
         .read_page(&root, &EventCursor::beginning(root.clone()), None, 10)
         .expect("page");
@@ -405,7 +406,7 @@ fn installation_migration_preserves_shared_nested_content() {
         };
         migrate_installation(dir.path(), target)
             .expect("whole installation preserves shared payloads");
-        assert!(family::FamilyEventStore::open(dir.path(), "fixture").is_ok());
+        assert!(scoped::ScopedEventStore::open(dir.path(), "fixture").is_ok());
     }
 }
 
@@ -586,7 +587,7 @@ fn migration_retains_erasure_skeleton_and_never_restores_deleted_bytes() {
             .digest()
             .expect("digest");
         migrate_installation(directory.path(), target).expect("migrate");
-        let migrated = family::FamilyEventStore::open(directory.path(), "fixture").expect("target");
+        let migrated = scoped::ScopedEventStore::open(directory.path(), "fixture").expect("target");
         assert_eq!(
             migrated.read_payload(&reference.payload_id).expect("read"),
             zeroclaw_api::session_events::PayloadRead::Redacted

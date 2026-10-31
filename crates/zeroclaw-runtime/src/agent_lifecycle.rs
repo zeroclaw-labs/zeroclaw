@@ -531,7 +531,7 @@ mod tests {
         config.heartbeat.agent = "victim".to_string();
         SessionRepository::legacy_fixture(&config.data_dir)
             .unwrap()
-            .create_session("live", "victim", "/tmp/victim", None)
+            .create_session("live", "test", "victim", "/tmp/victim", None)
             .unwrap();
 
         let preview = plan_agent_delete(&config, "victim");
@@ -606,7 +606,7 @@ mod tests {
                 ("chat_untouched", "other"),
             ] {
                 repository
-                    .create_session(id, owner, "/fixture", None)
+                    .create_session(id, "test", owner, "/fixture", None)
                     .unwrap();
             }
 

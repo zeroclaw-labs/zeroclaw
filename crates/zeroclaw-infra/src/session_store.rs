@@ -38,7 +38,9 @@ impl SessionStore {
         let mutation_lock = mutation_lock_for(&sessions_dir)?;
         {
             let mut state = mutation_lock.lock();
-            match crate::session_sqlite::has_committed_jsonl_import_receipts(workspace_dir) {
+            match crate::session_events::upgrade::legacy_sqlite::has_committed_jsonl_import_receipts(
+                workspace_dir,
+            ) {
                 Ok(true) => mark_session_directory_migrated(&sessions_dir, &mut state)?,
                 Ok(false) => state.receipt_state_uncertain = false,
                 Err(error) => {
@@ -596,7 +598,7 @@ impl SessionBackend for SessionStore {
                     .map(DateTime::<Utc>::from)
                     .unwrap_or_else(Utc::now);
                 crate::session_backend::SessionMetadata {
-                    name: None,
+                    title: None,
                     created_at: last_activity,
                     last_activity,
                     message_count: 0,
@@ -1397,7 +1399,7 @@ mod tests {
         let meta = backend.get_session_metadata("test_session").unwrap();
         assert_eq!(meta.key, "test_session");
         assert_eq!(meta.message_count, 2);
-        assert!(meta.name.is_none());
+        assert!(meta.title.is_none());
     }
 
     #[test]

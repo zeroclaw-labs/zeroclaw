@@ -151,6 +151,7 @@ pub(super) async fn open(
     source
         .open_system(
             family,
+            "peer",
             recipient.into(),
             "peer_inbox".into(),
             authority,

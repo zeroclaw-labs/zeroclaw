@@ -566,6 +566,7 @@ mod tests {
                     let port = source
                         .open(
                             family.into(),
+                            "test",
                             "alpha".into(),
                             principal.clone(),
                             Arc::new(AgentHistoryAuthority {
@@ -627,7 +628,7 @@ mod tests {
                         if ordinary { 2 } else { 1 }
                     );
 
-                    let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                    let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                         directory.path(),
                         family,
                     )

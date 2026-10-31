@@ -236,6 +236,7 @@ pub(super) async fn open(
         source
             .open_system(
                 family.into(),
+                &msg.channel,
                 ctx.agent_alias.to_string(),
                 "channel_ingress".into(),
                 authority,

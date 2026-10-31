@@ -492,10 +492,10 @@ pub(super) fn migrate_locked(
         return installation.finish(target);
     }
     let image = export(data_dir, source, None)?;
-    let families = installation::families(data_dir, source)?;
+    let families = installation::session_keys(data_dir, source)?;
     let _leases = families
         .keys()
-        .map(|family| ownership::FamilyExecutionLease::acquire(data_dir, family))
+        .map(|family| ownership::SessionExecutionLease::acquire(data_dir, family))
         .collect::<Result<Vec<_>, _>>()?;
     let digest = image.digest()?;
     if let Some(expected) = expected {

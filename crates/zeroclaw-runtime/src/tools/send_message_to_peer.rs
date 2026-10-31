@@ -1848,7 +1848,7 @@ mod tests {
             )
             .await
             .expect("stream");
-            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+            let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 workspace.path(),
                 &family,
             )
@@ -1942,7 +1942,7 @@ mod tests {
             )
             .await
             .expect("stream");
-            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+            let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 workspace.path(),
                 &family,
             )

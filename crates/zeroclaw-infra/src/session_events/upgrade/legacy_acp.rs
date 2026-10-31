@@ -3640,7 +3640,7 @@ mod tests {
         store.touch_session("fixture").expect("protocol activity");
         store.set_plan("fixture", &[]).expect("protocol plan");
         store
-            .create_session("unrelated", "agent", "/tmp", None)
+            .create_session("unrelated", "acp", "agent", "/tmp", None)
             .expect("unrelated");
         assert!(
             store.append_turn("unrelated", &[user]).is_err(),

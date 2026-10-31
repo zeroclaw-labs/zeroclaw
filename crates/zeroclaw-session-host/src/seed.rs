@@ -1,13 +1,14 @@
 use super::*;
 
-pub(super) struct FamilySeed<'a> {
-    pub family: &'a str,
+pub(super) struct SessionSeed<'a> {
+    pub session_key: &'a str,
+    pub source: &'a str,
     pub alias: &'a str,
     pub actor: EventActor,
     pub context: ContextSnapshot,
 }
 
-impl FamilySeed<'_> {
+impl SessionSeed<'_> {
     pub fn publish(
         self,
         store: &dyn SessionEventStore,
@@ -68,7 +69,8 @@ impl FamilySeed<'_> {
             self.actor.clone(),
         )?;
         projection.branch_id = Some(branch);
-        let (identity, identity_payload) = family_identity(stream.clone(), self.family)?;
+        let (identity, identity_payload) =
+            session_identity(stream.clone(), self.session_key, self.source)?;
         let mut events = vec![root, identity];
         let mut payloads = vec![identity_payload];
         if seeded {

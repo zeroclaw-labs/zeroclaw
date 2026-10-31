@@ -4646,7 +4646,7 @@ impl RpcDispatcher {
         // in the in-memory RPC store.
         let persisted_count = match self.ctx.native_sessions.as_ref() {
             Some(source) => source
-                .families()
+                .sessions()
                 .await
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
                 .len(),
@@ -5549,7 +5549,7 @@ impl RpcDispatcher {
             Some(
                     source
                         .open(
-                            family,
+                            family, "rpc",
                             req.agent_alias.clone(),
                             principal,
                             authority,
@@ -5678,7 +5678,7 @@ impl RpcDispatcher {
                             ) => Ok(AcpSessionNewLoad::Restored(data)),
                             zeroclaw_infra::session_repository::SessionRestore::Missing => {
                                 store_cloned.create_session_with_interaction_surface(
-                                    &sid,
+                                    &sid, "rpc",
                                     &alias,
                                     &cwd_owned,
                                     resolved_interaction_surface.map(|surface| surface.as_str()),
@@ -6807,6 +6807,7 @@ impl RpcDispatcher {
                 source
                     .open(
                         family,
+                        "rpc",
                         data.agent_alias.clone(),
                         principal,
                         authority,
@@ -7648,6 +7649,7 @@ impl RpcDispatcher {
             let session = source
                 .open(
                     session_key.clone(),
+                    "rpc",
                     agent_alias.clone(),
                     principal,
                     authority,
@@ -9339,7 +9341,7 @@ impl RpcDispatcher {
                 .as_ref()
                 .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
             backend
-                .set_session_name(&key, name)
+                .set_session_title(&key, name)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to rename session: {e}")))?;
             to_result(SessionRenameResult {
                 session_id: req.session_id.clone(),
@@ -9552,7 +9554,7 @@ impl RpcDispatcher {
                     message_count: meta.message_count,
                     agent_alias,
                     channel_id: meta.channel_id,
-                    name: meta.name,
+                    name: meta.title,
                 })
             })
             .collect();
@@ -9581,7 +9583,7 @@ impl RpcDispatcher {
         let req: SessionListParams = parse_params(params)?;
         let visible_ids = self.owner_visible_session_ids().await;
         let native_families = source
-            .families()
+            .sessions()
             .await
             .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let scope = self.scoped_principal_id();
@@ -9787,7 +9789,7 @@ impl RpcDispatcher {
         family: &str,
         record: Option<&crate::rpc::session::SessionRecord>,
         method: Method,
-    ) -> Result<Option<zeroclaw_kernel::session::engine::FamilyQuery>, JsonRpcError> {
+    ) -> Result<Option<zeroclaw_kernel::session::engine::SessionReadHandle>, JsonRpcError> {
         let Some(source) = &self.ctx.native_sessions else {
             return Ok(None);
         };
@@ -9898,7 +9900,7 @@ impl RpcDispatcher {
             history_has_trim_breadcrumb: Some(false),
         };
         source
-            .open(key.into(), alias, principal, authority, initial)
+            .open(key.into(), "rpc", alias, principal, authority, initial)
             .await
             .map(Some)
             .map_err(|error| {
@@ -9919,7 +9921,7 @@ impl RpcDispatcher {
         &self,
         sid: &str,
         method: Method,
-    ) -> Result<zeroclaw_kernel::session::engine::FamilyQuery, JsonRpcError> {
+    ) -> Result<zeroclaw_kernel::session::engine::SessionReadHandle, JsonRpcError> {
         let record = self.authorize_session_owner(sid, method).await?;
         let source = self
             .ctx
@@ -12868,7 +12870,7 @@ impl RpcDispatcher {
         let mut backend_counts = std::collections::HashMap::<String, usize>::new();
         if let Some(source) = self.ctx.native_sessions.clone() {
             let families = source
-                .families()
+                .sessions()
                 .await
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
             for family in families {
@@ -18728,7 +18730,7 @@ mod tests {
         config: zeroclaw_config::schema::Config,
     ) -> (
         Arc<RpcContext>,
-        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
         Arc<zeroclaw_infra::session_repository::SessionRepository>,
     ) {
         use zeroclaw_infra::session_queue::SessionActorQueue;
@@ -18736,8 +18738,12 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("the data dir is creatable");
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let chat_backend =
-            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                &data_dir,
+            )
+            .unwrap(),
+        );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(&data_dir)
                 .unwrap(),
@@ -19896,7 +19902,7 @@ mod tests {
     ) -> (
         Arc<RpcContext>,
         std::path::PathBuf,
-        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
     ) {
         let mut config = session_cwd_config(tmp, 4242, None);
         config
@@ -19919,7 +19925,9 @@ mod tests {
     /// Replacing an id installs a new incarnation with a new generation.
     async fn install_upload_session(
         ctx: &Arc<RpcContext>,
-        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        chat_backend: &Arc<
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+        >,
         sid: &str,
         owner: Option<&str>,
         agent_workspace: &std::path::Path,
@@ -24427,7 +24435,7 @@ mod tests {
         }
 
         acp_store
-            .create_session("collide-2", "test-agent", "/ws", Some("user:alice"))
+            .create_session("collide-2", "rpc", "test-agent", "/ws", Some("user:alice"))
             .unwrap();
         chat_backend
             .set_session_principal("rpc_collide-2", "user:bob")
@@ -24442,7 +24450,7 @@ mod tests {
         // when both records agree about ownership. Only the owner sees that
         // collision; another scoped principal gets the uniform denial.
         acp_store
-            .create_session("agree", "test-agent", "/ws", Some("user:alice"))
+            .create_session("agree", "rpc", "test-agent", "/ws", Some("user:alice"))
             .unwrap();
         chat_backend
             .set_session_principal("rpc_agree", "user:alice")
@@ -25208,8 +25216,12 @@ mod tests {
         let data_dir = config.data_dir.clone();
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let chat_backend =
-            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                &data_dir,
+            )
+            .unwrap(),
+        );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(&data_dir)
                 .unwrap(),
@@ -30145,7 +30157,7 @@ mod tests {
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
                 .unwrap(),
         );
-        acp.create_session(sid, "alpha", tmp.path().to_str().unwrap(), None)
+        acp.create_session(sid, "rpc", "alpha", tmp.path().to_str().unwrap(), None)
             .unwrap();
 
         let entries = vec![PlanEntry {
@@ -32375,6 +32387,7 @@ mod tests {
             let port = source
                 .open(
                     family.into(),
+                    "rpc",
                     "test-agent".into(),
                     principal,
                     authority.clone(),
@@ -32470,7 +32483,7 @@ mod tests {
                 .await
                 .expect("unchanged maintenance");
             assert_eq!(dispatcher.ctx.config.revision(), config_revision);
-            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+            let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 &config.data_dir,
                 family,
             )
@@ -32628,7 +32641,7 @@ mod tests {
                 ));
                 let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
                 let legacy = Arc::new(
-                    zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&config.data_dir)
+                    zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(&config.data_dir)
                         .expect("legacy"),
                 );
                 let acp = Arc::new(
@@ -32698,7 +32711,7 @@ mod tests {
                         .count(),
                     1
                 );
-                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                     &ctx.config.read().data_dir,
                     &family,
                 )
@@ -32909,6 +32922,7 @@ mod tests {
             let port = source
                 .open(
                     family.into(),
+                    "rpc",
                     "test-agent".into(),
                     principal,
                     authority,
@@ -32996,14 +33010,18 @@ mod tests {
     ) -> (
         RpcDispatcher,
         Arc<crate::rpc::session::SessionStore>,
-        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
         Arc<zeroclaw_infra::session_repository::SessionRepository>,
     ) {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let chat_backend =
-            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(data_dir).unwrap());
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                data_dir,
+            )
+            .unwrap(),
+        );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(data_dir)
                 .unwrap(),
@@ -33041,8 +33059,12 @@ mod tests {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let chat_backend =
-            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(data_dir).unwrap());
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                data_dir,
+            )
+            .unwrap(),
+        );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(data_dir)
                 .unwrap(),
@@ -33197,7 +33219,7 @@ mod tests {
         let foreign = "33333333-3333-4333-8333-333333333333";
         let unknown = "44444444-4444-4444-8444-444444444444";
         acp_store
-            .create_session(previous, "test-agent", "/previous", None)
+            .create_session(previous, "rpc", "test-agent", "/previous", None)
             .unwrap();
         acp_store
             .append_turn(
@@ -33208,10 +33230,16 @@ mod tests {
             )
             .unwrap();
         acp_store
-            .create_session(foreign, "other-agent", "/foreign", None)
+            .create_session(foreign, "rpc", "other-agent", "/foreign", None)
             .unwrap();
         acp_store
-            .create_session(current, "test-agent", data_dir.to_str().unwrap(), None)
+            .create_session(
+                current,
+                "rpc",
+                "test-agent",
+                data_dir.to_str().unwrap(),
+                None,
+            )
             .unwrap();
         acp_store
             .append_turn(
@@ -33338,8 +33366,12 @@ mod tests {
         let data_dir = config.data_dir.clone();
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let chat_backend =
-            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                &data_dir,
+            )
+            .unwrap(),
+        );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(&data_dir)
                 .unwrap(),
@@ -33574,7 +33606,7 @@ mod tests {
                 .unwrap();
             if original_mode == "chat" {
                 acp_store
-                    .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+                    .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
                     .unwrap();
             }
             acp_store
@@ -33817,7 +33849,7 @@ mod tests {
         // Seed the store with the representative parity shape (the shared
         // fixture above).
         acp_store
-            .create_session(sid, "test-agent", ws, None)
+            .create_session(sid, "rpc", "test-agent", ws, None)
             .unwrap();
         let history = parity_fixture();
         acp_store.append_turn(sid, &history).unwrap();
@@ -33934,7 +33966,10 @@ mod tests {
             )),
         ));
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                tmp.path(),
+            )
+            .unwrap(),
         );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
@@ -34050,7 +34085,7 @@ mod tests {
             let generation = sessions.get_generation(sid).await.unwrap();
             let history = serde_json::to_value(original.lock().await.history()).unwrap();
             store
-                .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+                .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
                 .unwrap();
             dispatcher.access_policy = RpcAccessPolicy::RemoteSessionOwner;
             let entered = Arc::new(tokio::sync::Notify::new());
@@ -34109,7 +34144,7 @@ mod tests {
             make_persistence_test_dispatcher(config, tmp.path());
         let sid = "successful-mode-replacement";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+            .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         acp_store
             .begin_turn_checkpoint(sid, "interrupted-seed", &[])
@@ -34559,6 +34594,7 @@ mod tests {
         acp_store
             .create_session_with_interaction_surface(
                 "surface-mismatch",
+                "rpc",
                 "test-agent",
                 "/tmp/test-agent",
                 Some("another_surface"),
@@ -34594,6 +34630,7 @@ mod tests {
             acp_store
                 .create_session_with_interaction_surface(
                     sid,
+                    "rpc",
                     "test-agent",
                     "/tmp/test-agent",
                     Some("another_surface"),
@@ -34670,6 +34707,7 @@ mod tests {
             acp_store
                 .create_session_with_interaction_surface(
                     sid,
+                    "rpc",
                     "test-agent",
                     "/tmp/test-agent",
                     stored,
@@ -34731,7 +34769,13 @@ mod tests {
         let (dispatcher, _sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
         acp_store
-            .create_session("legacy-surface", "test-agent", "/tmp/test-agent", None)
+            .create_session(
+                "legacy-surface",
+                "rpc",
+                "test-agent",
+                "/tmp/test-agent",
+                None,
+            )
             .unwrap();
 
         dispatcher
@@ -34798,7 +34842,9 @@ mod tests {
                 .unwrap(),
         );
         let sid = "trim-at-cap";
-        store.create_session(sid, "agent", "/tmp", None).unwrap();
+        store
+            .create_session(sid, "rpc", "agent", "/tmp", None)
+            .unwrap();
         let existing = (0..50)
             .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
             .collect::<Vec<_>>();
@@ -34847,7 +34893,9 @@ mod tests {
                 .unwrap(),
         );
         let sid = "trim-at-cap-checkpoint";
-        store.create_session(sid, "agent", "/tmp", None).unwrap();
+        store
+            .create_session(sid, "rpc", "agent", "/tmp", None)
+            .unwrap();
         let existing = (0..50)
             .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
             .collect::<Vec<_>>();
@@ -35028,7 +35076,7 @@ mod tests {
         let turn_id = "turn-safe-history";
         let initial = [ConversationMessage::Chat(ChatMessage::user("question"))];
         store
-            .create_session(session_id, "agent", "/tmp", None)
+            .create_session(session_id, "rpc", "agent", "/tmp", None)
             .unwrap();
         store
             .begin_turn_checkpoint(session_id, turn_id, &initial)
@@ -35116,7 +35164,9 @@ mod tests {
                 .unwrap(),
         );
         let sid = "trim-drops-old-turns";
-        store.create_session(sid, "agent", "/tmp", None).unwrap();
+        store
+            .create_session(sid, "rpc", "agent", "/tmp", None)
+            .unwrap();
         let existing = (0..10)
             .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
             .collect::<Vec<_>>();
@@ -35169,7 +35219,7 @@ mod tests {
         let rpc = Arc::new(RpcOutbound::new(tx));
         let session_id = "checkpoint-write-failure";
         store
-            .create_session(session_id, "agent", "/tmp", None)
+            .create_session(session_id, "rpc", "agent", "/tmp", None)
             .unwrap();
         store
             .begin_turn_checkpoint(session_id, "turn-live", &[])
@@ -35201,7 +35251,9 @@ mod tests {
                 .unwrap(),
         );
         let sid = "trim-notification-recovery";
-        store.create_session(sid, "agent", "/tmp", None).unwrap();
+        store
+            .create_session(sid, "rpc", "agent", "/tmp", None)
+            .unwrap();
         store
             .append_turn(
                 sid,
@@ -35318,7 +35370,7 @@ mod tests {
                 make_persistence_test_dispatcher(config, &data_dir);
             let sid = "two-trim-abort";
             store
-                .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+                .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
                 .unwrap();
             let original: Vec<_> = [("oldest", 16000), ("middle", 8000), ("recent", 4000)]
                 .into_iter()
@@ -35462,7 +35514,7 @@ mod tests {
         Arc::get_mut(&mut dispatcher.ctx).unwrap().hooks = Some(Arc::new(runner));
         let sid = "checkpoint-later-write-failure";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+            .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
 
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -35608,7 +35660,7 @@ mod tests {
                 make_persistence_test_dispatcher(config, &data_dir);
             let sid = "seed-write-failure";
             store
-                .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+                .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
                 .unwrap();
             let original = vec![
                 ConversationMessage::Chat(ChatMessage::user("old request")),
@@ -35676,7 +35728,9 @@ mod tests {
                 .unwrap(),
         );
         let sid = "no-turn-delta";
-        store.create_session(sid, "agent", "/tmp", None).unwrap();
+        store
+            .create_session(sid, "rpc", "agent", "/tmp", None)
+            .unwrap();
 
         let empty = Ok(TurnOutcome::Cancelled {
             partial_text: String::new(),
@@ -35695,7 +35749,7 @@ mod tests {
         let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
         let failed_sid = "failed-turn";
         store
-            .create_session(failed_sid, "agent", "/tmp", None)
+            .create_session(failed_sid, "rpc", "agent", "/tmp", None)
             .unwrap();
         store
             .begin_turn_checkpoint(failed_sid, "turn-failed", &initial)
@@ -35733,7 +35787,9 @@ mod tests {
                 .unwrap(),
         );
         let sid = "no-turn-delta-legacy";
-        store.create_session(sid, "agent", "/tmp", None).unwrap();
+        store
+            .create_session(sid, "rpc", "agent", "/tmp", None)
+            .unwrap();
         let empty = Ok(TurnOutcome::Cancelled {
             partial_text: String::new(),
             messages: Vec::new(),
@@ -36397,7 +36453,7 @@ mod tests {
             )
             .unwrap();
         acp_store
-            .create_session(sid, "test-agent", "/tmp/ws", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp/ws", None)
             .unwrap();
         acp_store
             .append_turn(
@@ -36559,7 +36615,7 @@ mod tests {
         assert!(sessions.remove(sid).await, "simulate a reaped Chat owner");
 
         acp_store
-            .create_session(sid, "test-agent", "/tmp/ws", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp/ws", None)
             .unwrap();
         let acp_history = ConversationMessage::Chat(ChatMessage::assistant("ACP history"));
         acp_store
@@ -36619,7 +36675,7 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
         let sid = "queued-chat-owner-race";
         acp_store
-            .create_session(sid, "test-agent", "/tmp/ws", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp/ws", None)
             .unwrap();
         acp_store
             .append_turn(
@@ -36723,7 +36779,7 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
         let sid = "acp-cursor-page";
         acp_store
-            .create_session(sid, "test-agent", "/tmp/ws", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp/ws", None)
             .unwrap();
         for text in ["one", "two", "three"] {
             acp_store
@@ -36779,7 +36835,7 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
         let sid = "acp-cursor-equivalence";
         acp_store
-            .create_session(sid, "test-agent", "/tmp/ws", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp/ws", None)
             .unwrap();
         acp_store
             .append_turn(
@@ -36865,7 +36921,7 @@ mod tests {
         let (dispatcher, _sessions, chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
         acp_store
-            .create_session("rpc-cursor", "test-agent", "/tmp/ws", None)
+            .create_session("rpc-cursor", "rpc", "test-agent", "/tmp/ws", None)
             .unwrap();
         chat_backend
             .append(
@@ -36918,7 +36974,7 @@ mod tests {
         let sid = "acp-malformed-history";
 
         acp_store
-            .create_session(sid, "test-agent", "/tmp/ws", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp/ws", None)
             .unwrap();
         acp_store
             .append_turn(
@@ -37314,7 +37370,7 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
         let sid = "acp-cancel-after-publication";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+            .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         acp_store
             .append_turn(
@@ -37422,8 +37478,12 @@ mod tests {
         let data_dir = config.data_dir.clone();
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let chat_backend =
-            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                &data_dir,
+            )
+            .unwrap(),
+        );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(&data_dir)
                 .unwrap(),
@@ -37490,6 +37550,7 @@ mod tests {
         acp_store
             .create_session_with_interaction_surface(
                 sid,
+                "rpc",
                 "test-agent",
                 "/tmp/test-agent",
                 Some("unsupported_surface"),
@@ -37554,6 +37615,7 @@ mod tests {
         acp_store
             .create_session_with_interaction_surface(
                 sid,
+                "rpc",
                 "test-agent",
                 "/tmp/test-agent",
                 Some("unsupported_surface"),
@@ -37603,6 +37665,7 @@ mod tests {
         acp_store
             .create_session_with_interaction_surface(
                 sid,
+                "rpc",
                 "test-agent",
                 "/tmp/test-agent",
                 Some("zerocode_code"),
@@ -37790,7 +37853,7 @@ mod tests {
             .append(&chat_key, &ChatMessage::user("retained chat history"))
             .unwrap();
         acp_store
-            .create_session(sid, "test-agent", "/tmp/test-agent", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp/test-agent", None)
             .unwrap();
 
         let error = dispatcher
@@ -37818,7 +37881,7 @@ mod tests {
             .append(&chat_key, &ChatMessage::user("retained chat history"))
             .unwrap();
         acp_store
-            .create_session(sid, "test-agent", "/tmp/test-agent", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp/test-agent", None)
             .unwrap();
 
         let error = dispatcher
@@ -38352,7 +38415,7 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
         let sid = "acp-cancel-follow-up-history";
         acp_store
-            .create_session(sid, "test-agent", "/tmp", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp", None)
             .unwrap();
 
         let prior = vec![
@@ -38581,7 +38644,7 @@ mod tests {
                 make_persistence_test_dispatcher(config, &data_dir);
             let sid = "acp-hard-removal-entry-pause";
             acp_store
-                .create_session(sid, "test-agent", "/tmp", None)
+                .create_session(sid, "rpc", "test-agent", "/tmp", None)
                 .unwrap();
             acp_store
                 .append_turn(
@@ -38942,7 +39005,7 @@ mod tests {
 
         let sid = "acp-alias-mismatch-001";
         acp_store
-            .create_session(sid, "test-agent", "/tmp/test-agent", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp/test-agent", None)
             .expect("test should seed durable ACP session");
 
         acp_store
@@ -39364,7 +39427,13 @@ mod tests {
             .expect("supervised dispatcher has an ACP store");
         let session_id = "reaped-acp-during-other-agent-delete";
         acp_store
-            .create_session(session_id, "test-agent", tmp.path().to_str().unwrap(), None)
+            .create_session(
+                session_id,
+                "rpc",
+                "test-agent",
+                tmp.path().to_str().unwrap(),
+                None,
+            )
             .expect("seed restorable ACP session");
         let (prompt_registered, release_prompt) = sessions.set_test_prompt_registration_pause();
 
@@ -46619,7 +46688,9 @@ mod tests {
     /// `set_session_state` only ever `UPDATE`s an existing row.
     async fn install_state_test_session(
         sessions: &Arc<crate::rpc::session::SessionStore>,
-        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        chat_backend: &Arc<
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+        >,
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
     ) -> String {
@@ -46628,7 +46699,9 @@ mod tests {
 
     async fn install_state_test_session_with_owner(
         sessions: &Arc<crate::rpc::session::SessionStore>,
-        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        chat_backend: &Arc<
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+        >,
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
         owner_tui_id: Option<&str>,
@@ -46662,7 +46735,9 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     async fn install_state_test_session_owned_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
-        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        chat_backend: &Arc<
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+        >,
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
         owner_tui_id: Option<&str>,
@@ -46710,7 +46785,9 @@ mod tests {
     /// owner, which is what an unscoped connection creates.
     async fn install_state_test_session_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
-        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        chat_backend: &Arc<
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+        >,
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
         owner_tui_id: Option<&str>,
@@ -46732,7 +46809,10 @@ mod tests {
     async fn owner_cancelled_rpc_prompt_returns_durable_chat_state_to_idle() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                tmp.path(),
+            )
+            .unwrap(),
         );
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             4, 10, 60,
@@ -46817,7 +46897,10 @@ mod tests {
     async fn dispatcher_shutdown_cancels_and_joins_inflight_prompt() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                tmp.path(),
+            )
+            .unwrap(),
         );
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             4, 10, 60,
@@ -46888,7 +46971,10 @@ mod tests {
     async fn session_prompt_reports_running_during_turn_and_idle_after() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                tmp.path(),
+            )
+            .unwrap(),
         );
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             4, 10, 60,
@@ -46973,7 +47059,10 @@ mod tests {
     async fn session_prompt_reports_error_state_on_provider_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                tmp.path(),
+            )
+            .unwrap(),
         );
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             4, 10, 60,
@@ -47026,7 +47115,10 @@ mod tests {
     async fn acp_mode_session_prompt_leaves_chat_backend_state_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                tmp.path(),
+            )
+            .unwrap(),
         );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
@@ -47039,7 +47131,7 @@ mod tests {
 
         let sid = "acp-state-gap";
         acp_store
-            .create_session(sid, "test-agent", "/tmp", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp", None)
             .unwrap();
 
         let agent = crate::agent::agent::Agent::builder()
@@ -47126,7 +47218,10 @@ mod tests {
     async fn acp_prompt_does_not_mutate_a_retained_chat_row_with_the_same_id() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                tmp.path(),
+            )
+            .unwrap(),
         );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
@@ -47157,7 +47252,7 @@ mod tests {
 
         // An ACP session now reuses the same caller-supplied id.
         acp_store
-            .create_session(sid, "test-agent", "/tmp", None)
+            .create_session(sid, "rpc", "test-agent", "/tmp", None)
             .unwrap();
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(FailingProvider))
@@ -47321,7 +47416,7 @@ mod tests {
 
         let sid = "acp-replaced-by-chat";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+            .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
@@ -47455,7 +47550,7 @@ mod tests {
 
         let sid = "acp-resume-transcript";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+            .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
 
         // The predecessor session runs a hand-built provider that gates its
@@ -47613,7 +47708,7 @@ mod tests {
 
         let sid = "rehydrate-unseeded-window";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+            .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         // The durable conversation a rehydration must restore.
         acp_store
@@ -47729,8 +47824,12 @@ mod tests {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        let chat_backend =
-            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                &data_dir,
+            )
+            .unwrap(),
+        );
         let acp_store = Arc::new(
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(&data_dir)
                 .unwrap(),
@@ -47746,7 +47845,7 @@ mod tests {
 
         let sid = "rehydrate-plan-restore";
         acp_store
-            .create_session(sid, "test-agent", tmp.path().to_str().unwrap(), None)
+            .create_session(sid, "rpc", "test-agent", tmp.path().to_str().unwrap(), None)
             .unwrap();
         let plan = vec![
             PlanEntry {
@@ -47815,7 +47914,10 @@ mod tests {
         for removal in [Removal::Close, Removal::Kill, Removal::Delete] {
             let tmp = tempfile::TempDir::new().unwrap();
             let chat_backend = Arc::new(
-                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+                zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                    tmp.path(),
+                )
+                .unwrap(),
             );
             let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
                 4, 2, 60,
@@ -47923,7 +48025,10 @@ mod tests {
     async fn prompt_setup_failure_unregisters_its_cancel_token() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                tmp.path(),
+            )
+            .unwrap(),
         );
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             4, 2, 60,
@@ -47977,7 +48082,13 @@ mod tests {
 
             let sid = format!("acp-removal-{removal:?}").to_ascii_lowercase();
             acp_store
-                .create_session(&sid, "test-agent", tmp.path().to_str().unwrap(), None)
+                .create_session(
+                    &sid,
+                    "rpc",
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    None,
+                )
                 .unwrap();
             let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
@@ -48380,7 +48491,7 @@ mod tests {
         // rehydrate_reaped_session can reinstall it under the same ID.
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace, None)
+            .create_session(&session_id, "rpc", "test-agent", &workspace, None)
             .expect("ACP session row must be created");
 
         let (entered, release, done) = sessions.set_test_gated_op_pause();
@@ -48517,7 +48628,13 @@ mod tests {
             let dispatcher = Arc::new(dispatcher);
             let sid = create_model_refresh_test_session(&dispatcher, &tmp).await;
             acp_store
-                .create_session(&sid, "test-agent", tmp.path().to_str().unwrap(), None)
+                .create_session(
+                    &sid,
+                    "rpc",
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    None,
+                )
                 .unwrap();
             sessions.remove(&sid).await;
 
@@ -48642,7 +48759,7 @@ mod tests {
         // Rehydration can reinstall it under the same ID once the live owner is reaped.
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace, None)
+            .create_session(&session_id, "rpc", "test-agent", &workspace, None)
             .expect("ACP session row must be created");
 
         let (entered, release, done) = sessions.set_test_gated_op_pause();
@@ -48774,7 +48891,7 @@ mod tests {
 
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace, None)
+            .create_session(&session_id, "rpc", "test-agent", &workspace, None)
             .expect("ACP session row must be created");
         sessions.remove(&session_id).await;
 
@@ -48886,7 +49003,7 @@ mod tests {
 
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace, None)
+            .create_session(&session_id, "rpc", "test-agent", &workspace, None)
             .expect("ACP session row must be created");
         sessions.remove(&session_id).await;
 
@@ -48973,7 +49090,7 @@ mod tests {
         // prompt path takes the rehydration branch.
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace, None)
+            .create_session(&session_id, "rpc", "test-agent", &workspace, None)
             .expect("ACP session row must be created");
         sessions.remove(&session_id).await;
         assert!(
@@ -49065,7 +49182,7 @@ mod tests {
 
         let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
         acp_store
-            .create_session(&session_id, "test-agent", &workspace, None)
+            .create_session(&session_id, "rpc", "test-agent", &workspace, None)
             .expect("ACP session row must be created");
         sessions.remove(&session_id).await;
 
@@ -49387,7 +49504,7 @@ mod tests {
         owner_tui_id: Option<&str>,
     ) -> (
         Arc<RpcContext>,
-        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
         ScriptedTurnHandles,
     ) {
         let config = session_cwd_config(tmp, 4242, None);
@@ -49765,7 +49882,7 @@ mod tests {
         );
         let renamed = chat_backend
             .get_session_metadata(&format!("rpc_{sid}"))
-            .and_then(|meta| meta.name);
+            .and_then(|meta| meta.title);
         assert_eq!(renamed, None, "a refused rename must not write");
 
         // Steering is a turn-execution grant alice holds; it reaches the
@@ -49903,7 +50020,7 @@ mod tests {
     }
 
     fn durable_turn_state(
-        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        backend: &Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
         sid: &str,
     ) -> Option<String> {
         zeroclaw_infra::session_backend::SessionBackend::get_session_state(
@@ -50145,7 +50262,7 @@ mod tests {
         admin: bool,
     ) -> (
         Arc<RpcContext>,
-        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
         String,
     ) {
         use zeroclaw_api::grants::{Resource, Verb};
@@ -50193,7 +50310,7 @@ mod tests {
     }
 
     fn durable_holds(
-        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        backend: &Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
         key: &str,
         text: &str,
     ) -> bool {
@@ -50670,7 +50787,7 @@ mod tests {
     /// `tools`, on the canonical `workspace` a scoped prompt requires.
     async fn install_recording_session(
         ctx: &Arc<RpcContext>,
-        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        backend: &Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
         sid: &str,
         owner: &str,
         workspace: &std::path::Path,
@@ -50705,7 +50822,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     async fn install_recording_session_with(
         ctx: &Arc<RpcContext>,
-        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        backend: &Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
         sid: &str,
         owner: &str,
         workspace: &std::path::Path,
@@ -50752,7 +50869,13 @@ mod tests {
             ctx.session_repository
                 .as_ref()
                 .expect("the persistence context has an ACP store")
-                .create_session(sid, "test-agent", workspace.to_str().unwrap(), Some(owner))
+                .create_session(
+                    sid,
+                    "rpc",
+                    "test-agent",
+                    workspace.to_str().unwrap(),
+                    Some(owner),
+                )
                 .unwrap();
             ctx.sessions.insert(sid.to_string(), session).await.unwrap();
             return handles;
@@ -50781,7 +50904,7 @@ mod tests {
         edit: impl FnOnce(&mut zeroclaw_config::schema::PermissionProfileConfig),
     ) -> (
         Arc<RpcContext>,
-        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
         std::path::PathBuf,
     ) {
         let mut config = session_cwd_config(tmp, 4242, None);

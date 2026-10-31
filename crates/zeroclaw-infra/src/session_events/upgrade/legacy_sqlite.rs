@@ -1,4 +1,7 @@
-//! SQLite-backed session persistence with FTS5 search.
+//! Legacy SQLite format reader and migration fixtures.
+//!
+//! The old on-disk `name` column is translated to the canonical `title` field
+//! here. Normal session reads and writes use the event catalog instead.
 
 use crate::session_backend::{
     SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
@@ -150,7 +153,7 @@ impl SqliteSessionBackend {
                 created,
                 activity,
                 count,
-                name,
+                title,
                 agent_alias,
                 channel_id,
                 room_id,
@@ -159,7 +162,7 @@ impl SqliteSessionBackend {
             )| {
                 Ok(SessionMetadata {
                     key: session_key.into(),
-                    name,
+                    title,
                     agent_alias,
                     channel_id,
                     room_id,
@@ -1299,7 +1302,7 @@ impl SessionBackend for SqliteSessionBackend {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
                 key,
-                name,
+                title: name,
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
@@ -1480,19 +1483,19 @@ impl SessionBackend for SqliteSessionBackend {
         .is_ok()
     }
 
-    fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
+    fn set_session_title(&self, session_key: &str, title: &str) -> std::io::Result<()> {
         let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
-        let name_val = if name.is_empty() { None } else { Some(name) };
+        let title = if title.is_empty() { None } else { Some(title) };
         conn.execute(
             "UPDATE session_metadata SET name = ?1 WHERE session_key = ?2",
-            params![name_val, session_key],
+            params![title, session_key],
         )
         .map_err(std::io::Error::other)?;
         Ok(())
     }
 
-    fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_title(&self, session_key: &str) -> std::io::Result<Option<String>> {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT name FROM session_metadata WHERE session_key = ?1",
@@ -1530,7 +1533,7 @@ impl SessionBackend for SqliteSessionBackend {
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 Ok(SessionMetadata {
                     key,
-                    name,
+                    title: name,
                     created_at: created,
                     last_activity: activity,
                     message_count: count as usize,
@@ -1626,7 +1629,7 @@ impl SessionBackend for SqliteSessionBackend {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
                 key,
-                name,
+                title: name,
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
@@ -1678,7 +1681,7 @@ impl SessionBackend for SqliteSessionBackend {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
                 key,
-                name,
+                title: name,
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
@@ -1746,7 +1749,7 @@ impl SessionBackend for SqliteSessionBackend {
                         let principal_id: Option<String> = row.get(8)?;
                         Ok(SessionMetadata {
                             key: key.clone(),
-                            name,
+                            title: name,
                             created_at: DateTime::parse_from_rfc3339(&created_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now()),
@@ -2046,7 +2049,7 @@ mod tests {
 
         backend.append("s1", &ChatMessage::user("hello")).unwrap();
         backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
-        backend.set_session_name("s1", "My Session").unwrap();
+        backend.set_session_title("s1", "My Session").unwrap();
 
         let cleared = backend.clear_messages("s1").unwrap();
         assert_eq!(cleared, 2);
@@ -2055,7 +2058,7 @@ mod tests {
         let meta = backend.list_sessions_with_metadata();
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0].message_count, 0);
-        assert_eq!(meta[0].name.as_deref(), Some("My Session"));
+        assert_eq!(meta[0].title.as_deref(), Some("My Session"));
     }
 
     #[test]
@@ -2564,7 +2567,7 @@ mod tests {
             .append("legacy_user", &ChatMessage::user("cleared"))
             .unwrap();
         backend
-            .set_session_name("legacy_user", "Preserved name")
+            .set_session_title("legacy_user", "Preserved name")
             .unwrap();
         assert_eq!(backend.clear_messages("legacy_user").unwrap(), 1);
 
@@ -2576,7 +2579,7 @@ mod tests {
         assert!(backend.load("legacy_user").is_empty());
         let metadata = backend.get_session_metadata("legacy_user").unwrap();
         assert_eq!(metadata.message_count, 0);
-        assert_eq!(metadata.name.as_deref(), Some("Preserved name"));
+        assert_eq!(metadata.title.as_deref(), Some("Preserved name"));
     }
 
     #[test]
@@ -3084,29 +3087,29 @@ mod tests {
     }
 
     #[test]
-    fn set_session_name_persists() {
+    fn set_session_title_persists() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
         backend.append("s1", &ChatMessage::user("hello")).unwrap();
-        backend.set_session_name("s1", "My Session").unwrap();
+        backend.set_session_title("s1", "My Session").unwrap();
 
         let meta = backend.list_sessions_with_metadata();
         assert_eq!(meta.len(), 1);
-        assert_eq!(meta[0].name.as_deref(), Some("My Session"));
+        assert_eq!(meta[0].title.as_deref(), Some("My Session"));
     }
 
     #[test]
-    fn set_session_name_updates_existing() {
+    fn set_session_title_updates_existing() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
         backend.append("s1", &ChatMessage::user("hello")).unwrap();
-        backend.set_session_name("s1", "First").unwrap();
-        backend.set_session_name("s1", "Second").unwrap();
+        backend.set_session_title("s1", "First").unwrap();
+        backend.set_session_title("s1", "Second").unwrap();
 
         let meta = backend.list_sessions_with_metadata();
-        assert_eq!(meta[0].name.as_deref(), Some("Second"));
+        assert_eq!(meta[0].title.as_deref(), Some("Second"));
     }
 
     #[test]
@@ -3118,7 +3121,7 @@ mod tests {
 
         let meta = backend.list_sessions_with_metadata();
         assert_eq!(meta.len(), 1);
-        assert!(meta[0].name.is_none());
+        assert!(meta[0].title.is_none());
     }
 
     // ── session state tests ─────────────────────────────────────────
@@ -3291,11 +3294,11 @@ mod tests {
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
         backend.append("s1", &ChatMessage::user("hello")).unwrap();
-        backend.set_session_name("s1", "Named").unwrap();
-        backend.set_session_name("s1", "").unwrap();
+        backend.set_session_title("s1", "Named").unwrap();
+        backend.set_session_title("s1", "").unwrap();
 
         let meta = backend.list_sessions_with_metadata();
-        assert!(meta[0].name.is_none());
+        assert!(meta[0].title.is_none());
     }
 
     // ── get_session_metadata tests ─────────────────────────────────
@@ -3307,11 +3310,11 @@ mod tests {
 
         backend.append("s1", &ChatMessage::user("hello")).unwrap();
         backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
-        backend.set_session_name("s1", "My Chat").unwrap();
+        backend.set_session_title("s1", "My Chat").unwrap();
 
         let meta = backend.get_session_metadata("s1").unwrap();
         assert_eq!(meta.key, "s1");
-        assert_eq!(meta.name.as_deref(), Some("My Chat"));
+        assert_eq!(meta.title.as_deref(), Some("My Chat"));
         assert_eq!(meta.message_count, 2);
     }
 
@@ -3457,7 +3460,7 @@ mod tests {
         let from_list = all.iter().find(|m| m.key == "s1").unwrap();
 
         assert_eq!(single.message_count, from_list.message_count);
-        assert_eq!(single.name, from_list.name);
+        assert_eq!(single.title, from_list.title);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
     }

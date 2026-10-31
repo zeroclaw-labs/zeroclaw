@@ -340,6 +340,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
                 let port = source
                     .open_system(
                         family,
+                        "sop",
                         "default".into(),
                         component.into(),
                         authority,

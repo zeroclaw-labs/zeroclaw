@@ -32,6 +32,7 @@ impl RepositoryView<'_> {
     pub fn create(
         &self,
         id: &str,
+        creation_source: &str,
         alias: &str,
         fields: Vec<(&str, serde_json::Value)>,
     ) -> Result<i64> {
@@ -56,7 +57,9 @@ impl RepositoryView<'_> {
             anyhow::ensure!(owner == expected, "session principal differs");
             self.0.commands().change(&record, fields)?;
         } else {
-            self.0.commands().create(&family, alias, fields)?;
+            self.0
+                .commands()
+                .create(&family, creation_source, alias, fields)?;
         }
         // The compatibility return value is the canonical root sequence,
         // rather than a new transport-specific row identifier.
@@ -72,15 +75,18 @@ impl RepositoryView<'_> {
     }
 
     pub fn summaries(&self) -> Result<Vec<(String, Session)>> {
-        let mut result = Vec::new();
-        for (family, stream) in self.0.query().families()? {
-            if let Some(id) = family.strip_prefix(self.1)
-                && let Some(summary) = self.0.query().summary(&stream)?
-                && !summary.deleted
-            {
-                result.push((id.to_owned(), summary));
-            }
-        }
+        let mut result = self
+            .0
+            .query()
+            .indexed_summaries()?
+            .into_iter()
+            .filter_map(|(source, summary)| {
+                source
+                    .strip_prefix(self.1)
+                    .filter(|_| !summary.deleted)
+                    .map(|id| (id.to_owned(), summary))
+            })
+            .collect::<Vec<_>>();
         result.sort_by(|left, right| {
             right
                 .1

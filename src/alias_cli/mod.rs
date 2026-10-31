@@ -1115,7 +1115,7 @@ mod tests {
 
         let workspace = config.agent_workspace_dir("victim");
         let handles = build_owned_state_handles(&config).unwrap();
-        let retained_memory = Arc::clone(&handles.0);
+        let retained_memory = Arc::clone(&handles);
         let agent_id = retained_memory.ensure_agent_uuid("victim").await.unwrap();
         retained_memory
             .store_with_agent(
@@ -1154,9 +1154,9 @@ mod tests {
             ..Config::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)
+        zeroclaw_session_host::open_repository(&config, "acp_")
             .unwrap()
-            .create_session("live-session", "busy", "/ws/busy", None)
+            .create_session("live-session", "test", "busy", "/ws/busy", None)
             .unwrap();
 
         let refusal = agent_delete_precheck(&config, "busy")
@@ -1180,14 +1180,13 @@ mod tests {
             zeroclaw_config::schema::AliasedAgentConfig::default(),
         );
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        let store =
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir).unwrap();
+        let store = zeroclaw_session_host::open_repository(&config, "acp_").unwrap();
         store
-            .create_session("ended-session", "victim", "/ws/victim", None)
+            .create_session("ended-session", "test", "victim", "/ws/victim", None)
             .unwrap();
         store.mark_session_killed("ended-session").unwrap();
         store
-            .create_session("other-session", "bystander", "/ws/bystander", None)
+            .create_session("other-session", "test", "bystander", "/ws/bystander", None)
             .unwrap();
 
         let workspace = config.agent_workspace_dir("victim");

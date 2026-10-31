@@ -7,6 +7,76 @@ use zeroclaw_kernel::session::{EffectIntent, PermissionResolver, SessionError};
 struct Authority(AtomicBool);
 
 #[tokio::test]
+async fn creation_source_is_independent_of_session_key_and_preserved_on_reopen() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: directory.path().into(),
+            ..Default::default()
+        };
+        config.channels.session_backend = backend.into();
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        let key = "project-discussion";
+        let initial = ContextSnapshot {
+            messages: vec![ConversationMessage::Chat(ChatMessage::user(
+                "retained context",
+            ))],
+            history_has_trim_breadcrumb: Some(false),
+        };
+        let hub = NativeSessionHub::new(live.handle());
+        let port = hub
+            .open(
+                key.into(),
+                "cron",
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority.clone(),
+                initial,
+            )
+            .await
+            .expect("create without protocol prefix");
+        let stream = hub.stream_id(key).await.expect("stream");
+        drop(port);
+        drop(hub);
+
+        let hub = NativeSessionHub::new(live.handle());
+        let port = hub
+            .open(
+                key.into(),
+                "rpc",
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority,
+                ContextSnapshot {
+                    messages: vec![],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+            )
+            .await
+            .expect("reopen through another entrance");
+        assert_eq!(hub.stream_id(key).await.expect("same stream"), stream);
+        assert_eq!(hub.sessions().await.expect("sessions"), vec![key]);
+        let restored = port
+            .restore_context()
+            .await
+            .expect("restore")
+            .expect("context");
+        assert!(
+            matches!(&restored.messages[0], ConversationMessage::Chat(chat) if chat.content == "retained context")
+        );
+        let catalog = SessionCatalog::open(directory.path(), &Default::default())
+            .expect("catalog")
+            .expect("native store");
+        let records = catalog.query().index_records().expect("index");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].stream_id, stream);
+        assert_eq!(records[0].session_key.as_deref(), Some(key));
+        assert_eq!(records[0].source.as_deref(), Some("cron"));
+    }
+}
+
+#[tokio::test]
 async fn ttl_expiry_reopens_same_family_with_history() {
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
@@ -21,6 +91,7 @@ async fn ttl_expiry_reopens_same_family_with_history() {
         let port = hub
             .open(
                 "gw_expired".into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
@@ -36,6 +107,7 @@ async fn ttl_expiry_reopens_same_family_with_history() {
         let resumed = hub
             .open(
                 "gw_expired".into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
@@ -55,7 +127,7 @@ async fn ttl_expiry_reopens_same_family_with_history() {
             matches!(&restored.messages[0], ConversationMessage::Chat(chat) if chat.content == "old history")
         );
         assert_eq!(
-            hub.families().await.expect("one logical family"),
+            hub.sessions().await.expect("one logical family"),
             vec!["gw_expired"]
         );
         drop(resumed);
@@ -68,6 +140,7 @@ async fn ttl_expiry_reopens_same_family_with_history() {
         let resumed = reopened
             .open(
                 "gw_expired".into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
@@ -87,6 +160,7 @@ async fn ttl_expiry_reopens_same_family_with_history() {
             reopened
                 .open(
                     "gw_expired".into(),
+                    "test",
                     "fixture".into(),
                     PrincipalId::shared_operator(),
                     authority.clone(),
@@ -98,6 +172,7 @@ async fn ttl_expiry_reopens_same_family_with_history() {
         let ordinary = reopened
             .open(
                 "gw_resume-project".into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
@@ -141,7 +216,7 @@ async fn native_ready_history_queries_finish_pending_acp_migration() {
         let directory = tempfile::tempdir().expect("directory");
         let source = SessionRepository::legacy_fixture(directory.path()).expect("legacy ACP");
         source
-            .create_session("pending", "fixture", "/workspace", Some("owner"))
+            .create_session("pending", "test", "fixture", "/workspace", Some("owner"))
             .expect("legacy session");
         source
             .append_turn(
@@ -168,7 +243,7 @@ async fn native_ready_history_queries_finish_pending_acp_migration() {
         let live = zeroclaw_config::live::LiveConfig::new(config);
         let hub = NativeSessionHub::new(live.handle());
         assert_eq!(
-            hub.families().await.expect("cold history query"),
+            hub.sessions().await.expect("cold history query"),
             vec!["acp_pending".to_owned()]
         );
         let descriptor = hub
@@ -197,7 +272,7 @@ async fn stream_resolution_waits_for_installation_without_blocking_reactor() {
     };
     let live = zeroclaw_config::live::LiveConfig::new(config);
     let hub = NativeSessionHub::new(live.handle());
-    hub.families().await.expect("ready installation");
+    hub.sessions().await.expect("ready installation");
     let sessions = directory.path().join("sessions");
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -247,6 +322,7 @@ async fn waiting_for_one_family_does_not_block_another_family() {
     let first = hub
         .open(
             "first".into(),
+            "test",
             "fixture".into(),
             PrincipalId::shared_operator(),
             authority.clone(),
@@ -264,6 +340,7 @@ async fn waiting_for_one_family_does_not_block_another_family() {
     let held = slot.lock().await;
     let waiting = hub.open(
         "first".into(),
+        "test",
         "fixture".into(),
         PrincipalId::shared_operator(),
         authority.clone(),
@@ -272,7 +349,7 @@ async fn waiting_for_one_family_does_not_block_another_family() {
     tokio::pin!(waiting);
     let other = tokio::select! {
         _ = &mut waiting => panic!("same-family initialization must wait"),
-        result = tokio::time::timeout(std::time::Duration::from_secs(5), hub.open("second".into(), "fixture".into(), PrincipalId::shared_operator(), authority, initial)) => result.expect("independent family is not blocked").expect("second"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(5), hub.open("second".into(), "test", "fixture".into(), PrincipalId::shared_operator(), authority, initial)) => result.expect("independent family is not blocked").expect("second"),
     };
     drop(held);
     let resumed = waiting.await.expect("same owner reused");
@@ -284,7 +361,10 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
     use zeroclaw_infra::session_backend::SessionBackend;
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
-        let legacy = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(directory.path())
+        let legacy =
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                directory.path(),
+            )
             .expect("legacy");
         for family in ["gw_expired", "channel_retained"] {
             legacy
@@ -304,7 +384,7 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
         let live = zeroclaw_config::live::LiveConfig::new(config);
         let hub = NativeSessionHub::new(live.handle());
         assert_eq!(
-            hub.families().await.expect("upgrade and enumerate").len(),
+            hub.sessions().await.expect("upgrade and enumerate").len(),
             2
         );
         let authority = Arc::new(Authority(AtomicBool::new(true)));
@@ -337,6 +417,7 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
         let continuation = hub
             .open(
                 successor.clone(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
@@ -395,6 +476,7 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
         let port = hub
             .open(
                 "gw_active".into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority,
@@ -432,7 +514,10 @@ async fn imported_message_identities_survive_first_context_replacement_and_reade
     use zeroclaw_infra::session_backend::SessionBackend;
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
-        let legacy = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(directory.path())
+        let legacy =
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                directory.path(),
+            )
             .expect("legacy");
         for index in 0..8 {
             legacy
@@ -453,6 +538,7 @@ async fn imported_message_identities_survive_first_context_replacement_and_reade
         let port = hub
             .open(
                 "imported".into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
@@ -554,7 +640,7 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
         ChildDispatchIntent, EngineInputPart, EngineTurnInput, current_provider_admission,
     };
     use zeroclaw_infra::session_events::{
-        family::FamilyEventStore, migration::migrate_installation,
+        migration::migrate_installation, scoped::ScopedEventStore,
     };
     for (backend, target) in [
         ("sqlite", NativeBackend::Jsonl),
@@ -572,6 +658,7 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
         let port = hub
             .open(
                 "child-fixture".into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority,
@@ -616,7 +703,7 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
         drop(port);
         drop(hub);
         let stream = NativeSessionHub::stream_id("child-fixture").expect("root");
-        let source = FamilyEventStore::open(directory.path(), "child-fixture").expect("source");
+        let source = ScopedEventStore::open(directory.path(), "child-fixture").expect("source");
         let parent = source
             .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
             .expect("parent");
@@ -652,7 +739,7 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
         );
         drop(source);
         migrate_installation(directory.path(), target).expect("migration");
-        let migrated = FamilyEventStore::open(directory.path(), "child-fixture").expect("target");
+        let migrated = ScopedEventStore::open(directory.path(), "child-fixture").expect("target");
         let after = migrated
             .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
             .expect("parent after");
@@ -698,7 +785,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
     use zeroclaw_api::session_events::capture::{
         ChildDispatchIntent, EngineInputPart, EngineTurnInput, current_provider_admission,
     };
-    use zeroclaw_infra::session_events::family::FamilyEventStore;
+    use zeroclaw_infra::session_events::scoped::ScopedEventStore;
 
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
@@ -714,6 +801,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
         let port = hub
             .open(
                 family.into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
@@ -757,7 +845,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
         drop(port);
         drop(hub);
         let store: Arc<dyn SessionEventStore> =
-            Arc::new(FamilyEventStore::open(directory.path(), family).expect("family store"));
+            Arc::new(ScopedEventStore::open(directory.path(), family).expect("family store"));
         let root = NativeSessionHub::stream_id(family).expect("root stream");
         let before = store
             .read_page(&root, &EventCursor::beginning(root.clone()), None, 256)
@@ -840,6 +928,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
         assert!(
             hub.open(
                 family.into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
@@ -867,6 +956,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
         let port = hub
             .open(
                 family.into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
@@ -921,6 +1011,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
         let repeated = hub
             .open(
                 family.into(),
+                "test",
                 "fixture".into(),
                 PrincipalId::shared_operator(),
                 authority,
@@ -981,6 +1072,7 @@ async fn host_seed_preserves_canonical_context_and_stable_public_ids_without_rea
         let port = hub
             .open(
                 "seed-fixture".into(),
+                "test",
                 "fixture".into(),
                 principal.clone(),
                 authority.clone(),
@@ -1079,7 +1171,7 @@ async fn host_seed_preserves_canonical_context_and_stable_public_ids_without_rea
                 .collect::<Vec<_>>()
         );
         let store: Arc<dyn SessionEventStore> = Arc::new(
-            zeroclaw_infra::session_events::family::FamilyEventStore::open(
+            zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 directory.path(),
                 "seed-fixture",
             )

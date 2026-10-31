@@ -3315,7 +3315,10 @@ mod tests {
     #[test]
     fn unreadable_store_does_not_stop_startup_and_the_error_is_returned() {
         let temp = tempfile::TempDir::new().unwrap();
-        let db_path = zeroclaw_infra::session_sqlite::SqliteSessionBackend::db_path(temp.path());
+        let db_path =
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::db_path(
+                temp.path(),
+            );
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         std::fs::write(&db_path, b"not a database").unwrap();
 
@@ -3324,7 +3327,10 @@ mod tests {
         drop(guard);
 
         let other = tempfile::TempDir::new().unwrap();
-        let db_path = zeroclaw_infra::session_sqlite::SqliteSessionBackend::db_path(other.path());
+        let db_path =
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::db_path(
+                other.path(),
+            );
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         std::fs::write(&db_path, b"not a database").unwrap();
         assert!(LiveConfigAuthority::new_owned(owned_config(other.path())).is_ok());

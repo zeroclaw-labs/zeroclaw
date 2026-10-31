@@ -1,7 +1,7 @@
 //! Installation-wide upgrade. All legacy writers share the publication fence;
 //! source files remain intact until every imported family has a final receipt.
 use super::import::{LegacyImport, LegacySnapshot, import_snapshot};
-use super::installation::{FormatPhase, InstallationGuard, NativeBackend, family_identity};
+use super::installation::{FormatPhase, InstallationGuard, NativeBackend, session_identity};
 use super::*;
 use crate::session_backend::SessionBackend;
 use std::collections::BTreeSet;
@@ -9,6 +9,7 @@ use zeroclaw_api::session_events::{BranchId, SessionId};
 mod acp;
 pub(crate) mod legacy_acp;
 pub(super) mod legacy_media;
+pub mod legacy_sqlite;
 
 pub fn upgrade_installation(
     data_dir: &Path,
@@ -31,9 +32,9 @@ pub fn upgrade_installation(
                 .map_err(jsonl::storage)? =>
         {
             let backend = *backend;
-            upgrade_leases = installation::families(data_dir, backend)?
+            upgrade_leases = installation::session_keys(data_dir, backend)?
                 .keys()
-                .map(|family| ownership::FamilyExecutionLease::acquire(data_dir, family))
+                .map(|family| ownership::SessionExecutionLease::acquire(data_dir, family))
                 .collect::<Result<Vec<_>, _>>()?;
             guard.begin(FormatPhase::Upgrading { target: backend })?;
             backend
@@ -49,7 +50,7 @@ pub fn upgrade_installation(
     };
     let store = open_event_store(data_dir, target.name())?;
     import_previous_catalog(data_dir, target, store.as_ref(), guard.generation())?;
-    let mut existing = installation::families(data_dir, target)?;
+    let mut existing = installation::session_keys(data_dir, target)?;
     let mut sqlite_keys = BTreeSet::new();
     if directory
         .join("sessions.db")
@@ -59,7 +60,10 @@ pub fn upgrade_installation(
         let _source_file =
             filesystem::reader(&directory.join("sessions.db")).map_err(jsonl::storage)?;
         let source =
-            crate::session_sqlite::SqliteSessionBackend::open_locked(&guard).map_err(storage)?;
+            crate::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::open_locked(
+                &guard,
+            )
+            .map_err(storage)?;
         for family in source.upgrade_keys().map_err(storage)? {
             sqlite_keys.insert(family.clone());
             if existing.contains_key(&family) {
@@ -84,7 +88,7 @@ pub fn upgrade_installation(
                         "principal_id".into(),
                         serde_json::json!(metadata.principal_id),
                     ),
-                    ("title".into(), serde_json::json!(metadata.name)),
+                    ("title".into(), serde_json::json!(metadata.title)),
                     ("channel_id".into(), serde_json::json!(metadata.channel_id)),
                     ("room_id".into(), serde_json::json!(metadata.room_id)),
                     ("sender_id".into(), serde_json::json!(metadata.sender_id)),
@@ -175,7 +179,10 @@ pub fn upgrade_installation(
         }
         let messages = jsonl_source.try_load(family).map_err(storage)?;
         if sqlite_keys.contains(family) {
-            let source = crate::session_sqlite::SqliteSessionBackend::open_locked(&guard)
+            let source =
+                crate::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::open_locked(
+                    &guard,
+                )
                 .map_err(storage)?;
             if zeroclaw_api::session_events::canonical_json(
                 &source.try_load(family).map_err(storage)?,
@@ -246,6 +253,7 @@ fn import_one(
         store,
         LegacyImport {
             family,
+            creation_source: "legacy",
             owning_agent: alias,
             target,
             branch: BranchId::parse(format!("branch-{stream}"))?,
@@ -286,7 +294,7 @@ fn import_previous_catalog(
     let records = old["families"]
         .as_object()
         .ok_or_else(|| AppendError::Corrupt("old family catalog missing".into()))?;
-    let known = installation::families(data_dir, target)?;
+    let known = installation::session_keys(data_dir, target)?;
     let mut archived = BTreeSet::new();
     for (family, location) in records {
         let phase = location["phase"]
@@ -324,7 +332,7 @@ fn import_previous_catalog(
             }
             continue;
         }
-        let _lease = ownership::FamilyExecutionLease::acquire(data_dir, family)?;
+        let _lease = ownership::SessionExecutionLease::acquire(data_dir, family)?;
         if source != target {
             let image = migration::export(data_dir, source, Some(&root))?;
             match target {
@@ -338,7 +346,7 @@ fn import_previous_catalog(
             .map_err(storage)?
             .is_none()
         {
-            let (event, payload) = family_identity(root.clone(), family)?;
+            let (event, payload) = session_identity(root.clone(), family, "legacy")?;
             store.append_batch(AppendRequest {
                 stream_id: root.clone(),
                 expected_head: store.head(&root).map_err(storage)?,

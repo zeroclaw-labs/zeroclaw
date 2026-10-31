@@ -31,6 +31,7 @@ fn committed_event_bytes(used: usize, event_len: usize) -> Result<usize, AppendE
 }
 
 pub mod catalog;
+pub mod index;
 pub mod search;
 
 type SqlitePayloadRow = (String, String, Option<Vec<u8>>);
@@ -223,6 +224,7 @@ impl SqliteEventStore {
         )
         .map_err(map_sqlite)?;
         }
+        index::ensure_sqlite_schema(&conn)?;
         // SQLite inherits the database mode for newly created sidecars; also
         // repair pre-existing files without following substituted links.
         for suffix in ["-wal", "-shm"] {
@@ -798,13 +800,13 @@ impl SessionEventStore for SqliteEventStore {
 }
 
 pub mod cli_state;
-pub mod family;
 mod filesystem;
 pub mod import;
 pub mod installation;
 mod jsonl;
 pub mod migration;
 pub mod ownership;
+pub mod scoped;
 mod sqlite_history;
 pub mod upgrade;
 pub use jsonl::JsonlEventStore;

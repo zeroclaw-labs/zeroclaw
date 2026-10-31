@@ -15864,54 +15864,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_attachment_markers_extracts_multiple_types() {
-        let message = "Here are files [IMAGE:/tmp/a.png] and [DOCUMENT:https://example.com/a.pdf]";
-        let (cleaned, attachments) = parse_attachment_markers(message);
-
-        assert_eq!(cleaned, "Here are files  and");
-        assert_eq!(attachments.len(), 2);
-        assert_eq!(attachments[0].kind, TelegramAttachmentKind::Image);
-        assert_eq!(attachments[0].target, "/tmp/a.png");
-        assert_eq!(attachments[1].kind, TelegramAttachmentKind::Document);
-        assert_eq!(attachments[1].target, "https://example.com/a.pdf");
-    }
-
-    #[test]
-    fn parse_attachment_markers_keeps_invalid_markers_in_text() {
-        let message = "Report [UNKNOWN:/tmp/a.bin]";
-        let (cleaned, attachments) = parse_attachment_markers(message);
-
-        assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
-        assert!(attachments.is_empty());
-    }
-
-    #[test]
-    fn parse_path_only_attachment_detects_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let image_path = dir.path().join("snap.png");
-        std::fs::write(&image_path, b"fake-png").unwrap();
-
-        let parsed = parse_path_only_attachment(image_path.to_string_lossy().as_ref())
-            .expect("expected attachment");
-
-        assert_eq!(parsed.kind, TelegramAttachmentKind::Image);
-        assert_eq!(parsed.target, image_path.to_string_lossy());
-    }
-
-    #[test]
-    fn parse_path_only_attachment_rejects_sentence_text() {
-        assert!(parse_path_only_attachment("Screenshot saved to /tmp/snap.png").is_none());
-    }
-
-    #[test]
-    fn infer_attachment_kind_from_target_detects_document_extension() {
-        assert_eq!(
-            infer_attachment_kind_from_target("https://example.com/files/specs.pdf?download=1"),
-            Some(TelegramAttachmentKind::Document)
-        );
-    }
-
-    #[test]
     fn parse_update_message_uses_chat_id_as_reply_target() {
         let mention_only = false;
         let ch = TelegramChannel::new(

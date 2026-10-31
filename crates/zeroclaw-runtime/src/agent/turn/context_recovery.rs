@@ -387,7 +387,7 @@ mod tests {
             zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
                 .unwrap();
         store
-            .create_session("typed-trim", "agent", "/tmp", None)
+            .create_session("typed-trim", "test", "agent", "/tmp", None)
             .unwrap();
         store
             .persist_retained_context_seed("typed-trim", &first.retained_messages, first.breadcrumb)

@@ -2156,7 +2156,10 @@ mod accept_error_tests {
         .unwrap();
 
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                tmp.path(),
+            )
+            .unwrap(),
         );
 
         let gen1_started = Arc::new(Notify::new());

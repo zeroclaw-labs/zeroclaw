@@ -1,5 +1,5 @@
 //! A native store handle resolves the active format at each mutation. The
-//! immutable handle binds only its family identity; installation format is the backend
+//! immutable handle binds only its session key; installation format is the backend
 //! choice owner and events are the relationship owner.
 use super::installation::{InstallationGuard, NativeBackend};
 use super::*;
@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use zeroclaw_api::session_events::{EventData, EventKind};
 
 /// A host generation reuses physical connections and their disposable
-/// indexes. The installation format still selects the backend at each family operation;
-/// this pool contains neither permissions nor writable family metadata.
+/// indexes. The installation format still selects the backend at each operation;
+/// this pool contains neither permissions nor writable session metadata.
 type StoreKey = (PathBuf, NativeBackend, u64);
 
 #[derive(Default)]
@@ -23,12 +23,12 @@ impl EventStorePool {
             .lock()
             .retain(|(path, _, _), _| path != data_dir);
     }
-    pub fn open_family(
+    pub fn open_session(
         &self,
         data_dir: &Path,
         family: &str,
-        lease: Option<Arc<super::ownership::FamilyExecutionLease>>,
-    ) -> Result<FamilyEventStore, AppendError> {
+        lease: Option<Arc<super::ownership::SessionExecutionLease>>,
+    ) -> Result<ScopedEventStore, AppendError> {
         if lease
             .as_ref()
             .is_some_and(|lease| !lease.matches(data_dir, family))
@@ -40,15 +40,21 @@ impl EventStorePool {
         let directory = data_dir.join("sessions");
         let guard = InstallationGuard::acquire(&directory)?;
         let (backend, generation) = guard.active()?;
-        let root_stream = super::installation::families(data_dir, backend)?
-            .remove(family)
-            .ok_or_else(|| {
-                AppendError::InvalidReference("native family identity missing".into())
-            })?;
         let store = self.open_installation(&guard)?;
-        Ok(FamilyEventStore {
+        // A session key has one deterministic storage stream. The source
+        // marker is metadata on the root event; it is never consulted for
+        // routing or enumeration.
+        let root_stream = super::upgrade::stream_id(family)
+            .map_err(|error| AppendError::InvalidReference(error.to_string()))?;
+        let head = store.head(&root_stream).map_err(super::upgrade::storage)?;
+        if head.sequence == 0 {
+            return Err(AppendError::InvalidReference(
+                "native session missing".into(),
+            ));
+        }
+        Ok(ScopedEventStore {
             directory,
-            family: family.into(),
+            session_key: family.into(),
             backend,
             generation,
             root_stream,
@@ -81,29 +87,29 @@ impl EventStorePool {
     }
 }
 
-pub struct FamilyEventStore {
+pub struct ScopedEventStore {
     directory: PathBuf,
-    family: String,
+    session_key: String,
     backend: NativeBackend,
     generation: u64,
     root_stream: SessionStreamId,
     store: Arc<dyn SessionEventStore>,
     cli_state_lease: Option<Arc<super::cli_state::CliStateGuard>>,
-    execution_lease: Option<Arc<super::ownership::FamilyExecutionLease>>,
+    execution_lease: Option<Arc<super::ownership::SessionExecutionLease>>,
 }
-impl FamilyEventStore {
+impl ScopedEventStore {
     pub fn root_stream(&self) -> &SessionStreamId {
         &self.root_stream
     }
     pub fn open(data_dir: &Path, family: &str) -> Result<Self, AppendError> {
-        EventStorePool::default().open_family(data_dir, family, None)
+        EventStorePool::default().open_session(data_dir, family, None)
     }
     /// Lease lives as long as the store, including outstanding commit workers
     /// and bound observations after the host drops its execution coordinator.
     pub fn open_with_execution_lease(
         data_dir: &Path,
         family: &str,
-        lease: Arc<super::ownership::FamilyExecutionLease>,
+        lease: Arc<super::ownership::SessionExecutionLease>,
     ) -> Result<Self, AppendError> {
         if !lease.matches(data_dir, family) {
             return Err(AppendError::InvalidReference(
@@ -125,13 +131,13 @@ impl FamilyEventStore {
         let binding = lease.binding().ok_or_else(|| {
             AppendError::InvalidReference("CLI path has no native binding".into())
         })?;
-        if binding.family != family || binding.data_dir != data_dir {
+        if binding.session_key != family || binding.data_dir != data_dir {
             return Err(AppendError::InvalidReference(
-                "CLI path lease belongs to another installation/family".into(),
+                "CLI path lease belongs to another installation/source".into(),
             ));
         }
         store.cli_state_lease = Some(lease);
-        store.execution_lease = Some(Arc::new(super::ownership::FamilyExecutionLease::acquire(
+        store.execution_lease = Some(Arc::new(super::ownership::SessionExecutionLease::acquire(
             data_dir, family,
         )?));
         Ok(store)
@@ -140,7 +146,7 @@ impl FamilyEventStore {
         if self.execution_lease.as_ref().is_some_and(|lease| {
             !lease.matches(
                 self.directory.parent().unwrap_or(&self.directory),
-                &self.family,
+                &self.session_key,
             )
         }) {
             return Err(AppendError::InvalidReference(
@@ -150,7 +156,7 @@ impl FamilyEventStore {
         if let Some(lease) = &self.cli_state_lease
             && lease
                 .binding()
-                .is_none_or(|binding| binding.family != self.family)
+                .is_none_or(|binding| binding.session_key != self.session_key)
         {
             return Err(AppendError::InvalidReference(
                 "CLI state ownership binding missing".into(),
@@ -176,7 +182,7 @@ impl FamilyEventStore {
                 return Ok(());
             }
             if !seen.insert(stream.clone()) {
-                return Err(AppendError::Corrupt("cyclic session family".into()));
+                return Err(AppendError::Corrupt("cyclic session source".into()));
             }
             let mut page = self
                 .store
@@ -200,7 +206,7 @@ impl FamilyEventStore {
                 })?;
             if !matches!(origin.body.data, EventData::DerivedSessionStarted { .. }) {
                 return Err(AppendError::InvalidReference(
-                    "stream belongs to another family".into(),
+                    "stream belongs to another source".into(),
                 ));
             }
             let cause = origin
@@ -218,11 +224,11 @@ impl FamilyEventStore {
             stream = parent.stream_id;
         }
         Err(AppendError::InvalidReference(
-            "session family depth exceeded".into(),
+            "session source depth exceeded".into(),
         ))
     }
 }
-impl SessionEventStore for FamilyEventStore {
+impl SessionEventStore for ScopedEventStore {
     fn read_latest_event(
         &self,
         stream: &SessionStreamId,

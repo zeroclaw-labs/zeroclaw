@@ -137,7 +137,8 @@ the instance.
 ## Source pointers
 
 - Config, install-root, and data-dir resolution: `crates/zeroclaw-config/src/schema.rs`
-- Session backends: `crates/zeroclaw-infra/src/session_sqlite.rs`, `crates/zeroclaw-infra/src/session_store.rs`
+- Native session stores: `crates/zeroclaw-infra/src/session_events.rs`, `crates/zeroclaw-infra/src/session_events/jsonl.rs`
+- Legacy SQLite migration reader and fixtures: `crates/zeroclaw-infra/src/session_events/upgrade/legacy_sqlite.rs`
 - Standard session repository: `crates/zeroclaw-infra/src/session_repository.rs`
 - Installation upgrades: `crates/zeroclaw-infra/src/session_events/upgrade.rs`
 - RPC live sessions: `crates/zeroclaw-runtime/src/rpc/session.rs`

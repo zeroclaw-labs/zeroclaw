@@ -351,6 +351,7 @@ impl AcpServer {
                 let port = source
                     .open(
                         family,
+                        "acp",
                         descriptor.owning_agent,
                         zeroclaw_api::principal::PrincipalId::shared_operator(),
                         authority,
@@ -397,6 +398,7 @@ impl AcpServer {
         let port = source
             .open(
                 family,
+                "acp",
                 alias.into(),
                 zeroclaw_api::principal::PrincipalId::shared_operator(),
                 authority,
@@ -1126,9 +1128,10 @@ impl AcpServer {
             // authenticated gateway principal, so these sessions are stamped
             // with a NULL owner -- visible only to unscoped connections, never
             // to a scoped gateway principal (RFC 7141 F2).
-            let created =
-                tokio::task::spawn_blocking(move || store.create_session(&sid, &alias, &wsd, None))
-                    .await;
+            let created = tokio::task::spawn_blocking(move || {
+                store.create_session(&sid, "acp", &alias, &wsd, None)
+            })
+            .await;
             let error = match created {
                 Ok(Ok(_)) => None,
                 Ok(Err(e)) => Some(e.to_string()),
@@ -2114,6 +2117,7 @@ impl AcpServer {
                 source
                     .open(
                         family,
+                        "acp",
                         agent_alias.clone(),
                         zeroclaw_api::principal::PrincipalId::shared_operator(),
                         authority,
@@ -4538,6 +4542,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -4578,6 +4583,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -5846,6 +5852,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "ghost-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -5934,6 +5941,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "ghost-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -5981,6 +5989,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "agent-alpha",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -6027,6 +6036,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "ghost-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -7618,7 +7628,7 @@ mod tests {
             assert!(result.get("error").is_none(), "{backend}: {result}");
             let family = format!("acp_{sid}");
             let stream = source.stream_id(&family).await.expect("stream");
-            let native = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+            let native = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 directory.path(),
                 &family,
             )
@@ -8034,6 +8044,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -8109,6 +8120,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -8199,6 +8211,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -8300,6 +8313,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -8494,6 +8508,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -8737,6 +8752,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -8816,6 +8832,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -8886,6 +8903,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -8968,6 +8986,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -9213,6 +9232,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -9316,6 +9336,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -9416,6 +9437,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -9523,6 +9545,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -9856,6 +9879,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -10176,6 +10200,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -10579,6 +10604,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -11338,6 +11364,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -11396,7 +11423,13 @@ mod tests {
         );
         let session_id = "sess-cross-agent-load";
         store
-            .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
+            .create_session(
+                session_id,
+                "acp",
+                "finance",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -11441,7 +11474,13 @@ mod tests {
         );
         let session_id = "sess-cross-agent-resume";
         store
-            .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
+            .create_session(
+                session_id,
+                "acp",
+                "finance",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -11501,6 +11540,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -11556,6 +11596,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -11699,7 +11740,13 @@ mod tests {
         // Pre-create a stored session that we'll attempt to load
         let stored_id = "sess-load-limit-test";
         store
-            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy(), None)
+            .create_session(
+                stored_id,
+                "acp",
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -11745,7 +11792,13 @@ mod tests {
         // Pre-create a stored session that we'll attempt to resume
         let stored_id = "sess-resume-limit-test";
         store
-            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy(), None)
+            .create_session(
+                stored_id,
+                "acp",
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -11792,6 +11845,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,
@@ -11856,6 +11910,7 @@ mod tests {
         store
             .create_session(
                 session_id,
+                "acp",
                 "test-agent",
                 &cwd.path().to_string_lossy(),
                 None,

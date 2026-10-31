@@ -1,6 +1,6 @@
 //! Standard session repository used by protocol entrances. Event storage and
-//! projections are shared; protocol namespaces select families, never a database.
-use crate::session_events::{catalog::SessionCatalog, family::EventStorePool};
+//! projections are shared; namespaces select session keys, never a database.
+use crate::session_events::{catalog::SessionCatalog, scoped::EventStorePool};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ pub struct SessionRepository {
 }
 
 impl SessionRepository {
-    /// Binds a family namespace to the installation's configured native format.
+    /// Binds a session key namespace to the installation's configured native format.
     /// Migration remains owned by installation startup, never this handle.
     pub fn for_namespace(data_dir: &Path, namespace: &str) -> Result<Self> {
         anyhow::ensure!(
@@ -90,6 +90,7 @@ impl SessionRepository {
     pub fn create_session(
         &self,
         session_uuid: &str,
+        creation_source: &str,
         agent_alias: &str,
         workspace_dir: &str,
         principal_id: Option<&str>,
@@ -101,6 +102,7 @@ impl SessionRepository {
 
         self.create_session_with_interaction_surface(
             session_uuid,
+            creation_source,
             agent_alias,
             workspace_dir,
             None,
@@ -111,6 +113,7 @@ impl SessionRepository {
     pub fn create_session_with_interaction_surface(
         &self,
         session_uuid: &str,
+        creation_source: &str,
         agent_alias: &str,
         workspace_dir: &str,
         interaction_surface: Option<&str>,
@@ -131,6 +134,7 @@ impl SessionRepository {
 
         native.create(
             session_uuid,
+            creation_source,
             agent_alias,
             vec![
                 ("workspace_dir", serde_json::json!(workspace_dir)),
@@ -554,14 +558,14 @@ mod tests {
                 .expect("ready");
             let acp = SessionRepository::for_namespace(directory.path(), "acp_").expect("acp");
             let rpc = SessionRepository::for_namespace(directory.path(), "rpc_").expect("rpc");
-            acp.create_session("same", "agent", "/workspace", Some("owner"))
+            acp.create_session("same", "test", "agent", "/workspace", Some("owner"))
                 .expect("create ACP");
-            rpc.create_session("same", "agent", "/workspace", Some("owner"))
+            rpc.create_session("same", "test", "agent", "/workspace", Some("owner"))
                 .expect("create RPC");
             assert_eq!(acp.list_sessions().expect("ACP list").len(), 1);
             assert_eq!(rpc.list_sessions().expect("RPC list").len(), 1);
             let catalog = acp.catalog().expect("catalog");
-            let families = catalog.query().families().expect("families");
+            let families = catalog.query().sessions().expect("families");
             let acp: zeroclaw_api::session_events::catalog::Session = catalog
                 .query()
                 .summary(&families["acp_same"])

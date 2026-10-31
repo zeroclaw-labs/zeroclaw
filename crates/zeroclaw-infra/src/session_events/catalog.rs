@@ -1,11 +1,60 @@
 //! Transport-neutral session metadata projected from the active event store.
 //! The installation lock serializes conditional metadata changes and cutover.
-use super::installation::{InstallationGuard, family_identity};
+use super::installation::{InstallationGuard, session_identity};
 use super::*;
 use std::collections::BTreeMap;
 use zeroclaw_api::session_events::{
     BranchId, CaptureMode, EventActor, EventData, SessionId, StoredPayloadRef,
 };
+
+fn string_field(fields: &BTreeMap<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| fields.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+}
+
+fn bounded_preview(value: &str) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(256).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn residual_metadata(fields: &BTreeMap<String, serde_json::Value>) -> serde_json::Value {
+    const INDEXED: &[&str] = &[
+        "session_key",
+        "source",
+        "title",
+        "cwd",
+        "workspace_dir",
+        "working_directory",
+        "git_remote",
+        "git.remote",
+        "git_branch",
+        "git.branch",
+        "git_commit",
+        "git.commit",
+        "provider",
+        "provider_ref",
+        "model_provider",
+        "model",
+        "model_name",
+        "category",
+        "session_category",
+        "project",
+        "project_id",
+    ];
+    serde_json::Value::Object(
+        fields
+            .iter()
+            .filter(|(key, _)| !INDEXED.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
 
 pub struct SessionCatalog {
     guard: InstallationGuard,
@@ -13,7 +62,7 @@ pub struct SessionCatalog {
 }
 
 use zeroclaw_api::session_events::catalog::SessionReducer;
-pub use zeroclaw_api::session_events::catalog::{Session, SessionDetail};
+pub use zeroclaw_api::session_events::catalog::{Session, SessionDetail, SessionIndexRecord};
 
 /// Common read surface for all protocol entrances.
 pub struct SessionQuery<'a> {
@@ -28,7 +77,7 @@ pub struct SessionCommand<'a> {
 impl SessionCatalog {
     pub fn open(
         data_dir: &Path,
-        stores: &super::family::EventStorePool,
+        stores: &super::scoped::EventStorePool,
     ) -> Result<Option<Self>, AppendError> {
         let guard = InstallationGuard::acquire(&data_dir.join("sessions"))?;
         if guard.phase().is_none() {
@@ -36,7 +85,28 @@ impl SessionCatalog {
             return Ok(None);
         }
         let store = stores.open_installation(&guard)?;
-        Ok(Some(Self { guard, store }))
+        let catalog = Self { guard, store };
+        let streams = {
+            let (backend, _) = catalog.guard.active()?;
+            let directory =
+                catalog.guard.directory().parent().ok_or_else(|| {
+                    AppendError::Corrupt("session directory parent missing".into())
+                })?;
+            installation::streams(directory, backend)?
+        };
+        let (backend, _) = catalog.guard.active()?;
+        index::synchronize(
+            catalog
+                .guard
+                .directory()
+                .parent()
+                .ok_or_else(|| AppendError::Corrupt("session directory parent missing".into()))?,
+            backend,
+            catalog.store.as_ref(),
+            &streams,
+            |stream| catalog.query().index_record(stream),
+        )?;
+        Ok(Some(catalog))
     }
 
     pub fn store(&self) -> &dyn SessionEventStore {
@@ -50,18 +120,351 @@ impl SessionCatalog {
     pub fn commands(&self) -> SessionCommand<'_> {
         SessionCommand { catalog: self }
     }
-}
 
-impl SessionQuery<'_> {
-    pub fn families(&self) -> Result<BTreeMap<String, SessionStreamId>, AppendError> {
-        let (backend, _) = self.catalog.guard.active()?;
+    fn refresh_index(&self) -> Result<(), AppendError> {
+        let (backend, _) = self.guard.active()?;
         let directory = self
-            .catalog
             .guard
             .directory()
             .parent()
             .ok_or_else(|| AppendError::Corrupt("session directory parent missing".into()))?;
-        installation::families(directory, backend)
+        let streams = installation::streams(directory, backend)?;
+        index::synchronize(
+            directory,
+            backend,
+            self.store.as_ref(),
+            &streams,
+            |stream| self.query().index_record(stream),
+        )
+    }
+}
+
+impl SessionQuery<'_> {
+    pub fn sessions(&self) -> Result<BTreeMap<String, SessionStreamId>, AppendError> {
+        Ok(self
+            .index_records()
+            .map_err(super::upgrade::storage)?
+            .into_iter()
+            .map(|record| {
+                (
+                    record
+                        .session_key
+                        .unwrap_or_else(|| record.stream_id.as_str().to_owned()),
+                    record.stream_id,
+                )
+            })
+            .collect())
+    }
+
+    pub(crate) fn index_record(
+        &self,
+        stream: &SessionStreamId,
+    ) -> Result<Option<SessionIndexRecord>, ReadError> {
+        let Some(detail) = self.project(stream, false)? else {
+            return Ok(None);
+        };
+        let session = &detail.session;
+        let mut first_user_message_id = None;
+        let mut first_user_preview = None;
+        let mut parent_stream_id = None;
+        let mut parent_thread_id = None;
+        let mut parent_agent = None;
+        let mut indexed_cwd = None;
+        let mut indexed_provider = None;
+        let mut indexed_model = None;
+        let head = self.catalog.store.head(stream)?;
+        let mut cursor = EventCursor::beginning(stream.clone());
+        while cursor.sequence < head.sequence {
+            let page = self
+                .catalog
+                .store
+                .read_page(stream, &cursor, Some(&head), 256)?;
+            for event in &page.events {
+                match &event.body.data {
+                    EventData::UserContentRecorded { content_ref, .. }
+                        if first_user_message_id.is_none() =>
+                    {
+                        if let PayloadRead::Present(payload) =
+                            self.catalog.store.read_payload(&content_ref.payload_id)?
+                        {
+                            let content: zeroclaw_api::session_events::ContentPayload =
+                                serde_json::from_slice(&payload.body)
+                                    .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                            first_user_message_id = Some(content.message_id.clone());
+                            first_user_preview = Some(self.preview_content(&content)?);
+                        }
+                    }
+                    EventData::ContextProjectionCreated {
+                        reason_key,
+                        result_ref,
+                        ..
+                    } if first_user_message_id.is_none()
+                        && (reason_key == "host_seed" || reason_key == "legacy_import") =>
+                    {
+                        let body = self.metadata_value(result_ref)?;
+                        let rows = body
+                            .get(if reason_key == "host_seed" {
+                                "seed_messages"
+                            } else {
+                                "legacy_messages"
+                            })
+                            .and_then(serde_json::Value::as_array)
+                            .ok_or_else(|| ReadError::Corrupt("seed identities missing".into()))?;
+                        if let Some(user) = rows.iter().find(|row| row["role"] == "user") {
+                            if reason_key == "legacy_import" {
+                                let reference: StoredPayloadRef =
+                                    serde_json::from_value(user["content_ref"].clone())
+                                        .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                                let content: zeroclaw_api::session_events::ContentPayload =
+                                    serde_json::from_slice(
+                                        &zeroclaw_api::session_events::context_read::present(
+                                            self.catalog.store(),
+                                            &reference,
+                                        )?
+                                        .body,
+                                    )
+                                    .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                                first_user_message_id = Some(content.message_id.clone());
+                                first_user_preview = Some(self.preview_content(&content)?);
+                            } else {
+                                let reference = zeroclaw_api::session_events::MessageRef {
+                                    message_id: serde_json::from_value(user["message_id"].clone())
+                                        .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+                                    source: zeroclaw_api::session_events::ContextMessageSource::Conversation {
+                                        payload_ref: serde_json::from_value(body["messages_ref"].clone())
+                                            .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+                                        item_index: serde_json::from_value(user["source_index"].clone())
+                                            .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+                                    },
+                                };
+                                first_user_message_id = Some(reference.message_id.clone());
+                                match zeroclaw_api::session_events::context_read::resolve_message(
+                                    self.catalog.store(),
+                                    stream,
+                                    &reference,
+                                ) {
+                                    Ok(Some(
+                                        zeroclaw_api::model_provider::ConversationMessage::Chat(
+                                            chat,
+                                        ),
+                                    )) => {
+                                        first_user_preview = Some(bounded_preview(&chat.content));
+                                    }
+                                    // Erasure retains the seed's stable message identity.
+                                    Err(ReadError::OriginalPayloadErased(_)) | Ok(None) => {}
+                                    Ok(Some(_)) => {
+                                        return Err(ReadError::Corrupt(
+                                            "user seed is not a chat message".into(),
+                                        ));
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                        }
+                    }
+                    EventData::TurnAccepted { ingress_ref, .. } => {
+                        if let PayloadRead::Present(payload) =
+                            self.catalog.store.read_payload(&ingress_ref.payload_id)?
+                        {
+                            let value: serde_json::Value = serde_json::from_slice(&payload.body)
+                                .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                            indexed_cwd = value
+                                .get("execution_workspace")
+                                .or_else(|| value.get("cwd"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned);
+                        }
+                    }
+                    EventData::ProviderRequestPrepared {
+                        route_attribution_ref,
+                        ..
+                    } => {
+                        if let PayloadRead::Present(payload) = self
+                            .catalog
+                            .store
+                            .read_payload(&route_attribution_ref.payload_id)?
+                        {
+                            let value: serde_json::Value = serde_json::from_slice(&payload.body)
+                                .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                            let dispatch = value.get("actual_dispatch").unwrap_or(&value);
+                            indexed_provider = dispatch
+                                .get("provider_ref")
+                                .or_else(|| dispatch.get("provider"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned);
+                            indexed_model = dispatch
+                                .get("model")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned);
+                        }
+                    }
+                    EventData::DerivedSessionStarted { .. } => {
+                        if let Some(causation) = &event.causation_id
+                            && let Some(parent) = self.catalog.store.read_event(causation)?
+                        {
+                            parent_stream_id = Some(parent.stream_id.clone());
+                            if let Some(parent_session) = self.project(&parent.stream_id, false)? {
+                                parent_thread_id = parent_session.session_id.clone();
+                                parent_agent = parent_session.owning_agent.clone();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cursor = page.through;
+            if !page.has_more {
+                break;
+            }
+        }
+        Ok(Some(SessionIndexRecord {
+            stream_id: stream.clone(),
+            session_id: session.session_id.clone(),
+            session_key: session.session_key().map(str::to_owned),
+            source: session.source().map(str::to_owned),
+            title: session
+                .fields
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            created_at: session.created_at,
+            last_activity: session.last_activity,
+            first_user_message_id,
+            first_user_preview,
+            cwd: indexed_cwd.or_else(|| {
+                string_field(
+                    &session.fields,
+                    &["cwd", "workspace_dir", "working_directory"],
+                )
+            }),
+            git_remote: string_field(&session.fields, &["git_remote", "git.remote"]),
+            git_branch: string_field(&session.fields, &["git_branch", "git.branch"]),
+            git_commit: string_field(&session.fields, &["git_commit", "git.commit"]),
+            provider: indexed_provider.or_else(|| {
+                string_field(
+                    &session.fields,
+                    &["provider", "provider_ref", "model_provider"],
+                )
+            }),
+            model: indexed_model
+                .or_else(|| string_field(&session.fields, &["model", "model_name"])),
+            category: string_field(&session.fields, &["category", "session_category"]),
+            project: string_field(&session.fields, &["project", "project_id"]),
+            parent_stream_id,
+            parent_thread_id,
+            parent_agent,
+            owning_agent: session.owning_agent.clone(),
+            closed: session.closed,
+            deleted: session.deleted,
+            head_sequence: session.head.sequence,
+            message_count: session.message_count,
+            running: session.running,
+            metadata: residual_metadata(&session.fields),
+        }))
+    }
+
+    /// Read the rebuildable discovery projection without replaying every
+    /// session. Full history remains available through `detail`/`summary`.
+    pub fn index_records(&self) -> Result<Vec<SessionIndexRecord>, ReadError> {
+        self.catalog
+            .refresh_index()
+            .map_err(|error| ReadError::StorageUnavailable(error.to_string()))?;
+        let (backend, _) = self
+            .catalog
+            .guard
+            .active()
+            .map_err(|error| ReadError::StorageUnavailable(error.to_string()))?;
+        index::read_records(
+            self.catalog
+                .guard
+                .directory()
+                .parent()
+                .ok_or_else(|| ReadError::Corrupt("session directory parent missing".into()))?,
+            backend,
+        )
+    }
+
+    /// Build the lightweight catalog summaries directly from the durable
+    /// discovery index. Full event replay remains reserved for detail and
+    /// restore operations.
+    pub fn indexed_summaries(
+        &self,
+    ) -> Result<Vec<(String, zeroclaw_api::session_events::catalog::Session)>, ReadError> {
+        let mut result = Vec::new();
+        for record in self.index_records()? {
+            let key = record
+                .session_key
+                .clone()
+                .unwrap_or_else(|| record.stream_id.as_str().to_owned());
+            let mut fields = match record.metadata {
+                serde_json::Value::Object(values) => values.into_iter().collect(),
+                _ => BTreeMap::new(),
+            };
+            fields.insert("session_key".into(), serde_json::Value::String(key.clone()));
+            if let Some(source) = &record.source {
+                fields.insert("source".into(), serde_json::Value::String(source.clone()));
+            }
+            if let Some(title) = &record.title {
+                fields.insert("title".into(), serde_json::Value::String(title.clone()));
+            }
+            if let Some(cwd) = &record.cwd {
+                fields.insert(
+                    "workspace_dir".into(),
+                    serde_json::Value::String(cwd.clone()),
+                );
+            }
+            for (key, value) in [
+                ("git_remote", record.git_remote),
+                ("git_branch", record.git_branch),
+                ("git_commit", record.git_commit),
+                ("provider", record.provider),
+                ("model", record.model),
+                ("category", record.category),
+                ("project", record.project),
+            ] {
+                if let Some(value) = value {
+                    fields.insert(key.into(), serde_json::Value::String(value));
+                }
+            }
+            result.push((
+                key,
+                zeroclaw_api::session_events::catalog::Session {
+                    session_id: record.session_id,
+                    owning_agent: record.owning_agent,
+                    fields,
+                    closed: record.closed,
+                    deleted: record.deleted,
+                    created_at: record.created_at,
+                    last_activity: record.last_activity,
+                    head: EventCursor {
+                        stream_id: record.stream_id,
+                        sequence: record.head_sequence,
+                    },
+                    message_count: record.message_count,
+                    running: record.running,
+                },
+            ));
+        }
+        Ok(result)
+    }
+
+    fn preview_content(
+        &self,
+        content: &zeroclaw_api::session_events::ContentPayload,
+    ) -> Result<String, ReadError> {
+        let mut preview = String::new();
+        for part in &content.parts {
+            if let zeroclaw_api::session_events::RecordedContentPart::Text { text_ref } = part
+                && let PayloadRead::Present(payload) =
+                    self.catalog.store.read_payload(&text_ref.payload_id)?
+            {
+                preview.push_str(
+                    std::str::from_utf8(&payload.body)
+                        .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+                );
+            }
+        }
+        Ok(bounded_preview(&preview))
     }
 
     pub fn detail(&self, stream: &SessionStreamId) -> Result<Option<SessionDetail>, ReadError> {
@@ -96,14 +499,12 @@ impl SessionQuery<'_> {
                 } = &event.body.data
                     && (reason_key == "host_seed" || reason_key == "legacy_import")
                 {
-                    let body: serde_json::Value = serde_json::from_slice(
-                        &zeroclaw_api::session_events::context_read::present(
-                            self.catalog.store(),
-                            result_ref,
-                        )?
-                        .body,
-                    )
-                    .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+                    let payload = zeroclaw_api::session_events::context_read::present(
+                        self.catalog.store(),
+                        result_ref,
+                    )?;
+                    let body: serde_json::Value = serde_json::from_slice(&payload.body)
+                        .map_err(|error| ReadError::Corrupt(error.to_string()))?;
                     Some(
                         body.get(if reason_key == "host_seed" {
                             "seed_messages"
@@ -174,7 +575,7 @@ pub(crate) fn metadata_payload(
 ) -> Result<PayloadRecord, AppendError> {
     let structural = matches!(
         field,
-        "family_key"
+        "session_identity"
             | "principal_id"
             | "created_at"
             | "last_activity"
@@ -194,6 +595,7 @@ impl SessionCommand<'_> {
     pub fn create(
         &self,
         family: &str,
+        source: &str,
         alias: &str,
         fields: Vec<(&str, serde_json::Value)>,
     ) -> Result<(), AppendError> {
@@ -223,7 +625,7 @@ impl SessionCommand<'_> {
             },
         )?;
         root.branch_id = Some(branch.clone());
-        let (identity, identity_payload) = family_identity(stream.clone(), family)?;
+        let (identity, identity_payload) = session_identity(stream.clone(), family, source)?;
         let body = PayloadRecord::json(
             "session.context/v1",
             &serde_json::json!({"message_refs":[],"history_has_trim_breadcrumb":false}),
@@ -273,6 +675,11 @@ impl SessionCommand<'_> {
         payloads: &mut Vec<PayloadRecord>,
     ) -> Result<(), AppendError> {
         for (field, value) in fields {
+            if matches!(field, "source" | "session_key" | "session_identity") {
+                return Err(AppendError::InvalidReference(
+                    "session creation identity is immutable".into(),
+                ));
+            }
             let body = metadata_payload(field, value)?;
             events.push(SessionEvent::typed(
                 stream.clone(),

@@ -431,6 +431,7 @@ pub(crate) async fn open_ingress(
     source
         .open_system(
             family.into(),
+            "gateway",
             alias.into(),
             component.into(),
             authority,
@@ -615,6 +616,7 @@ pub(crate) async fn open(
         source
             .open(
                 family.into(),
+                "gateway",
                 alias.into(),
                 PrincipalId::shared_operator(),
                 authority,
@@ -630,7 +632,7 @@ pub(crate) async fn query(
     state: &AppState,
     family: &str,
     subject: Option<&str>,
-) -> anyhow::Result<Option<zeroclaw_kernel::session::engine::FamilyQuery>> {
+) -> anyhow::Result<Option<zeroclaw_kernel::session::engine::SessionReadHandle>> {
     let Some(source) = &state.native_sessions else {
         return Ok(None);
     };
@@ -720,6 +722,7 @@ pub(crate) async fn command(
     source
         .open(
             family.into(),
+            "gateway",
             descriptor.owning_agent,
             PrincipalId::shared_operator(),
             authority,
@@ -741,7 +744,7 @@ pub(crate) async fn list(
         .as_ref()
         .ok_or_else(|| anyhow::Error::msg("native_session_source_missing"))?;
     let mut sessions = Vec::new();
-    for family in source.families().await? {
+    for family in source.sessions().await? {
         let native = match query(state, &family, subject).await {
             Ok(Some(native)) => native,
             Ok(None) => continue,
@@ -783,7 +786,7 @@ pub(crate) mod tests {
     use super::*;
     use zeroclaw_kernel::session::SessionCoordinator;
     use zeroclaw_kernel::session::engine::{
-        EngineSession, EngineSessionSource, FamilyDescriptor, FamilyQuery,
+        EngineSession, EngineSessionSource, SessionDescriptor, SessionReadHandle,
     };
 
     #[test]
@@ -989,11 +992,11 @@ pub(crate) mod tests {
             assert_eq!(family, self.family);
             Ok(self.stream.clone())
         }
-        async fn families(&self) -> anyhow::Result<Vec<String>> {
+        async fn sessions(&self) -> anyhow::Result<Vec<String>> {
             Ok(vec![self.family.clone()])
         }
-        async fn describe(&self, family: String) -> anyhow::Result<Option<FamilyDescriptor>> {
-            Ok((family == self.family).then(|| FamilyDescriptor {
+        async fn describe(&self, family: String) -> anyhow::Result<Option<SessionDescriptor>> {
+            Ok((family == self.family).then(|| SessionDescriptor {
                 stream: self.stream.clone(),
                 owning_agent: "web".into(),
                 owner: Some(PrincipalId::shared_operator().0),
@@ -1002,6 +1005,7 @@ pub(crate) mod tests {
         async fn open(
             &self,
             family: String,
+            _creation_source: &str,
             alias: String,
             principal: PrincipalId,
             authority: Arc<dyn EngineSessionAuthority>,
@@ -1022,6 +1026,7 @@ pub(crate) mod tests {
         async fn open_system(
             &self,
             family: String,
+            _creation_source: &str,
             alias: String,
             component: String,
             authority: Arc<dyn EngineSessionAuthority>,
@@ -1044,12 +1049,12 @@ pub(crate) mod tests {
             family: String,
             principal: PrincipalId,
             policy: Arc<dyn SessionAccessPolicy>,
-        ) -> anyhow::Result<Option<FamilyQuery>> {
+        ) -> anyhow::Result<Option<SessionReadHandle>> {
             if family != self.family {
                 return Ok(None);
             }
             policy.authorize(&principal, &self.stream, SessionAccess::Read)?;
-            Ok(Some(FamilyQuery {
+            Ok(Some(SessionReadHandle {
                 stream: self.stream.clone(),
                 query: self.owner.query(principal, policy),
             }))

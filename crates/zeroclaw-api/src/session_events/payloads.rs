@@ -774,8 +774,16 @@ fn validate_semantic_payloads(
         EventData::SessionMetadataChanged {
             field,
             new_value_ref,
-        } if field == "family_key" => {
-            let family: String = decode(payloads, new_value_ref, "session.authority/v1")?;
+        } if field == "session_identity" => {
+            let identity: Value = decode(payloads, new_value_ref, "session.authority/v1")?;
+            let family = identity
+                .get("session_key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("session key missing"))?;
+            let source = identity.get("source").and_then(Value::as_str);
+            if source.is_none_or(str::is_empty) || source.is_some_and(|value| value.len() > 128) {
+                return Err(invalid("session source missing"));
+            }
             if family.is_empty() || family.len() > 512 {
                 return Err(invalid("invalid family identity"));
             }
@@ -784,7 +792,7 @@ fn validate_semantic_payloads(
             });
             if root.is_none() || history.values().any(|prior| prior.event_id != event.event_id
                 && prior.stream_id == event.stream_id
-                && matches!(&prior.body.data, EventData::SessionMetadataChanged { field, .. } if field == "family_key")) {
+                && matches!(&prior.body.data, EventData::SessionMetadataChanged { field, .. } if field == "session_identity")) {
                 return Err(invalid("family identity requires an unbound root stream"));
             }
             for prior in history.values().filter(|prior| {
@@ -794,8 +802,11 @@ fn validate_semantic_payloads(
                     field,
                     new_value_ref,
                 } = &prior.body.data
-                    && field == "family_key"
-                    && decode::<String>(payloads, new_value_ref, "session.authority/v1")? == family
+                    && field == "session_identity"
+                    && decode::<Value>(payloads, new_value_ref, "session.authority/v1")?
+                        .get("session_key")
+                        .and_then(Value::as_str)
+                        == Some(family)
                 {
                     return Err(invalid("family identity already belongs to another root"));
                 }

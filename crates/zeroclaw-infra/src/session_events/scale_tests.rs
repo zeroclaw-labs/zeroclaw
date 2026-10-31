@@ -175,8 +175,10 @@ fn legacy_append_read_and_reopen_baseline() {
         let open = || -> Box<dyn SessionBackend> {
             match backend {
                 "sqlite" => Box::new(
-                    crate::session_sqlite::SqliteSessionBackend::new(directory.path())
-                        .expect("SQLite"),
+                    crate::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                        directory.path(),
+                    )
+                    .expect("SQLite"),
                 ),
                 _ => Box::new(
                     crate::session_store::SessionStore::new(directory.path()).expect("JSONL"),

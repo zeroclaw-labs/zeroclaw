@@ -699,6 +699,7 @@ async fn native_family_source_restores_context_fences_legacy_and_excludes_anothe
             std::time::Duration::from_secs(10),
             source.open(
                 "rpc_fixture".into(),
+                "test",
                 "fixture".into(),
                 principal.clone(),
                 Arc::new(Access),
@@ -712,6 +713,7 @@ async fn native_family_source_restores_context_fences_legacy_and_excludes_anothe
             source
                 .open(
                     "rpc_fixture".into(),
+                    "test",
                     "another-agent".into(),
                     principal.clone(),
                     Arc::new(Access),
@@ -744,6 +746,7 @@ async fn native_family_source_restores_context_fences_legacy_and_excludes_anothe
             other
                 .open(
                     "rpc_fixture".into(),
+                    "test",
                     "fixture".into(),
                     principal.clone(),
                     Arc::new(Access),
@@ -780,6 +783,7 @@ async fn native_family_source_restores_context_fences_legacy_and_excludes_anothe
         let reopened = other
             .open(
                 "rpc_fixture".into(),
+                "test",
                 "fixture".into(),
                 principal,
                 Arc::new(Access),
@@ -817,6 +821,7 @@ async fn child_capture_uses_a_distinct_stream_and_parent_receipt_never_replays()
         let session = source
             .open(
                 "child-fixture".into(),
+                "test",
                 "fixture".into(),
                 principal.clone(),
                 Arc::new(Access),
@@ -941,7 +946,7 @@ async fn child_capture_uses_a_distinct_stream_and_parent_receipt_never_replays()
                 .count(),
             1
         );
-        let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+        let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
             directory.path(),
             "child-fixture",
         )
@@ -1023,6 +1028,7 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
             source
                 .open(
                     "interrupted-family".into(),
+                    "test",
                     "fixture".into(),
                     principal.clone(),
                     Arc::new(Access),
@@ -1110,6 +1116,7 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
             reopened
                 .open(
                     "interrupted-family".into(),
+                    "test",
                     "fixture".into(),
                     principal,
                     Arc::new(Access),
@@ -1129,7 +1136,7 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
         );
         let family = if cli {
             reopened
-                .families()
+                .sessions()
                 .await
                 .expect("families")
                 .into_iter()
@@ -1138,7 +1145,7 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
         } else {
             "interrupted-family".to_owned()
         };
-        let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+        let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
             directory.path(),
             &family,
         )

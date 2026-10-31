@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_infra::session_backend::{SessionBackend, SessionContext};
-use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+use zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend;
 
 #[test]
 fn migration_adds_routing_columns_and_set_session_context_persists() {

@@ -72,6 +72,16 @@ pub struct JsonlEventStore {
     index: Mutex<Snapshot>,
 }
 impl JsonlEventStore {
+    pub(super) fn session_streams(&self) -> Result<Vec<SessionStreamId>, AppendError> {
+        let _guard = self.lock()?;
+        let snapshot = self.snapshot()?;
+        snapshot
+            .rows
+            .keys()
+            .map(|stream| SessionStreamId::parse(stream).map_err(AppendError::from))
+            .collect()
+    }
+
     pub(super) fn root_streams(&self) -> Result<Vec<SessionStreamId>, AppendError> {
         let _guard = self.lock()?;
         let snapshot = self.snapshot()?;

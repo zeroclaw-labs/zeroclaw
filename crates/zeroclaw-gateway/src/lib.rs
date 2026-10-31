@@ -1999,7 +1999,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     if config.gateway.session_persistence
         && let Some(source) = &native_sessions
     {
-        source.families().await?;
+        source.sessions().await?;
         if config.gateway.session_ttl_hours > 0 {
             let cutoff = chrono::Utc::now().timestamp_millis()
                 - i64::from(config.gateway.session_ttl_hours) * 3_600_000;
@@ -10874,7 +10874,7 @@ data: [DONE]\n\n";
                     _ => None,
                 })
                 .expect("input");
-            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+            let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 &state.config.read().data_dir,
                 &family,
             )
@@ -11597,8 +11597,10 @@ data: [DONE]\n\n";
         let session_directory = state.config.read().data_dir.clone();
         let backend: std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
             std::sync::Arc::new(
-                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&session_directory)
-                    .expect("sqlite session backend"),
+                zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                    &session_directory,
+                )
+                .expect("sqlite session backend"),
             );
         // Seed the transcript under the legacy raw gateway key: dot-bearing
         // display ids persisted this exact key before cancellation keys were
