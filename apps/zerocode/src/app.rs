@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use tokio::sync::mpsc;
 
@@ -747,6 +747,48 @@ pub struct CrossReconnectState {
 }
 
 pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
+
+/// Whether this launch reopens the saved sidebar list and keeps it current.
+/// `save` is the `[sidebar] restore_sessions` setting; `restore` is that and
+/// not `--fresh`. A `--fresh` launch still saves, so the next ordinary launch
+/// reopens what this one had open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenSessionsLaunch {
+    pub save: bool,
+    pub restore: bool,
+}
+
+impl OpenSessionsLaunch {
+    pub fn new(setting: bool, fresh: bool) -> Self {
+        Self {
+            save: setting,
+            restore: setting && !fresh,
+        }
+    }
+}
+
+fn restore_status(outcome: &crate::open_sessions::Restore) -> Option<String> {
+    let mut notices = Vec::new();
+    if outcome.elsewhere > 0 {
+        notices.push(crate::i18n::t_args(
+            "zc-app-restore-sessions-other-window",
+            &[("count", &outcome.elsewhere.to_string())],
+        ));
+    }
+    if outcome.dropped > 0 {
+        notices.push(crate::i18n::t_args(
+            "zc-app-restore-sessions-dropped",
+            &[("count", &outcome.dropped.to_string())],
+        ));
+    }
+    if let Some(error) = &outcome.publish_error {
+        notices.push(crate::i18n::t_args(
+            "zc-app-restore-sessions-save-failed",
+            &[("error", &format!("{error:#}"))],
+        ));
+    }
+    (!notices.is_empty()).then(|| notices.join("\n"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuickstartChatDrain {
@@ -1680,6 +1722,7 @@ pub async fn run(
     target: &crate::ConnectTarget,
     mut owned_daemon_pid: Option<u32>,
     initial_leg: crate::ActiveLeg,
+    open_sessions: OpenSessionsLaunch,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
@@ -1763,6 +1806,35 @@ pub async fn run(
     // daemon turn, so an elicitation may arrive while the panes are still
     // reattaching and must already have one app-level receiver waiting.
     let mut inbound_router = InboundRequestRouter::new(rpc.clone())?;
+
+    // The sidebar list saved by the last launch against this daemon. Pruned
+    // against the daemon first, then fed to the same resume path a reconnect
+    // rebuild uses.
+    let mut open_sessions_store = None;
+    if open_sessions.save {
+        match crate::open_sessions::Store::for_launch(config_dir, connect_label, rpc.transport()) {
+            Ok(store) => open_sessions_store = store,
+            Err(error) => {
+                reload_status = Some(crate::i18n::t_args(
+                    "zc-app-restore-sessions-save-failed",
+                    &[("error", &format!("{error:#}"))],
+                ));
+            }
+        }
+    }
+    let mut restored = None;
+    if let Some(store) = open_sessions_store.as_mut() {
+        let outcome = store.start(&rpc, open_sessions.restore).await;
+        reload_status = restore_status(&outcome);
+        restored = outcome.snapshot;
+    }
+    let (resume_chat, resume_acp) = restored
+        .as_ref()
+        .map(|snapshot| snapshot.resume_entries(chat::MAX_TRACKED_SESSIONS_PER_PANE))
+        .unwrap_or_default();
+    if let Some(snapshot) = &restored {
+        sidebar.restore_order(snapshot.sidebar_order());
+    }
     let (
         mut dashboard_pane,
         mut config_app,
@@ -1772,7 +1844,28 @@ pub async fn run(
         mut logs_pane,
         mut quickstart,
         mut sop_pane,
-    ) = build_panes!(Vec::new(), Vec::new())?;
+    ) = build_panes!(resume_chat, resume_acp)?;
+    // Open on the pane the user left, unless a Quickstart handoff already
+    // picked Chat.
+    if mode == Mode::Dashboard {
+        match restored
+            .as_ref()
+            .and_then(crate::open_sessions::Snapshot::start_pane)
+        {
+            Some(chat::PaneKind::Acp) => mode = Mode::Acp,
+            Some(chat::PaneKind::Chat) => mode = Mode::Chat,
+            None => {}
+        }
+    }
+    // The last chat-like pane on screen, saved so the next launch opens there
+    // even if the user quits from another pane.
+    let mut last_session_pane = match mode {
+        Mode::Acp => Some(chat::PaneKind::Acp),
+        Mode::Chat => Some(chat::PaneKind::Chat),
+        _ => restored
+            .as_ref()
+            .and_then(crate::open_sessions::Snapshot::start_pane),
+    };
 
     // Route one sidebar event: switch to the owning pane's mode and call
     // into it. A macro (like `build_panes!`) because the routing needs the
@@ -1996,10 +2089,45 @@ pub async fn run(
             theme::set_active(t);
         }
 
-        // Sidebar rows: Code group first, then Chat, matching the mode bar
-        // order. Derived fresh each frame — the panes own the state.
-        let mut sidebar_rows = acp_pane.session_summaries();
-        sidebar_rows.extend(chat_pane.session_summaries());
+        for (old, new) in acp_pane.take_session_replacements() {
+            sidebar.replace_session_id(chat::PaneKind::Acp, &old, new);
+        }
+        for (old, new) in chat_pane.take_session_replacements() {
+            sidebar.replace_session_id(chat::PaneKind::Chat, &old, new);
+        }
+        // The panes own membership; the sidebar owns display order, including
+        // Code/Chat interleaving from dragging or a restored snapshot.
+        let sidebar_rows = session_summaries_in_sidebar_order(
+            &sidebar,
+            acp_pane.session_summaries(),
+            chat_pane.session_summaries(),
+        );
+        match mode {
+            Mode::Acp => last_session_pane = Some(chat::PaneKind::Acp),
+            Mode::Chat => last_session_pane = Some(chat::PaneKind::Chat),
+            _ => {}
+        }
+        // Save only while connected: a dropped socket is not the user closing
+        // sessions, and the rebuild that follows carries the same list.
+        if let Some(store) = open_sessions_store.as_mut()
+            && !matches!(conn_state, ConnectionState::Disconnected { .. })
+        {
+            let snapshot =
+                crate::open_sessions::Snapshot::from_rows(&sidebar_rows, last_session_pane);
+            if let Err(error) = store.save_if_changed(&snapshot) {
+                let message = crate::i18n::t_args(
+                    "zc-app-restore-sessions-save-failed",
+                    &[("error", &format!("{error:#}"))],
+                );
+                match reload_status.as_mut() {
+                    Some(status) => {
+                        status.push('\n');
+                        status.push_str(&message);
+                    }
+                    None => reload_status = Some(message),
+                }
+            }
+        }
         let plan_visible = match mode {
             Mode::Acp => acp_pane.plan_visible(),
             Mode::Chat => chat_pane.plan_visible(),
@@ -3792,8 +3920,19 @@ fn chords_for<ActionType: PartialEq>(
 
 fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
     let text = format!(" {msg} ");
-    let box_w = (text.chars().count() as u16 + 2).min(area.width);
-    let box_h = 3u16.min(area.height);
+    let text_width = text
+        .lines()
+        .map(unicode_width::UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0);
+    let box_w = text_width.saturating_add(2).min(usize::from(area.width)) as u16;
+    let paragraph = Paragraph::new(text.as_str())
+        .style(theme::fill_style())
+        .wrap(Wrap { trim: false });
+    let box_h = paragraph
+        .line_count(box_w.saturating_sub(2))
+        .saturating_add(2)
+        .min(usize::from(area.height)) as u16;
     let x = area.x + area.width.saturating_sub(box_w) / 2;
     let y = area.y + area.height.saturating_sub(box_h).saturating_sub(1);
     let rect = Rect::new(x, y, box_w, box_h);
@@ -3805,10 +3944,7 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
         .style(theme::fill_style());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(
-        Paragraph::new(Span::styled(text, theme::body_style())).style(theme::fill_style()),
-        inner,
-    );
+    frame.render_widget(paragraph, inner);
 }
 #[cfg(test)]
 mod tests {
@@ -5744,6 +5880,16 @@ mod tests {
         let chat = vec![summary(chat::PaneKind::Chat, "chat-1")];
         let mut rows = acp.clone();
         rows.extend(chat.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::open_sessions::Store::for_launch(
+            dir.path(),
+            "local:/run/order-test.sock",
+            crate::client::Transport::Local,
+        )
+        .unwrap()
+        .unwrap();
+        let before_drag = crate::open_sessions::Snapshot::from_rows(&rows, None);
+        assert!(store.save_if_changed(&before_drag).unwrap());
         let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
         let area = Rect::new(0, 0, 30, 10);
         let ctx = crate::agent_sidebar::SidebarCtx {
@@ -5769,6 +5915,12 @@ mod tests {
             .unwrap();
 
         let sessions = session_summaries_in_sidebar_order(&sidebar, acp, chat);
+        let after_drag = crate::open_sessions::Snapshot::from_rows(&sessions, None);
+        assert!(
+            store.save_if_changed(&after_drag).unwrap(),
+            "dragging across panes must change the persisted snapshot"
+        );
+        assert_eq!(store.load().unwrap(), after_drag);
         let target = |action| {
             session_shortcut_event(session_shortcut_ordinal(Some(action)).unwrap(), &sessions)
         };
@@ -5996,6 +6148,76 @@ mod tests {
                 state.rpc_allowed()
             ),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn restore_status_keeps_all_launch_notices() {
+        assert!(restore_status(&crate::open_sessions::Restore::default()).is_none());
+        let outcome = crate::open_sessions::Restore {
+            elsewhere: 2,
+            dropped: 3,
+            publish_error: Some(anyhow::Error::msg("disk full")),
+            ..Default::default()
+        };
+        let status = restore_status(&outcome).unwrap();
+        assert_eq!(
+            status.lines().collect::<Vec<_>>(),
+            vec![
+                crate::i18n::t_args("zc-app-restore-sessions-other-window", &[("count", "2")]),
+                crate::i18n::t_args("zc-app-restore-sessions-dropped", &[("count", "3")]),
+                crate::i18n::t_args(
+                    "zc-app-restore-sessions-save-failed",
+                    &[("error", "disk full")],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn reload_status_toast_wraps_multiple_notices() {
+        let message = "Saved sessions are open in another window.\nDeleted sessions were skipped.\nCould not save the session list.";
+        for width in [24, 60] {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20)).unwrap();
+            term.draw(|frame| draw_reload_status_toast(frame, frame.area(), message))
+                .unwrap();
+            let buffer = term.backend().buffer();
+            let rendered: String = (0..20)
+                .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                .flat_map(str::chars)
+                .filter(char::is_ascii_alphanumeric)
+                .collect();
+            let expected: String = message
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect();
+            assert_eq!(rendered, expected, "width {width}");
+        }
+    }
+
+    #[test]
+    fn fresh_skips_restore_but_keeps_saving() {
+        assert_eq!(
+            OpenSessionsLaunch::new(true, false),
+            OpenSessionsLaunch {
+                save: true,
+                restore: true
+            }
+        );
+        assert_eq!(
+            OpenSessionsLaunch::new(true, true),
+            OpenSessionsLaunch {
+                save: true,
+                restore: false
+            }
+        );
+        assert_eq!(
+            OpenSessionsLaunch::new(false, false),
+            OpenSessionsLaunch {
+                save: false,
+                restore: false
+            }
         );
     }
 

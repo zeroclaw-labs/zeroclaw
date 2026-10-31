@@ -30,7 +30,7 @@ use crate::client::{
 use crate::diff;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::input_bar::{InputBarAction, InputBarState};
-use crate::jsonrpc::RpcOutbound;
+use crate::jsonrpc::{JsonRpcError, RpcOutbound};
 use crate::mouse;
 #[cfg(test)]
 use crate::text_selection::{CellPoint, TextCell as TranscriptCell, row_breaks_for_line};
@@ -69,6 +69,16 @@ const SESSION_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SESSION_RECOVERY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(35);
 const SESSION_RECOVERY_MAX_ATTEMPTS: u8 = 4;
 const SESSION_RECOVERY_RETRY_BASE: Duration = Duration::from_millis(100);
+
+fn is_session_environment_refusal(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<JsonRpcError>().is_some_and(|error| {
+        error.code == -32012
+            && (error.message.contains("Session environment differs")
+                || error
+                    .message
+                    .contains("Session retains a local operator environment"))
+    })
+}
 
 fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String {
     if let Some(cleanup) = cleanup {
@@ -456,9 +466,32 @@ pub(crate) struct ResumeEntry {
     /// red sidebar dot is carried here. `SessionLost` is not carried: the
     /// rebuild re-attaches the session, which is what clears it.
     turn_failed: bool,
+    /// The daemon refused this entry's immutable operator environment.
+    /// The retained entry owns this fact until explicit replacement succeeds.
+    environment_refused: bool,
     /// Bounded cleanup notice captured while the old pane was disconnected.
     /// It is restored only after the replacement pane successfully adopts.
     cleanup_notice: Option<String>,
+}
+
+impl ResumeEntry {
+    /// An entry read back from the saved open-session list at launch. Only
+    /// identity, order and focus survive a zerocode restart; the queue and
+    /// draft were never written, and no turn of this process was in flight.
+    pub(crate) fn saved(session_id: String, agent_alias: String, was_focused: bool) -> Self {
+        Self {
+            session_id,
+            agent_alias,
+            message_count: 0,
+            was_focused,
+            queue: ReconnectQueueState::default(),
+            interrupted: false,
+            recovery_required: false,
+            turn_failed: false,
+            environment_refused: false,
+            cleanup_notice: None,
+        }
+    }
 }
 
 /// Client-owned queue and composer state that cannot be reconstructed from the
@@ -500,7 +533,7 @@ fn classify_turn_failure(content: &str) -> SessionError {
 
 /// Upper bound on sessions one chat-like pane tracks (focused + background).
 /// Two panes keep the TUI comfortably under the daemon's 64-session cap.
-const MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
+pub(crate) const MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
 
 pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
@@ -543,6 +576,8 @@ pub(crate) struct Chat {
     /// Sidebar-stable ordering of tracked session ids (creation order).
     /// Reconciled against the live states by `session_summaries`.
     session_order: Vec<String>,
+    /// Successful replacements awaiting application to the cross-pane sidebar.
+    session_replacements: Vec<(String, String)>,
     /// Session to restore focus to when an add/pick flow is cancelled or
     /// fails while background sessions exist.
     last_focused_sid: Option<String>,
@@ -914,6 +949,7 @@ impl Chat {
             launch_dir: std::env::current_dir,
             background: Vec::new(),
             session_order: Vec::new(),
+            session_replacements: Vec::new(),
             last_focused_sid: None,
             resume_focused: None,
             resume_backgrounds: Vec::new(),
@@ -995,6 +1031,7 @@ impl Chat {
                         .session_resync_in_flight
                         .contains_key(&state.session_id),
                 turn_failed: state.last_error == Some(SessionError::TurnFailed),
+                environment_refused: false,
                 // Only the focused pane can display this notice. Cloning keeps
                 // it available when a transactional rebuild fails mid-flight.
                 cleanup_notice: summary
@@ -1184,6 +1221,81 @@ impl Chat {
         }
     }
 
+    pub(crate) fn take_session_replacements(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.session_replacements)
+    }
+
+    fn focused_environment_refusal(&self) -> bool {
+        matches!(self.phase, ChatPhase::Error(_))
+            && self
+                .resume_focused
+                .as_ref()
+                .is_some_and(|entry| entry.environment_refused)
+    }
+
+    fn environment_refusal_notice() -> String {
+        crate::i18n::t("zc-chat-restore-environment-refused")
+    }
+
+    fn show_environment_refusal(&mut self, mut entry: ResumeEntry) {
+        self.stash_active();
+        self.demote_focused_resume_to_background();
+        entry.was_focused = true;
+        self.resume_focused = Some(entry);
+        self.phase = ChatPhase::Error(Self::environment_refusal_notice());
+    }
+
+    /// Only an explicit new-conversation action may replace a refused ID.
+    /// Build separately so a failed creation leaves its slot and queue intact.
+    async fn replace_refused_session(&mut self) {
+        if !self.focused_environment_refusal() {
+            return;
+        }
+        let Some(entry) = self.resume_focused.as_ref() else {
+            return;
+        };
+        let old_sid = entry.session_id.clone();
+        let agent_alias = entry.agent_alias.clone();
+        let mut fresh = Self::new(self.rpc.clone(), self.pane_kind);
+        fresh.launch_dir = self.launch_dir;
+        match fresh.start_session(&agent_alias, None).await {
+            SessionStartOutcome::Started => {
+                let Some(new_sid) = fresh.current_session_id().map(str::to_owned) else {
+                    return;
+                };
+                let mut cleanup_report = CleanupReport::default();
+                if let Some(mut entry) = self.resume_focused.take() {
+                    for message in entry.queue.message_queue.clear() {
+                        cleanup_report.merge(cleanup_attachment_temps(&message.attachments));
+                    }
+                    cleanup_report
+                        .merge(cleanup_attachment_temps(&entry.queue.composer_attachments));
+                }
+                self.phase = fresh.phase;
+                if let ChatPhase::Active(state) = &mut self.phase {
+                    state.surface_cleanup_report(cleanup_report);
+                }
+                for sid in &mut self.session_order {
+                    if *sid == old_sid {
+                        *sid = new_sid.clone();
+                    }
+                }
+                if self.last_focused_sid.as_deref() == Some(old_sid.as_str()) {
+                    self.last_focused_sid = Some(new_sid.clone());
+                }
+                self.session_replacements.push((old_sid, new_sid));
+            }
+            SessionStartOutcome::Failed(error) => {
+                self.phase = ChatPhase::Error(format!(
+                    "{}\n{}",
+                    Self::environment_refusal_notice(),
+                    crate::i18n::t_args("zc-chat-error-create-session", &[("error", &error)]),
+                ));
+            }
+            SessionStartOutcome::Cancelled => {}
+        }
+    }
+
     fn state_for_session_mut(&mut self, session_id: &str) -> Option<&mut ChatState> {
         if let ChatPhase::Active(ref mut state) = self.phase
             && state.session_id == session_id
@@ -1243,7 +1355,25 @@ impl Chat {
                 .iter()
                 .any(|entry| entry.session_id == session_id)
         {
-            return self.retry_retained_session(session_id).await;
+            // Switching from a refused notice to another retained entry
+            // demotes the refused one. If the switch fails, it goes back to
+            // being the focused entry, so its notice and recovery still work.
+            let demoted_refusal = if self.focused_environment_refusal() {
+                self.resume_focused
+                    .as_ref()
+                    .filter(|entry| entry.session_id != session_id)
+                    .map(|entry| entry.session_id.clone())
+            } else {
+                None
+            };
+            if demoted_refusal.is_some() {
+                self.demote_focused_resume_to_background();
+            }
+            let switched = self.retry_retained_session(session_id).await;
+            if !switched && let Some(refused_id) = demoted_refusal {
+                self.refocus_demoted_refusal(&refused_id);
+            }
+            return switched;
         }
         let Some(idx) = self
             .background
@@ -1252,6 +1382,13 @@ impl Chat {
         else {
             return false;
         };
+        // Leaving a refused restore notice for a working session: the refused
+        // entry stops being the focused one, so closing it later cannot
+        // replace the session the user switched to. A retained entry that is
+        // not on screen (a pending reconnect) keeps its slot.
+        if self.focused_environment_refusal() {
+            self.demote_focused_resume_to_background();
+        }
         let incoming = self.background.remove(idx);
         // Swap with the focused session; a non-Active phase (picker, error)
         // is simply replaced — clicking a session row leaves those flows.
@@ -1285,7 +1422,11 @@ impl Chat {
             return false;
         };
 
-        match self.attach_resume_entry(&entry).await {
+        if entry.environment_refused {
+            self.show_environment_refusal(entry);
+            return true;
+        }
+        match self.attach_resume_entry(&mut entry).await {
             Ok(state) => {
                 let needs_terminal_recovery = entry.interrupted || entry.recovery_required;
                 let resumed_id = state.session_id.clone();
@@ -1308,6 +1449,10 @@ impl Chat {
                 true
             }
             Err(error) => {
+                if entry.environment_refused {
+                    self.show_environment_refusal(entry);
+                    return true;
+                }
                 entry.was_focused = false;
                 self.resume_backgrounds.push(entry);
                 if let ChatPhase::Active(state) = &mut self.phase {
@@ -1338,10 +1483,19 @@ impl Chat {
             .background
             .iter()
             .position(|s| s.session_id == session_id);
-        let retained_was_focused = self
-            .resume_focused
-            .as_ref()
-            .is_some_and(|entry| entry.session_id == session_id);
+        // A refused entry owns the pane only while its notice is on screen.
+        // With a live session focused it is closed like a background row, so
+        // the live session stays put.
+        let retained_unfocused = matches!(self.phase, ChatPhase::Active(_))
+            && self
+                .resume_focused
+                .as_ref()
+                .is_some_and(|entry| entry.session_id == session_id && entry.environment_refused);
+        let retained_was_focused = !retained_unfocused
+            && self
+                .resume_focused
+                .as_ref()
+                .is_some_and(|entry| entry.session_id == session_id);
         let retained_background = self
             .resume_backgrounds
             .iter()
@@ -1349,6 +1503,7 @@ impl Chat {
         if !was_focused
             && in_background.is_none()
             && !retained_was_focused
+            && !retained_unfocused
             && retained_background.is_none()
         {
             return false;
@@ -1406,6 +1561,8 @@ impl Chat {
             self.background.remove(idx);
         } else if let Some(idx) = retained_background {
             self.resume_backgrounds.remove(idx);
+        } else if retained_unfocused {
+            self.resume_focused = None;
         } else {
             if retained_was_focused {
                 self.resume_focused = None;
@@ -1671,6 +1828,7 @@ impl Chat {
         // rebuild and its agent is still present, reattach to it automatically
         // rather than forcing the user back through the picker and minting a
         // fresh session. The resume id is consumed by `start_session`.
+        self.promote_resumable_background(&agents);
         if let Some(prior) = self
             .resume_focused
             .as_ref()
@@ -1719,6 +1877,32 @@ impl Chat {
 
         self.show_agent_picker(agents);
         Ok(ChatInitOutcome::Other)
+    }
+
+    /// When the focused resume's agent is no longer enabled, focus the first
+    /// retained background whose agent still is, so one disabled agent does
+    /// not hold back the rest of the pane. The unmatched entry stays retained
+    /// for a later retry.
+    fn promote_resumable_background(&mut self, agents: &[String]) {
+        let Some(focused) = self.resume_focused.as_ref() else {
+            return;
+        };
+        if agents.iter().any(|a| a == &focused.agent_alias) {
+            return;
+        }
+        let Some(idx) = self
+            .resume_backgrounds
+            .iter()
+            .position(|entry| agents.iter().any(|a| a == &entry.agent_alias))
+        else {
+            return;
+        };
+        let mut promoted = self.resume_backgrounds.remove(idx);
+        promoted.was_focused = true;
+        if let Some(mut previous) = self.resume_focused.replace(promoted) {
+            previous.was_focused = false;
+            self.resume_backgrounds.insert(0, previous);
+        }
     }
 
     fn show_agent_picker(&mut self, agents: Vec<String>) {
@@ -1792,6 +1976,7 @@ impl Chat {
             interrupted: false,
             recovery_required: false,
             turn_failed: false,
+            environment_refused: false,
             cleanup_notice: None,
         });
         self.pick_or_start_session(&agent_alias).await;
@@ -1812,6 +1997,23 @@ impl Chat {
         self.cancel_entry_retry();
         self.pick_or_start_session_inner(agent_alias, None, None)
             .await;
+    }
+
+    /// Undo a refusal demotion after a failed switch: the refused entry
+    /// becomes the focused entry again while its notice is still on screen.
+    fn refocus_demoted_refusal(&mut self, session_id: &str) {
+        if self.resume_focused.is_some() || !matches!(self.phase, ChatPhase::Error(_)) {
+            return;
+        }
+        if let Some(idx) = self
+            .resume_backgrounds
+            .iter()
+            .position(|entry| entry.session_id == session_id)
+        {
+            let mut entry = self.resume_backgrounds.remove(idx);
+            entry.was_focused = true;
+            self.resume_focused = Some(entry);
+        }
     }
 
     /// Give up the focused-resume slot before a session start that must *not*
@@ -2075,6 +2277,9 @@ impl Chat {
     }
 
     pub(crate) async fn refresh_if_inactive(&mut self) {
+        if self.focused_environment_refusal() {
+            return;
+        }
         if should_retry_on_entry(&self.phase) {
             let _ = self.init().await;
         } else if !self.resume_backgrounds.is_empty() {
@@ -2088,7 +2293,10 @@ impl Chat {
         if self.pane_kind != PaneKind::Chat {
             return;
         }
-        if self.entry_retry_attempt.is_some() || !should_retry_on_entry(&self.phase) {
+        if self.entry_retry_attempt.is_some()
+            || self.focused_environment_refusal()
+            || !should_retry_on_entry(&self.phase)
+        {
             return;
         }
 
@@ -2163,7 +2371,9 @@ impl Chat {
                     return;
                 }
 
-                if matches!(result.chat.phase, ChatPhase::Error(_)) {
+                if matches!(result.chat.phase, ChatPhase::Error(_))
+                    && !result.chat.focused_environment_refusal()
+                {
                     if matches!(self.phase, ChatPhase::Error(_))
                         || result.init_outcome == ChatInitOutcome::NoEnabledAgents
                     {
@@ -2416,10 +2626,20 @@ impl Chat {
             }
             Err(e) => {
                 let error = e.to_string();
-                self.phase = ChatPhase::Error(crate::i18n::t_args(
-                    "zc-chat-error-create-session",
-                    &[("error", &error)],
-                ));
+                if resume.is_some() && is_session_environment_refusal(&e) {
+                    if let Some(entry) = &mut self.resume_focused {
+                        entry.environment_refused = true;
+                        if !self.session_order.contains(&entry.session_id) {
+                            self.session_order.push(entry.session_id.clone());
+                        }
+                    }
+                    self.phase = ChatPhase::Error(Self::environment_refusal_notice());
+                } else {
+                    self.phase = ChatPhase::Error(crate::i18n::t_args(
+                        "zc-chat-error-create-session",
+                        &[("error", &error)],
+                    ));
+                }
                 SessionStartOutcome::Failed(error)
             }
         };
@@ -2442,14 +2662,15 @@ impl Chat {
         // retained background that can. Failures stay queued for a later
         // reconnect instead of being retried repeatedly in this same pass.
         if start_error_notice.is_some()
+            && !self.focused_environment_refusal()
             && self.background.is_empty()
             && !self.resume_backgrounds.is_empty()
         {
             let entries = std::mem::take(&mut self.resume_backgrounds);
             let mut retained = Vec::new();
             let mut entries = entries.into_iter();
-            while let Some(entry) = entries.next() {
-                match self.attach_resume_entry(&entry).await {
+            while let Some(mut entry) = entries.next() {
+                match self.attach_resume_entry(&mut entry).await {
                     Ok(state) => {
                         let session_id = state.session_id.clone();
                         let needs_terminal_recovery = entry.interrupted || entry.recovery_required;
@@ -2472,11 +2693,11 @@ impl Chat {
             self.resume_backgrounds = retained;
         }
 
-        if matches!(self.phase, ChatPhase::Active(_)) {
+        if matches!(self.phase, ChatPhase::Active(_)) || self.focused_environment_refusal() {
             let entries = std::mem::take(&mut self.resume_backgrounds);
             let mut retained = Vec::new();
-            for entry in entries {
-                if failed_this_start.contains(&entry.session_id) {
+            for mut entry in entries {
+                if entry.environment_refused || failed_this_start.contains(&entry.session_id) {
                     retained.push(entry);
                     continue;
                 }
@@ -2491,7 +2712,7 @@ impl Chat {
                 {
                     continue;
                 }
-                match self.attach_resume_entry(&entry).await {
+                match self.attach_resume_entry(&mut entry).await {
                     Ok(state) => {
                         let session_id = state.session_id.clone();
                         let needs_terminal_recovery = entry.interrupted || entry.recovery_required;
@@ -2533,6 +2754,7 @@ impl Chat {
         // focused one and surface the error as a notice instead of taking
         // over the pane with the Error screen.
         if let ChatPhase::Error(msg) = &self.phase
+            && !self.focused_environment_refusal()
             && !self.background.is_empty()
         {
             let msg = msg.clone();
@@ -2551,7 +2773,7 @@ impl Chat {
         &self,
         agent_alias: &str,
         session_id: &str,
-    ) -> Result<ChatState, String> {
+    ) -> anyhow::Result<ChatState> {
         let result = if self.pane_kind == PaneKind::Acp {
             self.rpc
                 .session_new_acp(agent_alias, None, Some(session_id))
@@ -2561,7 +2783,7 @@ impl Chat {
                 .session_new_with_id(agent_alias, None, Some(session_id))
                 .await
         };
-        let session = result.map_err(|e| e.to_string())?;
+        let session = result?;
         let todo_fallback = match &self.phase {
             ChatPhase::Active(state) => state.todo_tracker.settings(),
             _ => self
@@ -2579,12 +2801,7 @@ impl Chat {
         state.message_count = session.message_count;
         state.cwd = session.workspace_dir;
         Self::refresh_model_identity(&self.rpc, &mut state).await;
-        let msgs = match self.rpc.session_messages(session_id).await {
-            Ok(messages) => messages,
-            Err(error) => {
-                return Err(error.to_string());
-            }
-        };
+        let msgs = self.rpc.session_messages(session_id).await?;
         state.message_count = msgs.total;
         state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
         Ok(state)
@@ -2592,10 +2809,18 @@ impl Chat {
 
     /// Reattach one reconnect entry, restoring only the client-owned queue
     /// after the daemon-owned transcript has been reloaded.
-    async fn attach_resume_entry(&self, entry: &ResumeEntry) -> Result<ChatState, String> {
-        let mut state = self
+    async fn attach_resume_entry(&self, entry: &mut ResumeEntry) -> Result<ChatState, String> {
+        let mut state = match self
             .attach_session(&entry.agent_alias, &entry.session_id)
-            .await?;
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                entry.environment_refused = is_session_environment_refusal(&error);
+                return Err(error.to_string());
+            }
+        };
+        entry.environment_refused = false;
         state.restore_reconnect_state(
             entry.queue.clone(),
             entry.interrupted,
@@ -3910,6 +4135,7 @@ impl Chat {
             state.advance_transcript_edge_drag();
         }
 
+        let environment_refused = self.focused_environment_refusal();
         match &mut self.phase {
             ChatPhase::PickAgent {
                 agents,
@@ -3950,7 +4176,23 @@ impl Chat {
                 render_with_plan_placement(frame, state, area, self.pane_kind, plan_placement);
             }
             ChatPhase::Error(msg) => {
-                draw_error(frame, area, msg, &self.pane_kind.name());
+                if environment_refused {
+                    let keys =
+                        crate::keymap::action_key_labels(crate::keymap::ChatTabAction::NewSession)
+                            .join(" / ");
+                    let hint = crate::i18n::t_args("zc-chat-restore-start-new", &[("key", &keys)]);
+                    let block = Block::default()
+                        .title(self.pane_kind.name())
+                        .borders(Borders::ALL);
+                    frame.render_widget(
+                        Paragraph::new(format!("{msg}\n\n{hint}"))
+                            .block(block)
+                            .wrap(Wrap { trim: false }),
+                        area,
+                    );
+                } else {
+                    draw_error(frame, area, msg, &self.pane_kind.name());
+                }
             }
         }
 
@@ -3985,6 +4227,13 @@ impl Chat {
                 == Some(crate::keymap::ChatTabAction::TodoToggle)
         {
             self.plan_toggle_requested = true;
+            return false;
+        }
+        if self.focused_environment_refusal()
+            && crate::keymap::ChatTabAction::from_chord(&key)
+                == Some(crate::keymap::ChatTabAction::NewSession)
+        {
+            self.replace_refused_session().await;
             return false;
         }
         // Determine which phase we're in without holding a borrow on self.
@@ -4873,7 +5122,11 @@ impl Chat {
         }
         let agent_alias = entry.agent_alias.unwrap_or(fallback_alias);
 
-        if self.background.iter().any(|s| s.session_id == new_sid) {
+        if self
+            .session_summaries()
+            .iter()
+            .any(|row| row.session_id == new_sid)
+        {
             self.focus_session(&new_sid).await;
             return;
         }
@@ -4898,10 +5151,19 @@ impl Chat {
                 self.phase = ChatPhase::Active(Box::new(state));
             }
             Err(e) => {
-                if let ChatPhase::Active(ref mut state) = self.phase {
-                    state.info_message = Some(crate::widgets::InfoMessage::error(
-                        crate::i18n::t_args("zc-chat-session-switch-error", &[("error", &e)]),
-                    ));
+                if is_session_environment_refusal(&e) {
+                    let mut entry = ResumeEntry::saved(new_sid.clone(), agent_alias, true);
+                    entry.environment_refused = true;
+                    if !self.session_order.contains(&new_sid) {
+                        self.session_order.push(new_sid);
+                    }
+                    self.show_environment_refusal(entry);
+                } else if let ChatPhase::Active(ref mut state) = self.phase {
+                    state.info_message =
+                        Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                            "zc-chat-session-switch-error",
+                            &[("error", &e.to_string())],
+                        )));
                     state.mark_dirty_full();
                 }
             }
@@ -6030,6 +6292,13 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                     E::desc(crate::i18n::t("zc-chat-help-acp-memory")),
                 ])
+            }
+            ChatPhase::Error(_) if self.focused_environment_refusal() => {
+                use crate::keymap::{ChatTabAction as C, action_key_labels};
+                HelpNode::entries(vec![E::new(
+                    action_key_labels(C::NewSession),
+                    crate::i18n::t("zc-chat-restore-new-conversation"),
+                )])
             }
             ChatPhase::Error(_) => {
                 use crate::keymap::{ChatTabAction as C, GlobalAction, action_key_labels};
@@ -13469,6 +13738,7 @@ mod tests {
             interrupted: false,
             recovery_required: false,
             turn_failed: false,
+            environment_refused: false,
             cleanup_notice: None,
         }
     }
@@ -17376,6 +17646,78 @@ mod tests {
             "failed resume entries stay available for a later reconnect retry"
         );
         assert!(matches!(chat.phase, ChatPhase::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn a_disabled_focused_agent_does_not_block_the_other_resumes() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.set_resume_sessions(vec![
+            resume_entry("sess-ghost", "ghost", true),
+            resume_entry("sess-alpha", "alpha", false),
+        ]);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "ghost", "enabled": false, "live_sessions": 0, "persisted_sessions": 1},
+                    {"alias": "alpha", "enabled": true, "live_sessions": 1, "persisted_sessions": 1},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        // Fail every later request; record which sessions init tries.
+        let mut attached = Vec::new();
+        let chat = loop {
+            if init.is_finished() {
+                break init.await.unwrap();
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(line)) => {
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if request["method"] == method::SESSION_NEW {
+                        attached.push(
+                            request["params"]["session_id"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                    }
+                    respond_err(&rpc, &request, -32000, "stop here");
+                }
+                _ => {
+                    if !init.is_finished() {
+                        panic!("init stalled; attached so far: {attached:?}");
+                    }
+                }
+            }
+        };
+        assert_eq!(
+            attached.first().map(String::as_str),
+            Some("sess-alpha"),
+            "the enabled background is resumed first"
+        );
+        let retained: Vec<_> = chat
+            .resume_focused
+            .iter()
+            .chain(chat.resume_backgrounds.iter())
+            .map(|entry| entry.session_id.as_str())
+            .collect();
+        assert!(
+            retained.contains(&"sess-ghost"),
+            "the disabled agent's session stays retained for a later retry"
+        );
     }
 
     #[tokio::test]
@@ -23152,6 +23494,745 @@ mod tests {
         // it to wherever this zerocode process was launched.
         assert!(request["params"]["cwd"].is_null());
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn saved_open_sessions_attach_exactly_the_restore_cap() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for cap in [1, 4, MAX_TRACKED_SESSIONS_PER_PANE] {
+                let rows: Vec<_> = (0..=cap)
+                    .map(|i| SidebarSessionSummary {
+                        session_id: format!("saved-{i}"),
+                        agent_alias: "alpha".into(),
+                        message_count: 0,
+                        status: SidebarStatus::Ready,
+                        pane_kind: pane,
+                        focused: i == 0,
+                    })
+                    .collect();
+                let snapshot = crate::open_sessions::Snapshot::from_rows(&rows, Some(pane));
+                let (chat_entries, code_entries) = snapshot.resume_entries(cap);
+                let (tx, mut rx) = mpsc::channel::<String>(16);
+                let rpc = Arc::new(RpcOutbound::new(tx));
+                let client = Arc::new(RpcClient::with_rpc_transport(
+                    Arc::clone(&rpc),
+                    crate::client::Transport::Local,
+                ));
+                let mut chat = Chat::new(client, pane);
+                chat.launch_dir =
+                    || panic!("a restored session must not read the launch directory");
+                chat.set_resume_sessions(match pane {
+                    PaneKind::Chat => chat_entries,
+                    PaneKind::Acp => code_entries,
+                });
+                let task = tokio::spawn(async move {
+                    chat.init().await.unwrap();
+                    chat
+                });
+                let request = next_rpc_request(&mut rx, "restore requests enabled agents").await;
+                assert_eq!(request["method"], method::AGENTS_STATUS);
+                respond_ok(
+                    &rpc,
+                    &request,
+                    serde_json::json!({ "agents": [
+                        {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": cap + 1}
+                    ]}),
+                );
+                for i in 0..cap {
+                    let id = format!("saved-{i}");
+                    let request = next_rpc_request(&mut rx, "restore attaches a saved id").await;
+                    assert_eq!(request["method"], method::SESSION_NEW);
+                    assert_eq!(request["params"]["session_id"], id);
+                    assert!(request["params"]["cwd"].is_null());
+                    respond_ok(&rpc, &request, serde_json::json!({ "session_id": id }));
+                    let request =
+                        next_rpc_request(&mut rx, "restore resolves model identity").await;
+                    assert_eq!(request["method"], method::CONFIG_LIST);
+                    respond_ok(&rpc, &request, serde_json::json!([]));
+                    let request = next_rpc_request(&mut rx, "restore reloads the transcript").await;
+                    assert_eq!(request["method"], method::SESSION_MESSAGES);
+                    respond_ok(&rpc, &request, serde_json::json!({ "messages": [] }));
+                }
+                let chat = tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .expect("restore must finish without attaching the extra saved entry")
+                    .unwrap();
+                assert_eq!(chat.tracked_session_count(), cap);
+                assert_eq!(chat.session_summaries().len(), cap);
+                assert!(rx.try_recv().is_err(), "restore must not attach cap + 1");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_open_sessions_reattach_by_id_at_launch() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.launch_dir = || panic!("a restored session must not read the launch directory");
+        chat.set_resume_sessions(vec![
+            ResumeEntry::saved("sess-a".into(), "alpha".into(), false),
+            ResumeEntry::saved("sess-b".into(), "alpha".into(), true),
+        ]);
+        let task = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "agents": [
+                {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 2},
+                {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+            ]}),
+        );
+        // The focused saved session reattaches first, by id, with no cwd and
+        // no session picker in between.
+        let request = next_rpc_request(&mut rx, "the focused saved session reattaches").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-b");
+        assert!(request["params"]["cwd"].is_null());
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// Exercise the saved-snapshot startup path with one rejected attachment
+    /// and one successful attachment, not an injected UI error state.
+    async fn restore_with_refused_entry(
+        pane: PaneKind,
+        refuse_focused: bool,
+        code: i32,
+        message: &str,
+    ) -> (Chat, Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let rows = [
+            SidebarSessionSummary {
+                session_id: "saved-bg".into(),
+                agent_alias: "beta".into(),
+                message_count: 2,
+                status: SidebarStatus::Ready,
+                pane_kind: pane,
+                focused: false,
+            },
+            SidebarSessionSummary {
+                session_id: "saved-focused".into(),
+                agent_alias: "alpha".into(),
+                message_count: 3,
+                status: SidebarStatus::Ready,
+                pane_kind: pane,
+                focused: true,
+            },
+        ];
+        let snapshot = crate::open_sessions::Snapshot::from_rows(&rows, Some(pane));
+        let (chat_entries, code_entries) = snapshot.resume_entries(MAX_TRACKED_SESSIONS_PER_PANE);
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            rpc.clone(),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, pane);
+        chat.set_resume_sessions(match pane {
+            PaneKind::Chat => chat_entries,
+            PaneKind::Acp => code_entries,
+        });
+        let task = tokio::spawn(async move {
+            chat.init().await.unwrap();
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "restore lists enabled agents").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"agents": [
+                {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 1},
+                {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 1}
+            ]}),
+        );
+        for (id, alias, refused) in [
+            ("saved-focused", "alpha", refuse_focused),
+            ("saved-bg", "beta", !refuse_focused),
+        ] {
+            let request = next_rpc_request(&mut rx, "restore attaches the saved ID").await;
+            assert_eq!(request["method"], method::SESSION_NEW);
+            assert_eq!(request["params"]["session_id"], id);
+            assert_eq!(request["params"]["agent_alias"], alias);
+            assert!(request["params"]["cwd"].is_null());
+            if refused {
+                respond_err(&rpc, &request, code, message);
+            } else {
+                respond_ok(&rpc, &request, serde_json::json!({"session_id": id}));
+                let request = next_rpc_request(&mut rx, "restore refreshes model identity").await;
+                assert_eq!(request["method"], method::CONFIG_LIST);
+                respond_ok(&rpc, &request, serde_json::json!([]));
+                let request = next_rpc_request(&mut rx, "restore replays history").await;
+                assert_eq!(request["method"], method::SESSION_MESSAGES);
+                respond_ok(&rpc, &request, serde_json::json!({"messages": []}));
+            }
+        }
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("restore completes without an automatic replacement")
+            .unwrap();
+        (chat, rpc, rx)
+    }
+
+    fn rendered_restore_pane(chat: &mut Chat) -> String {
+        let area = Rect::new(0, 0, 100, 20);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .unwrap();
+        terminal.draw(|frame| chat.draw(frame, area)).unwrap();
+        overlay_text(&terminal, Rect::new(1, 1, area.width - 2, area.height - 2))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn assert_restore_notice_visible(chat: &mut Chat) {
+        let text = rendered_restore_pane(chat);
+        let notice = crate::i18n::t("zc-chat-restore-environment-refused");
+        let compact_text: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let compact_notice: String = notice.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact_text.contains(&compact_notice), "{text}");
+        let keys =
+            crate::keymap::action_key_labels(crate::keymap::ChatTabAction::NewSession).join(" / ");
+        let hint = crate::i18n::t_args("zc-chat-restore-start-new", &[("key", &keys)]);
+        let compact_hint: String = hint.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact_text.contains(&compact_hint), "{text}");
+    }
+
+    #[tokio::test]
+    async fn focused_restored_environment_refusal_keeps_slot_focus_and_notice() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for message in [
+                "Session environment differs from the current terminal",
+                "Session retains a local operator environment unavailable here",
+            ] {
+                let (mut chat, _rpc, mut rx) =
+                    restore_with_refused_entry(pane, true, -32012, message).await;
+                let rows = chat.session_summaries();
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row.session_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["saved-bg", "saved-focused"]
+                );
+                assert!(!rows[0].focused);
+                assert!(
+                    rows[1].focused,
+                    "the refused entry must keep focus instead of promoting a background"
+                );
+                assert_eq!(chat.session_order, ["saved-bg", "saved-focused"]);
+                let snapshot = crate::open_sessions::Snapshot::from_rows(&rows, Some(pane));
+                assert_eq!(snapshot.sessions[1].session_id, "saved-focused");
+                assert!(snapshot.sessions[1].focused);
+                assert_restore_notice_visible(&mut chat);
+                chat.refresh_if_inactive().await;
+                chat.start_entry_retry();
+                assert!(chat.entry_retry_attempt.is_none());
+                assert_no_rpc_request(
+                    &mut rx,
+                    "refusal and pane re-entry must not start a new conversation",
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_refused_entry_after_switching_away_keeps_the_working_session() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            let (mut chat, rpc, mut rx) = restore_with_refused_entry(
+                pane,
+                true,
+                -32012,
+                "Session environment differs from the current terminal",
+            )
+            .await;
+            assert!(matches!(chat.phase, ChatPhase::Error(_)));
+            assert!(chat.focus_session("saved-bg").await);
+            assert_eq!(chat.current_session_id(), Some("saved-bg"));
+            let rows = chat.session_summaries();
+            assert!(
+                rows.iter()
+                    .any(|row| row.session_id == "saved-focused" && !row.focused),
+                "the refused row stays listed but loses focus"
+            );
+
+            let close = tokio::spawn(async move {
+                let closed = chat.close_session("saved-focused").await;
+                (chat, closed)
+            });
+            let request = next_rpc_request(&mut rx, "closing the refused row closes it").await;
+            assert_eq!(request["method"], method::SESSION_CLOSE);
+            assert_eq!(request["params"]["session_id"], "saved-focused");
+            respond_ok(&rpc, &request, serde_json::json!({}));
+            let (mut chat, closed) = tokio::time::timeout(Duration::from_secs(2), close)
+                .await
+                .expect("close completes")
+                .unwrap();
+            assert!(closed);
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("the working session must stay on screen");
+            };
+            assert_eq!(state.session_id, "saved-bg");
+            assert_eq!(
+                chat.session_summaries()
+                    .iter()
+                    .map(|row| row.session_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["saved-bg"]
+            );
+            assert_no_rpc_request(&mut rx, "closing the refused row sends nothing else").await;
+            let _ = &mut chat;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_switch_from_a_refused_notice_keeps_the_refused_entry_focused() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            let (mut chat, rpc, mut rx) = restore_with_refused_entry(
+                pane,
+                true,
+                -32012,
+                "Session environment differs from the current terminal",
+            )
+            .await;
+            assert!(chat.focused_environment_refusal());
+            // Another retained entry that is still waiting to reattach.
+            let mut other = chat.resume_focused.clone().expect("refused entry");
+            other.session_id = "saved-other".into();
+            other.environment_refused = false;
+            other.was_focused = false;
+            chat.resume_backgrounds.push(other);
+
+            let switch = tokio::spawn(async move {
+                let switched = chat.focus_session("saved-other").await;
+                (chat, switched)
+            });
+            let request = next_rpc_request(&mut rx, "the switch tries to attach").await;
+            assert_eq!(request["method"], method::SESSION_NEW);
+            assert_eq!(request["params"]["session_id"], "saved-other");
+            respond_err(&rpc, &request, -32603, "daemon unavailable");
+            let (mut chat, switched) = tokio::time::timeout(Duration::from_secs(2), switch)
+                .await
+                .expect("switch completes")
+                .unwrap();
+            assert!(!switched);
+            assert!(
+                chat.focused_environment_refusal(),
+                "a failed switch must leave the refused entry focused"
+            );
+            let focused = chat.resume_focused.as_ref().unwrap();
+            assert_eq!(focused.session_id, "saved-focused");
+            assert!(focused.was_focused);
+            assert!(
+                chat.resume_backgrounds
+                    .iter()
+                    .any(|entry| entry.session_id == "saved-other")
+            );
+            assert_restore_notice_visible(&mut chat);
+        }
+    }
+
+    #[tokio::test]
+    async fn background_restored_environment_refusal_keeps_slot_and_opens_notice_on_focus() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for message in [
+                "Session environment differs from the current terminal",
+                "Session retains a local operator environment unavailable here",
+            ] {
+                let (mut chat, _rpc, mut rx) =
+                    restore_with_refused_entry(pane, false, -32012, message).await;
+                assert_eq!(chat.current_session_id(), Some("saved-focused"));
+                let rows = chat.session_summaries();
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row.session_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["saved-bg", "saved-focused"]
+                );
+                assert!(!rows[0].focused);
+                assert!(rows[1].focused);
+                assert_no_rpc_request(
+                    &mut rx,
+                    "a background refusal must not create another session",
+                )
+                .await;
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(2), chat.focus_session("saved-bg"))
+                        .await
+                        .expect("selecting a refused row must show its notice without another RPC")
+                );
+                assert!(chat.session_summaries()[0].focused);
+                assert_restore_notice_visible(&mut chat);
+                assert_no_rpc_request(
+                    &mut rx,
+                    "selecting the refused row is not consent to replacement",
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_environment_refusal_new_conversation_replaces_only_the_selected_slot() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        use crate::keymap::{ChatTabAction, RebindableActions};
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for refuse_focused in [true, false] {
+                let (mut chat, rpc, mut rx) = restore_with_refused_entry(
+                    pane,
+                    refuse_focused,
+                    -32012,
+                    "Session environment differs",
+                )
+                .await;
+                let (old_id, alias) = if refuse_focused {
+                    ("saved-focused", "alpha")
+                } else {
+                    assert!(chat.focus_session("saved-bg").await);
+                    ("saved-bg", "beta")
+                };
+                let other_pane = if pane == PaneKind::Chat {
+                    PaneKind::Acp
+                } else {
+                    PaneKind::Chat
+                };
+                let other_row = SidebarSessionSummary {
+                    session_id: "other-pane".into(),
+                    agent_alias: "gamma".into(),
+                    message_count: 0,
+                    status: SidebarStatus::Ready,
+                    pane_kind: other_pane,
+                    focused: true,
+                };
+                let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+                sidebar.restore_order(vec![
+                    (pane, "saved-bg".into()),
+                    (other_pane, "other-pane".into()),
+                    (pane, "saved-focused".into()),
+                ]);
+                let chord = ChatTabAction::NewSession.resolved()[0].clone();
+                let key = KeyEvent::new(chord.code, chord.effective_modifiers());
+                let task = tokio::spawn(async move {
+                    let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                        crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                        ratatui::TerminalOptions {
+                            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                        },
+                    )
+                    .unwrap();
+                    assert!(!chat.handle_key(key, &mut term).await);
+                    chat
+                });
+                let request =
+                    next_rpc_request(&mut rx, "explicit recovery creates a fresh session").await;
+                assert_eq!(request["method"], method::SESSION_NEW);
+                assert!(request["params"]["session_id"].is_null());
+                assert_eq!(request["params"]["agent_alias"], alias);
+                assert_eq!(request["params"]["keep_siblings"], true);
+                if pane == PaneKind::Acp {
+                    assert_eq!(request["params"]["chat_mode"], "acp");
+                    assert_eq!(request["params"]["exclude_memory"], true);
+                    assert_eq!(request["params"]["interaction_surface"], "zerocode_code");
+                } else {
+                    assert!(request["params"]["chat_mode"].is_null());
+                    assert!(request["params"]["exclude_memory"].is_null());
+                }
+                respond_ok(
+                    &rpc,
+                    &request,
+                    serde_json::json!({"session_id": "fresh-id"}),
+                );
+                let request =
+                    next_rpc_request(&mut rx, "fresh conversation refreshes model identity").await;
+                assert_eq!(request["method"], method::CONFIG_LIST);
+                respond_ok(&rpc, &request, serde_json::json!([]));
+                let mut chat = tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(chat.current_session_id(), Some("fresh-id"));
+                assert!(
+                    !chat
+                        .resume_entries()
+                        .iter()
+                        .any(|entry| entry.session_id == old_id)
+                );
+                let expected = if refuse_focused {
+                    ["saved-bg", "fresh-id"]
+                } else {
+                    ["fresh-id", "saved-focused"]
+                };
+                assert_eq!(chat.session_order, expected);
+                let replacements = chat.take_session_replacements();
+                assert_eq!(replacements, [(old_id.to_string(), "fresh-id".to_string())]);
+                for (old, new) in replacements {
+                    sidebar.replace_session_id(pane, &old, new);
+                }
+                let mut rows = chat.session_summaries();
+                rows.push(other_row);
+                sidebar.sort_in_display_order(&mut rows);
+                let snapshot = crate::open_sessions::Snapshot::from_rows(&rows, Some(pane));
+                assert_eq!(
+                    snapshot
+                        .sessions
+                        .iter()
+                        .map(|entry| entry.session_id.as_str())
+                        .collect::<Vec<_>>(),
+                    [expected[0], "other-pane", expected[1]]
+                );
+                assert!(
+                    snapshot
+                        .sessions
+                        .iter()
+                        .find(|entry| entry.session_id == "fresh-id")
+                        .unwrap()
+                        .focused
+                );
+                assert_no_rpc_request(
+                    &mut rx,
+                    "replacement must neither close the old conversation nor replay its history",
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_refused_session_replacement_keeps_saved_id_and_notice() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            let (mut chat, rpc, mut rx) = restore_with_refused_entry(
+                pane,
+                true,
+                -32012,
+                "Session retains a local operator environment",
+            )
+            .await;
+            let task = tokio::spawn(async move {
+                chat.replace_refused_session().await;
+                chat
+            });
+            let request =
+                next_rpc_request(&mut rx, "explicit replacement attempts a fresh ID").await;
+            assert!(request["params"]["session_id"].is_null());
+            respond_err(&rpc, &request, -32603, "creation failed");
+            let mut chat = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(chat.session_order, ["saved-bg", "saved-focused"]);
+            assert!(chat.session_summaries()[1].focused);
+            assert!(chat.take_session_replacements().is_empty());
+            assert_restore_notice_visible(&mut chat);
+            assert!(rendered_restore_pane(&mut chat).contains("creation failed"));
+            assert_no_rpc_request(
+                &mut rx,
+                "failed recovery must keep the refused conversation",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_forbidden_restore_keeps_existing_error_behaviour() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for refuse_focused in [true, false] {
+                let (mut chat, _rpc, mut rx) = restore_with_refused_entry(
+                    pane,
+                    refuse_focused,
+                    -32012,
+                    "Caller cannot access this session",
+                )
+                .await;
+                // An ordinary focused failure still promotes a healthy background.
+                assert_eq!(
+                    chat.current_session_id(),
+                    Some(if refuse_focused {
+                        "saved-bg"
+                    } else {
+                        "saved-focused"
+                    })
+                );
+                assert!(!chat.focused_environment_refusal());
+                assert!(
+                    chat.resume_focused
+                        .iter()
+                        .chain(chat.resume_backgrounds.iter())
+                        .all(|entry| !entry.environment_refused)
+                );
+                let text = rendered_restore_pane(&mut chat);
+                assert!(!text.contains(&crate::i18n::t("zc-chat-restore-environment-refused")));
+                assert!(!text.contains(&crate::i18n::t("zc-chat-restore-new-conversation")));
+                assert_no_rpc_request(
+                    &mut rx,
+                    "other FORBIDDEN errors must not trigger replacement",
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_picker_environment_refusal_keeps_selected_entry_and_notice() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for startup_picker in [true, false] {
+                let (tx, mut rx) = mpsc::channel::<String>(16);
+                let rpc = Arc::new(RpcOutbound::new(tx));
+                let client = Arc::new(RpcClient::with_rpc_transport(
+                    rpc.clone(),
+                    crate::client::Transport::Local,
+                ));
+                let mut chat = Chat::new(client, pane);
+                if !startup_picker {
+                    chat.phase = ChatPhase::Active(Box::new(state_for("existing", "alpha")));
+                    chat.session_order.push("existing".into());
+                }
+                let entry = SessionEntry {
+                    session_id: "picker-saved".into(),
+                    session_key: "picker-saved".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    last_activity: "2026-01-01T00:00:00Z".into(),
+                    message_count: 3,
+                    agent_alias: Some("beta".into()),
+                    channel_id: None,
+                    name: None,
+                };
+                let task = tokio::spawn(async move {
+                    if startup_picker {
+                        chat.resume_session_entry(entry).await;
+                    } else {
+                        chat.switch_to_session_entry(entry).await;
+                    }
+                    chat
+                });
+                let request =
+                    next_rpc_request(&mut rx, "picker reattaches the selected saved conversation")
+                        .await;
+                assert_eq!(request["method"], method::SESSION_NEW);
+                assert_eq!(request["params"]["session_id"], "picker-saved");
+                respond_err(&rpc, &request, -32012, "Session environment differs");
+                let mut chat = tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let rows = chat.session_summaries();
+                assert_eq!(rows.last().unwrap().session_id, "picker-saved");
+                assert!(rows.last().unwrap().focused);
+                if !startup_picker {
+                    assert_eq!(rows[0].session_id, "existing");
+                }
+                assert_restore_notice_visible(&mut chat);
+                assert_no_rpc_request(
+                    &mut rx,
+                    "picker refusal must not automatically replace the session",
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_entry_retry_adopts_restored_environment_refusal_action() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            rpc.clone(),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Error("previous attachment failed".into());
+        chat.set_resume_sessions(vec![ResumeEntry::saved(
+            "saved-focused".into(),
+            "alpha".into(),
+            true,
+        )]);
+        chat.start_entry_retry();
+        let request = next_rpc_request(&mut rx, "entry retry lists enabled agents").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"agents": [
+                {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 1}
+            ]}),
+        );
+        let request = next_rpc_request(&mut rx, "entry retry uses the saved ID").await;
+        assert_eq!(request["params"]["session_id"], "saved-focused");
+        respond_err(&rpc, &request, -32012, "Session environment differs");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.entry_retry_attempt.is_some() {
+                chat.drain_entry_retry_results();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("entry retry completes");
+        assert!(chat.focused_environment_refusal());
+        assert!(chat.session_summaries()[0].focused);
+        assert_restore_notice_visible(&mut chat);
+        assert_no_rpc_request(&mut rx, "entry retry must retain the refused ID").await;
+    }
+
+    #[test]
+    fn restored_environment_refusal_requires_typed_code_and_specific_message() {
+        for (code, message, expected) in [
+            (-32012, "Session environment differs: changed", true),
+            (
+                -32012,
+                "Session retains a local operator environment: denied",
+                true,
+            ),
+            (-32012, "Caller cannot access this session", false),
+            (-32603, "Session environment differs", false),
+        ] {
+            let error = anyhow::Error::new(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            });
+            assert_eq!(is_session_environment_refusal(&error), expected);
+        }
+        let error = anyhow::Error::msg("Session environment differs (-32012)");
+        assert!(!is_session_environment_refusal(&error));
     }
 
     #[tokio::test]

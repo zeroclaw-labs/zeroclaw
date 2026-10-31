@@ -455,6 +455,9 @@ zc-chat-elicitation-dropped = Se descartó una pregunta del agente antes de pode
 zc-chat-session-restarted = Nueva sesión iniciada.
 zc-chat-session-cap = Límite de sesiones de este panel alcanzado ({ $max }). Cierra antes una sesión desde la barra lateral.
 zc-chat-resume-dropped = No se pudieron reconectar { $count } sesión(es) anteriores y se conservaron para reintentarlo.
+zc-app-restore-sessions-dropped = { $count } sesión(es) guardada(s) ya no existe(n) y no se reabrieron.
+zc-app-restore-sessions-save-failed = No se pudo guardar la lista de sesiones abiertas: { $error }
+zc-app-restore-sessions-other-window = { $count } sesión(es) guardada(s) están abiertas en otra ventana de zerocode y no se reabrieron aquí.
 zc-chat-reconnect-interrupted = Se restableció la conexión y se conservaron los mensajes en cola. Esperando a que termine el turno anterior antes de recargar la conversación persistente.
 zc-chat-resyncing = Se perdieron algunas actualizaciones en vivo. Recargando esta sesión antes de enviar mensajes en cola…
 zc-chat-resynced = Se perdieron actualizaciones en vivo, por lo que se recargó la conversación persistente. Se canceló cualquier aprobación o pregunta en curso.
@@ -706,3 +709,7 @@ zc-config-section-peer-groups-help = Grupos con nombre que vinculan un canal, ag
 zc-config-section-cron-help = Tareas programadas que vinculan un horario con un prompt, un canal y un destino.
 zc-config-section-tunnel-help = Expón opcionalmente la puerta de enlace mediante Cloudflare o ngrok, o mantenla solo local.
 zc-config-section-onboard-state-help = Estado del ciclo de vida del inicio rápido y su registro heredado de finalización por sección.
+
+zc-chat-restore-environment-refused = No se puede volver a conectar esta sesión guardada desde el entorno de este terminal. El demonio conserva la conversación anterior. Al iniciar una conversación nueva, esta pestaña se sustituirá por una conversación vacía.
+zc-chat-restore-start-new = Pulsa { $key } para iniciar una conversación nueva.
+zc-chat-restore-new-conversation = Iniciar una conversación nueva

@@ -455,6 +455,9 @@ zc-chat-elicitation-dropped = エージェントからの質問が表示され�
 zc-chat-session-restarted = 新しいセッションを開始しました。
 zc-chat-session-cap = このペインのセッション上限（{ $max }）に達しました。先にサイドバーからセッションを閉じてください。
 zc-chat-resume-dropped = 以前のセッション { $count } 件を再接続できなかったため、再試行用に保持しました。
+zc-app-restore-sessions-dropped = 保存済みのセッション { $count } 件は存在しないため、再度開きませんでした。
+zc-app-restore-sessions-save-failed = 開いているセッションの一覧を保存できませんでした: { $error }
+zc-app-restore-sessions-other-window = 保存済みのセッション { $count } 件は別の zerocode ウィンドウで開かれているため、ここでは再度開きませんでした。
 zc-chat-reconnect-interrupted = 接続を再構築し、キュー内のメッセージを保持しました。以前のターンが停止してから永続化された会話を再読み込みします。
 zc-chat-resyncing = 一部のライブ更新を受信できませんでした。キュー内のメッセージを送信する前に、このセッションを再読み込みしています…
 zc-chat-resynced = ライブ更新を受信できなかったため、永続化された会話を再読み込みしました。進行中の承認や質問はキャンセルされました。
@@ -705,3 +708,7 @@ zc-config-section-peer-groups-help = チャンネル、参加エージェント�
 zc-config-section-cron-help = スケジュール、プロンプト、チャンネル、対象を結び付ける定期タスクを設定します。
 zc-config-section-tunnel-help = Cloudflare または ngrok でゲートウェイを公開するか、ローカル専用のままにします。
 zc-config-section-onboard-state-help = クイックスタートのライフサイクル状態と、互換性のために残されたセクション別完了記録です。
+
+zc-chat-restore-environment-refused = このターミナル環境から保存済みセッションに再接続することはできません。以前の会話はデーモンに保持されています。新しい会話を開始すると、このタブは空の会話に置き換わります。
+zc-chat-restore-start-new = { $key } を押すと、新しい会話を開始します。
+zc-chat-restore-new-conversation = 新しい会話を開始

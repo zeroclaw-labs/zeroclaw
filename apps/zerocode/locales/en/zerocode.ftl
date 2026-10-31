@@ -534,6 +534,9 @@ zc-chat-elicitation-dropped = A prompt from the agent was dropped before it coul
 zc-chat-session-restarted = New session started.
 zc-chat-session-cap = Session limit for this pane reached ({ $max }). Close a session from the sidebar first.
 zc-chat-resume-dropped = { $count } prior session(s) could not be re-attached and were retained for retry.
+zc-app-restore-sessions-dropped = { $count } saved session(s) no longer exist and were not reopened.
+zc-app-restore-sessions-save-failed = Could not save the open-session list: { $error }
+zc-app-restore-sessions-other-window = { $count } saved session(s) are open in another zerocode window and were not reopened here.
 zc-chat-reconnect-interrupted = The connection was rebuilt and queued messages were preserved. Waiting for the prior turn to stop before reloading the durable transcript.
 zc-chat-resyncing = Some live updates were missed. Reloading this session before sending queued messages…
 zc-chat-resynced = Live updates were missed, so the durable transcript was reloaded. Any in-progress approval or question was cancelled.
@@ -889,3 +892,7 @@ zc-config-setup-create = Enter a name. { $confirm } saves it and opens fields. {
 zc-config-setup-required = required
 zc-config-setup-required-missing = missing
 zc-config-setup-no-filter-matches = No matches. Clear filter.
+
+zc-chat-restore-environment-refused = This saved session cannot be reattached from this terminal environment. The daemon still keeps the old conversation. Starting a new conversation will replace this tab with an empty conversation.
+zc-chat-restore-start-new = Press { $key } to start a new conversation.
+zc-chat-restore-new-conversation = Start a new conversation
