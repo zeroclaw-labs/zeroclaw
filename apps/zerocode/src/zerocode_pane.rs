@@ -366,6 +366,10 @@ impl ZerocodePane {
         self.conn_edit.is_some()
     }
 
+    pub(crate) fn capturing_key(&self) -> bool {
+        self.capture.is_some()
+    }
+
     // ── Draw ─────────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
