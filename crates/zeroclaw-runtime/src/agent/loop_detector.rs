@@ -155,6 +155,7 @@ fn hash_str(s: &str) -> u64 {
 
 /// Stateful loop detector that lives for the duration of a single
 /// `run_tool_call_loop` invocation.
+#[derive(Clone)]
 pub struct LoopDetector {
     config: LoopDetectorConfig,
     window: VecDeque<ToolCallRecord>,
@@ -165,6 +166,28 @@ impl LoopDetector {
         Self {
             window: VecDeque::with_capacity(config.window_size),
             config,
+        }
+    }
+
+    /// Check exact-repeat arguments before dispatch, including a batch preview.
+    pub fn check_before_call(&self, name: &str, args: &serde_json::Value) -> LoopDetectionResult {
+        if !self.config.enabled {
+            return LoopDetectionResult::Ok;
+        }
+        let hash = hash_value(args);
+        let repeats = self
+            .window
+            .iter()
+            .rev()
+            .take_while(|call| call.name == name && call.args_hash == hash)
+            .count();
+        if repeats >= self.config.max_repeats {
+            LoopDetectionResult::Block(crate::i18n::get_required_cli_string_with_args(
+                "turn-loop-repeat-refused",
+                &[("tool", name), ("repeats", &repeats.to_string())],
+            ))
+        } else {
+            LoopDetectionResult::Ok
         }
     }
 
@@ -1052,5 +1075,42 @@ mod tests {
             }
             other => panic!("expected exact-repeat Warning, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    #[test]
+    fn preflight_refuses_the_next_repeat_without_mutating_completed_history() {
+        let args = serde_json::json!({"command": "ssh target hostname"});
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        for _ in 0..3 {
+            detector.record("shell", &args, "connection refused");
+        }
+        assert!(matches!(
+            detector.check_before_call("shell", &args),
+            LoopDetectionResult::Block(_)
+        ));
+        assert_eq!(detector.window.len(), 3);
+        assert_eq!(
+            detector.check_before_call("shell", &serde_json::json!({"command":"different"})),
+            LoopDetectionResult::Ok
+        );
+    }
+    #[test]
+    fn disabled_detector_does_not_refuse_calls() {
+        let mut detector = LoopDetector::new(LoopDetectorConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let args = serde_json::json!({"command":"x"});
+        for _ in 0..8 {
+            detector.record("shell", &args, "error");
+        }
+        assert_eq!(
+            detector.check_before_call("shell", &args),
+            LoopDetectionResult::Ok
+        );
     }
 }
