@@ -204,6 +204,19 @@ impl FileEditTool {
             });
         }
 
+        // Editing reads existing content, including when only a match diagnostic
+        // is returned. A write-only grant must not expose that content.
+        if !self.security.is_resolved_path_readable(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_target),
+                ),
+            });
+        }
+
         // ── 9. Read → match → replace → write ─────────────────────
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
