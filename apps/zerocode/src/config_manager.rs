@@ -1232,10 +1232,10 @@ impl App {
         }
         self.status_msg = None;
 
-        // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
-        // zerocode) from anywhere — neither is bound inside the daemon
-        // editor or the zerocode pane, so there is no shadowing.
-        if !self.editor_owns_key(&key)
+        // Active key capture owns even section-navigation chords. Otherwise,
+        // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔ zerocode).
+        if !(self.section == ConfigSection::Zerocode && self.zerocode.capturing_key())
+            && !self.editor_owns_key(&key)
             && !(self.wants_text_input()
                 && matches!(key.code, KeyCode::Char(_)) // keyguard: literal text must not trigger a list navigation binding.
                 && !key
@@ -6570,6 +6570,119 @@ fn edit_in_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shift_tab_capture_precedes_config_navigation_and_renders_once() {
+        use crate::jsonrpc::RpcOutbound;
+        use ratatui::{TerminalOptions, Viewport, backend::TestBackend};
+        use tokio::sync::mpsc;
+
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let (tx, rx) = mpsc::channel::<String>(16);
+            drop(rx);
+            let rpc = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+            let mut manager = App::new(rpc, dir.path());
+            let area = Rect::new(0, 0, 120, 30);
+            let mut term = Terminal::with_options(
+                WideCellCleanupBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(area),
+                },
+            )
+            .unwrap();
+            let mut rendered = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            let render = |manager: &mut App, rendered: &mut Terminal<TestBackend>| -> String {
+                rendered
+                    .draw(|frame| manager.draw_into(frame, area))
+                    .unwrap();
+                (0..area.height)
+                    .map(|y| {
+                        (0..area.width)
+                            .map(|x| rendered.backend().buffer()[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+            // Reach the keybinding editor through Config's production dispatcher.
+            manager
+                .handle_key(key(KeyCode::Tab), &mut term)
+                .await
+                .unwrap();
+            for _ in 0..3 {
+                manager
+                    .handle_key(key(KeyCode::Down), &mut term)
+                    .await
+                    .unwrap();
+            }
+            manager
+                .handle_key(key(KeyCode::Enter), &mut term)
+                .await
+                .unwrap();
+
+            // Find the existing reverse-navigation action through the displayed
+            // capture prompt, without depending on its registry row number.
+            let mut found = false;
+            for _ in 0..512 {
+                manager
+                    .handle_key(key(KeyCode::Enter), &mut term)
+                    .await
+                    .unwrap();
+                if render(&mut manager, &mut rendered).contains("Rebind: config_tab.section_prev") {
+                    found = true;
+                    break;
+                }
+                manager
+                    .handle_key(key(KeyCode::Esc), &mut term)
+                    .await
+                    .unwrap();
+                manager
+                    .handle_key(key(KeyCode::Down), &mut term)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                found,
+                "reverse-navigation action must be reachable in the editor"
+            );
+            assert!(manager.zerocode.capturing_key());
+
+            let shift_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+            manager.handle_key(shift_tab, &mut term).await.unwrap();
+            assert!(manager.section == ConfigSection::Zerocode);
+            assert!(!manager.zerocode.capturing_key());
+            let screen = render(&mut manager, &mut rendered);
+            assert!(
+                screen.contains("config_tab.section_prev -> Shift+Tab"),
+                "{screen}"
+            );
+            assert!(!screen.contains("Shift+Shift+Tab"), "{screen}");
+            let saved = crate::config::load_persisted(dir.path()).unwrap();
+            assert_eq!(
+                saved.resolve_keybindings().unwrap()["config_tab"]["section_prev"],
+                vec![crate::keymap::Chord::with(
+                    KeyCode::BackTab,
+                    KeyModifiers::SHIFT
+                )]
+            );
+
+            // After capture, the same event again performs ordinary navigation.
+            manager.handle_key(shift_tab, &mut term).await.unwrap();
+            assert!(manager.section == ConfigSection::Zeroclaw);
+        });
+        crate::keymap::overrides::reset();
+    }
 
     #[test]
     fn mouse_shift_capture_uses_xtshiftescape_sequences() {
