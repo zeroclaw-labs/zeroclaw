@@ -212,6 +212,24 @@ version_gte() {
   return 0
 }
 
+# Extract the package version from `zeroclaw --version` output.
+# The line may end with a parenthesized build id, so the last field
+# is not always the version. Field 2 is the package version
+# for both the old and new formats.
+cli_package_version() {
+  local line="$1"
+  local ver
+  ver=$(printf '%s
+' "$line" | awk '{print $2}')
+  if [ -n "$ver" ]; then
+    printf '%s
+' "$ver"
+  else
+    return 1
+  fi
+}
+
+
 # ── Detect user's shell ──────────────────────────────────────────
 
 detect_shell_profile() {
@@ -505,7 +523,7 @@ do_uninstall() {
   other_bin=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
   if [ -n "$other_bin" ]; then
     local other_version
-    other_version=$("$other_bin" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+    other_version=$(cli_package_version "$("$other_bin" --version 2>/dev/null)" 2>/dev/null || echo "unknown")
     echo
     warn "Another zeroclaw found at $other_bin (v$other_version)"
     warn "Remove it manually if you want a full uninstall"
@@ -924,7 +942,7 @@ fi
 [ "${PREBUILT_OK:-false}" = true ] && [ "$DRY_RUN" != true ] && {
   BIN="$CARGO_HOME/bin/zeroclaw"
   if [ -f "$BIN" ]; then
-    NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "?")
+    NEW_VERSION=$(cli_package_version "$("$BIN" --version 2>/dev/null)" 2>/dev/null || echo "?")
     SIZE=$(du -h "$BIN" | awk '{print $1}')
     echo
     info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
@@ -1110,7 +1128,7 @@ See all available features:
 
   PATH_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
   if [ -n "$PATH_BIN" ]; then
-    PATH_VERSION=$("$PATH_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+    PATH_VERSION=$(cli_package_version "$("$PATH_BIN" --version 2>/dev/null)" 2>/dev/null || echo "unknown")
     TARGET_BIN="$CARGO_HOME/bin/zeroclaw"
     if [ "$PATH_BIN" != "$TARGET_BIN" ]; then
       warn "zeroclaw found at $PATH_BIN (v$PATH_VERSION)"
@@ -1272,13 +1290,13 @@ See all available features:
     BIN="$CARGO_HOME/bin/zeroclaw"
     if [ -f "$BIN" ]; then
       SIZE=$(du -h "$BIN" | awk '{print $1}')
-      NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "$VERSION")
+      NEW_VERSION=$(cli_package_version "$("$BIN" --version 2>/dev/null)" 2>/dev/null || echo "$VERSION")
       echo
       info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
 
       ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
       if [ -n "$ACTIVE_BIN" ] && [ "$ACTIVE_BIN" != "$BIN" ]; then
-        ACTIVE_VERSION=$("$ACTIVE_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+        ACTIVE_VERSION=$(cli_package_version "$("$ACTIVE_BIN" --version 2>/dev/null)" 2>/dev/null || echo "unknown")
         echo
         warn "$(bold "WARNING:") zeroclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
         warn "It will shadow the v$NEW_VERSION binary you just installed at $BIN"
