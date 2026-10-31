@@ -6258,6 +6258,47 @@ mod tests {
                     "{mode:?} must honour policy=ignore for a listed sender (is_group={is_group})"
                 );
             }
+
+            // Drive caption extraction through the real sender/group policy,
+            // mention gate and dispatch tail. No structured mention is present:
+            // without the caption fallback this event would be dropped.
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let mut context = context_for(&mode, &Policy::Allowlist, tx);
+            context.mention_only = true;
+            *context.bot_phone.lock() = Some("15550001234".to_string());
+            let caption = "@15550001234 what is this?";
+            let captioned = single_message_event(
+                Arc::new(captioned_media("image", Some(caption))),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: GROUP_JID.parse().unwrap(),
+                        sender: Jid::pn(ALLOWED),
+                        is_from_me: false,
+                        is_group: true,
+                        ..Default::default()
+                    },
+                    id: format!("caption-{mode:?}"),
+                    r#type: "image".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                WhatsAppWebChannel::handle_inbound_message_event(&captioned, &client, &context),
+            )
+            .await
+            .expect("caption handling must finish without a paired account");
+            let dispatched = rx
+                .try_recv()
+                .expect("allowed captioned group mention must reach dispatch");
+            assert_eq!(dispatched.content, caption);
+            assert_eq!(dispatched.sender, format!("+{ALLOWED}"));
+            assert_eq!(dispatched.reply_target, GROUP_JID);
+            assert!(
+                rx.try_recv().is_err(),
+                "one caption must dispatch only once"
+            );
         }
     }
 
