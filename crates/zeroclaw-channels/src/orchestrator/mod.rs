@@ -3847,6 +3847,21 @@ fn system_prompt_for_channel_turn(
 /// turn path never re-adds them, so they must survive every re-cap.
 const TEXT_TOOL_PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
 
+/// Heading that opens the tool listing inside the text tool-call
+/// instructions. An `rfind` hit on [`TEXT_TOOL_PROTOCOL_HEADER`] is only
+/// trusted when the tail after it actually carries this listing — skill or
+/// personality content can quote the bare header literal without being the
+/// runtime instruction block.
+const TEXT_TOOL_TOOLS_HEADER: &str = "### Available Tools\n\n";
+
+fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -> String {
+    cap_channel_system_prompt(
+        prompt,
+        ctx.agent_cfg.resolved.max_system_prompt_chars,
+        ctx.agent_alias.as_str(),
+    )
+}
+
 /// Re-apply the agent's `max_system_prompt_chars` budget to a channel system
 /// prompt that was modified after its startup-time finalization.
 ///
@@ -3865,20 +3880,62 @@ const TEXT_TOOL_PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
 /// request reaches a non-native-spec provider. The tail from the last tool
 /// protocol heading (the instructions, plus the per-channel signal and peer
 /// map that follow them) is therefore reserved before capping — the same
-/// mechanism `finalize_base_reserving_additions` uses at startup. When the
-/// tail alone meets the cap no reservation can help and the previous
-/// full-budget cap applies.
-fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -> String {
-    let max_chars = ctx.agent_cfg.resolved.max_system_prompt_chars;
+/// mechanism `finalize_base_reserving_additions` uses at startup, including
+/// its reserve-or-exceed fallback: a tail that alone meets the cap cannot be
+/// helped by a reservation, so the base keeps the full-budget cap and the
+/// whole tail is appended regardless, deliberately exceeding the cap rather
+/// than truncating the tool-call format away. A tail is only trusted as the
+/// instruction block when it actually carries the tool listing, so a skill or
+/// personality file that quotes the bare protocol heading collides with the
+/// sentinel harmlessly and takes the plain cap.
+fn cap_channel_system_prompt(prompt: String, max_chars: usize, agent_alias: &str) -> String {
     if max_chars > 0
         && let Some(start) = prompt.rfind(TEXT_TOOL_PROTOCOL_HEADER)
     {
         let (head, tail) = prompt.split_at(start);
-        if tail.chars().count() < max_chars {
-            return finalize_base_reserving_additions(head.to_string(), tail, max_chars);
+        if tail.contains(TEXT_TOOL_TOOLS_HEADER) {
+            return finalize_base_reserving_additions(
+                head.to_string(),
+                tail,
+                max_chars,
+                agent_alias,
+            );
         }
     }
     zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(prompt, max_chars)
+}
+
+/// Sections appended after the base prompt builder at startup: the text
+/// tool-call instructions, the deferred built-in section, and the
+/// tool-receipts addendum.
+///
+/// The base is capped with their length reserved
+/// (`finalize_base_reserving_additions`) so the head-retaining truncation
+/// never lands inside them — the channel turn path does not re-add them, and
+/// losing the text tool-call format would leave a non-native-spec provider
+/// without any call syntax.
+fn build_post_builder_additions(
+    expose_text_tool_protocol: bool,
+    tools_registry: &[Box<dyn Tool>],
+    effective_tool_names: &HashSet<&str>,
+    deferred_section: &str,
+    tool_receipts: &zeroclaw_config::schema::ToolReceiptsConfig,
+) -> String {
+    let mut additions = String::new();
+    if expose_text_tool_protocol {
+        additions.push_str(&build_tool_instructions_for_names(
+            tools_registry,
+            effective_tool_names,
+        ));
+    }
+    if !deferred_section.is_empty() {
+        additions.push('\n');
+        additions.push_str(deferred_section);
+    }
+    if tool_receipts.enabled && tool_receipts.inject_system_prompt {
+        additions.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+    }
+    additions
 }
 
 /// Finalize `base_prompt` against `max_system_prompt_chars` with enough budget
@@ -3886,21 +3943,37 @@ fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -
 ///
 /// The startup channel prompt appends text tool-call instructions, the
 /// deferred built-in section, and the tool-receipts addendum after the base
-/// prompt builder has already finalized. Capping after the append would let
-/// the head-retaining truncation land inside those instructions, and the
-/// channel turn path never re-adds them — the model would silently lose the
-/// tool-call format. Reserving their length caps the base first so the
-/// additions survive whole. When the additions alone meet the cap no
-/// reservation can help and the base keeps the full-budget cap; the result
-/// may then exceed the cap, as it did before any capping existed.
-/// `max_chars == 0` is unlimited.
+/// prompt builder has already finalized, and the channel turn path re-applies
+/// the cap to a prompt whose protocol tail ends in the same instructions.
+/// Capping after the append would let the head-retaining truncation land
+/// inside those instructions, and the channel turn path never re-adds them —
+/// the model would silently lose the tool-call format. Reserving their length
+/// caps the base first so the additions survive whole. When the additions
+/// alone meet the cap no reservation can help and the base keeps the
+/// full-budget cap; the result may then exceed the cap, as it did before any
+/// capping existed. `max_chars == 0` is unlimited.
 fn finalize_base_reserving_additions(
     base_prompt: String,
     additions: &str,
     max_chars: usize,
+    agent_alias: &str,
 ) -> String {
     let reserved = additions.chars().count();
     let base_cap = max_chars.saturating_sub(reserved);
+    if max_chars > 0 && base_cap == 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "prompt_cap_over_budget_overflow",
+                    "agent_alias": agent_alias,
+                    "budget_chars": max_chars,
+                    "reserved_chars": reserved,
+                })),
+            "Post-builder additions alone meet the prompt cap; keeping them whole exceeds the budget"
+        );
+    }
     let capped = zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(
         base_prompt,
         if base_cap > 0 { base_cap } else { max_chars },
@@ -3931,16 +4004,14 @@ fn channel_tool_available_for_turn(
 }
 
 fn text_tool_protocol_advertised(system_prompt: &str) -> bool {
-    const TOOLS_HEADER: &str = "### Available Tools\n\n";
-
     let Some(protocol_start) = system_prompt.rfind(TEXT_TOOL_PROTOCOL_HEADER) else {
         return false;
     };
     let protocol = &system_prompt[protocol_start + TEXT_TOOL_PROTOCOL_HEADER.len()..];
-    let Some(tools_start) = protocol.find(TOOLS_HEADER) else {
+    let Some(tools_start) = protocol.find(TEXT_TOOL_TOOLS_HEADER) else {
         return false;
     };
-    protocol[tools_start + TOOLS_HEADER.len()..]
+    protocol[tools_start + TEXT_TOOL_TOOLS_HEADER.len()..]
         .lines()
         .any(|line| line.starts_with("**") && line.contains("**:"))
 }
@@ -17467,31 +17538,18 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             config.channels.show_tool_calls,
             runtime.shell_profile().as_ref(),
         );
-        // Sections appended after the builder's internal finalization. The
-        // base is capped with their length reserved (below) so this truncation
-        // never lands inside them — the channel turn path does not re-add
-        // them, and losing the text tool-call format would leave a
-        // non-native-spec provider without any call syntax.
-        let mut post_builder_additions = String::new();
-        if expose_text_tool_protocol {
-            post_builder_additions.push_str(&build_tool_instructions_for_names(
-                tools_registry.as_ref(),
-                &effective_tool_names,
-            ));
-        }
-        if !deferred_section.is_empty() {
-            post_builder_additions.push('\n');
-            post_builder_additions.push_str(&deferred_section);
-        }
-        if agent.resolved.tool_receipts.enabled && agent.resolved.tool_receipts.inject_system_prompt
-        {
-            post_builder_additions
-                .push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
-        }
+        let post_builder_additions = build_post_builder_additions(
+            expose_text_tool_protocol,
+            tools_registry.as_ref(),
+            &effective_tool_names,
+            &deferred_section,
+            &agent.resolved.tool_receipts,
+        );
         let system_prompt = finalize_base_reserving_additions(
             system_prompt,
             &post_builder_additions,
             agent.resolved.max_system_prompt_chars,
+            agent_alias,
         );
 
         if channels_by_name_shared.is_none() {
@@ -47443,8 +47501,12 @@ BTC is currently around $65,000 based on latest tool output."#
             !startup_additions.is_empty(),
             "scenario setup: the startup additions must carry the text tool protocol"
         );
-        let initial_system_prompt =
-            finalize_base_reserving_additions(startup_base_prompt, &startup_additions, PROMPT_CAP);
+        let initial_system_prompt = finalize_base_reserving_additions(
+            startup_base_prompt,
+            &startup_additions,
+            PROMPT_CAP,
+            "test-agent",
+        );
         assert!(
             initial_system_prompt.chars().count() <= PROMPT_CAP,
             "startup prompt must respect the cap"
@@ -47663,13 +47725,16 @@ BTC is currently around $65,000 based on latest tool output."#
             .calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // De-brittled: assert on the last provider call instead of assuming
+        // exactly one, and on its first message being the system prompt.
+        let last_call = calls
+            .last()
+            .expect("the fresh turn should reach the provider at least once");
+        let (role, delivered_prompt) = &last_call[0];
         assert_eq!(
-            calls.len(),
-            1,
-            "the fresh turn should reach the provider once"
+            role, "system",
+            "the first message of the last call must be the system prompt"
         );
-        assert_eq!(calls[0][0].0, "system");
-        let delivered_prompt = &calls[0][0].1;
         assert!(
             delivered_prompt.chars().count() <= PROMPT_CAP,
             "system prompt delivered to the provider ({} chars) must respect the \
@@ -47768,7 +47833,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "scenario setup: appending the instructions must exceed the cap"
         );
 
-        let prompt = finalize_base_reserving_additions(base, &additions, PROMPT_CAP);
+        let prompt = finalize_base_reserving_additions(base, &additions, PROMPT_CAP, "test-agent");
 
         assert!(
             prompt.chars().count() <= PROMPT_CAP,
@@ -47789,6 +47854,119 @@ BTC is currently around $65,000 based on latest tool output."#
                 .count(),
             1,
             "the capped prompt must carry exactly one timestamp orientation"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_cap_ignores_tool_protocol_header_quoted_in_skill_content() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // A skill or personality body that quotes the bare protocol heading
+        // collides with the sentinel. The split must not treat it as the
+        // runtime instruction block, so the prompt takes the plain cap like
+        // any other content.
+        let quoted = format!(
+            "Skill body quoting the heading.\n\n{TEXT_TOOL_PROTOCOL_HEADER}\
+             This is a user-authored literal without a tool listing."
+        );
+        let mut prompt = "x".repeat(PROMPT_CAP);
+        prompt.push_str(&quoted);
+        assert!(
+            prompt.chars().count() > PROMPT_CAP,
+            "scenario setup: the assembled prompt must exceed the cap"
+        );
+
+        let capped = cap_channel_system_prompt(prompt, PROMPT_CAP, "test-agent");
+
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "a tail without the tool listing is content, not instructions; the \
+             plain cap applies (got {} chars)",
+            capped.chars().count()
+        );
+        assert!(
+            !capped.contains("## Tool Use Protocol"),
+            "the quoted heading must not be reserved as the runtime protocol tail"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_cap_keeps_whole_tool_protocol_tail_at_or_over_cap() {
+        const PROMPT_CAP: usize = 500;
+
+        // A tail carrying the actual tool listing is the instruction block
+        // even when it alone meets or exceeds the cap: the base is capped on
+        // the full budget and the tail is appended whole (reserve-or-exceed),
+        // never head-cut through the protocol.
+        let mut tail_at_cap = String::from(TEXT_TOOL_PROTOCOL_HEADER);
+        tail_at_cap.push_str(TEXT_TOOL_TOOLS_HEADER);
+        tail_at_cap.push_str("**read_skill**: Read a skill.\nParameters: `{}`\n");
+        let pad = PROMPT_CAP - tail_at_cap.chars().count();
+        tail_at_cap.push_str(&"y".repeat(pad));
+        assert_eq!(
+            tail_at_cap.chars().count(),
+            PROMPT_CAP,
+            "scenario setup: the tail must land exactly on the cap"
+        );
+        let mut tail_over_cap = String::from(TEXT_TOOL_PROTOCOL_HEADER);
+        tail_over_cap.push_str(TEXT_TOOL_TOOLS_HEADER);
+        tail_over_cap.push_str(&format!(
+            "**read_skill**: Read a skill.\nParameters: `{}`\n{}",
+            "{}",
+            "detail ".repeat(120)
+        ));
+
+        for (label, tail) in [("at the cap", tail_at_cap), ("over the cap", tail_over_cap)] {
+            let prompt = "z".repeat(101) + &tail;
+            let capped = cap_channel_system_prompt(prompt, PROMPT_CAP, "test-agent");
+            assert!(
+                capped.ends_with(&tail),
+                "{label}: the protocol tail must survive whole (reserve-or-exceed)"
+            );
+            assert!(
+                text_tool_protocol_advertised(&capped),
+                "{label}: the capped prompt must still advertise the complete text tool protocol"
+            );
+            assert!(
+                capped.chars().count() > PROMPT_CAP,
+                "{label}: the documented over-budget result must exceed the cap \
+                 rather than truncate the protocol"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_prompt_composition_builds_additions_reserved_against_cap() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // The production startup composition builds its post-builder additions
+        // through one function; the cap must reserve that function's output so
+        // the text tool protocol survives whole.
+        let raw_tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("read_skill"))];
+        let effective_tool_names: HashSet<&str> = HashSet::from(["read_skill"]);
+        let additions = build_post_builder_additions(
+            true,
+            &raw_tools,
+            &effective_tool_names,
+            "",
+            &zeroclaw_config::schema::ToolReceiptsConfig::default(),
+        );
+        assert!(
+            additions.contains(TEXT_TOOL_PROTOCOL_HEADER)
+                && additions.contains("### Available Tools"),
+            "the composed additions must carry the text tool protocol"
+        );
+
+        let base = "b".repeat(PROMPT_CAP);
+        let prompt = finalize_base_reserving_additions(base, &additions, PROMPT_CAP, "test-agent");
+        assert!(
+            prompt.ends_with(&additions),
+            "the startup composition must reserve the additions so they survive whole"
+        );
+        assert!(
+            prompt.chars().count() <= PROMPT_CAP,
+            "the assembled prompt ({} chars) must stay within the cap",
+            prompt.chars().count()
         );
     }
 
