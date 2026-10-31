@@ -1498,9 +1498,14 @@ fn read_heredoc_delimiter(
     if delimiter.contains('\n') {
         return Some(Err(()));
     }
-    // Any quoting in the word (`'`, `"`, `\`) leaves the body unexpanded, so
-    // its backslash-newlines stay literal.
-    let joins_lines = !raw.contains(['\'', '"', '\\']);
+    // A backslash-newline is removed before the word is read, so it is not
+    // quoting. `<<E\<newline>OF` is the unquoted delimiter `EOF`, and its body
+    // still joins continued lines. Counting that backslash as quoting left the
+    // body literal: the scanner waited for a later physical `EOF` and skipped
+    // the command bash runs after the joined terminator. A quote, or a
+    // backslash that survives the removal, still leaves the body literal.
+    let without_continuations = raw.replace("\\\n", "");
+    let joins_lines = !without_continuations.contains(['\'', '"', '\\']);
     Some(Ok(HeredocDelimiter {
         terminator: Some(delimiter),
         strip_tabs,
@@ -9890,6 +9895,14 @@ mod tests {
             "cat <<EOF\nEOF\\\n\nwc -l /etc/passwd\nEOF",
             "cat <<-EOF\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
             "echo \"$(cat <<EOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
+            // A backslash-newline in the delimiter is removed before the word
+            // is read, so `<<E\<newline>OF` is the unquoted delimiter `EOF`.
+            // The body still joins. Counting that backslash as quoting waited
+            // for the later physical `EOF` and skipped the read bash runs
+            // after the joined line. The closing text after that `EOF` also
+            // rebalanced the substitution, so no fallback ran.
+            "cat <<E\\\nOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "echo \"$(cat <<E\\\nOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
             "cat <<EOF\nE\\\n\\\nOF\nwc -l /etc/passwd\nEOF",
             // Bash strips the tab before an empty continuation and ends at
             // `EOF`; dash does not skip a tab-indented `\` line.
@@ -9927,10 +9940,14 @@ mod tests {
         );
         // No join: the whole read is body in both shells.
         for command in [
-            // Quoted delimiters leave backslash-newlines literal.
+            // Quoted delimiters leave backslash-newlines literal. A
+            // continuation inside an otherwise quoted word is still quoting,
+            // so the body does not join and the read stays data.
             "cat <<'EOF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
             "cat <<\"EOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
             "cat <<\\EOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\"E\\\nOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<E\\\n'OF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
             // An even number of backslashes is an escaped backslash.
             "cat <<EOF\nEO\\\\\nF\nwc -l /etc/passwd\nEOF",
             // `<<-` strips tabs only at the start of the logical line.
