@@ -12,6 +12,8 @@ use crate::control_plane::{
 use crate::cron::scheduler::deliver_announcement;
 use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 use crate::peers::resolve_peer_set;
+use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -47,11 +49,23 @@ pub struct SendMessageToPeerTool {
     description: String,
     task_control_plane: Option<ControlPlaneHandle>,
     execution_capability: Option<AgentExecutionCapability>,
+    security: Arc<SecurityPolicy>,
 }
 
 impl SendMessageToPeerTool {
     pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Self {
-        Self::new_with_live_config_and_capability(config, sender_alias, None, None)
+        let sender_alias = sender_alias.into();
+        let security = Arc::new(
+            SecurityPolicy::for_agent(config.as_ref(), &sender_alias)
+                .unwrap_or_else(|_| SecurityPolicy::default()),
+        );
+        Self::new_with_live_config_security_and_capability(
+            config,
+            sender_alias,
+            None,
+            security,
+            None,
+        )
     }
 
     pub fn new_with_capability(
@@ -59,13 +73,39 @@ impl SendMessageToPeerTool {
         sender_alias: impl Into<String>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Self {
-        Self::new_with_live_config_and_capability(config, sender_alias, None, execution_capability)
+        let sender_alias = sender_alias.into();
+        let security = Arc::new(
+            SecurityPolicy::for_agent(config.as_ref(), &sender_alias)
+                .unwrap_or_else(|_| SecurityPolicy::default()),
+        );
+        Self::new_with_live_config_security_and_capability(
+            config,
+            sender_alias,
+            None,
+            security,
+            execution_capability,
+        )
     }
 
-    pub(crate) fn new_with_live_config_and_capability(
+    pub fn new_with_security(
+        config: Arc<Config>,
+        sender_alias: impl Into<String>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
+        Self::new_with_live_config_security_and_capability(
+            config,
+            sender_alias,
+            None,
+            security,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_live_config_security_and_capability(
         config: Arc<Config>,
         sender_alias: impl Into<String>,
         live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+        security: Arc<SecurityPolicy>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Self {
         let sender_alias = sender_alias.into();
@@ -77,6 +117,7 @@ impl SendMessageToPeerTool {
             description,
             task_control_plane: None,
             execution_capability,
+            security,
         }
     }
 
@@ -126,6 +167,19 @@ impl Tool for SendMessageToPeerTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        // Peer messaging starts another agent's turn or posts externally —
+        // treat it as Act, matching a2a_send / spawn_subagent / delegate.
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "send_message_to_peer")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
         let channel = args
             .get("channel")
             .and_then(|v| v.as_str())
@@ -1801,5 +1855,166 @@ mod tests {
         .expect("recipient finishes persistence and releases admission");
         assert!(lifecycle.begin_delete("recipient").is_ok());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_message_to_peer_denied_in_readonly_autonomy() {
+        // Sibling contract of a2a_send_denied_in_readonly_autonomy (#12167):
+        // peer messaging is an Act and must refuse before any delivery.
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = SendMessageToPeerTool::new_with_security(
+            Arc::new(Config::default()),
+            "sender",
+            security,
+        );
+        let result = tool
+            .execute(json!({
+                "channel": "telegram.prod",
+                "target": "recipient",
+                "message": "hola"
+            }))
+            .await
+            .expect("execute returns a ToolResult");
+        assert!(
+            !result.success,
+            "read-only sender must be refused; got {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("read-only"),
+            "error must mention read-only; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_to_peer_readonly_for_agent_creates_no_peer_inbox() {
+        // Profile-based path: SecurityPolicy::for_agent(ReadOnly) must refuse
+        // before admit_peer_inbox_task runs (#12167).
+        use crate::control_plane::ControlPlaneHandle;
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+        use zeroclaw_config::schema::RiskProfileConfig;
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                risk_profile: "ro".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "ro".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::ReadOnly,
+                ..RiskProfileConfig::default()
+            },
+        );
+
+        let policy = SecurityPolicy::for_agent(&config, "sender").expect("sender policy");
+        assert!(!policy.can_act(), "readonly profile must disable can_act");
+
+        let control_plane = ControlPlaneHandle::open(workspace.path())
+            .expect("isolated control plane should initialize");
+        let task_store = Arc::clone(&control_plane.store);
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
+            .with_control_plane(control_plane);
+
+        let result = tool
+            .execute(json!({
+                "channel": "telegram.prod",
+                "target": "recipient",
+                "message": "hola"
+            }))
+            .await
+            .expect("execute returns a ToolResult");
+        assert!(
+            !result.success,
+            "read-only sender must be refused; got {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("read-only"),
+            "error must mention read-only; got {result:?}"
+        );
+
+        let running = task_store.list_running().await.expect("list_running");
+        assert!(
+            running.is_empty(),
+            "readonly denial must not create a PeerInbox task; got {running:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_to_peer_consumes_action_budget() {
+        use crate::security::SecurityPolicy;
+
+        let security = Arc::new(SecurityPolicy {
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let tool = SendMessageToPeerTool::new_with_security(
+            Arc::new(Config::default()),
+            "sender",
+            Arc::clone(&security),
+        );
+        let args = json!({
+            "channel": "telegram.prod",
+            "target": "recipient",
+            "message": "hola"
+        });
+        let first = tool
+            .execute(args.clone())
+            .await
+            .expect("first execute returns a ToolResult");
+        // First call may fail peer-set validation after consuming the Act slot.
+        assert!(
+            security.is_rate_limited() || !first.success,
+            "first Act must consume the single slot; got {first:?}"
+        );
+        let second = tool
+            .execute(args)
+            .await
+            .expect("second execute returns a ToolResult");
+        assert!(
+            !second.success,
+            "second send must be refused; got {second:?}"
+        );
+        let err = second.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("rate") || err.contains("limit") || err.contains("action"),
+            "second error should reflect the exhausted action budget; got {second:?}"
+        );
     }
 }
