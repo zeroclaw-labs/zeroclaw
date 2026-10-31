@@ -17013,13 +17013,25 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_photo_bytes_with_caption() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/sendPhoto"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"ok": false, "description": "synthetic photo rejection"}),
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
         let mention_only = false;
         let ch = TelegramChannel::new(
             "fake-token".into(),
             "telegram_test_alias",
             Arc::new(|| vec!["*".into()]),
             mention_only,
-        );
+        )
+        .with_mock_api_base(server.uri());
         let file_bytes = vec![0x89, 0x50, 0x4E, 0x47];
 
         // With caption
@@ -17032,13 +17044,29 @@ mod tests {
                 Some("Photo caption"),
             )
             .await;
-        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("controlled rejection")
+                .to_string()
+                .contains("synthetic photo rejection")
+        );
 
         // Without caption
         let result = ch
             .send_photo_bytes("123456", None, file_bytes, "test.png", None)
             .await;
-        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("controlled rejection")
+                .to_string()
+                .contains("synthetic photo rejection")
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("captured multipart requests");
+        assert!(String::from_utf8_lossy(&requests[0].body).contains("Photo caption"));
+        assert!(!String::from_utf8_lossy(&requests[1].body).contains("name=\"caption\""));
     }
 
     // ── Empty/edge case tests ───────────────────────────────────────
