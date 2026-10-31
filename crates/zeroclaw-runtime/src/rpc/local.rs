@@ -342,8 +342,10 @@ enum WriteOutcome {
 }
 
 /// Write one frame under the per-frame deadline. A peer that does not drain
-/// the frame in time is disconnected by cancelling the connection token, which
-/// also ends the dispatcher reading from it.
+/// the frame in time, or whose stream fails the write, is disconnected by
+/// cancelling the connection token, which also ends the dispatcher reading
+/// from it. The dispatcher ignores failed sends, so without the cancel a
+/// peer that can still send would keep a connection whose answers are lost.
 async fn write_frame<W>(
     writer: &mut W,
     line: &str,
@@ -361,7 +363,20 @@ where
     };
     match result {
         Ok(Ok(())) => WriteOutcome::Written,
-        Ok(Err(_)) => WriteOutcome::Stopped,
+        Ok(Err(error)) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "peer": peer_label,
+                        "error_kind": format!("{:?}", error.kind()),
+                    })),
+                "local RPC write failed; closing its connection"
+            );
+            cancel.cancel();
+            WriteOutcome::Stopped
+        }
         Err(_) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -438,7 +453,8 @@ impl LocalTransport {
         // Session approval channels and log forwarders retain writer senders
         // past disconnect, so channel closure alone cannot end this task.
         // Cancellation interrupts both queue waits and an in-flight write;
-        // each write and the final shutdown are bounded for suspended peers.
+        // each write and the final shutdown are bounded for suspended peers,
+        // and a stalled or failed write cancels the connection.
         let writer_peer_label = peer_label.clone();
         zeroclaw_spawn::spawn!(run_writer(
             write_half,
@@ -1559,10 +1575,11 @@ mod tests {
     async fn call_local_initializes_and_executes_one_admin_request() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = test_ctx(tmp.path());
-        ctx.config
-            .write()
-            .create_map_key("agents", "local_client")
-            .unwrap();
+        // Seed the agent as a publication — the read-only handle the
+        // context exposes has no raw write path.
+        let mut seeded = ctx.config.snapshot();
+        seeded.create_map_key("agents", "local_client").unwrap();
+        ctx.config_authority.publish_for_test(seeded);
         let config = ctx.config.read().clone();
         let sock_path = socket_path(&config);
         let cancel = CancellationToken::new();
@@ -2952,6 +2969,128 @@ mod tests {
             .expect("the writer ends after a stalled write")
             .expect("writer task must not panic");
         drop(writer_tx);
+    }
+
+    /// A stream whose every write fails, as a write to a peer that can no
+    /// longer receive does.
+    struct BrokenPipeWriter;
+
+    impl AsyncWrite for BrokenPipeWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_error_cancels_the_connection() {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(4);
+        let (_terminal_tx, terminal_rx) = mpsc::channel::<TerminalFrame>(1);
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.clone();
+        let writer_task = zeroclaw_spawn::spawn!(run_writer(
+            BrokenPipeWriter,
+            writer_rx,
+            terminal_rx,
+            writer_cancel,
+            // The write deadline is far longer than the test, so only the
+            // write error can end the connection here.
+            WriterTimeouts {
+                write: Duration::from_secs(600),
+                shutdown: Duration::from_millis(50),
+            },
+            "test".to_string(),
+        ));
+
+        writer_tx.send("frame".to_string()).await.unwrap();
+
+        // The dispatcher ignores failed sends, so without this the connection
+        // would keep reading and running requests it can no longer answer.
+        tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("a failed write cancels the connection");
+        tokio::time::timeout(Duration::from_secs(1), writer_task)
+            .await
+            .expect("the writer ends after a failed write")
+            .expect("writer task must not panic");
+        drop(writer_tx);
+    }
+
+    /// Linux fails a write to a Unix socket whose peer shut down its read
+    /// side (`EPIPE`). macOS accepts and buffers such writes, so there the
+    /// half-close is not detected from a successful write: the connection is
+    /// retired only if later writes fill the buffer and stall past the write
+    /// deadline, as in `stalled_reader_is_dropped_while_other_connections_proceed`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn half_closed_peer_retires_its_connection_after_a_write_error() {
+        use std::os::fd::AsRawFd;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server_count = count.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener_with_limits(
+                server_ctx,
+                server_cancel,
+                server_count,
+                None,
+                LocalListenerLimits {
+                    max_connections: 8,
+                    // Longer than the wait below, so the write deadline
+                    // cannot be what closes the connection.
+                    write_timeout: Duration::from_secs(30),
+                    initialize_timeout: LOCAL_INITIALIZE_TIMEOUT,
+                    frame_read_timeout: LOCAL_FRAME_READ_TIMEOUT,
+                },
+            )
+            .await;
+        });
+        wait_for_socket(&sock_path).await;
+
+        let (reader, mut writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+
+        // Stop receiving but keep the sending side open.
+        let fd = reader.get_ref().as_ref().as_raw_fd();
+        // SAFETY: `fd` is the open socket owned by `reader`, which outlives
+        // this call; `shutdown` does not close or invalidate it.
+        let rc = unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+        assert_eq!(rc, 0, "shutdown(SHUT_RD) failed");
+
+        // The daemon's answer to this request is the write that fails.
+        writer
+            .write_all(rpc_request(Method::Status, &serde_json::json!({}), 2).as_bytes())
+            .await
+            .unwrap();
+
+        wait_for_client_count(&count, 0).await;
+
+        drop(writer);
+        drop(reader);
+        cancel.cancel();
     }
 
     #[tokio::test]

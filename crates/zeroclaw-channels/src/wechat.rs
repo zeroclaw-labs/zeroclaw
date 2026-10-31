@@ -12,6 +12,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::paths::{normalize_lexical, resolve_under};
+#[cfg(test)]
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
@@ -1074,15 +1075,6 @@ impl WeChatChannel {
         self
     }
 
-    /// Wire a config handle so `persist_allowed_identity` can write a paired
-    /// user into `peer_groups` and save. Standalone callers get a local
-    /// mutation witness; supervised callers use
-    /// [`Self::with_persistence_authority`] to share the daemon witness.
-    pub fn with_persistence(mut self, config: Arc<parking_lot::RwLock<Config>>) -> Self {
-        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
-        self
-    }
-
     /// Wire the daemon generation's live-config authority for pairing writes.
     pub fn with_persistence_authority(
         mut self,
@@ -1320,7 +1312,7 @@ impl WeChatChannel {
     ///
     /// Asked before the pairing transition, because pairing consumes the one-time code.
     fn pairing_deny_conflict(&self, identity: &str) -> Option<String> {
-        let config = self.persist.as_ref()?.config();
+        let config = self.persist.as_ref()?.live_handle();
         let cfg = config.read();
         crate::identity_persist::external_peer_deny_conflict(
             &cfg,
@@ -3554,11 +3546,8 @@ mod tests {
         .with_persistence_authority(authority.clone());
         let stored = channel.persist.as_ref().expect("authority is stored");
 
-        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
-        assert!(Arc::ptr_eq(
-            &authority.config_write_lock(),
-            &stored.config_write_lock()
-        ));
+        assert!(authority.live_handle().same_storage(&stored.live_handle()));
+        assert_eq!(authority.config_epoch(), stored.config_epoch());
     }
 
     fn test_wechat_channel_for_api(api_base_url: String, state_dir: &Path) -> WeChatChannel {
@@ -3995,7 +3984,7 @@ mod tests {
                 Some(state_dir.path().to_path_buf()),
             )
             .expect("channel builds")
-            .with_persistence(Arc::new(parking_lot::RwLock::new(config)));
+            .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(config));
             channel.api_base_url = server.uri();
             *channel.bot_token.write().unwrap() = Some("test-token".into());
             channel
@@ -4074,7 +4063,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let config = Arc::new(parking_lot::RwLock::new(config));
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
 
         let mut ch = WeChatChannel::new(
             "admin",
@@ -4084,7 +4073,7 @@ mod tests {
             Some(state_dir.path().to_path_buf()),
         )
         .expect("channel builds")
-        .with_persistence(Arc::clone(&config));
+        .with_persistence_authority(authority.clone());
         ch.api_base_url = server.uri();
         *ch.bot_token.write().unwrap() = Some("test-token".into());
 
@@ -4121,7 +4110,7 @@ mod tests {
             Some("/tmp/test-wechat".into()),
         )
         .unwrap();
-        // No `.with_persistence(...)` wired — should not panic, returns Ok(()).
+        // No `.with_persistence_authority(...)` wired — should not panic, returns Ok(()).
         let result = ch.persist_allowed_identity("user_xyz@im.wechat").await;
         assert!(result.is_ok());
     }
@@ -4744,7 +4733,11 @@ mod tests {
     fn pairing_wechat_channel_for_mock(
         root: &Path,
         mock_base_url: String,
-    ) -> (WeChatChannel, Arc<parking_lot::RwLock<Config>>, String) {
+    ) -> (
+        WeChatChannel,
+        zeroclaw_config::live::LiveConfigHandle,
+        String,
+    ) {
         let alias = "wechat_test_alias";
         let mut config = Config {
             config_path: root.join("config.toml"),
@@ -4758,7 +4751,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let config = Arc::new(parking_lot::RwLock::new(config));
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let config = authority.live_handle();
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let config = config.clone();
             let alias = alias.to_string();
@@ -4768,7 +4762,7 @@ mod tests {
         let mut channel =
             WeChatChannel::new(alias, peer_resolver, None, None, Some(root.join("state")))
                 .unwrap()
-                .with_persistence(config.clone())
+                .with_persistence_authority(authority)
                 .with_workspace_dir(root.join("workspace"));
         let pairing_code = channel
             .pairing

@@ -22,7 +22,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::OidcConfig;
 
-use super::oidc::{read_response_limited, validate_discovered_endpoint};
+use super::oidc::{form_urlencode_component, read_response_limited, validate_discovered_endpoint};
 
 #[derive(Debug, Clone, Deserialize)]
 struct EnrollmentDiscovery {
@@ -195,7 +195,10 @@ impl Enrollment {
         form: &mut Vec<(&'static str, String)>,
     ) -> reqwest::RequestBuilder {
         match self.config.client_secret.as_deref() {
-            Some(secret) => request.basic_auth(self.config.effective_client_id(), Some(secret)),
+            Some(secret) => request.basic_auth(
+                form_urlencode_component(self.config.effective_client_id()),
+                Some(form_urlencode_component(secret)),
+            ),
             None => {
                 form.push(("client_id", self.config.effective_client_id().to_string()));
                 request
@@ -1059,6 +1062,91 @@ mod tests {
             enrollment.device_grant_poll("dev-1").await.unwrap(),
             DevicePollOutcome::Pending
         ));
+    }
+
+    #[tokio::test]
+    async fn enrollment_basic_credentials_round_trip_on_every_endpoint() {
+        use base64::engine::general_purpose::STANDARD;
+
+        fn decode_form(body: &[u8]) -> HashMap<String, String> {
+            let mut url = reqwest::Url::parse("http://localhost/").unwrap();
+            url.set_query(Some(std::str::from_utf8(body).unwrap()));
+            url.query_pairs().into_owned().collect()
+        }
+
+        for (client_id, secret) in [
+            ("daemon-client", Some("plainsecret123")),
+            ("daemon: +/%&=", Some("s: +/%&=cret")),
+            ("public: +/%&=", None),
+        ] {
+            let server = idp_with_device_endpoint().await;
+            Mock::given(method("POST"))
+                .and(path("/device"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_code": "dev-1",
+                    "user_code": "AAAA-BBBB",
+                    "verification_uri": "https://sso.example.com/activate",
+                    "expires_in": 600,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "synthetic-access-token", "token_type": "Bearer",
+                })))
+                .expect(if secret.is_some() { 2 } else { 1 })
+                .mount(&server)
+                .await;
+            let mut entry = config(&server.uri(), secret);
+            entry.client_id = client_id.to_string();
+            let enrollment = Enrollment::new("corp", entry).unwrap();
+            enrollment.device_grant_start().await.unwrap();
+            assert!(matches!(
+                enrollment.device_grant_poll("dev-1").await.unwrap(),
+                DevicePollOutcome::Token(_)
+            ));
+            if secret.is_some() {
+                enrollment.client_credentials().await.unwrap();
+            }
+            let requests = server.received_requests().await.unwrap();
+            let posts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+            assert_eq!(posts.len(), if secret.is_some() { 3 } else { 2 });
+            for request in posts {
+                let form = decode_form(&request.body);
+                assert!(!form.contains_key("client_secret"));
+                match secret {
+                    Some(secret) => {
+                        assert!(!form.contains_key("client_id"));
+                        let header = request
+                            .headers
+                            .get("authorization")
+                            .unwrap()
+                            .to_str()
+                            .unwrap();
+                        let decoded = STANDARD
+                            .decode(header.strip_prefix("Basic ").unwrap())
+                            .unwrap();
+                        let pair = String::from_utf8(decoded).unwrap();
+                        let (id, password) = pair.split_once(':').unwrap();
+                        assert!(
+                            !password.contains(':'),
+                            "literal credential separator reached the wire"
+                        );
+                        let encoded = format!("id={id}&secret={password}");
+                        let credentials = decode_form(encoded.as_bytes());
+                        assert_eq!(credentials.len(), 2);
+                        assert_eq!(credentials["id"], client_id);
+                        assert_eq!(credentials["secret"], secret);
+                    }
+                    None => {
+                        assert!(!request.headers.contains_key("authorization"));
+                        assert_eq!(form["client_id"], client_id);
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

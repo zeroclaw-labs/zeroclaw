@@ -69,11 +69,22 @@ Five functions have no Rust trait default and must genuinely work
 The poll bridge deserves a note: the host runs a poll-to-push loop
 (`listen` in `wasm_channel.rs`) that calls `poll-message` with exponential
 backoff from 50ms to 500ms while the queue is empty, resetting on traffic. If
-your `poll-message` traps, the host marks the channel poll-unhealthy, logs,
-and backs off; a plugin whose poll keeps trapping reports unhealthy through
-`health_check` even if it exports no `health-check` of its own. Trapping in
-`poll-message` is therefore visible, not fatal, but it makes your channel
-useless. Keep it simple: drain the queue, translate, return.
+your `poll-message` traps, the host logs it, backs off, and reports the channel
+unhealthy in the gateway's `/health` snapshot, even if you export no
+`health-check` of your own. A trap leaves the instance unable to run any
+export, so the host discards it and the next call builds a new one, running
+`configure` again. The message the trapping poll had taken off the queue is
+lost; later messages still arrive. Any export that traps or misses the call
+deadline is replaced the same way, while an error string your export returns
+leaves the instance in place. A rebuild reconnects a gateway-style
+plugin, so the host budgets them: it rebuilds at once while failures average
+no more than one every five minutes, allowing a burst of three, and beyond
+that waits for the budget to refill, failing calls in the meantime without
+running your plugin. A missed deadline in `request-approval` or
+`request-choice`, which wait for a person to answer, does not count against
+the budget. An export that routinely needs longer than the deadline, such as
+a large upload, calls for a higher `plugins.limits.call_timeout_ms`. Keep it
+simple: drain the queue, translate, return.
 
 ## Capability flags: the {{#include ../_snippets/plugin-channel-flag-count.md}} optional methods
 
@@ -91,7 +102,7 @@ flags declaration, which is the source of truth. In summary, the groups:
 
 | Group | Flags | What implementing buys you |
 |-------|-------|---------------------------|
-| Health | `health-check` | Report platform reachability; combined with poll health by the host adapter. |
+| Health | `health-check` | Report whether the channel works. The host asks about every 30 seconds while listening and shows the answer, combined with poll health, in `/health` (see [Health checks](#health-checks)). |
 | Identity | `self-handle`, `self-addressed-mention`, `drop-self-message` | Self-loop protection (the runtime drops the bot's own messages) and correct @-mention forms in the per-channel system prompt. The host caches `self-handle` and `self-addressed-mention` at load; they are read once. |
 | Typing | `start-typing`, `stop-typing` | Composing indicators while the agent thinks. |
 | Drafts | `supports-draft-updates`, `send-draft`, `update-draft`, `update-draft-progress`, `finalize-draft`, `cancel-draft` | Progressive message editing: the runtime streams the response into an editable platform message instead of waiting for completion. Implement all six together or none. |
@@ -103,6 +114,36 @@ flags declaration, which is the source of truth. In summary, the groups:
 Start with the required {{#include ../_snippets/plugin-channel-required-count.md}} plus `health-check`, and add groups as the
 platform supports them. Advertising a flag you have not implemented is worse
 than omitting it: the host will call your export and trust the answer.
+
+### Health checks
+
+While the channel listens, the host calls `health-check` on the running
+instance between polls: right after the first poll, then about every 30
+seconds. The answer becomes the channel's component in the gateway's `/health`
+snapshot, `channel:plugin.<alias>`:
+
+- `starting` until the first answer. A first answer of `false` also reads
+  `starting` until the next check, so a plugin still completing its handshake
+  is not reported as failed.
+- `ok` while the latest answer is `true`.
+- `error` when the latest answer is `false`, when the check traps or misses
+  the call deadline, when `poll-message` traps, or when no answer has arrived
+  for two intervals plus two call deadlines (two minutes with the default
+  30-second deadline).
+
+`zeroclaw channel doctor` also calls `health-check`, once, on a freshly
+configured instance.
+
+Because the check repeats, answer from state the plugin already holds: whether
+its connection is up, or how its last exchange with the platform went. A
+network request in `health-check` runs on every check and delays the next
+poll; if you verify credentials over the network, keep the last result and
+refresh it on your own schedule. A check that traps or misses the call
+deadline discards the instance, and the host rebuilds it with `configure`, so a
+gateway-style plugin loses its connection; after each such failure the host
+waits twice as long before the next check, up to ten minutes. The host also
+puts off a check while one more failure would make a rebuild wait, so a failed
+check never by itself makes one wait.
 
 ### The approval surface
 
@@ -250,10 +291,16 @@ platform's API hosts under `plugins.entries.<key>.egress_hosts` for that
 channel instance before `send` has a network path; any destination outside
 that list is refused before a packet leaves, and a granted host that resolves
 to a loopback, private, or link-local address is refused too unless it is also
-listed under `egress_allow_private`. Install-time seeding of that grant for channel instances is
-still manual (the grant ceremony is
-[#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584)), so document the
-hosts your plugin needs in its README.
+listed under `egress_allow_private`. Declare the platform's API hosts in your
+manifest's `[egress]` table. When an operator binds an instance with
+`zeroclaw plugin bind <package> --channel-alias <alias> --egress declared`,
+that declaration is seeded into the new instance's `egress_hosts` and printed;
+`--egress none` binds it with no network reach instead. For a channel instance
+the declaration counts with any governed transport, `http_client`,
+`websocket_client`, or `socket_client`, so a channel that speaks only over a
+socket is seeded the same way. A host that is deployment configuration, such as
+a self-hosted server, is not yours to declare: say in your README that the
+operator grants it.
 
 Pair `config_read` with the schema consumed by `ChannelConfig`:
 
@@ -287,9 +334,18 @@ before guest code runs instead of starting a channel without required config.
 Each channel instance selects the `plugins.entries` key derived from its full
 package, `channel` capability, and binding identity while reusing this one
 package-owned schema. Identical aliases in different packages therefore remain
-isolated. The install and info commands cannot create this key because they do
-not own the configured channel alias; their automatic print and seed behavior
-is tool-only, so a channel instance's entry is written by hand.
+isolated. The key exists once an operator binds an alias:
+`zeroclaw plugin bind` creates that instance's entry, and both it and
+`zeroclaw plugin info` list each of this schema's `required` keys as set or
+missing, with the `zeroclaw config set` command for a missing one. A secret
+key's command prompts for the value without echo, and no value is ever
+printed. The command is printed only for a property name in the portable key
+grammar (1 to 128 ASCII letters, digits, `_`, `-`, or `.`); any other name is
+reported with the config file row to edit instead, so keep required property
+names inside it. When the entry does not exist yet, as for a binding written
+by hand, `plugin info` prints the `plugin bind` command that creates it in
+place of the keys, once per egress decision when your manifest declares
+destinations, since `config set` resolves only an entry that exists.
 
 Call `config.get` and `secrets.get` inside each operation that uses them. The
 host resolves at most one canonical revision for that call and drops its view
@@ -311,7 +367,28 @@ that is absent or not marked `x-secret = true`.
 
 An installed package does nothing until an operator binds it to a logical
 channel instance. The binding names the package and nothing else; the alias
-is the instance's identity:
+is the instance's identity. The operator path is `zeroclaw plugin bind`, which
+writes the binding, seeds the instance's config entry, and reports what the
+instance still needs before it can start:
+
+```bash
+zeroclaw plugin bind acme.chat --channel-alias operations --egress declared
+```
+
+`--egress declared` grants the destinations the manifest declares, and
+`--egress none` binds with no network reach. The flag matters only when the
+command creates the instance's config entry, and it is required then if the
+manifest declares destinations and the package holds a transport that can
+reach them (`http_client`, `websocket_client`, or `socket_client`).
+`zeroclaw plugin install <source> --channel-alias operations` runs the same
+ceremony during installation; there the flag governs only the channel
+instance's entry, and a tool entry of the same package is seeded as install
+always seeds it.
+[Binding a channel instance](./index.md#binding-a-channel-instance) describes
+it in full.
+
+In `config.toml`, an instance that is bound and routed to an agent looks like
+this:
 
 ```toml
 [plugins]
@@ -324,6 +401,15 @@ enabled = true
 [agents.support]
 channels = ["plugin.operations"]
 ```
+
+`plugin bind` writes only the `[channels.plugin.operations]` table and the
+instance's `[[plugins.entries]]` row. A new binding is written with `package`
+and the default `enabled = true`. Two steps stay explicit operator
+decisions that the command never makes: turning the plugin system on
+(`plugins.enabled`), and ownership, adding `plugin.operations` to an enabled
+agent's `channels` list (`agents.<agent>.channels`). The readiness report the
+command prints, which `zeroclaw plugin info` repeats, names the first
+precondition still unmet and, where one exists, the command that meets it.
 
 The alias becomes an ordinary channel reference, so `plugin.operations` is
 routed, supervised, restarted, and addressed exactly like `telegram.main`.
@@ -351,6 +437,13 @@ plugin cannot stop the daemon from starting your other channels.
 across all capabilities. Explicit channel bindings rank ahead of
 auto-discovered tools and skills, so a full plugin directory cannot displace a
 channel the operator configured by hand.
+
+`zeroclaw plugin bind` and `zeroclaw plugin info` ask the activation plan for
+this verdict rather than restating its rules, so the first unmet gate they
+report, the ceiling included, is the one the daemon applies to the same config
+and installed packages. A ready verdict means the instance is admitted, not
+that its component loads; `plugin info` reports that separately with its load
+check.
 
 The same admitted set drives all three loaders: the channel loader, the tool
 registry, and the plugin-skill loader. The ceiling is therefore one shared
