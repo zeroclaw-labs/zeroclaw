@@ -2,7 +2,7 @@ use aes::Aes256;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::NoPadding};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::NoPadding};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use rand::RngExt;
@@ -271,8 +271,9 @@ impl MediaDecryptor {
         let iv = &key[..16];
 
         let mut buf = encrypted.to_vec();
-        let plaintext = cbc::Decryptor::<Aes256>::new(key.into(), iv.into())
-            .decrypt_padded_mut::<NoPadding>(&mut buf)
+        let plaintext = cbc::Decryptor::<Aes256>::new_from_slices(key, iv)
+            .map_err(|error| anyhow::Error::msg(format!("invalid WeCom media key or IV: {error}")))?
+            .decrypt_padded::<NoPadding>(&mut buf)
             .map_err(|e| {
                 anyhow::Error::msg(format!("failed to decrypt WeCom media attachment: {e}"))
             })?;

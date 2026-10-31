@@ -12291,6 +12291,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 result
             }
+            #[cfg(all(feature = "channel-xmpp", target_os = "linux"))]
+            ChannelCommands::XmppInbox { args } => {
+                let result = zeroclaw_channels::xmpp::inbox_admin::run(&args)?;
+                println!("{}", serde_json::to_string(&result)?);
+                Ok(())
+            }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
         },

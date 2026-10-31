@@ -1599,6 +1599,8 @@ jobs:
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark::"
           - name: Matrix
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-matrix --lib matrix::"
+          - name: XMPP
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-xmpp --lib xmpp:: xmpp_omemo:: native_ingress_ compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
           - name: MQTT
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-mqtt --lib orchestrator::mqtt"
           - name: QQ
@@ -1626,6 +1628,18 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Install XMPP boundary fixture dependencies
+        if: matrix.name == 'XMPP'
+        run: bash scripts/ci/apt_install.sh prosody openssl python3-venv
+      - name: Exercise native XMPP encrypted listener and shared dispatcher
+        if: matrix.name == 'XMPP'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+        run: |
+          python3 -m venv "$RUNNER_TEMP/xmpp-peer"
+          "$RUNNER_TEMP/xmpp-peer/bin/pip" install -r crates/zeroclaw-channels/tests/xmpp_native/requirements.txt
+          "$RUNNER_TEMP/xmpp-peer/bin/python" crates/zeroclaw-channels/tests/xmpp_native/managed_server.py --output "$RUNNER_TEMP/native-xmpp-result.json"
 
 
   # The SaaS and coding-CLI tools are out of Cargo `default`, so `test` no

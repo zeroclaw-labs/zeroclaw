@@ -297,3 +297,47 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
+
+# Exact-version native XMPP duplicate allowances for maintainer review (#11847).
+# Advisory, license and source checks remain unchanged.
+# Remove each allowance when its older dependency family is no longer required.
+
+[[bans.skip]]
+name = "core-foundation"
+version = "=0.9.4"
+reason = "Native XMPP certificate loading and existing platform TLS consumers require different Core Foundation generations; track alignment in #11847"
+
+[[bans.skip]]
+name = "digest"
+version = "=0.10.7"
+reason = "Existing SASL, password-KDF and hash consumers still require digest 0.10 while native XMPP uses 0.11; track alignment in #11847"
+
+[[bans.skip]]
+name = "hmac"
+version = "=0.12.1"
+reason = "Existing SASL and application consumers require HMAC 0.12 while the newer RustCrypto family requires 0.13; track alignment in #11847"
+
+[[bans.skip]]
+name = "rxml_validation"
+version = "=0.11.0"
+reason = "rxml_proc 0.12.1 requires validation 0.11 while rxml 0.14 requires validation 0.12; track upstream alignment in #11847"
+
+[[bans.skip]]
+name = "sha1"
+version = "=0.10.6"
+reason = "Existing SASL and WebSocket consumers require SHA-1 crate 0.10 while xmpp-parsers uses 0.11; track alignment in #11847"
+
+[[bans.skip]]
+name = "sha2"
+version = "=0.10.9"
+reason = "Existing SASL, password-KDF and application consumers require SHA-2 crate 0.10 while native XMPP uses 0.11; track alignment in #11847"
+
+[[bans.skip]]
+name = "windows-result"
+version = "=0.3.4"
+reason = "Existing windows-core and native XMPP DNS dependencies require different Windows support generations; track alignment in #11847"
+
+[[bans.skip]]
+name = "windows-strings"
+version = "=0.4.2"
+reason = "Existing windows-core and native XMPP DNS dependencies require different Windows support generations; track alignment in #11847"
