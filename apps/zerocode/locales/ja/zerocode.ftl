@@ -452,6 +452,11 @@ zc-chat-status-awaiting-input = 回答待ち
 zc-chat-status-cancelling = キャンセル中
 zc-chat-session-close-error = セッションを閉じられませんでした: { $error }
 zc-chat-elicitation-dropped = エージェントからの質問が表示される前に破棄されました（クライアントの処理が追いつきませんでした）。エージェントの質問がまだ待機している可能性があります。もう一度お試しください。
+zc-chat-elicitation-answered = あなたの回答: { $answer }
+zc-chat-elicitation-cancelled = 回答せずに質問を閉じました。
+zc-chat-elicitation-withdrawn = 回答する前に質問が閉じられました（表示が再読み込みされました）。エージェントにはキャンセルとして伝えられました。
+zc-chat-elicitation-expired = エージェントは質問への回答を待つのをやめました。
+zc-chat-elicitation-outcome-note = { $outcome }（質問: { $question }）
 zc-chat-session-restarted = 新しいセッションを開始しました。
 zc-chat-session-cap = このペインのセッション上限（{ $max }）に達しました。先にサイドバーからセッションを閉じてください。
 zc-chat-resume-dropped = 以前のセッション { $count } 件を再接続できなかったため、再試行用に保持しました。
@@ -705,3 +710,5 @@ zc-config-section-peer-groups-help = チャンネル、参加エージェント�
 zc-config-section-cron-help = スケジュール、プロンプト、チャンネル、対象を結び付ける定期タスクを設定します。
 zc-config-section-tunnel-help = Cloudflare または ngrok でゲートウェイを公開するか、ローカル専用のままにします。
 zc-config-section-onboard-state-help = クイックスタートのライフサイクル状態と、互換性のために残されたセクション別完了記録です。
+
+zc-chat-tool-question = 質問

@@ -452,6 +452,11 @@ zc-chat-status-awaiting-input = en attente d’une réponse
 zc-chat-status-cancelling = annulation
 zc-chat-session-close-error = Échec de la fermeture de la session : { $error }
 zc-chat-elicitation-dropped = Une question de l'agent a été abandonnée avant de pouvoir être affichée (le client a pris du retard). La question de l'agent est peut-être toujours en attente ; réessayez.
+zc-chat-elicitation-answered = Vous avez répondu : { $answer }
+zc-chat-elicitation-cancelled = Vous avez fermé la question sans répondre.
+zc-chat-elicitation-withdrawn = La question s'est fermée avant votre réponse (la vue a été rechargée). L'agent a été informé qu'elle était annulée.
+zc-chat-elicitation-expired = L'agent a cessé d'attendre une réponse à sa question.
+zc-chat-elicitation-outcome-note = { $outcome } (Question : { $question })
 zc-chat-session-restarted = Nouvelle session démarrée.
 zc-chat-session-cap = Limite de sessions de ce panneau atteinte ({ $max }). Fermez d'abord une session depuis la barre latérale.
 zc-chat-resume-dropped = { $count } session(s) précédente(s) n'ont pas pu être rattachées et ont été conservées pour une nouvelle tentative.
@@ -706,3 +711,5 @@ zc-config-section-peer-groups-help = Groupes nommés associant un canal, des age
 zc-config-section-cron-help = Tâches planifiées associant une planification à un prompt, un canal et une cible.
 zc-config-section-tunnel-help = Exposez éventuellement la passerelle via Cloudflare ou ngrok, ou gardez-la uniquement en local.
 zc-config-section-onboard-state-help = État du cycle de vie du démarrage rapide et registre hérité de complétion par section.
+
+zc-chat-tool-question = question
