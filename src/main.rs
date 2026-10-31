@@ -10249,6 +10249,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         }
 
         Commands::Gateway { gateway_command } => {
+            if !cfg!(feature = "gateway") {
+                bail!("{}", no_dashboard_in_build_message());
+            }
             match gateway_command {
                 Some(zeroclaw::GatewayCommands::Restart {
                     port,
@@ -11663,6 +11666,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     }
                 }
             }
+            #[cfg(not(feature = "gateway"))]
+            println!(
+                "{}",
+                t(
+                    "cli-status-web-ui-not-in-build",
+                    "🌐 Web UI:        not included in this build (CLI-only)"
+                )
+            );
             let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
@@ -12338,6 +12349,10 @@ Add pricing to the active provider profile or supply a catalog entry."
         Commands::Desktop {
             install: do_install,
         } => {
+            // The companion app needs the gateway this build does not have.
+            if !cfg!(feature = "gateway") {
+                bail!("{}", no_dashboard_in_build_message());
+            }
             // The marketing download page is not live; point at the GitHub
             // releases page, which hosts the desktop download assets (.deb /
             // .AppImage / .dmg) for the latest release.
@@ -16534,7 +16549,17 @@ async fn run_gateway_if_enabled(
     _config: zeroclaw::config::Config,
     _event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
+    anyhow::bail!("{}", no_dashboard_in_build_message())
+}
+
+/// The answer a build without the gateway gives for the gateway commands and
+/// the desktop companion: they need the standard build, which has the dashboard.
+#[cfg(feature = "agent-runtime")]
+fn no_dashboard_in_build_message() -> String {
+    t(
+        "cli-no-dashboard-in-build",
+        "This ZeroClaw build has no dashboard or web gateway (CLI-only build). To use them, install the standard build: curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh",
+    )
 }
 
 #[cfg(any(feature = "gateway", test))]
