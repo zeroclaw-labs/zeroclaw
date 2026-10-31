@@ -385,6 +385,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn task_deadline_falls_back_safely_with_legacy_translation_overrides() {
+        let key = "channel-runtime-task-deadline";
+        for locale in ["es", "fr", "ja", "zh-CN"] {
+            let sources = CliFtlSources {
+                locale: locale.to_string(),
+                builtin: Some("channel-runtime-request-timeout = Legacy built-in retry suggestion"),
+                disk: Some("channel-runtime-request-timeout = Legacy retry suggestion".to_string()),
+            };
+            let message = format_cli_string_with_args(&sources, key, &[]).unwrap();
+            assert_eq!(
+                message,
+                "⚠️ The task reached its processing deadline. Some actions may have completed; verify their state before retrying."
+            );
+        }
+    }
+
+    #[test]
     fn english_descriptions_are_embedded() {
         let map = format_ftl_messages(include_str!("../locales/en/tools.ftl"), "en");
         assert!(map.contains_key("tool-shell"));
@@ -2744,6 +2761,12 @@ mod tests {
     #[test]
     fn channel_runtime_committed_cli_catalogs_format_from_fluent() {
         let cases = [
+            ("channel-runtime-task-deadline", &[][..], [].as_slice()),
+            (
+                "channel-runtime-still-working",
+                &[("seconds", "60")][..],
+                ["60"].as_slice(),
+            ),
             (
                 "channel-runtime-malformed-tool-output",
                 &[][..],
@@ -2784,7 +2807,6 @@ mod tests {
                 ]
                 .as_slice(),
             ),
-            ("channel-runtime-request-timeout", &[][..], [].as_slice()),
             (
                 "channel-runtime-no-reply-refused",
                 &[][..],

@@ -7,6 +7,8 @@ pub mod acp_server;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
+mod turn_deadline;
+mod turn_progress;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -129,8 +131,8 @@ use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
-    scope_session_key, scope_thread_id, scrub_credentials,
+    build_tool_instructions_for_names, is_model_switch_requested, scope_session_key,
+    scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::agent::system_prompt::build_skills_prompt_with_effective_tools;
 use zeroclaw_runtime::approval::ApprovalManager;
@@ -2642,11 +2644,7 @@ fn provider_ready_cached_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     // Strip stale tool_result blocks from cached turns so the LLM never
     // sees a `<tool_result>` without a preceding `<tool_call>`, which
     // causes hallucinated output on subsequent heartbeat ticks or sessions.
-    for turn in &mut turns {
-        if turn.content.contains("<tool_result") {
-            turn.content = strip_tool_result_content(&turn.content);
-        }
-    }
+    strip_orphan_prompt_tool_results(&mut turns);
 
     // Strip [Used tools: ...] prefixes from cached assistant turns so the
     // LLM never sees (and reproduces) this internal summary format.
@@ -4548,7 +4546,13 @@ fn resync_history_after_trim_or_evict_cache(
     known_prefix: &[ChatMessage],
     outgoing_user_turn_raw_content: Option<&str>,
 ) -> bool {
-    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+    let last_user_idx = history
+        .iter()
+        .enumerate()
+        .rposition(|(index, message)| {
+            message.role == "user" && !is_paired_prompt_tool_result(history, index)
+        })
+        .unwrap_or(0);
     let retained_prior_turns = if last_user_idx >= 1 {
         &history[1..=last_user_idx]
     } else {
@@ -4625,31 +4629,43 @@ fn resync_history_after_trim_or_evict_cache(
     !reconciled
 }
 
-/// Extract tool-call (assistant with tool_call content) and tool-result
-/// messages from the current turn in the LLM history, excluding the final
-/// assistant text response.  "Current turn" = everything after the last
-/// user-role message.
-fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessage> {
-    // Find the index of the last user message — tool messages for the
-    // current turn come after it.
-    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+fn is_paired_prompt_tool_result(history: &[ChatMessage], index: usize) -> bool {
+    history.get(index).is_some_and(|message| {
+        message.role == "user"
+            && zeroclaw_api::tool_carrier::is_prompt_tool_carrier(&message.content)
+            && index
+                .checked_sub(1)
+                .and_then(|i| history.get(i))
+                .is_some_and(|previous| {
+                    previous.role == "assistant"
+                        && zeroclaw_tool_call_parser::contains_parseable_tool_call(
+                            &previous.content,
+                        )
+                })
+    })
+}
 
-    let tail = &history[last_user_idx + 1..];
-    if tail.is_empty() {
-        return Vec::new();
+fn strip_orphan_prompt_tool_results(history: &mut [ChatMessage]) {
+    for index in 0..history.len() {
+        if history[index].content.contains("<tool_result")
+            && !is_paired_prompt_tool_result(history, index)
+        {
+            history[index].content = strip_tool_result_content(&history[index].content);
+        }
     }
+}
 
-    // Everything except the very last assistant message (which is the
-    // final text response that gets stored separately).
-    let end = if tail.last().is_some_and(|m| m.role == "assistant") {
-        tail.len() - 1
+/// Project a completed canonical turn without duplicating its final reply.
+/// Prompt-mode tool results are user messages; retain them verbatim.
+fn canonical_channel_tool_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let end = if messages.last().is_some_and(|m| m.role == "assistant") {
+        messages.len() - 1
     } else {
-        tail.len()
+        messages.len()
     };
-
-    tail[..end]
+    messages[..end]
         .iter()
-        .filter(|m| m.role == "assistant" || m.role == "tool")
+        .filter(|m| m.role != "system")
         .cloned()
         .collect()
 }
@@ -10368,10 +10384,7 @@ async fn process_channel_message_body(
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
 
-    enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
-        Cancelled,
-    }
+    use turn_deadline::Outcome as LlmExecutionResult;
 
     let scale_cap = ctx
         .pacing
@@ -10437,6 +10450,9 @@ async fn process_channel_message_body(
         ctx.prompt_config
             .effective_max_execution_tree_iterations(&ctx.agent_alias),
     );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_budget_secs);
+    let mut completed_turn_messages = Vec::new();
+    let recovery = zeroclaw_runtime::agent::loop_::ToolLoopRecovery::default();
     let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -10451,7 +10467,7 @@ async fn process_channel_message_body(
                     ctx.non_cli_excluded_tools.as_ref()
                 };
             loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
-            let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
+            let tool_loop = Box::pin(zeroclaw_runtime::agent::loop_::run_tool_call_loop_with_recovery(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),
@@ -10510,7 +10526,7 @@ async fn process_channel_message_body(
                     .map(|_| tool_receipts_collector.as_ref()),
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+                new_messages_out: Some(&mut completed_turn_messages),
                 image_cache: None,
                 memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
                     handle: ctx.memory.as_ref(),
@@ -10540,7 +10556,7 @@ async fn process_channel_message_body(
                     config: ctx.prompt_config.as_ref(),
                     live_config: Some(ctx.live_config.clone()),
                 }),
-            }));
+            }, &recovery));
             // Scope this turn's routing handle so concurrent same-agent turns,
             // which share one SendViaTool, never read each other's routes.
             let tool_loop =
@@ -10566,15 +10582,14 @@ async fn process_channel_message_body(
                 attempt_allowlist.clone(),
                 tool_loop,
             );
-            let timed_tool_loop =
-                tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
+            let loop_result = turn_deadline::run(
+                tool_loop,
+                &cancellation_token,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await;
 
-            let loop_result = tokio::select! {
-                () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-                result = timed_tool_loop => LlmExecutionResult::Completed(result),
-            };
-
-            if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
+            if let LlmExecutionResult::Completed(Err(ref e)) = loop_result
                 && let Some((new_model_provider, new_model)) = is_model_switch_requested(e)
             {
                 ::zeroclaw_log::record!(
@@ -10701,9 +10716,48 @@ async fn process_channel_message_body(
         let safeguard = take_last_safeguard_fallback();
         (llm_result, fb, safeguard)
     }));
-    let (llm_result, fallback_info, safeguard_notice) = scope_safeguard_fallback(scoped_turn).await;
+    let progress_secs = ctx
+        .live_config
+        .read()
+        .channels
+        .message_progress_interval_secs;
+    let progress_secs = if progress_secs == 0 {
+        0
+    } else {
+        progress_secs.clamp(15, 3600)
+    };
+    let progress_ctx = &ctx;
+    let progress_msg = &msg;
+    let progress_channel = &target_channel;
+    let (llm_result, fallback_info, safeguard_notice) = turn_progress::with_progress(
+        scope_safeguard_fallback(scoped_turn),
+        std::time::Duration::from_secs(progress_secs),
+        |elapsed| async move {
+            if let Some(channel) = progress_channel.as_ref() {
+                let text = channel_runtime_cli_string_with_args(
+                    "channel-runtime-still-working",
+                    &[("seconds", &elapsed.as_secs().to_string())],
+                );
+                if let Some(guarded) = apply_multi_message_narration_policy(
+                    progress_ctx.hooks.as_deref(),
+                    &progress_ctx.prompt_config.security.leak_detection,
+                    &progress_msg.channel,
+                    &progress_msg.reply_target,
+                    "",
+                    text,
+                )
+                .await
+                {
+                    let _ = channel
+                        .send(&SendMessage::reply_to(progress_msg, guarded).suppress_voice())
+                        .await;
+                }
+            }
+        },
+    )
+    .await;
 
-    if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
+    if matches!(llm_result, LlmExecutionResult::Completed(Ok(_)))
         && let Some(tx) = delta_tx.as_ref()
     {
         let _ = tx
@@ -10786,12 +10840,38 @@ async fn process_channel_message_body(
     }
 
     let reaction_done_emoji = match &llm_result {
-        LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
-        _ => "\u{26A0}\u{FE0F}",                                // ⚠️
+        LlmExecutionResult::Completed(Ok(_)) => "\u{2705}", // ✅
+        _ => "\u{26A0}\u{FE0F}",                            // ⚠️
     };
+
+    // Commit the runtime-owned delta before outbound hooks or any terminal path.
+    // The final successful reply is saved separately after its delivery policy.
+    if !history_resync_failed && ctx.agent_cfg.resolved.keep_tool_context_turns > 0 {
+        let messages = if matches!(&llm_result, LlmExecutionResult::Completed(Ok(_))) {
+            canonical_channel_tool_messages(&completed_turn_messages)
+        } else {
+            completed_turn_messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .cloned()
+                .collect()
+        };
+        for message in messages {
+            append_sender_turn(ctx.as_ref(), &history_key, message);
+        }
+    }
 
     match llm_result {
         LlmExecutionResult::Cancelled => {
+            if !history_resync_failed {
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(
+                        "[Task interrupted. Verify recorded tool results and any operation without a result before retrying; do not repeat completed changes.]",
+                    ),
+                );
+            }
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -10825,7 +10905,7 @@ async fn process_channel_message_body(
                 );
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmExecutionResult::Completed(Ok(response)) => {
             // ── Hook: on_message_sending (modifying) ─────────
             let mut outbound_response = response;
             if let Some(hooks) = &ctx.hooks {
@@ -10910,27 +10990,6 @@ async fn process_channel_message_body(
                 safeguard_notice.as_ref(),
                 model_notice,
             );
-
-            // Persist intermediate tool-call/result messages from this turn
-            // so the model retains concrete "I used tools" examples in
-            // context, preventing drift toward tool-less responses.
-            //
-            // Skipped when the pre-trim resync above could not confirm the
-            // cache matches what's durable: appending onto an evicted cache
-            // would just recreate an unreconciled entry from this turn's
-            // own working buffer. The reply is still delivered to the user
-            // below; only this turn's contribution to the stored transcript
-            // is dropped, and the next turn reloads from the backend.
-            let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
-            if !history_resync_failed && keep_tool_turns > 0 {
-                // Find tool messages for the current turn: everything after
-                // the last user message up to (but not including) the final
-                // assistant response that matches our delivered text.
-                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
-                for tool_msg in tool_messages {
-                    append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
-                }
-            }
 
             if !history_resync_failed {
                 append_sender_turn(
@@ -11290,7 +11349,7 @@ async fn process_channel_message_body(
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Err(e))) => {
+        LlmExecutionResult::Completed(Err(e)) => {
             if zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e)
                 || cancellation_token.is_cancelled()
             {
@@ -11432,8 +11491,9 @@ async fn process_channel_message_body(
                         .with_attrs(error_attributes),
                     "channel_message_error"
                 );
-                let should_rollback_user_turn =
-                    context_window_exceeded.is_none() && should_rollback_failed_user_turn(&e);
+                let should_rollback_user_turn = context_window_exceeded.is_none()
+                    && completed_turn_messages.is_empty()
+                    && should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
                     && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
@@ -11450,7 +11510,9 @@ async fn process_channel_message_body(
                     append_sender_turn(
                         ctx.as_ref(),
                         &history_key,
-                        ChatMessage::assistant("[Task failed — not continuing this request]"),
+                        ChatMessage::assistant(
+                            "[Task failed. Verify recorded tool results and any operation without a result before retrying; do not repeat completed changes.]",
+                        ),
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
@@ -11467,7 +11529,7 @@ async fn process_channel_message_body(
                 }
             }
         }
-        LlmExecutionResult::Completed(Err(_)) => {
+        LlmExecutionResult::TimedOut => {
             let timeout_msg = format!(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
@@ -11503,7 +11565,9 @@ async fn process_channel_message_body(
                 append_sender_turn(
                     ctx.as_ref(),
                     &history_key,
-                    ChatMessage::assistant("[Task timed out — not continuing this request]"),
+                    ChatMessage::assistant(
+                        "[Task timed out. Verify recorded tool results and any operation without a result before retrying; do not repeat completed changes.]",
+                    ),
                 );
             }
             if let Some(channel) = target_channel.as_ref() {
@@ -11511,7 +11575,7 @@ async fn process_channel_message_body(
                 // (RFCerror-path fix): cancel the draft, then send as
                 // text so a timeout notice is never read aloud on a voice peer.
                 let error_text = zeroclaw_runtime::i18n::get_required_cli_string(
-                    "channel-runtime-request-timeout",
+                    "channel-runtime-task-deadline",
                 );
                 if let Some(draft_id) = draft_message_id.as_deref() {
                     let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
@@ -35902,9 +35966,17 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|(role, content)| { role == "user" && content.contains("summarize this") })
         );
-        assert!(
-            !second_call.iter().any(|(role, _)| role == "assistant"),
-            "cancelled turn should not persist an assistant response"
+        let assistant_context: Vec<_> = second_call
+            .iter()
+            .filter(|(role, _)| role == "assistant")
+            .map(|(_, content)| content.as_str())
+            .collect();
+        assert_eq!(
+            assistant_context,
+            [
+                "[Task interrupted. Verify recorded tool results and any operation without a result before retrying; do not repeat completed changes.]"
+            ],
+            "cancelled turn must retain only its interruption marker, not a provider response"
         );
     }
 
@@ -36408,9 +36480,17 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|(role, content)| { role == "user" && content.contains("second question") })
         );
-        assert!(
-            !second_call.iter().any(|(role, _)| role == "assistant"),
-            "cancelled turn should not persist an assistant response"
+        let assistant_context: Vec<_> = second_call
+            .iter()
+            .filter(|(role, _)| role == "assistant")
+            .map(|(_, content)| content.as_str())
+            .collect();
+        assert_eq!(
+            assistant_context,
+            [
+                "[Task interrupted. Verify recorded tool results and any operation without a result before retrying; do not repeat completed changes.]"
+            ],
+            "cancelled turn must retain only its interruption marker, not a provider response"
         );
     }
 
@@ -36688,11 +36768,17 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|(role, content)| role == "user" && content.contains("enabled second"))
         );
-        assert!(
-            !enabled_second_call
-                .iter()
-                .any(|(role, _)| role == "assistant"),
-            "cancelled turn should not persist an assistant response"
+        let assistant_context: Vec<_> = enabled_second_call
+            .iter()
+            .filter(|(role, _)| role == "assistant")
+            .map(|(_, content)| content.as_str())
+            .collect();
+        assert_eq!(
+            assistant_context,
+            [
+                "[Task interrupted. Verify recorded tool results and any operation without a result before retrying; do not repeat completed changes.]"
+            ],
+            "cancelled alias must retain only its interruption marker, not a provider response"
         );
         drop(calls);
         drop(sent_messages);
@@ -57002,7 +57088,7 @@ Done."#;
 
     #[test]
     fn extract_current_turn_tool_messages_returns_intermediate_messages() {
-        let history = vec![
+        let history = [
             ChatMessage::system("sys"),
             ChatMessage::user("older msg"),
             ChatMessage::assistant("older reply"),
@@ -57012,7 +57098,12 @@ Done."#;
             ChatMessage::assistant("Done, iPad is blocked."),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&history);
+        let tool_msgs = canonical_channel_tool_messages(
+            &history[history
+                .iter()
+                .rposition(|m| m.role == "user")
+                .map_or(0, |i| i + 1)..],
+        );
         assert_eq!(tool_msgs.len(), 2);
         assert_eq!(tool_msgs[0].role, "assistant");
         assert!(tool_msgs[0].content.contains("tool_call"));
@@ -57021,18 +57112,23 @@ Done."#;
 
     #[test]
     fn extract_current_turn_tool_messages_empty_when_no_tools() {
-        let history = vec![
+        let history = [
             ChatMessage::user("hello"),
             ChatMessage::assistant("Hi there!"),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&history);
+        let tool_msgs = canonical_channel_tool_messages(
+            &history[history
+                .iter()
+                .rposition(|m| m.role == "user")
+                .map_or(0, |i| i + 1)..],
+        );
         assert!(tool_msgs.is_empty());
     }
 
     #[test]
     fn extract_current_turn_tool_messages_multiple_tool_rounds() {
-        let history = vec![
+        let history = [
             ChatMessage::user("do two things"),
             ChatMessage::assistant("{\"tool_call\": \"read_skill\"}"),
             ChatMessage::tool("skill content"),
@@ -57041,7 +57137,12 @@ Done."#;
             ChatMessage::assistant("All done."),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&history);
+        let tool_msgs = canonical_channel_tool_messages(
+            &history[history
+                .iter()
+                .rposition(|m| m.role == "user")
+                .map_or(0, |i| i + 1)..],
+        );
         assert_eq!(tool_msgs.len(), 4);
     }
 
@@ -58539,6 +58640,331 @@ Done."#;
                 "ordinary chat must fall through: {content:?}"
             );
         }
+    }
+
+    #[test]
+    fn channel_recovery_preserves_paired_prompt_results_but_strips_orphans() {
+        let result = "[Tool results]\n[Tool attachments: 0]\n<tool_result name=\"mock_price\">65000</tool_result>";
+        let mut paired = vec![
+            ChatMessage::assistant(tool_call_payload()),
+            ChatMessage::user(result),
+        ];
+        strip_orphan_prompt_tool_results(&mut paired);
+        assert_eq!(paired[1].content, result);
+        let mut orphan = vec![
+            ChatMessage::assistant("ordinary reply"),
+            ChatMessage::user(result),
+        ];
+        strip_orphan_prompt_tool_results(&mut orphan);
+        assert!(!orphan[1].content.contains("65000"));
+    }
+
+    struct RecoveryFailureTool(Arc<AtomicUsize>);
+    impl ::zeroclaw_api::attribution::Attributable for RecoveryFailureTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            MockPriceTool.role()
+        }
+        fn alias(&self) -> &str {
+            "mock_price"
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for RecoveryFailureTool {
+        fn name(&self) -> &str {
+            "mock_price"
+        }
+        fn description(&self) -> &str {
+            "Synthetic failing operation"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            MockPriceTool.parameters_schema()
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some("synthetic failure".into()),
+            })
+        }
+    }
+    struct RecoveryRepeatingProvider;
+    impl ::zeroclaw_api::attribution::Attributable for RecoveryRepeatingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ToolCallingModelProvider.role()
+        }
+        fn alias(&self) -> &str {
+            "recovery-repeating-provider"
+        }
+    }
+    #[async_trait::async_trait]
+    impl ModelProvider for RecoveryRepeatingProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(tool_call_payload())
+        }
+        async fn chat_with_history(
+            &self,
+            _: &[ChatMessage],
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(tool_call_payload())
+        }
+    }
+    #[tokio::test]
+    async fn channel_recovery_contains_repeated_failures_before_deadline() {
+        let channel = Arc::new(RecordingChannel::default());
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut ctx = test_runtime_ctx_with_observer_and_tools(
+            channel.clone(),
+            Arc::new(RecoveryRepeatingProvider),
+            Default::default(),
+            Default::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(RecoveryFailureTool(executions.clone()))],
+        );
+        {
+            let c = Arc::get_mut(&mut ctx).unwrap();
+            c.max_tool_iterations = 20;
+            c.pacing.loop_detection_enabled = true;
+            c.pacing.loop_detection_max_repeats = 3;
+        }
+        process_channel_message(
+            ctx.clone(),
+            ChannelMessage {
+                id: "repeated-failure".into(),
+                sender: "operator".into(),
+                reply_target: "operator".into(),
+                content: "Perform the synthetic operation.".into(),
+                channel: channel.name().into(),
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(executions.load(Ordering::SeqCst), 4);
+        assert!(
+            channel
+                .sent_messages
+                .lock()
+                .await
+                .iter()
+                .any(|m| m.contains("recovery retry failed"))
+        );
+    }
+
+    struct RecoveryCountingTool(Arc<AtomicUsize>);
+    impl ::zeroclaw_api::attribution::Attributable for RecoveryCountingTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            MockPriceTool.role()
+        }
+        fn alias(&self) -> &str {
+            "mock_price"
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for RecoveryCountingTool {
+        fn name(&self) -> &str {
+            "mock_price"
+        }
+        fn description(&self) -> &str {
+            "Synthetic completed operation"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            MockPriceTool.parameters_schema()
+        }
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            MockPriceTool.execute(args).await
+        }
+    }
+
+    struct RecoveryResumeProvider {
+        calls: AtomicUsize,
+        native: bool,
+        resumed: Mutex<Vec<ChatMessage>>,
+    }
+    impl ::zeroclaw_api::attribution::Attributable for RecoveryResumeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ToolCallingModelProvider.role()
+        }
+        fn alias(&self) -> &str {
+            "recovery-resume-provider"
+        }
+    }
+    #[async_trait::async_trait]
+    impl ModelProvider for RecoveryResumeProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".into())
+        }
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: self.native,
+                ..Default::default()
+            }
+        }
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(tool_call_payload()),
+                1 => std::future::pending().await,
+                _ => {
+                    *self.resumed.lock().unwrap() = messages.to_vec();
+                    Ok("Used the retained result; no operation repeated.".into())
+                }
+            }
+        }
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if !self.native {
+                return Ok(zeroclaw_providers::ChatResponse {
+                    text: Some(
+                        self.chat_with_history(request.messages, model, temperature)
+                            .await?,
+                    ),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(zeroclaw_providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "completed-operation".into(),
+                        name: "mock_price".into(),
+                        arguments: r#"{"symbol":"BTC"}"#.into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                }),
+                1 => std::future::pending().await,
+                _ => {
+                    *self.resumed.lock().unwrap() = request.messages.to_vec();
+                    Ok(zeroclaw_providers::ChatResponse {
+                        text: Some("Used the retained result; no operation repeated.".into()),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                        reasoning_content: None,
+                    })
+                }
+            }
+        }
+    }
+
+    async fn assert_channel_recovery_resume(native: bool) {
+        let channel = Arc::new(RecordingChannel::default());
+        let provider = Arc::new(RecoveryResumeProvider {
+            calls: AtomicUsize::new(0),
+            native,
+            resumed: Mutex::new(Vec::new()),
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut ctx = test_runtime_ctx_with_observer_and_tools(
+            channel.clone(),
+            provider.clone(),
+            Default::default(),
+            Default::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(RecoveryCountingTool(executions.clone()))],
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let c = Arc::get_mut(&mut ctx).unwrap();
+            c.message_timeout_secs = 1;
+            c.pacing.message_timeout_scale_max = Some(1);
+            c.workspace_dir = Arc::new(tmp.path().to_path_buf());
+            c.session_store = Some(Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap()));
+        }
+        let message = ChannelMessage {
+            id: "first".into(),
+            sender: "operator".into(),
+            reply_target: "operator".into(),
+            content: "Perform the synthetic operation.".into(),
+            channel: channel.name().into(),
+            ..Default::default()
+        };
+        process_channel_message(ctx.clone(), message.clone(), CancellationToken::new()).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(
+            channel
+                .sent_messages
+                .lock()
+                .await
+                .iter()
+                .any(
+                    |m| m.ends_with(&zeroclaw_runtime::i18n::get_required_cli_string(
+                        "channel-runtime-task-deadline"
+                    ))
+                )
+        );
+        // Force reload from the session backend rather than reusing the cache.
+        ctx.conversation_histories.lock().unwrap().clear();
+        let followup = ChannelMessage {
+            id: "resume".into(),
+            content: "Resume from completed results; do not repeat changes.".into(),
+            ..message
+        };
+        process_channel_message(ctx.clone(), followup, CancellationToken::new()).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let history = provider.resumed.lock().unwrap();
+        assert!(
+            history.iter().any(|m| m.content.contains("65000")),
+            "completed result missing: {history:?}"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content.contains("do not repeat completed changes"))
+        );
+        if native {
+            assert!(
+                history
+                    .iter()
+                    .any(|m| m.role == "tool" && m.content.contains("completed-operation"))
+            );
+        } else {
+            assert!(
+                history
+                    .iter()
+                    .any(|m| m.role == "user" && m.content.starts_with("[Tool results]"))
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_recovery_resumes_native_results_after_deadline() {
+        assert_channel_recovery_resume(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_recovery_resumes_prompt_results_after_deadline() {
+        assert_channel_recovery_resume(false).await;
     }
 }
 
