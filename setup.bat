@@ -163,38 +163,15 @@ echo %BOLD%[3/5] Downloading prebuilt binary...%RESET%
 
 if "%DRY_RUN%"=="true" (
     echo   [dry-run] Would download the prebuilt Windows release archive
+    echo   [dry-run] Would verify SHA256SUMS from the same release before extraction
     echo   [dry-run] Would install to %USERPROFILE%\.zeroclaw\bin
     echo   [dry-run] Would add %USERPROFILE%\.zeroclaw\bin to PATH
     goto :dry_run_done
 )
 
-:: Try to get latest release URL via gh or curl
-where gh >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    for /f "tokens=*" %%u in ('gh release view --repo %REPO% --json assets --jq ".assets[] | select(.name | test(\"windows-msvc\")) | .url" 2^>nul') do (
-        set "DOWNLOAD_URL=%%u"
-    )
-)
-
-if not defined DOWNLOAD_URL (
-    :: Fallback: construct URL from known release pattern
-    set "DOWNLOAD_URL=https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-%TARGET%.zip"
-)
-
-echo   Downloading from release...
-curl -sSfL -o "%TEMP%\zeroclaw-windows.zip" "!DOWNLOAD_URL!"
-if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%Prebuilt binary not available. Falling back to source build - dist%RESET%
-    goto :build_dist
-)
-
-:: Extract
-echo   Extracting...
-mkdir "%USERPROFILE%\.zeroclaw\bin" 2>nul
-tar -xf "%TEMP%\zeroclaw-windows.zip" -C "%USERPROFILE%\.zeroclaw\bin"
-if %ERRORLEVEL% NEQ 0 (
-    powershell -Command "Expand-Archive -Force '%TEMP%\zeroclaw-windows.zip' '%USERPROFILE%\.zeroclaw\bin'"
-)
+echo   Downloading and verifying the release checksum...
+powershell -NoProfile -File "%~dp0scripts\install_windows_prebuilt.ps1"
+if errorlevel 1 goto :error_exit
 
 :: Add to PATH if not already there
 echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
