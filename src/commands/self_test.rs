@@ -374,6 +374,13 @@ fn format_probe_url(scheme: &str, configured_host: &str, port: u16, path: &str) 
 }
 
 async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
+    // A CLI-only build has no gateway to probe; that is its expected shape.
+    if !cfg!(feature = "gateway") {
+        return CheckResult::pass(
+            "gateway",
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-gateway-not-in-build"),
+        );
+    }
     let port = config.gateway.port;
     let (probe_host, _) = resolve_probe_host(&config.gateway.host);
     let probe_url = format!("http://{probe_host}:{port}/health");
@@ -780,5 +787,17 @@ fi
     fn build_websocket_probe_url_omits_token_when_none_resolved() {
         let url = build_websocket_probe_url("127.0.0.1", 42617, None, true, None);
         assert_eq!(url, "ws://127.0.0.1:42617/ws/chat");
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[tokio::test]
+    async fn gateway_check_reports_the_gateway_as_not_in_this_build() {
+        let config = zeroclaw_config::schema::Config::default();
+        let result = super::check_gateway_health(&config).await;
+        assert!(result.passed, "{}", result.detail);
+        let expected_detail =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-gateway-not-in-build");
+        assert_eq!(result.detail, expected_detail);
+        assert!(result.detail.contains("not included in this build"));
     }
 }
