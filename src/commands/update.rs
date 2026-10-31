@@ -384,14 +384,22 @@ fn current_target_triple() -> Option<&'static str> {
         std::env::consts::OS,
         std::env::consts::ARCH,
         cfg!(target_env = "gnu"),
+        cfg!(target_env = "musl"),
     )
 }
 
-fn target_triple_for(os: &str, arch: &str, windows_gnu: bool) -> Option<&'static str> {
+fn target_triple_for(
+    os: &str,
+    arch: &str,
+    windows_gnu: bool,
+    linux_musl: bool,
+) -> Option<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Some("aarch64-apple-darwin"),
         ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("linux", "aarch64") if linux_musl => Some("aarch64-unknown-linux-musl"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("linux", "x86_64") if linux_musl => Some("x86_64-unknown-linux-musl"),
         ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
         ("windows", "aarch64") => Some("aarch64-pc-windows-msvc"),
         ("windows", "x86_64") if windows_gnu => Some("x86_64-pc-windows-gnu"),
@@ -1413,20 +1421,40 @@ mod tests {
 
     #[test]
     fn target_triple_for_rejects_unsupported_architectures() {
-        assert_eq!(target_triple_for("linux", "arm", false), None);
-        assert_eq!(target_triple_for("macos", "powerpc", false), None);
-        assert_eq!(target_triple_for("windows", "x86", false), None);
+        assert_eq!(target_triple_for("linux", "arm", false, false), None);
+        assert_eq!(target_triple_for("macos", "powerpc", false, false), None);
+        assert_eq!(target_triple_for("windows", "x86", false, false), None);
     }
 
     #[test]
     fn target_triple_for_distinguishes_windows_envs() {
         assert_eq!(
-            target_triple_for("windows", "x86_64", false),
+            target_triple_for("windows", "x86_64", false, false),
             Some("x86_64-pc-windows-msvc")
         );
         assert_eq!(
-            target_triple_for("windows", "x86_64", true),
+            target_triple_for("windows", "x86_64", true, false),
             Some("x86_64-pc-windows-gnu")
+        );
+    }
+
+    #[test]
+    fn target_triple_for_distinguishes_linux_libcs() {
+        assert_eq!(
+            target_triple_for("linux", "x86_64", false, false),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            target_triple_for("linux", "x86_64", false, true),
+            Some("x86_64-unknown-linux-musl")
+        );
+        assert_eq!(
+            target_triple_for("linux", "aarch64", false, false),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            target_triple_for("linux", "aarch64", false, true),
+            Some("aarch64-unknown-linux-musl")
         );
     }
 
