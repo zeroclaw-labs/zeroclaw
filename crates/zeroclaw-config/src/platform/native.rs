@@ -516,16 +516,19 @@ mod tests {
 
     /// Per-test PowerShell cache root for Linux/macOS. Parallel nextest workers
     /// share `$HOME`, and concurrent `pwsh` exits can corrupt
-    /// `~/.cache/powershell/StartupProfileData-NonInteractive` (PowerShell#26528).
-    /// Pin each test's `pwsh` processes to an exclusive `XDG_CACHE_HOME` instead.
-    /// Windows keeps its cache under `LOCALAPPDATA`; leave that path alone.
+    /// `~/.cache/powershell/StartupProfileData-NonInteractive` (upstream PowerShell
+    /// startup-profile race). Pin each test's `pwsh` processes to an exclusive
+    /// `XDG_CACHE_HOME` instead. Windows keeps its cache under `LOCALAPPDATA`;
+    /// leave that path alone.
     struct IsolatedPowershellCache {
+        #[cfg(not(target_os = "windows"))]
         dir: tempfile::TempDir,
     }
 
     impl IsolatedPowershellCache {
         fn new() -> Self {
             Self {
+                #[cfg(not(target_os = "windows"))]
                 dir: tempfile::tempdir().expect("powershell test cache tempdir"),
             }
         }
@@ -535,6 +538,10 @@ mod tests {
             {
                 cmd.env("XDG_CACHE_HOME", self.dir.path());
             }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = cmd;
+            }
         }
 
         fn apply_tokio(&self, cmd: &mut tokio::process::Command) {
@@ -542,9 +549,12 @@ mod tests {
             {
                 cmd.env("XDG_CACHE_HOME", self.dir.path());
             }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = cmd;
+            }
         }
     }
-
 
     fn find_powershell_interpreter(cache: &IsolatedPowershellCache) -> Option<&'static str> {
         ["pwsh", "powershell"].into_iter().find(|candidate| {
@@ -558,7 +568,6 @@ mod tests {
                 .is_ok()
         })
     }
-
 
     #[test]
     fn default_candidates_skip_unavailable_login_shell() {
