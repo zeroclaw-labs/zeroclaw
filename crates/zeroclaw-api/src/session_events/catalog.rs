@@ -31,7 +31,7 @@ pub struct SessionIndexRecord {
     /// Adapter session identity. This is independent of creation provenance.
     pub session_key: Option<String>,
     /// Protocol that originally created the session; never a routing key.
-    pub source: Option<String>,
+    pub creation_source: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
     pub last_activity: i64,
@@ -67,8 +67,8 @@ impl Session {
     pub fn channel_id(&self) -> Option<&str> {
         self.fields.get("channel_id").and_then(Value::as_str)
     }
-    pub fn source(&self) -> Option<&str> {
-        self.fields.get("source").and_then(Value::as_str)
+    pub fn creation_source(&self) -> Option<&str> {
+        self.fields.get("creation_source").and_then(Value::as_str)
     }
     pub fn session_key(&self) -> Option<&str> {
         self.fields.get("session_key").and_then(Value::as_str)
@@ -190,7 +190,7 @@ impl SessionReducer {
         let state = &mut detail.session;
         if !self.importing
             && !matches!(&event.actor, EventActor::System {component} if component == "session_upgrade")
-            && !matches!(&event.body.data, EventData::SessionMetadataChanged {field, ..} if field == "session_identity")
+            && !matches!(&event.body.data, EventData::SessionMetadataChanged {field, ..} if matches!(field.as_str(), "session_key" | "creation_source"))
         {
             state.last_activity = event.committed_at;
             self.last_activity_sequence = event.sequence;
@@ -314,21 +314,21 @@ impl SessionReducer {
             .ok_or_else(|| ReadError::Corrupt("session root missing".into()))?
             .session;
         match field {
-            "session_identity" => {
+            "session_key" => {
                 let key = value
-                    .get("session_key")
-                    .and_then(Value::as_str)
+                    .as_str()
                     .ok_or_else(|| ReadError::Corrupt("session key missing".into()))?;
-                let source = value
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| ReadError::Corrupt("session source missing".into()))?;
                 state
                     .fields
                     .insert("session_key".into(), Value::String(key.into()));
+            }
+            "creation_source" => {
+                let source = value
+                    .as_str()
+                    .ok_or_else(|| ReadError::Corrupt("session creation source missing".into()))?;
                 state
                     .fields
-                    .insert("source".into(), Value::String(source.into()));
+                    .insert("creation_source".into(), Value::String(source.into()));
             }
             "created_at" => {
                 state.created_at = value

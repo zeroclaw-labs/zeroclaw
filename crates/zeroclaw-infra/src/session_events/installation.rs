@@ -210,33 +210,48 @@ pub(crate) fn legacy_guard(directory: &Path) -> std::io::Result<InstallationGuar
     Ok(guard)
 }
 
-/// Immutable adapter identity and creation provenance. Source only describes
-/// the initial protocol; it is never a routing or enumeration key.
-pub fn session_identity(
+/// Immutable session identity. The key is the only value needed to resolve a
+/// stream; creation provenance is stored by the separate metadata event below.
+pub fn session_key(
     stream: SessionStreamId,
     key: &str,
-    source: &str,
 ) -> Result<(SessionEvent, PayloadRecord), AppendError> {
     if key.is_empty() || key.len() > 512 {
         return Err(AppendError::InvalidReference("invalid session key".into()));
     }
-    if source.is_empty() {
+    let value = PayloadRecord::json("session.authority/v1", &key)?;
+    let event = SessionEvent::typed(
+        stream,
+        EventData::SessionMetadataChanged {
+            field: "session_key".into(),
+            new_value_ref: StoredPayloadRef::from(&value),
+        },
+        EventActor::System {
+            component: "session_key".into(),
+        },
+    )?;
+    Ok((event, value))
+}
+
+/// Immutable protocol provenance captured when a session is first created.
+pub fn creation_source(
+    stream: SessionStreamId,
+    source: &str,
+) -> Result<(SessionEvent, PayloadRecord), AppendError> {
+    if source.is_empty() || source.len() > 128 {
         return Err(AppendError::InvalidReference(
             "invalid session creation source".into(),
         ));
     }
-    let value = PayloadRecord::json(
-        "session.authority/v1",
-        &serde_json::json!({"session_key":key,"source":source}),
-    )?;
+    let value = PayloadRecord::json("session.authority/v1", &source)?;
     let event = SessionEvent::typed(
         stream,
         EventData::SessionMetadataChanged {
-            field: "session_identity".into(),
+            field: "creation_source".into(),
             new_value_ref: StoredPayloadRef::from(&value),
         },
         EventActor::System {
-            component: "session_identity".into(),
+            component: "creation_source".into(),
         },
     )?;
     Ok((event, value))
@@ -283,7 +298,7 @@ pub fn session_keys(
                     field,
                     new_value_ref,
                 } = &event.body.data
-                    && field == "session_identity"
+                    && field == "session_key"
                 {
                     let PayloadRead::Present(value) = store
                         .read_payload(&new_value_ref.payload_id)
@@ -298,13 +313,11 @@ pub fn session_keys(
                             "session identity reference mismatch".into(),
                         ));
                     }
-                    let identity: serde_json::Value = serde_json::from_slice(&value.body)
+                    let family: String = serde_json::from_slice(&value.body)
                         .map_err(|error| AppendError::Corrupt(error.to_string()))?;
-                    let family = identity
-                        .get("session_key")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| AppendError::Corrupt("session key missing".into()))?
-                        .to_owned();
+                    if family.is_empty() || family.len() > 512 {
+                        return Err(AppendError::Corrupt("invalid session key".into()));
+                    }
                     if result.insert(family, stream.clone()).is_some() {
                         return Err(AppendError::Corrupt("duplicate session identity".into()));
                     }

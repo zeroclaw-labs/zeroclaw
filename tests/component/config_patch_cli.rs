@@ -1065,7 +1065,7 @@ fn seed_native_provider_rename_family(
         AppendRequest, BranchId, CaptureMode, EventActor, EventCursor, EventData, SessionEvent,
         SessionId, SessionStreamId,
     };
-    use zeroclaw_infra::session_events::installation::{NativeBackend, session_identity};
+    use zeroclaw_infra::session_events::installation::{NativeBackend, session_key};
 
     zeroclaw_infra::session_events::upgrade::upgrade_installation(data_dir, backend, |_| {
         "fixture".into()
@@ -1094,7 +1094,7 @@ fn seed_native_provider_rename_family(
     )
     .expect("native event");
     event.branch_id = Some(BranchId::new());
-    let (identity, payload) = session_identity(stream.clone(), "fixture", "test").unwrap();
+    let (identity, payload) = session_key(stream.clone(), "fixture").unwrap();
     store
         .append_batch(AppendRequest {
             stream_id: stream.clone(),

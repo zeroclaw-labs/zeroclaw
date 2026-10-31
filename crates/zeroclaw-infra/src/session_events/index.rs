@@ -21,7 +21,7 @@ pub(crate) fn ensure_sqlite_schema(connection: &Connection) -> Result<(), Append
             "CREATE TABLE IF NOT EXISTS session_index (
                stream_id TEXT PRIMARY KEY,
                session_id TEXT,
-               source TEXT,
+               creation_source TEXT,
                title TEXT,
                session_key TEXT UNIQUE,
                created_at INTEGER NOT NULL,
@@ -207,13 +207,13 @@ fn upsert_sqlite(
         .map_err(|error| AppendError::Corrupt(error.to_string()))?;
     tx.execute(
         "INSERT INTO session_index (
-            stream_id,session_id,source,title,created_at,last_activity,
+            stream_id,session_id,creation_source,title,created_at,last_activity,
             first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,
             provider,model,category,project,parent_stream_id,parent_thread_id,parent_agent,
             owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json,session_key
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
          ON CONFLICT(stream_id) DO UPDATE SET
-            session_id=excluded.session_id,source=excluded.source,title=excluded.title,session_key=excluded.session_key,
+            session_id=excluded.session_id,creation_source=excluded.creation_source,title=excluded.title,session_key=excluded.session_key,
             created_at=excluded.created_at,last_activity=excluded.last_activity,
             first_user_message_id=excluded.first_user_message_id,first_user_preview=excluded.first_user_preview,
             cwd=excluded.cwd,git_remote=excluded.git_remote,git_branch=excluded.git_branch,
@@ -226,7 +226,7 @@ fn upsert_sqlite(
         params![
             record.stream_id.as_str(),
             record.session_id.as_ref().map(ToString::to_string),
-            record.source,
+            record.creation_source,
             record.title,
             record.created_at,
             record.last_activity,
@@ -271,7 +271,7 @@ fn load_sqlite_records(
         return Ok(BTreeMap::new());
     }
     let mut statement = connection
-        .prepare("SELECT stream_id,session_id,source,title,created_at,last_activity,first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,provider,model,category,project,parent_stream_id,parent_thread_id,parent_agent,owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json,session_key FROM session_index")
+        .prepare("SELECT stream_id,session_id,creation_source,title,created_at,last_activity,first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,provider,model,category,project,parent_stream_id,parent_thread_id,parent_agent,owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json,session_key FROM session_index")
         .map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -295,7 +295,7 @@ fn load_sqlite_records(
                 })?,
                 session_id: parse_optional(row.get(1)?),
                 session_key: row.get(26)?,
-                source: row.get(2)?,
+                creation_source: row.get(2)?,
                 title: row.get(3)?,
                 created_at: row.get(4)?,
                 last_activity: row.get(5)?,
@@ -447,7 +447,7 @@ mod tests {
             .change(&session, vec![("title", json!("Renamed session"))])
             .expect("rename");
         let rows = catalog.query().index_records().expect("updated index");
-        assert_eq!(rows[0].source.as_deref(), Some("gateway"));
+        assert_eq!(rows[0].creation_source.as_deref(), Some("gateway"));
         assert_eq!(rows[0].title.as_deref(), Some("Renamed session"));
         let columns = connection
             .prepare("PRAGMA table_info(session_index)")
@@ -513,7 +513,7 @@ mod tests {
         fs::write(&index, "interrupted index write\n").expect("corrupt disposable index");
         let rebuilt = catalog.query().index_records().expect("rebuilt index");
         assert_eq!(rebuilt.len(), 1);
-        assert_eq!(rebuilt[0].source.as_deref(), Some("gateway"));
+        assert_eq!(rebuilt[0].creation_source.as_deref(), Some("gateway"));
         fs::remove_file(&index).expect("remove index");
         fs::create_dir(&index).expect("block index read");
         assert!(matches!(
@@ -550,7 +550,7 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert!(rows[0].first_user_message_id.is_some());
             assert_eq!(rows[0].first_user_preview.as_deref(), Some("首条用户消息"));
-            assert_eq!(rows[0].source.as_deref(), Some("legacy"));
+            assert_eq!(rows[0].creation_source.as_deref(), Some("legacy"));
             assert_eq!(rows[0].title.as_deref(), Some("Migrated title"));
             let session = catalog
                 .query()

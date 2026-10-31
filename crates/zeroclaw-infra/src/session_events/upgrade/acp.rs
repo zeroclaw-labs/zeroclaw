@@ -1,4 +1,5 @@
 //! Legacy ACP execution is imported as observed history, never replayed effects.
+use super::super::installation::creation_source;
 use super::*;
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::session_events::*;
@@ -459,9 +460,10 @@ fn import_one(
     )?;
     let mut final_context = projection(&stream, &branch, &body, "legacy_acp_context")?;
     final_context.event_id = EventId::parse(format!("legacy-acp-final-{stream}"))?;
-    let (identity, identity_payload) = session_identity(stream.clone(), family, "acp")?;
+    let (identity, identity_payload) = session_key(stream.clone(), family)?;
+    let (source, source_payload) = creation_source(stream.clone(), "acp")?;
     let mut events = Vec::new();
-    let mut payloads = vec![body, identity_payload];
+    let mut payloads = vec![body, identity_payload, source_payload];
     if let Some(checkpoint) = checkpoint {
         events.push(SessionEvent::typed(
             stream.clone(),
@@ -484,7 +486,7 @@ fn import_one(
             EventActor::default(),
         )?);
     }
-    events.extend([final_context, identity]);
+    events.extend([final_context, identity, source]);
     append(
         store,
         &stream,

@@ -28,8 +28,7 @@ fn seed(
     .expect("event");
     event.branch_id = Some(branch);
     let (identity, identity_payload) =
-        super::super::installation::session_identity(stream.clone(), "fixture", "test")
-            .expect("identity");
+        super::super::installation::session_key(stream.clone(), "fixture").expect("identity");
     let request = AppendRequest {
         stream_id: stream.clone(),
         expected_head: EventCursor::beginning(stream.clone()),

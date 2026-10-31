@@ -8,7 +8,7 @@ use zeroclaw_api::session_events::{
     PayloadRecord, SessionEvent, SessionId, SessionStreamId, StoredPayloadRef,
 };
 use zeroclaw_infra::session_events::installation::{
-    InstallationGuard, NativeBackend, session_identity,
+    InstallationGuard, NativeBackend, creation_source, session_key,
 };
 use zeroclaw_kernel::session::engine::{EngineSession, EngineSessionAuthority};
 use zeroclaw_kernel::session::query::{SessionAccess, SessionAccessPolicy};
@@ -282,10 +282,11 @@ pub async fn open_cli_session(
                     summary_source_refs:vec![], transform_started_event_id:None,
                 }, EventActor::default())?;
                 context.branch_id=Some(branch.clone());
-                let (identity, identity_payload) = session_identity(stream.clone(), &family, "cli")?;
+                let (identity, identity_payload) = session_key(stream.clone(), &family)?;
+                let (source, source_payload) = creation_source(stream.clone(), "cli")?;
                 SessionCoordinator::new(Arc::clone(&store)).append(AppendRequest {
                     stream_id:stream.clone(), expected_head:EventCursor::beginning(stream.clone()), idempotency_key:key.clone(),
-                    events:vec![root,identity,context], payloads:vec![context_payload,identity_payload], erasure_reference_commitment:None,
+                    events:vec![root,identity,source,context], payloads:vec![context_payload,identity_payload,source_payload], erasure_reference_commitment:None,
                 })?;
             }
             drop(installation);

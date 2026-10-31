@@ -72,7 +72,65 @@ async fn creation_source_is_independent_of_session_key_and_preserved_on_reopen()
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].stream_id, stream);
         assert_eq!(records[0].session_key.as_deref(), Some(key));
-        assert_eq!(records[0].source.as_deref(), Some("cron"));
+        assert_eq!(records[0].creation_source.as_deref(), Some("cron"));
+        let summaries = catalog
+            .query()
+            .indexed_summaries()
+            .expect("indexed summaries");
+        assert_eq!(summaries[0].1.session_key(), Some(key));
+        assert_eq!(summaries[0].1.creation_source(), Some("cron"));
+        let store = catalog.store();
+        let page = store
+            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
+            .expect("creation events");
+        let mut metadata = Vec::new();
+        for event in &page.events {
+            if let EventData::SessionMetadataChanged {
+                field,
+                new_value_ref,
+            } = &event.body.data
+                && matches!(field.as_str(), "session_key" | "creation_source")
+            {
+                let PayloadRead::Present(payload) = store
+                    .read_payload(&new_value_ref.payload_id)
+                    .expect("metadata payload")
+                else {
+                    panic!("metadata present");
+                };
+                let value: String = serde_json::from_slice(&payload.body).expect("plain string");
+                metadata.push((field.as_str(), value));
+            }
+        }
+        assert_eq!(
+            metadata,
+            vec![
+                ("session_key", key.into()),
+                ("creation_source", "cron".into())
+            ]
+        );
+        let head = store.head(&stream).expect("head");
+        for (event, payload) in [
+            zeroclaw_infra::session_events::installation::session_key(
+                stream.clone(),
+                "another-key",
+            )
+            .expect("replacement key"),
+            zeroclaw_infra::session_events::installation::creation_source(stream.clone(), "rpc")
+                .expect("replacement source"),
+        ] {
+            assert!(matches!(
+                store.append_batch(AppendRequest {
+                    stream_id: stream.clone(),
+                    expected_head: head.clone(),
+                    idempotency_key: format!("replace-{}", event.event_id),
+                    events: vec![event],
+                    payloads: vec![payload],
+                    erasure_reference_commitment: None,
+                }),
+                Err(AppendError::InvalidReference(_))
+            ));
+        }
+        assert_eq!(store.head(&stream).expect("unchanged head"), head);
     }
 }
 

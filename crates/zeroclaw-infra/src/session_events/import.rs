@@ -1,6 +1,6 @@
 //! Bounded, resumable import into the installation's selected event format.
 //! The caller holds the installation or CLI source lease until publication.
-use super::installation::{NativeBackend, session_identity};
+use super::installation::{NativeBackend, creation_source, session_key};
 use super::*;
 use crate::session_backend::TimestampedMessage;
 use zeroclaw_api::session_events::*;
@@ -266,17 +266,15 @@ pub(super) fn import_snapshot(
         EventActor::default(),
     )?;
     projection.branch_id = Some(command.branch.clone());
-    let (identity, identity_payload) = session_identity(
-        command.stream.clone(),
-        command.family,
-        command.creation_source,
-    )?;
+    let (identity, identity_payload) = session_key(command.stream.clone(), command.family)?;
+    let (source, source_payload) =
+        creation_source(command.stream.clone(), command.creation_source)?;
     append(
         store,
         &command.stream,
         completed,
-        vec![projection, identity],
-        vec![context, identity_payload],
+        vec![projection, identity, source],
+        vec![context, identity_payload, source_payload],
     )?;
     Ok(command.stream)
 }

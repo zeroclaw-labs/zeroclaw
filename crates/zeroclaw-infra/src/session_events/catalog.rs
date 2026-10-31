@@ -1,6 +1,6 @@
 //! Transport-neutral session metadata projected from the active event store.
 //! The installation lock serializes conditional metadata changes and cutover.
-use super::installation::{InstallationGuard, session_identity};
+use super::installation::{InstallationGuard, creation_source, session_key};
 use super::*;
 use std::collections::BTreeMap;
 use zeroclaw_api::session_events::{
@@ -26,7 +26,7 @@ fn bounded_preview(value: &str) -> String {
 fn residual_metadata(fields: &BTreeMap<String, serde_json::Value>) -> serde_json::Value {
     const INDEXED: &[&str] = &[
         "session_key",
-        "source",
+        "creation_source",
         "title",
         "cwd",
         "workspace_dir",
@@ -321,7 +321,7 @@ impl SessionQuery<'_> {
             stream_id: stream.clone(),
             session_id: session.session_id.clone(),
             session_key: session.session_key().map(str::to_owned),
-            source: session.source().map(str::to_owned),
+            creation_source: session.creation_source().map(str::to_owned),
             title: session
                 .fields
                 .get("title")
@@ -401,8 +401,11 @@ impl SessionQuery<'_> {
                 _ => BTreeMap::new(),
             };
             fields.insert("session_key".into(), serde_json::Value::String(key.clone()));
-            if let Some(source) = &record.source {
-                fields.insert("source".into(), serde_json::Value::String(source.clone()));
+            if let Some(source) = &record.creation_source {
+                fields.insert(
+                    "creation_source".into(),
+                    serde_json::Value::String(source.clone()),
+                );
             }
             if let Some(title) = &record.title {
                 fields.insert("title".into(), serde_json::Value::String(title.clone()));
@@ -575,7 +578,8 @@ pub(crate) fn metadata_payload(
 ) -> Result<PayloadRecord, AppendError> {
     let structural = matches!(
         field,
-        "session_identity"
+        "session_key"
+            | "creation_source"
             | "principal_id"
             | "created_at"
             | "last_activity"
@@ -625,7 +629,8 @@ impl SessionCommand<'_> {
             },
         )?;
         root.branch_id = Some(branch.clone());
-        let (identity, identity_payload) = session_identity(stream.clone(), family, source)?;
+        let (identity, identity_payload) = session_key(stream.clone(), family)?;
+        let (source, source_payload) = creation_source(stream.clone(), source)?;
         let body = PayloadRecord::json(
             "session.context/v1",
             &serde_json::json!({"message_refs":[],"history_has_trim_breadcrumb":false}),
@@ -645,8 +650,8 @@ impl SessionCommand<'_> {
             EventActor::default(),
         )?;
         context.branch_id = Some(branch);
-        let mut events = vec![root, identity];
-        let mut payloads = vec![identity_payload, body];
+        let mut events = vec![root, identity, source];
+        let mut payloads = vec![identity_payload, source_payload, body];
         Self::metadata_events(&stream, fields, &mut events, &mut payloads)?;
         events.push(context);
         self.append(
@@ -675,7 +680,7 @@ impl SessionCommand<'_> {
         payloads: &mut Vec<PayloadRecord>,
     ) -> Result<(), AppendError> {
         for (field, value) in fields {
-            if matches!(field, "source" | "session_key" | "session_identity") {
+            if matches!(field, "creation_source" | "session_key") {
                 return Err(AppendError::InvalidReference(
                     "session creation identity is immutable".into(),
                 ));

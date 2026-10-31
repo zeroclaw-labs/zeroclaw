@@ -13,7 +13,7 @@ use zeroclaw_api::{
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_infra::session_events::{
     catalog::SessionCatalog,
-    installation::{InstallationGuard, NativeBackend, session_identity},
+    installation::{InstallationGuard, NativeBackend, session_key},
     open_event_store,
     scoped::EventStorePool,
 };

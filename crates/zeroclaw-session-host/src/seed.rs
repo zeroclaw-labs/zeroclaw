@@ -1,4 +1,5 @@
 use super::*;
+use zeroclaw_infra::session_events::installation::creation_source;
 
 pub(super) struct SessionSeed<'a> {
     pub session_key: &'a str,
@@ -69,10 +70,10 @@ impl SessionSeed<'_> {
             self.actor.clone(),
         )?;
         projection.branch_id = Some(branch);
-        let (identity, identity_payload) =
-            session_identity(stream.clone(), self.session_key, self.source)?;
-        let mut events = vec![root, identity];
-        let mut payloads = vec![identity_payload];
+        let (identity, identity_payload) = session_key(stream.clone(), self.session_key)?;
+        let (source, source_payload) = creation_source(stream.clone(), self.source)?;
+        let mut events = vec![root, identity, source];
+        let mut payloads = vec![identity_payload, source_payload];
         if seeded {
             let evidence = PayloadRecord::json(
                 "session.evidence/v1",

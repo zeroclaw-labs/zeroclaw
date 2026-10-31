@@ -582,7 +582,7 @@ fn previous_catalog_upgrade_resumes_source_archival_after_identity_publication()
             store.lookup_receipt(&stream, "old-root").expect("receipt"),
             Some(receipt)
         );
-        assert_eq!(store.head(&stream).expect("head").sequence, 2);
+        assert_eq!(store.head(&stream).expect("head").sequence, 3);
         drop(store);
         upgrade_installation(directory.path(), target, |_| "fixture".into())
             .expect("idempotent startup");
@@ -675,7 +675,7 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
         )
         .unwrap();
         root.branch_id = Some(BranchId::parse(format!("branch-{stream}")).unwrap());
-        let (identity, body) = session_identity(stream.clone(), "acp_registration", "acp").unwrap();
+        let (identity, body) = session_key(stream.clone(), "acp_registration").unwrap();
         let store = open_event_store(directory.path(), target.name()).unwrap();
         store
             .append_batch(AppendRequest {
@@ -789,8 +789,7 @@ fn earlier_native_acp_installation_merges_protocol_data_without_replacing_newer_
         )
         .unwrap();
         root.branch_id = Some(branch.clone());
-        let (identity, identity_payload) =
-            session_identity(stream.clone(), "acp_existing", "acp").unwrap();
+        let (identity, identity_payload) = session_key(stream.clone(), "acp_existing").unwrap();
         let messages = vec![ConversationMessage::Chat(ChatMessage::assistant(
             "newer native context",
         ))];

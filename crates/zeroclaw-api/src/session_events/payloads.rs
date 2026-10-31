@@ -774,26 +774,18 @@ fn validate_semantic_payloads(
         EventData::SessionMetadataChanged {
             field,
             new_value_ref,
-        } if field == "session_identity" => {
-            let identity: Value = decode(payloads, new_value_ref, "session.authority/v1")?;
-            let family = identity
-                .get("session_key")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid("session key missing"))?;
-            let source = identity.get("source").and_then(Value::as_str);
-            if source.is_none_or(str::is_empty) || source.is_some_and(|value| value.len() > 128) {
-                return Err(invalid("session source missing"));
-            }
+        } if field == "session_key" => {
+            let family: String = decode(payloads, new_value_ref, "session.authority/v1")?;
             if family.is_empty() || family.len() > 512 {
-                return Err(invalid("invalid family identity"));
+                return Err(invalid("invalid session key"));
             }
             let root = history.values().find(|prior| {
                 prior.stream_id == event.stream_id && prior.body.kind() == EventKind::SessionStarted
             });
             if root.is_none() || history.values().any(|prior| prior.event_id != event.event_id
                 && prior.stream_id == event.stream_id
-                && matches!(&prior.body.data, EventData::SessionMetadataChanged { field, .. } if field == "session_identity")) {
-                return Err(invalid("family identity requires an unbound root stream"));
+                && matches!(&prior.body.data, EventData::SessionMetadataChanged { field, .. } if field == "session_key")) {
+                return Err(invalid("session key requires an unbound root stream"));
             }
             for prior in history.values().filter(|prior| {
                 prior.event_id != event.event_id && prior.stream_id != event.stream_id
@@ -802,14 +794,32 @@ fn validate_semantic_payloads(
                     field,
                     new_value_ref,
                 } = &prior.body.data
-                    && field == "session_identity"
-                    && decode::<Value>(payloads, new_value_ref, "session.authority/v1")?
-                        .get("session_key")
-                        .and_then(Value::as_str)
-                        == Some(family)
+                    && field == "session_key"
+                    && decode::<String>(payloads, new_value_ref, "session.authority/v1")? == family
                 {
-                    return Err(invalid("family identity already belongs to another root"));
+                    return Err(invalid("session key already belongs to another root"));
                 }
+            }
+        }
+        EventData::SessionMetadataChanged {
+            field,
+            new_value_ref,
+        } if field == "creation_source" => {
+            let source: String = decode(payloads, new_value_ref, "session.authority/v1")?;
+            if source.is_empty() || source.len() > 128 {
+                return Err(invalid("invalid session creation source"));
+            }
+            if !history.values().any(|prior| {
+                prior.stream_id == event.stream_id && prior.body.kind() == EventKind::SessionStarted
+            }) {
+                return Err(invalid("session creation source requires a root stream"));
+            }
+            if history.values().any(|prior| {
+                prior.event_id != event.event_id
+                    && prior.stream_id == event.stream_id
+                    && matches!(&prior.body.data, EventData::SessionMetadataChanged { field, .. } if field == "creation_source")
+            }) {
+                return Err(invalid("session creation source is immutable"));
             }
         }
         EventData::UserContentRecorded { content_ref, .. }

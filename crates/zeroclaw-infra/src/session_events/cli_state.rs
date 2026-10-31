@@ -1,6 +1,6 @@
 //! Physical binding of a legacy CLI state path to its native event family.
 //! A temporary sidecar fences incomplete imports. After archival, the backup
-//! itself fences legacy saves and events own the permanent family identity.
+//! itself fences legacy saves and events own the permanent session key.
 use super::*;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;

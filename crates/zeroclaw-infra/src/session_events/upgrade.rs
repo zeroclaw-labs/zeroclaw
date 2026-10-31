@@ -1,7 +1,9 @@
 //! Installation-wide upgrade. All legacy writers share the publication fence;
 //! source files remain intact until every imported family has a final receipt.
 use super::import::{LegacyImport, LegacySnapshot, import_snapshot};
-use super::installation::{FormatPhase, InstallationGuard, NativeBackend, session_identity};
+use super::installation::{
+    FormatPhase, InstallationGuard, NativeBackend, creation_source, session_key,
+};
 use super::*;
 use crate::session_backend::SessionBackend;
 use std::collections::BTreeSet;
@@ -346,13 +348,14 @@ fn import_previous_catalog(
             .map_err(storage)?
             .is_none()
         {
-            let (event, payload) = session_identity(root.clone(), family, "legacy")?;
+            let (event, payload) = session_key(root.clone(), family)?;
+            let (source_event, source_payload) = creation_source(root.clone(), "legacy")?;
             store.append_batch(AppendRequest {
                 stream_id: root.clone(),
                 expected_head: store.head(&root).map_err(storage)?,
                 idempotency_key: key,
-                events: vec![event],
-                payloads: vec![payload],
+                events: vec![event, source_event],
+                payloads: vec![payload, source_payload],
                 erasure_reference_commitment: None,
             })?;
             #[cfg(test)]
