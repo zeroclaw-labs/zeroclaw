@@ -16,6 +16,8 @@ use zeroclaw_config::schema::{
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
+use crate::telegram_rate_limit::{BotApiClass, TelegramRateLimiter};
+
 /// How long a successful `getUpdates` exchange stays evidence that the listener
 /// is working.
 ///
@@ -77,26 +79,23 @@ impl std::fmt::Display for SendChunksError {
     }
 }
 
-/// Longest `retry_after` the send path waits out inline before retrying the
-/// same request. A longer penalty fails the send instead of blocking the reply
-/// task for many minutes; either way no request is fired into an active limit.
-const TELEGRAM_MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(60);
-
 /// How many times one `sendMessage` request is retried after HTTP 429.
 const TELEGRAM_RATE_LIMIT_RETRIES: u32 = 2;
 
 /// Server-directed wait for a Telegram flood-limit response.
 ///
-/// Returns `None` unless `status` is HTTP 429. Telegram reports the penalty in
-/// `parameters.retry_after` (seconds); a 429 without it waits one second.
+/// Returns `None` unless `status` is HTTP 429. The delay comes from the same
+/// parser the shared per-token gate uses - `parameters.retry_after` first,
+/// then a `retry after <N>` scan of the description - falling back to the
+/// gate's five-second contract when the body carries no parseable hint. A
+/// description-only "retry after 30" must keep the token blocked for the full
+/// requested window, never for a hardcoded 1s guess.
 fn telegram_retry_after(status: reqwest::StatusCode, body: &str) -> Option<Duration> {
     if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }
-    let secs = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("parameters")?.get("retry_after")?.as_u64())
-        .unwrap_or(1);
+    let secs = crate::telegram_rate_limit::parse_retry_after(body)
+        .unwrap_or(crate::telegram_rate_limit::FALLBACK_RETRY_AFTER_SECS);
     Some(Duration::from_secs(secs))
 }
 
@@ -966,6 +965,25 @@ const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 /// Default minimum interval between Telegram draft edits.
 const TELEGRAM_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
+/// Default ceiling on how long a deliver-class Bot API call waits out a
+/// Telegram flood-control window (`retry_after`) before giving up.
+const TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS: u64 = 60;
+
+/// Upper bound applied to a configured `rate_limit_max_wait_secs`: a wait
+/// budget of hours would stall the reply pipeline far past any realistic
+/// Telegram penalty.
+const TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS: u64 = 300;
+
+/// Upper bound applied to a configured `typing_refresh_interval_secs`:
+/// Telegram expires the typing indicator after ~5s, so a slower refresh just
+/// lets it lapse. (`0` restores the default before this bound is consulted,
+/// which is why there is no lower clamp.)
+const TELEGRAM_TYPING_REFRESH_MAX_SECS: u64 = 5;
+
+/// Default typing-indicator refresh cadence. Telegram expires the indicator
+/// after ~5s, so the loop refreshes just under that.
+const TELEGRAM_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -980,6 +998,9 @@ pub struct TelegramChannel {
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
+    /// Shared per-token flood-control window (HTTP 429 / `retry_after`).
+    /// Runtime-only mirror of Telegram's server-side limiter; not config.
+    rate_limiter: TelegramRateLimiter,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
@@ -2604,6 +2625,7 @@ impl TelegramChannel {
             pairing,
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
+            rate_limiter: TelegramRateLimiter::new(),
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
@@ -2780,6 +2802,68 @@ impl TelegramChannel {
             draft_update_interval_ms
         };
         self
+    }
+
+    /// Canonical source: `[channels.telegram.<alias>].rate_limit_max_wait_secs`
+    /// and `.typing_refresh_interval_secs`, read from the live config handle
+    /// in one guard acquisition. Shared by the channel methods and the
+    /// detached typing loop, which has no `&self`. A zero value restores the
+    /// channel default (it is not a disable switch), and out-of-range values
+    /// are clamped into the supported bounds with a warning. A channel
+    /// without a persistence authority runs on the defaults.
+    fn resolve_rate_limit_tuning(
+        persist: &Option<zeroclaw_runtime::LiveConfigAuthority>,
+        alias: &str,
+    ) -> (u64, u64) {
+        let configured = persist.as_ref().and_then(|config| {
+            config
+                .live_handle()
+                .read()
+                .channels
+                .telegram
+                .get(alias)
+                .map(|tg| (tg.rate_limit_max_wait_secs, tg.typing_refresh_interval_secs))
+        });
+        let max_wait = configured
+            .map(|(max_wait, _)| max_wait)
+            .filter(|max_wait| *max_wait > 0)
+            .unwrap_or(TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS);
+        if max_wait > TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "configured_secs": max_wait,
+                        "clamped_secs": TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS,
+                    })),
+                "Telegram rate_limit_max_wait_secs exceeds the supported ceiling; clamping"
+            );
+        }
+        let max_wait = max_wait.min(TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS);
+        let refresh = configured
+            .map(|(_, refresh)| refresh)
+            .filter(|refresh| *refresh > 0)
+            .unwrap_or(TELEGRAM_TYPING_REFRESH_INTERVAL_SECS);
+        if refresh > TELEGRAM_TYPING_REFRESH_MAX_SECS {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "configured_secs": refresh,
+                        "clamped_secs": TELEGRAM_TYPING_REFRESH_MAX_SECS,
+                    })),
+                "Telegram typing_refresh_interval_secs exceeds the supported maximum; clamping"
+            );
+        }
+        let refresh = refresh.min(TELEGRAM_TYPING_REFRESH_MAX_SECS);
+        (max_wait, refresh)
+    }
+
+    /// Canonical source: `[channels.telegram.<alias>].rate_limit_max_wait_secs`.
+    fn resolve_rate_limit_max_wait_secs(&self) -> u64 {
+        Self::resolve_rate_limit_tuning(&self.persist, &self.alias).0
     }
 
     /// Canonical source: `[channels.telegram.<alias>].multi_message_delay_ms`.
@@ -3836,6 +3920,28 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+    }
+
+    /// POST to a Bot API method through the shared per-token flood-control
+    /// gate (see [`crate::telegram_rate_limit::post_bot_api_json`]). Deliver-
+    /// class calls wait out an active 429 window (bounded by the live
+    /// `rate_limit_max_wait_secs`) and retry once on a fresh 429; Droppable
+    /// calls fail with a skip error instead of touching the network.
+    async fn bot_api_post(
+        &self,
+        method: &str,
+        body: &serde_json::Value,
+        class: BotApiClass,
+    ) -> anyhow::Result<reqwest::Response> {
+        crate::telegram_rate_limit::post_bot_api_json(
+            &self.http_client(),
+            &self.api_url(method),
+            body,
+            class,
+            &self.rate_limiter,
+            Duration::from_secs(self.resolve_rate_limit_max_wait_secs()),
+        )
+        .await
     }
 
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
@@ -6267,15 +6373,74 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Posts one `sendMessage` request. On HTTP 429 it waits the server's
-    /// `retry_after` (up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`]) and resends the
+    /// `retry_after` (bounded by the remaining wait allowance) and resends the
     /// same body, at most [`TELEGRAM_RATE_LIMIT_RETRIES`] times, so a flood
     /// limit is never answered with immediate extra requests.
+    ///
+    /// The wait ceiling is
+    /// `[channels.telegram.<alias>].rate_limit_max_wait_secs`, resolved live
+    /// at send time - the same canonical source the shared per-token gate
+    /// draws its Deliver budget from, so final answers honor the operator's
+    /// setting just like draft creation and approval prompts.
+    ///
+    /// Waits run through the shared per-token gate's own wait loop
+    /// ([`crate::telegram_rate_limit::wait_out_window`]), and every wait -
+    /// pre-send or post-429 - draws down one allowance: the retry never gets
+    /// a fresh `max_wait`, so all sleeps together never exceed the configured
+    /// budget. The loop re-checks after each sleep, so a window extended by a
+    /// concurrent 429 while this sender sleeps is honored (never sent into)
+    /// as long as allowance remains. Every observed 429 also feeds the shared
+    /// window so droppable traffic and other chats on the token go quiet too.
+    /// A penalty beyond the remaining allowance fails the send instead of
+    /// firing into the window; one that merely equals the allowance is
+    /// waited out and sent - the gate's deadline only carries the jitter
+    /// tail past the server penalty. Either way no request is posted too
+    /// early.
     async fn send_message_honoring_rate_limit(
         &self,
         body: &serde_json::Value,
     ) -> Result<SendMessageAttempt, reqwest::Error> {
+        let max_wait = Duration::from_secs(self.resolve_rate_limit_max_wait_secs());
+        // One caller-side allowance covers the whole send: the pre-send wait
+        // and every post-429 wait draw it down together.
+        let mut allowance = max_wait;
         let mut retries = 0;
         loop {
+            // Pre-send gate: never fire into a window a concurrent call
+            // already noted for this token. The gate's remaining wait carries
+            // the note's jitter on top of the server penalty, so the fail-fast
+            // decision compares the penalty itself against the allowance: a
+            // penalty that merely equals the allowance is waited out and sent
+            // (like it was before the jittered deadline), only one that
+            // outlives the allowance fails fast. A reachable window is waited
+            // out through the shared loop, which re-checks after each sleep,
+            // so a window extended mid-wait is honored, never sent into.
+            if let crate::telegram_rate_limit::RateLimitGate::Blocked(remaining) =
+                self.rate_limiter.check()
+                && self.rate_limiter.penalty_remaining() > allowance
+            {
+                return Ok(SendMessageAttempt::RateLimited {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body: format!(
+                        "shared Telegram flood window active for {}s more",
+                        remaining.as_secs()
+                    ),
+                });
+            }
+            if let Err(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted {
+                remaining,
+            }) = crate::telegram_rate_limit::wait_out_window(&self.rate_limiter, &mut allowance)
+                .await
+            {
+                return Ok(SendMessageAttempt::RateLimited {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body: format!(
+                        "shared Telegram flood window active for {}s more",
+                        remaining.as_secs()
+                    ),
+                });
+            }
+
             let resp = self
                 .http_client()
                 .post(self.api_url("sendMessage"))
@@ -6290,7 +6455,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             let Some(wait) = telegram_retry_after(status, &text) else {
                 return Ok(SendMessageAttempt::Failed { status, body: text });
             };
-            if retries >= TELEGRAM_RATE_LIMIT_RETRIES || wait > TELEGRAM_MAX_INLINE_RETRY_AFTER {
+            // Feed the shared per-token window so droppable calls (typing,
+            // draft edits) and deliver calls for other chats skip the penalty
+            // instead of piling their own 429s onto it.
+            self.rate_limiter.note_rate_limited(wait.as_secs());
+            if retries >= TELEGRAM_RATE_LIMIT_RETRIES || wait > allowance {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6314,7 +6483,34 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     })),
                 "Telegram sendMessage rate limited; waiting retry_after before resending"
             );
-            tokio::time::sleep(wait).await;
+            // Wait the noted window out through the shared loop, bounded by
+            // the remaining allowance: a concurrent 429 may extend the window
+            // mid-wait and is honored while allowance remains.
+            if let Err(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted {
+                remaining,
+            }) = crate::telegram_rate_limit::wait_out_window(&self.rate_limiter, &mut allowance)
+                .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "retry_after_secs": wait.as_secs(),
+                            "remaining_secs": remaining.as_secs(),
+                            "attempt": retries,
+                        })),
+                    "Telegram sendMessage wait budget exhausted while waiting to resend; \
+                     not retrying inside the penalty window"
+                );
+                return Ok(SendMessageAttempt::RateLimited {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body: format!(
+                        "shared Telegram flood window active for {}s more",
+                        remaining.as_secs()
+                    ),
+                });
+            }
         }
     }
 
@@ -6324,7 +6520,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// time and reports how many chunks it accepted before a failure. On such a
     /// partial failure this first *resumes* from the accepted prefix, so a
     /// transient error still completes the answer without re-posting earlier
-    /// chunks. If the resume also fails after some chunks were accepted, it
+    /// chunks - unless the failure is flood-control exhaustion
+    /// ([`crate::telegram_rate_limit::TelegramGateError`]), which is not a
+    /// formatting failure: the window is still active, so no resume is
+    /// attempted. If the resume also fails after some chunks were accepted, it
     /// returns [`FinalizePartialDelivery`] so the orchestrator's generic
     /// finalize fallback does not resend the whole answer and duplicate what
     /// Telegram already delivered. A failure before any chunk is accepted
@@ -6363,7 +6562,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 source,
                 ..
             }) => Err(source),
-            Err(SendChunksError { delivered, .. }) => {
+            Err(SendChunksError {
+                delivered, source, ..
+            }) => {
+                // Flood-control exhaustion is not a formatting failure: the
+                // token is inside an active window that already outlasted the
+                // wait budget, so resuming would just burn the budget again.
+                // Report the accepted prefix so the orchestrator does not
+                // resend it, and stop.
+                if source
+                    .downcast_ref::<crate::telegram_rate_limit::TelegramGateError>()
+                    .is_some()
+                {
+                    return Err(zeroclaw_api::channel::FinalizePartialDelivery { delivered }.into());
+                }
                 // Some chunks are already posted. Resume from the first unsent
                 // chunk rather than restarting, then report the accepted prefix
                 // if it still cannot finish.
@@ -7830,11 +8042,13 @@ impl Channel for TelegramChannel {
                     body["message_thread_id"] = serde_json::Value::String(tid.to_string());
                 }
 
+                // The draft placeholder is user-visible (it becomes the final
+                // answer), so it is Deliver-class: it waits out an active
+                // flood-control window within budget, its own 429 feeds the
+                // shared limiter, and an exhausted budget fails the draft -
+                // the orchestrator then falls back to the (gated) plain send.
                 let resp = self
-                    .http_client()
-                    .post(self.api_url("sendMessage"))
-                    .json(&body)
-                    .send()
+                    .bot_api_post("sendMessage", &body, BotApiClass::Deliver)
                     .await?;
 
                 if !resp.status().is_success() {
@@ -7927,12 +8141,29 @@ impl Channel for TelegramChannel {
                     "text": display_text,
                 });
 
-                let resp = self
-                    .http_client()
-                    .post(self.api_url("editMessageText"))
-                    .json(&body)
-                    .send()
-                    .await?;
+                let resp = match self
+                    .bot_api_post("editMessageText", &body, BotApiClass::Droppable)
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(err) if err.is::<crate::telegram_rate_limit::TelegramGateError>() => {
+                        // Inside the shared flood-control window (or just
+                        // answered 429): this draft frame is stale by the next
+                        // scheduled edit anyway, so drop it like the per-chat
+                        // interval short-circuit does.
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": err.to_string()})),
+                            "editMessageText draft update dropped"
+                        );
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                };
 
                 if resp.status().is_success() {
                     self.last_draft_edit
@@ -8163,10 +8394,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .http_client()
-            .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
+            .bot_api_post("editMessageText", &body, BotApiClass::Deliver)
             .await?;
 
         match Self::classify_edit_message_response(resp).await {
@@ -8189,10 +8417,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .http_client()
-            .post(self.api_url("editMessageText"))
-            .json(&plain_body)
-            .send()
+            .bot_api_post("editMessageText", &plain_body, BotApiClass::Deliver)
             .await?;
 
         match Self::classify_edit_message_response(resp).await {
@@ -8678,16 +8903,34 @@ Ensure only one `zeroclaw` process is using this bot token."
         let client = self.http_client();
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
+        let rate_limiter = self.rate_limiter.clone();
+        // The detached loop re-resolves both flood-control tunables from the
+        // live config on every tick (AGENTS.md single source of truth); a
+        // channel without persistence authority gets the defaults.
+        let persist = self.persist.clone();
+        let alias = self.alias.clone();
 
         let handle = zeroclaw_spawn::spawn!(async move {
             loop {
+                let (max_wait_secs, refresh_secs) =
+                    TelegramChannel::resolve_rate_limit_tuning(&persist, &alias);
                 let body = serde_json::json!({
                     "chat_id": &chat_id,
                     "action": "typing"
                 });
-                let _ = client.post(&url).json(&body).send().await;
-                // Telegram typing indicator expires after 5s; refresh at 4s
-                tokio::time::sleep(Duration::from_secs(4)).await;
+                // Droppable: inside a flood-control window the indicator is
+                // skipped entirely and refreshed on the next tick.
+                let _ = crate::telegram_rate_limit::post_bot_api_json(
+                    &client,
+                    &url,
+                    &body,
+                    BotApiClass::Droppable,
+                    &rate_limiter,
+                    Duration::from_secs(max_wait_secs),
+                )
+                .await;
+                // Telegram typing indicator expires after ~5s; refresh sooner.
+                tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
             }
         });
 
@@ -8841,10 +9084,7 @@ impl TelegramChannel {
 
         let send_prompt = async {
             let resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&body)
-                .send()
+                .bot_api_post("sendMessage", &body, BotApiClass::Deliver)
                 .await;
 
             match resp {
@@ -8882,10 +9122,7 @@ impl TelegramChannel {
                     }
 
                     let plain_resp = self
-                        .http_client()
-                        .post(self.api_url("sendMessage"))
-                        .json(&plain_body)
-                        .send()
+                        .bot_api_post("sendMessage", &plain_body, BotApiClass::Deliver)
                         .await;
 
                     match plain_resp {
@@ -8897,10 +9134,10 @@ impl TelegramChannel {
                                 "Telegram sendMessage (approval) failed ({status}): {err}"
                             );
                         }
-                        Err(e) => Err(e.into()),
+                        Err(e) => Err(e),
                     }
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => Err(e),
             }
         };
 
@@ -8993,6 +9230,24 @@ mod tests {
             TelegramConfig {
                 bot_token: "fake-token".into(),
                 multi_message_delay_ms,
+                ..TelegramConfig::default()
+            },
+        );
+        LiveConfigAuthority::new(config)
+    }
+
+    fn telegram_rate_limit_authority(
+        alias: &str,
+        rate_limit_max_wait_secs: u64,
+        typing_refresh_interval_secs: u64,
+    ) -> LiveConfigAuthority {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                rate_limit_max_wait_secs,
+                typing_refresh_interval_secs,
                 ..TelegramConfig::default()
             },
         );
@@ -12011,7 +12266,89 @@ mod tests {
         );
     }
 
-    /// Regression:
+    /// Regression: a flood window already noted on the shared per-token gate
+    /// (by an earlier call or a concurrent task on the same token) is
+    /// terminal for a multi-message finalization, not an ordinary transient
+    /// failure: the pending-narration send refuses to fire inside the window,
+    /// no narration retry or final-answer send restarts against the gate, and
+    /// finalize reports `FinalizeUndelivered` so the orchestrator neither
+    /// resends nor counts the unsent final answer as delivered.
+    #[tokio::test]
+    async fn finalize_stops_on_noted_flood_window_with_zero_accepted_narration_prefix() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(0)
+            .named("no sendMessage may fire into the active flood window")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750)
+        .with_mock_api_base(mock_server.uri());
+        let recipient = "123";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        let key = TelegramChannel::multi_draft_key(recipient, &draft_id);
+
+        // Pending intermediate narration with no accepted prefix.
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut st = MultiDraftState::new(None);
+            st.latest_visible = "Searching the docs...".to_string();
+            st.sent_text = String::new();
+            drafts.insert(key.clone(), st);
+        }
+        // A window past the inline wait ceiling, as noted by any call on this
+        // token: the narration send must stop without firing a request.
+        ch.rate_limiter.note_rate_limited(120);
+
+        let started = std::time::Instant::now();
+        let err = match ch
+            .finalize_draft(recipient, &draft_id, "Final answer", false)
+            .await
+        {
+            Ok(()) => panic!("a gated finalization must not report success"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some(),
+            "the terminal flood stop must report FinalizeUndelivered, got: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+                .is_none(),
+            "nothing of the final answer reached the wire, so no degraded-delivery report"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a window past the inline ceiling must stop the finalize without waiting it out: {elapsed:?}"
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "no request may fire into the active window"
+        );
+        assert!(
+            !ch.multi_message_drafts.lock().contains_key(&key),
+            "finalize remains the terminal lifecycle event: no orphaned draft state"
+        );
+    }
+
     /// when the outbound hook cancels a narration turn, `discard_draft_turn`
     /// consumes exactly that turn (nothing is sent, and it is never resurrected),
     /// while a later turn's narration still flushes normally.
@@ -24760,6 +25097,154 @@ mod tests {
         assert!(ch.pending_approvals.lock().await.is_empty());
     }
 
+    /// An approval prompt is Deliver-class: inside a flood window that fits
+    /// the configured budget the prompt is waited out and delivered, and the
+    /// approval flow continues to the operator's tap.
+    #[tokio::test]
+    async fn approval_prompt_waits_out_flood_window_within_budget_and_continues() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 66 }
+            })))
+            .expect(1)
+            .named("the approval prompt lands after the flood wait")
+            .mount(&mock_server)
+            .await;
+
+        let ch = Arc::new(
+            rate_limit_test_channel(mock_server.uri()).with_persistence_authority(
+                telegram_rate_limit_authority("telegram_test_alias", 2, 4),
+            ),
+        );
+        ch.rate_limiter.note_rate_limited(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let waiter = {
+            let ch = Arc::clone(&ch);
+            zeroclaw_spawn::spawn!(async move {
+                ch.request_approval_attributed_with_timeout(
+                    "12345",
+                    &request,
+                    Duration::from_secs(30),
+                )
+                .await
+            })
+        };
+
+        // The pending entry is registered before the send; the prompt itself
+        // is held by the 1s window and must arrive within the 2s budget.
+        let approval_id = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(id) = ch.pending_approvals.lock().await.keys().next().cloned() {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("approval entry must be registered");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !mock_server.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the prompt must be delivered after the flood window");
+
+        let pending = ch
+            .pending_approvals
+            .lock()
+            .await
+            .remove(&approval_id)
+            .expect("the delivered prompt must still be pending");
+        pending
+            .sender
+            .send(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
+            .expect("the prompt receiver must remain live");
+
+        let attributed = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the approval must resolve before the test deadline")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attributed.response,
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::Operator
+        );
+        assert!(ch.pending_approvals.lock().await.is_empty());
+    }
+
+    /// A flood window past the configured budget fails the approval prompt
+    /// with the gate error, without firing into the window and without
+    /// leaving a stale pending entry behind.
+    #[tokio::test]
+    async fn approval_prompt_past_flood_budget_fails_without_stale_pending_entry() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 66 }
+            })))
+            .expect(0)
+            .named("no prompt may fire into a window past the budget")
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4));
+        ch.rate_limiter.note_rate_limited(30);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let err = ch
+            .request_approval("12345", &request)
+            .await
+            .expect_err("a prompt past the flood budget must fail");
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::telegram_rate_limit::TelegramGateError>(),
+                Some(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted { .. })
+            ),
+            "expected a flood gate error, got: {err}"
+        );
+        assert!(
+            ch.pending_approvals.lock().await.is_empty(),
+            "a failed prompt must not leave a stale pending entry"
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "no prompt request may reach the network inside the window"
+        );
+    }
+
     #[tokio::test]
     async fn routed_approval_honors_predeadline_callback_claim_after_route_deadline() {
         use wiremock::matchers::{method, path_regex};
@@ -25242,6 +25727,7 @@ mod tests {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
     }
+
     fn rate_limit_test_channel(api_base: String) -> TelegramChannel {
         TelegramChannel::new(
             "fake-token".into(),
@@ -25268,9 +25754,19 @@ mod tests {
             telegram_retry_after(reqwest::StatusCode::TOO_MANY_REQUESTS, body),
             Some(Duration::from_secs(536))
         );
+        // Description-only hint, no `parameters` envelope: the shared parser
+        // scans the text, so the full requested window is honored instead of
+        // the 1s guess this sender used to return.
+        let description_only =
+            r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 30"}"#;
+        assert_eq!(
+            telegram_retry_after(reqwest::StatusCode::TOO_MANY_REQUESTS, description_only),
+            Some(Duration::from_secs(30))
+        );
+        // No parseable hint at all: the shared gate's five-second fallback.
         assert_eq!(
             telegram_retry_after(reqwest::StatusCode::TOO_MANY_REQUESTS, "not json"),
-            Some(Duration::from_secs(1))
+            Some(Duration::from_secs(5))
         );
         assert_eq!(
             telegram_retry_after(reqwest::StatusCode::BAD_REQUEST, body),
@@ -25345,6 +25841,99 @@ mod tests {
             requests.len(),
             1,
             "no markdown or plain retry into the limit"
+        );
+    }
+
+    /// The final-reply send path draws its inline wait ceiling from the live
+    /// `rate_limit_max_wait_secs` config, not from a hardcoded constant: with
+    /// a 1s budget a 2s penalty is reported as rate-limited without an inline
+    /// wait, where the old fixed 60s ceiling would have slept and resent.
+    #[tokio::test]
+    async fn send_text_chunks_honors_configured_wait_budget() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(2))
+            .expect(1)
+            .named("a penalty past the configured budget is not retried")
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4));
+
+        let started = Instant::now();
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.rate_limited,
+            "expected a rate-limited chunk error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a penalty past the configured 1s budget must not be waited inline: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            1,
+            "no resend into a penalty beyond the configured budget"
+        );
+    }
+
+    /// A penalty exactly equal to the configured wait budget is waited out
+    /// and resent, not reported as rate-limited: the gate's deadline only
+    /// carries the jitter tail past the server penalty, so a budget-length
+    /// penalty still fits.
+    #[tokio::test]
+    async fn send_text_chunks_waits_out_penalty_equal_to_configured_budget() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(2))
+            .up_to_n_times(1)
+            .expect(1)
+            .named("sendMessage flood-limited once with a penalty equal to the budget")
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .expect(1)
+            .named("sendMessage succeeds after the budget-length wait")
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 2, 4));
+
+        let started = Instant::now();
+        let sent = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("a penalty equal to the budget must be waited out and sent, got: {err}")
+            });
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "the resend must wait for the full penalty"
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            2,
+            "the budget-length penalty is waited out and then sent"
         );
     }
 
@@ -25433,6 +26022,292 @@ mod tests {
         assert_eq!(bodies[0]["parse_mode"], "HTML");
         assert!(bodies[1].get("parse_mode").is_none());
         assert_eq!(bodies[1], bodies[2], "the plain-text resend keeps its body");
+    }
+
+    /// Review regression: the pre-send sleep targets the window noted at
+    /// entry, but a concurrent in-flight response can extend the shared
+    /// window mid-wait. The final send must re-check through the shared
+    /// wait loop - no POST into the extended window, one POST after it
+    /// clears, all inside the single allowance.
+    #[tokio::test]
+    async fn send_text_chunks_rechecks_window_extended_during_pre_send_wait() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        ch.rate_limiter.note_rate_limited(1);
+
+        // 200ms into the pre-send wait, a concurrent 429 notes a 2s penalty:
+        // the send must ride the extension out, not wake into it.
+        let extender = ch.rate_limiter.clone();
+        let extend = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            extender.note_rate_limited(2);
+        });
+
+        let started = Instant::now();
+        let sent = ch.send_text_chunks("hello", "123", None, 0).await.unwrap();
+        extend.await.expect("extender task");
+
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "the extended window must be honored before the single POST: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            1,
+            "exactly one POST, after the extended window cleared"
+        );
+    }
+
+    /// A shared window that already outlives the whole wait allowance stops
+    /// the final send fast: no POST, no budget burn.
+    #[tokio::test]
+    async fn send_text_chunks_fails_fast_when_window_outlives_allowance() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(0)
+            .named("no sendMessage may fire into a window past the allowance")
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4));
+        ch.rate_limiter.note_rate_limited(30);
+
+        let started = Instant::now();
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.rate_limited,
+            "expected a rate-limited chunk error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a window past the allowance must stop the send without waiting it out: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "no request may fire while the window is active"
+        );
+    }
+
+    /// A window reachable at entry but extended past the allowance mid-wait
+    /// (the allowance is spent on the first sleep, the extension outlives
+    /// the rest) stops the final send without any POST.
+    #[tokio::test]
+    async fn send_text_chunks_stops_waiting_when_extension_outlives_allowance() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(0)
+            .named("no sendMessage may fire into the extended window")
+            .mount(&mock_server)
+            .await;
+
+        // Allowance 4s comfortably covers the 1s initial window (up to 2s of
+        // jitter) but not the 30s mid-wait extension.
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 4, 4));
+        ch.rate_limiter.note_rate_limited(1);
+
+        let extender = ch.rate_limiter.clone();
+        let extend = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            extender.note_rate_limited(30);
+        });
+
+        let started = Instant::now();
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        extend.await.expect("extender task");
+
+        assert!(
+            err.rate_limited,
+            "expected a rate-limited chunk error: {err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the reachable initial window is waited out before giving up: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "no request may fire into the extended window"
+        );
+    }
+
+    /// Review regression: the pre-send wait and the post-429 wait share one
+    /// allowance. The pre-send wait burns most of it, so a `retry_after`
+    /// that would fit a *fresh* `max_wait` no longer authorizes a retry.
+    #[tokio::test]
+    async fn send_text_chunks_pre_send_and_retry_waits_share_one_allowance() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(4))
+            .expect(1)
+            .named("the initial attempt is the only request")
+            .mount(&mock_server)
+            .await;
+
+        // The 1s initial window (up to 2s of jitter) always leaves less than
+        // the 4s allowance, so the send goes out; the 4s penalty then exceeds
+        // what is left - no retry gets a fresh budget.
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 4, 4));
+        ch.rate_limiter.note_rate_limited(1);
+
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.rate_limited,
+            "expected a rate-limited chunk error: {err}"
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            1,
+            "the retry never fires once the shared allowance is spent"
+        );
+    }
+
+    /// Review regression: a 429 whose body carries the penalty only in the
+    /// description (no `parameters.retry_after`) must block the token for the
+    /// full requested window through the shared gate, not the 1s this sender
+    /// used to assume.
+    #[tokio::test]
+    async fn send_text_chunks_honors_description_only_429_retry_after() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 30"
+            })))
+            .expect(1)
+            .named("no retry inside the description-requested window")
+            .mount(&mock_server)
+            .await;
+
+        // A 1s allowance cannot wait 30s: the send stops after its single
+        // attempt, and the window the attempt noted carries 30s (up to 2s of
+        // jitter), proving the description hint was parsed.
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4));
+
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.rate_limited,
+            "expected a rate-limited chunk error: {err}"
+        );
+        match ch.rate_limiter.check() {
+            crate::telegram_rate_limit::RateLimitGate::Blocked(remaining) => {
+                assert!(
+                    remaining > Duration::from_secs(27) && remaining <= Duration::from_secs(33),
+                    "the shared window must carry the description's 30s: {remaining:?}"
+                );
+            }
+            crate::telegram_rate_limit::RateLimitGate::Clear => {
+                panic!("the description-only 429 must block the token for ~30s")
+            }
+        }
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            1,
+            "no early retry into the requested window"
+        );
+    }
+
+    /// A 429 with no delay hint at all (truncated or proxy-generated body)
+    /// waits the shared parser's five-second fallback before the retry, not
+    /// the 1s this sender used to assume.
+    #[tokio::test]
+    async fn send_text_chunks_waits_parser_fallback_when_429_has_no_delay_hint() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri());
+        let started = Instant::now();
+        let sent = ch.send_text_chunks("hello", "123", None, 0).await.unwrap();
+
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "the retry must wait the parser fallback window, not 1s: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            2,
+            "one flood-limited attempt, one retry after the fallback window"
+        );
     }
 
     /// A flood-limited finalize must not resume or let the orchestrator fall
@@ -25563,5 +26438,319 @@ mod tests {
     #[tokio::test]
     async fn finalize_draft_multi_message_stops_on_narration_flood_limit_after_accepted_prefix() {
         assert_finalize_stops_on_narration_flood_limit(1).await;
+    }
+
+    #[tokio::test]
+    async fn droppable_calls_make_no_network_request_inside_flood_window() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/(editMessageText|sendChatAction)$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(0)
+            .named("droppable traffic suppressed while blocked")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_mock_api_base(mock_server.uri());
+        ch.rate_limiter.note_rate_limited(30);
+
+        ch.update_draft("123", "42", "delta text")
+            .await
+            .expect("a skipped draft edit is not an error");
+
+        ch.start_typing("123").await.expect("start_typing");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ch.stop_typing("123").await.expect("stop_typing");
+
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "inside the shared flood window, droppable traffic must not reach the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_under_flood_window_waits_instead_of_double_firing() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 1",
+                "parameters": { "retry_after": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .named("editMessageText flood-limited once")
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .named("editMessageText succeeds after the wait")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_mock_api_base(mock_server.uri());
+
+        let started = std::time::Instant::now();
+        ch.finalize_draft("123", "42", "short final text", true)
+            .await
+            .expect("the gated retry must land the edit");
+
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "finalize must wait out the flood window instead of instantly firing the plain fallback, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            2,
+            "HTML attempt plus one gated retry; no immediate plain double-fire"
+        );
+    }
+
+    /// The shared window a `sendMessage` 429 notes for the token also covers
+    /// droppable traffic for *other* chats: a penalty past the inline wait
+    /// ceiling stops the deliver call after its single attempt, and the window
+    /// that attempt noted skips a draft edit for another chat without any
+    /// further network call.
+    #[tokio::test]
+    async fn flood_window_is_shared_across_chats_on_the_same_token() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(536))
+            .expect(1)
+            .named("sendMessage flood-limited once, never retried into the window")
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(0)
+            .named("no draft edit may fire while the token is blocked")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_mock_api_base(mock_server.uri());
+
+        // Chat "100" eats a penalty too long to wait out: the deliver call
+        // stops after its single attempt and notes the window for the token.
+        let err = ch
+            .send_text_chunks("final answer", "100", None, 0)
+            .await
+            .expect_err("a penalty past the inline ceiling must fail the chunk");
+        assert!(
+            err.rate_limited,
+            "expected a rate-limited chunk error: {err}"
+        );
+
+        // A draft edit for a *different* chat on the same channel instance is
+        // inside that window and must be skipped without a network call.
+        ch.update_draft("200", "42", "delta text")
+            .await
+            .expect("a skipped draft edit is not an error");
+
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            1,
+            "only chat 100's flood-limited sendMessage attempt reached the mock"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_channel_fires_no_premature_request_when_starting_a_draft() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(0)
+            .named("no draft creation may fire while the token is blocked")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4))
+        .with_mock_api_base(mock_server.uri());
+        ch.rate_limiter.note_rate_limited(30);
+
+        // Draft creation is Deliver-class: it waits its 1s budget, re-checks
+        // the still-active window, and fails without a network request.
+        let started = std::time::Instant::now();
+        let err = match ch.send_draft(&SendMessage::new("hello", "123")).await {
+            Ok(_) => panic!("a blocked channel must not create a draft over the wire"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::telegram_rate_limit::TelegramGateError>(),
+                Some(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted { .. })
+            ),
+            "expected BudgetExhausted, got: {err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "draft creation waits its budget before giving up: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "no premature network request while the token is blocked"
+        );
+    }
+
+    #[test]
+    fn rate_limit_tuning_resolves_from_live_config_without_rebuilding_the_channel() {
+        let authority = telegram_rate_limit_authority("telegram_test_alias", 60, 4);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(authority.clone());
+
+        assert_eq!(ch.resolve_rate_limit_max_wait_secs(), 60);
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (60, 4)
+        );
+
+        // A published change reaches the next use of the already-running
+        // channel - no rebuild, no restart-only snapshot.
+        let mut updated = Config::default();
+        updated.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                rate_limit_max_wait_secs: 7,
+                typing_refresh_interval_secs: 3,
+                ..TelegramConfig::default()
+            },
+        );
+        authority.publish_for_test(updated);
+
+        assert_eq!(ch.resolve_rate_limit_max_wait_secs(), 7);
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (7, 3)
+        );
+
+        // Zero restores the channel default; it is not a disable switch.
+        let mut zeroed = Config::default();
+        zeroed.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                rate_limit_max_wait_secs: 0,
+                typing_refresh_interval_secs: 0,
+                ..TelegramConfig::default()
+            },
+        );
+        authority.publish_for_test(zeroed);
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (
+                TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS,
+                TELEGRAM_TYPING_REFRESH_INTERVAL_SECS
+            )
+        );
+    }
+
+    #[test]
+    fn rate_limit_tuning_clamps_out_of_range_config_to_supported_bounds() {
+        let authority = telegram_rate_limit_authority("telegram_test_alias", 600, 9);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(authority);
+
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (
+                TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS,
+                TELEGRAM_TYPING_REFRESH_MAX_SECS
+            ),
+            "an absurd wait budget and a too-slow typing refresh are clamped, \
+             not honored literally"
+        );
+    }
+
+    #[test]
+    fn rate_limit_tuning_falls_back_to_defaults_without_persistence_authority() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert_eq!(
+            ch.resolve_rate_limit_max_wait_secs(),
+            TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS
+        );
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (
+                TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS,
+                TELEGRAM_TYPING_REFRESH_INTERVAL_SECS
+            )
+        );
     }
 }
