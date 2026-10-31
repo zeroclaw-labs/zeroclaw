@@ -1360,6 +1360,7 @@ an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
+  zeroclaw cron runs --limit 10
   zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
   zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
   zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel

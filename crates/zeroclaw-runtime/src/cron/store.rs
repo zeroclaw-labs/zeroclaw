@@ -1530,6 +1530,33 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
     Ok(runs)
 }
 
+/// List the most recent runs across all jobs, newest first. Operator-scope
+/// read used by `zeroclaw cron runs` without a `--job` filter.
+pub fn list_recent_runs(config: &Config, limit: usize) -> Result<Vec<CronRun>> {
+    let Some(runs) = with_read_connection(config, |conn| {
+        let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_SELECT_COLUMNS}
+             FROM cron_runs
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?1"
+        ))?;
+
+        let rows = stmt.query_map(params![lim], map_run_row)?;
+
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(runs)
+}
+
 /// Owner-scoped run-history read: the ownership predicate rides the SAME
 /// query that returns the rows, so authorization and retrieval can never
 /// straddle a concurrent rename or owner re-point — the row set is decided
@@ -6223,6 +6250,55 @@ mod tests {
 
         let runs = list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn list_recent_runs_spans_jobs_newest_first_and_honors_limit() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job_a = add_job(&config, "test-agent", "*/5 * * * *", "echo a").unwrap();
+        let job_b = add_job(&config, "test-agent", "*/5 * * * *", "echo b").unwrap();
+        let base = Utc::now();
+
+        for (idx, job) in [&job_a, &job_b, &job_a].iter().enumerate() {
+            let start = base + ChronoDuration::seconds(idx as i64);
+            record_run(
+                &config,
+                &job.id,
+                start,
+                start + ChronoDuration::milliseconds(100),
+                "ok",
+                RunOutcomes {
+                    execution: "ok",
+                    delivery: "not_required",
+                    persistence: "not_bound",
+                },
+                RunProvenance {
+                    principal: None,
+                    executing_agent: None,
+                    job_source: None,
+                },
+                Some("done"),
+                100,
+            )
+            .unwrap();
+        }
+
+        let runs = list_recent_runs(&config, 10).unwrap();
+        assert_eq!(runs.len(), 3, "runs from both jobs must be returned");
+        for window in runs.windows(2) {
+            assert!(
+                window[0].started_at >= window[1].started_at,
+                "runs must be ordered newest first"
+            );
+        }
+
+        let limited = list_recent_runs(&config, 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].started_at, runs[0].started_at);
+
+        let scoped = list_runs(&config, &job_a.id, 10).unwrap();
+        assert_eq!(scoped.len(), 2, "per-job filter must stay scoped");
     }
 
     #[test]
