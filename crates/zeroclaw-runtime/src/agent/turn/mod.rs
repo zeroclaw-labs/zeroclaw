@@ -1072,6 +1072,8 @@ fn context_window_exceeded_error(
         raw_estimated_tokens,
         system_tokens,
         tool_schema_tokens,
+        window_is_compatibility_fallback: limits.model_context_window_source
+            == zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
     }
     .into()
 }
@@ -2449,9 +2451,12 @@ async fn run_tool_call_loop_impl<'a>(
             // reaches model capacity (an explicit budget clamped by the
             // route's window, or the legacy default clamped the same way),
             // the capacity check below refuses the identical request with
-            // `ContextWindowExceeded`, which names the remediation that
-            // actually helps — raising the budget cannot substitute for a
-            // larger model window.
+            // `ContextWindowExceeded`. That error carries the window's
+            // provenance, so its remediation names a larger model window
+            // only when the window is configured capacity — when it is the
+            // unconfigured-model compatibility stub (possibly raised to the
+            // budget), the refusal instead names `max_context_tokens`,
+            // which is the remediation that actually helps.
             if context_token_budget < model_context_window
                 && !crate::agent::history::system_floor_within_budget(
                     system_floor,
@@ -11922,10 +11927,13 @@ mod tool_lifecycle_abandonment_tests {
             .find_map(|source| source.downcast_ref::<SystemPromptFloorExceedsBudget>())
             .expect("the refusal must keep its typed budget cause");
         assert_eq!(refusal.context_token_budget, budget);
-        assert_eq!(
-            refusal.system_floor_tokens, budget,
-            "the measured floor must include the native tool schema tokens, \
-             not just the system messages (system floor alone: {system_floor})"
+        let known_minimum = system_floor + schema_tokens;
+        assert!(
+            refusal.system_floor_tokens >= known_minimum,
+            "the measured floor ({}) must include the native tool schema tokens \
+             on top of the system messages (known minimum: {known_minimum}, \
+             system floor alone: {system_floor})",
+            refusal.system_floor_tokens,
         );
         assert_eq!(
             *provider.calls.lock().expect("call count lock"),

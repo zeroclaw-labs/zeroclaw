@@ -3314,6 +3314,36 @@ mod tests {
     }
 
     #[test]
+    fn budget_refusal_strings_format_in_every_locale() {
+        // Both fail-closed budget refusals are user-facing in every committed
+        // locale: the floor refusal interpolates its measured numbers and the
+        // unconfigured-window refusal names the max_context_tokens remediation.
+        for (source, locale) in committed_locale_sources() {
+            for (key, args) in [
+                (
+                    "turn-system-floor-exceeds-budget-error",
+                    vec![("floor", "143448"), ("budget", "40000")],
+                ),
+                ("turn-context-window-unconfigured-error", vec![]),
+            ] {
+                let formatted = format_ftl_message(source, locale, key, &args)
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(!formatted.is_empty(), "{locale}: {key} should not be empty");
+                for (name, value) in args {
+                    assert!(
+                        formatted.contains(value),
+                        "{locale}: {key} missing {name} in: {formatted}"
+                    );
+                    assert!(
+                        !formatted.contains(&format!("{{${name}}}")),
+                        "{locale}: {key} has unformatted placeholder in: {formatted}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn integration_info_chrome_strings_format_in_all_locales() {
         let argless_keys = [
             "cli-integrations-category-heading",
