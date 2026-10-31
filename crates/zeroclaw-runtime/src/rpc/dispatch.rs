@@ -23650,6 +23650,10 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_approval_install_rechecks_after_agent_wait() {
+        // Keep the shared writer and broadcast hook stable through the deferred
+        // refusal capture, in the same lock order as other log-capture tests.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
         for (own, replaced) in [(false, false), (true, false), (false, true)] {
             let tmp = tempfile::TempDir::new().unwrap();
