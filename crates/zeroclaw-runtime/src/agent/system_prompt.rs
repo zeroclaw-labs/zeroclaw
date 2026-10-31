@@ -593,11 +593,13 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
 pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
     if max_chars > 0 && prompt.chars().count() > max_chars {
         // A prompt that was already finalized once (e.g. the cached channel
-        // prompt) carries its orientation block inside the head-retained
-        // portion below; re-appending would duplicate it. Strip every existing
-        // copy first so re-finalizing an over-cap prompt is idempotent.
-        while let Some(index) = prompt.find(TIMESTAMP_ORIENTATION) {
-            prompt.replace_range(index..index + TIMESTAMP_ORIENTATION.len(), "");
+        // prompt) carries its orientation block at the very end; re-appending
+        // would duplicate it. Strip only trailing runtime-appended copies, so
+        // re-finalizing an over-cap prompt is idempotent without touching
+        // legitimate quotes of the orientation text inside prompt content.
+        while prompt.ends_with(TIMESTAMP_ORIENTATION) {
+            let stripped_len = prompt.len() - TIMESTAMP_ORIENTATION.len();
+            prompt.truncate(stripped_len);
         }
         // The orientation is runtime-critical, so it must land inside the
         // budget. Reserve room at the head-retained portion, then re-append it
