@@ -93,6 +93,11 @@ pub struct InteractionContext {
     persistence: SessionPersistence,
 }
 
+/// Header both identity renderers (the direct `append_project_context` and the
+/// channel `IdentitySection`) emit at a section boundary — the single source
+/// for the identity-zone lookup in `system_prompt::project_context_zone`.
+pub(crate) const PROJECT_CONTEXT_HEADER: &str = "## Project Context\n\n";
+
 pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
@@ -324,7 +329,7 @@ impl PromptSection for IdentitySection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let mut prompt = String::from("## Project Context\n\n");
+        let mut prompt = String::from(PROJECT_CONTEXT_HEADER);
         let mut has_aieos = false;
         if let Some(config) = ctx.identity_config
             && identity::is_aieos_configured(config)

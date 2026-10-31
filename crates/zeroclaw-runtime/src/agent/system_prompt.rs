@@ -2,7 +2,9 @@
 //! These functions were originally in `channels/mod.rs` but live here to
 //! break a circular dependency between the channels and agent modules.
 
-use crate::agent::prompt::{TIMESTAMP_ORIENTATION, append_timestamp_orientation};
+use crate::agent::prompt::{
+    PROJECT_CONTEXT_HEADER, TIMESTAMP_ORIENTATION, append_timestamp_orientation,
+};
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -82,7 +84,7 @@ fn append_project_context(
     bootstrap_max_chars: Option<usize>,
     inject_memory: bool,
 ) {
-    prompt.push_str("## Project Context\n\n");
+    prompt.push_str(PROJECT_CONTEXT_HEADER);
 
     if let Some(config) = identity_config
         && identity::is_aieos_configured(config)
@@ -659,7 +661,14 @@ const POST_IDENTITY_SECTION_MARKERS: &[&str] = &[
 /// header through the start of the next builder-owned section, or the end of
 /// the prompt when no later section exists.
 fn project_context_zone(prompt: &str) -> Option<(usize, usize)> {
-    let start = prompt.find("## Project Context")?;
+    // Both builders emit the header at a section boundary, i.e. at the start
+    // of a line; anchoring the lookup to the line start keeps an inline
+    // mention of the same text inside a workspace file from being mistaken
+    // for the zone.
+    let start = prompt
+        .find("\n## Project Context")
+        .map(|offset| offset + 1)
+        .or_else(|| prompt.starts_with("## Project Context").then_some(0))?;
     let end = POST_IDENTITY_SECTION_MARKERS
         .iter()
         .filter_map(|marker| prompt[start..].find(marker).map(|offset| start + offset))
@@ -1982,6 +1991,84 @@ mod tests {
         assert_eq!(attrs["retained_chars"].as_u64(), Some(0));
         assert_eq!(attrs["total_chars"].as_u64(), Some(total_zone_chars as u64));
         assert_eq!(attrs["max_chars"].as_u64(), Some(40));
+
+        // Case 3 (builder parity): the direct builder assembles the zone the
+        // stop-crane measures. An over-budget no-tools prompt must report
+        // total_chars equal to the real rendered `## Project Context`
+        // section — dropping "\n## Your Task" from POST_IDENTITY_SECTION_MARKERS
+        // would extend the measured zone to `## Safety` and break this count.
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(workspace.path().join("AGENTS.md"), "i".repeat(2_000))
+            .expect("write AGENTS.md");
+        let build = |max_system_prompt_chars: usize| {
+            super::build_system_prompt_with_mode_and_autonomy(
+                workspace.path(),
+                "test-model",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                false,
+                zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
+                false,
+                max_system_prompt_chars,
+                true,
+                false,
+                None,
+            )
+        };
+        // No-tools layout: the zone directly precedes "## Your Task", then
+        // "## Safety". Measure the real section span on an under-budget build.
+        let assembled = build(10_000);
+        let zone_start = assembled
+            .find("## Project Context")
+            .expect("project context header");
+        let zone_end = assembled[zone_start..]
+            .find("\n## ")
+            .map_or(assembled.len(), |offset| zone_start + offset);
+        let expected_zone_chars = assembled[zone_start..zone_end].chars().count();
+        assert!(
+            assembled.contains("\n## Your Task"),
+            "no-tools layout places Your Task right after the identity zone"
+        );
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        zeroclaw_log::set_broadcast_hook(tx);
+        let finalized = build(900);
+        assert!(
+            finalized.contains("## Project Context"),
+            "partial cut retains the zone head"
+        );
+        zeroclaw_log::clear_broadcast_hook();
+        let mut builder_cut = None;
+        loop {
+            let frame = match rx.try_recv() {
+                Ok(frame) => frame,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => break,
+            };
+            if frame["attributes"]["error_key"] == "agent.system_prompt_identity_truncated" {
+                builder_cut = Some(frame);
+            }
+        }
+        let builder_cut = builder_cut.expect("builder identity-cut WARN frame reached the hook");
+        let attrs = &builder_cut["attributes"];
+        assert_eq!(attrs["present"], true);
+        assert_eq!(
+            attrs["total_chars"].as_u64(),
+            Some(expected_zone_chars as u64),
+            "reported zone size must match the real rendered section"
+        );
+        let retained = attrs["retained_chars"].as_u64().expect("retained_chars");
+        assert!(
+            retained > 0 && retained < expected_zone_chars as u64,
+            "partial cut retains only a prefix of the zone: {retained}"
+        );
+        assert_eq!(attrs["max_chars"].as_u64(), Some(900));
     }
 
     #[test]
@@ -2040,7 +2127,15 @@ mod tests {
             "the workspace tail falls to the cut"
         );
         zeroclaw_log::clear_broadcast_hook();
-        while let Ok(frame) = rx.try_recv() {
+        loop {
+            let frame = match rx.try_recv() {
+                Ok(frame) => frame,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => break,
+            };
             assert_ne!(
                 frame["attributes"]["error_key"], "agent.system_prompt_identity_truncated",
                 "identity survived, so no truncation warning may fire"
