@@ -480,12 +480,16 @@ exit 2
             (script, Vec::new())
         }
 
+        // A plain script, not one with a `param()` block: an advanced script
+        // reads `-p` as an abbreviated common parameter (`-PipelineVariable`
+        // in Windows PowerShell), so the upload stage's port flag would never
+        // reach the logged arguments.
         #[cfg(windows)]
         fn create_executable(dir: &std::path::Path) -> (PathBuf, Vec<OsString>) {
             let script = dir.join("arduino-cli.ps1");
             std::fs::write(
                 &script,
-                r#"param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CliArgs)
+                r#"$CliArgs = $args
 Add-Content -LiteralPath $env:ZC_FAKE_LOG -Value ($CliArgs -join ' ')
 $stdinValue = [Console]::In.ReadLine()
 if ($null -eq $stdinValue) {
@@ -652,7 +656,13 @@ exit 2
                 .unwrap()
                 .contains("arduino-cli preflight failed")
         );
-        assert_eq!(std::fs::read_to_string(&fake.log).unwrap(), "version\n");
+        assert_eq!(
+            std::fs::read_to_string(&fake.log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["version"]
+        );
         assert_eq!(
             std::fs::read_to_string(&fake.stdin_state).unwrap().trim(),
             "version:eof"
