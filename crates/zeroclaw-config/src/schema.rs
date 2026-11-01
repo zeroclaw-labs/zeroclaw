@@ -26477,7 +26477,7 @@ impl Config {
     /// a file gets exactly one create and must then reload or use
     /// `force_save()`; `force_save()` is the explicit overwrite path.
     pub async fn save(&self) -> Result<()> {
-        self.save_impl(false).await.map(|_| ())
+        self.save_impl(false, |_, _| Ok(())).await.map(|_| ())
     }
 
     /// Same as `save()`, but skips the loaded-provenance guard. Only for
@@ -26489,10 +26489,14 @@ impl Config {
     /// A bare filename such as `config.toml` is refused if its runtime-resolved
     /// destination already exists.
     pub async fn force_save(&self) -> Result<()> {
-        self.save_impl(true).await.map(|_| ())
+        self.save_impl(true, |_, _| Ok(())).await.map(|_| ())
     }
 
-    async fn save_impl(&self, force: bool) -> Result<PathBuf> {
+    async fn save_impl(
+        &self,
+        force: bool,
+        validate: impl FnOnce(Option<&str>, &str) -> Result<()>,
+    ) -> Result<PathBuf> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -26588,8 +26592,12 @@ impl Config {
 
         // If an existing config file is present, sync the new values onto it
         // to preserve comments and formatting. Otherwise, use the fresh serialization.
-        let toml_str = if config_path.exists() {
-            let existing = fs::read_to_string(&config_path).await.unwrap_or_default();
+        let existing = if config_path.exists() {
+            Some(fs::read_to_string(&config_path).await.unwrap_or_default())
+        } else {
+            None
+        };
+        let toml_str = if let Some(existing) = &existing {
             if existing.is_empty() {
                 new_toml
             } else {
@@ -26606,6 +26614,7 @@ impl Config {
             new_toml
         };
 
+        validate(existing.as_deref(), &toml_str)?;
         write_config_atomically(&config_path, &toml_str).await?;
         // Report the path actually written so `save_dirty`'s create
         // fallback can record provenance without re-resolving (the
@@ -26620,13 +26629,29 @@ impl Config {
     /// written. Falls back to a full `save()` when the file doesn't
     /// exist yet. Clears the dirty set on success.
     pub async fn save_dirty(&mut self) -> Result<()> {
+        self.save_dirty_with_validation(|_, _| Ok(())).await
+    }
+
+    /// Incremental save with a caller's validation of the actual persisted
+    /// documents. The callback receives the original file (or `None` for a
+    /// new file) and the final TOML after env/secret masking, encryption and
+    /// dirty-path merging. It runs before the atomic writer creates a temp
+    /// file or backup. Refusal leaves the file and dirty set unchanged.
+    ///
+    /// This uses the same materialization as `save_dirty`, including its
+    /// missing-file full-save fallback; it does not preview and rebuild the
+    /// candidate. An empty dirty set does not invoke the callback.
+    pub async fn save_dirty_with_validation(
+        &mut self,
+        validate: impl FnOnce(Option<&str>, &str) -> Result<()>,
+    ) -> Result<()> {
         if self.dirty_paths.is_empty() {
             return Ok(());
         }
 
         let config_path = self.resolve_config_path_for_save().await?;
         if !config_path.exists() {
-            return match self.save_impl(false).await {
+            return match self.save_impl(false, validate).await {
                 Ok(written) => {
                     // This value just created the file; `written` is the
                     // path the full save actually wrote.
@@ -26725,6 +26750,7 @@ impl Config {
 
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
+        validate(Some(&existing), &toml_str)?;
         write_config_atomically(&config_path, &toml_str).await?;
         if retired_nevis {
             ::zeroclaw_log::record!(
@@ -34938,6 +34964,64 @@ default_temperature = 0.7
         );
 
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn save_dirty_with_validation_checks_the_exact_masked_and_merged_document() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = format!(
+            "schema_version = {}\n[users.me]\nuid = 1000\n[users.bob]\nuid = 3000\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        let mut config: Config = toml::from_str(&original).unwrap();
+        config.config_path = path.clone();
+        config.users.get_mut("me").unwrap().uid = Some(2000);
+        config
+            .pre_override_snapshots
+            .insert("users.me.uid".into(), "1000".into());
+        config.set_prop_persistent("users.me.uid", "2000").unwrap();
+        config.set_prop_persistent("gateway.port", "43112").unwrap();
+
+        // The writer merges only dirty paths into the current file. A
+        // validation of the staged Config would see the stale bob uid and
+        // the effective me uid; neither is what this save will persist.
+        let existing = original.replace("3000", "5000") + "\n# preserved disk comment\n";
+        fs::write(&path, &existing).await.unwrap();
+        let mut checked = String::new();
+        let error = config
+            .save_dirty_with_validation(|before, candidate| {
+                assert_eq!(before, Some(existing.as_str()));
+                let saved: Config = toml::from_str(candidate).unwrap();
+                assert_eq!(saved.users["me"].uid, Some(1000));
+                assert_eq!(saved.users["bob"].uid, Some(5000));
+                assert_eq!(saved.gateway.port, 43112);
+                assert!(candidate.contains("# preserved disk comment"));
+                checked = candidate.to_owned();
+                anyhow::bail!("test validation refusal")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "test validation refusal");
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), existing);
+        assert!(!path.with_extension("toml.bak").exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(config.dirty_paths.len(), 2);
+
+        config
+            .save_dirty_with_validation(|_, candidate| {
+                assert_eq!(candidate, checked);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), checked);
+        assert!(config.dirty_paths.is_empty());
+        assert_eq!(
+            config.users["me"].uid,
+            Some(2000),
+            "saving does not change the effective config"
+        );
     }
 
     // Upgrade compatibility and durable selector persistence.

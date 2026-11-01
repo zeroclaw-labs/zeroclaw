@@ -133,7 +133,12 @@ at a time; `config patch` validates the whole resulting configuration
 first, as it always has. A save writes back the value each `ZEROCLAW_*`
 override replaced, so while such overrides set authorization inputs, the
 policy config.toml holds after the save is checked the same way as the one
-the CLI sees: a daemon started without the overrides compiles that one. So while a daemon runs or another process holds
+the CLI sees: a daemon started without the overrides compiles that one. The
+file check uses the actual persisted baseline and candidate after environment
+masking and incremental merging, including unrelated file edits made while
+the CLI waited for the daemon. Both policies keep the same repair allowance;
+CLI environment overrides are not reapplied when parsing the persisted file.
+So while a daemon runs or another process holds
 the ownership lock, `config init users.<name>` and
 `config init oidc.<alias>` fail, since their entries cannot compile until
 filled in, and `config init permission_profiles.<name>` is saved and

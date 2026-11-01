@@ -13093,7 +13093,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 // ownership lock, which no daemon can hold meanwhile.
                 let holds_config_ownership = offline_ownership.is_some();
                 let publication = if daemon_replays_write(&config, &path, &selected_value) {
-                    let publication = Box::pin(config_publication::commit_set(
+                    Box::pin(config_publication::commit_set(
                         &before,
                         &config,
                         &path,
@@ -13101,27 +13101,20 @@ Add pricing to the active provider profile or supply a catalog entry."
                         comment.as_deref(),
                         holds_config_ownership,
                     ))
-                    .await?;
-                    // A daemon that applied the edit has already saved
-                    // config.toml.
-                    if !matches!(publication, config_publication::Publication::Applied) {
-                        Box::pin(config.save_dirty()).await?;
-                    }
-                    publication
+                    .await?
                 } else {
-                    // Classified before the save: while a daemon runs, an
-                    // edit that breaks a policy that compiles saves nothing.
-                    let publication = config_publication::classify_local_save(
+                    config_publication::classify_local_save(
                         &before,
                         &config,
                         std::slice::from_ref(&path),
                         config_publication::PendingReason::NotReplayable,
                         true,
                         holds_config_ownership,
-                    )?;
-                    Box::pin(config.save_dirty()).await?;
-                    publication
+                    )?
                 };
+                // The daemon-applied path is already saved. Pending local
+                // writes validate the final persisted policy at the writer.
+                Box::pin(publication.save_local(&mut config, true)).await?;
                 // Reported before the comment is written: the edit's outcome is
                 // settled, and a failed annotation must not hide it.
                 publication.report(json);
@@ -13225,10 +13218,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 // `config init` has no daemon path for a roster, profile or
                 // OIDC entry: one it creates waits for the running daemon's
-                // next reload. It is classified before the save, so while a
-                // daemon runs an entry that breaks a policy that compiles
-                // saves nothing. An offline agent route already holds the
-                // configuration's ownership lock.
+                // next reload. Check its effective policy here and the final
+                // persisted policy at the local save. An offline agent route
+                // already holds the configuration's ownership lock.
                 let publication = config_publication::classify_local_save(
                     &before,
                     &config,
@@ -13238,7 +13230,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     offline_ownership.is_some(),
                 )?;
                 if !initialized.is_empty() {
-                    Box::pin(config.save_dirty()).await?;
+                    Box::pin(publication.save_local(&mut config, true)).await?;
                 }
                 publication.report(json);
                 if json {
@@ -13739,7 +13731,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 // ownership lock, which no daemon can hold meanwhile.
                 let holds_config_ownership = offline_ownership.is_some();
                 let publication = if patch_batch_is_delegatable(sets.len(), replayable) {
-                    let publication = match Box::pin(config_publication::commit_set_many(
+                    match Box::pin(config_publication::commit_set_many(
                         &before,
                         &config,
                         &sets,
@@ -13758,19 +13750,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                             daemon_commit_api_error(&err),
                             err.to_string(),
                         )?,
-                    };
-                    // A daemon that applied the batch has already saved
-                    // config.toml.
-                    if !matches!(publication, config_publication::Publication::Applied) {
-                        Box::pin(config.save_dirty()).await?;
                     }
-                    publication
                 } else {
                     let touched: Vec<String> = sets.iter().map(|(path, _)| path.clone()).collect();
-                    // Classified before the save: while a daemon runs, a patch
-                    // that breaks a policy that compiles fails whole, in the
-                    // envelope the delegated branch's verdict uses.
-                    let publication = match config_publication::classify_local_save(
+                    match config_publication::classify_local_save(
                         &before,
                         &config,
                         &touched,
@@ -13784,10 +13767,21 @@ Add pricing to the active provider profile or supply a catalog entry."
                             daemon_commit_api_error(&err),
                             err.to_string(),
                         )?,
-                    };
-                    Box::pin(config.save_dirty()).await?;
-                    publication
+                    }
                 };
+                if let Err(err) = Box::pin(publication.save_local(&mut config, false)).await {
+                    if err
+                        .downcast_ref::<config_publication::CommitFailure>()
+                        .is_some()
+                    {
+                        config_patch_fail_json_or_human(
+                            json,
+                            daemon_commit_api_error(&err),
+                            err.to_string(),
+                        )?;
+                    }
+                    return Err(err);
+                }
 
                 // Report only a new enable transition: startup already recorded
                 // an enabled section. Drain this post-save notice before the

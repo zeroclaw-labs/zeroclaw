@@ -45,7 +45,9 @@
 //! `ZEROCLAW_*` overrides set authorization inputs, the policy config.toml
 //! holds once saved, which keeps the values those overrides replaced, is
 //! checked the same way as the one the command sees: a daemon started
-//! without the overrides compiles the file's.
+//! without the overrides compiles the file's. The persisted check runs on
+//! the writer's actual masked and merged document, including non-dirty file
+//! edits made while the command waited for the daemon.
 
 use std::cell::OnceCell;
 use std::fmt;
@@ -54,7 +56,6 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
-use zeroclaw_config::env_overrides::mask_env_overrides_for_save;
 use zeroclaw_runtime::daemon::{STATUS_FLUSH_SECONDS, state_file_path};
 use zeroclaw_runtime::live_config_authority::{ConfigOwnershipError, ConfigOwnershipGuard};
 use zeroclaw_runtime::rpc::auth::{auth_inputs, validate_accepted_auth_config};
@@ -86,26 +87,6 @@ fn is_auth_input_path(path: &str) -> bool {
         || path == "security.trust_daemon_uid"
 }
 
-/// Whether a `ZEROCLAW_*` override sets one of `config`'s authorization
-/// inputs, so that config.toml holds another policy than the one `config`
-/// compiles to.
-fn overrides_auth_inputs(config: &Config) -> bool {
-    config
-        .pre_override_snapshots
-        .keys()
-        .any(|path| is_auth_input_path(path))
-}
-
-/// `config` as config.toml holds it once saved. A save writes back, for each
-/// property a `ZEROCLAW_*` override set, the value the override replaced, so
-/// a daemon started without those overrides compiles its policy from these
-/// values, not from the ones this command sees.
-fn as_saved(config: &Config) -> anyhow::Result<Config> {
-    let mut saved = config.clone();
-    mask_env_overrides_for_save(&mut saved, &config.pre_override_snapshots)?;
-    Ok(saved)
-}
-
 /// The authorization inputs as they stood before a command staged its edit,
 /// and the configuration they came from, which tells whether the policy they
 /// made compiled.
@@ -116,8 +97,6 @@ pub(crate) struct AuthSnapshot {
     /// and an HTTP client, for every OIDC entry, so it is judged only when an
     /// edit needs the answer, and at most once.
     compiled: OnceCell<bool>,
-    /// The same for the policy config.toml held ([`as_saved`]).
-    compiled_as_saved: OnceCell<bool>,
 }
 
 impl AuthSnapshot {
@@ -126,7 +105,6 @@ impl AuthSnapshot {
             inputs: auth_inputs(config)?,
             config: Box::new(config.clone()),
             compiled: OnceCell::new(),
-            compiled_as_saved: OnceCell::new(),
         })
     }
 
@@ -136,14 +114,6 @@ impl AuthSnapshot {
         *self
             .compiled
             .get_or_init(|| validate_accepted_auth_config(&self.config).is_ok())
-    }
-
-    /// Whether the policy config.toml held when this snapshot was captured
-    /// compiled.
-    fn compiles_as_saved(&self) -> bool {
-        *self.compiled_as_saved.get_or_init(|| {
-            as_saved(&self.config).is_ok_and(|saved| validate_accepted_auth_config(&saved).is_ok())
-        })
     }
 
     /// Whether `staged` compiles to a different authorization policy than the
@@ -157,9 +127,9 @@ impl AuthSnapshot {
     /// compile after it: a daemon enforcing deny-all in its place can then be
     /// repaired one field at a time.
     ///
-    /// While `ZEROCLAW_*` overrides set authorization inputs, the policy
-    /// config.toml holds is judged the same way, beside the one this command
-    /// sees: a daemon started without those overrides compiles the file's.
+    /// This protects the effective policy, which a daemon sharing the CLI's
+    /// environment would see. The persisted policy is checked separately
+    /// against the writer's actual documents at the local save boundary.
     fn refuse_breaking(&self, staged: &Config, suggest_patch: bool) -> anyhow::Result<()> {
         let refuse = |error: anyhow::Error| CommitFailure::PolicyWouldNotCompile {
             error: error.to_string(),
@@ -168,11 +138,53 @@ impl AuthSnapshot {
         if self.compiles() {
             validate_accepted_auth_config(staged).map_err(refuse)?;
         }
-        if overrides_auth_inputs(staged) && self.compiles_as_saved() {
-            validate_accepted_auth_config(&as_saved(staged)?).map_err(refuse)?;
-        }
         Ok(())
     }
+}
+
+/// Compile what the file stores, using the load-time migration/parser but
+/// without reapplying this CLI process's environment. Non-auth salvage keeps
+/// the same semantics as normal loading; malformed auth sections must not
+/// masquerade as a valid policy made from their substituted defaults.
+fn validate_persisted_auth(document: Option<&str>) -> anyhow::Result<()> {
+    let config = if let Some(document) = document {
+        let loaded = zeroclaw_config::migration::migrate_to_current_salvaged(document);
+        if loaded.dropped_security.iter().any(|section| {
+            is_auth_input_path(section)
+                || section == "security"
+                || section == zeroclaw_config::migration::WHOLE_CONFIG_SENTINEL
+        }) {
+            // Reuse the strict parser's original error instead of treating a
+            // dropped authorization section as a compiling empty roster.
+            zeroclaw_config::migration::migrate_to_current(document)?
+        } else {
+            loaded.config
+        }
+    } else {
+        // Creating a missing file starts from the valid default policy;
+        // absence is not an already-invalid policy eligible for repair.
+        Config::default()
+    };
+    validate_accepted_auth_config(&config)
+}
+
+fn refuse_breaking_persisted(
+    before: Option<&str>,
+    candidate: &str,
+    suggest_patch: bool,
+) -> anyhow::Result<()> {
+    // Preserve the lockout-repair path, judged from the saved baseline,
+    // which may differ from the CLI's env-overridden configuration.
+    if validate_persisted_auth(before).is_err() {
+        return Ok(());
+    }
+    validate_persisted_auth(Some(candidate)).map_err(|error| {
+        CommitFailure::PolicyWouldNotCompile {
+            error: error.to_string(),
+            suggest_patch,
+        }
+        .into()
+    })
 }
 
 /// Why an authorization edit was saved without reaching the running daemon.
@@ -268,6 +280,27 @@ pub(crate) enum Publication {
 }
 
 impl Publication {
+    /// Save only an edit the daemon did not apply. Pending saves validate
+    /// the exact original and candidate documents materialized by the config
+    /// writer, before its first atomic-write effect. Other local writes keep
+    /// their existing behavior.
+    pub(crate) async fn save_local(
+        &self,
+        config: &mut Config,
+        suggest_patch: bool,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Applied => Ok(()),
+            Self::Pending { .. } => {
+                Box::pin(config.save_dirty_with_validation(|before, candidate| {
+                    refuse_breaking_persisted(before, candidate, suggest_patch)
+                }))
+                .await
+            }
+            Self::NotAuthorizationEdit | Self::NoDaemon => Box::pin(config.save_dirty()).await,
+        }
+    }
+
     /// `Some(json!({"applied": true}))`, `Some(json!({"applied": false,
     /// "pending_reload": true, "reason": code}))`, or `None` when the daemon
     /// has nothing to apply.
@@ -1349,6 +1382,63 @@ mod tests {
     }
 
     #[test]
+    fn persisted_policy_validation_does_not_accept_salvaged_auth_defaults() {
+        let valid = format!(
+            "schema_version = {}\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
+        let malformed = format!("{valid}\n[users.bob]\nuid = \"not-a-uid\"\n");
+        assert!(validate_persisted_auth(Some(&malformed)).is_err());
+        let failure = refuse_breaking_persisted(Some(&valid), &malformed, true)
+            .expect_err("a dropped auth section is not a valid empty policy");
+        assert!(matches!(
+            failure.downcast_ref::<CommitFailure>(),
+            Some(CommitFailure::PolicyWouldNotCompile { .. })
+        ));
+        refuse_breaking_persisted(Some(&malformed), &valid, true)
+            .expect("a malformed persisted policy remains repairable");
+    }
+
+    #[test]
+    fn unrelated_salvage_does_not_disable_persisted_policy_validation() {
+        let before = format!(
+            "schema_version = {}\n[gateway]\nport = \"not-a-port\"\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
+        validate_persisted_auth(Some(&before)).expect("non-auth salvage preserves a valid policy");
+        let after = format!("{before}\n[users.bob]\nuid = 4242\n");
+        let failure = refuse_breaking_persisted(Some(&before), &after, false)
+            .expect_err("non-auth salvage must not let a profileless user through");
+        assert_would_not_compile(&failure, false);
+    }
+
+    #[tokio::test]
+    async fn pending_local_save_validates_new_file_against_the_default_policy() {
+        let (_dir, config) = scratch_config();
+        let publication = Publication::Pending {
+            reason: PendingReason::OfflineCommand,
+            detail: String::new(),
+        };
+        let mut invalid = with_profileless_user(&config);
+        invalid.mark_dirty("users");
+        let failure = publication
+            .save_local(&mut invalid, true)
+            .await
+            .expect_err("absence is not an already-invalid policy");
+        assert_would_not_compile(&failure, true);
+        assert!(!config.config_path.exists());
+        assert!(invalid.dirty_paths.contains("users"));
+        let mut valid = with_trust_flipped(&config);
+        valid.mark_dirty("security.trust_daemon_uid");
+        publication
+            .save_local(&mut valid, true)
+            .await
+            .expect("valid file creation");
+        validate_persisted_auth(Some(&std::fs::read_to_string(&config.config_path).unwrap()))
+            .expect("new file compiles");
+    }
+
+    #[test]
     fn auth_snapshot_sees_only_authorization_edits() {
         let config = Config::default();
         let before = AuthSnapshot::capture(&config).expect("the default config encodes");
@@ -1777,29 +1867,27 @@ mod tests {
         );
     }
 
-    /// A save writes back the value each `ZEROCLAW_*` override replaced, and
-    /// a daemon started without the override compiles the file's policy: an
-    /// edit that breaks only that policy is refused too, and one that keeps
-    /// both compiling is pending.
-    #[test]
-    fn classify_local_save_judges_the_policy_config_toml_holds_without_env_overrides() {
+    /// Pending saves preserve both policies: the effective one this CLI
+    /// loaded, and the actual masked document the writer would persist.
+    #[tokio::test]
+    async fn pending_local_save_judges_effective_and_persisted_policies() {
         let (_dir, config) = scratch_config();
-        // config.toml maps alice to uid 1000; this command's environment maps
-        // her to 2000.
-        let loaded = with_alice_uid_overridden(&with_roster(&config));
+        let persisted = with_roster(&config);
+        Box::pin(persisted.save())
+            .await
+            .expect("persist a valid baseline");
+        let loaded = with_alice_uid_overridden(&persisted);
         let before = AuthSnapshot::capture(&loaded).expect("encodes");
         record_running_daemon(&loaded);
         let touched = ["users.bob.uid".to_owned()];
 
         let mut colliding = loaded.clone();
         colliding
-            .users
-            .get_mut("bob")
-            .expect("bob is on the roster")
-            .uid = Some(1000);
+            .set_prop_persistent("users.bob.uid", "1000")
+            .unwrap();
         validate_accepted_auth_config(&colliding)
-            .expect("the policy this command sees maps alice to 2000 and bob to 1000");
-        let failure = classify_local_save(
+            .expect("effective policy maps alice to 2000 and bob to 1000");
+        let publication = classify_local_save(
             &before,
             &colliding,
             &touched,
@@ -1807,15 +1895,41 @@ mod tests {
             true,
             false,
         )
-        .expect_err("config.toml would map uid 1000 to both alice and bob");
+        .expect("the effective policy still compiles");
+        let original = std::fs::read_to_string(&loaded.config_path).unwrap();
+        let failure = publication
+            .save_local(&mut colliding, true)
+            .await
+            .expect_err("the file would map uid 1000 to both alice and bob");
         assert_would_not_compile(&failure, true);
+        assert_eq!(
+            std::fs::read_to_string(&loaded.config_path).unwrap(),
+            original
+        );
+
+        let mut effective_collision = loaded.clone();
+        effective_collision
+            .set_prop_persistent("users.bob.uid", "2000")
+            .unwrap();
+        let failure = classify_local_save(
+            &before,
+            &effective_collision,
+            &touched,
+            PendingReason::NotReplayable,
+            true,
+            false,
+        )
+        .expect_err("the effective policy must still compile too");
+        assert_would_not_compile(&failure, true);
+        assert_eq!(
+            std::fs::read_to_string(&loaded.config_path).unwrap(),
+            original
+        );
 
         let mut renumbered = loaded.clone();
         renumbered
-            .users
-            .get_mut("bob")
-            .expect("bob is on the roster")
-            .uid = Some(4000);
+            .set_prop_persistent("users.bob.uid", "4000")
+            .unwrap();
         let publication = classify_local_save(
             &before,
             &renumbered,
@@ -1825,16 +1939,14 @@ mod tests {
             false,
         )
         .expect("both policies still compile");
-        assert!(
-            matches!(
-                publication,
-                Publication::Pending {
-                    reason: PendingReason::NotReplayable,
-                    ..
-                }
-            ),
-            "{publication:?}"
-        );
+        publication
+            .save_local(&mut renumbered, true)
+            .await
+            .expect("save valid policy");
+        let saved: Config =
+            toml::from_str(&std::fs::read_to_string(&loaded.config_path).unwrap()).unwrap();
+        assert_eq!(saved.users["alice"].uid, Some(1000));
+        assert_eq!(saved.users["bob"].uid, Some(4000));
     }
 
     /// A write to an authorization input counts even when it leaves the

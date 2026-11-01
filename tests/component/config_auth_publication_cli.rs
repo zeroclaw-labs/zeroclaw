@@ -17,9 +17,9 @@
 //! config dir, keep the direct save and today's output, and contact no
 //! daemon.
 //!
-//! Every test drives real processes: a `zeroclaw daemon` on a private config
-//! dir and port, the CLI in a separate process, and a raw JSON-RPC client on
-//! the daemon's local socket. The fixture maps this process's uid to
+//! The tests drive real CLI processes with a `zeroclaw daemon` on a private
+//! config dir and port, ownership locks, or a scripted same-account Unix
+//! handshake. Raw JSON-RPC clients probe the daemon's local socket. The fixture maps this process's uid to
 //! `[users.me]` (or, to have the daemon refuse this process at the
 //! handshake, another uid) and sets `security.trust_daemon_uid = false`. With
 //! the default `true`, the daemon's own uid is the shared operator whatever
@@ -1546,6 +1546,389 @@ fn config_set_reports_pending_while_another_process_owns_the_configuration() {
         fixture.config_text()
     );
     drop(owner);
+}
+
+/// A valid two-user file, with fixed synthetic uids so a replacement on disk
+/// can collide with a staged edit without involving the test account's uid.
+fn pending_disk_roster_fixture() -> Fixture {
+    let fixture = Fixture::with_roster_uid("admin", 1000);
+    fixture.write_config_text(&format!(
+        "{}\n[users.bob]\nuid = 3000\npermission_profiles = [\"admin\"]\n",
+        fixture.config_text()
+    ));
+    fixture
+}
+
+/// The CLI stages before initialize. This same-account server is identified by
+/// a real peer pid and a recent heartbeat, replaces the file only after reading
+/// that request, then refuses the unbound caller. The pending save must merge
+/// against that replacement. Socket readiness and the protocol establish the
+/// order; no scheduling delay or production hook is involved.
+fn with_disk_edit_at_handshake(
+    fixture: &Fixture,
+    replacement: String,
+    invoke: impl FnOnce() -> Output,
+) -> Output {
+    for text in [fixture.config_text(), replacement.clone()] {
+        let config: zeroclaw_config::schema::Config = toml::from_str(&text).unwrap();
+        zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(&config)
+            .expect("both the loaded and replacement file policies compile");
+    }
+    std::fs::create_dir_all(fixture.data_dir()).unwrap();
+    std::fs::create_dir_all(fixture.path().join("state")).unwrap();
+    std::fs::write(
+        fixture.path().join("state/daemon_state.json"),
+        json!({
+            "pid": std::process::id(),
+            "written_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let listener = UnixListener::bind(fixture.socket()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config_path = fixture.path().join("config.toml");
+    let original = fixture.config_text();
+    let server = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut stream = runtime.block_on(async {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            tokio::time::timeout(RPC_TIMEOUT, listener.accept())
+                .await
+                .expect("CLI reaches initialize")
+                .unwrap()
+                .0
+                .into_std()
+                .unwrap()
+        });
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(RPC_TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(RPC_TIMEOUT)).unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "initialize", "{request}");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+        std::fs::write(config_path, replacement).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {"code": AUTH_REQUIRED, "message": "unmapped peer"},
+            })
+        )
+        .unwrap();
+    });
+    let output = invoke();
+    server.join().expect("scripted handshake completed");
+    output
+}
+
+#[test]
+fn pending_disk_merge_set_refuses_a_collision_after_initialize() {
+    let fixture = pending_disk_roster_fixture();
+    let latest = fixture.config_text().replace("uid = 1000", "uid = 2000");
+    let output = with_disk_edit_at_handshake(&fixture, latest.clone(), || {
+        config_set_json(&fixture, "users.bob.uid", "2000")
+    });
+    let saved = fixture.config_toml();
+    assert_eq!(
+        toml_at(&saved, "users.bob.uid").and_then(toml::Value::as_integer),
+        Some(3000),
+        "a pending edit must not collide with the newer me uid: me={:?}; {}",
+        toml_at(&saved, "users.me.uid"),
+        describe(&output)
+    );
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("would not compile"));
+    assert_eq!(fixture.config_text(), latest);
+}
+
+#[test]
+fn pending_disk_merge_patch_refuses_the_whole_batch_after_initialize() {
+    let fixture = pending_disk_roster_fixture();
+    let latest = fixture.config_text().replace("uid = 1000", "uid = 2000");
+    let patch = json!([
+        {"op": "replace", "path": "/gateway/host", "value": "127.0.0.7"},
+        {"op": "replace", "path": "/users/bob/uid", "value": 2000},
+    ]);
+    let output = with_disk_edit_at_handshake(&fixture, latest.clone(), || {
+        config_patch_json(&fixture, &patch)
+    });
+    assert_eq!(
+        toml_at(&fixture.config_toml(), "users.bob.uid").and_then(toml::Value::as_integer),
+        Some(3000),
+        "the mixed batch must not persist the uid collision; {}",
+        describe(&output)
+    );
+    assert!(!output.status.success(), "{}", describe(&output));
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["code"], "validation_failed", "{error}");
+    assert_eq!(fixture.config_text(), latest, "refuse every batch edit");
+}
+
+#[test]
+fn pending_disk_merge_accepts_a_compatible_edit_after_initialize() {
+    let fixture = pending_disk_roster_fixture();
+    let latest = fixture.config_text().replace("uid = 1000", "uid = 2000");
+    let output = with_disk_edit_at_handshake(&fixture, latest, || {
+        config_set_json(&fixture, "users.bob.uid", "4000")
+    });
+    assert!(output.status.success(), "{}", describe(&output));
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["daemon"]["pending_reload"], true, "{envelope}");
+    assert_eq!(envelope["daemon"]["reason"], "refused");
+    let saved = fixture.config_toml();
+    assert_eq!(
+        toml_at(&saved, "users.me.uid").and_then(toml::Value::as_integer),
+        Some(2000),
+        "the unrelated replacement survives the dirty-path merge"
+    );
+    assert_eq!(
+        toml_at(&saved, "users.bob.uid").and_then(toml::Value::as_integer),
+        Some(4000)
+    );
+}
+
+/// A persisted roster whose first uid can differ in the CLI's
+/// environment. The ownership lock forces the real CLI down its pending
+/// local-save path without depending on daemon startup timing.
+fn persisted_roster_fixture(bob_uid: u32) -> Fixture {
+    let fixture = Fixture::with_roster_uid("admin", 1000);
+    fixture.write_config_text(&format!(
+        "{}\n[users.bob]\nuid = {bob_uid}\npermission_profiles = [\"reader\"]\n",
+        fixture.config_text()
+    ));
+    fixture
+}
+
+fn run_with_roster_override(
+    fixture: &Fixture,
+    uid: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Output {
+    let mut command = zeroclaw_command(fixture.path());
+    command.env("ZEROCLAW_users__me__uid", uid);
+    run(command, args, input)
+}
+
+#[test]
+fn pending_env_set_refuses_a_duplicate_in_the_persisted_roster() {
+    let fixture = persisted_roster_fixture(3000);
+    let _owner = ConfigOwnershipGuard::acquire(&fixture.data_dir()).expect("take ownership");
+    let before = fixture.config_text();
+    let output = run_with_roster_override(
+        &fixture,
+        "2000",
+        &[
+            "config",
+            "set",
+            "--no-interactive",
+            "users.bob.uid",
+            "1000",
+            "--json",
+        ],
+        None,
+    );
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("would not compile"),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(
+        fixture.config_text(),
+        before,
+        "CLI-only env must not hide a persisted uid collision"
+    );
+}
+
+#[test]
+fn pending_env_patch_refuses_the_whole_persisted_batch() {
+    let fixture = persisted_roster_fixture(3000);
+    let _owner = ConfigOwnershipGuard::acquire(&fixture.data_dir()).expect("take ownership");
+    let before = fixture.config_text();
+    let patch = json!([
+        {"op": "replace", "path": "/gateway/host", "value": "127.0.0.5"},
+        {"op": "replace", "path": "/users/bob/uid", "value": 1000}
+    ]);
+    let output = run_with_roster_override(
+        &fixture,
+        "2000",
+        &["config", "patch", "--json"],
+        Some(patch.to_string().as_bytes()),
+    );
+    assert!(!output.status.success(), "{}", describe(&output));
+    let error: Value = serde_json::from_slice(&output.stderr).expect("structured patch refusal");
+    assert_eq!(error["code"], "validation_failed", "{error}");
+    assert_eq!(
+        fixture.config_text(),
+        before,
+        "no part of a refused batch may be saved"
+    );
+}
+
+#[test]
+fn pending_env_invalid_effective_baseline_does_not_bypass_the_saved_policy_guard() {
+    let fixture = persisted_roster_fixture(3000);
+    let _owner = ConfigOwnershipGuard::acquire(&fixture.data_dir()).expect("take ownership");
+    let before = fixture.config_text();
+    // The env override collides with bob, but the persisted baseline is
+    // valid. Adding a profileless user would break that saved policy.
+    let output = run_with_roster_override(
+        &fixture,
+        "3000",
+        &[
+            "config",
+            "set",
+            "--no-interactive",
+            "users.charlie.uid",
+            "4000",
+            "--json",
+        ],
+        None,
+    );
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("would not compile"),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(fixture.config_text(), before);
+}
+
+#[test]
+fn pending_env_set_keeps_the_effective_policy_guard_and_allows_valid_policies() {
+    let fixture = persisted_roster_fixture(3000);
+    let _owner = ConfigOwnershipGuard::acquire(&fixture.data_dir()).expect("take ownership");
+    let before = fixture.config_text();
+    for (uid, allowed) in [("2000", false), ("4000", true)] {
+        let output = run_with_roster_override(
+            &fixture,
+            "2000",
+            &[
+                "config",
+                "set",
+                "--no-interactive",
+                "users.bob.uid",
+                uid,
+                "--json",
+            ],
+            None,
+        );
+        assert_eq!(output.status.success(), allowed, "{}", describe(&output));
+        if allowed {
+            assert_eq!(stdout_json(&output)["daemon"]["pending_reload"], true);
+            let saved = fixture.config_toml();
+            assert_eq!(
+                toml_at(&saved, "users.me.uid").and_then(toml::Value::as_integer),
+                Some(1000)
+            );
+            assert_eq!(
+                toml_at(&saved, "users.bob.uid").and_then(toml::Value::as_integer),
+                Some(4000)
+            );
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("would not compile"));
+            assert_eq!(
+                fixture.config_text(),
+                before,
+                "valid saved policy cannot excuse an effective collision"
+            );
+        }
+    }
+}
+
+#[test]
+fn pending_env_explicit_override_edit_keeps_the_effective_policy_guard() {
+    let fixture = persisted_roster_fixture(3000);
+    let _owner = ConfigOwnershipGuard::acquire(&fixture.data_dir()).expect("take ownership");
+    let before = fixture.config_text();
+    let output = run_with_roster_override(
+        &fixture,
+        "2000",
+        &[
+            "config",
+            "set",
+            "--no-interactive",
+            "users.me.uid",
+            "3000",
+            "--json",
+        ],
+        None,
+    );
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("would not compile"));
+    assert_eq!(
+        fixture.config_text(),
+        before,
+        "masking does not excuse an effective collision"
+    );
+}
+
+#[test]
+fn pending_env_invalid_persisted_policy_can_still_be_repaired_in_steps() {
+    let fixture = persisted_roster_fixture(1000);
+    let _owner = ConfigOwnershipGuard::acquire(&fixture.data_dir()).expect("take ownership");
+    for (path, value) in [
+        ("security.trust_daemon_uid", "true"),
+        ("users.bob.uid", "4000"),
+    ] {
+        let output = run_with_roster_override(
+            &fixture,
+            "2000",
+            &["config", "set", "--no-interactive", path, value, "--json"],
+            None,
+        );
+        assert!(output.status.success(), "{}", describe(&output));
+        assert_eq!(stdout_json(&output)["daemon"]["pending_reload"], true);
+    }
+    let saved = fixture.config_toml();
+    assert_eq!(
+        toml_at(&saved, "users.me.uid").and_then(toml::Value::as_integer),
+        Some(1000)
+    );
+    assert_eq!(
+        toml_at(&saved, "users.bob.uid").and_then(toml::Value::as_integer),
+        Some(4000)
+    );
+}
+
+#[test]
+fn pending_env_absent_daemon_keeps_the_existing_local_save_behavior() {
+    let fixture = persisted_roster_fixture(3000);
+    let output = run_with_roster_override(
+        &fixture,
+        "2000",
+        &[
+            "config",
+            "set",
+            "--no-interactive",
+            "users.bob.uid",
+            "1000",
+            "--json",
+        ],
+        None,
+    );
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(stdout_json(&output).get("daemon").is_none());
+    let saved = fixture.config_toml();
+    assert_eq!(
+        toml_at(&saved, "users.me.uid").and_then(toml::Value::as_integer),
+        Some(1000)
+    );
+    assert_eq!(
+        toml_at(&saved, "users.bob.uid").and_then(toml::Value::as_integer),
+        Some(1000)
+    );
 }
 
 /// A patch that tests an authorization input and replaces another, which a
