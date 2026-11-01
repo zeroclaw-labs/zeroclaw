@@ -2349,6 +2349,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
             ("atlascloud", "Atlas Cloud", false),
+            ("opper", "Opper", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2617,6 +2618,40 @@ mod tests {
         assert!(
             create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
             "Atlas Cloud should construct through the OpenAI-compatible family factory"
+        );
+    }
+
+    #[test]
+    fn resolve_opper_credential_stays_on_typed_alias_boundary() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("OPPER_API_KEY", Some("  opper-env-key  "));
+        assert!(resolve_model_provider_credential("opper", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("opper", Some("  explicit-key  ")).as_deref(),
+            Some("explicit-key")
+        );
+        assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn opper_uses_canonical_provider_id_only() {
+        assert_eq!(canonicalize_v2_model_provider_name("opper"), "opper");
+        for alias in ["opper-ai", "opper_ai", "opperai"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+        }
+    }
+
+    #[test]
+    fn opper_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let opper = providers
+            .iter()
+            .find(|provider| provider.name == "opper")
+            .expect("Opper provider should be listed");
+        assert_eq!(opper.display_name, "Opper");
+        assert!(
+            create_model_provider("opper", Some("provider-test-credential")).is_ok(),
+            "Opper should construct through the OpenAI-compatible family factory"
         );
     }
 
@@ -3972,6 +4007,10 @@ mod tests {
         assert_eq!(
             default_model_provider_url("crusoe"),
             Some("https://api.inference.crusoecloud.com/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("opper"),
+            Some("https://api.opper.ai/v3/compat")
         );
     }
 
