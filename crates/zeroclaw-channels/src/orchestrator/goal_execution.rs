@@ -3478,8 +3478,10 @@ mod tests {
             }
         }
 
+        type RecordedToolCallStart = (String, Option<String>, Option<String>);
+
         #[derive(Default)]
-        struct RecordingObserver(Mutex<Vec<(String, Option<String>, Option<String>)>>);
+        struct RecordingObserver(Mutex<Vec<RecordedToolCallStart>>);
         impl zeroclaw_runtime::observability::Observer for RecordingObserver {
             fn record_event(&self, event: &zeroclaw_runtime::observability::ObserverEvent) {
                 if let zeroclaw_runtime::observability::ObserverEvent::ToolCallStart {
@@ -6085,7 +6087,7 @@ mod tests {
                 .enabled
         );
         // Same deterministic fixture as the ordinary channel leak controls.
-        let secret = "AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let secret = "AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow; nosemgrep: generic.secrets.security.detected-aws-access-key-id-value.detected-aws-access-key-id-value
         assert_eq!(zeroclaw_providers::scrub_secret_patterns(secret), secret);
         let padding = "safe live policy diagnostic prose ".repeat(30);
         let error = anyhow::Error::msg(format!(
@@ -12641,6 +12643,10 @@ mod tests {
 
     #[tokio::test]
     async fn matrix_root_deadline_drains_real_pipeline_child_settlement_and_row_cleanup() {
+        Box::pin(matrix_root_deadline_pipeline_case()).await;
+    }
+
+    async fn matrix_root_deadline_pipeline_case() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
         use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
         use zeroclaw_goal::GoalAccountingState;

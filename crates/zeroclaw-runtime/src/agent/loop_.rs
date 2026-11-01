@@ -3468,7 +3468,9 @@ pub async fn run(
 
         Ok(final_output)
     };
-    __zc_body
+    // Pin the body before by-value instrumentation, preserving same-task poll/drop.
+    // Concrete body construction can still use native temporaries.
+    Box::pin(__zc_body)
         .instrument(__zc_scope_span)
         .instrument(__zc_attribution_span)
         .await
@@ -19624,6 +19626,95 @@ Let me check the result."#;
         }
     }
 
+    fn assert_no_goal_run_context() {
+        assert!(crate::goal_accounting::GoalForegroundContext::current().is_none());
+        assert!(zeroclaw_api::tool::ToolExecutionContext::current().is_none());
+        assert!(
+            !zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .try_with(Option::is_some)
+                .unwrap_or(false)
+        );
+    }
+
+    struct SingleShotRunScopeAccounting {
+        inner: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        child: crate::goal_accounting::GoalForegroundContext,
+        accountant: std::sync::OnceLock<
+            std::sync::Weak<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        >,
+        lifecycle: crate::live_config_authority::AgentLifecycleCoordinator,
+        task_id: Option<tokio::task::Id>,
+        calls: std::sync::atomic::AtomicUsize,
+        admissions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SingleShotRunScopeAccounting {
+        fn observe(&self) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(tokio::task::try_id(), self.task_id);
+            assert_eq!(self.lifecycle.active_turn_count("main"), 1);
+            let active = crate::goal_accounting::GoalForegroundContext::current_for_child()
+                .unwrap()
+                .unwrap();
+            let expected = self.child.scope_identity();
+            assert_eq!(active.scope_identity().task_id(), expected.task_id());
+            assert_eq!(active.scope_identity().session_id(), expected.session_id());
+            assert_eq!(
+                active.scope_identity().execution_epoch(),
+                expected.execution_epoch()
+            );
+            assert_eq!(active.depth(), self.child.depth());
+            assert_eq!(active.deadline(), self.child.deadline());
+            assert_eq!(
+                active.control_plane().boot_id,
+                self.child.control_plane().boot_id
+            );
+            assert!(Arc::ptr_eq(
+                &active.control_plane().store,
+                &self.child.control_plane().store
+            ));
+            let expected_accountant = self.accountant.get().unwrap().upgrade().unwrap();
+            let active_accountant = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .try_with(Clone::clone)
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&active_accountant, &expected_accountant));
+            let cancelled = self.child.token().is_cancelled();
+            assert_eq!(active.token().is_cancelled(), cancelled);
+            let api = zeroclaw_api::tool::ToolExecutionContext::current().unwrap();
+            assert!(api.is_goal_foreground());
+            assert_eq!(api.cancellation_token().unwrap().is_cancelled(), cancelled);
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for SingleShotRunScopeAccounting {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.observe();
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.admit(request).await
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.observe();
+            let result = self.inner.settle(settlement).await;
+            self.observe();
+            result
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            self.observe();
+            self.inner.pricing_complete().await
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum SingleShotSkillCase {
         ReflectionSuccess,
@@ -19634,12 +19725,89 @@ Let me check the result."#;
     }
 
     async fn actual_goal_single_shot_skill_case(case: SingleShotSkillCase) {
+        boxed_goal_single_shot_skill_case(case).await;
+    }
+
+    fn boxed_goal_single_shot_skill_case(
+        case: SingleShotSkillCase,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+        Box::pin(actual_goal_single_shot_skill_case_body(case))
+    }
+
+    fn single_shot_skill_config_and_authority(
+        directory: &std::path::Path,
+        workspace: std::path::PathBuf,
+        provider_uri: String,
+        case: SingleShotSkillCase,
+    ) -> (
+        Config,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        crate::live_config_authority::LiveConfigAuthority,
+    ) {
+        // Synchronous fixture setup returns before the real run is polled.
+        // This does not guarantee compiler stack elimination.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let mut config = Config {
+            data_dir: directory.join("runtime"),
+            config_path: directory.join("config.toml"),
+            ..Config::default()
+        };
+        config.memory.backend = "none".into();
+        config.memory.auto_save = false;
+        config.reliability.provider_retries = 0;
+        config.providers.models.ollama.insert(
+            "default".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".into()),
+                    uri: Some(provider_uri),
+                    native_tools: Some(matches!(case, SingleShotSkillCase::ReviewSuccess)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".into(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                allowed_tools: vec!["file_read".into()],
+                auto_approve: vec!["file_read".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "main".into(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.skills.skill_creation.enabled = true;
+        config.skills.skill_creation.reflection_enabled = true;
+        config.skills.skill_improvement.enabled = true;
+        config.skills.skill_improvement.nudge_interval_iterations = 1;
+        config.skills.skill_improvement.max_review_iterations = 2;
+        let artifact_dir = config.data_dir.join("skills").join("inspect-fixture-files");
+        let runtime_dir = config.data_dir.clone();
+        let authority =
+            crate::live_config_authority::LiveConfigAuthority::for_tests(config.clone());
+        (config, artifact_dir, runtime_dir, authority)
+    }
+
+    async fn actual_goal_single_shot_skill_case_body(case: SingleShotSkillCase) {
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
             matchers::{method, path},
-        };
-        use zeroclaw_config::schema::{
-            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
         };
         use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
 
@@ -19684,53 +19852,9 @@ Let me check the result."#;
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("one.txt"), "first fixture").unwrap();
         std::fs::write(workspace.join("two.txt"), "second fixture").unwrap();
-        let mut config = Config {
-            data_dir: directory.path().join("runtime"),
-            config_path: directory.path().join("config.toml"),
-            ..Config::default()
-        };
-        config.memory.backend = "none".into();
-        config.memory.auto_save = false;
-        config.reliability.provider_retries = 0;
-        config.providers.models.ollama.insert(
-            "default".into(),
-            OllamaModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("mock-model".into()),
-                    uri: Some(server.uri()),
-                    native_tools: Some(matches!(case, SingleShotSkillCase::ReviewSuccess)),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        config.risk_profiles.insert(
-            "fixture".into(),
-            RiskProfileConfig {
-                level: crate::security::AutonomyLevel::Full,
-                allowed_tools: vec!["file_read".into()],
-                auto_approve: vec!["file_read".into()],
-                ..Default::default()
-            },
-        );
-        config.agents.insert(
-            "main".into(),
-            AliasedAgentConfig {
-                model_provider: "ollama.default".into(),
-                risk_profile: "fixture".into(),
-                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
-                    path: Some(workspace),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        config.skills.skill_creation.enabled = true;
-        config.skills.skill_creation.reflection_enabled = true;
-        config.skills.skill_improvement.enabled = true;
-        config.skills.skill_improvement.nudge_interval_iterations = 1;
-        config.skills.skill_improvement.max_review_iterations = 2;
-        let artifact_dir = config.data_dir.join("skills").join("inspect-fixture-files");
+        let (config, artifact_dir, runtime_dir, authority) =
+            single_shot_skill_config_and_authority(directory.path(), workspace, server.uri(), case);
+        let lifecycle = authority.agent_lifecycle();
         let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
             if matches!(case, SingleShotSkillCase::CancelAfterTurn) {
                 Arc::new(CancelAfterGoalSettlement {
@@ -19741,30 +19865,67 @@ Let me check the result."#;
             } else {
                 accountant
             };
+        let observed = Arc::new(SingleShotRunScopeAccounting {
+            inner: accountant,
+            child: child.clone(),
+            accountant: std::sync::OnceLock::new(),
+            lifecycle: lifecycle.clone(),
+            task_id: tokio::task::try_id(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            admissions: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            observed.clone();
+        assert!(observed.accountant.set(Arc::downgrade(&accountant)).is_ok());
+        assert_no_goal_run_context();
+        assert_eq!(lifecycle.active_turn_count("main"), 0);
+        // Pin the unpolled run before by-value scopes so their carriers hold a handle.
+        let run_future = Box::pin(super::run(
+            config,
+            "main",
+            Some("Inspect fixture files".into()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides {
+                is_subagent: true,
+                suppress_memory_inject: true,
+                execution_capability: Some(authority.execution_capability()),
+                ..Default::default()
+            },
+        ));
+        // Construction must not start admission, accounting, provider or body work.
+        assert_no_goal_run_context();
+        assert_eq!(lifecycle.active_turn_count("main"), 0);
+        assert_eq!(observed.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(bodies.lock().unwrap().is_empty());
+        assert!(!runtime_dir.exists());
+        assert!(!artifact_dir.exists());
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("continuation-goal")
+                .unwrap()
+                .0,
+            0
+        );
         let result = GOAL_OPERATION_ACCOUNTING
-            .scope(
-                Some(accountant),
-                child.scope(super::run(
-                    config,
-                    "main",
-                    Some("Inspect fixture files".into()),
-                    None,
-                    None,
-                    None,
-                    Vec::new(),
-                    false,
-                    None,
-                    None,
-                    TurnOrigin::SubTurn,
-                    super::AgentRunOverrides {
-                        is_subagent: true,
-                        suppress_memory_inject: true,
-                        ..Default::default()
-                    },
-                )),
-            )
+            .scope(Some(accountant), child.scope(run_future))
             .await;
+        assert_no_goal_run_context();
+        assert_eq!(lifecycle.active_turn_count("main"), 0);
         let count = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            count
+        );
         let goal = child
             .control_plane()
             .goal_store()
@@ -24066,11 +24227,56 @@ Let me check the result."#;
 
         let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
 
+        struct OrdinaryRunScopeObserver {
+            inner: Arc<CapturingObserver>,
+            task_id: Option<tokio::task::Id>,
+            observed_start: std::sync::atomic::AtomicBool,
+        }
+
+        impl Observer for OrdinaryRunScopeObserver {
+            fn record_event(&self, event: &ObserverEvent) {
+                if matches!(
+                    event,
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                        if agent_alias.as_deref() == Some("run-lifecycle-success-agent")
+                ) {
+                    assert_no_goal_run_context();
+                    assert_eq!(tokio::task::try_id(), self.task_id);
+                    self.observed_start
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.inner.record_event(event);
+            }
+            fn record_metric(&self, metric: &zeroclaw_api::observability_traits::ObserverMetric) {
+                self.inner.record_metric(metric);
+            }
+            fn name(&self) -> &str {
+                "ordinary-run-scope"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn flush(&self) {
+                self.inner.flush();
+            }
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test listener should bind");
         let addr = listener.local_addr().expect("listener should have address");
-        let app = Router::new().route("/v1/chat/completions", post(respond_with_done));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded_requests = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let requests = Arc::clone(&recorded_requests);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    respond_with_done().await
+                }
+            }),
+        );
         let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app)
                 .await
@@ -24103,10 +24309,16 @@ Let me check the result."#;
             .insert("default".to_string(), RiskProfileConfig::default());
 
         let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
+        let scope_observer = Arc::new(OrdinaryRunScopeObserver {
+            inner: Arc::clone(&capturing),
+            task_id: tokio::task::try_id(),
+            observed_start: std::sync::atomic::AtomicBool::new(false),
+        });
+        let observer: Arc<dyn Observer> = scope_observer.clone();
         let hook_guard = observability::set_scoped_broadcast_hook(observer);
 
-        let result = super::run(
+        assert_no_goal_run_context();
+        let run_future = super::run(
             config,
             "run-lifecycle-success-agent",
             Some("hello".to_string()),
@@ -24119,8 +24331,26 @@ Let me check the result."#;
             None,
             TurnOrigin::SubTurn,
             super::AgentRunOverrides::default(),
-        )
-        .await;
+        );
+        assert_no_goal_run_context();
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            !scope_observer
+                .observed_start
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(
+            lifecycle_events_for_alias(&capturing.events.lock(), "run-lifecycle-success-agent"),
+            (0, 0)
+        );
+        let result = run_future.await;
+        assert_no_goal_run_context();
+        assert!(
+            scope_observer
+                .observed_start
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         drop(hook_guard);
         server.abort();
