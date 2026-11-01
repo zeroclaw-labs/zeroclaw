@@ -600,10 +600,12 @@ identity provider. When a session ends (sign-out, expiry, or a
 check it fails) or loses the access a page needs, that page's sockets and
 event streams close at once. Signing in again in the same browser ends
 the session it held before, whichever account that was, so a later
-sign-out leaves nothing of that browser signed in. A chat turn already
-running finishes unattended, as when a viewer leaves, and a tool approval
-it was waiting on is refused; nothing the closed socket sent afterwards
-is acted on. A
+sign-out leaves nothing of that browser signed in. A request admitted
+before its session ended that has not yet taken effect, such as a
+configuration change whose body is still arriving, is refused. A chat
+turn already running finishes unattended, as when a viewer leaves, and a
+tool approval it was waiting on is refused; nothing the closed socket
+sent afterwards is acted on. A
 reload also closes the sockets a session opened, and the dashboard
 reconnects them under the new configuration. A request that still reaches
 the gateway generation being replaced, over a connection that stayed

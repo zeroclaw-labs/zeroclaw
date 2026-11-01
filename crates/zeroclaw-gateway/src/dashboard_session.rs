@@ -439,6 +439,21 @@ impl SessionAuth {
     pub fn is_admin(&self) -> bool {
         self.grants.admin
     }
+
+    /// Why this session no longer admits anything, by what is already known
+    /// and without verifying again: its expiry passed, or it ended (sign-out,
+    /// eviction, revocation, its provider taken off sign-in). A route that
+    /// acts some time after admission, once it has read a body or taken a
+    /// lock, checks this where it acts.
+    pub(crate) fn ended_now(&self) -> Option<SessionRejection> {
+        if self.expires_at <= now_unix() {
+            Some(SessionRejection::Expired)
+        } else if self.ended.is_cancelled() {
+            Some(SessionRejection::Invalid)
+        } else {
+            None
+        }
+    }
 }
 
 /// Why a request that carried a session cookie is not signed in.
@@ -458,7 +473,7 @@ pub enum SessionRejection {
 }
 
 impl SessionRejection {
-    fn reason(self) -> &'static str {
+    pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::Expired => "session_expired",
             Self::Invalid => "session_invalid",
@@ -467,14 +482,14 @@ impl SessionRejection {
         }
     }
 
-    fn status(self) -> StatusCode {
+    pub(crate) fn status(self) -> StatusCode {
         match self {
             Self::Expired | Self::Invalid => StatusCode::UNAUTHORIZED,
             Self::Csrf | Self::Origin => StatusCode::FORBIDDEN,
         }
     }
 
-    fn message(self) -> &'static str {
+    pub(crate) fn message(self) -> &'static str {
         match self {
             Self::Expired => "Your dashboard sign-in has expired. Sign in again.",
             Self::Invalid => "This dashboard sign-in is no longer valid. Sign in again.",
@@ -533,8 +548,13 @@ impl DashboardCaller {
     /// answers with its own reason instead of the pairing prompt.
     pub(crate) fn admit_operator(&self) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
         match self {
-            Self::Session(session) if session.is_admin() => Ok(()),
-            Self::Session(_) => Err(operator_required()),
+            // The session was admitted before the route ran. A route that
+            // read its body first still sees an end that landed meanwhile.
+            Self::Session(session) => match session.ended_now() {
+                Some(rejection) => Err(rejection.body()),
+                None if session.is_admin() => Ok(()),
+                None => Err(operator_required()),
+            },
             Self::Rejected(rejection) => Err(rejection.body()),
         }
     }
@@ -1823,6 +1843,16 @@ mod tests {
         }
     }
 
+    /// An operator route that reads its whole body before deciding, as the
+    /// handlers that take `Json` and then call `require_auth` do.
+    async fn operator_probe_after_body(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        _body: axum::body::Bytes,
+    ) -> Response {
+        operator_probe(State(state), headers).await
+    }
+
     struct Fixture {
         router: Router,
         auth: Arc<DashboardAuth>,
@@ -1894,7 +1924,10 @@ mod tests {
         let router = Router::new()
             .merge(crate::config_admin_router(&inbound))
             .merge(crate::api_oidc::routes())
-            .route("/api/operator-probe", get(operator_probe))
+            .route(
+                "/api/operator-probe",
+                get(operator_probe).post(operator_probe_after_body),
+            )
             .route("/ws/canvas/{id}", get(crate::canvas::handle_ws_canvas))
             .route("/api/events", get(crate::sse::handle_sse_events))
             .route("/ws/sop/runs", get(crate::ws_sop_runs::handle_ws_sop_runs))
@@ -3157,6 +3190,180 @@ mod tests {
             earlier.ended.is_cancelled(),
             "another account signing in on this browser ends alice's session"
         );
+    }
+
+    // ── Ends that land while a request is under way ──────────────────
+
+    /// A request body the test hands over when it chooses, and a signal for
+    /// when the handler starts reading it: by then every route layer has
+    /// admitted the request.
+    fn paced_body() -> (
+        Body,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::mpsc::UnboundedSender<axum::body::Bytes>,
+    ) {
+        let (chunks, mut queued) = tokio::sync::mpsc::unbounded_channel::<axum::body::Bytes>();
+        let (reading, read_started) = tokio::sync::oneshot::channel();
+        let mut reading = Some(reading);
+        let body = futures_util::stream::poll_fn(move |cx| {
+            if let Some(reading) = reading.take() {
+                let _ = reading.send(());
+            }
+            queued
+                .poll_recv(cx)
+                .map(|chunk| chunk.map(Ok::<_, std::io::Error>))
+        });
+        (Body::from_stream(body), read_started, chunks)
+    }
+
+    fn request_with_body(
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Body,
+    ) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header("host", HOST);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(body).unwrap();
+        request.extensions_mut().insert(ConnectInfo(loopback()));
+        request
+    }
+
+    /// Send a cookie request whose body is still arriving when its session
+    /// ends (`case` is "sign-out" or "expiry"), and return the answer.
+    async fn answer_after_the_session_ends(
+        fixture: &Fixture,
+        case: &str,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let lifetime = if case == "expiry" { 2 } else { 3600 };
+        let (cookie, session) = fixture
+            .auth
+            .sign_in(
+                "corp",
+                pin_for(fixture, "corp"),
+                "at-alice".into(),
+                lifetime,
+            )
+            .await
+            .expect("alice signs in");
+        let cookie = cookie_for(&cookie);
+        let (paced, read_started, chunks) = paced_body();
+        let request = request_with_body(
+            method,
+            path,
+            &[
+                ("cookie", &cookie),
+                ("origin", OWN_ORIGIN),
+                (CSRF_HEADER, &session.csrf),
+                ("content-type", "application/json"),
+            ],
+            paced,
+        );
+        let router = fixture.router.clone();
+        let answer = zeroclaw_spawn::spawn!(async move { router.oneshot(request).await.unwrap() });
+        read_started.await.expect("the handler reads the body");
+        match case {
+            "sign-out" => assert!(fixture.auth.end(&session)),
+            // Past the session's two-second cap; the token itself is valid
+            // for ten minutes.
+            _ => tokio::time::sleep(Duration::from_secs(3)).await,
+        }
+        chunks
+            .send(axum::body::Bytes::from(body.to_string()))
+            .expect("the body is still being read");
+        drop(chunks);
+        let response = answer.await.unwrap();
+        let status = response.status();
+        (status, json(response).await)
+    }
+
+    /// A config write admitted while its session was live, whose body was
+    /// still arriving when the session ended, is refused at the write: the
+    /// check under the config write lock binds the session's end, not only
+    /// the token's.
+    #[tokio::test]
+    async fn a_config_write_admitted_before_its_session_ended_is_refused() {
+        let server = idp(&["admins"], "gw").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = sign_in_config(&server.uri());
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        let fixture = fixture(config);
+        let paired = [("authorization", "Bearer zc_paired")];
+        let response = send(
+            &fixture.router,
+            request(
+                "POST",
+                "/api/config/map-key?path=agents&key=alpha",
+                loopback(),
+                &paired,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "fixture agent");
+        let path = "agents.alpha.workspace.path";
+        let prop = format!("/api/config/prop?path={path}");
+        let read_back = || async {
+            let response = send(&fixture.router, request("GET", &prop, loopback(), &paired)).await;
+            json(response).await["value"].clone()
+        };
+        let before = read_back().await;
+
+        for (case, reason) in [
+            ("sign-out", "session_invalid"),
+            ("expiry", "session_expired"),
+        ] {
+            let (status, body) = answer_after_the_session_ends(
+                &fixture,
+                case,
+                "PUT",
+                "/api/config/prop",
+                serde_json::json!({"path": path, "value": format!("written-after-{case}")}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{case}: the write must be refused: {body}"
+            );
+            assert_eq!(body["reason"], reason, "{case}: {body}");
+            assert_eq!(read_back().await, before, "{case}: nothing was written");
+        }
+    }
+
+    /// The same for an operator route that reads its body before
+    /// `require_auth` decides: the decision binds the session's end.
+    #[tokio::test]
+    async fn an_operator_request_admitted_before_its_session_ended_is_refused() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        for (case, reason) in [
+            ("sign-out", "session_invalid"),
+            ("expiry", "session_expired"),
+        ] {
+            let (status, body) = answer_after_the_session_ends(
+                &fixture,
+                case,
+                "POST",
+                "/api/operator-probe",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{case}: the request must be refused: {body}"
+            );
+            assert_eq!(body["reason"], reason, "{case}: {body}");
+        }
     }
 
     #[test]

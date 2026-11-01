@@ -56,7 +56,7 @@ use zeroclaw_runtime::rpc::transport::TransportKind;
 use zeroclaw_runtime::security::auth_provider::Credential;
 
 use crate::ConfigWriteGuard;
-use crate::dashboard_session::DashboardCaller;
+use crate::dashboard_session::{DashboardCaller, SessionAuth, SessionRejection};
 
 /// Header naming the auth provider to verify the bearer with, mirroring
 /// the RPC handshake's `auth_provider` field (e.g. `oidc.corp`). Absent
@@ -216,6 +216,9 @@ fn forbidden(message: impl Into<String>) -> Response {
 pub struct WriteDenied {
     status: StatusCode,
     message: String,
+    /// The session layer's reason, for a write whose dashboard session
+    /// ended, so the dashboard answers it as it answers any ended session.
+    reason: Option<&'static str>,
 }
 
 impl WriteDenied {
@@ -223,6 +226,7 @@ impl WriteDenied {
         Self {
             status: StatusCode::FORBIDDEN,
             message,
+            reason: None,
         }
     }
 
@@ -235,17 +239,26 @@ impl WriteDenied {
         Self {
             status,
             message: denied.message,
+            reason: None,
+        }
+    }
+
+    fn session_ended(rejection: SessionRejection) -> Self {
+        Self {
+            status: rejection.status(),
+            message: rejection.message().to_owned(),
+            reason: Some(rejection.reason()),
         }
     }
 }
 
 impl IntoResponse for WriteDenied {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "error": self.message })),
-        )
-            .into_response()
+        let mut body = serde_json::json!({ "error": self.message });
+        if let Some(reason) = self.reason {
+            body["reason"] = reason.into();
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -276,6 +289,11 @@ fn method_floor(method: &Method) -> Option<&'static [Verb]> {
 pub struct RequestAuth {
     principal: Option<Arc<ConnectionAuth>>,
     authority: Arc<GatewayInboundAuth>,
+    /// The dashboard session that admitted the request, when its cookie
+    /// did. Ending the session (sign-out, its hard expiry, eviction, its
+    /// provider taken off sign-in) is that credential's revocation, so the
+    /// check at the write binds it as it binds the token's.
+    session: Option<Arc<SessionAuth>>,
 }
 
 /// The extractor a mutating handler declares to receive its
@@ -442,6 +460,9 @@ fn current_grants(
     conn: &ConnectionAuth,
     _guard: &ConfigWriteGuard,
 ) -> Result<ResolvedGrants, WriteDenied> {
+    if let Some(rejection) = request.session.as_deref().and_then(SessionAuth::ended_now) {
+        return Err(WriteDenied::session_ended(rejection));
+    }
     request
         .authority
         .inner
@@ -570,6 +591,7 @@ pub async fn config_route_auth(
         request.extensions_mut().insert(RequestAuth {
             principal: Some(Arc::new(conn)),
             authority: Arc::clone(&auth),
+            session: Some(session),
         });
         return next.run(request).await;
     }
@@ -598,6 +620,7 @@ pub async fn config_route_auth(
         request.extensions_mut().insert(RequestAuth {
             principal: None,
             authority: Arc::clone(&auth),
+            session: None,
         });
         return next.run(request).await;
     }
@@ -635,6 +658,7 @@ pub async fn config_route_auth(
     request.extensions_mut().insert(RequestAuth {
         principal: Some(Arc::new(conn)),
         authority: Arc::clone(&auth),
+        session: None,
     });
     next.run(request).await
 }
