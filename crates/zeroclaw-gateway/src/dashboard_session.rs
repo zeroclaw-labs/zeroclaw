@@ -888,6 +888,12 @@ impl DashboardAuth {
     pub(crate) fn end(&self, session: &SessionAuth) -> bool {
         self.sessions.remove_key(&session.key)
     }
+
+    /// End the session stored under `key`: the one a browser held before it
+    /// signed in again. A key that names no session ends nothing.
+    pub(crate) fn end_key(&self, key: &[u8; 32]) -> bool {
+        self.sessions.remove_key(key)
+    }
 }
 
 /// A display name for the header, from the verified access-token claims.
@@ -1977,7 +1983,14 @@ mod tests {
     }
 
     async fn start(fixture: &Fixture, path: &str) -> Started {
-        let response = send(&fixture.router, request("GET", path, loopback(), &[])).await;
+        start_with(fixture, path, &[]).await
+    }
+
+    /// [`start`] from a browser that sends `headers`, such as the session
+    /// cookie it holds: the start is a navigation from the dashboard itself,
+    /// so a `SameSite=Strict` cookie rides along.
+    async fn start_with(fixture: &Fixture, path: &str, headers: &[(&str, &str)]) -> Started {
+        let response = send(&fixture.router, request("GET", path, loopback(), headers)).await;
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
         let location = response
             .headers()
@@ -2900,6 +2913,249 @@ mod tests {
             .await
             .is_err(),
             "a socket without a session is never closed by it"
+        );
+    }
+
+    // ── Signing in again ─────────────────────────────────────────────
+
+    /// The code exchange for `code` answers with `access_token` and an ID
+    /// token for `started`'s nonce, ahead of any catch-all answer, so several
+    /// flows can finish against one provider.
+    async fn mount_token_for(
+        server: &MockServer,
+        started: &Started,
+        code: &str,
+        access_token: &str,
+    ) {
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .and(wiremock::matchers::body_string_contains(format!(
+                "code={code}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": 600,
+                "id_token": id_token(serde_json::json!({
+                    "iss": server.uri(),
+                    "aud": "gw",
+                    "sub": "alice",
+                    "exp": unix_now() + 600,
+                    "nonce": started.nonce,
+                })),
+            })))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    /// The provider vouches for `access_token` as `sub` in `groups`.
+    async fn mount_identity(server: &MockServer, access_token: &str, sub: &str, groups: &[&str]) {
+        Mock::given(http_method("POST"))
+            .and(http_path("/introspect"))
+            .and(wiremock::matchers::body_string_contains(format!(
+                "token={access_token}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true,
+                "token_type": "Bearer",
+                "client_id": "gw",
+                "iss": server.uri(),
+                "sub": sub,
+                "aud": "zeroclaw",
+                "exp": unix_now() + 600,
+                "groups": groups,
+            })))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn session_for(fixture: &Fixture, cookie: &str) -> Arc<SessionAuth> {
+        match fixture
+            .auth
+            .admit(|alias| Some(pin_for(fixture, alias)), cookie)
+            .await
+        {
+            DashboardCaller::Session(session) => session,
+            DashboardCaller::Rejected(rejection) => panic!("not signed in: {rejection:?}"),
+        }
+    }
+
+    async fn sign_out(fixture: &Fixture, cookie_header: &str, csrf: &str) -> StatusCode {
+        send(
+            &fixture.router,
+            request(
+                "POST",
+                "/auth/sign-out",
+                loopback(),
+                &[
+                    ("cookie", cookie_header),
+                    ("origin", OWN_ORIGIN),
+                    (CSRF_HEADER, csrf),
+                ],
+            ),
+        )
+        .await
+        .status()
+    }
+
+    /// A browser that signs in again holds only the new session: the one its
+    /// cookie named before ends, and the sockets it opened close, so signing
+    /// out afterwards leaves nothing of that browser signed in. The start is
+    /// a navigation from the dashboard and carries the `SameSite=Strict`
+    /// session cookie; the callback comes from the identity provider's site
+    /// and does not.
+    #[tokio::test]
+    async fn signing_in_again_ends_the_session_the_browser_held() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let first = sign_in(&fixture, &server).await;
+        let earlier = session_for(&fixture, &first.cookie).await;
+        // Another tab's socket, still on the first session.
+        let mut watch = Some(SessionWatch::new(
+            Arc::clone(&fixture.auth),
+            Arc::clone(&earlier),
+            true,
+            &fixture.state,
+        ));
+
+        let started = start_with(
+            &fixture,
+            "/auth/sign-in/corp",
+            &[("cookie", &first.cookie_header())],
+        )
+        .await;
+        mount_token_for(&server, &started, "code-2", "at-alice").await;
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "code-2", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let second = cookie_from(&response, SESSION_COOKIE).expect("a new session");
+        assert_ne!(second, first.cookie);
+        assert!(
+            earlier.ended.is_cancelled(),
+            "signing in again must end the session the browser held"
+        );
+
+        let csrf = session_for(&fixture, &second).await.csrf.clone();
+        assert_eq!(
+            sign_out(&fixture, &cookie_for(&second), &csrf).await,
+            StatusCode::NO_CONTENT
+        );
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            session_lost(&mut watch, &fixture.state),
+        )
+        .await
+        .expect("the first session's socket closes");
+        assert_eq!(code, WS_CLOSE_SESSION_ENDED);
+        let (status, body) = probe(&fixture, &[("cookie", &first.cookie_header())]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "session_invalid");
+        assert_eq!(
+            fixture.auth.sessions.len(),
+            0,
+            "nothing of this browser stays signed in"
+        );
+    }
+
+    /// With an identity provider on the dashboard's own site the callback
+    /// carries the session cookie too. It can name a session another tab
+    /// signed in while this flow was at the provider, and that one ends as
+    /// well.
+    #[tokio::test]
+    async fn a_sign_in_ends_the_session_its_callback_cookie_names() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let started = start(&fixture, "/auth/sign-in/corp").await;
+        let other_tab = sign_in(&fixture, &server).await;
+        let earlier = session_for(&fixture, &other_tab.cookie).await;
+
+        mount_token_for(&server, &started, "code-2", "at-alice").await;
+        let response = send(
+            &fixture.router,
+            callback_with(
+                &started,
+                Some(&started.binding),
+                "code-2",
+                &[other_tab.cookie_header()],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            earlier.ended.is_cancelled(),
+            "the session the callback's cookie names must end"
+        );
+        assert_eq!(fixture.auth.sessions.len(), 1);
+    }
+
+    /// The session a browser held ends only once the new sign-in has
+    /// succeeded; a cookie that names no session is ignored; and whose
+    /// session it was does not matter, since the browser now belongs to
+    /// whoever signed in last.
+    #[tokio::test]
+    async fn a_held_session_ends_only_when_the_new_sign_in_succeeds() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let first = sign_in(&fixture, &server).await;
+        let earlier = session_for(&fixture, &first.cookie).await;
+        let held = first.cookie_header();
+
+        mount_identity(&server, "at-nobody", "nobody", &["nobody"]).await;
+        let started = start_with(&fixture, "/auth/sign-in/corp", &[("cookie", &held)]).await;
+        mount_token_for(&server, &started, "code-refused", "at-nobody").await;
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "code-refused", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !earlier.ended.is_cancelled(),
+            "a refused sign-in keeps the session the browser held"
+        );
+        assert_eq!(
+            probe(&fixture, &[("cookie", &held)]).await.0,
+            StatusCode::OK
+        );
+
+        let forged = format!("{SESSION_COOKIE}=forged");
+        let started = start_with(&fixture, "/auth/sign-in/corp", &[("cookie", &forged)]).await;
+        mount_token_for(&server, &started, "code-forged", "at-alice").await;
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "code-forged", &[forged]),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a cookie naming no session is no obstacle"
+        );
+        assert!(!earlier.ended.is_cancelled());
+
+        mount_identity(&server, "at-bob", "bob", &["admins"]).await;
+        let started = start_with(&fixture, "/auth/sign-in/corp", &[("cookie", &held)]).await;
+        mount_token_for(&server, &started, "code-bob", "at-bob").await;
+        let response = send(
+            &fixture.router,
+            callback_with(&started, Some(&started.binding), "code-bob", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let bob = cookie_from(&response, SESSION_COOKIE).expect("bob signs in");
+        assert_ne!(
+            session_for(&fixture, &bob).await.principal().id,
+            earlier.principal().id,
+            "the new session is another account's"
+        );
+        assert!(
+            earlier.ended.is_cancelled(),
+            "another account signing in on this browser ends alice's session"
         );
     }
 

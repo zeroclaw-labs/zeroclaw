@@ -147,6 +147,12 @@ enum FlowMode {
         /// Re-authentication in a popup: answer with a page that tells the
         /// opener's other tabs and closes, instead of a redirect.
         popup: bool,
+        /// The store key of the session this browser held when it started
+        /// the flow. The start is a navigation from the dashboard, so the
+        /// `SameSite=Strict` session cookie comes with it; the callback
+        /// arrives from the identity provider's site and usually does not.
+        /// A sign-in that succeeds ends that session.
+        replaces: Option<[u8; 32]>,
     },
 }
 
@@ -916,6 +922,10 @@ async fn handle_dashboard_sign_in(
     let binding = dashboard_session::random_token();
     let authorize_url = flow.authorize_url.clone();
     let flow_state = flow.state.clone();
+    let scope = CookieScope {
+        https,
+        path_prefix: &state.path_prefix,
+    };
     if let Err(full) = relay.flows.insert(PendingPkce {
         alias,
         flow,
@@ -925,14 +935,13 @@ async fn handle_dashboard_sign_in(
             binding_hash: dashboard_session::session_key(&binding),
             return_to: safe_return_path(query.return_to.as_deref()),
             popup: query.popup.as_deref() == Some("1"),
+            replaces: scope
+                .session_value(&headers)
+                .map(|value| dashboard_session::session_key(&value)),
         },
     }) {
         return too_many_requests(full, CAPACITY_RETRY_AFTER_SECS);
     }
-    let scope = CookieScope {
-        https,
-        path_prefix: &state.path_prefix,
-    };
     let mut response = Redirect::temporary(&authorize_url).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -1344,7 +1353,10 @@ async fn handle_pkce_callback(
         ),
         (
             FlowMode::Dashboard {
-                return_to, popup, ..
+                return_to,
+                popup,
+                replaces,
+                ..
             },
             Some((dashboard, provider, lifetime_secs)),
         ) => {
@@ -1359,6 +1371,7 @@ async fn handle_pkce_callback(
                 client: key,
                 return_to,
                 popup,
+                replaces,
             };
             finish_dashboard_sign_in(&state, &dashboard, &headers, landing, token.access_token)
                 .await
@@ -1381,6 +1394,8 @@ struct DashboardLanding {
     client: String,
     return_to: String,
     popup: bool,
+    /// The session the browser held when it started the flow, if any.
+    replaces: Option<[u8; 32]>,
 }
 
 /// Turn a dashboard sign-in the identity provider completed into a session:
@@ -1402,12 +1417,33 @@ async fn finish_dashboard_sign_in(
         client,
         return_to,
         popup,
+        replaces,
     } = landing;
     match dashboard
         .sign_in(&alias, provider, access_token, lifetime_secs)
         .await
     {
         Ok((cookie, session)) => {
+            let scope = CookieScope {
+                https: request_is_https(state, headers),
+                path_prefix: &state.path_prefix,
+            };
+            // The browser now holds only the new session. The one it held
+            // before ends, whoever it belonged to, and so do the sockets it
+            // opened, so a later sign-out leaves nothing of this browser
+            // signed in. A callback from an identity provider on the
+            // dashboard's own site also carries the session cookie, which
+            // can name a session another tab signed in meanwhile. A key that
+            // names no session ends nothing.
+            let replaced = replaces
+                .into_iter()
+                .chain(
+                    scope
+                        .session_value(headers)
+                        .map(|value| dashboard_session::session_key(&value)),
+                )
+                .filter(|key| dashboard.end_key(key))
+                .count();
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Connect)
@@ -1417,13 +1453,10 @@ async fn finish_dashboard_sign_in(
                         "principal_id": session.principal().id.as_str(),
                         "admin": session.is_admin(),
                         "client": client,
+                        "replaced_sessions": replaced,
                     })),
                 "dashboard sign-in"
             );
-            let scope = CookieScope {
-                https: request_is_https(state, headers),
-                path_prefix: &state.path_prefix,
-            };
             let mut response = if popup {
                 signed_in_popup_page(session.principal().id.as_str())
             } else {
