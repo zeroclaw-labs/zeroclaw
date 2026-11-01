@@ -464,6 +464,11 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   en: {
+    'xmpp.allowed_users': 'Allowed users',
+    'xmpp.create_policy': 'Create authorization policy for this channel',
+    'xmpp.allowed_users_help': 'Authorization uses peer groups for this channel. Add bare account JIDs to external_peers; ignore rules override grants. An empty list denies everyone. Bind the channel to an enabled agent separately.',
+    'xmpp.manage_peer_groups': 'Create or manage peer groups',
+
     // Plugin package catalog
     'nav.plugins': "Plugins",
     'plugins.title': "Plugins",
@@ -10416,6 +10421,11 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   pt: {
+    'xmpp.allowed_users': 'Usuários autorizados',
+    'xmpp.create_policy': 'Criar política de autorização para este canal',
+    'xmpp.allowed_users_help': 'A autorização usa os peer groups deste canal. Adicione JIDs de contas, sem recurso, em external_peers; regras ignore prevalecem. Uma lista vazia nega todos. Vincule o canal separadamente a um agente habilitado.',
+    'xmpp.manage_peer_groups': 'Criar ou gerenciar peer groups',
+
     'sidebar.update_available': "Atualização disponível",
     'upgrade.title': "Atualizar",
     'upgrade.current': "Atual",

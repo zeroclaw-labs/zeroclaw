@@ -15993,6 +15993,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub irc: HashMap<String, IrcConfig>,
+    /// XMPP client instances, compatible with Prosody (`[channels.xmpp.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub xmpp: HashMap<String, XmppConfig>,
     /// Twitch chat channel instances (`[channels.twitch.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -16240,6 +16244,13 @@ impl ChannelsConfig {
                 configured: !self.twitch.is_empty(),
             },
             ChannelInfo {
+                kind: "xmpp",
+                config_key: "xmpp",
+                name: "XMPP",
+                desc: "XMPP / Prosody over TLS",
+                configured: !self.xmpp.is_empty(),
+            },
+            ChannelInfo {
                 kind: "irc",
                 config_key: "irc",
                 name: "IRC",
@@ -16415,6 +16426,7 @@ impl ChannelsConfig {
             || self.nextcloud_talk.values().any(|c| c.enabled)
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
+            || self.xmpp.values().any(|c| c.enabled)
             || self.irc.values().any(|c| c.enabled)
             || self.twitch.values().any(|c| c.enabled)
             || self.lark.values().any(|c| c.enabled)
@@ -16447,7 +16459,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -16462,6 +16474,7 @@ impl ChannelsConfig {
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
             ("email", !self.email.is_empty(), true),
             ("gmail_push", !self.gmail_push.is_empty(), true),
+            ("xmpp", !self.xmpp.is_empty(), true),
             ("irc", !self.irc.is_empty(), true),
             ("twitch", !self.twitch.is_empty(), true),
             ("lark", !self.lark.is_empty(), true),
@@ -16549,6 +16562,7 @@ impl Default for ChannelsConfig {
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            xmpp: HashMap::new(),
             twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
@@ -19120,6 +19134,98 @@ fn default_amqp_sender_label() -> String {
 
 fn default_amqp_durable_ack() -> bool {
     true
+}
+
+/// Encrypted client-to-server XMPP transport. Plaintext is never supported.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum XmppProtocol {
+    /// TLS starts immediately on the configured TCP port (normally 5223).
+    #[default]
+    DirectTls,
+    /// Require STARTTLS before authentication (normally port 5222).
+    Starttls,
+}
+
+/// XMPP direct text chat. Authorization is owned by peer_groups.external_peers
+/// and ignore, not duplicated in a transport-specific allowed_users list.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.xmpp"]
+#[serde(default)]
+pub struct XmppConfig {
+    /// Enable the listener only after configuring credentials, peers and agent binding.
+    #[tab(Connection)]
+    pub enabled: bool,
+    /// Bare account JID, for example bot@example.org. This domain is the TLS
+    /// service identity; it need not equal the TCP connection hostname.
+    #[tab(Connection)]
+    pub username: String,
+    /// TCP hostname of the XMPP service, without a scheme or URL path.
+    #[tab(Connection)]
+    pub server: String,
+    /// TCP port. Default 5223; set 443 only when the server offers XMPP there.
+    #[tab(Connection)]
+    pub port: u16,
+    /// Encrypted transport: Direct TLS or mandatory STARTTLS. No insecure fallback.
+    #[tab(Connection)]
+    pub protocol: XmppProtocol,
+    /// Account password. For LDAP-backed Prosody this is the account's AD password.
+    /// Stored through the encrypted secret store; never returned to the WebUI.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[tab(Connection)]
+    pub password: String,
+    /// Resource identifying this client. Use a different resource for other clients.
+    #[tab(Advanced)]
+    pub resource: String,
+    /// Maximum direct-message body in characters. Larger messages are ignored.
+    #[tab(Advanced)]
+    pub max_message_chars: usize,
+    /// Deadline for connection, TLS and authentication in seconds.
+    #[tab(Advanced)]
+    pub connect_timeout_secs: u64,
+    /// Require OMEMO for both inbound and outbound text. No plaintext fallback.
+    /// Uses native Linux legacy OMEMO and manually trusted device fingerprints below.
+    #[tab(Advanced)]
+    pub omemo_enabled: bool,
+    /// Trusted devices as "bare-jid Curve25519-fingerprint" entries (64 hex
+    /// characters, optionally grouped with spaces). Empty denies all
+    /// encrypted senders/devices. Confirm fingerprints out of band before adding.
+    /// Supports the legacy OMEMO namespace used by Conversations/Gajim; not omemo:2.
+    #[tab(Advanced)]
+    pub omemo_trusted_devices: Vec<String>,
+}
+
+impl Default for XmppConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            username: String::new(),
+            server: String::new(),
+            port: 5223,
+            protocol: XmppProtocol::DirectTls,
+            password: String::new(),
+            resource: "zeroclaw".into(),
+            max_message_chars: 16000,
+            connect_timeout_secs: 30,
+            omemo_enabled: false,
+            omemo_trusted_devices: Vec::new(),
+        }
+    }
+}
+
+impl ChannelConfig for XmppConfig {
+    fn name() -> &'static str {
+        "XMPP"
+    }
+    fn desc() -> &'static str {
+        "XMPP / Prosody over TLS"
+    }
 }
 
 /// IRC channel configuration.
@@ -24478,6 +24584,64 @@ impl Config {
         // enabled channel built with an empty credential never connects and
         // its per-channel supervisor restarts it forever (crashloop), so
         // reject at config-load time instead.
+        for (alias, xmpp) in &self.channels.xmpp {
+            if !xmpp.enabled {
+                continue;
+            }
+            let enabled_path = format!("channels.xmpp.{alias}.enabled");
+            for (field, value) in [
+                ("username", &xmpp.username),
+                ("server", &xmpp.server),
+                ("password", &xmpp.password),
+                ("resource", &xmpp.resource),
+            ] {
+                validate_required_field(
+                    &format!("channels.xmpp.{alias}.{field}"),
+                    &enabled_path,
+                    true,
+                    value,
+                )?;
+            }
+            anyhow::ensure!(
+                xmpp.username.contains('@')
+                    && !xmpp.username.contains('/')
+                    && !xmpp.username.chars().any(char::is_whitespace),
+                "XMPP username must be a bare account JID"
+            );
+            anyhow::ensure!(
+                !xmpp.server.contains('/') && !xmpp.server.chars().any(char::is_whitespace),
+                "XMPP server must be a hostname, not a URL"
+            );
+            anyhow::ensure!(
+                xmpp.port > 0
+                    && (1..=120).contains(&xmpp.connect_timeout_secs)
+                    && (1..=64000).contains(&xmpp.max_message_chars),
+                "XMPP port, timeout or message limit is invalid"
+            );
+            anyhow::ensure!(
+                !xmpp.resource.contains('/') && !xmpp.resource.chars().any(char::is_control),
+                "XMPP resource is invalid"
+            );
+            if xmpp.omemo_enabled {
+                for pin in &xmpp.omemo_trusted_devices {
+                    let mut parts = pin.split_whitespace();
+                    let account = parts.next().unwrap_or_default();
+                    let fingerprint: String = parts.collect();
+                    let fingerprint = fingerprint
+                        .strip_prefix("05")
+                        .filter(|_| fingerprint.len() == 66)
+                        .unwrap_or(&fingerprint);
+                    anyhow::ensure!(
+                        account.contains('@')
+                            && !account.contains('/')
+                            && fingerprint.len() == 64
+                            && fingerprint.bytes().all(|b| b.is_ascii_hexdigit()),
+                        "XMPP trusted devices must contain a bare JID and a 64-hex-character fingerprint"
+                    );
+                }
+            }
+        }
+
         for (alias, sig) in &self.channels.signal {
             sig.validate_required(alias)?;
         }
@@ -33818,6 +33982,7 @@ auto_save = true
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
                 irc: HashMap::new(),
+                xmpp: HashMap::new(),
                 twitch: HashMap::new(),
                 lark: HashMap::new(),
                 line: HashMap::new(),
@@ -36242,6 +36407,7 @@ allowed_users = ["@u:matrix.org"]
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            xmpp: HashMap::new(),
             twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
@@ -36861,6 +37027,7 @@ allowed_numbers = ["+1", "+2"]
             email: HashMap::new(),
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
+            xmpp: HashMap::new(),
             twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
