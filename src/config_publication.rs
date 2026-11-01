@@ -41,7 +41,11 @@
 //! compiles into one that does not is refused and nothing is saved: the
 //! daemon could never take it, and would install a deny-all policy in its
 //! place at its next reload. An edit to a policy that already does not
-//! compile is saved, so a lockout can be repaired one field at a time.
+//! compile is saved, so a lockout can be repaired one field at a time. While
+//! `ZEROCLAW_*` overrides set authorization inputs, the policy config.toml
+//! holds once saved, which keeps the values those overrides replaced, is
+//! checked the same way as the one the command sees: a daemon started
+//! without the overrides compiles the file's.
 
 use std::cell::OnceCell;
 use std::fmt;
@@ -50,6 +54,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
+use zeroclaw_config::env_overrides::mask_env_overrides_for_save;
 use zeroclaw_runtime::daemon::{STATUS_FLUSH_SECONDS, state_file_path};
 use zeroclaw_runtime::live_config_authority::{ConfigOwnershipError, ConfigOwnershipGuard};
 use zeroclaw_runtime::rpc::auth::{auth_inputs, validate_accepted_auth_config};
@@ -81,6 +86,26 @@ fn is_auth_input_path(path: &str) -> bool {
         || path == "security.trust_daemon_uid"
 }
 
+/// Whether a `ZEROCLAW_*` override sets one of `config`'s authorization
+/// inputs, so that config.toml holds another policy than the one `config`
+/// compiles to.
+fn overrides_auth_inputs(config: &Config) -> bool {
+    config
+        .pre_override_snapshots
+        .keys()
+        .any(|path| is_auth_input_path(path))
+}
+
+/// `config` as config.toml holds it once saved. A save writes back, for each
+/// property a `ZEROCLAW_*` override set, the value the override replaced, so
+/// a daemon started without those overrides compiles its policy from these
+/// values, not from the ones this command sees.
+fn as_saved(config: &Config) -> anyhow::Result<Config> {
+    let mut saved = config.clone();
+    mask_env_overrides_for_save(&mut saved, &config.pre_override_snapshots)?;
+    Ok(saved)
+}
+
 /// The authorization inputs as they stood before a command staged its edit,
 /// and the configuration they came from, which tells whether the policy they
 /// made compiled.
@@ -91,6 +116,8 @@ pub(crate) struct AuthSnapshot {
     /// and an HTTP client, for every OIDC entry, so it is judged only when an
     /// edit needs the answer, and at most once.
     compiled: OnceCell<bool>,
+    /// The same for the policy config.toml held ([`as_saved`]).
+    compiled_as_saved: OnceCell<bool>,
 }
 
 impl AuthSnapshot {
@@ -99,6 +126,7 @@ impl AuthSnapshot {
             inputs: auth_inputs(config)?,
             config: Box::new(config.clone()),
             compiled: OnceCell::new(),
+            compiled_as_saved: OnceCell::new(),
         })
     }
 
@@ -108,6 +136,14 @@ impl AuthSnapshot {
         *self
             .compiled
             .get_or_init(|| validate_accepted_auth_config(&self.config).is_ok())
+    }
+
+    /// Whether the policy config.toml held when this snapshot was captured
+    /// compiled.
+    fn compiles_as_saved(&self) -> bool {
+        *self.compiled_as_saved.get_or_init(|| {
+            as_saved(&self.config).is_ok_and(|saved| validate_accepted_auth_config(&saved).is_ok())
+        })
     }
 
     /// Whether `staged` compiles to a different authorization policy than the
@@ -120,16 +156,22 @@ impl AuthSnapshot {
     /// not. A policy that did not compile before the edit may still not
     /// compile after it: a daemon enforcing deny-all in its place can then be
     /// repaired one field at a time.
-    fn refuse_breaking(&self, staged: &Config, suggest_patch: bool) -> Result<(), CommitFailure> {
-        if !self.compiles() {
-            return Ok(());
+    ///
+    /// While `ZEROCLAW_*` overrides set authorization inputs, the policy
+    /// config.toml holds is judged the same way, beside the one this command
+    /// sees: a daemon started without those overrides compiles the file's.
+    fn refuse_breaking(&self, staged: &Config, suggest_patch: bool) -> anyhow::Result<()> {
+        let refuse = |error: anyhow::Error| CommitFailure::PolicyWouldNotCompile {
+            error: error.to_string(),
+            suggest_patch,
+        };
+        if self.compiles() {
+            validate_accepted_auth_config(staged).map_err(refuse)?;
         }
-        validate_accepted_auth_config(staged).map_err(|error| {
-            CommitFailure::PolicyWouldNotCompile {
-                error: error.to_string(),
-                suggest_patch,
-            }
-        })
+        if overrides_auth_inputs(staged) && self.compiles_as_saved() {
+            validate_accepted_auth_config(&as_saved(staged)?).map_err(refuse)?;
+        }
+        Ok(())
     }
 }
 
@@ -1246,6 +1288,44 @@ mod tests {
         staged
     }
 
+    /// `config` with roster entries alice (uid 1000) and bob (uid 3000), both
+    /// granted the `operator` profile: a policy that compiles.
+    fn with_roster(config: &Config) -> Config {
+        let mut staged = config.clone();
+        staged
+            .permission_profiles
+            .insert("operator".into(), PermissionProfileConfig::default());
+        for (name, uid) in [("alice", 1000), ("bob", 3000)] {
+            staged.users.insert(
+                name.into(),
+                UserConfig {
+                    principal_id: None,
+                    uid: Some(uid),
+                    permission_profiles: vec!["operator".into()],
+                },
+            );
+        }
+        staged
+    }
+
+    /// `config` as loaded with `ZEROCLAW_users__alice__uid=2000` exported:
+    /// the override's value in memory, and the value it replaced kept for a
+    /// save to write back. The process environment is left alone, since
+    /// other tests load configurations meanwhile.
+    fn with_alice_uid_overridden(config: &Config) -> Config {
+        let mut loaded = config.clone();
+        loaded
+            .users
+            .get_mut("alice")
+            .expect("alice is on the roster")
+            .uid = Some(2000);
+        loaded.env_overridden_paths.insert("users.alice.uid".into());
+        loaded
+            .pre_override_snapshots
+            .insert("users.alice.uid".into(), "1000".into());
+        loaded
+    }
+
     /// `config` with its endpoint at a path too long for a unix socket, so a
     /// connect fails for another reason than nothing listening there.
     #[cfg(unix)]
@@ -1685,6 +1765,66 @@ mod tests {
             false,
         )
         .expect("a policy that did not compile before may still not");
+        assert!(
+            matches!(
+                publication,
+                Publication::Pending {
+                    reason: PendingReason::NotReplayable,
+                    ..
+                }
+            ),
+            "{publication:?}"
+        );
+    }
+
+    /// A save writes back the value each `ZEROCLAW_*` override replaced, and
+    /// a daemon started without the override compiles the file's policy: an
+    /// edit that breaks only that policy is refused too, and one that keeps
+    /// both compiling is pending.
+    #[test]
+    fn classify_local_save_judges_the_policy_config_toml_holds_without_env_overrides() {
+        let (_dir, config) = scratch_config();
+        // config.toml maps alice to uid 1000; this command's environment maps
+        // her to 2000.
+        let loaded = with_alice_uid_overridden(&with_roster(&config));
+        let before = AuthSnapshot::capture(&loaded).expect("encodes");
+        record_running_daemon(&loaded);
+        let touched = ["users.bob.uid".to_owned()];
+
+        let mut colliding = loaded.clone();
+        colliding
+            .users
+            .get_mut("bob")
+            .expect("bob is on the roster")
+            .uid = Some(1000);
+        validate_accepted_auth_config(&colliding)
+            .expect("the policy this command sees maps alice to 2000 and bob to 1000");
+        let failure = classify_local_save(
+            &before,
+            &colliding,
+            &touched,
+            PendingReason::NotReplayable,
+            true,
+            false,
+        )
+        .expect_err("config.toml would map uid 1000 to both alice and bob");
+        assert_would_not_compile(&failure, true);
+
+        let mut renumbered = loaded.clone();
+        renumbered
+            .users
+            .get_mut("bob")
+            .expect("bob is on the roster")
+            .uid = Some(4000);
+        let publication = classify_local_save(
+            &before,
+            &renumbered,
+            &touched,
+            PendingReason::NotReplayable,
+            true,
+            false,
+        )
+        .expect("both policies still compile");
         assert!(
             matches!(
                 publication,

@@ -130,7 +130,10 @@ It refuses, saving nothing, only an edit that would turn a policy that
 compiles into one that does not, so with `config set` and `config init` a
 file whose policy already fails to compile can still be repaired one field
 at a time; `config patch` validates the whole resulting configuration
-first, as it always has. So while a daemon runs or another process holds
+first, as it always has. A save writes back the value each `ZEROCLAW_*`
+override replaced, so while such overrides set authorization inputs, the
+policy config.toml holds after the save is checked the same way as the one
+the CLI sees: a daemon started without the overrides compiles that one. So while a daemon runs or another process holds
 the ownership lock, `config init users.<name>` and
 `config init oidc.<alias>` fail, since their entries cannot compile until
 filled in, and `config init permission_profiles.<name>` is saved and
