@@ -2347,6 +2347,7 @@ allowed_users = ["user1"]
             assemblyai: None,
             google: None,
             local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                model: None,
                 url,
                 bearer_token: Some("test_token".to_string()),
                 max_audio_bytes: 25_000_000,
