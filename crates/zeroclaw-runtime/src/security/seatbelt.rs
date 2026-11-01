@@ -532,12 +532,14 @@ mod tests {
             crate::security::shell_identity::invocation(&cmd, Some(OsStr::new("sh"))).unwrap();
         sandbox.wrap_invocation(&mut cmd, &invocation).unwrap();
         assert_eq!(cmd.get_program(), SANDBOX_EXEC_PATH);
-        assert!(cmd.get_args().collect::<Vec<_>>().ends_with(
-            &invocation
-                .iter()
-                .map(OsString::as_os_str)
-                .collect::<Vec<_>>()
-        ));
+        assert!(
+            cmd.get_args().collect::<Vec<_>>().ends_with(
+                &invocation
+                    .iter()
+                    .map(OsString::as_os_str)
+                    .collect::<Vec<_>>()
+            )
+        );
         assert_eq!(cmd.get_current_dir(), Some(dir.path()));
     }
 
@@ -675,8 +677,11 @@ mod tests {
         let workspace = PathBuf::from("/tmp/zeroclaw-seatbelt-test-workspace");
         let policy = generate_policy(&workspace, &[], &[], &[]);
 
-        assert!(policy
-            .contains(r#"(allow file-read* (subpath "/tmp/zeroclaw-seatbelt-test-workspace"))"#));
+        assert!(
+            policy.contains(
+                r#"(allow file-read* (subpath "/tmp/zeroclaw-seatbelt-test-workspace"))"#
+            )
+        );
         assert!(policy.contains(r#"(subpath "/tmp/zeroclaw-seatbelt-test-workspace")"#));
     }
 
@@ -1075,7 +1080,9 @@ mod tests {
         let tricky = PathBuf::from("/srv/zc\"quote\\slash\nnewline");
         let policy = generate_policy(&PathBuf::from("/ws"), &[tricky], &[], &[]);
 
-        assert!(policy.contains(r#"(allow file-read* (subpath "/srv/zc\"quote\\slash\nnewline"))"#));
+        assert!(
+            policy.contains(r#"(allow file-read* (subpath "/srv/zc\"quote\\slash\nnewline"))"#)
+        );
         assert!(
             policy.contains(r#"(allow file-write* (subpath "/srv/zc\"quote\\slash\nnewline"))"#)
         );
@@ -1113,14 +1120,16 @@ mod tests {
         std::os::unix::fs::symlink("cycle", &cycle).unwrap();
         assert!(resolve_policy_root(&cycle, &mut BTreeSet::new()).is_err());
         if SeatbeltSandbox::is_installed() {
-            assert!(SeatbeltSandbox::with_roots(
-                Some(fixture.path()),
-                std::slice::from_ref(&cycle),
-                &[],
-                &[],
-                &[],
-            )
-            .is_err());
+            assert!(
+                SeatbeltSandbox::with_roots(
+                    Some(fixture.path()),
+                    std::slice::from_ref(&cycle),
+                    &[],
+                    &[],
+                    &[],
+                )
+                .is_err()
+            );
         }
     }
 
