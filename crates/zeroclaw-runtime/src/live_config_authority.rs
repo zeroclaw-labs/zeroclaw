@@ -718,9 +718,33 @@ fn lock_dir_creation_error(
     ))
 }
 
+/// Render `path` for a pasted shell remedy.
+///
+/// Relative paths whose first component starts with `-` would be read as
+/// options by `rm`, and by GNU `chmod`/`chown`. BSD `chmod`/`chown` also reject
+/// a `--` separator, so prefix those paths with `./` instead. Absolute paths
+/// and every other relative form are left alone.
+#[cfg(unix)]
+fn remedy_shell_path(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Normal(first)) if first.to_string_lossy().starts_with('-') => {
+            let mut out = std::path::PathBuf::from(".");
+            out.push(path);
+            out
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 #[cfg(unix)]
 fn remedy_command(command: &str, path: &Path) -> String {
-    format!("{command} {}", crate::util::shell_escape(path.as_os_str()))
+    format!(
+        "{command} {}",
+        crate::util::shell_escape(remedy_shell_path(path).as_os_str())
+    )
 }
 
 /// The account name for `uid`, when the user database has one.
@@ -1995,6 +2019,70 @@ mod tests {
             .expect_err("a dangling lifecycle link must be refused")
             .to_string();
         assert!(error.contains(&command), "missing `{command}`: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remedy_commands_keep_dash_prefixed_relative_paths_as_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let lock_dir = temp
+            .path()
+            .join("-install")
+            .join("data")
+            .join(LIFECYCLE_DIR);
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        std::fs::set_permissions(&lock_dir, PermissionsExt::from_mode(0o775)).unwrap();
+
+        let relative = Path::new("-install").join("data").join(LIFECYCLE_DIR);
+        let chmod_cmd = remedy_command("chmod 700", &relative);
+        assert_eq!(chmod_cmd, "chmod 700 ./-install/data/.lifecycle");
+        assert!(
+            Command::new("sh")
+                .arg("-c")
+                .arg(&chmod_cmd)
+                .current_dir(temp.path())
+                .status()
+                .unwrap()
+                .success(),
+            "chmod remedy must succeed when pasted: {chmod_cmd}"
+        );
+        assert_eq!(mode_of(&lock_dir) & 0o777, 0o700);
+
+        // Replace the directory with a symlink so `rm` is the pasted fix.
+        std::fs::remove_dir(&lock_dir).unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &lock_dir).unwrap();
+        let rm_cmd = remedy_command("rm", &relative);
+        assert_eq!(rm_cmd, "rm ./-install/data/.lifecycle");
+        assert!(
+            Command::new("sh")
+                .arg("-c")
+                .arg(&rm_cmd)
+                .current_dir(temp.path())
+                .status()
+                .unwrap()
+                .success(),
+            "rm remedy must succeed when pasted: {rm_cmd}"
+        );
+        assert!(!lock_dir.exists());
+        assert!(
+            elsewhere.exists(),
+            "rm must remove the link, not the target"
+        );
+
+        // Absolute paths, and relatives that do not start with `-`, stay as-is.
+        assert_eq!(
+            remedy_command("chmod 700", Path::new("/tmp/data/.lifecycle")),
+            "chmod 700 /tmp/data/.lifecycle"
+        );
+        assert_eq!(
+            remedy_command("rm", Path::new("data/.lifecycle")),
+            "rm data/.lifecycle"
+        );
     }
 
     /// Remedy commands are pasted into a shell, so the rendered text must not
