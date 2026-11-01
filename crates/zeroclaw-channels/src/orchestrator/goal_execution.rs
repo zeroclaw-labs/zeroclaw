@@ -10086,7 +10086,7 @@ mod tests {
         use wiremock::{Mock, MockServer, Respond, ResponseTemplate, matchers::method};
 
         struct TargetReply {
-            calls: std::sync::atomic::AtomicUsize,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
             native: bool,
         }
         impl Respond for TargetReply {
@@ -10113,9 +10113,10 @@ mod tests {
         }
 
         let server = MockServer::start().await;
+        let target_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Mock::given(method("POST"))
             .respond_with(TargetReply {
-                calls: std::sync::atomic::AtomicUsize::new(0),
+                calls: target_calls.clone(),
                 native,
             })
             .mount(&server)
@@ -10127,6 +10128,7 @@ mod tests {
         );
         let mut initial_rows = Vec::new();
         for goal in [false, true] {
+            let target_start = target_calls.load(std::sync::atomic::Ordering::SeqCst);
             let tmp = tempfile::tempdir().unwrap();
             let backend = Arc::new(
                 zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
@@ -10258,7 +10260,206 @@ mod tests {
                 .await;
             }
             assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-            assert_eq!(tool_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{}",
+                {
+                    // assert_eq! evaluates this metadata-only message only on failure.
+                    let metadata = |value: Option<&serde_json::Value>, expected: &str| match value {
+                        None => "missing",
+                        Some(serde_json::Value::String(text)) if text == expected => "expected",
+                        Some(serde_json::Value::String(_)) => "other",
+                        Some(_) => "malformed",
+                    };
+                    let result_facts = |row: &serde_json::Value| {
+                        let content = row.get("content").and_then(serde_json::Value::as_str);
+                        let is_native =
+                            row.get("role").and_then(serde_json::Value::as_str) == Some("tool");
+                        // Recognize only this fixture's exact carrier, not arbitrary XML/prose.
+                        let payload = if is_native {
+                            content
+                        } else {
+                            content
+                                .and_then(|text| {
+                                    text.strip_prefix(
+                            "[Tool results]\n[Tool attachments: 0]\n<tool_result name=\"echo\">\n",
+                        )
+                                })
+                                .and_then(|text| text.strip_suffix("\n</tool_result>\n"))
+                        };
+                        let structured = payload
+                            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+                        let object = structured.as_ref().and_then(serde_json::Value::as_object);
+                        let error = object.and_then(|object| object.get("error"));
+                        serde_json::json!({
+                            "kind":if is_native { "native_tool" } else { "text_result_prefix" },
+                            "correlation":if is_native {
+                                metadata(row.get("tool_call_id"), "target-echo")
+                            } else if payload.is_some() { "fixture_echo_carrier" } else { "unknown" },
+                            "content_state":if content.is_some() { "string" } else { "missing/malformed" },
+                            "content_chars":content.map(|text| text.chars().count()),
+                            "payload_class":match payload {
+                                Some("stable tool result") => "fixture_echo_result",
+                                Some("Tool not available in this turn: echo") => "fixed_echo_unavailable_result",
+                                Some(_) if object.is_some() => "structured_object",
+                                Some(_) => "unknown",
+                                None => "unsupported/missing",
+                            },
+                            "json_state":if object.is_some() { "object" } else if structured.is_some() {
+                                "unsupported_shape"
+                            } else { "not_json_or_unavailable" },
+                            "success":match object.and_then(|object| object.get("success")) {
+                                Some(serde_json::Value::Bool(true)) => "true",
+                                Some(serde_json::Value::Bool(false)) => "false",
+                                None if object.is_some() => "missing",
+                                None => "unknown",
+                                Some(_) => "malformed",
+                            },
+                            "error":match error {
+                                None if object.is_some() => "absent",
+                                None => "unknown",
+                                Some(serde_json::Value::Null) => "null",
+                                Some(serde_json::Value::String(_)) => "present_string",
+                                Some(_) => "unsupported_shape",
+                            },
+                            "error_category":if payload == Some("Tool not available in this turn: echo")
+                                || error.and_then(serde_json::Value::as_str) == Some("Tool not available in this turn: echo") {
+                                "fixed_echo_unavailable"
+                            } else { "unknown" },
+                        })
+                    };
+                    let target_end = target_calls.load(std::sync::atomic::Ordering::SeqCst);
+                    let route = match context.route_overrides.try_lock() {
+                        Ok(routes) => match routes.get(&key) {
+                            Some(route) => {
+                                let classify = |value: &str, initial: &str, target: &str| {
+                                    if value == target {
+                                        "target"
+                                    } else if value == initial {
+                                        "initial"
+                                    } else if value.is_empty() {
+                                        "unknown"
+                                    } else {
+                                        "other"
+                                    }
+                                };
+                                serde_json::json!({
+                                    "state":"available",
+                                    "model_provider":classify(&route.model_provider, &defaults.defaults.default_model_provider, "custom.target"),
+                                    "model":classify(&route.model, &defaults.defaults.model, "target-model"),
+                                    "automatic":route.automatic,
+                                })
+                            }
+                            None => serde_json::json!({"state":"unavailable: missing"}),
+                        },
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            serde_json::json!({"state":"unavailable: busy"})
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            serde_json::json!({"state":"unavailable: poisoned"})
+                        }
+                    };
+                    let messages = match channel.messages.try_lock() {
+                        Ok(messages) => serde_json::json!({
+                            "state":"available", "total":messages.len(),
+                            "omitted":messages.len().saturating_sub(8),
+                            "entries":messages.iter().take(8).enumerate().map(|(ordinal, text)| serde_json::json!({
+                                "ordinal":ordinal, "chars":text.chars().count(),
+                                "class":if text == "switched candidate" { "fixture_candidate" } else { "unclassified" },
+                            })).collect::<Vec<_>>(),
+                        }),
+                        Err(_) => serde_json::json!({"state":"unavailable: busy"}),
+                    };
+                    // Snapshot guards have ended before the failure-only asynchronous capture.
+                    let requests = match server.received_requests().await {
+                        None => serde_json::json!({"state":"unavailable"}),
+                        Some(requests) => {
+                            let posts = requests
+                                .iter()
+                                .filter(|request| request.method.as_str() == "POST");
+                            let post_total = posts.clone().count();
+                            let summaries = posts.take(16).enumerate().map(|(ordinal, request)| {
+                            match serde_json::from_slice::<serde_json::Value>(&request.body) {
+                                Err(_) => serde_json::json!({"post_ordinal":ordinal, "body":"malformed JSON"}),
+                                Ok(body) => {
+                                    let rows = body.get("messages").and_then(serde_json::Value::as_array);
+                                    let roles = rows.map(|rows| rows.iter().take(16).map(|row| {
+                                        let role = match row.get("role").and_then(serde_json::Value::as_str) {
+                                            Some("system") => "system",
+                                            Some("user") => "user",
+                                            Some("assistant") => "assistant",
+                                            Some("tool") => "tool",
+                                            Some(_) => "unknown",
+                                            None => "missing/malformed",
+                                        };
+                                        let calls = row.get("tool_calls").and_then(serde_json::Value::as_array);
+                                        serde_json::json!({
+                                            "role":role,
+                                            "tool_calls_state":if calls.is_some() { "array" } else if row.get("tool_calls").is_none() { "missing" } else { "malformed" },
+                                            "tool_calls_total":calls.map(Vec::len),
+                                            "tool_calls_omitted":calls.map(|calls| calls.len().saturating_sub(8)),
+                                            "tool_calls":calls.map(|calls| calls.iter().take(8).map(|call| serde_json::json!({
+                                                "name":metadata(call.get("function").and_then(|function| function.get("name")), "echo"),
+                                                "id":metadata(call.get("id"), "target-echo"),
+                                            })).collect::<Vec<_>>()),
+                                        })
+                                    }).collect::<Vec<_>>());
+                                    let results = rows.map(|rows| {
+                                        let results = rows.iter().enumerate().filter(|(_, row)| {
+                                            row.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                                                || row.get("content").and_then(serde_json::Value::as_str)
+                                                    .is_some_and(|text| text.starts_with("[Tool results]"))
+                                        });
+                                        let total = results.clone().count();
+                                        serde_json::json!({
+                                            "total":total, "omitted":total.saturating_sub(8),
+                                            "entries":results.take(8).map(|(row_ordinal, row)| serde_json::json!({
+                                                "row_ordinal":row_ordinal, "facts":result_facts(row),
+                                            })).collect::<Vec<_>>(),
+                                        })
+                                    });
+                                    serde_json::json!({
+                                        "post_ordinal":ordinal,
+                                        "body_state":if body.is_object() { "object" } else { "malformed_shape" },
+                                        "model":metadata(body.get("model"), "target-model"),
+                                        "stream":match body.get("stream") {
+                                            None => "missing",
+                                            Some(serde_json::Value::Bool(false)) => "false",
+                                            Some(serde_json::Value::Bool(true)) => "true",
+                                            Some(_) => "malformed",
+                                        },
+                                        "messages_state":if rows.is_some() { "array" } else { "missing/malformed" },
+                                        "roles_total":rows.map(Vec::len),
+                                        "roles_omitted":rows.map(|rows| rows.len().saturating_sub(16)),
+                                        "roles":roles, "results":results,
+                                    })
+                                }
+                            }
+                        }).collect::<Vec<_>>();
+                            serde_json::json!({
+                                "state":"available", "total":requests.len(),
+                                "get_total":requests.iter().filter(|request| request.method.as_str() == "GET").count(),
+                                "post_total":post_total, "posts_omitted":post_total.saturating_sub(16),
+                                "other_method_total":requests.iter().filter(|request| !matches!(request.method.as_str(), "GET" | "POST")).count(),
+                                "posts":summaries,
+                            })
+                        }
+                    };
+                    serde_json::json!({
+                        "native":native, "recall":recall, "automatic":automatic, "goal":goal,
+                        "initial_calls":initial_calls.load(std::sync::atomic::Ordering::SeqCst),
+                        "echo_calls":tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+                        "target_start":target_start, "target_end":target_end,
+                        "target_delta":target_end.checked_sub(target_start),
+                        "target_delta_state":if target_end >= target_start { "known" } else { "unknown: counter decreased" },
+                        "phase":"even=echo, odd=final; counts do not prove client receipt",
+                        "start_next_phase":if target_start.is_multiple_of(2) { "echo" } else { "final" },
+                        "end_next_phase":if target_end.is_multiple_of(2) { "echo" } else { "final" },
+                        "route":route, "channel_messages":messages, "requests":requests,
+                    })
+                }
+            );
             assert!(
                 channel
                     .messages
