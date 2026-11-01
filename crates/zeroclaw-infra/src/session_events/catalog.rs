@@ -4,7 +4,8 @@ use super::installation::{InstallationGuard, creation_source};
 use super::*;
 use std::collections::BTreeMap;
 use zeroclaw_api::session_events::{
-    BranchId, CaptureMode, EventActor, EventData, SessionId, StoredPayloadRef,
+    BranchId, CaptureMode, EventActor, EventData, RangeDisposition, SessionId, SourceRange,
+    StoredPayloadRef,
 };
 
 fn string_field(fields: &BTreeMap<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
@@ -139,6 +140,38 @@ impl SessionCatalog {
 }
 
 impl SessionQuery<'_> {
+    /// Resolve a copy's immutable seed coordinate from the canonical root
+    /// metadata. The returned cursor is a read hint only; writes always use
+    /// the copied session's own event stream.
+    pub fn copy_source(&self, session_id: &SessionId) -> Result<Option<EventCursor>, ReadError> {
+        let Some(session) = self.summary(session_id)? else {
+            return Ok(None);
+        };
+        if session
+            .fields
+            .get("session_kind")
+            .and_then(|value| value.as_str())
+            != Some("copy")
+        {
+            return Ok(None);
+        }
+        let source = session
+            .fields
+            .get("copy_source_session_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ReadError::Corrupt("copy source session id missing".into()))?;
+        let sequence = session
+            .fields
+            .get("copy_source_sequence")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| ReadError::Corrupt("copy source sequence missing".into()))?;
+        Ok(Some(EventCursor {
+            session_id: SessionId::parse(source.to_owned())
+                .map_err(|error| ReadError::Corrupt(error.to_string()))?,
+            sequence,
+        }))
+    }
+
     pub fn sessions(&self) -> Result<BTreeMap<String, SessionId>, AppendError> {
         Ok(self
             .index_records()
@@ -161,6 +194,19 @@ impl SessionQuery<'_> {
         let mut parent_session_id = None;
         let mut parent_thread_id = None;
         let mut parent_agent = None;
+        let mut derived_child = false;
+        if let Some(value) = session.fields.get("parent_session_id") {
+            parent_session_id = serde_json::from_value(value.clone()).ok();
+        }
+        if session
+            .fields
+            .get("session_kind")
+            .and_then(|value| value.as_str())
+            == Some("copy")
+            && let Some(value) = session.fields.get("copy_source_session_id")
+        {
+            parent_session_id = serde_json::from_value(value.clone()).ok();
+        }
         let mut indexed_cwd = None;
         let mut indexed_provider = None;
         let mut indexed_model = None;
@@ -291,6 +337,7 @@ impl SessionQuery<'_> {
                         }
                     }
                     EventData::DerivedSessionStarted { .. } => {
+                        derived_child = true;
                         if let Some(causation) = &event.causation_id
                             && let Some(parent) = self.catalog.store.read_event(causation)?
                         {
@@ -308,6 +355,10 @@ impl SessionQuery<'_> {
             if !page.has_more {
                 break;
             }
+        }
+        let mut metadata = residual_metadata(&session.fields);
+        if derived_child {
+            metadata["session_kind"] = serde_json::json!("child_agent");
         }
         Ok(Some(SessionIndexRecord {
             session_id: stream.clone(),
@@ -349,7 +400,7 @@ impl SessionQuery<'_> {
             head_sequence: session.head.sequence,
             message_count: session.message_count,
             running: session.running,
-            metadata: residual_metadata(&session.fields),
+            metadata,
         }))
     }
 
@@ -580,6 +631,106 @@ pub(crate) fn metadata_payload(
 }
 
 impl SessionCommand<'_> {
+    /// Create a separately listed session whose initial context refers to a
+    /// frozen point in another session. The event log remains independent;
+    /// readers can resolve the source lazily and later writes stay local.
+    pub fn create_copy(
+        &self,
+        session_id: &SessionId,
+        source_session_id: &SessionId,
+        source_cursor: &EventCursor,
+        source_branch_id: &BranchId,
+        source: &str,
+        alias: &str,
+    ) -> Result<(), AppendError> {
+        if source_cursor.session_id != *source_session_id || source_cursor.sequence == 0 {
+            return Err(AppendError::InvalidReference(
+                "copy source cursor is invalid".into(),
+            ));
+        }
+        let source_head = self
+            .catalog
+            .store
+            .head(source_session_id)
+            .map_err(upgrade::storage)?;
+        if source_cursor.sequence > source_head.sequence {
+            return Err(AppendError::InvalidReference(
+                "copy source cursor is beyond the source head".into(),
+            ));
+        }
+        self.create(
+            session_id.as_str(),
+            source,
+            alias,
+            vec![
+                ("session_kind", serde_json::json!("copy")),
+                (
+                    "copy_source_session_id",
+                    serde_json::json!(source_session_id),
+                ),
+                (
+                    "copy_source_sequence",
+                    serde_json::json!(source_cursor.sequence),
+                ),
+                ("copy_source_branch_id", serde_json::json!(source_branch_id)),
+            ],
+        )?;
+        let record = self
+            .catalog
+            .query()
+            .summary(session_id)
+            .map_err(|error| AppendError::Corrupt(error.to_string()))?
+            .ok_or_else(|| AppendError::Corrupt("copy session root missing".into()))?;
+        let body = PayloadRecord::json(
+            "session.context/v1",
+            &serde_json::json!({
+                "copy_source_session_id": source_session_id,
+                "copy_source_sequence": source_cursor.sequence,
+                "copy_source_branch_id": source_branch_id,
+                "history_has_trim_breadcrumb": false
+            }),
+        )?;
+        let mut context = SessionEvent::typed(
+            session_id.clone(),
+            EventData::ContextProjectionCreated {
+                source_ranges: vec![SourceRange {
+                    session_id: source_session_id.clone(),
+                    from_seq: 1,
+                    to_seq: source_cursor.sequence,
+                    disposition: RangeDisposition::Included,
+                }],
+                summary_ref: None,
+                budget: 0,
+                reason_key: "copy_on_write_seed".into(),
+                algorithm_version: "session-copy/v1".into(),
+                result_ref: StoredPayloadRef::from(&body),
+                summary_source_refs: vec![],
+                transform_started_event_id: None,
+            },
+            EventActor::System {
+                component: "session_catalog".into(),
+            },
+        )?;
+        context.branch_id = Some(BranchId::parse(format!("branch-{session_id}"))?);
+        self.append(session_id, record.head, vec![context], vec![body])
+    }
+
+    /// Create a durable, independently listed temporary session. Retention
+    /// and close use the same canonical session events as normal sessions.
+    pub fn create_temporary(
+        &self,
+        session_id: &SessionId,
+        parent_session_id: Option<&SessionId>,
+        source: &str,
+        alias: &str,
+    ) -> Result<(), AppendError> {
+        let mut fields = vec![("session_kind", serde_json::json!("temporary"))];
+        if let Some(parent) = parent_session_id {
+            fields.push(("parent_session_id", serde_json::json!(parent)));
+        }
+        self.create(session_id.as_str(), source, alias, fields)
+    }
+
     pub fn create(
         &self,
         family: &str,
@@ -715,5 +866,92 @@ impl SessionCommand<'_> {
             erasure_reference_commitment: None,
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_events::installation::NativeBackend;
+    use crate::session_events::scoped::EventStorePool;
+
+    #[test]
+    fn copy_and_temporary_sessions_use_independent_ids_and_index_metadata() {
+        let directory = tempfile::tempdir().expect("directory");
+        crate::session_events::upgrade::upgrade_installation(
+            directory.path(),
+            NativeBackend::Sqlite,
+            |_| "fixture".into(),
+        )
+        .expect("installation");
+        let pool = EventStorePool::default();
+        let catalog = SessionCatalog::open(directory.path(), &pool)
+            .expect("catalog")
+            .expect("native catalog");
+        let source_id = SessionId::parse("source-session").expect("source id");
+        catalog
+            .commands()
+            .create("source-session", "rpc", "agent", vec![])
+            .expect("source");
+        let source = catalog
+            .query()
+            .summary(&source_id)
+            .expect("source summary")
+            .expect("source exists");
+        let copied_id = SessionId::parse("copied-session").expect("copy id");
+        catalog
+            .commands()
+            .create_copy(
+                &copied_id,
+                &source_id,
+                &source.head,
+                &BranchId::parse(format!("branch-{source_id}")).expect("source branch"),
+                "rpc",
+                "agent",
+            )
+            .expect("copy");
+        let temporary_id = SessionId::parse("temporary-session").expect("temporary id");
+        catalog
+            .commands()
+            .create_temporary(&temporary_id, Some(&source_id), "subagent", "agent")
+            .expect("temporary");
+        let rows = catalog.query().indexed_summaries().expect("index");
+        assert_eq!(rows.len(), 3);
+        let copied = rows
+            .iter()
+            .find(|(id, _)| id == copied_id.as_str())
+            .expect("copy row");
+        assert_eq!(
+            copied.1.fields.get("session_kind").and_then(|v| v.as_str()),
+            Some("copy")
+        );
+        assert_eq!(
+            catalog
+                .query()
+                .copy_source(&copied_id)
+                .expect("copy source")
+                .expect("copy source present"),
+            source.head
+        );
+        let temporary = rows
+            .iter()
+            .find(|(id, _)| id == temporary_id.as_str())
+            .expect("temporary row");
+        assert_eq!(
+            temporary
+                .1
+                .fields
+                .get("session_kind")
+                .and_then(|v| v.as_str()),
+            Some("temporary")
+        );
+        assert_eq!(
+            temporary
+                .1
+                .fields
+                .get("parent_session_id")
+                .and_then(|v| v.as_str()),
+            Some(source_id.as_str())
+        );
     }
 }

@@ -535,6 +535,76 @@ impl EngineSession {
             anyhow::bail!("engine context projection has been erased");
         };
         let value: serde_json::Value = serde_json::from_slice(&context.body)?;
+        if let (Some(source_id), Some(sequence)) = (
+            value
+                .get("copy_source_session_id")
+                .and_then(serde_json::Value::as_str),
+            value
+                .get("copy_source_sequence")
+                .and_then(serde_json::Value::as_u64),
+        ) {
+            let source = SessionId::parse(source_id.to_owned())?;
+            let source_branch = value
+                .get("copy_source_branch_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| BranchId::parse(value.to_owned()))
+                .transpose()?;
+            let owner = self.owner.clone();
+            let messages = owner
+                .clone()
+                .blocking(move || {
+                    let head = owner.store.head(&source)?;
+                    let through = EventCursor {
+                        session_id: source.clone(),
+                        sequence: sequence.min(head.sequence),
+                    };
+                    let mut after = EventCursor::beginning(source.clone());
+                    let mut latest = None;
+                    loop {
+                        let page = owner
+                            .store
+                            .read_page(&source, &after, Some(&through), 256)?;
+                        for candidate in &page.events {
+                            if candidate.body.kind() == EventKind::ContextProjectionCreated
+                                && source_branch.as_ref().is_none_or(|branch| {
+                                    candidate.branch_id.as_ref() == Some(branch)
+                                })
+                            {
+                                latest = Some(candidate.clone());
+                            }
+                        }
+                        if !page.has_more {
+                            break;
+                        }
+                        after = page.through;
+                    }
+                    let projection = latest.ok_or_else(|| {
+                        SessionError::StaleTarget("copy source context missing".into())
+                    })?;
+                    let refs = zeroclaw_api::session_events::context_read::context_refs(
+                        owner.store.as_ref(),
+                        &projection,
+                    )?;
+                    refs.iter()
+                        .map(|item| {
+                            zeroclaw_api::session_events::context_read::resolve_message(
+                                owner.store.as_ref(),
+                                &source,
+                                item,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|items| items.into_iter().flatten().collect())
+                        .map_err(SessionError::from)
+                })
+                .await?;
+            return Ok(Some(ContextSnapshot {
+                messages,
+                history_has_trim_breadcrumb: value
+                    .get("history_has_trim_breadcrumb")
+                    .and_then(serde_json::Value::as_bool),
+            }));
+        }
         let messages = if let Some(items) = value.get("message_refs") {
             let refs: Vec<MessageRef> = serde_json::from_value(items.clone())?;
             let owner = self.owner.clone();

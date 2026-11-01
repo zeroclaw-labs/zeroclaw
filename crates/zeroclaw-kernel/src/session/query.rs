@@ -58,6 +58,7 @@ pub use zeroclaw_api::session_events::views::{
     HistoricalMessage, HistoricalMessagePage, MessageCursor, PayloadSelector, SessionSummary,
 };
 
+#[derive(Clone)]
 pub struct SessionQuery {
     coordinator: Arc<SessionCoordinator>,
     actor: EventActor,
@@ -387,6 +388,65 @@ impl SessionQuery {
                 break;
             }
         }
+        let mut seeds = Vec::new();
+        if let Some(copy) = history.iter().find(|event| {
+            matches!(
+                &event.body.data,
+                EventData::ContextProjectionCreated { reason_key, .. }
+                    if reason_key == "copy_on_write_seed"
+            )
+        }) {
+            let EventData::ContextProjectionCreated { result_ref, .. } = &copy.body.data else {
+                unreachable!();
+            };
+            let PayloadRead::Present(record) = self
+                .coordinator
+                .store
+                .read_payload(&result_ref.payload_id)?
+            else {
+                return Err(SessionError::StaleTarget(
+                    "copy source context unavailable".into(),
+                ));
+            };
+            let value: serde_json::Value = serde_json::from_slice(&record.body)
+                .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+            let source = SessionId::parse(
+                value
+                    .get("copy_source_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| ReadError::Corrupt("copy source session id missing".into()))?
+                    .to_owned(),
+            )
+            .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+            if source == stream {
+                return Err(SessionError::InvalidAdmission("copy source cycle".into()));
+            }
+            let sequence = value
+                .get("copy_source_sequence")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| ReadError::Corrupt("copy source sequence missing".into()))?;
+            let source_branch = value
+                .get("copy_source_branch_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| BranchId::parse(value.to_owned()))
+                .transpose()
+                .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+            let source_cursor = EventCursor {
+                session_id: source.clone(),
+                sequence,
+            };
+            let mut source_query = self.clone();
+            source_query.branch = source_branch;
+            let inherited = std::pin::Pin::from(Box::new(source_query.message_window(
+                source,
+                Some(source_cursor),
+                None,
+                None,
+            )))
+            .await?
+            .messages;
+            seeds.extend(inherited);
+        }
         let branch = self.branch.clone().or_else(|| {
             history
                 .iter()
@@ -409,7 +469,6 @@ impl SessionQuery {
             })
             .transpose()?;
         let mut imported = Vec::new();
-        let mut seeds = Vec::new();
         let mut messages = Vec::new();
         for event in &history {
             if lineage

@@ -669,3 +669,14 @@ installation ownership lock. Operators must apply their retention policy to
 all copies and exports before claiming installation-wide content removal.
 Append request commitments identify retries, and migration commitments identify
 the transferred snapshot; neither forms a content-integrity chain.
+
+Session relationships use the same canonical identity model. A child agent gets a
+new `session_id` and starts with `DerivedSessionStarted`, causally linked to the
+parent child request. A same-session fork keeps the `session_id` and creates a
+new `branch_id` with a frozen parent cursor. A copied session gets a new
+`session_id` and stores a `copy_on_write_seed` pointing to the source session
+and immutable sequence; history is resolved from that prefix until the copy
+writes its own events. A temporary session also gets a new `session_id`, is
+marked `session_kind=temporary`, and may record its parent in the index
+metadata. All four forms are independently enumerable and use the ordinary
+permission, recovery, close and retention paths.

@@ -1237,11 +1237,17 @@ fn validate_coordinates(
                 }
             }
         }
-        EventData::ContextProjectionCreated { source_ranges, .. } => {
+        EventData::ContextProjectionCreated {
+            source_ranges,
+            reason_key,
+            ..
+        } => {
             for range in source_ranges {
                 if range.from_seq == 0
                     || range.from_seq > range.to_seq
-                    || !by_cursor.contains_key(&(range.session_id.clone(), range.to_seq))
+                    || (range.session_id == event.session_id
+                        && !by_cursor.contains_key(&(range.session_id.clone(), range.to_seq)))
+                    || (range.session_id != event.session_id && reason_key != "copy_on_write_seed")
                 {
                     return Err(reference("context range is not a frozen committed prefix"));
                 }
