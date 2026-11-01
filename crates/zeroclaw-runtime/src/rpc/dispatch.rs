@@ -16406,6 +16406,69 @@ mod tests {
         );
     }
 
+    /// A workspace and an allowed root configured through a symlink, as a
+    /// macOS temp path is (`/var` and `/tmp` link into `/private`), admit a
+    /// scoped principal's sessions, and those sessions stay usable: each
+    /// holds the resolved directory, which a resume and a steer accept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_sessions_accept_a_workspace_and_allowed_root_configured_through_a_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("agent-workspace")).unwrap();
+        std::fs::create_dir_all(real.join("project")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, Some(link.join("project")));
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("the fixture agent exists")
+            .workspace
+            .path = Some(link.join("agent-workspace"));
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let workspace = real.join("agent-workspace").canonicalize().unwrap();
+        let root = real.join("project").canonicalize().unwrap();
+
+        // No cwd selects the configured workspace. The allowed root is
+        // selected by its configured spelling and by its resolved one.
+        for (id, sid, cwd, held) in [
+            (1, "s-workspace", None, &workspace),
+            (4, "s-root-link", Some(link.join("project")), &root),
+            (7, "s-root-real", Some(root.clone()), &root),
+        ] {
+            let mut params = json!({"agent_alias": "test-agent", "session_id": sid});
+            if let Some(cwd) = cwd {
+                params["cwd"] = json!(cwd.to_string_lossy());
+            }
+            let created = rpc(&mut alice, &mut rx, id, "session/new", params.clone()).await;
+            assert_eq!(created["result"]["session_id"], json!(sid), "{created}");
+            assert_eq!(
+                ctx.sessions.get_workspace_dir(sid).await.as_deref(),
+                Some(&*held.to_string_lossy()),
+                "{sid} must hold the resolved directory, not the link"
+            );
+            // A resume re-checks the held workspace, and a steer reaches the
+            // handler, which finds no running turn.
+            let resumed = rpc(&mut alice, &mut rx, id + 1, "session/new", params).await;
+            assert_eq!(resumed["result"]["session_id"], json!(sid), "{resumed}");
+            let steer = rpc(
+                &mut alice,
+                &mut rx,
+                id + 2,
+                "session/steer",
+                json!({"session_id": sid, "content": "x"}),
+            )
+            .await;
+            assert_eq!(
+                steer["error"]["code"],
+                json!(SESSION_NOT_FOUND),
+                "{sid}: {steer}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn admin_and_shared_operator_keep_arbitrary_session_cwd() {
         let tmp = tempfile::TempDir::new().unwrap();
