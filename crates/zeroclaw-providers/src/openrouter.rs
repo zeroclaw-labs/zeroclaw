@@ -87,6 +87,8 @@ struct ImageUrlPart {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,7 +675,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
-            .post(endpoint_url("chat/completions"))
+            .post(self.streaming_endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -692,6 +694,7 @@ impl ModelProvider for OpenRouterModelProvider {
             &resp_body,
             "chat-completions",
         )?;
+        crate::dispatch::accounting::observe_raw_string_usage(chat_response.usage.as_ref(), true);
 
         chat_response
             .choices
@@ -1130,6 +1133,508 @@ impl ::zeroclaw_api::attribution::Attributable for OpenRouterModelProvider {
 mod tests {
     use super::*;
     use crate::traits::{ChatMessage, ModelProvider};
+
+    // Loopback proves request construction and response handling, not live TLS,
+    // vendor authentication, model availability, or billing behavior.
+    #[tokio::test]
+    async fn goal_string_usage_openrouter_actual_dispatch() {
+        use crate::dispatch::{
+            AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, ProviderDispatch,
+        };
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, Method, StatusCode, Uri},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use std::{
+            collections::VecDeque,
+            sync::{Arc, Mutex},
+        };
+        use tokio::sync::{Notify, mpsc};
+
+        struct Script {
+            status: StatusCode,
+            body: Value,
+            hold: bool,
+        }
+        struct Capture {
+            method: Method,
+            uri: Uri,
+            headers: HeaderMap,
+            body: Value,
+        }
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let scripts = Arc::new(Mutex::new(VecDeque::<Script>::new()));
+        let (capture_tx, mut capture_rx) = mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/api/v1/chat/completions",
+            post({
+                let scripts = Arc::clone(&scripts);
+                let release = Arc::clone(&release);
+                move |method: Method, uri: Uri, headers: HeaderMap, Json(body): Json<Value>| {
+                    let scripts = Arc::clone(&scripts);
+                    let capture_tx = capture_tx.clone();
+                    let finished_tx = finished_tx.clone();
+                    let release = Arc::clone(&release);
+                    async move {
+                        let script = scripts
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .expect("unexpected request");
+                        capture_tx
+                            .send(Capture {
+                                method,
+                                uri,
+                                headers,
+                                body,
+                            })
+                            .unwrap();
+                        if script.hold {
+                            let _finished = scopeguard::guard(finished_tx, |tx| {
+                                let _ = tx.send(());
+                            });
+                            release.notified().await;
+                        }
+                        (script.status, Json(script.body))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut server = scopeguard::guard(server, |server| server.abort());
+        let _release_on_unwind =
+            scopeguard::guard(Arc::clone(&release), |release| release.notify_one());
+        let provider = OpenRouterModelProvider::builder("goal-router")
+            .credential(Some("synthetic-key"))
+            .max_tokens(Some(123))
+            .streaming_base_url(&format!("http://{addr}/api/v1"))
+            .build();
+        assert_eq!(
+            endpoint_url("chat/completions"),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+        let canonical = OpenRouterModelProvider::builder("canonical").build();
+        assert_eq!(
+            canonical.streaming_endpoint_url("chat/completions"),
+            endpoint_url("chat/completions")
+        );
+        let dispatch = ProviderDispatch::from_ref(&provider);
+        let valid = json!({"choices":[{"message":{"content":"  answer\n"}}],"usage":{"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2}}});
+        let enqueue = |body: Value, status: StatusCode, hold: bool| {
+            scripts
+                .lock()
+                .unwrap()
+                .push_back(Script { status, body, hold });
+        };
+        let check_capture = |capture: Capture,
+                             temperature: Option<f64>,
+                             max_tokens: Option<u32>| {
+            assert_eq!(capture.method, Method::POST);
+            assert_eq!(
+                capture.uri.path_and_query().unwrap().as_str(),
+                "/api/v1/chat/completions"
+            );
+            assert_eq!(capture.headers["authorization"], "Bearer synthetic-key");
+            assert_eq!(capture.headers["content-type"], "application/json");
+            assert_eq!(
+                capture.headers["http-referer"],
+                "https://github.com/zeroclaw-labs/zeroclaw"
+            );
+            assert_eq!(capture.headers["x-title"], "ZeroClaw");
+            assert_eq!(
+                capture.headers["x-openrouter-categories"],
+                "personal-agent,cli-agent"
+            );
+            assert_eq!(capture.body["model"], "fixture/model");
+            assert_eq!(
+                capture.body["messages"],
+                json!([
+                    {"role":"system","content":[{"type":"text","text":"system\nbytes","cache_control":{"type":"ephemeral"}}]},
+                    {"role":"user","content":"user\nbytes"}
+                ])
+            );
+            match temperature {
+                Some(t) => assert_eq!(capture.body["temperature"], json!(t)),
+                None => assert!(capture.body.get("temperature").is_none()),
+            }
+            match max_tokens {
+                Some(n) => assert_eq!(capture.body["max_tokens"], json!(n)),
+                None => assert!(capture.body.get("max_tokens").is_none()),
+            }
+        };
+        async fn receive(rx: &mut mpsc::UnboundedReceiver<Capture>) -> Capture {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        // Direct and ordinary collectors must preserve text/request while not capturing String usage.
+        enqueue(valid.clone(), StatusCode::OK, false);
+        assert_eq!(
+            dispatch
+                .chat_with_system(
+                    Some("system\nbytes"),
+                    "user\nbytes",
+                    "fixture/model",
+                    Some(0.25)
+                )
+                .await
+                .unwrap(),
+            "  answer\n"
+        );
+        check_capture(receive(&mut capture_rx).await, Some(0.25), Some(123));
+        enqueue(valid.clone(), StatusCode::OK, false);
+        let ordinary = AccountedChatScope::new();
+        assert_eq!(
+            ordinary
+                .scope(dispatch.chat_with_system(
+                    Some("system\nbytes"),
+                    "user\nbytes",
+                    "fixture/model",
+                    Some(0.25)
+                ))
+                .await
+                .unwrap(),
+            "  answer\n"
+        );
+        ordinary.mark_logical_success();
+        let report = ordinary.take();
+        assert_eq!(report.attempts().len(), 1);
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::Missing
+        ));
+        check_capture(receive(&mut capture_rx).await, Some(0.25), Some(123));
+
+        // Each entry is sent through the real String method; numeric siblings are
+        // checked even when another recognized field is malformed.
+        enum Expected {
+            Missing,
+            Complete(Option<u64>, Option<u64>, Option<u64>),
+            Invalid(InvalidUsageReason, Option<u64>, Option<u64>, Option<u64>),
+        }
+        let cases = vec![
+            (None, Expected::Missing),
+            (Some(Value::Null), Expected::Missing),
+            (Some(json!({})), Expected::Missing),
+            (
+                Some(json!({"prompt_tokens":8})),
+                Expected::Invalid(InvalidUsageReason::MissingOutput, Some(8), None, None),
+            ),
+            (
+                Some(json!({"completion_tokens":3})),
+                Expected::Invalid(InvalidUsageReason::MissingInput, None, Some(3), None),
+            ),
+            (
+                Some(json!(17)),
+                Expected::Invalid(InvalidUsageReason::MalformedUsage, None, None, None),
+            ),
+            (
+                Some(json!({"prompt_tokens":"8","completion_tokens":3})),
+                Expected::Invalid(InvalidUsageReason::MalformedUsage, None, Some(3), None),
+            ),
+            (
+                Some(json!({"prompt_tokens":-1,"completion_tokens":3})),
+                Expected::Invalid(InvalidUsageReason::MalformedUsage, None, Some(3), None),
+            ),
+            (
+                Some(json!({"prompt_tokens":1.8446744073709552e19,"completion_tokens":3})),
+                Expected::Invalid(InvalidUsageReason::MalformedUsage, None, Some(3), None),
+            ),
+            (
+                Some(
+                    json!({"prompt_tokens":8,"completion_tokens":{},"prompt_tokens_details":{"cached_tokens":2}}),
+                ),
+                Expected::Invalid(InvalidUsageReason::MalformedUsage, Some(8), None, Some(2)),
+            ),
+            (
+                Some(
+                    json!({"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":"bad"}),
+                ),
+                Expected::Invalid(InvalidUsageReason::MalformedUsage, Some(8), Some(3), None),
+            ),
+            (
+                Some(
+                    json!({"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":-1}}),
+                ),
+                Expected::Invalid(InvalidUsageReason::MalformedUsage, Some(8), Some(3), None),
+            ),
+            (
+                Some(
+                    json!({"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":9}}),
+                ),
+                Expected::Invalid(
+                    InvalidUsageReason::CachedInputExceedsInput,
+                    Some(8),
+                    Some(3),
+                    Some(9),
+                ),
+            ),
+            (
+                Some(json!({"prompt_tokens":u64::MAX,"completion_tokens":1})),
+                Expected::Invalid(
+                    InvalidUsageReason::TotalOverflow,
+                    Some(u64::MAX),
+                    Some(1),
+                    None,
+                ),
+            ),
+            (
+                Some(
+                    json!({"prompt_tokens":0,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}),
+                ),
+                Expected::Complete(Some(0), Some(0), Some(0)),
+            ),
+            (
+                Some(
+                    json!({"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2,"extension":true},"extension":{"future":true}}),
+                ),
+                Expected::Complete(Some(8), Some(3), Some(2)),
+            ),
+        ];
+        for (usage, expected) in cases {
+            let mut body = json!({"choices":[{"message":{"content":"  answer\n"}}]});
+            if let Some(usage) = usage {
+                body["usage"] = usage;
+            }
+            enqueue(body, StatusCode::OK, false);
+            let scope = AccountedChatScope::new_with_string_usage();
+            assert_eq!(
+                scope
+                    .scope(dispatch.chat_with_system(
+                        Some("system\nbytes"),
+                        "user\nbytes",
+                        "fixture/model",
+                        Some(0.25)
+                    ))
+                    .await
+                    .unwrap(),
+                "  answer\n"
+            );
+            scope.mark_logical_success();
+            let report = scope.take();
+            assert_eq!(report.attempts().len(), 1);
+            let attempt = &report.attempts()[0];
+            assert_eq!(attempt.provider_ref(), "goal-router");
+            assert_eq!(attempt.model(), "fixture/model");
+            let route = report.accepted_route().unwrap();
+            assert_eq!(route.provider_ref(), "goal-router");
+            assert_eq!(route.model(), "fixture/model");
+            let dimensions = |u: &crate::traits::TokenUsage| {
+                (u.input_tokens, u.output_tokens, u.cached_input_tokens)
+            };
+            match (expected, attempt.outcome()) {
+                (Expected::Missing, AttemptUsageOutcome::Missing) => (),
+                (Expected::Complete(i, o, c), AttemptUsageOutcome::Complete(u)) => {
+                    assert_eq!(dimensions(u), (i, o, c))
+                }
+                (
+                    Expected::Invalid(reason, i, o, c),
+                    AttemptUsageOutcome::Invalid {
+                        observed,
+                        reason: actual,
+                    },
+                ) => {
+                    assert_eq!(*actual, reason);
+                    assert_eq!(dimensions(observed), (i, o, c));
+                }
+                (_, actual) => panic!("unexpected outcome: {actual:?}"),
+            }
+            check_capture(receive(&mut capture_rx).await, Some(0.25), Some(123));
+        }
+
+        // None omission and extra-body precedence are separate original request policies.
+        let no_options = OpenRouterModelProvider::builder("none")
+            .credential(Some("synthetic-key"))
+            .streaming_base_url(&format!("http://{addr}/api/v1"))
+            .build();
+        enqueue(valid.clone(), StatusCode::OK, false);
+        let scope = AccountedChatScope::new_with_string_usage();
+        let text = scope
+            .scope(ProviderDispatch::from_ref(&no_options).chat_with_system(
+                Some("system\nbytes"),
+                "user\nbytes",
+                "fixture/model",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(text, "  answer\n");
+        scope.mark_logical_success();
+        assert!(matches!(
+            scope.take().attempts()[0].outcome(),
+            AttemptUsageOutcome::Complete(_)
+        ));
+        check_capture(receive(&mut capture_rx).await, None, None);
+        let merged = OpenRouterModelProvider::builder("merged")
+            .credential(Some("synthetic-key"))
+            .max_tokens(Some(123))
+            .extra_body(json!({"temperature":0.75,"max_tokens":77,"extension":"kept"}))
+            .streaming_base_url(&format!("http://{addr}/api/v1"))
+            .build();
+        enqueue(valid.clone(), StatusCode::OK, false);
+        let scope = AccountedChatScope::new_with_string_usage();
+        assert_eq!(
+            scope
+                .scope(ProviderDispatch::from_ref(&merged).chat_with_system(
+                    Some("system\nbytes"),
+                    "user\nbytes",
+                    "fixture/model",
+                    Some(0.25)
+                ))
+                .await
+                .unwrap(),
+            "  answer\n"
+        );
+        scope.mark_logical_success();
+        assert!(matches!(
+            scope.take().attempts()[0].outcome(),
+            AttemptUsageOutcome::Complete(_)
+        ));
+        let capture = receive(&mut capture_rx).await;
+        assert_eq!(capture.body["extension"], "kept");
+        check_capture(capture, Some(0.75), Some(77));
+
+        let mut opt_in_http_error = None;
+        for (body, status, lower_bound) in [
+            (
+                json!({"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2}}}),
+                StatusCode::OK,
+                true,
+            ),
+            (
+                json!({"error":{"message":"fixture rejection"}}),
+                StatusCode::BAD_REQUEST,
+                false,
+            ),
+            (
+                json!({"choices":"invalid","usage":{"prompt_tokens":8,"completion_tokens":3}}),
+                StatusCode::OK,
+                false,
+            ),
+        ] {
+            enqueue(body, status, false);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let error = scope
+                .scope(dispatch.chat_with_system(
+                    Some("system\nbytes"),
+                    "user\nbytes",
+                    "fixture/model",
+                    Some(0.25),
+                ))
+                .await
+                .unwrap_err();
+            if lower_bound {
+                assert!(error.to_string().contains("No response from OpenRouter"));
+            } else {
+                assert!(error.to_string().contains("OpenRouter"));
+            }
+            if status == StatusCode::BAD_REQUEST {
+                opt_in_http_error = Some(error.to_string());
+            }
+            let report = scope.take();
+            assert_eq!(report.attempts().len(), 1);
+            assert!(report.accepted_route().is_none());
+            match report.attempts()[0].outcome() {
+                AttemptUsageOutcome::OutcomeUnknown { observed: Some(u) } if lower_bound => {
+                    assert_eq!(
+                        (u.input_tokens, u.output_tokens, u.cached_input_tokens),
+                        (Some(8), Some(3), Some(2))
+                    )
+                }
+                AttemptUsageOutcome::OutcomeUnknown { observed: None } if !lower_bound => (),
+                other => panic!("unexpected error outcome: {other:?}"),
+            }
+            check_capture(receive(&mut capture_rx).await, Some(0.25), Some(123));
+        }
+
+        // Error behavior is unchanged for direct calls and ordinary collectors.
+        let error_body = json!({"error":{"message":"fixture rejection"}});
+        enqueue(error_body.clone(), StatusCode::BAD_REQUEST, false);
+        let direct_error = dispatch
+            .chat_with_system(
+                Some("system\nbytes"),
+                "user\nbytes",
+                "fixture/model",
+                Some(0.25),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        check_capture(receive(&mut capture_rx).await, Some(0.25), Some(123));
+        enqueue(error_body, StatusCode::BAD_REQUEST, false);
+        let ordinary = AccountedChatScope::new();
+        let ordinary_error = ordinary
+            .scope(dispatch.chat_with_system(
+                Some("system\nbytes"),
+                "user\nbytes",
+                "fixture/model",
+                Some(0.25),
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(direct_error, ordinary_error);
+        assert_eq!(opt_in_http_error.as_deref(), Some(direct_error.as_str()));
+        let report = ordinary.take();
+        assert_eq!(report.attempts().len(), 1);
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+        check_capture(receive(&mut capture_rx).await, Some(0.25), Some(123));
+
+        let scope = AccountedChatScope::new_with_string_usage();
+        let unpolled = scope.scope(dispatch.chat_with_system(
+            Some("system\nbytes"),
+            "user\nbytes",
+            "fixture/model",
+            Some(0.25),
+        ));
+        drop(unpolled);
+        assert!(scope.take().attempts().is_empty());
+        assert!(capture_rx.try_recv().is_err());
+
+        enqueue(valid, StatusCode::OK, true);
+        let scope = AccountedChatScope::new_with_string_usage();
+        {
+            let future = scope.scope(dispatch.chat_with_system(
+                Some("system\nbytes"),
+                "user\nbytes",
+                "fixture/model",
+                Some(0.25),
+            ));
+            tokio::pin!(future);
+            tokio::select! {
+                capture = receive(&mut capture_rx) => check_capture(capture, Some(0.25), Some(123)),
+                result = &mut future => panic!("held request completed early: {result:?}"),
+            }
+        }
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 1);
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(scripts.lock().unwrap().is_empty());
+        assert!(capture_rx.try_recv().is_err());
+        server.abort();
+        let _ = (&mut *server).await;
+    }
 
     #[test]
     fn capabilities_report_vision_support() {

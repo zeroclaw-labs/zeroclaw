@@ -44,17 +44,34 @@ pub(in crate::orchestrator) async fn deliver_matrix_goal_command(
                     return;
                 }
             };
-            command.settings =
-                match matrix_goal_settings(command.context.as_ref(), &command.history_key) {
-                    Ok(settings) => settings,
-                    Err(error) => {
+            let config = command.context.live_config.snapshot();
+            let control_plane =
+                match matrix_goal_control_plane(&command.context, &command.history_key) {
+                    Some(control_plane) => control_plane,
+                    None => {
                         drop(ready);
-                        log_delivery_error("Goal deferred settings could not be resolved", &error);
+                        log_delivery_error(
+                            "Goal deferred settings could not be resolved",
+                            &anyhow::Error::msg("Goal control plane is unavailable"),
+                        );
                         send_command_failed(channel.as_ref(), &message).await;
                         return;
                     }
                 };
-            let commit = match ready.commit(command.settings.clone()).await {
+            let settings = match GoalHostSettings::from_config(
+                &config,
+                std::process::id(),
+                control_plane.boot_id.clone(),
+            ) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    drop(ready);
+                    log_delivery_error("Goal deferred settings could not be resolved", &error);
+                    send_command_failed(channel.as_ref(), &message).await;
+                    return;
+                }
+            };
+            let commit = match ready.commit(&settings).await {
                 Ok(commit) => commit,
                 Err(error) => {
                     log_delivery_error("Goal deferred command could not commit", &error);

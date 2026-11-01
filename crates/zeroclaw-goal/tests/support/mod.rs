@@ -19,6 +19,23 @@ pub enum IntentState {
     Settled(GoalControlIntentSettlement),
 }
 
+#[derive(Debug)]
+pub struct CleanupFault(pub &'static str);
+
+impl std::fmt::Display for CleanupFault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for CleanupFault {}
+
+pub enum PauseWinner {
+    Pause(GoalPauseState),
+    Finish(TaskStatus),
+    Delete,
+}
+
 #[derive(Default)]
 pub struct RegistryState {
     pub task: Option<TaskRecord>,
@@ -29,14 +46,37 @@ pub struct RegistryState {
     pub fail_settlement: bool,
     pub fail_finish: bool,
     pub fail_finish_once: bool,
+    pub fail_restart_pause_once: bool,
+    pub restart_pause_failed: Option<Arc<tokio::sync::Semaphore>>,
+    pub fail_lookup_after_restart_pause: bool,
+    pub lookup_failed: Option<Arc<tokio::sync::Semaphore>>,
     pub settlement_wait: Option<Arc<tokio::sync::Semaphore>>,
     pub settlement_entered: Option<Arc<tokio::sync::Semaphore>>,
     pub transitions: Vec<&'static str>,
     pub session_lookups: usize,
     pub fail_lookup_at: Option<usize>,
+    pub fail_lookup: bool,
+    pub lookup_failure_text: Option<&'static str>,
+    pub panic_lookup_once: bool,
+    pub lookup_wait_at: Option<usize>,
+    pub lookup_wait: Option<Arc<tokio::sync::Semaphore>>,
+    pub lookup_entered: Option<Arc<tokio::sync::Semaphore>>,
+    pub gate_admitted_projection: bool,
+    pub fail_pause: bool,
+    pub pause_result: Option<GoalTransitionResult>,
+    pub pause_winner: Option<PauseWinner>,
+    pub pause_calls: usize,
+    pub pause_failed: Option<Arc<tokio::sync::Semaphore>>,
+    pub fail_delete: bool,
+    pub delete_calls: usize,
     pub terminal_reason: Option<String>,
     pub pending_settlements: Vec<GoalAccountingState>,
     pub finish_calls: usize,
+    pub finish_wait_at: Option<usize>,
+    pub finish_wait: Option<Arc<tokio::sync::Semaphore>>,
+    pub finish_entered: Option<Arc<tokio::sync::Semaphore>>,
+    pub pending_admissions: usize,
+    pub accounting_settlements: usize,
 }
 
 #[derive(Default)]
@@ -153,7 +193,9 @@ impl GoalTaskRegistry for Registry {
         }
         let mut state = self.0.lock().unwrap();
         if state.fail_settlement {
-            bail!("fixture intent settlement unavailable");
+            return Err(anyhow::Error::new(CleanupFault(
+                "fixture intent settlement unavailable",
+            )));
         }
         let Some((_, disposition)) = state
             .intents
@@ -222,10 +264,36 @@ impl GoalTaskRegistry for Registry {
         Ok(None)
     }
     async fn current_goal_for_session(&self, session: &str) -> Result<Option<TaskRecord>> {
-        let mut state = self.0.lock().unwrap();
-        state.session_lookups += 1;
-        if state.fail_lookup_at == Some(state.session_lookups) {
-            bail!("fixture session lookup unavailable");
+        let (lookup_number, wait, entered, panic_lookup) = {
+            let mut state = self.0.lock().unwrap();
+            state.session_lookups += 1;
+            let gated = state.lookup_wait_at == Some(state.session_lookups);
+            (
+                state.session_lookups,
+                gated.then(|| state.lookup_wait.clone()).flatten(),
+                gated.then(|| state.lookup_entered.clone()).flatten(),
+                std::mem::take(&mut state.panic_lookup_once),
+            )
+        };
+        // Panic outside the fixture mutex: cleanup-task failure must not also
+        // poison the canonical store used by the following explicit retry.
+        assert!(!panic_lookup, "fixture cleanup lookup panicked");
+        if let Some(wait) = wait {
+            if let Some(entered) = entered {
+                entered.add_permits(1);
+            }
+            wait.acquire().await?.forget();
+        }
+        let state = self.0.lock().unwrap();
+        if state.fail_lookup || state.fail_lookup_at == Some(lookup_number) {
+            if let Some(signal) = &state.lookup_failed {
+                signal.add_permits(1);
+            }
+            return Err(anyhow::Error::new(CleanupFault(
+                state
+                    .lookup_failure_text
+                    .unwrap_or("fixture session lookup unavailable"),
+            )));
         }
         Ok(state
             .task
@@ -261,6 +329,9 @@ impl GoalTaskRegistry for Registry {
         state.goal = Some(goal);
         state.terminal_reason = None;
         state.transitions.push("start");
+        if state.gate_admitted_projection {
+            state.lookup_wait_at = Some(state.session_lookups + 1);
+        }
         Ok(GoalTransitionResult::Applied)
     }
     async fn pause_session_goal(
@@ -270,6 +341,73 @@ impl GoalTaskRegistry for Registry {
         epoch: i64,
         pause: GoalPauseState,
     ) -> Result<GoalTransitionResult> {
+        let injected_winner = {
+            let mut state = self.0.lock().unwrap();
+            state.pause_calls += 1;
+            if state.fail_pause {
+                if let Some(signal) = &state.pause_failed {
+                    signal.add_permits(1);
+                }
+                return Err(anyhow::Error::new(CleanupFault(
+                    "fixture cleanup pause unavailable",
+                )));
+            }
+            let winner = state.pause_winner.take();
+            if winner.is_none()
+                && let Some(result) = state.pause_result
+            {
+                return Ok(result);
+            }
+            if pause.reason == zeroclaw_goal::GoalPauseReason::DaemonRestart
+                && std::mem::take(&mut state.fail_restart_pause_once)
+            {
+                if state.fail_lookup_after_restart_pause {
+                    state.fail_lookup_at = Some(state.session_lookups + 1);
+                }
+                if let Some(signal) = &state.restart_pause_failed {
+                    signal.add_permits(1);
+                }
+                bail!("fixture restart pause write failed");
+            }
+            winner.map(|winner| {
+                (
+                    winner,
+                    state.pause_result.unwrap_or(GoalTransitionResult::Stale),
+                )
+            })
+        };
+        if let Some((winner, result)) = injected_winner {
+            assert_eq!(
+                self.guarded(id, session, epoch, |state| {
+                    match winner {
+                        PauseWinner::Pause(pause) => {
+                            let task = state.task.as_mut().unwrap();
+                            task.status = TaskStatus::Paused;
+                            task.execution_epoch += 1;
+                            let goal = state.goal.as_mut().unwrap();
+                            goal.pause_reason = Some(pause.reason);
+                            goal.pause_description = pause.description;
+                            goal.blockers = pause.blockers;
+                            state.transitions.push("pause");
+                        }
+                        PauseWinner::Finish(status) => {
+                            let task = state.task.as_mut().unwrap();
+                            task.status = status;
+                            task.execution_epoch += 1;
+                            state.terminal_reason = Some("fixture competing winner".into());
+                            state.transitions.push("finish");
+                        }
+                        PauseWinner::Delete => {
+                            state.task = None;
+                            state.goal = None;
+                            state.transitions.push("delete");
+                        }
+                    }
+                }),
+                GoalTransitionResult::Applied
+            );
+            return Ok(result);
+        }
         Ok(self.guarded(id, session, epoch, |state| {
             let task = state.task.as_mut().unwrap();
             assert_eq!(task.status, TaskStatus::Running);
@@ -299,6 +437,9 @@ impl GoalTaskRegistry for Registry {
             task.owner_boot_id = boot.into();
             state.goal.as_mut().unwrap().pause_reason = None;
             state.transitions.push("resume");
+            if state.gate_admitted_projection {
+                state.lookup_wait_at = Some(state.session_lookups + 1);
+            }
         }))
     }
     async fn finish_session_goal(
@@ -309,11 +450,27 @@ impl GoalTaskRegistry for Registry {
         status: TaskStatus,
         error: Option<String>,
     ) -> Result<GoalTransitionResult> {
-        {
+        let (wait, entered) = {
             let mut state = self.0.lock().unwrap();
             state.finish_calls += 1;
+            let gated = state.finish_wait_at == Some(state.finish_calls);
+            (
+                gated.then(|| state.finish_wait.clone()).flatten(),
+                gated.then(|| state.finish_entered.clone()).flatten(),
+            )
+        };
+        if let Some(wait) = wait {
+            if let Some(entered) = entered {
+                entered.add_permits(1);
+            }
+            wait.acquire().await?.forget();
+        }
+        {
+            let mut state = self.0.lock().unwrap();
             if state.fail_finish || std::mem::take(&mut state.fail_finish_once) {
-                bail!("fixture lifecycle settlement unavailable");
+                return Err(anyhow::Error::new(CleanupFault(
+                    "fixture lifecycle settlement unavailable",
+                )));
             }
         }
         Ok(self.guarded(id, session, epoch, |state| {
@@ -331,6 +488,7 @@ impl GoalTaskRegistry for Registry {
         _epoch: i64,
         _pending: &str,
     ) -> Result<GoalTransitionResult> {
+        self.0.lock().unwrap().pending_admissions += 1;
         bail!("fixture driver makes no physical provider attempt")
     }
     async fn settle_pending_operation(
@@ -342,6 +500,7 @@ impl GoalTaskRegistry for Registry {
         accounting: GoalAccountingState,
     ) -> Result<GoalTransitionResult> {
         let mut state = self.0.lock().unwrap();
+        state.accounting_settlements += 1;
         let Some(task) = state.task.as_ref() else {
             return Ok(GoalTransitionResult::Missing);
         };
@@ -388,6 +547,12 @@ impl GoalTaskRegistry for Registry {
         epoch: i64,
     ) -> Result<GoalTransitionResult> {
         let mut state = self.0.lock().unwrap();
+        state.delete_calls += 1;
+        if state.fail_delete {
+            return Err(anyhow::Error::new(CleanupFault(
+                "fixture cleanup delete unavailable",
+            )));
+        }
         let Some(task) = state.task.as_ref() else {
             return Ok(GoalTransitionResult::Missing);
         };
@@ -401,6 +566,62 @@ impl GoalTaskRegistry for Registry {
         state.task = None;
         state.goal = None;
         Ok(GoalTransitionResult::Applied)
+    }
+}
+
+#[tokio::test]
+async fn competing_pause_winners_are_visible_after_a_rejected_transition() {
+    let operator_pause = || GoalPauseState {
+        reason: zeroclaw_goal::GoalPauseReason::OperatorPaused,
+        description: None,
+        blockers: vec![],
+    };
+    for rejected in [GoalTransitionResult::Stale, GoalTransitionResult::Missing] {
+        for winner_status in [Some(TaskStatus::Paused), Some(TaskStatus::Completed), None] {
+            let registry = Registry::default();
+            registry.seed("fixture-session", TaskStatus::Running);
+            {
+                let mut state = registry.0.lock().unwrap();
+                state.pause_result = Some(rejected);
+                state.pause_winner = Some(match winner_status {
+                    Some(TaskStatus::Paused) => PauseWinner::Pause(operator_pause()),
+                    Some(status) => PauseWinner::Finish(status),
+                    None => PauseWinner::Delete,
+                });
+            }
+            assert_eq!(
+                registry
+                    .pause_session_goal("fixture-goal", "fixture-session", 1, operator_pause())
+                    .await
+                    .unwrap(),
+                rejected
+            );
+            let state = registry.0.lock().unwrap();
+            assert_eq!(state.task.as_ref().map(|task| task.status), winner_status);
+            if let Some(task) = &state.task {
+                assert_eq!(task.execution_epoch, 2);
+                if task.status == TaskStatus::Paused {
+                    assert_eq!(
+                        state.goal.as_ref().unwrap().pause_reason,
+                        Some(operator_pause().reason)
+                    );
+                    assert_eq!(state.transitions, ["pause"]);
+                } else {
+                    assert_eq!(state.transitions, ["finish"]);
+                    assert_eq!(
+                        state.terminal_reason.as_deref(),
+                        Some("fixture competing winner")
+                    );
+                }
+            } else {
+                assert!(state.goal.is_none());
+                assert_eq!(state.transitions, ["delete"]);
+            }
+            assert_eq!(state.pause_calls, 1);
+            assert!(state.pause_winner.is_none());
+            assert_eq!(state.pending_admissions, 0);
+            assert_eq!(state.accounting_settlements, 0);
+        }
     }
 }
 

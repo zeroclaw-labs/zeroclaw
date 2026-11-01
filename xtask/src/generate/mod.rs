@@ -10,6 +10,7 @@ pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
+pub mod release;
 pub mod review_docs;
 pub mod runtime_locales;
 pub mod setup_bat;
@@ -136,6 +137,11 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| flake::render_file(root, cur),
         },
         Surface {
+            name: "release-distributions",
+            file: ".github/workflows/release-stable-manual.yml",
+            render: release::render_file,
+        },
+        Surface {
             name: "docker-tags",
             file: "dev/ci/docker-tags.toml",
             render: |root, cur| docker_tags::render_file(root, cur),
@@ -148,7 +154,7 @@ fn registry() -> Vec<Surface> {
     ]
 }
 
-/// Dockerfile-family ARG default: ships the lean standard Dist selection,
+/// Dockerfile-family ARG default: ships the standard Dist selection,
 /// build-time overridable via --build-arg.
 fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     let body = container::render_features_arg(root, &Sel::Dist)?;
@@ -156,8 +162,8 @@ fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     container_base::splice_zones(root, &spliced)
 }
 
-/// Containerfile surface: standard image ships lean Dist; fat image ships All
-/// (kitchen sink). Selections, not literals.
+/// Containerfile surface: standard image ships Dist for minimal/full tools;
+/// fat image ships All (kitchen sink). Selections, not literals.
 fn containerfile_surface() -> ContainerSurface {
     ContainerSurface {
         file: "Containerfile",

@@ -123,6 +123,7 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
         "fresh_install"
     };
     ConfigStatusResult {
+        application: None,
         needs_quickstart: !ready,
         reason: reason.to_string(),
         has_partial_state,

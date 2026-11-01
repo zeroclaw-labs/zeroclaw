@@ -930,6 +930,7 @@ impl ModelProvider for CopilotModelProvider {
         let response = self
             .send_chat_request(messages, None, model, temperature)
             .await?;
+        crate::dispatch::accounting::observe_string_usage(response.usage.clone());
         Ok(response.text.unwrap_or_default())
     }
 
@@ -986,6 +987,52 @@ impl ::zeroclaw_api::attribution::Attributable for CopilotModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_copilot_request_and_text() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::Mutex as StdMutex;
+        let captured = Arc::new(StdMutex::new(None));
+        let capture = Arc::clone(&captured);
+        let app = Router::new().route("/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                *capture.lock().unwrap() = Some(body);
+                Json(serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8,"completion_tokens":3}}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = CopilotModelProvider::builder("test")
+            .github_token(None)
+            .build();
+        *provider.refresh_lock.lock().await = Some(CachedApiKey {
+            token: "fixture".into(),
+            api_endpoint: endpoint,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+        });
+        let dispatch = crate::dispatch::ProviderDispatch::new(Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let text = scope
+            .scope(dispatch.chat_with_system(Some("system"), "hello", "model", Some(0.4)))
+            .await
+            .unwrap();
+        let report = scope.take();
+        server.abort();
+        assert_eq!(text, "ok");
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let body = captured.lock().unwrap().take().unwrap();
+        assert_eq!(body["model"], "model");
+        assert_eq!(body["messages"][0]["content"], "system");
+        assert_eq!(body["messages"][1]["content"], "hello");
+        assert_eq!(body["temperature"], 0.4);
+    }
 
     #[test]
     fn new_without_token() {

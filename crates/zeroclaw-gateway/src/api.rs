@@ -1302,6 +1302,7 @@ pub async fn handle_api_cost(
                 "monthly_cost_usd": 0.0,
                 "total_tokens": 0,
                 "request_count": 0,
+                "rejected_records": 0,
                 "by_model": {},
                 "by_agent": {},
             }
@@ -2258,6 +2259,7 @@ pub async fn handle_api_session_abort(
 
 // ── Claude Code hook endpoint ────────────────────────────────────
 
+#[cfg(feature = "tool-claude-code-runner")]
 pub async fn handle_claude_code_hook(
     State(state): State<AppState>,
     Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,

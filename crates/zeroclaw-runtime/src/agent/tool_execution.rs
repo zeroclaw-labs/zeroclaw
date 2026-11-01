@@ -11,6 +11,7 @@ use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
 use zeroclaw_api::attribution::Attributable;
+use zeroclaw_api::tool::{GoalChildOperationError, ToolExecutionCancelled, ToolExecutionContext};
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
@@ -102,6 +103,7 @@ fn unavailable_tool_outcome(
         output: reason.clone(),
         success: false,
         error_reason: Some(reason),
+        terminal_error: None,
         duration,
         receipt: None,
         output_data: None,
@@ -132,6 +134,8 @@ pub struct ToolExecutionOutcome {
     /// post-execution log line, CLI progress) and, unlike this field, on the
     /// model-visible `output`.
     pub error_reason: Option<String>,
+    /// Original Goal child boundary failure, retained only for in-process control flow.
+    pub terminal_error: Option<anyhow::Error>,
     pub duration: Duration,
     /// Cryptographic HMAC receipt proving this tool actually executed.
     /// Present only when tool receipts are enabled in config.
@@ -225,6 +229,7 @@ pub(crate) async fn execute_one_tool(
             output: reason.clone(),
             success: false,
             error_reason: Some(reason),
+            terminal_error: None,
             duration,
             receipt: None,
             output_data: None,
@@ -285,24 +290,34 @@ pub(crate) async fn execute_one_tool(
             .await;
     }
 
-    let tool_future = tool
-        .execute(call_arguments.clone())
-        .instrument(tool_span.clone());
-    let execute = async {
-        if let Some(token) = cancellation_token {
-            tokio::select! {
-                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
-            }
-        } else {
-            Ok(tool_future.await)
-        }
+    let participating = crate::goal_accounting::GoalForegroundContext::is_participating();
+    let context = ToolExecutionContext::new(cancellation_token.cloned());
+    let context = if participating {
+        context.with_goal_foreground()
+    } else {
+        context
     };
+    let possible_child = participating && tool.may_invoke_agent_child(&call_arguments);
+    let execute = async {
+        let call = tool.execute_with_context(call_arguments.clone(), &context);
+        if possible_child {
+            context.scope_only(call).await
+        } else {
+            context.run(call).await
+        }
+    }
+    .instrument(tool_span.clone());
     let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
     } else {
         execute.await
-    }?;
+    };
+    if tool_result.as_ref().is_err_and(|error| {
+        !(participating && error.is::<GoalChildOperationError>())
+            && error.is::<ToolExecutionCancelled>()
+    }) {
+        return Err(ToolLoopCancelled.into());
+    }
 
     let outcome = {
         let _result_guard = tool_span.entered();
@@ -371,6 +386,7 @@ pub(crate) async fn execute_one_tool(
                         output_data: r.output.into_data(),
                         success: true,
                         error_reason: None,
+                        terminal_error: None,
                         duration,
                         receipt,
                     })
@@ -420,6 +436,7 @@ pub(crate) async fn execute_one_tool(
                         output: format!("Error: {model_visible}"),
                         success: false,
                         error_reason: Some(reason),
+                        terminal_error: None,
                         duration,
                         receipt: None,
                         attachments,
@@ -428,6 +445,7 @@ pub(crate) async fn execute_one_tool(
                 }
             }
             Err(e) => {
+                let is_goal_child_error = participating && e.is::<GoalChildOperationError>();
                 let duration = start.elapsed();
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -466,6 +484,7 @@ pub(crate) async fn execute_one_tool(
                     output: model_visible,
                     success: false,
                     error_reason: Some(reason),
+                    terminal_error: if is_goal_child_error { Some(e) } else { None },
                     duration,
                     receipt: None,
                     output_data: None,
@@ -563,6 +582,20 @@ pub(crate) async fn execute_tools_parallel(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<Vec<Option<ToolExecutionOutcome>>> {
+    if crate::goal_accounting::GoalForegroundContext::is_participating()
+        || ToolExecutionContext::current().is_some_and(|context| context.is_goal_foreground())
+    {
+        return execute_tools_sequential(
+            tool_calls,
+            dispatch,
+            meta,
+            observer,
+            cancellation_token,
+            receipt_generator,
+            event_tx,
+        )
+        .await;
+    }
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|call| {
@@ -652,7 +685,11 @@ pub(crate) async fn execute_tools_sequential(
             Err(e) if is_tool_loop_cancelled(&e) => break,
             Err(e) => return Err(e),
         };
+        let fatal = outcome.terminal_error.is_some();
         slots.push(Some(outcome));
+        if fatal {
+            break;
+        }
     }
 
     slots.resize_with(tool_calls.len(), || None);
@@ -662,15 +699,19 @@ pub(crate) async fn execute_tools_sequential(
 #[cfg(test)]
 mod tests {
     use super::{
-        Observer, ObserverEvent, ToolDispatchContext, execute_one_tool, resolved_tool_provenance,
+        Observer, ObserverEvent, ToolDispatchContext, ToolExecutionOutcome, TurnMeta,
+        execute_one_tool, is_tool_loop_cancelled, resolved_tool_provenance,
     };
     use crate::observability::noop::NoopObserver;
     use crate::observability::traits::ObserverMetric;
     use crate::tools::ActivatedToolSet;
+    use anyhow::Result;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use zeroclaw_api::tool::Tool;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    use zeroclaw_api::tool::{Tool, ToolExecutionContext};
 
     /// Minimal tool that records invocations. Used to verify that the
     /// poisoned-lock recovery path still resolves an activated tool and
@@ -2322,6 +2363,188 @@ mod tests {
         }
     }
 
+    struct GoalDispatchProbe {
+        calls: Arc<AtomicUsize>,
+    }
+    zeroclaw_api::mock_tool_attribution!(GoalDispatchProbe);
+
+    #[async_trait]
+    impl Tool for GoalDispatchProbe {
+        fn name(&self) -> &str {
+            "goal_dispatch_probe"
+        }
+        fn description(&self) -> &str {
+            "records Goal dispatch and returns a marked failure"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args.get("child").and_then(|v| v.as_bool()).unwrap_or(false)
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<zeroclaw_api::tool::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                ToolExecutionContext::current()
+                    .unwrap()
+                    .is_goal_foreground()
+            );
+            if args.get("fail").and_then(|v| v.as_bool()) == Some(true) {
+                return Err(
+                    anyhow::Error::new(zeroclaw_api::tool::ToolExecutionCancelled)
+                        .context(zeroclaw_api::tool::GoalChildOperationError),
+                );
+            }
+            Ok(zeroclaw_api::tool::ToolResult::ok("done"))
+        }
+        async fn execute_with_context(
+            &self,
+            args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> Result<zeroclaw_api::tool::ToolResult> {
+            context.scope_only(self.execute(args)).await
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_parallel_dispatch_preserves_marked_failure_and_stops_tail() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(GoalDispatchProbe {
+            calls: calls.clone(),
+        })];
+        let mut batch = vec![
+            parsed_tool_call("goal_dispatch_probe"),
+            parsed_tool_call("goal_dispatch_probe"),
+            parsed_tool_call("goal_dispatch_probe"),
+        ];
+        batch[1].arguments = serde_json::json!({"child": true, "fail": true});
+        let meta = TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "goal-dispatch",
+            channel_name: "test",
+        };
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let outcomes = context
+            .scope_only(super::execute_tools_parallel(
+                &batch,
+                dispatch,
+                &meta,
+                &NoopObserver,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(outcomes[0].as_ref().unwrap().success);
+        let failed = outcomes[1].as_ref().unwrap();
+        assert!(!failed.success);
+        let error = failed.terminal_error.as_ref().unwrap();
+        assert!(error.is::<zeroclaw_api::tool::GoalChildOperationError>());
+        assert!(error.is::<zeroclaw_api::tool::ToolExecutionCancelled>());
+        assert!(outcomes[2].is_none());
+    }
+
+    struct GoalDrainProbe {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    zeroclaw_api::mock_tool_attribution!(GoalDrainProbe);
+    #[async_trait]
+    impl Tool for GoalDrainProbe {
+        fn name(&self) -> &str {
+            "goal_drain_probe"
+        }
+        fn description(&self) -> &str {
+            "awaits cleanup after cancellation"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args["child"] == true
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<zeroclaw_api::tool::ToolResult> {
+            let context = ToolExecutionContext::current().unwrap();
+            self.entered.notify_one();
+            context.cancellation_token().unwrap().cancelled().await;
+            self.release.notified().await;
+            Err(
+                anyhow::Error::new(zeroclaw_api::tool::ToolExecutionCancelled)
+                    .context(zeroclaw_api::tool::GoalChildOperationError),
+            )
+        }
+        async fn execute_with_context(
+            &self,
+            args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> Result<zeroclaw_api::tool::ToolResult> {
+            context.scope_only(self.execute(args)).await
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_dispatch_awaits_child_cleanup_before_terminal_outcome() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(GoalDrainProbe {
+            entered: entered.clone(),
+            release: release.clone(),
+        })];
+        let token = CancellationToken::new();
+        let meta = TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "goal-drain",
+            channel_name: "test",
+        };
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let future = context.scope_only(execute_one_tool(
+            "goal_drain_probe",
+            serde_json::json!({"child": true}),
+            None,
+            dispatch,
+            &meta,
+            &NoopObserver,
+            Some(&token),
+            None,
+            None,
+        ));
+        let mut call = Box::pin(future);
+        tokio::select! {
+            () = entered.notified() => {},
+            result = &mut call => panic!("child completed before cancellation: {}", result.is_ok()),
+        }
+        token.cancel();
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(call.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.notify_one();
+        let outcome = call.await.unwrap();
+        assert!(
+            outcome
+                .terminal_error
+                .unwrap()
+                .is::<zeroclaw_api::tool::GoalChildOperationError>()
+        );
+    }
+
     fn supervised_risk_profile() -> RiskProfileConfig {
         RiskProfileConfig {
             level: AutonomyLevel::Supervised,
@@ -2574,5 +2797,300 @@ mod tests {
                 _ => panic!("expected an empty Plan event (clear)"),
             }
         }
+    }
+
+    struct TurnTokenProbe {
+        saw_turn_token: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for TurnTokenProbe {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-turn-token-probe"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TurnTokenProbe {
+        fn name(&self) -> &str {
+            "turn_token_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records whether the running turn's cancellation token is visible"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}, "required": []})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.saw_turn_token.lock().unwrap() = Some(
+                ToolExecutionContext::current()
+                    .and_then(|context| context.cancellation_token().cloned())
+                    .is_some(),
+            );
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: crate::tools::ToolOutput::from("probed"),
+                error: None,
+            })
+        }
+    }
+
+    async fn probe_turn_token(token: Option<&tokio_util::sync::CancellationToken>) -> bool {
+        let saw = Arc::new(Mutex::new(None));
+        let probe: Box<dyn Tool> = Box::new(TurnTokenProbe {
+            saw_turn_token: Arc::clone(&saw),
+        });
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![probe]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let outcome = execute_one_tool(
+            "turn_token_probe",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            token,
+            None,
+            None,
+        )
+        .await
+        .expect("probe executes");
+        assert!(outcome.success);
+        let seen = saw.lock().unwrap();
+        seen.expect("the probe ran")
+    }
+
+    #[tokio::test]
+    async fn tools_see_the_running_turn_token_only_while_the_turn_runs_with_one() {
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(probe_turn_token(Some(&token)).await);
+        assert!(!probe_turn_token(None).await);
+        assert!(
+            ToolExecutionContext::current().is_none(),
+            "the token must not leak past the tool execution"
+        );
+    }
+
+    async fn execute_context_test_tool(
+        name: &str,
+        args: serde_json::Value,
+        tools: Vec<Box<dyn Tool>>,
+        token: &CancellationToken,
+    ) -> Result<ToolExecutionOutcome> {
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools);
+        let meta = TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn",
+            channel_name: "test",
+        };
+        execute_one_tool(
+            name,
+            args,
+            None,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            Some(token),
+            None,
+            None,
+        )
+        .await
+    }
+
+    struct ContextChildProbe {
+        started: Arc<tokio::sync::Notify>,
+        child: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ContextChildProbe);
+
+    #[async_trait]
+    impl Tool for ContextChildProbe {
+        fn name(&self) -> &str {
+            "context_child_probe"
+        }
+        fn description(&self) -> &str {
+            "Starts token-bound child work"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            anyhow::bail!("context-aware entrypoint required")
+        }
+        async fn execute_with_context(
+            &self,
+            args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            assert_eq!(args["scope"], "fixed");
+            let token = context
+                .cancellation_token()
+                .expect("turn token")
+                .child_token();
+            *self.child.lock().unwrap() = Some(zeroclaw_spawn::spawn!(async move {
+                token.cancelled().await;
+            }));
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_context_dispatch_cancels_child_after_wrapper_future_is_dropped() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let child = Arc::new(Mutex::new(None));
+        let probe: Arc<dyn Tool> = Arc::new(ContextChildProbe {
+            started: Arc::clone(&started),
+            child: Arc::clone(&child),
+        });
+        let skill = crate::skills::SkillTool {
+            name: "child".into(),
+            description: "Context child".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: Default::default(),
+            target: Some("context_child_probe".into()),
+            locked_args: Default::default(),
+            timeout_secs: None,
+        };
+        let wrapped: Arc<dyn Tool> = Arc::new(crate::tools::skill_tool::SkillBuiltinTool::new(
+            "context",
+            &skill,
+            probe,
+            std::collections::HashMap::from([("scope".into(), "fixed".into())]),
+        ));
+        let name = wrapped.name().to_string();
+        let token = CancellationToken::new();
+        let turn = token.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            execute_context_test_tool(
+                &name,
+                serde_json::json!({"scope": "model override"}),
+                vec![Box::new(crate::tools::ArcToolRef(wrapped))],
+                &turn,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(is_tool_loop_cancelled(
+            &outcome.err().expect("cancelled dispatch")
+        ));
+        let child = child.lock().unwrap().take().expect("child was started");
+        tokio::time::timeout(Duration::from_secs(3), child)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_context_dispatch_cancellation_stops_shell_process_group() {
+        use crate::platform::NativeRuntime;
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let shell = crate::tools::shell::ShellTool::new(security, Arc::new(NativeRuntime::new()));
+        let token = CancellationToken::new();
+        let turn = token.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            execute_context_test_tool(
+                "shell",
+                serde_json::json!({"command": "sleep 30 & echo $! > child.pid; wait"}),
+                vec![Box::new(shell)],
+                &turn,
+            )
+            .await
+        });
+        let pid_path = workspace.path().join("child.pid");
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&pid_path).await
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell child started");
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(is_tool_loop_cancelled(
+            &outcome.err().expect("cancelled dispatch")
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                // SAFETY: signal zero probes this fixture's child PID without sending a signal.
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                #[cfg(target_os = "linux")]
+                if tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .await
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(") ")
+                            .map(|(_, tail)| tail.starts_with('Z'))
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled shell child stopped");
     }
 }

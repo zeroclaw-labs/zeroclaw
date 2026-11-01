@@ -367,6 +367,15 @@ async fn matrix_goal_stop_non_matrix_control_avoids_goal_lock() {
 
 /// Fail the predecessor through the ordinary model boundary, then hold a
 /// successor so the command's launch and cleanup can be observed separately.
+#[derive(Clone, Copy, Debug, Default)]
+enum GoalFailedFirstResponse {
+    #[default]
+    BareError,
+    CompleteEmpty,
+    MissingResponseUsage,
+    CompleteCandidate,
+}
+
 #[derive(Default)]
 struct GoalFailedPredecessorProvider {
     calls: std::sync::atomic::AtomicUsize,
@@ -374,7 +383,86 @@ struct GoalFailedPredecessorProvider {
     hold_first: std::sync::atomic::AtomicBool,
     first_entered: tokio::sync::Notify,
     first_release: tokio::sync::Notify,
-    succeed_first: std::sync::atomic::AtomicBool,
+    first_response: GoalFailedFirstResponse,
+}
+
+impl GoalFailedPredecessorProvider {
+    fn new(first_response: GoalFailedFirstResponse) -> Self {
+        Self {
+            first_response,
+            ..Self::default()
+        }
+    }
+}
+
+fn assert_failed_predecessor_ledger(
+    directory: &std::path::Path,
+    tracker: &zeroclaw_runtime::cost::CostTracker,
+    task_id: &str,
+    known_attempt: bool,
+    total_attempts: usize,
+) {
+    let ledger = match std::fs::read_to_string(directory.join("state/costs.jsonl")) {
+        Ok(ledger) => ledger,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => panic!("fixture ledger must remain readable: {error}"),
+    };
+    let records: Vec<zeroclaw_config::cost::CostRecord> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records.len(),
+        total_attempts,
+        "task {task_id}: one canonical writer"
+    );
+    assert!(
+        records.iter().all(|row| row.task_id.is_some()),
+        "no ordinary duplicate row"
+    );
+    let task_rows: Vec<_> = records
+        .iter()
+        .filter(|row| row.task_id.as_deref() == Some(task_id))
+        .collect();
+    assert_eq!(
+        task_rows.len(),
+        usize::from(known_attempt),
+        "task {task_id}"
+    );
+    for row in task_rows {
+        assert_eq!(row.provider_ref.as_deref(), Some("test-provider"));
+        assert_eq!(row.usage.model, "test-model");
+        assert_eq!(row.usage.input_tokens, 10);
+        assert_eq!(row.usage.output_tokens, 2);
+        assert_eq!(row.usage.total_tokens, 12);
+        assert_eq!(row.usage.cost_usd, 0.0);
+        assert_eq!(row.usage.unpriced_tokens, 12);
+        assert!(!row.usage.pricing_available);
+    }
+    let reopened = zeroclaw_runtime::cost::CostTracker::new(Default::default(), directory).unwrap();
+    for reader in [tracker, &reopened] {
+        assert_eq!(
+            reader
+                .get_strict_usage_totals_for_task_with_pricing(task_id)
+                .unwrap(),
+            if known_attempt {
+                (12, 0.0, false)
+            } else {
+                (0, 0.0, true)
+            },
+            "task {task_id}: incomplete accounting is asserted separately from its known lower bound"
+        );
+        let summary = reader.get_summary_for_task(task_id).unwrap();
+        assert_eq!(summary.request_count, usize::from(known_attempt));
+        assert_eq!(summary.total_tokens, if known_attempt { 12 } else { 0 });
+        assert_eq!(
+            reader
+                .get_summary_in_bounds(None, None)
+                .unwrap()
+                .request_count,
+            total_attempts
+        );
+    }
 }
 
 #[tokio::test]
@@ -416,13 +504,15 @@ async fn assert_matrix_goal_stop_order_and_bound(check_bound: bool) {
     let handle = ControlPlaneHandle::open(directory.path()).unwrap();
     let registry = handle.goal_store().unwrap();
     let channel = Arc::new(SendMessageRecordingChannel::matrix());
-    let provider = Arc::new(GoalFailedPredecessorProvider::default());
+    let provider = Arc::new(GoalFailedPredecessorProvider::new(
+        GoalFailedFirstResponse::CompleteCandidate,
+    ));
     provider.hold_first.store(true, Ordering::SeqCst);
-    provider.succeed_first.store(true, Ordering::SeqCst);
     let mut config = matrix_control_test_config();
     config.data_dir = directory.path().to_owned();
     config.goal.enabled = true;
     config.goal.verifier.model_provider = "custom.fixture".into();
+    config.providers.models.ensure("custom", "fixture").unwrap();
     config.reliability.provider_retries = 0;
     let mut context = test_runtime_ctx_with_config_agent_and_provider_ref(
         channel.clone(),
@@ -675,8 +765,31 @@ impl ModelProvider for GoalFailedPredecessorProvider {
                 if self.hold_first.load(std::sync::atomic::Ordering::SeqCst) {
                     self.first_release.notified().await;
                 }
-                if !self.succeed_first.load(std::sync::atomic::Ordering::SeqCst) {
-                    anyhow::bail!("scripted parent failure");
+                match self.first_response {
+                    GoalFailedFirstResponse::BareError => {
+                        anyhow::bail!("scripted parent failure");
+                    }
+                    GoalFailedFirstResponse::CompleteEmpty => {
+                        return Ok(zeroclaw_api::model_provider::ChatResponse {
+                            text: None,
+                            tool_calls: Vec::new(),
+                            usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                                input_tokens: Some(10),
+                                output_tokens: Some(2),
+                                ..Default::default()
+                            }),
+                            reasoning_content: None,
+                        });
+                    }
+                    GoalFailedFirstResponse::MissingResponseUsage => {
+                        return Ok(zeroclaw_api::model_provider::ChatResponse {
+                            text: Some("missing usage candidate".into()),
+                            tool_calls: Vec::new(),
+                            usage: None,
+                            reasoning_content: None,
+                        });
+                    }
+                    GoalFailedFirstResponse::CompleteCandidate => {}
                 }
             }
             1 => self.successor_release.notified().await,
@@ -704,7 +817,8 @@ async fn matrix_goal_pause_now_preserves_fenced_parent_error_and_failure_notice(
     {
         return;
     }
-    assert_matrix_fenced_parent_failure_delivery(false, false).await;
+    assert_matrix_fenced_parent_failure_delivery(false, GoalFailedFirstResponse::BareError, false)
+        .await;
 }
 
 #[tokio::test]
@@ -716,7 +830,8 @@ async fn matrix_goal_stop_preserves_fenced_parent_error_and_failure_notice() {
     {
         return;
     }
-    assert_matrix_fenced_parent_failure_delivery(true, false).await;
+    assert_matrix_fenced_parent_failure_delivery(true, GoalFailedFirstResponse::BareError, false)
+        .await;
 }
 
 #[tokio::test]
@@ -728,10 +843,87 @@ async fn matrix_goal_pause_now_preserves_unsettled_accounting_failure_notice() {
     {
         return;
     }
-    assert_matrix_fenced_parent_failure_delivery(false, true).await;
+    assert_matrix_fenced_parent_failure_delivery(
+        false,
+        GoalFailedFirstResponse::CompleteCandidate,
+        true,
+    )
+    .await;
 }
 
-async fn assert_matrix_fenced_parent_failure_delivery(stop: bool, unsettled: bool) {
+#[tokio::test]
+async fn matrix_goal_pause_now_preserves_complete_empty_operator_pause() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_pause_now_preserves_complete_empty_operator_pause
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_fenced_parent_failure_delivery(
+        false,
+        GoalFailedFirstResponse::CompleteEmpty,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_goal_stop_preserves_complete_empty_operator_pause() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_stop_preserves_complete_empty_operator_pause
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_fenced_parent_failure_delivery(
+        true,
+        GoalFailedFirstResponse::CompleteEmpty,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_goal_pause_now_preserves_missing_response_usage_failure() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_pause_now_preserves_missing_response_usage_failure
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_fenced_parent_failure_delivery(
+        false,
+        GoalFailedFirstResponse::MissingResponseUsage,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_goal_stop_preserves_missing_response_usage_failure() {
+    if matrix_goal_ingress_delegated_to_fresh_process(stringify!(
+        matrix_goal_stop_preserves_missing_response_usage_failure
+    ))
+    .await
+    {
+        return;
+    }
+    assert_matrix_fenced_parent_failure_delivery(
+        true,
+        GoalFailedFirstResponse::MissingResponseUsage,
+        false,
+    )
+    .await;
+}
+
+async fn assert_matrix_fenced_parent_failure_delivery(
+    stop: bool,
+    first_response: GoalFailedFirstResponse,
+    unsettled: bool,
+) {
     use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
     use zeroclaw_goal::{GoalResponse, GoalRuntime};
     use zeroclaw_runtime::{
@@ -744,17 +936,15 @@ async fn assert_matrix_fenced_parent_failure_delivery(stop: bool, unsettled: boo
     let handle = ControlPlaneHandle::open(directory.path()).unwrap();
     let registry = handle.goal_store().unwrap();
     let channel = Arc::new(SendMessageRecordingChannel::matrix());
-    let provider = Arc::new(GoalFailedPredecessorProvider::default());
+    let provider = Arc::new(GoalFailedPredecessorProvider::new(first_response));
     provider
         .hold_first
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    provider
-        .succeed_first
-        .store(unsettled, std::sync::atomic::Ordering::SeqCst);
     let mut config = matrix_control_test_config();
     config.data_dir = directory.path().to_owned();
     config.goal.enabled = true;
     config.goal.verifier.model_provider = "custom.fixture".into();
+    config.providers.models.ensure("custom", "fixture").unwrap();
     config.reliability.provider_retries = 0;
     let mut context = test_runtime_ctx_with_config_agent_and_provider_ref(
         channel.clone(),
@@ -806,12 +996,31 @@ async fn assert_matrix_fenced_parent_failure_delivery(stop: bool, unsettled: boo
     )
     .await
     .unwrap();
-    assert!(matches!(started.response(), GoalResponse::Started(_)));
+    let GoalResponse::Started(started_projection) = started.response() else {
+        panic!("fixture must start directly");
+    };
+    let predecessor_id = started_projection.task_id.clone();
+    let predecessor_epoch = started_projection.execution_epoch;
     goal_execution::deliver_matrix_goal_command(started, Some(channel.clone()), message.clone())
         .await;
     tokio::time::timeout(Duration::from_secs(3), provider.first_entered.notified())
         .await
         .expect("the actual Matrix parent provider call must be held");
+    let admitted = registry
+        .get_goal_task(&predecessor_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let pending_call_id = admitted
+        .pending_call_id
+        .clone()
+        .expect("held physical attempt must own its pending slot");
+    assert_eq!(admitted.pending_call_epoch, Some(predecessor_epoch));
+    assert_eq!(
+        admitted.accounting_state,
+        zeroclaw_goal::GoalAccountingState::Complete
+    );
+    assert_failed_predecessor_ledger(directory.path(), &tracker, &predecessor_id, false, 0);
     if unsettled {
         // Refuse only the ordinary operation's settlement. The drainer can
         // still clear the exact pending slot as outcome-unknown, preserving
@@ -875,6 +1084,16 @@ async fn assert_matrix_fenced_parent_failure_delivery(stop: bool, unsettled: boo
             TaskStatus::Paused
         );
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let held = registry
+            .get_goal_task(&predecessor_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held.pending_call_id.as_deref(),
+            Some(pending_call_id.as_str())
+        );
+        assert_eq!(held.pending_call_epoch, Some(predecessor_epoch));
     };
     let result = std::panic::AssertUnwindSafe(outcome).catch_unwind().await;
     provider.first_release.notify_one();
@@ -885,100 +1104,336 @@ async fn assert_matrix_fenced_parent_failure_delivery(stop: bool, unsettled: boo
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
-    let failed = registry
+    let settled = registry
         .current_goal_for_session(&key)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(failed.status, TaskStatus::Failed);
-    assert_eq!(
-        registry
-            .terminal_reason_for_session_goal(&failed.id, &key)
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(if unsettled {
-            "accounting_outcome_unknown"
-        } else {
-            "executor_failed"
-        })
+    let goal = registry.get_goal_task(&settled.id).await.unwrap().unwrap();
+    let reason = registry
+        .terminal_reason_for_session_goal(&settled.id, &key)
+        .await
+        .unwrap();
+    let replies = channel.sent_messages.lock().await;
+    let diagnostic = format!(
+        "mode={first_response:?}, task={}, epoch={}, status={:?}, accounting={:?}, pending={:?}/{:?}, reason={reason:?}, sent={:?}",
+        settled.id,
+        settled.execution_epoch,
+        settled.status,
+        goal.accounting_state,
+        goal.pending_call_id,
+        goal.pending_call_epoch,
+        replies
+            .iter()
+            .map(|row| row.content.as_str())
+            .collect::<Vec<_>>()
     );
-    if unsettled {
-        let goal = registry.get_goal_task(&failed.id).await.unwrap().unwrap();
-        assert_eq!(
-            goal.accounting_state,
+    let complete_empty = matches!(first_response, GoalFailedFirstResponse::CompleteEmpty);
+    let missing = matches!(
+        first_response,
+        GoalFailedFirstResponse::MissingResponseUsage
+    );
+    let known_attempt = complete_empty || unsettled;
+    assert_eq!(settled.id, predecessor_id, "{diagnostic}");
+    assert_eq!(
+        settled.execution_epoch,
+        predecessor_epoch + if complete_empty { 1 } else { 2 },
+        "{diagnostic}"
+    );
+    assert_eq!(
+        settled.status,
+        if complete_empty {
+            TaskStatus::Paused
+        } else {
+            TaskStatus::Failed
+        },
+        "{diagnostic}"
+    );
+    assert_eq!(
+        goal.accounting_state,
+        if complete_empty {
+            zeroclaw_goal::GoalAccountingState::Complete
+        } else if missing {
+            zeroclaw_goal::GoalAccountingState::Missing
+        } else {
             zeroclaw_goal::GoalAccountingState::OutcomeUnknown
-        );
-        assert!(goal.pending_call_id.is_none());
-        assert!(goal.pending_call_epoch.is_none());
-        assert_eq!(tracker.get_usage_totals_for_task(&failed.id).unwrap().0, 12);
-        let ledger = std::fs::read_to_string(directory.path().join("state/costs.jsonl")).unwrap();
-        let records: Vec<zeroclaw_config::cost::CostRecord> = ledger
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        },
+        "{diagnostic}"
+    );
+    assert!(
+        goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none(),
+        "{diagnostic}"
+    );
+    if complete_empty {
         assert_eq!(
-            records
-                .iter()
-                .filter(|row| row.task_id.as_deref() == Some(failed.id.as_str()))
-                .count(),
-            1,
-            "settlement failure and drainer must not duplicate the known physical attempt"
+            goal.pause_reason,
+            Some(zeroclaw_goal::GoalPauseReason::OperatorPaused),
+            "{diagnostic}"
+        );
+        assert!(
+            reason.is_none(),
+            "winning pause has no terminal failure reason; {diagnostic}"
+        );
+    } else {
+        assert_eq!(
+            reason.as_deref(),
+            Some(if missing {
+                "accounting_missing_or_invalid"
+            } else {
+                "accounting_outcome_unknown"
+            }),
+            "{diagnostic}"
         );
     }
+    assert_failed_predecessor_ledger(
+        directory.path(),
+        &tracker,
+        &predecessor_id,
+        known_attempt,
+        usize::from(known_attempt),
+    );
+    assert!(
+        context
+            .session_store
+            .as_ref()
+            .unwrap()
+            .load(&key)
+            .iter()
+            .all(|row| row.role != "assistant"),
+        "no failed parent candidate may append; {diagnostic}"
+    );
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    let replies = channel.sent_messages.lock().await;
-    let failure = channel_runtime_cli_string(if unsettled {
-        "goal-mode-failure-outcome-unknown"
+    let failure = channel_runtime_cli_string(if missing {
+        "goal-mode-failure-accounting"
     } else {
-        "goal-mode-failure-executor"
+        "goal-mode-failure-outcome-unknown"
     });
-    let original_text = if unsettled {
+    let semantic_cause = "provider completed without final text or tool calls";
+    let original_cause = if complete_empty {
+        semantic_cause
+    } else if unsettled {
         "fixture pending settlement unavailable"
+    } else if missing {
+        "Goal accounting is missing after a durable usage settlement"
     } else {
         "scripted parent failure"
     };
-    let original_error = anyhow::Error::msg(original_text);
-    let original_reply = channel_user_error_message(
-        &original_error,
-        &zeroclaw_providers::sanitize_api_error(original_text),
+    let unsettled_diagnostic =
+        "fixture pending settlement unavailable: Error code 1811: constraint failed";
+    let unsettled_hint = channel_user_error_message(
+        &anyhow::Error::msg(unsettled_diagnostic),
+        unsettled_diagnostic,
     );
-    let late = channel_runtime_cli_string("goal-mode-terminal");
+    let unsettled_original = format!("{unsettled_hint}\n{unsettled_diagnostic}");
+    let original_rows: Vec<_> = replies
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            if unsettled {
+                row.content == unsettled_original
+            } else {
+                row.content.starts_with("⚠️ Error: ")
+                    && row.content.contains(original_cause)
+                    && !row
+                        .content
+                        .contains("Goal failure lost its execution fence")
+            }
+        })
+        .collect();
+    assert_eq!(
+        original_rows.len(),
+        1,
+        "ordinary native error exactly once; {diagnostic}"
+    );
+    let (original, original_row) = original_rows[0];
+    assert_eq!(
+        original_row.content.matches(original_cause).count(),
+        1,
+        "{diagnostic}"
+    );
+    if unsettled {
+        assert_eq!(
+            unsettled_hint,
+            "I'm temporarily unable to reach my AI backend — please try again in a moment.",
+            "the ordinary unavailable hint retains its native role; {diagnostic}"
+        );
+        assert_eq!(original_row.content, unsettled_original, "{diagnostic}");
+    }
+    if complete_empty {
+        let native = zeroclaw_runtime::agent::terminal_completion_error_message(
+            &anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion),
+            None,
+        )
+        .unwrap();
+        assert!(
+            original_row
+                .content
+                .starts_with(&format!("⚠️ Error: {native}")),
+            "{diagnostic}"
+        );
+    } else if !unsettled {
+        let state = if missing {
+            "missing"
+        } else {
+            "outcome-unknown"
+        };
+        let issue = if missing {
+            "missing usage"
+        } else {
+            "usage outcome unknown"
+        };
+        let settlement = format!(
+            "Goal accounting is {state} after a durable usage settlement; no further Goal model call will be admitted: accounting issue for actual provider `test-provider`, model `test-model`: {issue}"
+        );
+        assert!(original_row.content.contains(&settlement), "{diagnostic}");
+        assert!(
+            !original_row
+                .content
+                .contains("fixture pending settlement unavailable"),
+            "{diagnostic}"
+        );
+        if missing {
+            assert!(
+                !original_row.content.contains("scripted parent failure"),
+                "{diagnostic}"
+            );
+        }
+    }
+    let late = channel_runtime_cli_string(if complete_empty {
+        "goal-mode-paused"
+    } else {
+        "goal-mode-terminal"
+    });
     let ack = replies
         .iter()
         .position(|row| row.content == pending)
         .unwrap();
-    let original = replies
-        .iter()
-        .position(|row| row.content == original_reply)
-        .unwrap_or_else(|| {
-            panic!(
-                "ordinary core error must remain visible; emitted contents: {:?}",
-                replies
-                    .iter()
-                    .map(|row| row.content.as_str())
-                    .collect::<Vec<_>>()
-            )
-        });
-    let notice = replies
-        .iter()
-        .position(|row| row.content == failure)
-        .expect("the closed admission checkpoint must not suppress the failure notice");
     let terminal = replies
         .iter()
         .position(|row| row.content.starts_with(&late))
-        .expect("late terminal response must follow failure delivery");
-    assert!(ack < original && original < notice && notice < terminal);
+        .unwrap_or_else(|| {
+            panic!("late lifecycle response must follow ordinary error; {diagnostic}")
+        });
+    assert!(ack < original && original < terminal, "{diagnostic}");
     assert_eq!(
-        replies.iter().filter(|row| row.content == failure).count(),
-        1
+        replies.iter().filter(|row| row.content == pending).count(),
+        1,
+        "{diagnostic}"
     );
     assert_eq!(
         replies
             .iter()
-            .filter(|row| row.content == original_reply)
+            .filter(|row| row.content.starts_with(&late))
             .count(),
-        1
+        1,
+        "{diagnostic}"
+    );
+    if complete_empty {
+        assert!(
+            !replies.iter().any(|row| row
+                .content
+                .contains("Goal failure lost its execution fence")),
+            "{diagnostic}"
+        );
+        for key in [
+            "goal-mode-failure-accounting",
+            "goal-mode-failure-pricing",
+            "goal-mode-failure-outcome-unknown",
+            "goal-mode-failure-executor",
+            "goal-mode-failure-executor-start",
+            "goal-mode-failure-agent-operation",
+            "goal-mode-failure-tool-results-unpaired",
+            "goal-mode-failure-empty-agent-response",
+            "goal-mode-failure-verifier-operation",
+            "goal-mode-failure-verifier-response",
+            "goal-mode-failure-candidate-persistence",
+            "goal-mode-failure-other",
+        ] {
+            assert!(
+                !replies
+                    .iter()
+                    .any(|row| row.content == channel_runtime_cli_string(key)),
+                "no Failed notice for the winning pause; {diagnostic}"
+            );
+        }
+    } else {
+        let notices: Vec<_> = replies
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.content == failure)
+            .collect();
+        assert_eq!(notices.len(), 1, "{diagnostic}");
+        let parked: Vec<_> = replies
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.content
+                    .contains("Goal failure lost its execution fence")
+            })
+            .collect();
+        assert_eq!(parked.len(), 1, "{diagnostic}");
+        assert!(
+            parked[0].1.content.starts_with("⚠️ Error: "),
+            "{diagnostic}"
+        );
+        if unsettled {
+            assert_eq!(
+                parked[0].1.content,
+                format!(
+                    "⚠️ Error: Goal failure lost its execution fence: Goal parent operation failed: {unsettled_diagnostic}"
+                ),
+                "the handed aggregate has its own exact warning role; {diagnostic}"
+            );
+            assert_eq!(
+                parked[0].1.content.matches(unsettled_diagnostic).count(),
+                1,
+                "aggregate retains the complete original diagnostic once, not its hint; {diagnostic}"
+            );
+        } else {
+            assert!(
+                parked[0]
+                    .1
+                    .content
+                    .contains(&original_row.content["⚠️ Error: ".len()..]),
+                "aggregate must retain the complete original diagnostic; {diagnostic}"
+            );
+        }
+        assert_eq!(
+            parked[0]
+                .1
+                .content
+                .matches("Goal failure lost its execution fence")
+                .count(),
+            1,
+            "{diagnostic}"
+        );
+        assert!(
+            original < parked[0].0 && parked[0].0 < notices[0].0 && notices[0].0 < terminal,
+            "{diagnostic}"
+        );
+    }
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|row| row.content.starts_with("⚠️ Error: "))
+            .count(),
+        if complete_empty || unsettled { 1 } else { 2 },
+        "warning roles are distinct from the ordinary backend hint; {diagnostic}"
+    );
+    if unsettled {
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|row| row.content.starts_with(&unsettled_hint))
+                .count(),
+            1,
+            "exactly one ordinary backend-hint row; {diagnostic}"
+        );
+    }
+    assert_eq!(
+        replies.len(),
+        if complete_empty { 4 } else { 6 },
+        "fixed lifecycle and native-error reply count; {diagnostic}"
     );
     assert!(
         replies
@@ -1039,7 +1494,7 @@ async fn matrix_goal_start_waits_for_worker_tail_original_and_failure_notice() {
     assert_matrix_failure_delivery_behind_ordinary_lane(MatrixFailureDeliveryCase::TailStart).await;
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum MatrixFailureDeliveryCase {
     Drainer,
     DrainerStart,
@@ -1158,7 +1613,14 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
     let handle = ControlPlaneHandle::open(directory.path()).unwrap();
     let registry = handle.goal_store().unwrap();
     let channel = Arc::new(SendMessageRecordingChannel::matrix());
-    let provider = Arc::new(GoalOrdinaryLaneFailureProvider::default());
+    let provider = Arc::new(GoalOrdinaryLaneFailureProvider {
+        goal: GoalFailedPredecessorProvider::new(if worker_tail {
+            GoalFailedFirstResponse::CompleteEmpty
+        } else {
+            GoalFailedFirstResponse::BareError
+        }),
+        ..Default::default()
+    });
     provider
         .goal
         .hold_first
@@ -1167,6 +1629,7 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
     config.data_dir = directory.path().to_owned();
     config.goal.enabled = true;
     config.goal.verifier.model_provider = "custom.fixture".into();
+    config.providers.models.ensure("custom", "fixture").unwrap();
     config.reliability.provider_retries = 0;
     config
         .channels
@@ -1188,16 +1651,17 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
     let mut message = matrix_msg("@fixture:example.test");
     let key = runtime_conversation_history_key(&context, &message);
     foreground::install_goal_test_control_plane(&context.persist_locks, &key, handle.clone());
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig::default(),
+            directory.path(),
+        )
+        .unwrap(),
+    );
     let accounting = Arc::new(
         RuntimeGoalOperationAccountingFactory::new(
             registry.clone(),
-            Arc::new(
-                CostTracker::new(
-                    zeroclaw_config::schema::CostConfig::default(),
-                    directory.path(),
-                )
-                .unwrap(),
-            ),
+            tracker.clone(),
             context.agent_alias.to_string(),
             Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
         )
@@ -1223,6 +1687,11 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
     )
     .await
     .unwrap();
+    let GoalResponse::Started(predecessor) = started.response() else {
+        panic!("fixture must start directly");
+    };
+    let predecessor_id = predecessor.task_id.clone();
+    let predecessor_epoch = predecessor.execution_epoch;
     goal_execution::deliver_matrix_goal_command(started, Some(channel.clone()), message.clone())
         .await;
     tokio::time::timeout(
@@ -1231,6 +1700,18 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
     )
     .await
     .unwrap();
+    let admitted = registry
+        .get_goal_task(&predecessor_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(admitted.pending_call_id.is_some());
+    assert_eq!(admitted.pending_call_epoch, Some(predecessor_epoch));
+    assert_eq!(
+        admitted.accounting_state,
+        zeroclaw_goal::GoalAccountingState::Complete
+    );
+    assert_failed_predecessor_ledger(directory.path(), &tracker, &predecessor_id, false, 0);
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
     let router = AgentRouter::single(context.clone());
     let mut dispatch = zeroclaw_spawn::spawn!(run_message_dispatch_loop(receiver, router, 4));
@@ -1246,7 +1727,7 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
             .is_err()
     );
     let mut delivery = if worker_tail {
-        // Refuse the first terminal write only. The worker's fallback commits
+        // Reject the targeted engine transition. The worker's fallback commits
         // Failed and parks this Goal-only original for its native tail delivery.
         rusqlite::Connection::open(directory.path().join("control_plane.db"))
             .unwrap()
@@ -1285,10 +1766,15 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
             }))
         }
     };
-    let failure = channel_runtime_cli_string("goal-mode-failure-executor");
+    let failure = channel_runtime_cli_string(if worker_tail {
+        "goal-mode-failure-executor"
+    } else {
+        "goal-mode-failure-outcome-unknown"
+    });
     let queued_reply = render_goal_response(&GoalResponse::Queued(GoalQueuedControl::Start));
     let mut successor_delivery = None;
     let mut delivery_waited_for_ordinary = false;
+    let mut predecessor_diagnostic = String::new();
     let outcome = async {
         let pending = channel_runtime_cli_string("goal-mode-pause-pending");
         if !worker_tail && !ack_failure {
@@ -1324,6 +1810,87 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
         })
         .await
         .unwrap();
+        let failed = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = registry
+            .get_goal_task(&predecessor_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let reason = registry
+            .terminal_reason_for_session_goal(&predecessor_id, &key)
+            .await
+            .unwrap();
+        let sent = channel.sent_messages.lock().await;
+        let diagnostic = format!(
+            "case={case:?}, task={}, epoch={}, status={:?}, accounting={:?}, pending={:?}/{:?}, reason={reason:?}, sent={:?}",
+            failed.id,
+            failed.execution_epoch,
+            failed.status,
+            goal.accounting_state,
+            goal.pending_call_id,
+            goal.pending_call_epoch,
+            sent.iter()
+                .map(|row| row.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        predecessor_diagnostic = diagnostic.clone();
+        assert_eq!(failed.id, predecessor_id, "{diagnostic}");
+        assert_eq!(
+            failed.execution_epoch,
+            predecessor_epoch + if worker_tail { 1 } else { 2 },
+            "{diagnostic}"
+        );
+        assert_eq!(
+            goal.accounting_state,
+            if worker_tail {
+                zeroclaw_goal::GoalAccountingState::Complete
+            } else {
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+            },
+            "{diagnostic}"
+        );
+        assert!(
+            goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none(),
+            "{diagnostic}"
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some(if worker_tail {
+                "executor_failed"
+            } else {
+                "accounting_outcome_unknown"
+            }),
+            "{diagnostic}"
+        );
+        assert_failed_predecessor_ledger(
+            directory.path(),
+            &tracker,
+            &predecessor_id,
+            worker_tail,
+            usize::from(worker_tail),
+        );
+        assert!(
+            context
+                .session_store
+                .as_ref()
+                .unwrap()
+                .load(&key)
+                .iter()
+                .all(|row| row.role != "assistant"),
+            "no failed parent candidate append; {diagnostic}"
+        );
+        assert!(
+            !sent.iter().any(|row| row
+                .content
+                .contains("Goal failure lost its execution fence")
+                || row.content.contains("scripted Goal finish failure")),
+            "Goal-only aggregate must wait for ordinary lane; {diagnostic}"
+        );
+        drop(sent);
         if ack_failure {
             // Native publication may wait for the ordinary lane, but must not
             // keep the conversation's independent command authority hostage.
@@ -1486,7 +2053,7 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("executor_failed")
+            Some("accounting_outcome_unknown")
         );
         assert!(
             foreground::goal_supervisor_slot(&context.persist_locks, &key)
@@ -1515,6 +2082,11 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
         .await
     } else {
         Ok(())
+    };
+    let successor_task = if start_successor && result.is_ok() && successor_admission.is_ok() {
+        Some(registry.current_goal_for_session(&key).await)
+    } else {
+        None
     };
     drop(sender);
     let disposing = supervisor.clone();
@@ -1547,28 +2119,118 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
         std::panic::resume_unwind(panic);
     }
     successor_admission.expect("the successor must reach its provider before fixture disposal");
-    let replies = channel.sent_messages.lock().await;
-    let original_error = anyhow::Error::msg("scripted parent failure");
-    let original_reply = channel_user_error_message(
-        &original_error,
-        &zeroclaw_providers::sanitize_api_error("scripted parent failure"),
+    let total_attempts = usize::from(worker_tail) + usize::from(start_successor);
+    assert_failed_predecessor_ledger(
+        directory.path(),
+        &tracker,
+        &predecessor_id,
+        worker_tail,
+        total_attempts,
     );
-    let original = replies
+    if let Some(successor) = successor_task {
+        let successor = successor.unwrap().unwrap();
+        assert_ne!(
+            successor.id, predecessor_id,
+            "queued Start must create a distinct Goal"
+        );
+        assert_eq!(successor.status, TaskStatus::Running);
+        let successor_id = successor.id;
+        assert_failed_predecessor_ledger(
+            directory.path(),
+            &tracker,
+            &successor_id,
+            true,
+            total_attempts,
+        );
+        assert!(
+            registry
+                .get_goal_task(&successor_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "hard disposal removes control state, not its canonical ledger rows"
+        );
+    }
+    let replies = channel.sent_messages.lock().await;
+    let diagnostic = format!(
+        "{predecessor_diagnostic}, final sent={:?}",
+        replies
+            .iter()
+            .map(|row| row.content.as_str())
+            .collect::<Vec<_>>()
+    );
+    let semantic_cause = "provider completed without final text or tool calls";
+    let original_cause = if worker_tail {
+        semantic_cause
+    } else {
+        "scripted parent failure"
+    };
+    let original_rows: Vec<_> = replies
         .iter()
-        .position(|row| row.content == original_reply)
-        .unwrap_or_else(|| {
-            panic!(
-                "the ordinary original error must remain visible; emitted contents: {:?}",
-                replies
-                    .iter()
-                    .map(|row| row.content.as_str())
-                    .collect::<Vec<_>>()
-            )
-        });
+        .enumerate()
+        .filter(|(_, row)| {
+            row.content.starts_with("⚠️ Error: ")
+                && row.content.contains(original_cause)
+                && !row
+                    .content
+                    .contains("Goal failure lost its execution fence")
+                && !row.content.contains("scripted Goal finish failure")
+        })
+        .collect();
+    assert_eq!(
+        original_rows.len(),
+        1,
+        "one ordinary native error; {diagnostic}"
+    );
+    let (original, original_row) = original_rows[0];
+    assert_eq!(
+        original_row.content.matches(original_cause).count(),
+        1,
+        "{diagnostic}"
+    );
+    let semantic_heading = zeroclaw_runtime::agent::terminal_completion_error_message(
+        &anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion),
+        None,
+    )
+    .unwrap();
+    if worker_tail {
+        assert!(
+            original_row
+                .content
+                .starts_with(&format!("⚠️ Error: {semantic_heading}")),
+            "{diagnostic}"
+        );
+    } else {
+        assert!(original_row.content.contains("Goal accounting is outcome-unknown after a durable usage settlement; no further Goal model call will be admitted: accounting issue for actual provider `test-provider`, model `test-model`: usage outcome unknown"), "{diagnostic}");
+    }
     let ordinary = replies
         .iter()
         .position(|row| row.content == "ordinary lane finished")
-        .unwrap();
+        .unwrap_or_else(|| panic!("ordinary lane must complete; {diagnostic}"));
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|row| row.content == "ordinary lane finished")
+            .count(),
+        1,
+        "{diagnostic}"
+    );
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|row| row.content == "unrelated conversation finished")
+            .count(),
+        1,
+        "{diagnostic}"
+    );
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|row| row.content.starts_with("⚠️ Error: "))
+            .count(),
+        if reset_session { 1 } else { 2 },
+        "one original and only the owed transition aggregate; {diagnostic}"
+    );
     if reset_session {
         let reset = replies
             .iter()
@@ -1576,19 +2238,16 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
                 row.content == channel_runtime_cli_string("channel-runtime-new-session")
             })
             .expect("reset must follow the earlier ordinary turn");
-        assert!(original < ordinary && ordinary < reset);
-        assert!(!replies.iter().any(|row| row.content == failure));
+        assert!(original < ordinary && ordinary < reset, "{diagnostic}");
+        assert!(
+            !replies.iter().any(|row| row.content == failure),
+            "{diagnostic}"
+        );
         assert!(
             !replies
                 .iter()
-                .any(|row| row.content == "⚠️ Error: scripted Goal finish failure")
-        );
-        assert_eq!(
-            replies
-                .iter()
-                .filter(|row| row.content == original_reply)
-                .count(),
-            1
+                .any(|row| row.content.contains("scripted Goal finish failure")),
+            "withdrawn aggregate must not publish; {diagnostic}"
         );
         assert_eq!(
             provider
@@ -1609,27 +2268,59 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
     let notice = replies
         .iter()
         .position(|row| row.content == failure)
-        .expect("the failure notice must survive the closed admission checkpoint");
+        .unwrap_or_else(|| {
+            panic!("failure notice must survive the closed admission checkpoint; {diagnostic}")
+        });
+    let transition_cause = if worker_tail {
+        "scripted Goal finish failure"
+    } else {
+        "Goal failure lost its execution fence"
+    };
+    let parked: Vec<_> = replies
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.content.contains(transition_cause))
+        .collect();
+    assert_eq!(parked.len(), 1, "one parked native aggregate; {diagnostic}");
+    let (parked_index, parked_row) = parked[0];
+    assert!(parked_row.content.starts_with("⚠️ Error: "), "{diagnostic}");
+    assert_eq!(
+        parked_row.content.matches(transition_cause).count(),
+        1,
+        "{diagnostic}"
+    );
+    assert_eq!(
+        parked_row.content.matches(original_cause).count(),
+        1,
+        "{diagnostic}"
+    );
+    assert!(
+        original < ordinary && ordinary < parked_index && parked_index < notice,
+        "{diagnostic}"
+    );
     if worker_tail {
-        let parked_reply = format!(
-            "⚠️ Error: {}",
-            zeroclaw_providers::sanitize_api_error("scripted Goal finish failure"),
+        assert!(
+            parked_row
+                .content
+                .starts_with(&format!("⚠️ Error: {semantic_heading}")),
+            "{diagnostic}"
         );
-        let parked = replies
-            .iter()
-            .position(|row| row.content == parked_reply)
-            .expect("the worker tail must preserve its parked Goal-only original");
-        assert!(ordinary < parked && parked < notice);
         assert_eq!(
-            replies
-                .iter()
-                .filter(|row| row.content == parked_reply)
+            parked_row
+                .content
+                .matches("Goal parent operation failed")
                 .count(),
-            1
+            1,
+            "storage aggregate must retain parent and semantic causes; {diagnostic}"
         );
     } else if ack_failure {
         assert!(delivery_waited_for_ordinary);
-        assert!(original < ordinary && ordinary < notice);
+        assert!(
+            parked_row
+                .content
+                .contains(&original_row.content["⚠️ Error: ".len()..]),
+            "lost-fence aggregate must retain the complete original diagnostic; {diagnostic}"
+        );
         assert!(!replies.iter().any(|row| {
             row.content
                 .starts_with(&channel_runtime_cli_string("goal-mode-terminal"))
@@ -1651,35 +2342,15 @@ async fn assert_matrix_failure_delivery_behind_ordinary_lane(case: MatrixFailure
             .position(|row| row.content == channel_runtime_cli_string("goal-mode-pause-pending"))
             .unwrap();
         assert!(ack < original && original < ordinary && ordinary < notice && notice < late);
-        let parked = replies
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                row.content
-                    .contains("Goal failure lost its execution fence")
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            parked.len(),
-            1,
-            "BR32(d): one fenced transition original; emitted contents: {:?}",
-            replies
-                .iter()
-                .map(|row| row.content.as_str())
-                .collect::<Vec<_>>()
+        assert!(
+            parked_row
+                .content
+                .contains(&original_row.content["⚠️ Error: ".len()..]),
+            "lost-fence aggregate must retain the complete original diagnostic; {diagnostic}"
         );
-        assert!(ordinary < parked[0] && parked[0] < notice);
     }
     assert_eq!(
         replies.iter().filter(|row| row.content == failure).count(),
-        1
-    );
-    assert_eq!(
-        replies
-            .iter()
-            .filter(|row| row.content == original_reply)
-            .count(),
         1
     );
     assert!(
@@ -1746,6 +2417,7 @@ async fn matrix_goal_failed_predecessor_max_epoch_status_preserves_terminal_reco
     config.data_dir = directory.path().to_owned();
     config.goal.enabled = true;
     config.goal.verifier.model_provider = "custom.fixture".into();
+    config.providers.models.ensure("custom", "fixture").unwrap();
     config.reliability.provider_retries = 0;
     let mut context = test_runtime_ctx_with_config_agent_and_provider_ref(
         channel.clone(),
@@ -1771,7 +2443,7 @@ async fn matrix_goal_failed_predecessor_max_epoch_status_preserves_terminal_reco
     let accounting = Arc::new(
         RuntimeGoalOperationAccountingFactory::new(
             registry.clone(),
-            tracker,
+            tracker.clone(),
             context.agent_alias.to_string(),
             Arc::new(ModelProviderGoalUsagePricer::new(Arc::default())),
         )
@@ -1801,7 +2473,24 @@ async fn matrix_goal_failed_predecessor_max_epoch_status_preserves_terminal_reco
         panic!("fixture must start directly");
     };
     let scope = GoalExecutionScope::new(&started.task_id, &key, started.execution_epoch).unwrap();
-    // Obtain the normal settled operator pause before seeding only the epoch.
+    // Establish the exact operator-pause winner before dropping unlaunched
+    // custody; cancellation cleanup must preserve that canonical fence.
+    assert_eq!(
+        registry
+            .pause_session_goal(
+                scope.task_id(),
+                &key,
+                scope.execution_epoch(),
+                zeroclaw_goal::GoalPauseState {
+                    reason: zeroclaw_goal::GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+        zeroclaw_goal::GoalTransitionResult::Applied,
+    );
     drop(initial);
     let mut paused = goal_execution::submit_matrix_goal(
         context.clone(),
@@ -1811,7 +2500,10 @@ async fn matrix_goal_failed_predecessor_max_epoch_status_preserves_terminal_reco
     )
     .await
     .unwrap();
-    assert!(matches!(paused.response(), GoalResponse::Paused(_)));
+    assert!(
+        matches!(paused.response(), GoalResponse::AlreadyPaused(projection)
+        if projection.pause_reason == Some(zeroclaw_goal::GoalPauseReason::OperatorPaused))
+    );
     paused.after_response().await.unwrap();
     drop(paused);
     assert!(!supervisor.owns_scope(&scope).await);
@@ -1861,7 +2553,7 @@ async fn matrix_goal_failed_predecessor_max_epoch_status_preserves_terminal_reco
     assert_eq!(running.execution_epoch, i64::MAX);
     resumed.after_response().await.unwrap();
     let notice =
-        zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-failure-agent-operation");
+        zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-failure-outcome-unknown");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let count = channel
@@ -1886,15 +2578,70 @@ async fn matrix_goal_failed_predecessor_max_epoch_status_preserves_terminal_reco
         .unwrap()
         .unwrap();
     assert_eq!(predecessor.status, TaskStatus::Failed);
+    assert_eq!(predecessor.id, scope.task_id());
     assert_eq!(predecessor.execution_epoch, i64::MAX);
-    assert_eq!(
-        registry
-            .terminal_reason_for_session_goal(&predecessor.id, &key)
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("parent_operation_failed")
+    let goal = registry
+        .get_goal_task(&predecessor.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let reason = registry
+        .terminal_reason_for_session_goal(&predecessor.id, &key)
+        .await
+        .unwrap();
+    let sent = channel.sent_messages.lock().await;
+    let diagnostic = format!(
+        "mode=BareError/max-epoch, task={}, epoch={}, status={:?}, accounting={:?}, pending={:?}/{:?}, reason={reason:?}, sent={:?}",
+        predecessor.id,
+        predecessor.execution_epoch,
+        predecessor.status,
+        goal.accounting_state,
+        goal.pending_call_id,
+        goal.pending_call_epoch,
+        sent.iter()
+            .map(|row| row.content.as_str())
+            .collect::<Vec<_>>()
     );
+    assert_eq!(
+        goal.accounting_state,
+        zeroclaw_goal::GoalAccountingState::OutcomeUnknown,
+        "{diagnostic}"
+    );
+    assert!(
+        goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none(),
+        "{diagnostic}"
+    );
+    assert_failed_predecessor_ledger(directory.path(), &tracker, &predecessor.id, false, 0);
+    assert!(
+        context
+            .session_store
+            .as_ref()
+            .unwrap()
+            .load(&key)
+            .iter()
+            .all(|row| row.role != "assistant"),
+        "no failed parent candidate append; {diagnostic}"
+    );
+    let originals: Vec<_> = sent
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.content.starts_with("⚠️ Error: ") && row.content.contains("scripted parent failure")
+        })
+        .collect();
+    assert_eq!(originals.len(), 1, "{diagnostic}");
+    assert_eq!(
+        sent.iter()
+            .filter(|row| row.content.starts_with("⚠️ Error: "))
+            .count(),
+        1,
+        "{diagnostic}"
+    );
+    assert!(originals[0].1.content.contains("Goal accounting is outcome-unknown after a durable usage settlement; no further Goal model call will be admitted: accounting issue for actual provider `test-provider`, model `test-model`: usage outcome unknown"), "{diagnostic}");
+    let notice_index = sent.iter().position(|row| row.content == notice).unwrap();
+    assert!(originals[0].0 < notice_index, "{diagnostic}");
+    drop(sent);
+    assert_eq!(reason.as_deref(), Some("accounting_outcome_unknown"));
     let next = tokio::time::timeout(
         Duration::from_secs(5),
         goal_execution::submit_matrix_goal(
@@ -1919,6 +2666,15 @@ async fn matrix_goal_failed_predecessor_max_epoch_status_preserves_terminal_reco
         )
         .unwrap(),
         serde_json::to_value(&predecessor).unwrap()
+    );
+    assert_eq!(
+        registry
+            .get_goal_task(&predecessor.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        goal,
+        "Status must preserve the exact settled accounting record; {diagnostic}"
     );
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     drop(next);
@@ -4696,6 +5452,7 @@ async fn assert_matrix_goal_deferred_ingress(
     verifier.model = Some("fixture-verifier".into());
     verifier.live_pricing = false;
     config.channels.debounce_ms = 1000;
+    let live_config = zeroclaw_config::live::LiveConfig::new(config.clone());
     let mut context = test_runtime_ctx_with_config_agent_and_provider_ref(
         channel.clone(),
         provider.clone(),
@@ -4704,6 +5461,7 @@ async fn assert_matrix_goal_deferred_ingress(
         "test-provider",
         None,
     );
+    Arc::get_mut(&mut context).unwrap().live_config = live_config.handle();
     let backend = Arc::new(
         zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(directory.path()).unwrap(),
     );
@@ -5011,15 +5769,11 @@ async fn assert_matrix_goal_deferred_ingress(
             // Corrupt only the fixture's live settings after valid admission.
             // The production delivery path must resolve them again at the
             // checkpoint, abandon its ready intent, and publish one failure.
-            let snapshot = runtime_defaults_snapshot(&context);
-            let mut config = (*snapshot.config).clone();
-            config.goal.default_cost_limit_usd = f64::NAN;
-            *context.runtime_defaults_override.lock().unwrap() =
-                Some(Arc::new(ChannelRuntimeOverride {
-                    config: Arc::new(config),
-                    defaults: snapshot.defaults,
-                    generation: snapshot.generation + 1,
-                }));
+            let mut config = live_config.snapshot();
+            config.goal.default_cost_limit_usd = Some(f64::NAN);
+            live_config
+                .publish(live_config.next_revision().unwrap(), config)
+                .unwrap();
             return;
         }
         if matches!(

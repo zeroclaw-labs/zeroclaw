@@ -1282,6 +1282,18 @@ impl ModelProvider for HailoOllamaModelProvider {
         }
         messages.push(ChatMessage::user(message));
         let response = self.chat_messages(&messages, model, temperature).await?;
+        crate::dispatch::accounting::observe_string_usage(
+            if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
+                Some(TokenUsage {
+                    input_tokens: response.prompt_eval_count,
+                    output_tokens: response.eval_count,
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                })
+            } else {
+                None
+            },
+        );
         Self::response_text(&response)
     }
 
@@ -1373,6 +1385,56 @@ impl Attributable for HailoOllamaModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_hailo_request_and_text() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::Mutex;
+        let captured = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let app = Router::new().route("/api/chat", post(move |Json(body): Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                *capture.lock().unwrap() = Some(body);
+                Json(serde_json::json!({"message":{"role":"assistant","content":"ok"},"done":true,"prompt_eval_count":8,"eval_count":3}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = scopeguard::guard(server, |server| server.abort());
+        let provider =
+            HailoOllamaModelProvider::new("edge", Some(&url), 90, 5, OllamaTuning::default())
+                .unwrap();
+        let dispatch = crate::dispatch::ProviderDispatch::new(Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let text = scope
+            .scope(dispatch.chat_with_system(Some("system"), "hello", "edge-model", Some(0.4)))
+            .await
+            .unwrap();
+        let report = scope.take();
+        let server = scopeguard::ScopeGuard::into_inner(server);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        assert_eq!(text, "ok");
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let body = captured.lock().unwrap().take().unwrap();
+        assert_eq!(body["model"], "edge-model");
+        // Preserve Hailo's existing native-prompt folding, not the generic
+        // Ollama wire shape: its backend receives one user-anchored message.
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "Instructions: system Request: hello"
+        );
+        assert_eq!(body["options"]["temperature"], 0.4);
+    }
 
     #[test]
     fn constructor_normalizes_request_and_gate_url_identity() {

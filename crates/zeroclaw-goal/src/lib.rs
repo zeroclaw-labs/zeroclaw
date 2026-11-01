@@ -27,12 +27,12 @@ pub use control::{
     GoalDiagnosticTextGuard, GoalExecutionEngine, GoalExecutionHost, GoalExecutionNotice,
     GoalExecutionOutcome, GoalExecutionRequest, GoalExecutionRestartCoordinator,
     GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor, GoalFailureReason,
-    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalLaunchFailureReported,
-    GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult,
-    GoalPendingAction, GoalQueuedControl, GoalResponse, GoalRuntime, GoalRuntimeSubmission,
-    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalStatusProjection, GoalSubmission, GoalSupervisorRetired, GoalSurface,
-    GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
+    GoalHostSettings, GoalHostSettingsSource, GoalIngressContext, GoalIngressPrincipal,
+    GoalLaunchFailureReported, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
+    GoalParentTurnResult, GoalPendingAction, GoalQueuedControl, GoalResponse, GoalRuntime,
+    GoalRuntimeSubmission, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
+    GoalSessionKey, GoalSessionLease, GoalStatusProjection, GoalSubmission, GoalSupervisorRetired,
+    GoalSurface, GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
     classify_goal_control,
 };
 pub use task::{

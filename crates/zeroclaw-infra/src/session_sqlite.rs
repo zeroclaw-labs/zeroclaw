@@ -12,6 +12,10 @@ use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::model_provider::ChatMessage;
 
+/// How long opening the session store waits on another connection that holds
+/// the database.
+const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
@@ -56,22 +60,33 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
 
 impl SqliteSessionBackend {
     /// Open or create the sessions database.
+    ///
+    /// A daemon's gateway, channels and RPC plane each open this database
+    /// when they start, so on a fresh data dir their first opens race. The
+    /// switch to WAL is retried while another opener holds the file, and the
+    /// schema and column migration run in one IMMEDIATE transaction: a later
+    /// opener waits for the first and then finds every column in place.
     pub fn new(workspace_dir: &Path) -> Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
         let db_path = sessions_dir.join("sessions.db");
 
-        let conn = Connection::open(&db_path)
+        let mut conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open session DB: {}", db_path.display()))?;
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT)
+            .context("Failed to set the session DB busy timeout")?;
 
+        Self::enable_wal(&conn)?;
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+            "PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 4194304;",
         )?;
 
-        conn.execute_batch(
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to lock the session DB for schema setup")?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_key TEXT NOT NULL,
@@ -158,7 +173,7 @@ impl SqliteSessionBackend {
                 "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
             ),
         ] {
-            Self::ensure_metadata_column(&conn, column, ddl)?;
+            Self::ensure_metadata_column(&tx, column, ddl)?;
         }
         for (index, ddl) in [
             (
@@ -187,13 +202,41 @@ impl SqliteSessionBackend {
                  ON session_metadata(principal_id)",
             ),
         ] {
-            conn.execute(ddl, [])
+            tx.execute(ddl, [])
                 .with_context(|| format!("Failed to create session index {index}"))?;
         }
+        tx.commit().context("Failed to commit the session schema")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Switch the database to WAL, retrying while another connection holds it.
+    ///
+    /// A second first-time opener of a fresh file can get `SQLITE_BUSY` from
+    /// the journal-mode change at once: SQLite skips the busy handler where
+    /// waiting could deadlock, so the busy timeout alone does not cover it.
+    fn enable_wal(conn: &Connection) -> Result<()> {
+        let deadline = std::time::Instant::now() + OPEN_BUSY_TIMEOUT;
+        let mut pause = std::time::Duration::from_millis(5);
+        loop {
+            match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(_) => return Ok(()),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(100));
+                }
+                Err(error) => {
+                    return Err(error).context("Failed to switch the session DB to WAL");
+                }
+            }
+        }
     }
 
     fn ensure_metadata_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {
@@ -2819,6 +2862,40 @@ mod tests {
             .err()
             .expect("index name collision must fail startup");
         assert!(err.to_string().contains("idx_session_metadata_agent_alias"));
+    }
+
+    /// A daemon's gateway, channels and RPC plane open the store together
+    /// when it starts. On a fresh data dir every one of them must get a
+    /// working store, not a lost `ALTER` race or a busy journal-mode switch.
+    #[test]
+    fn concurrent_first_openers_of_a_fresh_store_all_succeed() {
+        const TRIALS: usize = 40;
+        const OPENERS: usize = 4;
+        for trial in 0..TRIALS {
+            let tmp = TempDir::new().unwrap();
+            let start = Arc::new(std::sync::Barrier::new(OPENERS));
+            let openers: Vec<_> = (0..OPENERS)
+                .map(|opener| {
+                    let (dir, start) = (tmp.path().to_path_buf(), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let backend = SqliteSessionBackend::new(&dir).map_err(|error| {
+                            format!("trial {trial}, opener {opener}: {error:#}")
+                        })?;
+                        backend
+                            .append(&format!("opener-{opener}"), &ChatMessage::user("hello"))
+                            .map_err(|error| {
+                                format!("trial {trial}, opener {opener} append: {error:#}")
+                            })
+                    })
+                })
+                .collect();
+            for opener in openers {
+                opener.join().unwrap().unwrap();
+            }
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            assert_eq!(backend.list_sessions().len(), OPENERS);
+        }
     }
 
     #[test]

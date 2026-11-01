@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -22,7 +22,9 @@ use zeroclaw_api::{
 use zeroclaw_commands::goal::GoalCommand;
 
 use crate::{
-    accounting::{GOAL_OPERATION_ACCOUNTING, GoalOperationAccountingFactory},
+    accounting::{
+        GOAL_OPERATION_ACCOUNTING, GoalAccountingFailure, GoalOperationAccountingFactory,
+    },
     checkpoint::{GoalCheckpointClosed, GoalDeferredControlTicket, GoalParentTurnCheckpoint},
     task::{
         GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
@@ -32,9 +34,10 @@ use crate::{
 
 use super::{
     GoalExecutionNotice, GoalExecutionRequest, GoalExecutionScope, GoalFailureReason,
-    GoalHostSettings, GoalIngressContext, GoalParentTurn, GoalResponse, GoalRuntime,
-    GoalRuntimeSubmission, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionLease,
-    GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierTurn, goal_verifier_feedback_message,
+    GoalHostSettings, GoalHostSettingsSource, GoalIngressContext, GoalParentTurn, GoalResponse,
+    GoalRuntime, GoalRuntimeSubmission, GoalSessionDriver, GoalSessionExecutionLease,
+    GoalSessionLease, GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierTurn,
+    goal_verifier_feedback_message,
 };
 
 mod deferred_control;
@@ -45,13 +48,16 @@ pub use deferred_control::{
     GoalDeferredControl, GoalDeferredReady,
 };
 use failure_delivery::GoalFailureNoticeDelivery;
-use launch_guard::GoalLaunchGuard;
+pub(super) use launch_guard::GoalLaunchGuard;
+use launch_guard::GoalLaunchOwner;
 
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
 const MAX_VERIFIER_BLOCKERS: usize = 16;
 const MAX_VERIFIER_BLOCKER_MESSAGE_CHARS: usize = 2_000;
-const MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES: usize = 4 * 1024;
-const MAX_VERIFIER_RESPONSE_BYTES: usize = 512 * 1024;
+/// Maximum UTF-8 bytes accepted before parsing a verifier response.
+const MAX_VERIFIER_RESPONSE_BYTES: usize = 1_048_576;
+/// Maximum compact-JSON bytes retained for one blocker payload.
+pub(super) const MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES: usize = 4_096;
 
 /// Terminal or paused result of one owned Goal execution epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,8 +73,8 @@ pub enum GoalExecutionOutcome {
 ///
 /// The response is intentionally separate from the lease so an adapter can
 /// render it while retaining command ownership. A newly admitted execution also
-/// retains supervisor custody until launch or pre-launch pause settles; the
-/// supervisor cannot retire while that custody remains held.
+/// retains supervisor custody until worker registration or synchronous cleanup
+/// transfer; unresolved cleanup still prevents supervisor retirement.
 pub struct GoalExecutionSubmission {
     response: GoalResponse,
     /// A newly admitted epoch is held until its representation surface has
@@ -143,6 +149,8 @@ pub struct GoalExecutionEngine {
 pub struct GoalExecutionSupervisor {
     engine: Arc<GoalExecutionEngine>,
     workers: Arc<Mutex<HashMap<String, Arc<Mutex<GoalWorker>>>>>,
+    /// Exact unlaunched custody, independent of notice publication latches.
+    launches: Arc<GoalLaunchOwner>,
     /// Publication custody for unlaunched epochs, not durable lifecycle state.
     unlaunched_failure_notices:
         Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<GoalFailurePublication>>>>>,
@@ -195,13 +203,14 @@ impl GoalSupervisorCustodyGate {
 
 /// Process-local coordinator for the Goal executors admitted by one daemon.
 ///
-/// It retains only weak worker owners. Durable identity, lifecycle, and usage
-/// remain in the task control plane; this coordinator exists solely to fence
+/// It retains supervisors until atomic retirement proves their duties settled.
+/// Durable identity, lifecycle, and usage remain in the task control plane;
+/// this coordinator exists solely to fence
 /// fresh execution admission and drain already-admitted work before a daemon
 /// replacement tears down its transport hosts.
 pub struct GoalExecutionRestartCoordinator {
     gate: Arc<GoalExecutionRestartGate>,
-    supervisors: Mutex<Vec<Weak<GoalExecutionSupervisor>>>,
+    supervisors: Mutex<Vec<Arc<GoalExecutionSupervisor>>>,
 }
 
 impl Default for GoalExecutionRestartCoordinator {
@@ -220,7 +229,7 @@ impl GoalExecutionRestartCoordinator {
 
     /// Create and retain a supervisor for one transport-owned Goal host.
     ///
-    /// The weak registration is deliberately not a second session registry:
+    /// The retained registration is deliberately not a second session registry:
     /// the supervisor's durable scope remains the sole identity authority.
     pub async fn new_supervisor(
         &self,
@@ -231,8 +240,8 @@ impl GoalExecutionRestartCoordinator {
             Arc::clone(&self.gate),
         ));
         let mut supervisors = self.supervisors.lock().await;
-        supervisors.retain(|candidate| candidate.strong_count() > 0);
-        supervisors.push(Arc::downgrade(&supervisor));
+        supervisors.retain(|candidate| !candidate.custody_gate.retired.load(Ordering::Acquire));
+        supervisors.push(Arc::clone(&supervisor));
         supervisor
     }
 
@@ -244,21 +253,17 @@ impl GoalExecutionRestartCoordinator {
         self.gate.close_admission().await;
         let supervisors = {
             let mut registered = self.supervisors.lock().await;
-            let supervisors = registered
-                .iter()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
-            registered.retain(|candidate| candidate.strong_count() > 0);
-            supervisors
+            registered.retain(|candidate| !candidate.custody_gate.retired.load(Ordering::Acquire));
+            registered.clone()
         };
         let mut restart_fences = Vec::with_capacity(supervisors.len());
         let mut failure = None;
-        for supervisor in supervisors {
+        for supervisor in &supervisors {
             let fence = supervisor.fence_for_restart().await;
             if let Some(error) = fence.error {
                 failure.get_or_insert(error);
             }
-            restart_fences.push((supervisor, fence.scopes));
+            restart_fences.push((supervisor.clone(), fence.scopes));
         }
         // Every host is durably fenced before any one host is allowed to wait
         // for an admitted operation. A slow worker must not leave another
@@ -277,12 +282,33 @@ impl GoalExecutionRestartCoordinator {
         if let Some(error) = failure {
             return Err(error);
         }
+        for supervisor in &supervisors {
+            // Keep an externally live host reusable after explicit reopening.
+            // Count selects only an optional retirement attempt: the atomic
+            // custody/obligation checks, never this count, authorize pruning.
+            // The registration and this snapshot account for two references.
+            if Arc::strong_count(supervisor) == 2 {
+                supervisor.try_retire().await;
+            }
+        }
+        self.supervisors
+            .lock()
+            .await
+            .retain(|candidate| !candidate.custody_gate.retired.load(Ordering::Acquire));
         Ok(())
     }
 
     /// Reopen admission for the next daemon generation after the retiring
     /// generation has fully quiesced.
     pub async fn reopen_for_generation(&self) {
+        let supervisors = self.supervisors.lock().await.clone();
+        if let Some(supervisor) = supervisors
+            .iter()
+            .find(|supervisor| !supervisor.launches.is_empty())
+        {
+            supervisor.launches.log_reopen_refusal();
+            return;
+        }
         self.gate.reopen().await;
     }
 }
@@ -402,6 +428,11 @@ enum GoalRunErrorReport {
     Handed(anyhow::Error),
 }
 
+enum GoalSpendRefusalOutcome {
+    Fenced,
+    NotPaused(anyhow::Error),
+}
+
 fn report_run_error(report: &mut Option<&mut GoalRunErrorReport>, outcome: GoalRunErrorReport) {
     if let Some(report) = report {
         debug_assert!(matches!(report, GoalRunErrorReport::Unreported));
@@ -425,6 +456,15 @@ fn report_transition_error(
 }
 
 type GoalWorkerCompletion = std::result::Result<GoalExecutionOutcome, String>;
+
+// A queued control must also be released when the worker future unwinds or is dropped.
+struct GoalWorkerCheckpointGuard(GoalParentTurnCheckpoint);
+
+impl Drop for GoalWorkerCheckpointGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
 
 struct GoalRestartFence {
     scopes: Vec<GoalExecutionScope>,
@@ -460,9 +500,12 @@ impl GoalLifecycleDrain {
 
 impl GoalExecutionSupervisor {
     pub fn new(engine: Arc<GoalExecutionEngine>) -> Self {
+        let workers = Arc::new(Mutex::new(HashMap::new()));
+        let launches = GoalLaunchOwner::new(engine.clone(), workers.clone());
         Self {
             engine,
-            workers: Arc::new(Mutex::new(HashMap::new())),
+            workers,
+            launches,
             unlaunched_failure_notices: Arc::new(std::sync::Mutex::new(HashMap::new())),
             restart_gate: None,
             pending_boundaries: Mutex::new(HashMap::new()),
@@ -474,9 +517,12 @@ impl GoalExecutionSupervisor {
         engine: Arc<GoalExecutionEngine>,
         restart_gate: Arc<GoalExecutionRestartGate>,
     ) -> Self {
+        let workers = Arc::new(Mutex::new(HashMap::new()));
+        let launches = GoalLaunchOwner::new(engine.clone(), workers.clone());
         Self {
             engine,
-            workers: Arc::new(Mutex::new(HashMap::new())),
+            workers,
+            launches,
             unlaunched_failure_notices: Arc::new(std::sync::Mutex::new(HashMap::new())),
             restart_gate: Some(restart_gate),
             pending_boundaries: Mutex::new(HashMap::new()),
@@ -499,7 +545,20 @@ impl GoalExecutionSupervisor {
         let Ok(_barrier) = self.custody_gate.barrier.clone().try_write_owned() else {
             return false;
         };
-        if !self.workers.lock().await.is_empty() || !self.pending_boundaries.lock().await.is_empty()
+        let Ok(workers) = self.workers.try_lock() else {
+            return false;
+        };
+        let Ok(boundaries) = self.pending_boundaries.try_lock() else {
+            return false;
+        };
+        if !self.launches.is_empty()
+            || !self
+                .unlaunched_failure_notices
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+            || !workers.is_empty()
+            || !boundaries.is_empty()
         {
             return false;
         }
@@ -514,14 +573,17 @@ impl GoalExecutionSupervisor {
     /// epoch first, preserving the durable epoch fence instead of relying on
     /// a best-effort detached task.
     /// The caller must retain admission custody until worker registration.
+    /// Supply the host generation's canonical live-config source; settings
+    /// are resolved by the worker immediately before execution acquisition.
     pub async fn launch(
         &self,
-        settings: GoalHostSettings,
+        source: &GoalHostSettingsSource,
         request: GoalExecutionRequest,
         driver: Arc<dyn GoalSessionDriver>,
         ingress: GoalIngressContext,
     ) -> Result<()> {
         let scope = request.scope().clone();
+        self.launches.launch_permitted(&scope)?;
         ensure!(
             driver.session_key() == ingress.session_key()
                 && scope.session_id() == ingress.session_key().durable_id(),
@@ -543,11 +605,16 @@ impl GoalExecutionSupervisor {
         let worker_failure_publication = Arc::clone(&failure_publication);
         let worker_driver = Arc::clone(&driver);
         let worker_ingress = ingress.clone();
+        let checkpoint_guard = GoalWorkerCheckpointGuard(checkpoint.clone());
         let (completion_tx, completion) = watch::channel(None);
+        let source = source.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
+            // Fallback publication still needs this checkpoint. Retain RAII
+            // cleanup through the whole worker, including panic or abort.
+            let _checkpoint_guard = checkpoint_guard;
             let result = engine
                 .run_with_failure_notice(
-                    &settings,
+                    &source,
                     request,
                     worker_checkpoint.clone(),
                     Arc::clone(&worker_failure_publication),
@@ -631,9 +698,10 @@ impl GoalExecutionSupervisor {
     /// A retired supervisor returns [`GoalSupervisorRetired`] before admission
     /// has any effects. The adapter must select a current supervisor before
     /// retrying the command.
+    /// Build settings from the current canonical config for this command.
     pub async fn submit(
         &self,
-        settings: GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
@@ -645,33 +713,44 @@ impl GoalExecutionSupervisor {
 
     async fn submit_with_custody(
         &self,
-        settings: GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
         custody: OwnedRwLockReadGuard<()>,
     ) -> Result<GoalExecutionSubmission> {
-        let mut custody = Some(custody);
         let admission = match &self.restart_gate {
             Some(gate) => gate.admit(&command).await?,
             None => None,
         };
-        let previous = self.scope_for_session(&ingress).await?;
         let retained_driver = Arc::clone(&driver);
         let retained_ingress = ingress.clone();
+        let mut launch_guard =
+            GoalLaunchGuard::new(self.launches.clone(), admission, Some(custody));
         let runtime_submission = self
             .engine
             .runtime
-            .submit(&settings, ingress, driver, command)
+            .submit_with_launch_guard(settings, ingress, driver, command, &mut launch_guard)
             .await?;
+        let previous = match self.scope_for_session(&retained_ingress).await {
+            Ok(previous) => previous,
+            Err(error) => {
+                if launch_guard.scope().is_none() {
+                    return Err(error);
+                }
+                launch_guard.retain_primary(error);
+                return Err(launch_guard
+                    .take_primary()
+                    .context("Goal handoff lost its original cause")?);
+            }
+        };
         Ok(self.execution_submission(
             runtime_submission,
             previous,
             retained_driver,
             retained_ingress,
-            admission,
+            launch_guard,
             None,
-            &mut custody,
         ))
     }
 
@@ -681,9 +760,8 @@ impl GoalExecutionSupervisor {
         previous: Option<GoalExecutionScope>,
         driver: Arc<dyn GoalSessionDriver>,
         ingress: GoalIngressContext,
-        admission: Option<GoalExecutionAdmission>,
+        launch_guard: GoalLaunchGuard,
         boundary: Option<GoalTurnBoundary>,
-        custody: &mut Option<OwnedRwLockReadGuard<()>>,
     ) -> GoalExecutionSubmission {
         let (mut response, execution, lease) = runtime_submission.into_parts_with_lease();
 
@@ -709,13 +787,6 @@ impl GoalExecutionSupervisor {
             };
         }
 
-        let launch_custody = execution.as_ref().and_then(|_| custody.take());
-        let launch_guard = GoalLaunchGuard::new(
-            self.engine.clone(),
-            execution.as_ref(),
-            admission,
-            launch_custody,
-        );
         GoalExecutionSubmission {
             response,
             execution,
@@ -730,14 +801,16 @@ impl GoalExecutionSupervisor {
 
     /// Start a newly admitted Goal only after its owning surface has delivered
     /// the started/resumed response.
+    /// Pass the host generation's canonical live-config source, not settings
+    /// resolved before a predecessor drain or worker registration.
     pub async fn launch_after_response(
         &self,
-        settings: GoalHostSettings,
+        source: &GoalHostSettingsSource,
         submission: &mut GoalExecutionSubmission,
     ) -> Result<Option<GoalResponse>> {
         let mut launch_guard = submission.launch_guard.take();
         let execution = submission.execution.take();
-        let mut failure_reported = false;
+        let mut worker_registered = false;
         let result = async {
             // The surface has already made the lifecycle response observable.
             // Release command serialization before waiting for the admitted
@@ -760,76 +833,73 @@ impl GoalExecutionSupervisor {
                 return Ok(None);
             };
             let scope = request.scope().clone();
-            let lease = match submission.driver.bind(&submission.ingress).await {
-                Ok(lease) => lease,
-                Err(error) => {
-                    launch_guard.failed();
-                    failure_reported |= self
-                        .reconcile_launch_failure(
-                            &scope,
-                            submission.driver.as_ref(),
-                            &submission.ingress,
-                        )
-                        .await?;
-                    return Err(error).context("revalidate Goal session before executor launch");
-                }
-            };
+            let lease = submission
+                .driver
+                .bind(&submission.ingress)
+                .await
+                .context("revalidate Goal session before executor launch")?;
             if !self.execution_is_current(&scope).await? {
                 return Ok(None);
             }
-            if let Err(error) = self
-                .launch(
-                    settings,
-                    request,
-                    Arc::clone(&submission.driver),
-                    submission.ingress.clone(),
-                )
-                .await
-            {
-                launch_guard.failed();
-                failure_reported |= self
-                    .reconcile_launch_failure(
-                        &scope,
-                        submission.driver.as_ref(),
-                        &submission.ingress,
-                    )
-                    .await?;
-                return Err(error).context("Goal executor launch failed");
-            }
+            self.launch(
+                source,
+                request,
+                Arc::clone(&submission.driver),
+                submission.ingress.clone(),
+            )
+            .await
+            .context("Goal executor launch failed")?;
+            worker_registered = true;
             drop(lease);
             Ok(None)
         }
         .await;
-        // Once launch/failure handling is settled, restart may close admission
-        // and fence the now-registered worker even if the surface keeps the
-        // submission around while finishing its request handler.
-        if result.is_err() {
-            launch_guard.failed();
-            if let Some(scope) = launch_guard.scope() {
-                failure_reported |= self
+        match result {
+            Err(error) => {
+                if launch_guard.scope().is_none() {
+                    return Err(error);
+                }
+                // Store the original before fallback can suspend. Cancelling
+                // this future transfers that same cause with the exact scope.
+                launch_guard.retain_primary(error);
+                let cleanup = self
                     .reconcile_launch_failure(
-                        scope,
+                        &mut launch_guard,
                         submission.driver.as_ref(),
                         &submission.ingress,
                     )
-                    .await?;
+                    .await;
+                let primary = launch_guard
+                    .take_primary()
+                    .context("Goal launch failure lost its original cause")?;
+                match cleanup {
+                    Ok(true) => Err(primary.context(GoalLaunchFailureReported)),
+                    Ok(false) => Err(primary),
+                    Err(secondary) => {
+                        Err(primary
+                            .context(format!("reconcile Goal launch failure: {secondary:#}")))
+                    }
+                }
             }
-        }
-        launch_guard.settled();
-        if failure_reported {
-            result.map_err(|error| error.context(GoalLaunchFailureReported))
-        } else {
-            result
+            Ok(response) => {
+                if !worker_registered && launch_guard.scope().is_some() {
+                    launch_guard.reconcile_held().await?;
+                }
+                // Worker registration or an authoritative fence, not merely
+                // returning from an error arm, discharges the launch guard.
+                launch_guard.settled();
+                Ok(response)
+            }
         }
     }
 
     async fn reconcile_launch_failure(
         &self,
-        scope: &GoalExecutionScope,
+        guard: &mut GoalLaunchGuard,
         driver: &dyn GoalSessionDriver,
         ingress: &GoalIngressContext,
     ) -> Result<bool> {
-        let Some(notice) = self.fail_unlaunched_execution(scope).await? else {
+        let Some(notice) = self.fail_unlaunched_execution(guard).await? else {
             return Ok(false);
         };
         self.publish_unlaunched_failure_notice(notice, driver, ingress)
@@ -842,8 +912,12 @@ impl GoalExecutionSupervisor {
     /// The caller may or may not hold command serialization on this path.
     async fn fail_unlaunched_execution(
         &self,
-        scope: &GoalExecutionScope,
+        guard: &mut GoalLaunchGuard,
     ) -> Result<Option<GoalUnlaunchedFailureNotice>> {
+        let Some(scope) = guard.scope().cloned() else {
+            return Ok(None);
+        };
+        guard.failed();
         let latch = Arc::new(Mutex::new(GoalFailurePublication::default()));
         let publication = latch.clone().lock_owned().await;
         let previous = self
@@ -861,11 +935,11 @@ impl GoalExecutionSupervisor {
             latch,
             slots: self.unlaunched_failure_notices.clone(),
         };
-        if !self.execution_is_current(scope).await? {
-            return Ok(None);
+        if guard.reconcile_held().await? {
+            Ok(Some(notice))
+        } else {
+            Ok(None)
         }
-        self.engine.fail(scope, "executor_start_failed").await?;
-        Ok(Some(notice))
     }
 
     /// Attempt delivery without ordinary-turn ownership: the publisher reacquires it.
@@ -904,32 +978,10 @@ impl GoalExecutionSupervisor {
         reason: GoalPauseReason,
     ) -> Result<()> {
         let mut launch_guard = submission.launch_guard.take();
-        let execution = submission.execution.take();
+        drop(submission.execution.take());
         launch_guard.pausing(reason);
         let result = async {
-            if let Some(request) = execution {
-                let scope = request.scope();
-                match self
-                    .engine
-                    .registry
-                    .pause_session_goal(
-                        scope.task_id(),
-                        scope.session_id(),
-                        scope.execution_epoch(),
-                        GoalPauseState {
-                            reason,
-                            description: None,
-                            blockers: Vec::new(),
-                        },
-                    )
-                    .await?
-                {
-                    GoalTransitionResult::Applied => {}
-                    GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                        bail!("Goal pre-launch pause lost its execution fence")
-                    }
-                }
-            }
+            launch_guard.reconcile_held().await?;
             // The unseen launch is settled. As in launch_after_response,
             // release command and turn custody before draining or publishing.
             drop(submission._lease.take());
@@ -946,8 +998,6 @@ impl GoalExecutionSupervisor {
         .await;
         if result.is_ok() {
             launch_guard.settled();
-        } else {
-            launch_guard.failed();
         }
         result
     }
@@ -975,6 +1025,7 @@ impl GoalExecutionSupervisor {
             .current_goal_for_session(session_id)
             .await?
         else {
+            self.launches.retry_session(session_id).await?;
             return Ok(GoalTransitionResult::Missing);
         };
         let task_id = current.id.clone();
@@ -997,6 +1048,10 @@ impl GoalExecutionSupervisor {
                 result => return Ok(result),
             }
         }
+
+        // Disposal's authorized terminal fence takes precedence over a faulting
+        // pause retry. A retained error still prevents reporting deletion.
+        self.launches.retry_session(session_id).await?;
 
         if let Some(scope) = self.scope_for_session_id(session_id).await?
             && scope.task_id() == task_id
@@ -1070,10 +1125,10 @@ impl GoalExecutionSupervisor {
         for delivery in drain.failure_notices {
             delivery.deliver().await;
         }
-        if let Some(error) = drain.error {
+        if let Some(error) = fence.error {
             return Err(error);
         }
-        if let Some(error) = fence.error {
+        if let Some(error) = drain.error {
             return Err(error);
         }
         Ok(())
@@ -1095,6 +1150,9 @@ impl GoalExecutionSupervisor {
         let mut error = None;
         for (session_id, worker) in workers {
             let worker = worker.lock().await;
+            // The durable pause can fail or its preceding read can fail. The
+            // resident checkpoint must still reject every successor operation.
+            worker.checkpoint.close();
             let scope = match GoalExecutionScope::new(
                 worker.task_id.clone(),
                 session_id,
@@ -1151,6 +1209,14 @@ impl GoalExecutionSupervisor {
             }
             scopes.push(scope);
         }
+        // Admission is closed before coordinator entry. Dropped launch guards
+        // have released both readers and are discoverable here without a
+        // worker, command lease or ordinary-turn boundary.
+        for scope in self.launches.pending_scopes(None) {
+            if let Err(candidate) = self.launches.retry_scope(&scope, true).await {
+                error.get_or_insert(candidate);
+            }
+        }
         GoalRestartFence { scopes, error }
     }
 
@@ -1176,6 +1242,9 @@ impl GoalExecutionSupervisor {
     /// consumes its result. The durable task status—not this handle map—is the
     /// source of truth for whether the Goal is currently running.
     pub async fn owns_scope(&self, scope: &GoalExecutionScope) -> bool {
+        if self.launches.owns(scope) {
+            return true;
+        }
         let worker = {
             let workers = self.workers.lock().await;
             workers.get(scope.session_id()).cloned()
@@ -1220,6 +1289,14 @@ impl GoalExecutionSupervisor {
     /// operation. A pause path uses this after durable fencing so the admitted
     /// operation can settle its usage but cannot admit another operation.
     pub async fn drain(&self, scope: &GoalExecutionScope) -> Result<GoalExecutionOutcome> {
+        if self.launches.owns(scope) {
+            self.launches.retry_scope(scope, false).await?;
+            ensure!(
+                !self.launches.owns(scope),
+                "Goal launch handoff remains held before drain"
+            );
+            return Ok(GoalExecutionOutcome::Fenced);
+        }
         let worker = {
             let workers = self.workers.lock().await;
             let Some(worker) = workers.get(scope.session_id()) else {
@@ -1244,8 +1321,8 @@ impl GoalExecutionSupervisor {
         let outcome = completion
             .borrow()
             .clone()
-            .context("Goal execution worker stopped without reporting its completion")?
-            .map_err(anyhow::Error::msg);
+            .context("Goal execution worker stopped without reporting its completion")
+            .and_then(|outcome| outcome.map_err(anyhow::Error::msg));
         // Lifecycle finalization owns worker retirement and pending-operation
         // classification. Never let a generic drainer remove the handle first.
         self.drain_lifecycle_fence(scope).await?.deliver().await;
@@ -1400,6 +1477,7 @@ impl GoalExecutionSupervisor {
             workers.get(scope.session_id()).cloned()
         };
         let Some(worker) = worker else {
+            self.launches.retry_scope(scope, false).await?;
             return self
                 .fenced_response(scope, None)
                 .await
@@ -1434,12 +1512,16 @@ impl GoalExecutionSupervisor {
             .engine
             .registry
             .current_goal_for_session(scope.session_id())
-            .await?;
-        let exact_epoch_is_still_running = current.as_ref().is_some_and(|task| {
-            task.id == scope.task_id()
-                && task.execution_epoch == scope.execution_epoch()
-                && task.status == TaskStatus::Running
-        });
+            .await;
+        let exact_epoch_is_still_running = current
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|task| {
+                task.id == scope.task_id()
+                    && task.execution_epoch == scope.execution_epoch()
+                    && task.status == TaskStatus::Running
+            });
         if !exact_epoch_is_still_running {
             // A reserved session replacement/removal may be ahead of this
             // worker in the ordinary foreground queue. Fence only its pending
@@ -1455,6 +1537,7 @@ impl GoalExecutionSupervisor {
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, &worker))
         };
         if !still_registered {
+            let _ = current?;
             return self
                 .fenced_response(scope, None)
                 .await
@@ -1465,10 +1548,15 @@ impl GoalExecutionSupervisor {
                 break;
             }
         }
-        let completion_error = match completion.borrow().clone() {
-            Some(Ok(_)) => None,
-            Some(Err(error)) => Some(error),
-            None => Some("Goal worker stopped without reporting its completion".to_owned()),
+        // A failed pre-drain lookup must not let an admitted operation outlive
+        // this fence. Preserve that error, but only after the worker settles.
+        let _ = current?;
+        let (completion_missing, completion_failed) = {
+            let completion = completion.borrow();
+            (
+                completion.is_none(),
+                matches!(completion.as_ref(), Some(Err(_))),
+            )
         };
 
         let Some(current) = self
@@ -1536,8 +1624,13 @@ impl GoalExecutionSupervisor {
             return Ok(GoalLifecycleDrain::from_response(None));
         }
         let mut classified_epoch = None;
+        let pending_operation = goal.pending_call_id.is_some() || goal.pending_call_epoch.is_some();
+        let incomplete_accounting = goal.accounting_state != GoalAccountingState::Complete;
         if matches!(current.status, TaskStatus::Paused | TaskStatus::Running)
-            && (goal.pending_call_id.is_some() || completion_error.is_some())
+            && (pending_operation
+                || incomplete_accounting
+                || completion_missing
+                || (current.status == TaskStatus::Running && completion_failed))
         {
             let failure_epoch = current.execution_epoch;
             match self
@@ -1548,8 +1641,9 @@ impl GoalExecutionSupervisor {
                     scope.session_id(),
                     failure_epoch,
                     TaskStatus::Failed,
-                    Some(if goal.pending_call_id.is_some() {
-                        "accounting_outcome_unknown".to_owned()
+                    Some(if pending_operation || incomplete_accounting {
+                        accounting_failure_reason(goal.accounting_state, pending_operation)
+                            .to_owned()
                     } else {
                         "executor_failed".to_owned()
                     }),
@@ -1826,6 +1920,26 @@ fn log_failure_notice_delivery_failure(scope: &GoalExecutionScope) {
     );
 }
 
+// Anyhow contexts and foreign standard-error wrappers expose types differently.
+fn accounting_failure_metadata(error: &anyhow::Error) -> Option<(GoalAccountingState, bool)> {
+    error
+        .downcast_ref::<GoalAccountingFailure>()
+        .or_else(|| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<GoalAccountingFailure>())
+        })
+        .map(|failure| (failure.accounting_state(), failure.has_pending_operation()))
+}
+
+fn accounting_failure_reason(state: GoalAccountingState, pending: bool) -> &'static str {
+    if pending || state == GoalAccountingState::OutcomeUnknown {
+        "accounting_outcome_unknown"
+    } else {
+        "accounting_missing_or_invalid"
+    }
+}
+
 impl GoalExecutionEngine {
     pub fn new(
         runtime: GoalRuntime,
@@ -1850,32 +1964,39 @@ impl GoalExecutionEngine {
     }
 
     /// Run one admitted Goal epoch to a verified completion or verifier pause.
-    /// A continuation keeps only a process-local transcript; intermediate
-    /// candidates and verifier feedback do not become authoritative user
-    /// history. Every model call uses the runtime's per-scope accountant.
+    /// Every accepted parent candidate is durably appended to the canonical
+    /// session before verification; verifier feedback stays process-local.
+    /// Every model call uses the runtime's per-scope accountant.
+    /// Resolve `source` once, immediately before execution acquisition. The
+    /// operation-local config and borrowed settings are dropped before model
+    /// work; no live-config read guard is held across an await.
+    /// Errors before the first parent attempt—including objective lookup,
+    /// acquisition or its config refusal, resume-response append, and history
+    /// access—make no durable lifecycle change. The owning caller must settle
+    /// the exact execution epoch when such an error follows a transition.
     pub async fn run(
         &self,
-        settings: &GoalHostSettings,
+        source: &GoalHostSettingsSource,
         request: GoalExecutionRequest,
         checkpoint: GoalParentTurnCheckpoint,
     ) -> Result<GoalExecutionOutcome> {
-        self.run_inner(settings, request, checkpoint, None).await
+        self.run_inner(source, request, checkpoint, None).await
     }
 
     async fn run_with_failure_notice(
         &self,
-        settings: &GoalHostSettings,
+        source: &GoalHostSettingsSource,
         request: GoalExecutionRequest,
         checkpoint: GoalParentTurnCheckpoint,
         failure_publication: Arc<Mutex<GoalFailurePublication>>,
     ) -> Result<GoalExecutionOutcome> {
-        self.run_inner(settings, request, checkpoint, Some(failure_publication))
+        self.run_inner(source, request, checkpoint, Some(failure_publication))
             .await
     }
 
     async fn run_inner(
         &self,
-        settings: &GoalHostSettings,
+        source: &GoalHostSettingsSource,
         request: GoalExecutionRequest,
         checkpoint: GoalParentTurnCheckpoint,
         failure_publication: Option<Arc<Mutex<GoalFailurePublication>>>,
@@ -1887,11 +2008,18 @@ impl GoalExecutionEngine {
             return Ok(GoalExecutionOutcome::Fenced);
         };
         let accountant = self.accounting_factory.for_scope(scope.clone());
-        let mut lease = match self
-            .runtime
-            .acquire_execution(settings, request, &checkpoint)
-            .await
-        {
+        let acquired = {
+            let config = source.snapshot();
+            match source.settings(&config) {
+                Ok(settings) => {
+                    self.runtime
+                        .acquire_execution(&settings, request, &checkpoint)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let mut lease = match acquired {
             Ok(lease) => lease,
             Err(error) => {
                 if self.exact_running_task_or_fenced(&scope).await?.is_none() {
@@ -1916,20 +2044,32 @@ impl GoalExecutionEngine {
         }
 
         let mut error_report = GoalRunErrorReport::Unreported;
-        let report = failure_publication.as_ref().map(|_| &mut error_report);
-        let result = GOAL_OPERATION_ACCOUNTING
-            .scope(Some(accountant), async {
-                self.run_scoped(
-                    &scope,
-                    &objective,
-                    initial_turn_kind,
-                    lease.as_mut(),
-                    &checkpoint,
-                    report,
-                )
-                .await
-            })
-            .await;
+        // The supervised report borrows its existing publication owner; public
+        // execution has neither and retains each original typed error.
+        let report = failure_publication
+            .as_deref()
+            .map(|publication| (&mut error_report, publication));
+        // Keep a scope-only participation sentinel at the accountant producer.
+        // A composite cannot silently turn a partially propagated Goal into an
+        // ordinary child invocation; the runtime still validates its real root.
+        let tool_context = zeroclaw_api::tool::ToolExecutionContext::current()
+            .unwrap_or_default()
+            .with_goal_foreground();
+        // Make the Send boundary explicit before nesting the task-local scopes.
+        let accounting_future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<GoalExecutionOutcome>> + Send + '_>,
+        > = Box::pin(GOAL_OPERATION_ACCOUNTING.scope(Some(accountant), async {
+            self.run_scoped(
+                &scope,
+                &objective,
+                initial_turn_kind,
+                lease.as_mut(),
+                &checkpoint,
+                report,
+            )
+            .await
+        }));
+        let result = tool_context.scope_only(accounting_future).await;
         if let Some(publication) = &failure_publication {
             let mut publication = publication.lock().await;
             match error_report {
@@ -1988,14 +2128,35 @@ impl GoalExecutionEngine {
         mut parent_turn_kind: super::GoalParentTurnKind,
         lease: &mut dyn GoalSessionExecutionLease,
         checkpoint: &GoalParentTurnCheckpoint,
-        mut error_report: Option<&mut GoalRunErrorReport>,
+        report: Option<(&mut GoalRunErrorReport, &Mutex<GoalFailurePublication>)>,
     ) -> Result<GoalExecutionOutcome> {
+        let (mut error_report, failure_publication) = match report {
+            Some((report, publication)) => (Some(report), Some(publication)),
+            None => (None, None),
+        };
         let accountant = GOAL_OPERATION_ACCOUNTING
             .try_with(Clone::clone)
             .ok()
             .flatten()
             .context("Goal operation accountant is not scoped")?;
-        let mut working_history = lease.canonical_history()?;
+        let mut working_history = match lease.canonical_history() {
+            Ok(history) => history,
+            Err(error) => {
+                let Some(publication) = failure_publication else {
+                    return Err(error);
+                };
+                let text = format!("{error:#}");
+                let mut publication = publication.lock().await;
+                if matches!(publication.core_error, GoalCoreErrorPublication::Absent) {
+                    publication.core_error = GoalCoreErrorPublication::Parked(error);
+                    // The held native lease must attempt the earliest original
+                    // before worker fallback can encounter a competing pause.
+                    publish_parked_core_error(scope, lease, &mut publication).await;
+                }
+                report_run_error(&mut error_report, GoalRunErrorReport::Surfaced);
+                return Err(anyhow::Error::msg(text));
+            }
+        };
         loop {
             // The driver may return from a previously admitted parent call
             // after a pause, cancellation, or replacement fenced this epoch.
@@ -2023,6 +2184,8 @@ impl GoalExecutionEngine {
                 .await
             {
                 Ok(parent) => {
+                    self.require_complete_accounting(scope, accountant.as_ref(), &mut error_report)
+                        .await?;
                     if parent.candidate.trim().is_empty() {
                         if let Err(error) = self.fail(scope, "candidate_empty").await {
                             return Err(report_transition_error(&mut error_report, error));
@@ -2031,19 +2194,15 @@ impl GoalExecutionEngine {
                         bail!("Goal parent returned an empty candidate");
                     }
 
-                    // Parent output is ordinary agent output, not verifier
-                    // metadata. Persist and deliver it before any verifier
-                    // decision can pause or terminate this execution.
                     if let Err(error) = lease
                         .append_parent_candidate(parent.candidate.clone())
                         .await
                     {
-                        report_run_error(&mut error_report, GoalRunErrorReport::Surfaced);
-                        return Err(error)
-                            .context("publish Goal parent candidate before verification");
+                        let error = self
+                            .fail_with(scope, "candidate_persistence_failed", error)
+                            .await;
+                        return Err(report_transition_error(&mut error_report, error));
                     }
-                    self.require_complete_accounting(scope, accountant.as_ref(), &mut error_report)
-                        .await?;
                     parent
                 }
                 Err(error) => {
@@ -2060,12 +2219,35 @@ impl GoalExecutionEngine {
                     {
                         return Ok(outcome);
                     }
-                    if let Err(transition_error) = self.fail(scope, "parent_operation_failed").await
+                    let error = match self
+                        .ordinary_spend_refusal_outcome(
+                            error,
+                            scope,
+                            accountant.as_ref(),
+                            &mut error_report,
+                        )
+                        .await?
                     {
-                        return Err(report_transition_error(&mut error_report, transition_error));
+                        GoalSpendRefusalOutcome::Fenced => return Ok(GoalExecutionOutcome::Fenced),
+                        GoalSpendRefusalOutcome::NotPaused(error) => error,
+                    };
+                    let (reason, error) =
+                        if let Some((state, pending)) = accounting_failure_metadata(&error) {
+                            (accounting_failure_reason(state, pending), error)
+                        } else {
+                            (
+                                "parent_operation_failed",
+                                error.context("Goal parent operation failed"),
+                            )
+                        };
+                    if let Err(transition_error) = self.fail(scope, reason).await {
+                        return Err(report_transition_error(
+                            &mut error_report,
+                            error.context(format!("{transition_error:#}")),
+                        ));
                     }
                     report_run_error(&mut error_report, GoalRunErrorReport::Surfaced);
-                    return Err(error).context("Goal parent operation failed");
+                    return Err(error);
                 }
             };
             let candidate = parent.candidate;
@@ -2133,6 +2315,27 @@ impl GoalExecutionEngine {
                     {
                         return Ok(outcome);
                     }
+                    let error = match self
+                        .ordinary_spend_refusal_outcome(
+                            error,
+                            scope,
+                            accountant.as_ref(),
+                            &mut error_report,
+                        )
+                        .await?
+                    {
+                        GoalSpendRefusalOutcome::Fenced => return Ok(GoalExecutionOutcome::Fenced),
+                        GoalSpendRefusalOutcome::NotPaused(error) => error,
+                    };
+                    let (reason, error) =
+                        if let Some((state, pending)) = accounting_failure_metadata(&error) {
+                            (accounting_failure_reason(state, pending), error)
+                        } else {
+                            (
+                                "verifier_operation_failed",
+                                error.context("Goal verifier operation failed"),
+                            )
+                        };
                     log_verifier_diagnostic(
                         self.diagnostic_text_guard.as_deref(),
                         scope,
@@ -2146,9 +2349,9 @@ impl GoalExecutionEngine {
                         "pending",
                         "operation_failed",
                     );
-                    if let Err(transition_error) =
-                        self.fail(scope, "verifier_operation_failed").await
-                    {
+                    // A failed lifecycle transition must not replace the operation's
+                    // original error; it is added as context, as in `fail_with`.
+                    if let Err(transition_error) = self.fail(scope, reason).await {
                         log_verifier_diagnostic(
                             self.diagnostic_text_guard.as_deref(),
                             scope,
@@ -2162,7 +2365,10 @@ impl GoalExecutionEngine {
                             "terminal_transition_failed",
                             "after_controller_action",
                         );
-                        return Err(report_transition_error(&mut error_report, transition_error));
+                        return Err(report_transition_error(
+                            &mut error_report,
+                            error.context(format!("{transition_error:#}")),
+                        ));
                     }
                     log_verifier_diagnostic(
                         self.diagnostic_text_guard.as_deref(),
@@ -2178,7 +2384,7 @@ impl GoalExecutionEngine {
                         "after_controller_action",
                     );
                     report_run_error(&mut error_report, GoalRunErrorReport::Surfaced);
-                    return Err(error).context("Goal verifier operation failed");
+                    return Err(error);
                 }
             };
             drop(verifier_operation);
@@ -2396,6 +2602,85 @@ impl GoalExecutionEngine {
         Ok(Some(GoalExecutionOutcome::Fenced))
     }
 
+    /// Ordinary spend refusal is resumable only with positive local phase
+    /// evidence, complete canonical accounting, and the exact execution fence.
+    async fn ordinary_spend_refusal_outcome(
+        &self,
+        error: anyhow::Error,
+        scope: &GoalExecutionScope,
+        accountant: &dyn crate::accounting::GoalOperationAccounting,
+        error_report: &mut Option<&mut GoalRunErrorReport>,
+    ) -> Result<GoalSpendRefusalOutcome> {
+        use crate::accounting::GoalOrdinarySpendRefusal;
+        use zeroclaw_api::turn_stop::{TurnStopCode, turn_stop};
+
+        if turn_stop(&error).is_none_or(|stop| stop.code != TurnStopCode::BudgetExhausted)
+            || accounting_failure_metadata(&error).is_some()
+        {
+            return Ok(GoalSpendRefusalOutcome::NotPaused(error));
+        }
+        let mut checked_clean = false;
+        let mut non_clean = false;
+        if let Some(refusal) = error.downcast_ref::<GoalOrdinarySpendRefusal>() {
+            non_clean |= !refusal.clean_tool_phase();
+            checked_clean = true;
+        }
+        for refusal in error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<GoalOrdinarySpendRefusal>())
+        {
+            non_clean |= !refusal.clean_tool_phase();
+            checked_clean = true;
+        }
+        if !checked_clean || non_clean {
+            return Ok(GoalSpendRefusalOutcome::NotPaused(error));
+        }
+
+        // This guard may fail the exact Goal. Combine its original failure
+        // before handing anything to the supervised publication owner once.
+        let transition = async {
+            self.require_complete_accounting(scope, accountant, &mut None)
+                .await?;
+            if self.exact_running_task_or_fenced(scope).await?.is_none() {
+                return Ok(true);
+            }
+            let message = "An ordinary daily or monthly cost limit refused the next Goal call. Wait for the ordinary limit to reset or raise it, then explicitly resume.";
+            let pause = GoalPauseState {
+                reason: GoalPauseReason::BudgetExhausted,
+                description: Some(message.to_owned()),
+                blockers: vec![GoalBlocker {
+                    kind: GoalBlockerKind::Budget,
+                    message: message.to_owned(),
+                    payload: None,
+                }],
+            };
+            match self.registry.pause_session_goal(
+                scope.task_id(),
+                scope.session_id(),
+                scope.execution_epoch(),
+                pause,
+            ).await? {
+                GoalTransitionResult::Applied => Ok(true),
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                    // A lost CAS is not a pause. Adopt only a committed winner
+                    // that actually discharges this original execution epoch.
+                    Ok(self.exact_running_task_or_fenced(scope).await?.is_none())
+                }
+            }
+        }.await;
+        match transition {
+            Ok(true) => {
+                report_run_error(error_report, GoalRunErrorReport::Surfaced);
+                Ok(GoalSpendRefusalOutcome::Fenced)
+            }
+            Ok(false) => Ok(GoalSpendRefusalOutcome::NotPaused(error)),
+            Err(secondary) => Err(report_transition_error(
+                error_report,
+                GoalAccountingFailure::preserving_primary_error(error, secondary),
+            )),
+        }
+    }
+
     async fn require_complete_accounting(
         &self,
         scope: &GoalExecutionScope,
@@ -2411,11 +2696,19 @@ impl GoalExecutionEngine {
             || goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
         {
-            if let Err(error) = self.fail(scope, "accounting_missing_or_invalid").await {
-                return Err(report_transition_error(error_report, error));
-            }
-            report_run_error(error_report, GoalRunErrorReport::Surfaced);
-            bail!("Goal accounting is incomplete");
+            let pending = goal.pending_call_id.is_some() || goal.pending_call_epoch.is_some();
+            let error = anyhow::Error::new(GoalAccountingFailure::incomplete(
+                goal.accounting_state,
+                pending,
+            ));
+            let error = self
+                .fail_with(
+                    scope,
+                    accounting_failure_reason(goal.accounting_state, pending),
+                    error,
+                )
+                .await;
+            return Err(report_transition_error(error_report, error));
         }
         if goal.effective_cost_limit_usd.is_some() && !accountant.pricing_complete().await? {
             if let Err(error) = self.fail(scope, "pricing_unavailable").await {
@@ -2510,6 +2803,19 @@ impl GoalExecutionEngine {
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
                 bail!("Goal verifier pause lost its execution fence")
             }
+        }
+    }
+
+    // A failed lifecycle transition must not replace the operation's original error.
+    async fn fail_with(
+        &self,
+        scope: &GoalExecutionScope,
+        reason: &'static str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        match self.fail(scope, reason).await {
+            Ok(()) => error,
+            Err(transition_error) => error.context(format!("{transition_error:#}")),
         }
     }
 
@@ -2713,6 +3019,8 @@ fn log_verifier_diagnostic(
 }
 
 fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
+    // The raw limit bounds parsing and the payload limit bounds stored pause
+    // state. Neither limit alters an accepted value.
     ensure!(
         raw.len() <= MAX_VERIFIER_RESPONSE_BYTES,
         "verifier response is too large"
@@ -2740,11 +3048,10 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
                 payload.is_object(),
                 "verifier blocker payload must be a JSON object"
             );
+            let encoded = serde_json::to_string(payload)
+                .context("verifier blocker payload cannot be encoded")?;
             ensure!(
-                serde_json::to_vec(payload)
-                    .context("serialize verifier blocker payload")?
-                    .len()
-                    <= MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES,
+                encoded.len() <= MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES,
                 "verifier blocker payload is too large"
             );
         }
@@ -2853,16 +3160,31 @@ mod tests {
         let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
             runtime.execution_engine(Arc::new(NoModelAccounting)),
         )));
-        let settings = GoalHostSettings::new(
-            true,
-            zeroclaw_commands::goal::GoalBudgetLimits {
-                token_limit: Some(1000),
-                cost_limit_usd: None,
+        let mut config = zeroclaw_config::schema::Config {
+            goal: zeroclaw_config::goal::GoalConfig {
+                enabled: true,
+                default_token_limit: Some(1000),
+                default_cost_limit_usd: Some(0.0),
+                include_channel_turn_context: true,
+                verifier: zeroclaw_config::goal::GoalVerifierConfig {
+                    model_provider: zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.default",
+                    ),
+                    model: None,
+                },
             },
-            1,
-            "fixture-boot",
-        )
-        .unwrap();
+            ..Default::default()
+        };
+        config.providers.models.openai.insert(
+            "default".into(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("gpt-test".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let settings = GoalHostSettings::from_config(&config, 1, "fixture-boot").unwrap();
         let driver = Arc::new(BoundaryDriver {
             key,
             command: Arc::new(Mutex::new(())),
@@ -2871,7 +3193,7 @@ mod tests {
         let ordinary = driver.boundary.clone().lock_owned().await;
         let GoalControlAdmission::Queued { deferred, .. } = supervisor
             .admit_control(
-                settings.clone(),
+                &settings,
                 ingress,
                 driver.clone(),
                 GoalCommand::Pause { immediate: false },
@@ -2897,9 +3219,222 @@ mod tests {
         assert!(driver.command.try_lock().is_err());
         assert!(driver.boundary.try_lock().is_err());
         assert!(registry.0.lock().unwrap().transitions.is_empty());
-        let committed = ready.commit(settings).await.unwrap();
+        let committed = ready.commit(&settings).await.unwrap();
         drop(committed.release());
         assert!(supervisor.try_retire().await);
+    }
+
+    #[test]
+    fn accounting_failures_are_classified_by_type_through_context_layers() {
+        #[derive(Debug)]
+        struct ForeignWrapper(GoalAccountingFailure);
+        impl std::fmt::Display for ForeignWrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "foreign wrapper: {}", self.0)
+            }
+        }
+        impl std::error::Error for ForeignWrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        for (state, pending, expected) in [
+            (
+                GoalAccountingState::Missing,
+                false,
+                "accounting_missing_or_invalid",
+            ),
+            (
+                GoalAccountingState::Invalid,
+                false,
+                "accounting_missing_or_invalid",
+            ),
+            (
+                GoalAccountingState::OutcomeUnknown,
+                false,
+                "accounting_outcome_unknown",
+            ),
+            (
+                GoalAccountingState::Complete,
+                true,
+                "accounting_outcome_unknown",
+            ),
+            (
+                GoalAccountingState::Missing,
+                true,
+                "accounting_outcome_unknown",
+            ),
+        ] {
+            let failure = GoalAccountingFailure::incomplete(state, pending);
+            let same_text = failure.to_string();
+            let error = anyhow::Error::new(failure)
+                .context("fixture turn context")
+                .context("fixture outer context");
+            assert_eq!(accounting_failure_metadata(&error), Some((state, pending)));
+            assert_eq!(accounting_failure_reason(state, pending), expected);
+            assert!(accounting_failure_metadata(&anyhow::Error::msg(same_text)).is_none());
+
+            let wrapped = anyhow::Error::new(ForeignWrapper(GoalAccountingFailure::incomplete(
+                state, pending,
+            )))
+            .context("foreign outer context");
+            assert_eq!(
+                accounting_failure_metadata(&wrapped),
+                Some((state, pending))
+            );
+        }
+        assert!(
+            accounting_failure_metadata(&anyhow::Error::new(
+                crate::accounting::GoalOperationFenced::NOT_RUNNING,
+            ))
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn completeness_guard_uses_durable_state_and_pending_evidence() {
+        use crate::accounting::{
+            GoalOperationAccounting, GoalOperationRequest, GoalOperationSettlement,
+        };
+        use crate::test_support::{NoModelAccounting, Registry};
+
+        struct UnusedAccountant;
+        #[async_trait::async_trait]
+        impl GoalOperationAccounting for UnusedAccountant {
+            async fn admit(&self, _: GoalOperationRequest) -> Result<()> {
+                unreachable!()
+            }
+            async fn settle(&self, _: GoalOperationSettlement) -> Result<()> {
+                unreachable!()
+            }
+            async fn pricing_complete(&self) -> Result<bool> {
+                unreachable!()
+            }
+        }
+
+        for (state, pending, expected) in [
+            (
+                GoalAccountingState::Missing,
+                false,
+                "accounting_missing_or_invalid",
+            ),
+            (
+                GoalAccountingState::Invalid,
+                false,
+                "accounting_missing_or_invalid",
+            ),
+            (
+                GoalAccountingState::OutcomeUnknown,
+                false,
+                "accounting_outcome_unknown",
+            ),
+            (
+                GoalAccountingState::Complete,
+                true,
+                "accounting_outcome_unknown",
+            ),
+        ] {
+            let registry = Arc::new(Registry::default());
+            registry.seed("fixture-session", TaskStatus::Running);
+            {
+                let mut stored = registry.0.lock().unwrap();
+                let goal = stored.goal.as_mut().unwrap();
+                goal.accounting_state = state;
+                if pending {
+                    goal.pending_call_id = Some("fixture-call".into());
+                    goal.pending_call_epoch = Some(1);
+                }
+            }
+            let engine =
+                GoalRuntime::new(registry.clone()).execution_engine(Arc::new(NoModelAccounting));
+            let scope = GoalExecutionScope::new("fixture-goal", "fixture-session", 1).unwrap();
+            let error = engine
+                .require_complete_accounting(&scope, &UnusedAccountant, &mut None)
+                .await
+                .unwrap_err();
+            assert_eq!(accounting_failure_metadata(&error), Some((state, pending)));
+            let stored = registry.0.lock().unwrap();
+            assert_eq!(stored.terminal_reason.as_deref(), Some(expected));
+            assert_eq!(stored.task.as_ref().unwrap().status, TaskStatus::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_spend_refusal_checks_each_pending_field_before_once_only_handoff() {
+        use crate::test_support::{NoModelAccounting, Registry};
+        use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, turn_stop};
+
+        struct UnusedAccountant;
+        #[async_trait::async_trait]
+        impl crate::accounting::GoalOperationAccounting for UnusedAccountant {
+            async fn admit(&self, _: crate::accounting::GoalOperationRequest) -> Result<()> {
+                unreachable!()
+            }
+            async fn settle(&self, _: crate::accounting::GoalOperationSettlement) -> Result<()> {
+                unreachable!()
+            }
+            async fn pricing_complete(&self) -> Result<bool> {
+                unreachable!()
+            }
+        }
+
+        for (pending_id, pending_epoch) in [(true, false), (false, true), (true, true)] {
+            let registry = Arc::new(Registry::default());
+            registry.seed("fixture-session", TaskStatus::Running);
+            {
+                let mut stored = registry.0.lock().unwrap();
+                let goal = stored.goal.as_mut().unwrap();
+                goal.pending_call_id = pending_id.then(|| "fixture-prior-call".to_owned());
+                goal.pending_call_epoch = pending_epoch.then_some(1);
+            }
+            let factory = Arc::new(NoModelAccounting);
+            let scope = GoalExecutionScope::new("fixture-goal", "fixture-session", 1).unwrap();
+            let engine = GoalRuntime::new(registry.clone()).execution_engine(factory);
+            let original = anyhow::Error::new(crate::accounting::GoalOrdinarySpendRefusal::new(
+                TurnStop::fatal(
+                    TurnStopCode::BudgetExhausted,
+                    "original ordinary spend refusal",
+                )
+                .into(),
+                true,
+            ));
+            let mut report = GoalRunErrorReport::Unreported;
+            let returned = engine
+                .ordinary_spend_refusal_outcome(
+                    original,
+                    &scope,
+                    &UnusedAccountant,
+                    &mut Some(&mut report),
+                )
+                .await
+                .err()
+                .unwrap();
+            let GoalRunErrorReport::Handed(original) = report else {
+                panic!("combined guard error must be handed once, not marked already surfaced");
+            };
+            assert_eq!(
+                turn_stop(&original).unwrap().code,
+                TurnStopCode::BudgetExhausted
+            );
+            assert_eq!(
+                accounting_failure_metadata(&original),
+                Some((GoalAccountingState::Complete, true))
+            );
+            assert_eq!(returned.to_string(), format!("{original:#}"));
+            assert_eq!(
+                format!("{original:#}")
+                    .matches("original ordinary spend refusal")
+                    .count(),
+                1
+            );
+            let stored = registry.0.lock().unwrap();
+            assert_eq!(stored.task.as_ref().unwrap().status, TaskStatus::Failed);
+            assert_eq!(
+                stored.terminal_reason.as_deref(),
+                Some("accounting_outcome_unknown")
+            );
+        }
     }
 
     #[test]
@@ -3191,5 +3726,72 @@ mod tests {
             pause_reason_for_verifier_blockers(&[blocker(GoalBlockerKind::ExternalDependency)]),
             GoalPauseReason::ExternalDependency
         );
+    }
+
+    #[test]
+    fn verifier_protocol_accepts_a_blocker_payload_at_the_byte_limit() {
+        // Multibyte data at the compact-JSON byte ceiling remains unchanged.
+        let payload = serde_json::json!({"context": "é".repeat(2_041)});
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap().len(),
+            MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES
+        );
+        let raw = serde_json::json!({
+            "decision": "blocked",
+            "reason": "operator choice required",
+            "blockers": [{
+                "kind": "needs_user_input",
+                "message": "choose an option",
+                "payload": payload,
+            }],
+        })
+        .to_string();
+        let VerifierDecision::Blocked { blockers, .. } = parse_verifier_response(&raw).unwrap()
+        else {
+            panic!("expected a bounded blocked decision");
+        };
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].payload.as_ref(), Some(&payload));
+    }
+
+    #[test]
+    fn verifier_protocol_rejects_a_blocker_payload_over_the_byte_limit() {
+        // One ASCII byte over the multibyte boundary rejects the whole value.
+        let payload = serde_json::json!({"context": format!("{}x", "é".repeat(2_041))});
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap().len(),
+            MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES + 1
+        );
+        let raw = serde_json::json!({
+            "decision": "blocked",
+            "reason": "operator choice required",
+            "blockers": [{
+                "kind": "needs_user_input",
+                "message": "choose an option",
+                "payload": payload,
+            }],
+        })
+        .to_string();
+        let error = parse_verifier_response(&raw).err().unwrap();
+        assert!(error.to_string().contains("payload is too large"));
+    }
+
+    #[test]
+    fn verifier_protocol_bounds_the_raw_response_bytes() {
+        // Whitespace counts toward the pre-parse UTF-8 response ceiling.
+        let mut raw =
+            r#"{"decision":"continue","reason":"finish the criterion","blockers":[]}"#.to_owned();
+        raw.extend(std::iter::repeat_n(
+            ' ',
+            MAX_VERIFIER_RESPONSE_BYTES - raw.len(),
+        ));
+        assert_eq!(raw.len(), MAX_VERIFIER_RESPONSE_BYTES);
+        assert!(matches!(
+            parse_verifier_response(&raw).unwrap(),
+            VerifierDecision::Continue { .. }
+        ));
+        raw.push(' ');
+        let error = parse_verifier_response(&raw).err().unwrap();
+        assert!(error.to_string().contains("response is too large"));
     }
 }

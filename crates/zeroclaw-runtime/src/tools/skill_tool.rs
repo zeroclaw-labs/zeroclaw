@@ -291,6 +291,31 @@ pub struct SkillBuiltinTool {
     advertised_schema: Arc<serde_json::Value>,
 }
 
+/// Assembly-local identity of the one pipeline that has not been shared yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotId(pub(crate) usize);
+
+pub(crate) enum TargetRef {
+    Existing(Arc<dyn Tool>),
+    Pipeline(SlotId),
+}
+
+/// Constructor metadata only: this cannot execute or escape as a `Tool`.
+pub(crate) struct PreparedSkillBuiltin {
+    pub(crate) tool_name: String,
+    tool_description: String,
+    locked_args: serde_json::Map<String, serde_json::Value>,
+    advertised_schema: Arc<serde_json::Value>,
+}
+
+pub(crate) enum PreparedSkill {
+    Ready(Box<dyn Tool>),
+    Elevated {
+        prepared: PreparedSkillBuiltin,
+        target: TargetRef,
+    },
+}
+
 impl SkillBuiltinTool {
     pub fn new(
         skill_name: &str,
@@ -298,17 +323,69 @@ impl SkillBuiltinTool {
         target_tool: Arc<dyn zeroclaw_api::tool::Tool>,
         locked_args: HashMap<String, String>,
     ) -> Self {
+        PreparedSkillBuiltin::prepare(skill_name, tool, locked_args, target_tool.as_ref())
+            .bind(target_tool)
+    }
+}
+
+impl PreparedSkillBuiltin {
+    pub(crate) fn prepare(
+        skill_name: &str,
+        tool: &crate::skills::SkillTool,
+        locked_args: HashMap<String, String>,
+        target: &dyn Tool,
+    ) -> Self {
         let locked: serde_json::Map<String, serde_json::Value> = locked_args
             .into_iter()
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
-        let advertised_schema = Arc::new(narrow_schema(target_tool.parameters_schema(), &locked));
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        crate::tools::late_tool_search_observer::record(
+            "skill-schema-enter",
+            "prepare",
+            crate::tools::late_tool_search_observer::borrowed_id(target),
+            0,
+        );
+        let advertised_schema = Arc::new(narrow_schema(target.parameters_schema(), &locked));
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        crate::tools::late_tool_search_observer::record(
+            "skill-schema-return",
+            "prepare",
+            crate::tools::late_tool_search_observer::borrowed_id(target),
+            crate::tools::late_tool_search_observer::arc_id(&advertised_schema),
+        );
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
-            target_tool,
             locked_args: locked,
             advertised_schema,
+        }
+    }
+
+    pub(crate) fn bind(self, target_tool: Arc<dyn Tool>) -> SkillBuiltinTool {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        crate::tools::late_tool_search_observer::record(
+            "skill-bind",
+            &self.tool_name,
+            crate::tools::late_tool_search_observer::arc_id(&target_tool),
+            crate::tools::late_tool_search_observer::arc_id(&self.advertised_schema),
+        );
+        SkillBuiltinTool {
+            tool_name: self.tool_name,
+            tool_description: self.tool_description,
+            target_tool,
+            locked_args: self.locked_args,
+            advertised_schema: self.advertised_schema,
+        }
+    }
+
+    pub(crate) fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        zeroclaw_api::tool::ToolSpec {
+            name: self.tool_name.clone(),
+            description: self.tool_description.clone(),
+            parameters: Arc::clone(&self.advertised_schema),
+            output: None,
+            param_domains: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -358,6 +435,11 @@ fn narrow_schema(
 
 #[async_trait]
 impl Tool for SkillBuiltinTool {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        let effective = merge_locked_args(&self.locked_args, args.clone());
+        self.target_tool.may_invoke_agent_child(&effective)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.target_tool.requires_unrestricted_principal()
     }
@@ -388,6 +470,18 @@ impl Tool for SkillBuiltinTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_with_context(
+            args,
+            &zeroclaw_api::tool::ToolExecutionContext::current().unwrap_or_default(),
+        )
+        .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
         // Audit: elevated skill tools delegate to a target that may be blocked
         // by SecurityPolicy or hidden from the model. Record every invocation
         // at INFO with the delegation target and the locked scope keys.
@@ -403,7 +497,7 @@ impl Tool for SkillBuiltinTool {
             "skill-scoped elevated tool invoked"
         );
         let merged = merge_locked_args(&self.locked_args, args);
-        self.target_tool.execute(merged).await
+        self.target_tool.execute_with_context(merged, context).await
     }
 }
 
@@ -415,6 +509,54 @@ mod tests {
     use crate::skills::SkillTool;
     use zeroclaw_api::attribution::{Attributable, ToolProvenance};
     use zeroclaw_config::schema::DockerRuntimeConfig;
+
+    struct AliasChildPredicateProbe;
+    zeroclaw_api::mock_tool_attribution!(AliasChildPredicateProbe);
+
+    #[async_trait]
+    impl Tool for AliasChildPredicateProbe {
+        fn name(&self) -> &str {
+            "actual_target"
+        }
+        fn description(&self) -> &str {
+            "argument-sensitive child predicate"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args.get("action").and_then(|v| v.as_str()) != Some("list_results")
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            panic!("predicate must not execute the target")
+        }
+    }
+
+    #[test]
+    fn skill_child_predicate_uses_target_and_locked_argument_precedence() {
+        let target: Arc<dyn Tool> = Arc::new(AliasChildPredicateProbe);
+        for (locked_action, caller_action, expected) in [
+            (Some("list_results"), "delegate", false),
+            (Some("delegate"), "list_results", true),
+            (None, "list_results", false),
+            (None, "delegate", true),
+        ] {
+            let mut locked = HashMap::new();
+            if let Some(action) = locked_action {
+                locked.insert("action".to_string(), action.to_string());
+            }
+            let skill = elevation_skill_tool("builtin", "actual_target", locked.clone());
+            let alias = SkillBuiltinTool::new("unrelated_alias", &skill, target.clone(), locked);
+            assert_eq!(
+                alias.may_invoke_agent_child(&serde_json::json!({"action": caller_action})),
+                expected
+            );
+        }
+        let locked = HashMap::new();
+        let skill = elevation_skill_tool("builtin", "actual_target", locked.clone());
+        let alias = SkillBuiltinTool::new("unrelated_alias", &skill, target, locked);
+        assert!(alias.may_invoke_agent_child(&serde_json::json!({})));
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {

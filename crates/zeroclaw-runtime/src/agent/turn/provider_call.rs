@@ -4,14 +4,16 @@
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress, thinking_status_text};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
-    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+    is_tool_loop_cancelled,
 };
 use super::redact::scrub_credentials;
-use super::stream_consume::{StreamProviderFailure, consume_provider_streaming_response};
+use super::stream_consume::{
+    StreamProviderFailure, consume_provider_streaming_response_with_policy,
+};
 use crate::agent::cost::{admit_goal_operation_if_scoped, check_tool_loop_budget};
-use crate::cost::types::BudgetCheck;
+use crate::cost::types::{BudgetCheck, UsagePeriod};
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
@@ -245,47 +247,101 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
     Ok(())
 }
 
+/// Surface a `cost.warn_at_percent` crossing to the turn's event stream.
+/// Sends at most one [`TurnEvent::BudgetWarning`] per turn (`*sent` latches)
+/// and never blocks the turn: an exceeded limit is left to
+/// [`enforce_tool_loop_budget`], and a full or closed channel drops the
+/// notice. No-op when unscoped or when the turn has no event stream.
+pub(crate) fn announce_budget_warning(
+    event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    sent: &mut bool,
+) {
+    if *sent {
+        return;
+    }
+    let Some(tx) = event_tx else { return };
+    let Some(BudgetCheck::Warning {
+        current_usd,
+        limit_usd,
+        period,
+    }) = check_tool_loop_budget()
+    else {
+        return;
+    };
+    let period = match period {
+        UsagePeriod::Day => zeroclaw_api::agent::BudgetWarningPeriod::Day,
+        UsagePeriod::Month => zeroclaw_api::agent::BudgetWarningPeriod::Month,
+        UsagePeriod::Session => return,
+    };
+    *sent = true;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_attrs(::serde_json::json!({
+                "current_usd": current_usd,
+                "limit_usd": limit_usd,
+                "period": format!("{period:?}"),
+            })),
+        "cost warning threshold reached"
+    );
+    // `try_send`: a slow event consumer must never hold up the next
+    // provider call for a heads-up notice.
+    let _ = tx.try_send(zeroclaw_api::agent::TurnEvent::BudgetWarning {
+        current_usd,
+        limit_usd,
+        period,
+    });
+}
+
 /// One provider call: streaming via `consume_provider_streaming_response`
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
 /// cancel asymmetry this function must preserve.
+/// An active Goal foreground token or absolute deadline is checked before
+/// accountant admission; once admitted, existing settlement and drain apply.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
     active_model_provider_name: &str,
     active_model: &str,
     active_dispatch_model: &str,
-    prepared_messages: &[ChatMessage],
+    original_request: ChatRequest<'_>,
     image_recovery_messages: Option<&[ChatMessage]>,
-    request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
+    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     iteration: usize,
+    guard_tools: Option<&[ToolSpec]>,
 ) -> Result<ProviderCallOutcome> {
+    let foreground = crate::goal_accounting::GoalForegroundContext::current();
+    if foreground.as_ref().is_some_and(|context| {
+        context.token().is_cancelled() || tokio::time::Instant::now() >= context.deadline()
+    }) {
+        return Err(ToolLoopCancelled.into());
+    }
     admit_goal_operation_if_scoped(ctx.provider_name, active_model).await?;
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
     let mut image_recovery_succeeded = false;
-    let original_request = ChatRequest {
-        messages: prepared_messages,
-        tools: request_tools,
-        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-            .try_with(Clone::clone)
-            .ok()
-            .flatten(),
-    };
+    let prepared_messages = original_request.messages;
+    let request_tools = original_request.tools;
 
     let (chat_result, accounting) = if should_consume_provider_stream {
         // The stream is lazily consumed inside this call-scoped owner. Its
         // permitted non-stream recovery therefore shares the same Reliable
         // attempt ledger instead of opening a second scope.
-        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        let scope = if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            zeroclaw_providers::dispatch::AccountedChatScope::new_with_string_usage()
+        } else {
+            zeroclaw_providers::dispatch::AccountedChatScope::new()
+        };
         let (result, live_deltas, protocol_suppressed, visible_text, recovered_image_request) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
-                    match consume_provider_streaming_response(
+                    match consume_provider_streaming_response_with_policy(
                         active_model_provider,
-                        prepared_messages,
-                        request_tools,
+                        original_request,
                         active_dispatch_model,
                         ctx.temperature,
                         ctx.cancellation_token,
@@ -293,6 +349,8 @@ pub(crate) async fn call_provider(
                         ctx.event_tx,
                         ctx.strict_tool_parsing,
                         ctx.draft_reasoning,
+                        policy,
+                        guard_tools,
                     )
                     .await
                     {
@@ -314,6 +372,9 @@ pub(crate) async fn call_provider(
                         }
                         Err(stream_err)
                             if stream_err
+                                .downcast_ref::<super::stream_consume::SingleToolRoundViolation>()
+                                .is_some()
+                                || stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
                                 .is_some()
                                 || is_tool_loop_cancelled(&stream_err)
@@ -323,8 +384,13 @@ pub(crate) async fn call_provider(
                                 =>
                         {
                             if let Some(usage) = stream_err
+                                .downcast_ref::<super::stream_consume::SingleToolRoundViolation>()
+                                .and_then(|error| error.usage.clone())
+                                .or_else(|| {
+                                    stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
                                 .and_then(|error| error.usage.clone())
+                                })
                                 .or_else(|| {
                                     stream_err
                                         .downcast_ref::<StreamInterruptedAfterOutput>()
@@ -351,33 +417,20 @@ pub(crate) async fn call_provider(
                             (Err(stream_err), false, false, String::new(), false)
                         }
                         Err(stream_err) => {
-                            let streamed_refusal = stream_err
-                                .downcast_ref::<StreamErrorWithUsage>()
-                                .and_then(|error| match &error.source {
-                                    zeroclaw_api::model_provider::StreamError::ModelRefusal(
-                                        refusal,
-                                    ) => Some((**refusal).clone()),
-                                    _ => None,
-                                })
-                                .or_else(|| {
-                                    stream_err.chain().find_map(|cause| {
-                                        if let Some(
-                                            zeroclaw_api::model_provider::StreamError::ModelRefusal(
-                                                refusal,
-                                            ),
-                                        ) = cause.downcast_ref::<
-                                            zeroclaw_api::model_provider::StreamError,
-                                        >() {
-                                            Some((**refusal).clone())
-                                        } else {
-                                            cause
-                                                .downcast_ref::<
-                                                    zeroclaw_api::model_provider::ModelRefusalError,
-                                                >()
-                                                .cloned()
-                                        }
-                                    })
-                                });
+                            let streamed_refusal = stream_err.chain().find_map(|cause| {
+                                if let Some(
+                                    zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal),
+                                ) = cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>()
+                                {
+                                    Some((**refusal).clone())
+                                } else {
+                                    cause
+                                        .downcast_ref::<
+                                            zeroclaw_api::model_provider::ModelRefusalError,
+                                        >()
+                                        .cloned()
+                                }
+                            });
                             if let Some(usage) = streamed_refusal
                                 .as_ref()
                                 .and_then(|refusal| refusal.usage.as_deref().cloned())
@@ -389,13 +442,8 @@ pub(crate) async fn call_provider(
                             {
                                 scope.record_stream_semantic_rejection_usage(usage);
                             } else if let Some(usage) = stream_err
-                                .downcast_ref::<StreamErrorWithUsage>()
-                                .and_then(|error| error.usage.clone())
-                                .or_else(|| {
-                                    stream_err
-                                        .downcast_ref::<StreamProviderFailure>()
-                                        .and_then(StreamProviderFailure::usage)
-                                })
+                                .downcast_ref::<StreamProviderFailure>()
+                                .and_then(StreamProviderFailure::usage)
                             {
                                 scope.record_stream_interruption_usage(usage);
                             }
@@ -407,16 +455,8 @@ pub(crate) async fn call_provider(
                             }
                             scope.record_stream_recovery_failure(&stream_err);
                             let terminal_stream_error = stream_err
-                                .downcast_ref::<StreamErrorWithUsage>()
-                                .is_some_and(|error| {
-                                    matches!(
-                                        &error.source,
-                                        zeroclaw_providers::traits::StreamError::Terminal(_)
-                                    )
-                                })
-                                || stream_err
-                                    .downcast_ref::<StreamProviderFailure>()
-                                    .is_some_and(StreamProviderFailure::is_terminal);
+                                .downcast_ref::<StreamProviderFailure>()
+                                .is_some_and(StreamProviderFailure::is_terminal);
                             if terminal_stream_error {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -467,10 +507,7 @@ pub(crate) async fn call_provider(
                                 let request = ChatRequest {
                                     messages: recovery_messages,
                                     tools: request_tools,
-                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                        .try_with(Clone::clone)
-                                        .ok()
-                                        .flatten(),
+                                    thinking: original_request.thinking,
                                 };
                                 let recovery = with_exact_dispatch_route(
                                     active_model_provider_name.to_string(),
@@ -479,20 +516,22 @@ pub(crate) async fn call_provider(
                                         match streamed_refusal {
                                             Some(refusal) => {
                                                 dispatcher
-                                                    .chat_after_stream_refusal(
+                                                    .chat_after_stream_refusal_with_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
                                                         ctx.temperature,
                                                         refusal,
+                                                        policy,
                                                     )
                                                     .await
                                             }
                                             None => {
                                                 dispatcher
-                                                    .chat(
+                                                    .chat_with_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
                                                         ctx.temperature,
+                                                        policy,
                                                     )
                                                     .await
                                             }
@@ -561,7 +600,11 @@ pub(crate) async fn call_provider(
         // Non-streaming path: wrap with optional per-step timeout from
         // pacing config to catch hung model responses.
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        let scope = if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            zeroclaw_providers::dispatch::AccountedChatScope::new_with_string_usage()
+        } else {
+            zeroclaw_providers::dispatch::AccountedChatScope::new()
+        };
         // Both attempts belong to one inference step: recovery must not
         // outlive cancellation or receive a fresh timeout allowance.
         let chat_future = async {
@@ -569,7 +612,12 @@ pub(crate) async fn call_provider(
                 .scope(Box::pin(with_exact_dispatch_route(
                     active_model_provider_name.to_string(),
                     active_model.to_string(),
-                    dispatcher.chat(original_request, active_dispatch_model, ctx.temperature),
+                    dispatcher.chat_with_tool_round_policy(
+                        original_request,
+                        active_dispatch_model,
+                        ctx.temperature,
+                        policy,
+                    ),
                 )))
                 .await;
 
@@ -585,18 +633,16 @@ pub(crate) async fn call_provider(
                             scope.scope(with_exact_dispatch_route(
                                 active_model_provider_name.to_string(),
                                 active_model.to_string(),
-                                dispatcher.chat(
+                                dispatcher.chat_with_tool_round_policy(
                                     ChatRequest {
                                         messages: image_recovery_messages
                                             .unwrap_or(prepared_messages),
                                         tools: request_tools,
-                                        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                            .try_with(Clone::clone)
-                                            .ok()
-                                            .flatten(),
+                                        thinking: original_request.thinking,
                                     },
                                     active_dispatch_model,
                                     ctx.temperature,
+                                    policy,
                                 ),
                             )),
                         )
@@ -1191,7 +1237,9 @@ mod streaming_fallback_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::{ModelRefusalError, StreamError, StreamEvent};
+    use zeroclaw_api::model_provider::{
+        ModelRefusalError, StreamError, StreamEvent, ToolRoundPolicy,
+    };
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
     use zeroclaw_providers::reliable::ReliableModelProvider;
@@ -1224,6 +1272,259 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+        }
+    }
+
+    struct AdmissionProvider {
+        chat: AtomicUsize,
+        stream: AtomicUsize,
+    }
+
+    impl Attributable for AdmissionProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "admission-provider"
+        }
+    }
+
+    fn admission_usage() -> TokenUsage {
+        TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for AdmissionProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            unreachable!("structured chat is used")
+        }
+        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: Option<f64>) -> Result<ChatResponse> {
+            self.chat.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("response".into()),
+                tool_calls: vec![],
+                usage: Some(admission_usage()),
+                reasoning_content: None,
+            })
+        }
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn stream_chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta("response"),
+                )),
+                Ok(StreamEvent::Usage(admission_usage())),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
+    struct AdmissionSpy {
+        forbidden: bool,
+        admits: AtomicUsize,
+        settles: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for AdmissionSpy {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> Result<()> {
+            assert!(!self.forbidden, "unexpected accountant admission");
+            assert_eq!(request.model_provider, "test-provider");
+            assert_eq!(request.model, "test-model");
+            self.admits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> Result<()> {
+            self.settles.fetch_add(1, Ordering::SeqCst);
+            panic!("call_provider must not settle")
+        }
+        async fn pricing_complete(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    async fn admission_call(
+        provider: &AdmissionProvider,
+        streaming: bool,
+    ) -> Result<ProviderCallOutcome> {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = recovery_test_ctx(&observer, &pacing);
+        let messages = [ChatMessage::user("hello")];
+        call_provider(
+            &ctx,
+            provider,
+            "test-provider",
+            "test-model",
+            "test-model",
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            None,
+            streaming,
+            ToolRoundPolicy::Batch,
+            0,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_provider_admission_rejects_stopped_or_expired_root() {
+        for streaming in [false, true] {
+            for cancelled in [false, true] {
+                let directory = tempfile::TempDir::new().unwrap();
+                let handle =
+                    crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap();
+                let token = tokio_util::sync::CancellationToken::new();
+                let now = tokio::time::Instant::now();
+                let deadline = if cancelled {
+                    now + Duration::from_secs(60)
+                } else {
+                    now
+                };
+                if cancelled {
+                    token.cancel();
+                }
+                let root = crate::goal_accounting::GoalForegroundContext::new_root(
+                    zeroclaw_goal::GoalExecutionScope::new(
+                        "goal-accounting",
+                        "matrix_goal-accounting",
+                        1,
+                    )
+                    .unwrap(),
+                    handle,
+                    token,
+                    deadline,
+                );
+                let provider = AdmissionProvider {
+                    chat: AtomicUsize::new(0),
+                    stream: AtomicUsize::new(0),
+                };
+                let spy = Arc::new(AdmissionSpy {
+                    forbidden: true,
+                    admits: AtomicUsize::new(0),
+                    settles: AtomicUsize::new(0),
+                });
+                let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+                    spy.clone();
+                let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .scope(
+                        Some(accountant),
+                        root.scope(admission_call(&provider, streaming)),
+                    )
+                    .await;
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("stopped Goal was admitted"),
+                };
+                assert!(error.downcast_ref::<ToolLoopCancelled>().is_some());
+                assert_eq!(provider.chat.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.stream.load(Ordering::SeqCst), 0);
+                assert_eq!(spy.admits.load(Ordering::SeqCst), 0);
+                assert_eq!(spy.settles.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_provider_admission_live_and_unscoped_succeed() {
+        for streaming in [false, true] {
+            for scoped in [false, true] {
+                let directory = tempfile::TempDir::new().unwrap();
+                let handle =
+                    crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap();
+                let root = crate::goal_accounting::GoalForegroundContext::new_root(
+                    zeroclaw_goal::GoalExecutionScope::new(
+                        "goal-accounting",
+                        "matrix_goal-accounting",
+                        1,
+                    )
+                    .unwrap(),
+                    handle,
+                    tokio_util::sync::CancellationToken::new(),
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                );
+                let provider = AdmissionProvider {
+                    chat: AtomicUsize::new(0),
+                    stream: AtomicUsize::new(0),
+                };
+                let spy = Arc::new(AdmissionSpy {
+                    forbidden: false,
+                    admits: AtomicUsize::new(0),
+                    settles: AtomicUsize::new(0),
+                });
+                let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+                    spy.clone();
+                let outcome = if scoped {
+                    zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                        .scope(
+                            Some(accountant),
+                            root.scope(admission_call(&provider, streaming)),
+                        )
+                        .await
+                } else {
+                    admission_call(&provider, streaming).await
+                }
+                .unwrap();
+                assert!(outcome.chat_result.is_ok());
+                assert_eq!(
+                    provider.chat.load(Ordering::SeqCst),
+                    usize::from(!streaming)
+                );
+                assert_eq!(
+                    provider.stream.load(Ordering::SeqCst),
+                    usize::from(streaming)
+                );
+                assert_eq!(spy.admits.load(Ordering::SeqCst), usize::from(scoped));
+                assert_eq!(spy.settles.load(Ordering::SeqCst), 0);
+                assert_eq!(outcome.attempts.len(), 1);
+                let attempt = &outcome.attempts[0];
+                assert_eq!(
+                    attempt.provider_ref(),
+                    if streaming {
+                        "admission-provider"
+                    } else {
+                        "test-provider"
+                    }
+                );
+                assert_eq!(attempt.model(), "test-model");
+                match attempt.outcome() {
+                    zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage) => {
+                        assert_eq!(usage.input_tokens, Some(10));
+                        assert_eq!(usage.output_tokens, Some(2));
+                    }
+                    other => panic!("unexpected attempt outcome: {other:?}"),
+                }
+            }
         }
     }
     struct RejectedImageThenPendingProvider {
@@ -1298,11 +1599,19 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 false,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             );
             let cancel = async {
                 provider.recovery_started.notified().await;
@@ -1343,11 +1652,19 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 false,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             ),
         )
         .await
@@ -1369,6 +1686,7 @@ mod streaming_fallback_tests {
         stream_calls: Arc<AtomicUsize>,
         non_stream_calls: Arc<AtomicUsize>,
         cancel_on_final: Option<tokio_util::sync::CancellationToken>,
+        policies: Arc<std::sync::Mutex<Vec<ToolRoundPolicy>>>,
     }
 
     struct PreExecutedToolThenEmptyProvider {
@@ -1468,6 +1786,29 @@ mod streaming_fallback_tests {
 
     #[async_trait]
     impl ModelProvider for EmptyStreamThenTextProvider {
+        async fn chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+        ) -> Result<ChatResponse> {
+            self.policies.lock().unwrap().push(policy);
+            self.chat(request, model, temperature).await
+        }
+
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            options: StreamOptions,
+            policy: ToolRoundPolicy,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.policies.lock().unwrap().push(policy);
+            self.stream_chat(request, model, temperature, options)
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -1811,22 +2152,26 @@ mod streaming_fallback_tests {
 
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
-        check_empty_stream_recovery(false).await;
+        for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+            check_empty_stream_recovery(false, policy).await;
+        }
     }
 
     #[tokio::test]
     async fn cancelled_empty_stream_does_not_start_recovery() {
-        check_empty_stream_recovery(true).await;
+        check_empty_stream_recovery(true, ToolRoundPolicy::Batch).await;
     }
 
-    async fn check_empty_stream_recovery(cancel_on_final: bool) {
+    async fn check_empty_stream_recovery(cancel_on_final: bool, policy: ToolRoundPolicy) {
         let stream_calls = Arc::new(AtomicUsize::new(0));
         let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let policies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let token = tokio_util::sync::CancellationToken::new();
         let provider = EmptyStreamThenTextProvider {
             stream_calls: Arc::clone(&stream_calls),
             non_stream_calls: Arc::clone(&non_stream_calls),
             cancel_on_final: cancel_on_final.then(|| token.clone()),
+            policies: Arc::clone(&policies),
         };
         let provider = ReliableModelProvider::new(
             "test",
@@ -1878,11 +2223,19 @@ mod streaming_fallback_tests {
                         "test-provider",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        policy,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -1890,6 +2243,11 @@ mod streaming_fallback_tests {
             .expect("provider call returns its terminal outcome");
 
         assert_eq!(stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *policies.lock().unwrap(),
+            vec![policy; if cancel_on_final { 1 } else { 2 }],
+            "non-stream recovery must preserve the stream request's explicit policy"
+        );
         assert!(matches!(
             event_rx
                 .try_recv()
@@ -1976,11 +2334,19 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("stream fallback remains a provider-call outcome");
@@ -2031,11 +2397,19 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("stream interruption remains a provider-call outcome")
@@ -2167,11 +2541,19 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &[ChatMessage::user("go")],
-                None,
+                ChatRequest {
+                    messages: &[ChatMessage::user("go")],
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("stream failure is returned as a provider-call outcome");
@@ -2290,11 +2672,19 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "hint:images",
-            &original,
+            ChatRequest {
+                messages: &original,
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             Some(&recovery),
-            None,
             false,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("provider call returns its outcome");
@@ -2372,11 +2762,19 @@ mod streaming_fallback_tests {
                 "requested-provider",
                 "requested-model",
                 "requested-model",
-                &[ChatMessage::user("go")],
-                None,
+                ChatRequest {
+                    messages: &[ChatMessage::user("go")],
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("pre-output refusal is recovered by the next candidate");
@@ -2476,11 +2874,19 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("dispatch returns the provider outcome")
@@ -2547,11 +2953,19 @@ mod streaming_fallback_tests {
             "requested-provider",
             "requested-model",
             "requested-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             false,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("cancellation remains a provider-call outcome");
@@ -2619,11 +3033,19 @@ mod streaming_fallback_tests {
             "requested-provider",
             "requested-model",
             "requested-model",
-            &[ChatMessage::user("go")],
-            None,
+            ChatRequest {
+                messages: &[ChatMessage::user("go")],
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             None,
             false,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("timeout remains a provider-call outcome");
@@ -2644,6 +3066,136 @@ mod streaming_fallback_tests {
             zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+
+    #[derive(Default)]
+    struct ImageRecoveryPolicyProvider {
+        requests: std::sync::Mutex<Vec<(ToolRoundPolicy, bool)>>,
+    }
+
+    impl ImageRecoveryPolicyProvider {
+        fn record_request(&self, request: ChatRequest<'_>, policy: ToolRoundPolicy) -> bool {
+            let has_image =
+                zeroclaw_providers::multimodal::count_image_markers(request.messages) > 0;
+            self.requests.lock().unwrap().push((policy, has_image));
+            has_image
+        }
+    }
+
+    impl Attributable for ImageRecoveryPolicyProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "image-recovery-policy"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ImageRecoveryPolicyProvider {
+        fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("every request must retain its explicit tool-round policy")
+        }
+
+        async fn chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+        ) -> anyhow::Result<ChatResponse> {
+            if self.record_request(request, policy) {
+                return Err(StreamError::HttpStatus {
+                    status: 400,
+                    message: "image request rejected".to_string(),
+                }
+                .into());
+            }
+            Ok(ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+            policy: ToolRoundPolicy,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            assert!(self.record_request(request, policy));
+            Box::pin(futures_util::stream::iter(vec![Err(
+                StreamError::HttpStatus {
+                    status: 400,
+                    message: "image request rejected".to_string(),
+                },
+            )]))
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_preserves_tool_round_policy_in_both_transports() {
+        for streaming in [false, true] {
+            for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+                let provider = ImageRecoveryPolicyProvider::default();
+                let observer = NoopObserver;
+                let pacing = PacingConfig::default();
+                let ctx = recovery_test_ctx(&observer, &pacing);
+                let original = [ChatMessage::user(
+                    "inspect [IMAGE:https://example.test/image.png]",
+                )];
+                let recovery = [ChatMessage::user("inspect")];
+                let outcome = call_provider(
+                    &ctx,
+                    &provider,
+                    "test-provider",
+                    "test-model",
+                    "test-model",
+                    ChatRequest {
+                        messages: &original,
+                        tools: None,
+                        thinking: None,
+                    },
+                    Some(&recovery),
+                    streaming,
+                    policy,
+                    0,
+                    None,
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    outcome.chat_result.unwrap().text.as_deref(),
+                    Some("recovered")
+                );
+                assert!(outcome.image_recovery_succeeded);
+                assert_eq!(
+                    *provider.requests.lock().unwrap(),
+                    vec![(policy, true), (policy, false)],
+                    "streaming={streaming}, policy={policy:?}"
+                );
+            }
+        }
     }
 
     struct ImageRecoveryStreamProvider {
@@ -2820,11 +3372,19 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &original,
+            ChatRequest {
+                messages: &original,
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             Some(&recovery),
-            None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         );
         let cancel = async {
             provider.recovery_started.notified().await;
@@ -2871,11 +3431,19 @@ mod streaming_fallback_tests {
             "test-provider",
             "test-model",
             "test-model",
-            &original,
+            ChatRequest {
+                messages: &original,
+                tools: None,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             Some(&recovery),
-            None,
             true,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
+            None,
         )
         .await
         .expect("provider call completes");
@@ -2917,11 +3485,19 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("provider call completes");
@@ -3030,11 +3606,19 @@ mod streaming_fallback_tests {
                 "context-overflow",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 streaming,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("provider call completes");
@@ -3080,11 +3664,19 @@ mod streaming_fallback_tests {
                 "test-provider",
                 "test-model",
                 "test-model",
-                &original,
+                ChatRequest {
+                    messages: &original,
+                    tools: None,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
                 Some(&recovery),
-                None,
                 true,
+                zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
+                None,
             )
             .await
             .expect("provider call completes");
@@ -3237,11 +3829,19 @@ mod streaming_fallback_tests {
                         "router-test",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3343,11 +3943,19 @@ mod streaming_fallback_tests {
                         "router-test",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3602,11 +4210,19 @@ mod streaming_fallback_tests {
                         "router-test",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3679,11 +4295,19 @@ mod streaming_fallback_tests {
                         "router-test",
                         "test-model",
                         "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
+                        ChatRequest {
+                            messages: &[ChatMessage::user("go")],
+                            tools: None,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
                         None,
                         true,
+                        zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
+                        None,
                     ),
                 ),
             )
@@ -3726,6 +4350,134 @@ mod tests {
                 .expect("stop must survive the anyhow hop")
                 .code,
             TurnStopCode::StepTimeout
+        );
+    }
+
+    /// A tracker with `spent_usd` already recorded against a $10 daily limit
+    /// and the default 80% warning threshold.
+    fn tracker_with_spend(
+        tmp: &tempfile::TempDir,
+        spent_usd: f64,
+    ) -> std::sync::Arc<crate::cost::CostTracker> {
+        let tracker = crate::cost::CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: true,
+                daily_limit_usd: 10.0,
+                monthly_limit_usd: 1_000.0,
+                warn_at_percent: 80,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        // 1M input tokens at `spent_usd` per million = `spent_usd`.
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                spent_usd,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        std::sync::Arc::new(tracker)
+    }
+
+    /// Run `announce_budget_warning` `calls` times inside a cost scope for
+    /// `tracker` and return every event it sent.
+    async fn budget_warnings_for(
+        tracker: std::sync::Arc<crate::cost::CostTracker>,
+        calls: usize,
+    ) -> Vec<zeroclaw_api::agent::TurnEvent> {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        let ctx = ToolLoopCostTrackingContext::new(
+            tracker,
+            std::sync::Arc::new(crate::agent::cost::ModelProviderPricing::new()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                let mut sent = false;
+                for _ in 0..calls {
+                    announce_budget_warning(Some(&tx), &mut sent);
+                }
+            })
+            .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn spend_past_the_warning_threshold_announces_once_per_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events = budget_warnings_for(tracker_with_spend(&tmp, 8.5), 3).await;
+        assert_eq!(events.len(), 1, "one warning per turn, got {events:?}");
+        match &events[0] {
+            zeroclaw_api::agent::TurnEvent::BudgetWarning {
+                current_usd,
+                limit_usd,
+                period,
+            } => {
+                assert!((current_usd - 8.5).abs() < 1e-9, "{current_usd}");
+                assert!((limit_usd - 10.0).abs() < 1e-9, "{limit_usd}");
+                assert_eq!(*period, zeroclaw_api::agent::BudgetWarningPeriod::Day);
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_event_channel_drops_the_warning_instead_of_waiting() {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolLoopCostTrackingContext::new(
+            tracker_with_spend(&tmp, 8.5),
+            std::sync::Arc::new(crate::agent::cost::ModelProviderPricing::new()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(zeroclaw_api::agent::TurnEvent::Chunk {
+            delta: "filler".into(),
+        })
+        .unwrap();
+        // A blocking send would never return here: nobody reads `rx` until
+        // after the call. The timeout turns a hang into a failure.
+        let mut sent = false;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                announce_budget_warning(Some(&tx), &mut sent);
+            }),
+        )
+        .await
+        .expect("announce_budget_warning must not wait on a full channel");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(zeroclaw_api::agent::TurnEvent::Chunk { .. })
+        ));
+        assert!(rx.try_recv().is_err(), "the warning is dropped, not queued");
+    }
+
+    #[tokio::test]
+    async fn spend_below_the_threshold_or_past_the_limit_announces_nothing() {
+        let below = tempfile::tempdir().unwrap();
+        assert!(
+            budget_warnings_for(tracker_with_spend(&below, 7.5), 1)
+                .await
+                .is_empty()
+        );
+        // Past the hard limit the stop belongs to `enforce_tool_loop_budget`;
+        // a warning there would be noise next to the failed turn.
+        let over = tempfile::tempdir().unwrap();
+        assert!(
+            budget_warnings_for(tracker_with_spend(&over, 10.5), 1)
+                .await
+                .is_empty()
         );
     }
 
