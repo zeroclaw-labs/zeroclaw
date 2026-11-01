@@ -21,6 +21,7 @@ zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-sop-graph.workspace = true
+zeroclaw-goal.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
 fluent = "0.16"

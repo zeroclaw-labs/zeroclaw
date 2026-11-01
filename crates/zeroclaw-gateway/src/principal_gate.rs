@@ -996,7 +996,7 @@ mod tests {
             &tmp,
             &idp.uri(),
             &[Verb::Update],
-            &["agents.*"],
+            &["agents.*", "providers.models.openai.*"],
         ));
         create_agent(&router, "alpha").await;
 
@@ -1030,18 +1030,44 @@ mod tests {
         );
         assert_eq!(agent_model(&router, "beta").await.0, StatusCode::NOT_FOUND);
 
-        // So is a PUT that would bring a new map key into being.
-        let (status, _) = send(
+        // So is a PUT that would bring a valid new map key into being.
+        let provider_path = "providers.models.openai.gamma.model";
+        let provider_value = serde_json::json!({ "path": provider_path, "value": "gpt-4o" });
+        let (status, body) = send(
             &router,
             "PUT",
             "/api/config/prop",
             SCOPED.0,
             SCOPED.1,
-            Some(put_model("gamma", "m1")),
+            Some(provider_value.clone()),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(agent_model(&router, "gamma").await.0, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"].as_str().unwrap().contains("`create`"),
+            "{body}"
+        );
+        let (status, _) = send(
+            &router,
+            "GET",
+            &format!("/api/config/prop?path={provider_path}"),
+            OPERATOR.0,
+            OPERATOR.1,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // The same input is valid and succeeds when creation is authorized.
+        let (status, body) = send(
+            &router,
+            "PUT",
+            "/api/config/prop",
+            OPERATOR.0,
+            OPERATOR.1,
+            Some(provider_value),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
 
         // Removing the entry is a `delete`, whatever the method.
         let (status, body) = send(
