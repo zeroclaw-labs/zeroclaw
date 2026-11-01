@@ -2,80 +2,17 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
 use zeroclaw_config::live::ConfigRevision;
 
 const MAX_APPLICATION_RECORDS: usize = 512;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct PublishedConfigRevision {
-    pub epoch: String,
-    pub sequence: u64,
-}
-
-impl From<ConfigRevision> for PublishedConfigRevision {
-    fn from(revision: ConfigRevision) -> Self {
-        Self {
-            epoch: revision.epoch().to_string(),
-            sequence: revision.sequence(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub enum ConfigApplicationTarget {
-    /// Scoped to the publication epoch in the enclosing revision.
-    Daemon,
-    Session {
-        id: String,
-        generation: u64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub enum ConfigApplicationOutcome {
-    Pending,
-    AppliedLive,
-    QueuedForReload,
-    Rejected,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub enum ConfigApplicationReason {
-    AwaitingAcknowledgement,
-    DaemonReloadRequired,
-    ChangeScopeUnavailable,
-    TargetRetired,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct ConfigApplicationRecord {
-    /// Canonical field/key components. A dotted map key is one component.
-    pub path: Vec<String>,
-    pub target: ConfigApplicationTarget,
-    pub revision: PublishedConfigRevision,
-    pub outcome: ConfigApplicationOutcome,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<ConfigApplicationReason>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct ConfigApplicationStatus {
-    pub published_revision: PublishedConfigRevision,
-    /// Latest observed changes/attempts, not every subsystem's startup state.
-    pub records: Vec<ConfigApplicationRecord>,
-    pub record_limit: usize,
-    pub truncated: bool,
-}
+// The report types are wire contract: they ride on the `config/*` results
+// and `config/status`, so they are defined in `zeroclaw-rpc-proto`. The
+// ledger that produces them stays here.
+pub use zeroclaw_rpc_proto::types::{
+    ConfigApplicationOutcome, ConfigApplicationReason, ConfigApplicationRecord,
+    ConfigApplicationStatus, ConfigApplicationTarget, PublishedConfigRevision,
+};
 
 struct ApplicationResult {
     revision: ConfigRevision,

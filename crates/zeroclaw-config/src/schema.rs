@@ -4332,6 +4332,14 @@ pub struct AliasedAgentConfig {
     #[nested]
     pub precheck: crate::scattered_types::ChannelPrecheckConfig,
 
+    /// Whether this agent takes turns from channel-plugin webhooks delivered
+    /// over the daemon's RPC socket (`plugin-webhook/dispatch`, which the
+    /// standalone `zeroclaw gateway` uses). `false` refuses such a delivery
+    /// to any channel this agent handles, whatever the caller's grants.
+    #[tab(Channels)]
+    #[serde(default = "default_true")]
+    pub accept_injected_webhooks: bool,
+
     /// Per-agent override for the context-compression summarizer provider, as
     /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
     /// the runtime profile's `context_compression.summary_provider`, else the
@@ -4424,6 +4432,7 @@ impl Default for AliasedAgentConfig {
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
             precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
+            accept_injected_webhooks: true,
             summary_provider: crate::providers::ModelProviderRef::default(),
             delegate_same_risk_profile: true,
             delegates: Vec::new(),
@@ -14321,6 +14330,26 @@ impl Config {
                     );
                 }
             }
+            for channel in &profile.allowed_channels {
+                let trimmed = channel.trim();
+                if trimmed.is_empty() || trimmed == "*" {
+                    continue;
+                }
+                let configured = trimmed.split_once('.').is_some_and(|(ty, inner)| {
+                    !ty.is_empty()
+                        && !inner.is_empty()
+                        && self
+                            .get_map_keys(&format!("channels.{ty}"))
+                            .is_some_and(|keys| keys.iter().any(|k| k == inner))
+                });
+                if !configured {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("permission_profiles.{alias}.allowed_channels"),
+                        "permission_profiles.{alias}.allowed_channels names {trimmed:?} but it is not a configured channel instance `channels.<type>.<alias>` (use \"*\" for every channel)",
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -14554,6 +14583,13 @@ pub struct PermissionProfileConfig {
     /// deny-by-default. The agent's own risk-profile policy still applies
     /// on top.)
     pub allowed_tools: Vec<String>,
+    /// Channel instances holders may reach through the `channels` grant,
+    /// named `<type>.<alias>` (for example `plugin.support`). Empty grants
+    /// NO channels; grant every instance with the explicit `"*"` entry.
+    /// The `channels` grant's consumers are the plugin webhook RPC methods:
+    /// `channels = ["execute"]` delivers a webhook to a named plugin
+    /// channel's route, and `channels = ["read"]` lists those routes.
+    pub allowed_channels: Vec<String>,
     /// Resource-class grants: for each resource kind, the verbs
     /// permitted. Resources: `system`, `sessions`, `memory`, `cron`,
     /// `config`, `agents`, `cost`, `skills`, `personality`, `logs`,
@@ -14593,6 +14629,13 @@ impl PermissionProfileConfig {
             .iter()
             .map(|t| t.trim())
             .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        resolved.allowed_channels = self
+            .allowed_channels
+            .iter()
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
             .map(str::to_string)
             .collect();
         for (resource, verbs) in &self.grants {
@@ -16601,6 +16644,13 @@ pub struct PluginChannelConfig {
     /// Whether this logical instance may be admitted at channel startup.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Whether webhook requests delivered over the daemon's RPC socket
+    /// (`plugin-webhook/dispatch`, which the standalone `zeroclaw gateway`
+    /// uses) may reach this instance. `false` refuses them at dispatch,
+    /// whatever the caller's grants. Requests through the daemon's own
+    /// gateway are not affected.
+    #[serde(default = "default_true")]
+    pub accept_injected_webhooks: bool,
 }
 
 impl Default for PluginChannelConfig {
@@ -16608,6 +16658,7 @@ impl Default for PluginChannelConfig {
         Self {
             package: String::new(),
             enabled: true,
+            accept_injected_webhooks: true,
         }
     }
 }
@@ -30470,6 +30521,77 @@ mod tests {
             err.contains("permission_profiles.operator.allowed_agents"),
             "got: {err}"
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_allowed_channels_must_be_configured_instances() {
+        let mut config = auth_config();
+        config.channels.plugin.insert(
+            "support".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                ..PluginChannelConfig::default()
+            },
+        );
+        for accepted in [vec!["plugin.support"], vec!["*"], vec![" plugin.support "]] {
+            config
+                .permission_profiles
+                .get_mut("operator")
+                .unwrap()
+                .allowed_channels = accepted.iter().map(|c| (*c).to_string()).collect();
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{accepted:?} must validate: {err}"));
+        }
+        for rejected in ["plugin.ghost", "plugin", "ghost.support"] {
+            config
+                .permission_profiles
+                .get_mut("operator")
+                .unwrap()
+                .allowed_channels = vec![rejected.to_string()];
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("permission_profiles.operator.allowed_channels"),
+                "{rejected:?} got: {err}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_resolves_channel_selectors() {
+        let profile = PermissionProfileConfig {
+            allowed_channels: vec![" plugin.support ".to_string(), "  ".to_string()],
+            ..PermissionProfileConfig::default()
+        };
+        let resolved = profile.resolve();
+        assert!(resolved.may_use_channel("plugin.support"));
+        assert!(!resolved.may_use_channel("plugin.billing"));
+        assert_eq!(resolved.allowed_channels, ["plugin.support"]);
+        assert!(
+            !PermissionProfileConfig::default()
+                .resolve()
+                .may_use_channel("plugin.support"),
+            "an empty selector grants no channels"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn injected_webhooks_are_accepted_unless_config_refuses_them() {
+        let channel: PluginChannelConfig =
+            toml::from_str("package = \"acme.chat\"").expect("a minimal plugin channel parses");
+        assert!(channel.accept_injected_webhooks);
+        assert!(PluginChannelConfig::default().accept_injected_webhooks);
+        let agent: AliasedAgentConfig = toml::from_str("").expect("an empty agent parses");
+        assert!(agent.accept_injected_webhooks);
+        assert!(AliasedAgentConfig::default().accept_injected_webhooks);
+
+        let channel: PluginChannelConfig =
+            toml::from_str("package = \"acme.chat\"\naccept_injected_webhooks = false")
+                .expect("the refusal parses");
+        assert!(!channel.accept_injected_webhooks);
+        let agent: AliasedAgentConfig =
+            toml::from_str("accept_injected_webhooks = false").expect("the agent refusal parses");
+        assert!(!agent.accept_injected_webhooks);
     }
 
     #[::core::prelude::v1::test]
@@ -48193,6 +48315,7 @@ allowed_users = []
             PluginChannelConfig {
                 package: "acme.chat".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         );
         config.agents.get_mut("alpha").unwrap().channels =
@@ -48213,6 +48336,7 @@ allowed_users = []
                 PluginChannelConfig {
                     package: "acme.chat".to_string(),
                     enabled: true,
+                    ..PluginChannelConfig::default()
                 },
             );
         }
@@ -48231,6 +48355,7 @@ allowed_users = []
             PluginChannelConfig {
                 package: "acme.chat".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         );
         let error = config
@@ -48247,6 +48372,7 @@ allowed_users = []
             PluginChannelConfig {
                 package: "Acme Chat".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         );
         let error = config
@@ -48290,6 +48416,7 @@ allowed_users = []
             PluginChannelConfig {
                 package: "acme.chat".to_string(),
                 enabled: false,
+                ..PluginChannelConfig::default()
             },
         );
 
@@ -48311,6 +48438,7 @@ allowed_users = []
             PluginChannelConfig {
                 package: "acme.chat".to_string(),
                 enabled: true,
+                ..PluginChannelConfig::default()
             },
         );
 
