@@ -112,8 +112,10 @@ This **enrollment code** issues a certificate and nothing else: `POST /pair`
 refuses it, so a party that sees it cannot turn it into a bearer token. It is
 separate from the gateway's pairing code, and minting either one leaves the
 other pending. Enrollment always requires a code, even when
-`[gateway].require_pairing` is off. A gateway pairing code is also accepted by
-`POST /enroll`, once: enrolling with it spends it, so it can no longer pair.
+`[gateway].require_pairing` is off. An unbound gateway pairing code is also
+accepted by `POST /enroll`, once: enrolling with it spends it, so it can no
+longer pair. A roster-bound gateway code is refused without being consumed;
+redeem it at the gateway's `POST /pair` route to obtain that user's bearer token.
 Then, on the workstation:
 
 ```sh
@@ -495,8 +497,9 @@ the browsers that use it, in two distinct ways:
   pairing code and the issued certificate, and could use an observed pairing
   code to enrol a client of its own.** Give the frontdoor an enrollment code
   (`zeroclaw security enroll-paircode --new`): the gateway's `POST /pair`
-  refuses it. A gateway pairing code also enrolls here, but a relay that saw
-  one could pair a bearer token with it instead, if it can reach the gateway.
+  refuses it. An unbound gateway pairing code also enrolls here, but a relay
+  that saw one could pair a bearer token with it instead, if it can reach the
+  gateway.
 
 What the relay does **not** get is the private key: the browser generates the
 keypair with WebCrypto and transmits only a CSR.

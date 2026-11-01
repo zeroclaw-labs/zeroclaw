@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
+use zeroclaw_config::pairing::{PairedTokenSubject, PairingCodePolicy, PairingGuard};
 
 use crate::security::cert_ledger::{CertLedger, CertStatus, IssuanceActor, LedgerEntry};
 
@@ -198,9 +198,9 @@ pub struct EnrollServer {
     /// The daemon's canonical pairing authority (`RpcInboundAuth::pairing`),
     /// shared with `/pair` and RPC auth so one code policy, lifetime and
     /// brute-force budget govern every surface. Enrollment codes live in their
-    /// own slot of it and never pair a bearer; a gateway pairing code may also
-    /// enroll. Never a private guard: a second guard would hide enrollment
-    /// from the authority that later binds codes to principals.
+    /// own slot of it and never pair a bearer; an unbound gateway pairing code
+    /// may also enroll. Never a private guard: a second guard would hide
+    /// enrollment from the authority that later binds codes to principals.
     pub pairing: Arc<PairingGuard>,
     /// Resolve the pairing-code policy from the canonical live config at the
     /// instant an operator asks the admin loop to mint another code.
@@ -282,6 +282,18 @@ impl EnrollServer {
                 }
             }
         };
+        // A code the operator bound to a roster user pairs that user's bearer
+        // token at the gateway. Enrollment would spend it on a certificate
+        // instead, so refuse it; dropping the reservation leaves the code
+        // redeemable, still bound.
+        if *pairing.subject() != PairedTokenSubject::SharedOperator {
+            return Err((
+                409,
+                "this pairing code is bound to a roster user; redeem it at the gateway's \
+                 /pair route, not for certificate enrollment"
+                    .to_string(),
+            ));
+        }
         // Enrollment pairs no bearer token; the reservation's opaque issuance
         // id is what correlates the ledger row and audit event to this code.
         let token_hash = pairing.issuance_id();
@@ -988,6 +1000,75 @@ mod tests {
         let fps = server.ledger.list_active().unwrap();
         assert_eq!(fps.len(), 1);
         assert_eq!(fps[0].device_id, resp.device_id);
+    }
+
+    #[tokio::test]
+    async fn process_refuses_a_user_bound_code_and_keeps_it_redeemable() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing =
+            PairingGuard::new(true, &["zc_existing".into()], PairingCodePolicy::default());
+        let bound = PairedTokenSubject::RosterUser {
+            principal_id: "alice".into(),
+        };
+        let code = pairing
+            .generate_new_pairing_code_as(PairingCodePolicy::default(), bound.clone())
+            .expect("pairing is required");
+        let enrollment = pairing.mint_enrollment_code(PairingCodePolicy::default());
+        let initial_tokens = pairing.persisted_tokens();
+        let guard = pairing.clone();
+        let server = test_server(pairing, None);
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
+        let req = EnrollRequest {
+            pairing_code: code.clone(),
+            csr_pem: csr,
+        };
+
+        for class in [PeerClass::Direct, PeerClass::RelayBridge] {
+            let err = server
+                .process(&req, "198.51.100.7", class)
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, 409);
+            assert!(
+                server.ledger.list_active().unwrap().is_empty(),
+                "no certificate may be issued for a user-bound code"
+            );
+            assert_eq!(guard.persisted_tokens(), initial_tokens);
+            assert_eq!(
+                guard.pending_pairing_code(),
+                Some((code.clone(), bound.clone())),
+                "the code stays redeemable, still bound"
+            );
+            assert_eq!(
+                guard.enrollment_code(PairingCodePolicy::default()),
+                enrollment,
+                "refusal leaves the separate enrollment code untouched"
+            );
+        }
+
+        let token = guard
+            .try_pair(&code, "198.51.100.7")
+            .await
+            .unwrap()
+            .expect("the refused code must still pair its roster user");
+        assert_eq!(guard.subject_for_token(&token), Some(bound));
+        assert!(!guard.is_authenticated(&token));
+        assert_eq!(
+            guard.persisted_tokens().paired_tokens,
+            initial_tokens.paired_tokens,
+            "the roster token never becomes an operator token"
+        );
+        let paired_tokens = guard.persisted_tokens();
+        let enrollment_req = EnrollRequest {
+            pairing_code: enrollment,
+            csr_pem: req.csr_pem,
+        };
+        server
+            .process(&enrollment_req, "198.51.100.7", PeerClass::Direct)
+            .await
+            .expect("the separate enrollment code must still issue a certificate");
+        assert_eq!(server.ledger.list_active().unwrap().len(), 1);
+        assert_eq!(guard.persisted_tokens(), paired_tokens);
     }
 
     #[tokio::test]
