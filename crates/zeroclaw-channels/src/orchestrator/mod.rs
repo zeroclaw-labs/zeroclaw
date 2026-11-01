@@ -26477,12 +26477,15 @@ api_key = "anthropic-key"
             _suppress_voice: bool,
         ) -> anyhow::Result<()> {
             if self.finalize_flood_limited {
+                #[cfg(feature = "channel-telegram")]
                 return Err(
                     crate::telegram_rate_limit::TelegramGateError::BudgetExhausted {
                         remaining: Duration::from_secs(30),
                     }
                     .into(),
                 );
+                #[cfg(not(feature = "channel-telegram"))]
+                anyhow::bail!("finalize flood-limited");
             }
             if self.finalize_should_fail {
                 anyhow::bail!("finalize boom")
