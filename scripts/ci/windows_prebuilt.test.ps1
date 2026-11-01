@@ -160,6 +160,8 @@ function Invoke-WebRequest {
     $start.EnvironmentVariables['USERPROFILE'] = $batchProfile
     $start.EnvironmentVariables['PATH'] = "$stubs;$env:PATH"
     $start.EnvironmentVariables['ZEROCLAW_TEST_INSTALLER'] = $installer
+    # Do not inherit a permissive policy from the test runner into the real batch launch.
+    $start.EnvironmentVariables['PSExecutionPolicyPreference'] = 'Restricted'
     $start.EnvironmentVariables.Remove('PSModulePath')
     $process = [Diagnostics.Process]::Start($start)
     $outputTask = $process.StandardOutput.ReadToEndAsync()
@@ -172,7 +174,7 @@ function Invoke-WebRequest {
     Assert ([IO.File]::ReadAllText($batchExisting) -eq 'existing install') 'Batch changed the existing install'
     Assert (@(Get-ChildItem -LiteralPath $batchBin).Count -eq 1) 'Batch extracted an unverified archive'
     $process.Dispose()
-    Write-Host 'PASS setup.bat --prebuilt: checksum mismatch, exit 1, no extraction, source fallback or PATH write'
+    Write-Host 'PASS setup.bat --prebuilt under Restricted policy: checksum mismatch, exit 1, no extraction, source fallback or PATH write'
     Write-Host "PASS $count checksum cases, explicit tag and 3 invalid tags; all network calls mocked"
 } finally {
     $env:TEMP = $originalTemp

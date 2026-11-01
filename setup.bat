@@ -170,7 +170,7 @@ if "%DRY_RUN%"=="true" (
 )
 
 echo   Downloading and verifying the release checksum...
-powershell -NoProfile -File "%~dp0scripts\install_windows_prebuilt.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install_windows_prebuilt.ps1"
 if errorlevel 1 goto :error_exit
 
 :: Add to PATH if not already there
