@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "agent-runtime")]
@@ -94,10 +95,47 @@ fn install_dir_not_writable_message(dir: &str, error: &str) -> String {
     }
 }
 
-const GITHUB_RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
-const GITHUB_RELEASES_TAG_URL: &str =
-    "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/tags";
+/// Why a CLI-only build updates only with `--standard`: what the standard
+/// build adds, with the gateway's default address, and how to choose.
+fn cli_only_needs_standard_message() -> String {
+    let gateway = zeroclaw_config::schema::GatewayConfig::default();
+    let address = format!("{}:{}", gateway.host, gateway.port);
+
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string_with_args(
+            "cli-update-cli-only-needs-standard",
+            &[("address", &address)],
+        )
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!(
+            "This is a CLI-only build, and releases publish only the standard build. The \
+             standard build adds the dashboard and web gateway, which start with the daemon, \
+             by default on {address} with pairing required.\n\
+             To switch to the standard build, run: zeroclaw update --standard\n\
+             To stay CLI-only, re-run the installer: install.sh --cli-only"
+        )
+    }
+}
+
+fn update_switching_to_standard_message() -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string("cli-update-switching-to-standard")
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        "Switching this CLI-only build to the standard build, which adds the dashboard and web \
+         gateway."
+            .to_string()
+    }
+}
+
+const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases";
 
 #[derive(Debug)]
 pub struct UpdateInfo {
@@ -116,7 +154,18 @@ pub struct UpdateInfo {
 
 /// Check for available updates without downloading.
 /// If `target_version` is `Some`, fetch that specific release tag instead of latest.
-pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
+/// `standard` is `zeroclaw update --standard`: a CLI-only build then takes the
+/// standard archive (see `stays_cli_only`).
+pub async fn check(target_version: Option<&str>, standard: bool) -> Result<UpdateInfo> {
+    check_from(GITHUB_RELEASES_URL, target_version, standard).await
+}
+
+/// `check` against the releases API at `releases_url`.
+async fn check_from(
+    releases_url: &str,
+    target_version: Option<&str>,
+    standard: bool,
+) -> Result<UpdateInfo> {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
     let client = reqwest::Client::builder()
@@ -131,9 +180,9 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
             } else {
                 format!("v{v}")
             };
-            format!("{GITHUB_RELEASES_TAG_URL}/{tag}")
+            format!("{releases_url}/tags/{tag}")
         }
-        None => GITHUB_RELEASES_LATEST_URL.to_string(),
+        None => format!("{releases_url}/latest"),
     };
 
     let resp = client
@@ -153,7 +202,7 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
         .trim_start_matches('v')
         .to_string();
 
-    let download_url = find_asset_url(&release);
+    let download_url = find_asset_url(&release, standard);
     let sha256sums_url = find_sha256sums_url(&release);
     let is_newer = version_is_newer(&current, &tag);
 
@@ -176,42 +225,80 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     })
 }
 
-pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
+pub async fn run(target_version: Option<&str>, force: bool, standard: bool) -> Result<()> {
+    run_from(
+        GITHUB_RELEASES_URL,
+        target_version,
+        force,
+        standard,
+        &mut std::io::stdout(),
+    )
+    .await
+}
+
+/// `run` against the releases API at `releases_url`, writing its messages to
+/// `out`.
+async fn run_from(
+    releases_url: &str,
+    target_version: Option<&str>,
+    force: bool,
+    standard: bool,
+    out: &mut (dyn Write + Send),
+) -> Result<()> {
     // Phase 1: Preflight
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         "Phase 1/6: Preflight checks..."
     );
-    let update_info = check(target_version).await?;
+    let update_info = check_from(releases_url, target_version, standard).await?;
+    let switching = switches_to_standard(standard);
 
-    if !should_install(update_info.is_newer, force) {
-        println!(
+    if !should_install(
+        &update_info.current_version,
+        &update_info.latest_version,
+        force,
+        switching,
+    ) {
+        writeln!(
+            out,
             "{}",
             update_already_current_message(&update_info.current_version)
-        );
+        )?;
+        // A CLI-only build gets the same guidance as for a newer release:
+        // without --standard it never takes the standard build.
+        if stays_cli_only(standard) {
+            writeln!(out, "{}", cli_only_needs_standard_message())?;
+        }
         return Ok(());
     }
 
     if update_info.is_newer {
-        println!(
+        writeln!(
+            out,
             "{}",
             update_available_message(&update_info.current_version, &update_info.latest_version)
-        );
-    } else {
+        )?;
+    } else if force {
         // --force on a version that is not newer: reinstall or downgrade/pin.
-        println!(
+        // Without it, only a same-version switch to the standard build gets
+        // here, and the switching line below says what happens.
+        writeln!(
+            out,
             "{}",
             update_forcing_reinstall_message(
                 &update_info.current_version,
                 &update_info.latest_version
             )
-        );
+        )?;
     }
 
     let download_url = update_info
         .download_url
-        .context("no suitable binary found for this platform")?;
+        .with_context(|| no_release_archive_message(standard))?;
+    if switching {
+        writeln!(out, "{}", update_switching_to_standard_message())?;
+    }
 
     let current_exe =
         std::env::current_exe().context("cannot determine current executable path")?;
@@ -298,8 +385,12 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
             // the validated main binary is already in place and must not be
             // rolled back if these fail.
             install_companion_artifacts(&staging, &current_exe, &host_dashboard_candidates()).await;
-            println!("{}", update_success_message(&update_info.latest_version));
-            println!("{}", prebuilt_channel_note_message());
+            writeln!(
+                out,
+                "{}",
+                update_success_message(&update_info.latest_version)
+            )?;
+            writeln!(out, "{}", prebuilt_channel_note_message())?;
             Ok(())
         }
         Err(e) => {
@@ -318,12 +409,12 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
     }
 }
 
-fn find_asset_url(release: &serde_json::Value) -> Option<String> {
+fn find_asset_url(release: &serde_json::Value, standard: bool) -> Option<String> {
     let target = current_target_triple()?;
 
     release["assets"].as_array()?.iter().find_map(|asset| {
         let name = asset["name"].as_str()?;
-        if !is_installable_release_asset(name, target) {
+        if !is_installable_release_asset(name, target, standard) {
             return None;
         }
         let url = asset["browser_download_url"].as_str()?.trim();
@@ -367,7 +458,25 @@ fn is_sha256sums_asset(name: &str) -> bool {
             .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("sha256sums"))
 }
 
-fn is_installable_release_asset(name: &str, target: &str) -> bool {
+fn is_installable_release_asset(name: &str, target: &str, standard: bool) -> bool {
+    release_asset_matches(name, target, stays_cli_only(standard))
+}
+
+/// Whether this update keeps a CLI-only build (no gateway). Releases publish
+/// only the standard build, with the dashboard and web gateway, so a CLI-only
+/// build installs nothing unless `--standard` asks to switch to it. A standard
+/// build ignores the flag.
+fn stays_cli_only(standard: bool) -> bool {
+    !cfg!(feature = "gateway") && !standard
+}
+
+/// Whether `name` is the standard archive for `target`. With `stay_cli_only`
+/// nothing matches, so a CLI-only build is never replaced by the standard
+/// build without `--standard`.
+fn release_asset_matches(name: &str, target: &str, stay_cli_only: bool) -> bool {
+    if stay_cli_only {
+        return false;
+    }
     // .tar.gz and .tgz are universal across all platforms
     if name == format!("zeroclaw-{target}.tar.gz") || name == format!("zeroclaw-{target}.tgz") {
         return true;
@@ -377,6 +486,14 @@ fn is_installable_release_asset(name: &str, target: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Why `run` found nothing to install.
+fn no_release_archive_message(standard: bool) -> String {
+    if stays_cli_only(standard) {
+        return cli_only_needs_standard_message();
+    }
+    "no suitable binary found for this platform".to_string()
 }
 
 fn current_target_triple() -> Option<&'static str> {
@@ -418,9 +535,19 @@ fn version_is_newer(current: &str, candidate: &str) -> bool {
 /// Decide whether to proceed with the install. A newer version always installs;
 /// a non-newer one (same or older) installs only with `--force`, which enables
 /// reinstalling the current version or downgrading/pinning to a specific
-/// `--version`.
-fn should_install(is_newer: bool, force: bool) -> bool {
-    is_newer || force
+/// `--version`. A CLI-only build switching to the standard build also installs
+/// the same version, because the build changes; it still downgrades only with
+/// `--force`.
+fn should_install(current: &str, latest: &str, force: bool, switching: bool) -> bool {
+    let is_newer = version_is_newer(current, latest);
+    let is_older = version_is_newer(latest, current);
+    is_newer || force || (switching && !is_older)
+}
+
+/// Whether `--standard` switches this build: only a CLI-only build (no
+/// gateway) has another build to switch to.
+fn switches_to_standard(standard: bool) -> bool {
+    standard && !cfg!(feature = "gateway")
 }
 
 /// Download a release asset and unpack it into `staging`.
@@ -1386,11 +1513,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_install_requires_newer_or_force() {
-        assert!(should_install(true, false)); // newer → install
-        assert!(should_install(true, true)); // newer + force → install
-        assert!(!should_install(false, false)); // not newer → skip
-        assert!(should_install(false, true)); // not newer + force → reinstall/downgrade
+    fn should_install_requires_newer_force_or_a_same_version_switch() {
+        // (current, latest, force, switching to the standard build) → install
+        let table = [
+            ("0.9.0", "0.9.1", false, false, true), // newer
+            ("0.9.0", "0.9.1", true, false, true),
+            ("0.9.0", "0.9.1", false, true, true),
+            ("0.9.0", "0.9.1", true, true, true),
+            ("0.9.0", "0.9.0", false, false, false), // same: already up to date
+            ("0.9.0", "0.9.0", true, false, true),   // --force reinstalls
+            ("0.9.0", "0.9.0", false, true, true),   // the switch changes the build
+            ("0.9.0", "0.9.0", true, true, true),
+            ("0.9.0", "0.8.7", false, false, false), // older: only with --force
+            ("0.9.0", "0.8.7", true, false, true),
+            ("0.9.0", "0.8.7", false, true, false), // a switch never downgrades alone
+            ("0.9.0", "0.8.7", true, true, true),
+        ];
+        for (current, latest, force, switching, expected) in table {
+            assert_eq!(
+                should_install(current, latest, force, switching),
+                expected,
+                "{current} -> {latest}, force={force}, switching={switching}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_cli_only_build_switches_with_standard() {
+        assert!(!switches_to_standard(false));
+        assert_eq!(switches_to_standard(true), !cfg!(feature = "gateway"));
     }
 
     #[test]
@@ -1471,6 +1622,8 @@ mod tests {
         serde_json::json!({ "assets": assets })
     }
 
+    // These pass `true` (`--standard`), with which every build selects the
+    // standard archive, so they run in CLI-only builds too.
     #[test]
     fn find_asset_url_picks_correct_gnu_over_android() {
         let release = make_release(&[
@@ -1483,7 +1636,7 @@ mod tests {
             "zeroclaw-aarch64-pc-windows-msvc.tar.gz",
         ]);
 
-        let url = find_asset_url(&release);
+        let url = find_asset_url(&release, true);
         assert!(url.is_some(), "should find an asset");
         let url = url.unwrap();
         // Must NOT match the android binary
@@ -1503,7 +1656,7 @@ mod tests {
             &format!("zeroclaw-{target}.tar.gz"),
         ]);
 
-        let url = find_asset_url(&release).expect("should select archive asset");
+        let url = find_asset_url(&release, true).expect("should select archive asset");
         let is_tar = url.ends_with(".tar.gz");
         let is_zip = url.ends_with(".zip");
         assert!(
@@ -1532,7 +1685,7 @@ mod tests {
             ]
         });
 
-        let url = find_asset_url(&release).expect("should skip unusable URLs");
+        let url = find_asset_url(&release, true).expect("should skip unusable URLs");
         assert_eq!(url, format!("https://example.com/zeroclaw-{target}.tar.gz"));
     }
 
@@ -1544,7 +1697,7 @@ mod tests {
             &format!("zeroclaw-{target}.tar.gz"),
         ]);
 
-        let url = find_asset_url(&release).expect("should select zeroclaw asset");
+        let url = find_asset_url(&release, true).expect("should select zeroclaw asset");
         assert!(
             url.contains(&format!("zeroclaw-{target}.tar.gz")),
             "should select zeroclaw archive, got: {url}"
@@ -1552,23 +1705,202 @@ mod tests {
     }
 
     #[test]
+    fn a_build_staying_cli_only_matches_no_release_archive() {
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ] {
+            for name in [
+                format!("zeroclaw-{target}.tar.gz"),
+                format!("zeroclaw-{target}.tgz"),
+                format!("zeroclaw-{target}.zip"),
+            ] {
+                assert!(!release_asset_matches(&name, target, true), "{name}");
+            }
+        }
+        assert!(release_asset_matches(
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+            "x86_64-unknown-linux-gnu",
+            false
+        ));
+    }
+
+    /// A release with this host's standard archive among other assets, and the
+    /// URL `find_asset_url` should select for it.
+    fn release_with_this_standard_archive() -> (serde_json::Value, String) {
+        let target = current_target_triple().expect("supported test platform");
+        let ext = if target.contains("windows") {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let archive = format!("zeroclaw-{target}.{ext}");
+        let release = make_release(&[
+            "zeroclaw-aarch64-linux-android.tar.gz",
+            &archive,
+            "SHA256SUMS",
+        ]);
+        (release, format!("https://example.com/{archive}"))
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[test]
+    fn this_cli_only_build_selects_nothing_without_standard() {
+        let (release, _) = release_with_this_standard_archive();
+        assert_eq!(find_asset_url(&release, false), None);
+
+        let message = no_release_archive_message(false);
+        assert!(message.contains("zeroclaw update --standard"), "{message}");
+        assert!(message.contains("install.sh --cli-only"), "{message}");
+        let gateway = zeroclaw_config::schema::GatewayConfig::default();
+        let address = format!("{}:{}", gateway.host, gateway.port);
+        assert!(message.contains(&address), "{message}");
+        assert!(
+            gateway.require_pairing,
+            "the message says pairing is required"
+        );
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[test]
+    fn this_cli_only_build_selects_the_standard_archive_with_standard() {
+        let (release, standard_archive) = release_with_this_standard_archive();
+        assert_eq!(find_asset_url(&release, true), Some(standard_archive));
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn this_standard_build_selects_the_standard_archive_with_or_without_standard() {
+        let (release, standard_archive) = release_with_this_standard_archive();
+        assert_eq!(
+            find_asset_url(&release, false),
+            Some(standard_archive.clone())
+        );
+        assert_eq!(find_asset_url(&release, true), Some(standard_archive));
+        assert_eq!(
+            no_release_archive_message(false),
+            "no suitable binary found for this platform"
+        );
+    }
+
+    /// A releases API serving release `version` with this host's standard
+    /// archive and `SHA256SUMS`, which answer 404 and may be fetched only
+    /// `downloads` times in all.
+    async fn releases_api_with(version: &str, downloads: u64) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let target = current_target_triple().expect("supported test platform");
+        let release = serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "assets": [
+                {
+                    "name": format!("zeroclaw-{target}.tar.gz"),
+                    "browser_download_url": format!("{}/download/zeroclaw-{target}.tar.gz", server.uri()),
+                },
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": format!("{}/download/SHA256SUMS", server.uri()),
+                },
+            ],
+        });
+        for route in ["/latest".to_string(), format!("/tags/v{version}")] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&release))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path_regex("^/download/"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(downloads)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn run_installs_nothing_from_the_same_or_an_older_release() {
+        let current = env!("CARGO_PKG_VERSION");
+        for (release, target_version) in [(current, None), ("0.0.1", Some("0.0.1"))] {
+            let server = releases_api_with(release, 0).await;
+            let mut out = Vec::new();
+            run_from(&server.uri(), target_version, false, false, &mut out)
+                .await
+                .unwrap_or_else(|e| panic!("v{release}: {e:#}"));
+
+            // Only a CLI-only build adds the guidance, as for a newer release.
+            let mut lines = vec![update_already_current_message(current)];
+            if !cfg!(feature = "gateway") {
+                lines.push(cli_only_needs_standard_message());
+            }
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("{}\n", lines.join("\n")),
+                "v{release}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[tokio::test]
+    async fn run_in_a_cli_only_build_refuses_a_newer_release_without_standard() {
+        let server = releases_api_with("999.0.0", 0).await;
+        let mut out = Vec::new();
+        let err = run_from(&server.uri(), None, false, false, &mut out)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), cli_only_needs_standard_message());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{}\n",
+                update_available_message(env!("CARGO_PKG_VERSION"), "999.0.0")
+            )
+        );
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[tokio::test]
+    async fn run_in_a_cli_only_build_with_standard_downloads_the_same_version() {
+        // The stub's 404 stops the download before anything is replaced.
+        let server = releases_api_with(env!("CARGO_PKG_VERSION"), 1).await;
+        let mut out = Vec::new();
+        let err = run_from(&server.uri(), None, false, true, &mut out)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("download returned 404"), "{err:#}");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{}\n", update_switching_to_standard_message())
+        );
+    }
+
+    #[test]
     fn installable_release_asset_rejects_unknown_target() {
         assert!(!is_installable_release_asset(
             "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
-            "unknown"
+            "unknown",
+            true
         ));
     }
 
     #[test]
     fn find_asset_url_returns_none_for_empty_assets() {
         let release = serde_json::json!({ "assets": [] });
-        assert!(find_asset_url(&release).is_none());
+        assert!(find_asset_url(&release, true).is_none());
     }
 
     #[test]
     fn find_asset_url_returns_none_for_missing_assets() {
         let release = serde_json::json!({});
-        assert!(find_asset_url(&release).is_none());
+        assert!(find_asset_url(&release, true).is_none());
     }
 
     #[test]
