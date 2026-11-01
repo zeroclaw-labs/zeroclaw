@@ -17060,6 +17060,70 @@ Let me check the result."#;
     }
 
     #[test]
+    fn turn_prompt_budget_truncation_retains_identity_bootstrap() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().expect("tempdir");
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            format!("IDENTITY_MARKER_FIRST_CONTACT\n{}", "x".repeat(4_000)),
+        )
+        .expect("write AGENTS.md");
+        let skills = vec![crate::skills::Skill {
+            name: "bulk-skill".into(),
+            description: "SKILL_METADATA_BULK".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &[],
+            "",
+            &skills,
+            None,
+            None,
+            &RiskProfileConfig::default(),
+            &provider,
+            &[],
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            3_000,
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("turn prompt");
+
+        // The direct turn path applies the budget after assembling every
+        // section; the identity zone must render early enough to survive the
+        // head-retained cut (regression: it used to sit last and was dropped
+        // whole on every cron/CLI/headless turn of an over-budget agent).
+        assert_eq!(prompt.chars().count(), 3_000);
+        assert!(
+            prompt.contains("## Project Context"),
+            "identity section must survive whole-prompt budget truncation"
+        );
+        assert!(
+            prompt.contains("IDENTITY_MARKER_FIRST_CONTACT"),
+            "bootstrap identity content must survive whole-prompt budget truncation"
+        );
+        assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+    }
+
+    #[test]
     fn interactive_turn_system_prompt_uses_effective_dynamic_mcp_specs() {
         use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
         use zeroclaw_config::schema::{
