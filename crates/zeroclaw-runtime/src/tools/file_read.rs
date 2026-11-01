@@ -450,9 +450,8 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_existing_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         tokio::fs::write(dir.join("test.txt"), "hello world")
             .await
             .unwrap();
@@ -463,29 +462,23 @@ mod tests {
         assert!(result.output.contains("1: hello world"));
         assert!(result.output.contains("[1 lines total]"));
         assert!(result.error.is_none());
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_nonexistent_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_missing");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let tool = test_tool(dir.clone());
         let result = tool.execute(json!({"path": "nope.txt"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("Failed to resolve"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_blocks_path_traversal() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_traversal");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let tool = test_tool(dir.clone());
         let result = tool
@@ -494,8 +487,6 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
@@ -517,9 +508,8 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_allows_readonly_mode() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_readonly");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         tokio::fs::write(dir.join("test.txt"), "readonly ok")
             .await
             .unwrap();
@@ -529,8 +519,6 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("1: readonly ok"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
@@ -549,9 +537,8 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_base64_returns_encoded_bytes() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_base64");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         // Non-UTF-8 bytes — proves we return raw bytes, not lossy text.
         let raw: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'P', b'K', 0x03, 0x04];
@@ -569,17 +556,14 @@ mod tests {
             .decode(result.output.trim())
             .expect("output must be valid base64");
         assert_eq!(decoded, raw, "base64 read must round-trip exact bytes");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     // ── Ephemeral-workspace warning────────────────
 
     #[tokio::test]
     async fn file_read_warns_on_ephemeral_workspace() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_ephemeral");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         tokio::fs::write(dir.join("notes.txt"), "host content?")
             .await
             .unwrap();
@@ -598,15 +582,12 @@ mod tests {
             "original read content must be preserved, got: {}",
             result.output
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_base64_not_warned_on_ephemeral_workspace() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_ephemeral_b64");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         let raw: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'P', b'K'];
         tokio::fs::write(dir.join("data.bin"), &raw).await.unwrap();
 
@@ -626,15 +607,12 @@ mod tests {
             .decode(result.output.trim())
             .expect("base64 output must still decode");
         assert_eq!(decoded, raw, "base64 read must round-trip exact bytes");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_failure_not_warned_on_ephemeral_workspace() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_ephemeral_fail");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let tool = ephemeral_tool(dir.clone());
         let result = tool.execute(json!({"path": "missing.txt"})).await.unwrap();
@@ -647,15 +625,12 @@ mod tests {
                 .unwrap_or("")
                 .contains("EPHEMERAL WORKSPACE")
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_no_warning_when_persistent() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_persistent");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         tokio::fs::write(dir.join("notes.txt"), "ok").await.unwrap();
 
         let tool = test_tool(dir.clone());
@@ -666,15 +641,12 @@ mod tests {
             "no ephemeral warning expected on a persistent runtime, got: {}",
             result.output
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_unsupported_encoding_errors() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_bad_encoding");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         tokio::fs::write(dir.join("f.txt"), "hi").await.unwrap();
 
         let tool = test_tool(dir.clone());
@@ -690,29 +662,24 @@ mod tests {
                 .unwrap_or("")
                 .contains("Unsupported encoding")
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_empty_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_empty");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         tokio::fs::write(dir.join("empty.txt"), "").await.unwrap();
 
         let tool = test_tool(dir.clone());
         let result = tool.execute(json!({"path": "empty.txt"})).await.unwrap();
         assert!(result.success);
         assert_eq!(result.output, "");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_nested_path() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_nested");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         tokio::fs::create_dir_all(dir.join("sub/dir"))
             .await
             .unwrap();
@@ -727,17 +694,15 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("1: deep content"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_normalizes_workspace_prefixed_relative_path() {
-        let root = std::env::temp_dir().join("zeroclaw_test_file_read_workspace_prefixed");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
         let workspace = root.join("workspace");
         let nested = workspace.join("nested");
 
-        let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&nested).await.unwrap();
         tokio::fs::write(nested.join("notes.txt"), "prefixed content")
             .await
@@ -757,8 +722,6 @@ mod tests {
             result.error
         );
         assert!(result.output.contains("1: prefixed content"));
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[cfg(unix)]
@@ -766,11 +729,11 @@ mod tests {
     async fn file_read_blocks_symlink_escape() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join("zeroclaw_test_file_read_symlink_escape");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
         let workspace = root.join("workspace");
         let outside = root.join("outside");
 
-        let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         tokio::fs::create_dir_all(&outside).await.unwrap();
 
@@ -791,18 +754,16 @@ mod tests {
                 .unwrap_or("")
                 .contains("escapes workspace")
         );
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
     async fn file_read_blocks_outside_workspace_regardless_of_policy() {
-        let root = std::env::temp_dir().join("zeroclaw_test_file_read_blocks_outside");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
         let workspace = root.join("workspace");
         let outside = root.join("outside");
         let outside_file = outside.join("notes.txt");
 
-        let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         tokio::fs::create_dir_all(&outside).await.unwrap();
         tokio::fs::write(&outside_file, "outside").await.unwrap();
@@ -816,19 +777,16 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("escapes workspace"));
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
     async fn file_read_admits_absolute_path_under_read_only_root() {
-        let root =
-            std::env::temp_dir().join("zeroclaw_test_file_read_admits_absolute_path_under_ro_root");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
         let workspace = root.join("workspace");
         let ro_root = root.join("shared");
         let ro_file = ro_root.join("notes.txt");
 
-        let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         tokio::fs::create_dir_all(&ro_root).await.unwrap();
         tokio::fs::write(&ro_file, "cross-agent read")
@@ -853,15 +811,12 @@ mod tests {
             "absolute path under read-only root must read: {result:?}"
         );
         assert!(result.output.contains("cross-agent read"));
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
     async fn file_read_with_offset_and_limit() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_offset");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         tokio::fs::write(dir.join("lines.txt"), "aaa\nbbb\nccc\nddd\neee")
             .await
             .unwrap();
@@ -907,15 +862,12 @@ mod tests {
         assert!(result.output.contains("1: aaa"));
         assert!(result.output.contains("5: eee"));
         assert!(result.output.contains("[5 lines total]"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_offset_beyond_end() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_offset_end");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
         tokio::fs::write(dir.join("short.txt"), "one\ntwo")
             .await
             .unwrap();
@@ -931,15 +883,12 @@ mod tests {
                 .output
                 .contains("[No lines in range, file has 2 lines]")
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_rejects_oversized_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_large");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         // Create a file just over 10 MB
         let big = vec![b'x'; 10 * 1024 * 1024 + 1];
@@ -949,15 +898,12 @@ mod tests {
         let result = tool.execute(json!({"path": "huge.bin"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("File too large"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_rejects_binary_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_binary");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         // Non-UTF-8 bytes containing a NUL — the classic binary signal.
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'h', b'i', 0x80];
@@ -987,15 +933,12 @@ mod tests {
             "must not return lossy replacement output, got: {:?}",
             result.output
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_rejects_pdf_without_rag_pdf() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_pdf");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         // Minimal PDF-looking bytes: valid header followed by invalid UTF-8 and
         // a NUL byte so the non-UTF-8 path triggers the binary heuristic now
@@ -1029,15 +972,12 @@ mod tests {
             "base64 pdf read must succeed: {:?}",
             result.error
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_rejects_png_image() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_png");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         // PNG magic (0x89 makes it invalid UTF-8) + a few header bytes.
         let png: Vec<u8> = vec![
@@ -1059,15 +999,12 @@ mod tests {
             "error must point at image_info, got: {:?}",
             result.error
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_rejects_jpeg_image() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_jpeg");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let jpeg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
         tokio::fs::write(dir.join("pic.jpg"), &jpeg).await.unwrap();
@@ -1085,15 +1022,12 @@ mod tests {
             "error must indicate image rejection, got: {:?}",
             result.error
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_rejects_bmp_image() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_bmp");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         // BMP: "BM", bfSize, reserved=0, bfOffBits=54, a 40-byte DIB header,
         // then pixel bytes. The 0xFF pixel byte makes the file invalid UTF-8 (a
@@ -1119,15 +1053,12 @@ mod tests {
             "error must point at image_info, got: {:?}",
             result.error
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_reads_non_utf8_bm_text_lossy() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_bm_text");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         // "BM" followed by cp1251 high bytes (a Cyrillic phrase): >14 bytes, the
         // reserved field (offset 6..10) holds printable text, no NUL / control.
@@ -1145,15 +1076,12 @@ mod tests {
             "non-UTF-8 text starting with BM must not be rejected as an image, error: {:?}",
             result.error
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_reads_non_utf8_text_lossy() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_legacy_text");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         // "Privet" (Cyrillic) in Windows-1251: all high bytes, but no NUL / control / magic.
         let cp1251: Vec<u8> = vec![0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2];
@@ -1169,8 +1097,6 @@ mod tests {
             "non-UTF-8 text must not be rejected as binary, error: {:?}",
             result.error
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     // ── E2E: full agent pipeline with real FileReadTool + PDF extraction ──
@@ -1269,9 +1195,8 @@ mod tests {
         use zeroclaw_providers::{ChatResponse, ModelProvider, ToolCall};
 
         // ── Set up workspace with binary file ──
-        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_lossy");
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
 
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'v', b'a', b'l', b'i', b'd', 0x80];
         tokio::fs::write(workspace.join("data.bin"), &binary_data)
@@ -1349,15 +1274,12 @@ mod tests {
                 tool_result_msg.content,
             );
         }
-
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
     #[tokio::test]
     async fn file_read_blocks_null_byte_in_path() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_null_byte");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let tool = test_tool(dir.clone());
         let result = tool
@@ -1366,16 +1288,13 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn file_read_allows_dev_null() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_dev_null");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let tool = test_tool(dir.clone());
         let result = tool.execute(json!({"path": "/dev/null"})).await.unwrap();
@@ -1386,17 +1305,15 @@ mod tests {
             result.error
         );
         assert_eq!(result.output, "", "/dev/null must read as empty");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_allowed_root_with_workspace_only() {
-        let root = std::env::temp_dir().join("zeroclaw_test_file_read_allowed_root");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
         let workspace = root.join("workspace");
         let allowed = root.join("allowed_dir");
 
-        let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         tokio::fs::create_dir_all(&allowed).await.unwrap();
         tokio::fs::write(allowed.join("data.txt"), "allowed content")
@@ -1432,15 +1349,12 @@ mod tests {
         let outside_path = outside.join("secret.txt").to_string_lossy().to_string();
         let result = tool.execute(json!({"path": &outside_path})).await.unwrap();
         assert!(!result.success);
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
     async fn wrapped_file_read_failure_preserves_rate_limit_budget() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let inner = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
         let security = inner.security.clone();
@@ -1477,7 +1391,5 @@ mod tests {
             !security.record_action(),
             "successful debits exhaust the budget"
         );
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
