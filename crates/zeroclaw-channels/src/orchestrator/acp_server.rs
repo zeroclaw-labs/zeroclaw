@@ -4652,6 +4652,8 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
+                        credit_balance_enabled: false,
                     },
                 );
                 p
@@ -4739,6 +4741,8 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
+                        credit_balance_enabled: false,
                     },
                 );
                 providers
@@ -4993,6 +4997,8 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
+                        credit_balance_enabled: false,
                     },
                 );
                 p
@@ -5068,6 +5074,8 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
+                        credit_balance_enabled: false,
                     },
                 );
                 p
@@ -5122,6 +5130,8 @@ mod tests {
                             model: Some("test-model".to_string()),
                             ..Default::default()
                         },
+                        management_api_key: None,
+                        credit_balance_enabled: false,
                     },
                 );
                 p
