@@ -166,6 +166,10 @@ struct MultiDraftState {
     /// Payload of the chunk `html_fallback_skip` belongs to. A mismatch on
     /// the next flush drops the fallback position.
     html_fallback_chunk: String,
+    /// Format used for the partial delivery that produced the progress above.
+    /// A resume must keep that format so chunk and HTML-fallback indexes stay
+    /// valid even if live `rich_messages` changes before the next flush.
+    delivery_rich: Option<bool>,
 }
 
 impl MultiDraftState {
@@ -180,6 +184,7 @@ impl MultiDraftState {
             delivered_prefix: String::new(),
             html_fallback_skip: 0,
             html_fallback_chunk: String::new(),
+            delivery_rich: None,
         }
     }
 
@@ -188,6 +193,7 @@ impl MultiDraftState {
         self.delivered_prefix.clear();
         self.html_fallback_skip = 0;
         self.html_fallback_chunk.clear();
+        self.delivery_rich = None;
     }
 
     fn note_partial_delivery(
@@ -204,6 +210,13 @@ impl MultiDraftState {
             .cloned()
             .collect::<Vec<_>>()
             .concat();
+        // Pin only when Telegram accepted something. A zero-progress failure
+        // must keep reading live config for the next attempt.
+        if delivered > 0 || html_fallback_skip > 0 {
+            self.delivery_rich = Some(rich);
+        } else {
+            self.delivery_rich = None;
+        }
         if html_fallback_skip > 0 {
             self.html_fallback_skip = html_fallback_skip;
             self.html_fallback_chunk =
@@ -4036,8 +4049,13 @@ impl TelegramChannel {
         self.pace_multi_message_send(last_sent_at).await;
 
         // One format for this flush. Chunk indexes and the HTML fallback
-        // position both address that format's pieces.
-        let rich = self.rich_messages_enabled();
+        // position both address that format's pieces. A partial delivery pins
+        // its format on the draft so a live reload cannot retarget them.
+        let saved_rich = {
+            let drafts = self.multi_message_drafts.lock();
+            drafts.get(&key).and_then(|d| d.delivery_rich)
+        };
+        let rich = saved_rich.unwrap_or_else(|| self.rich_messages_enabled());
         let (skip, html_fallback_skip) = {
             let drafts = self.multi_message_drafts.lock();
             let d = drafts.get(&key);
@@ -4163,6 +4181,7 @@ impl TelegramChannel {
                         draft.delivered_prefix.clone(),
                         draft.html_fallback_skip,
                         draft.html_fallback_chunk.clone(),
+                        draft.delivery_rich,
                     )
                 });
             (
@@ -4182,18 +4201,24 @@ impl TelegramChannel {
         // (in-order delivery preserved); a permanent failure drops the narration
         // with a WARN and still delivers the final answer below, rather than
         // re-inserting unreachable orphaned draft state.
-        if let Some((unsent, delivered_chunks, delivered_prefix, saved_html_skip, saved_html_chunk)) =
-            pending
+        if let Some((
+            unsent,
+            delivered_chunks,
+            delivered_prefix,
+            saved_html_skip,
+            saved_html_chunk,
+            saved_rich,
+        )) = pending
             && !voice_only
         {
             let cleaned = strip_tool_call_tags(unsent.trim());
             let cleaned = cleaned.trim();
             if !cleaned.is_empty() {
                 let mut attempt = 0u32;
-                // Retries share the format from the start of this send so
+                // Retries share the format that produced any saved progress so
                 // `skip` and the HTML fallback position keep addressing the
-                // same chunk list.
-                let rich = self.rich_messages_enabled();
+                // same chunk list, even if live config flipped in between.
+                let rich = saved_rich.unwrap_or_else(|| self.rich_messages_enabled());
                 let chunks = delivery_chunks(cleaned, rich);
                 let (mut skip, mut html_skip) = narration_resume_cursor(
                     &chunks,
@@ -12263,6 +12288,7 @@ mod tests {
             assert_eq!(state.delivered_chunks, 0);
             assert_eq!(state.html_fallback_skip, 1);
             assert!(state.html_fallback_chunk.contains("HEADTOKEN"));
+            assert_eq!(state.delivery_rich, Some(true));
             assert_eq!(state.sent_text, "");
         }
 
@@ -12306,6 +12332,240 @@ mod tests {
                 .count(),
             1,
             "the unsent HTML piece must be sent once: {bodies:?}"
+        );
+    }
+
+    fn rich_multi_message_channel_with_authority(
+        alias: &str,
+    ) -> (TelegramChannel, LiveConfigAuthority) {
+        let mut config = config_with_rich_messages(alias, true);
+        let telegram = config
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias");
+        telegram.multi_message_delay_ms = 0;
+        telegram.bot_token = "fake-token".into();
+        let authority = LiveConfigAuthority::new(config);
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(authority.clone())
+        .with_streaming(StreamMode::MultiMessage, 750);
+        (channel, authority)
+    }
+
+    fn publish_rich_messages(authority: &LiveConfigAuthority, alias: &str, rich: bool) {
+        let mut config = authority.snapshot_config();
+        config
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias")
+            .rich_messages = rich;
+        authority.publish_for_test(config);
+    }
+
+    /// After a rich narration accepts its first HTML fallback piece, flipping
+    /// `rich_messages` off must not restart that fallback from chunk zero.
+    #[tokio::test]
+    async fn flush_unsent_keeps_rich_fallback_when_rich_messages_turns_off() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let alias = "telegram_test_alias";
+        let narration = rich_html_narration();
+        assert!(split_message_for_telegram(&narration).len() >= 2);
+        assert_eq!(delivery_chunks(&narration, true).len(), 1);
+
+        let fail_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "send failed"
+            })))
+            .mount(&fail_server)
+            .await;
+
+        let (channel, authority) = rich_multi_message_channel_with_authority(alias);
+        let channel = channel.with_api_base(fail_server.uri());
+        let recipient = "123";
+        let draft_id = seed_narration_draft(&channel, recipient, &narration);
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("a partial flush is retained on the draft");
+        {
+            let drafts = channel.multi_message_drafts.lock();
+            let state = drafts
+                .get(&TelegramChannel::multi_draft_key(recipient, &draft_id))
+                .expect("draft survives a partial flush");
+            assert_eq!(state.delivery_rich, Some(true));
+            assert_eq!(state.html_fallback_skip, 1);
+        }
+
+        publish_rich_messages(&authority, alias, false);
+        assert!(!channel.rich_messages_enabled());
+
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 2 }
+            })))
+            .mount(&resume_server)
+            .await;
+        let channel = channel.with_api_base(resume_server.uri());
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("the next flush finishes the pinned rich fallback");
+        let requests = resume_server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path().ends_with("/sendMessage")),
+            "resume must stay on the HTML fallback started under rich mode"
+        );
+        let bodies: Vec<String> = requests
+            .into_iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("HEADTOKEN"))
+                .count(),
+            0,
+            "the accepted HTML prefix must not be sent again after the setting flips: {bodies:?}"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("TAILTOKEN"))
+                .count(),
+            1,
+            "the unsent HTML piece must be sent once: {bodies:?}"
+        );
+    }
+
+    /// Same cross-flush case through finalize: the accepted HTML prefix must
+    /// stay unreposted after live `rich_messages` turns off.
+    #[tokio::test]
+    async fn finalize_multi_message_keeps_rich_fallback_when_rich_messages_turns_off() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let alias = "telegram_test_alias";
+        let narration = rich_html_narration();
+        assert!(split_message_for_telegram(&narration).len() >= 2);
+        assert_eq!(delivery_chunks(&narration, true).len(), 1);
+
+        let fail_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "send failed"
+            })))
+            .mount(&fail_server)
+            .await;
+
+        let (channel, authority) = rich_multi_message_channel_with_authority(alias);
+        let channel = channel.with_api_base(fail_server.uri());
+        let recipient = "123";
+        let draft_id = seed_narration_draft(&channel, recipient, &narration);
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("a partial flush is retained on the draft");
+
+        publish_rich_messages(&authority, alias, false);
+        assert!(!channel.rich_messages_enabled());
+
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 2 }
+            })))
+            .mount(&resume_server)
+            .await;
+        let channel = channel.with_api_base(resume_server.uri());
+        channel
+            .finalize_multi_message_draft(recipient, &draft_id, "Final answer", true)
+            .await
+            .expect("finalize resumes the pinned rich fallback then sends the final answer");
+
+        let bodies: Vec<String> = resume_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("HEADTOKEN"))
+                .count(),
+            0,
+            "the accepted HTML prefix must not be sent again after the setting flips: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("TAILTOKEN")),
+            "the remaining HTML piece must still be sent: {bodies:?}"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("Final answer"))
+                .count(),
+            1,
+            "the final answer must follow the narration once"
         );
     }
 
