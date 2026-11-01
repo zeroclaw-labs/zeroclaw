@@ -12860,6 +12860,41 @@ mod tests {
         assert!(ctx.contains("Step one"));
     }
 
+    /// Tool-context retention recognises a step prompt by the shape this
+    /// function writes, so the two must agree, whatever the SOP is named.
+    #[test]
+    fn step_context_is_recognised_as_a_step_prompt_for_any_name() {
+        for name in ["pump-shutdown", "Deploy\nproduction", "Deploy [eu] (run x)"] {
+            let mut sop = test_sop(name, SopExecutionMode::Auto, SopPriority::Critical);
+            sop.name = name.to_string();
+            let run = SopRun {
+                run_id: "run-001".into(),
+                sop_name: name.into(),
+                initiating_agent: None,
+                trigger_event: manual_event(),
+                frame_marker_id: "marker-001".into(),
+                status: SopRunStatus::Running,
+                current_step: 1,
+                total_steps: 2,
+                started_at: now_iso8601(),
+                completed_at: None,
+                failure_reason: None,
+                step_results: Vec::new(),
+                waiting_since: None,
+                llm_calls_saved: 0,
+                revision: 0,
+                revision_base: 0,
+                decided_mode: None,
+                decisions: std::collections::BTreeMap::new(),
+            };
+            let ctx = format_step_context(&sop, &run, &sop.steps[0], &SopConfig::default());
+            assert!(
+                crate::agent::history_trim::is_sop_step_prompt(&ctx),
+                "step prompt for {name:?} must be recognised: {ctx:?}"
+            );
+        }
+    }
+
     // ── Get run (active + finished) ─────────────────────
 
     #[test]

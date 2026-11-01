@@ -2,8 +2,61 @@
 //! that fit the token budget, drop the rest, never cut a turn in half.
 
 use crate::agent::history::estimate_history_tokens;
+use std::collections::HashSet;
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::ChatMessage;
+
+/// Prefixes of the user-role rows the tool loop itself appends mid-turn to give
+/// the model feedback on its own output (see the malformed-protocol retry in
+/// `turn/mod.rs`). They are user-role only because no `tool_call_id` exists to
+/// attach them to, and they belong to the turn they interrupt.
+pub(crate) const RUNTIME_FEEDBACK_PREFIXES: &[&str] = &["[Tool call parse error]"];
+
+/// Prefix of the prompt a live SOP step appends to the caller's history
+/// (`format_step_context` in the SOP engine). A step runs inside the caller's
+/// turn, so its prompt row belongs to that turn for retention: otherwise each
+/// step would age the running turn by one, and with a small window the caller
+/// would resume without the tool results it still needs.
+pub(crate) const SOP_STEP_PROMPT_PREFIX: &str = "[SOP: ";
+
+/// The fixed last line of every step prompt the SOP engine writes.
+pub(crate) const SOP_STEP_PROMPT_TRAILER: &str = "When done, report your result.";
+
+/// Whether `content` is the prompt a live SOP step appends, judged by the
+/// shape the engine writes around the SOP's name rather than by the prefix
+/// alone: the header `[SOP: <name> (run <id>) — Step <n> of <m>]` closing a
+/// line, and the fixed last line. The name is not parsed, since a SOP name
+/// is free text and may hold newlines or brackets of its own; the step
+/// numbers after it and the trailer are what a user message does not carry.
+pub(crate) fn is_sop_step_prompt(content: &str) -> bool {
+    let Some(after_prefix) = content.strip_prefix(SOP_STEP_PROMPT_PREFIX) else {
+        return false;
+    };
+    let Some((_, after_step)) = after_prefix.split_once(") — Step ") else {
+        return false;
+    };
+    let Some((n, after_n)) = after_step.split_once(" of ") else {
+        return false;
+    };
+    let Some((m, _)) = after_n.split_once("]\n") else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(n) && digits(m) && content.trim_end().ends_with(SOP_STEP_PROMPT_TRAILER)
+}
+
+/// A user row that opens a turn for tool-context retention: a turn boundary
+/// that is neither runtime feedback nor a live SOP step prompt. Whole-turn
+/// trimming keeps its own boundary rule; retention must not let a row the
+/// loop itself appended mid-turn push the running turn's tool rows out of the
+/// retained window.
+fn opens_retention_turn(msg: &ChatMessage) -> bool {
+    is_turn_boundary(msg)
+        && !RUNTIME_FEEDBACK_PREFIXES
+            .iter()
+            .any(|prefix| msg.content.starts_with(prefix))
+        && !is_sop_step_prompt(&msg.content)
+}
 
 /// Outcome of a trim pass. `trimmed` is true only when at least one whole turn
 /// was dropped, in which case the caller emits a user-visible event and injects
@@ -350,6 +403,177 @@ fn next_boundary_after(boundaries: &[usize], current: usize) -> usize {
 
 pub(crate) fn count_turns(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| is_turn_boundary(m)).count()
+}
+
+/// Provider-facing population derived from a history whose older turns lost
+/// their tool context. `source_rows[i]` is the index, in the input history, of
+/// the row `messages[i]` stands for; a tool-exchange summary stands for the
+/// assistant row that issued the calls it summarises. The input is never
+/// modified, so the working history and every transcript an owner persists
+/// from it keep all their rows.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CollapsedToolContext {
+    pub messages: Vec<ChatMessage>,
+    pub source_rows: Vec<usize>,
+    /// Tool-call and tool-result rows that `messages` leaves out.
+    pub dropped_messages: usize,
+    pub collapsed_turns: usize,
+}
+
+impl CollapsedToolContext {
+    fn keep(&mut self, source_row: usize, message: ChatMessage) {
+        self.messages.push(message);
+        self.source_rows.push(source_row);
+    }
+
+    fn identity(history: &[ChatMessage]) -> Self {
+        Self {
+            messages: history.to_vec(),
+            source_rows: (0..history.len()).collect(),
+            dropped_messages: 0,
+            collapsed_turns: 0,
+        }
+    }
+}
+
+/// Whether an assistant row is a tool-call carrier the runtime issued, as
+/// opposed to an ordinary reply whose JSON merely contains a `tool_calls`
+/// array. Flat provider JSON cannot tell the two apart by shape, so the rule
+/// is what the loop itself applies when it parses a response: a call is
+/// executed only when it names a tool the loop can execute. A row naming one
+/// is a carrier, answered or not (an unanswered one is an interrupted
+/// exchange); a row naming none executed nothing and is the turn's reply.
+/// `known_tools` holds the lower-cased names of the loop's registered tools.
+fn is_tool_call_carrier(message: &ChatMessage, known_tools: &HashSet<String>) -> bool {
+    message.role == "assistant"
+        && crate::agent::history_pruner::extract_assistant_tool_call_ids(&message.content).is_some()
+        && assistant_tool_call_names(&message.content)
+            .iter()
+            .any(|name| known_tools.contains(&name.to_ascii_lowercase()))
+}
+
+/// The tool names an assistant row's `tool_calls` array carries, in either
+/// the flat (`name`) or the OpenAI (`function.name`) layout.
+fn assistant_tool_call_names(content: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+    value
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| {
+                    call.get("name")
+                        .or_else(|| call.get("function").and_then(|f| f.get("name")))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A closing reply is a turn's last assistant row when it is not a tool-call
+/// carrier; a carrier there is an exchange whose results never arrived.
+fn is_closing_reply(message: &ChatMessage, known_tools: &HashSet<String>) -> bool {
+    message.role == "assistant" && !is_tool_call_carrier(message, known_tools)
+}
+
+fn count_tool_calls(rows: &[ChatMessage], known_tools: &HashSet<String>) -> usize {
+    let from_carriers: usize = rows
+        .iter()
+        .filter(|m| is_tool_call_carrier(m, known_tools))
+        .filter_map(|m| crate::agent::history_pruner::extract_assistant_tool_call_ids(&m.content))
+        .map(|ids| ids.len())
+        .sum();
+    if from_carriers > 0 {
+        return from_carriers;
+    }
+    rows.iter()
+        .filter(|m| {
+            m.role == "tool"
+                || (m.role == "user"
+                    && m.content
+                        .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX))
+        })
+        .count()
+        .max(1)
+}
+
+/// Build the provider-facing population in which every turn older than the
+/// newest `keep_prior_turns + 1` turns keeps its user prompt and closing
+/// assistant reply but loses its tool-call and tool-result rows. The running
+/// turn is always sent whole because the model needs its own results, so `0`
+/// keeps tool context for the running turn only. Leading system messages and
+/// the breadcrumb are copied through. A turn collapses as a unit: the assistant
+/// row that issued the calls is replaced by one `[Tool exchange: …]` summary
+/// row (the marker providers already recognise) and the rows that answered it
+/// are left out, so no orphan call or result is created. A turn that ended on a
+/// call or a result keeps only its prompt and the summary. `known_tools` holds
+/// the lower-cased names of the tools the loop can execute; it is how a call
+/// row is told apart from an ordinary reply whose JSON merely contains a
+/// `tool_calls` array (see [`is_tool_call_carrier`]).
+pub(crate) fn collapse_tool_context_older_than(
+    history: &[ChatMessage],
+    keep_prior_turns: usize,
+    crumb_present: bool,
+    known_tools: &HashSet<String>,
+) -> CollapsedToolContext {
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let body_start = leading_system + usize::from(crumb_present);
+    let boundaries: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .skip(body_start)
+        .filter(|(_, m)| opens_retention_turn(m))
+        .map(|(i, _)| i)
+        .collect();
+    let protected = keep_prior_turns.saturating_add(1);
+    if boundaries.len() <= protected {
+        return CollapsedToolContext::identity(history);
+    }
+    let mut out = CollapsedToolContext::default();
+    let mut cursor = 0;
+    for turn in 0..boundaries.len() - protected {
+        let boundary = boundaries[turn];
+        for (row, message) in history.iter().enumerate().take(boundary + 1).skip(cursor) {
+            out.keep(row, message.clone());
+        }
+        let span_start = boundary + 1;
+        let span_end = boundaries[turn + 1];
+        let closing = (span_end > span_start
+            && is_closing_reply(&history[span_end - 1], known_tools))
+        .then_some(span_end - 1);
+        let drain_end = closing.unwrap_or(span_end);
+        if drain_end > span_start {
+            let drained = &history[span_start..drain_end];
+            out.dropped_messages += drained.len();
+            out.collapsed_turns += 1;
+            // A turn with a closing reply is sent as prompt and reply alone:
+            // user and assistant rows that alternate on every provider. The
+            // summary stands in only where no reply closed the turn, so the
+            // model still sees that calls were made and the prompt is not
+            // left answered by nothing.
+            if closing.is_none() && history[span_start].role == "assistant" {
+                out.keep(
+                    span_start,
+                    ChatMessage::assistant(ChatMessage::pruned_tool_exchange_summary(
+                        count_tool_calls(drained, known_tools),
+                    )),
+                );
+            }
+        }
+        if let Some(row) = closing {
+            out.keep(row, history[row].clone());
+        }
+        cursor = span_end;
+    }
+    for (row, message) in history.iter().enumerate().skip(cursor) {
+        out.keep(row, message.clone());
+    }
+    out
 }
 
 /// Drop the oldest whole turn (after leading system messages and an optional
@@ -1586,5 +1810,381 @@ mod tests {
             with_marker.get(2),
             Some(m) if m.role == "user" && m.content == "newest request"
         ));
+    }
+}
+
+#[cfg(test)]
+mod collapse_tests {
+    use super::*;
+
+    fn sys(c: &str) -> ChatMessage {
+        ChatMessage::system(c)
+    }
+    fn user(c: &str) -> ChatMessage {
+        ChatMessage::user(c)
+    }
+    fn asst(c: &str) -> ChatMessage {
+        ChatMessage::assistant(c)
+    }
+    fn tool(c: &str) -> ChatMessage {
+        ChatMessage::tool(c)
+    }
+    /// A runtime-issued carrier: every call names the `shell` tool the loop
+    /// can execute, as the runtime's own serialization does.
+    fn carrier(ids: &[&str]) -> ChatMessage {
+        let calls: Vec<String> = ids
+            .iter()
+            .map(|id| format!("{{\"id\":\"{id}\",\"name\":\"shell\",\"arguments\":\"{{}}\"}}"))
+            .collect();
+        asst(&format!("{{\"tool_calls\":[{}]}}", calls.join(",")))
+    }
+
+    /// The tools the loop can execute in these tests.
+    fn known() -> HashSet<String> {
+        HashSet::from(["shell".to_string()])
+    }
+
+    /// user → assistant(call) → tool → assistant(final)
+    fn native_turn(n: usize) -> Vec<ChatMessage> {
+        vec![
+            user(&format!("request {n}")),
+            carrier(&[&format!("call_{n}")]),
+            tool(&format!(
+                "{{\"tool_call_id\":\"call_{n}\",\"content\":\"result {n}\"}}"
+            )),
+            asst(&format!("answer {n}")),
+        ]
+    }
+
+    /// user → assistant(call) → user([Tool results]) → assistant(final)
+    fn prompt_mode_turn(n: usize) -> Vec<ChatMessage> {
+        vec![
+            user(&format!("request {n}")),
+            asst(&format!("[tool_call] shell {n}")),
+            user(&format!("[Tool results]\nresult {n}")),
+            asst(&format!("answer {n}")),
+        ]
+    }
+
+    fn rows(history: &[ChatMessage]) -> Vec<(String, String)> {
+        history
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect()
+    }
+
+    fn summary(calls: usize) -> String {
+        ChatMessage::pruned_tool_exchange_summary(calls)
+    }
+
+    fn assert_identity(c: &CollapsedToolContext, history: &[ChatMessage]) {
+        assert_eq!(rows(&c.messages), rows(history));
+        assert_eq!(c.source_rows, (0..history.len()).collect::<Vec<_>>());
+        assert_eq!(c.dropped_messages, 0);
+        assert_eq!(c.collapsed_turns, 0);
+    }
+
+    #[test]
+    fn keeps_running_turn_plus_prior_turns_and_summarises_older_ones() {
+        let mut h = vec![sys("s")];
+        for n in 1..=4 {
+            h.extend(native_turn(n));
+        }
+        let before = rows(&h);
+        let c = collapse_tool_context_older_than(&h, 1, false, &known());
+        assert_eq!(rows(&h), before, "input history is never modified");
+        assert_eq!(c.collapsed_turns, 2);
+        assert_eq!(c.dropped_messages, 4);
+        // A closed turn is sent as its prompt and its reply: no summary row,
+        // so roles alternate on every provider.
+        let expected: Vec<(String, String)> = [
+            ("system", "s"),
+            ("user", "request 1"),
+            ("assistant", "answer 1"),
+            ("user", "request 2"),
+            ("assistant", "answer 2"),
+        ]
+        .iter()
+        .map(|(r, t)| (r.to_string(), t.to_string()))
+        .chain(rows(&native_turn(3)))
+        .chain(rows(&native_turn(4)))
+        .collect();
+        assert_eq!(rows(&c.messages), expected);
+        assert!(
+            c.messages
+                .iter()
+                .all(|m| !m.is_pruned_tool_exchange_summary())
+        );
+        assert!(
+            c.messages
+                .windows(2)
+                .all(|pair| pair[0].role != pair[1].role || pair[0].role == "system"),
+            "roles alternate: {:?}",
+            rows(&c.messages)
+        );
+        // Every request row maps to the history row it stands for.
+        assert_eq!(
+            c.source_rows,
+            vec![0, 1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(c.source_rows.len(), c.messages.len());
+    }
+
+    #[test]
+    fn prompt_mode_results_carrier_is_not_a_turn_boundary() {
+        let mut h = vec![sys("s")];
+        for n in 1..=3 {
+            h.extend(prompt_mode_turn(n));
+        }
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 2);
+        assert_eq!(c.dropped_messages, 4);
+        assert_eq!(count_turns(&c.messages), 3);
+        assert!(
+            !c.messages
+                .iter()
+                .any(|m| m.content == "[Tool results]\nresult 1")
+        );
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.content == "[Tool results]\nresult 3")
+        );
+        assert_eq!(c.messages[2].content, "answer 1");
+    }
+
+    #[test]
+    fn zero_keeps_tool_context_for_the_running_turn_only() {
+        let mut h = native_turn(1);
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 1);
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), "answer 1".to_string()),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn breadcrumb_and_system_prefix_are_copied_and_not_counted() {
+        let mut h = vec![sys("a"), sys("b"), breadcrumb()];
+        h.extend(native_turn(1));
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, true, &known());
+        assert_eq!(c.collapsed_turns, 1);
+        assert_eq!(rows(&c.messages[..3]), rows(&h[..3]));
+        assert_eq!(c.messages[3].content, "request 1");
+        assert_eq!(c.messages[4].content, "answer 1");
+        assert_eq!(&c.source_rows[..5], &[0, 1, 2, 3, 6]);
+    }
+
+    #[test]
+    fn aborted_turn_keeps_prompt_and_summary_but_never_a_dangling_carrier() {
+        let mut h = vec![
+            user("request 1"),
+            carrier(&["call_1"]),
+            tool("{\"tool_call_id\":\"call_1\",\"content\":\"done\"}"),
+            carrier(&["call_2", "call_3"]),
+        ];
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.dropped_messages, 3);
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), summary(3)),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn runtime_feedback_rows_do_not_split_the_running_turn() {
+        // The running turn already holds a tool round when the loop appends
+        // its own feedback row (twice, the retry budget). With the smallest
+        // window the model must still see that round.
+        let mut h = native_turn(1);
+        h.extend(native_turn(2));
+        h.pop();
+        h.push(user(
+            "[Tool call parse error]\nYour previous response looked like...",
+        ));
+        h.push(user(
+            "[Tool call parse error]\nYour previous response looked like...",
+        ));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 1, "only the prior turn collapses");
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), "answer 1".to_string()),
+        ];
+        expected.extend(rows(&h[4..]));
+        assert_eq!(rows(&c.messages), expected);
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("result 2")),
+            "the running turn keeps its own tool result"
+        );
+    }
+
+    #[test]
+    fn ordinary_json_reply_is_kept_as_the_closing_reply() {
+        // A final answer whose JSON merely contains a `tool_calls` array: it
+        // names no tool the loop can execute, so it executed nothing. It is
+        // the turn's reply and must survive collapse whole, exactly as the
+        // history-window preflight leaves it.
+        let json_reply =
+            r#"{"answer":"here","tool_calls":[{"id":"x","name":"noop","arguments":"{}"}]}"#;
+        let mut h = vec![user("request 1"), asst(json_reply)];
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 0, "{:?}", rows(&c.messages));
+        assert_identity(&c, &h);
+
+        // The same reply after a real exchange: the exchange collapses, the
+        // reply is kept.
+        let mut h = vec![
+            user("request 1"),
+            carrier(&["call_1"]),
+            tool("{\"tool_call_id\":\"call_1\",\"content\":\"result 1\"}"),
+            asst(json_reply),
+        ];
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), json_reply.to_string()),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+    }
+
+    #[test]
+    fn an_unanswered_call_to_a_known_tool_is_still_summarised() {
+        // The interrupted exchange keeps its protection: the carrier names a
+        // tool the loop executes, so it is a call whose results never came,
+        // not a reply, and the turn keeps only its prompt and the summary.
+        let mut h = vec![user("request 1"), carrier(&["call_1"])];
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), summary(1)),
+        ];
+        expected.extend(rows(&native_turn(2)));
+        assert_eq!(rows(&c.messages), expected);
+
+        // The same row answered by its result is a carrier for the same
+        // reason: it names the tool the loop executed.
+        let mut h = native_turn(1);
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 1, "{:?}", rows(&c.messages));
+    }
+
+    #[test]
+    fn sop_step_prompts_do_not_split_the_running_turn() {
+        // A live SOP step appends its prompt to the caller's history and runs
+        // on it; when the caller resumes, with the smallest window, the tool
+        // round that began its turn must still be in the request. Three steps
+        // would otherwise age the turn past the default window too.
+        let mut h = native_turn(1);
+        h.push(user("request 2"));
+        h.push(carrier(&["call_2"]));
+        h.push(tool(
+            "{\"tool_call_id\":\"call_2\",\"content\":\"result 2\"}",
+        ));
+        for step in 1..=3 {
+            h.push(user(&format!(
+                "[SOP: Deploy (run r1) — Step {step} of 3]\n\nCurrent step: **do it**\nWhen done, report your result.\n"
+            )));
+            h.push(asst(&format!("step {step} done")));
+        }
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_eq!(c.collapsed_turns, 1, "only the prior turn collapses");
+        let mut expected = vec![
+            ("user".to_string(), "request 1".to_string()),
+            ("assistant".to_string(), "answer 1".to_string()),
+        ];
+        expected.extend(rows(&h[4..]));
+        assert_eq!(rows(&c.messages), expected);
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.contains("result 2")),
+            "the running turn keeps its own tool result across the step prompts"
+        );
+    }
+
+    #[test]
+    fn a_user_message_that_merely_starts_like_a_step_prompt_opens_a_turn() {
+        // Only the engine's full header marks a step prompt. A user who
+        // types `[SOP: ` opens a turn of their own, so neither their prompt
+        // nor the answer before it can be drained with a prior turn's tools.
+        assert!(!is_sop_step_prompt(
+            "[SOP: notes for today]\nplease summarise"
+        ));
+        assert!(!is_sop_step_prompt(
+            "[SOP: x (run 1) — Step one of 3]\n\nWhen done, report your result.\n"
+        ));
+        assert!(!is_sop_step_prompt(
+            "[SOP: Deploy (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n"
+        ));
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n\nWhen done, report your result.\n"
+        ));
+        // A SOP name is free text: newlines and brackets inside it do not
+        // hide the step prompt, so the caller's turn is not aged by it.
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy\nproduction (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n\nWhen done, report your result.\n"
+        ));
+        assert!(is_sop_step_prompt(
+            "[SOP: Deploy [eu] (run r1) — Step 2 of 3]\n\nCurrent step: **do it**\n\nWhen done, report your result.\n"
+        ));
+
+        let mut h = native_turn(1);
+        h.push(user("[SOP: notes for today] what did we decide?"));
+        h.push(asst("we decided X"));
+        h.extend(native_turn(2));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert!(
+            c.messages
+                .iter()
+                .any(|m| m.role == "user" && m.content.starts_with("[SOP: notes")),
+            "the user's own prompt is kept: {:?}",
+            rows(&c.messages)
+        );
+        assert!(
+            c.messages.iter().any(|m| m.content == "answer 1"),
+            "the answer before it is kept as its turn's closing reply: {:?}",
+            rows(&c.messages)
+        );
+    }
+
+    #[test]
+    fn text_only_turns_and_small_histories_pass_through_unchanged() {
+        let mut h = vec![
+            user("hi"),
+            asst("hello"),
+            user("again"),
+            asst("hello again"),
+        ];
+        h.extend(native_turn(3));
+        let c = collapse_tool_context_older_than(&h, 0, false, &known());
+        assert_identity(&c, &h);
+
+        let mut h2 = native_turn(1);
+        h2.extend(native_turn(2));
+        let c2 = collapse_tool_context_older_than(&h2, 1, false, &known());
+        assert_identity(&c2, &h2);
+
+        let mut h3 = vec![sys("s")];
+        for n in 1..=6 {
+            h3.extend(native_turn(n));
+        }
+        let c3 = collapse_tool_context_older_than(&h3, usize::MAX, false, &known());
+        assert_identity(&c3, &h3);
     }
 }
