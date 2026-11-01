@@ -1198,6 +1198,7 @@ channel-runtime-fallback-footer =
     Cambiar modelo: /models
 channel-runtime-model-fallback-redacted = ⚡ El modelo solicitado no estaba disponible; un modelo de respaldo generó esta respuesta.
 delegate-provider-fallback-warning = Advertencia: El agente delegado se recuperó mediante una alternativa de proveedor. Los detalles del fallo del proveedor se registraron y se omitieron de este resultado.
+delegate-knowledge-init-failed = No se pudo inicializar el conocimiento del agente delegado '{ $agent }': { $error }
 turn-tool-protocol-strict-mixed-error = El análisis estricto de herramientas no puede ejecutar una cadena de alternativas que mezcle candidatos con herramientas nativas y candidatos de solo texto. Configura cada candidato accesible para que use el mismo protocolo de herramientas, o establece strict_tool_parsing en false.
 delegate-provider-fallback-header = [Agente '{ $agent }' (solicitado: { $requested_provider }/{ $requested_model }; servido: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agente '{ $agent }' (solicitado: { $requested_provider }/{ $requested_model }; servido: { $actual_provider }/{ $actual_model }, agentic)]
@@ -1221,6 +1222,8 @@ cli-alias-not-configured = {$path} no está configurado
 cli-alias-delete-failed = error al eliminar: {$error}
 cli-alias-delete-reserved-default = el agente `default` está reservado y no se puede eliminar
 cli-alias-create-reserved-default = el agente `default` está reservado y no se puede crear
+cli-alias-create-knowledge-retained = el agente `{$alias}` todavía posee conocimiento; completa su retiro antes de reutilizar el alias
+cli-alias-create-knowledge-uninspectable = no se puede inspeccionar el conocimiento retirado del agente `{$alias}`: {$reason}
 cli-alias-renamed = renombrado {$section}.{$from} → {$section}.{$to} (se reescribieron {$count} ruta(s) de referencia)
 cli-alias-rename-invalid = nuevo alias no válido: {$message}
 cli-alias-rename-reserved = el alias `{$alias}` está reservado y no se puede renombrar

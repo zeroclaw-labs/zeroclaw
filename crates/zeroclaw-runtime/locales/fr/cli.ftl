@@ -1201,6 +1201,7 @@ channel-runtime-fallback-footer =
     Changer de modèle : /models
 channel-runtime-model-fallback-redacted = ⚡ Le modèle demandé était indisponible ; un modèle de secours a généré cette réponse.
 delegate-provider-fallback-warning = Avertissement : l’agent délégué a repris son exécution grâce à un basculement vers un fournisseur de secours. Les détails de la défaillance du fournisseur ont été consignés et omis de ce résultat.
+delegate-knowledge-init-failed = Impossible d’initialiser les connaissances de l’agent délégué '{ $agent }' : { $error }
 turn-tool-protocol-strict-mixed-error = L’analyse stricte des outils ne peut pas exécuter une chaîne de repli qui mélange des candidats native-tool et text-only. Configurez chaque candidat accessible pour utiliser le même protocole d’outils, ou définissez strict_tool_parsing sur false.
 delegate-provider-fallback-header = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model }, agentique)]
@@ -1224,6 +1225,8 @@ cli-alias-not-configured = {$path} n'est pas configuré
 cli-alias-delete-failed = échec de la suppression : {$error}
 cli-alias-delete-reserved-default = l'agent `default` est réservé et ne peut pas être supprimé
 cli-alias-create-reserved-default = l'agent `default` est réservé et ne peut pas être créé
+cli-alias-create-knowledge-retained = l'agent `{$alias}` possède encore des connaissances ; terminez son retrait avant de réutiliser l'alias
+cli-alias-create-knowledge-uninspectable = impossible d'inspecter les connaissances retirées de l'agent `{$alias}` : {$reason}
 cli-alias-renamed = {$section}.{$from} → {$section}.{$to} renommé ({$count} chemin(s) de référence réécrit(s))
 cli-alias-rename-invalid = nouvel alias invalide : {$message}
 cli-alias-rename-reserved = l'alias `{$alias}` est réservé et ne peut pas être renommé

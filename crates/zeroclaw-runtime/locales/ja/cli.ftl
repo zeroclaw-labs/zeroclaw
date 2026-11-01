@@ -1196,6 +1196,7 @@ channel-runtime-fallback-footer =
     モデル切り替え: /models
 channel-runtime-model-fallback-redacted = ⚡ 要求されたモデルが利用できなかったため、代替モデルがこの応答を生成しました。
 delegate-provider-fallback-warning = 警告: 委譲されたエージェントは、プロバイダーのフォールバックによって復旧しました。プロバイダーの障害の詳細はログに記録され、この結果からは省略されています。
+delegate-knowledge-init-failed = 委譲先エージェント '{ $agent }' のナレッジを初期化できませんでした: { $error }
 turn-tool-protocol-strict-mixed-error = 厳格なツール解析では、native-tool と text-only の候補が混在するフォールバックチェーンを実行できません。到達可能なすべての候補が同じツールプロトコルを使用するよう設定するか、strict_tool_parsing を false に設定してください。
 delegate-provider-fallback-header = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model }, agentic)]
@@ -1219,6 +1220,8 @@ cli-alias-not-configured = {$path} は設定されていません
 cli-alias-delete-failed = 削除に失敗しました: {$error}
 cli-alias-delete-reserved-default = `default` エージェントは予約されており、削除できません
 cli-alias-create-reserved-default = `default` エージェントは予約されており、作成できません
+cli-alias-create-knowledge-retained = エージェント `{$alias}` はまだナレッジを所有しています。エイリアスを再利用する前に退役処理を完了してください
+cli-alias-create-knowledge-uninspectable = エージェント `{$alias}` の退役済みナレッジを検査できません: {$reason}
 cli-alias-renamed = {$section}.{$from} → {$section}.{$to} にリネームしました（{$count} 件の参照パスを書き換えました）
 cli-alias-rename-invalid = 無効な新しいエイリアス: {$message}
 cli-alias-rename-reserved = エイリアス `{$alias}` は予約されており、リネームできません

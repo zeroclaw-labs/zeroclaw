@@ -1,14 +1,13 @@
 //! Shared agent lifecycle primitives used by RPC, gateway, and CLI adapters.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
 
-use anyhow::Context;
+#[cfg(test)]
 use zeroclaw_api::memory_traits::Memory;
 use zeroclaw_config::alias_refs::{self, AliasKind};
 use zeroclaw_config::schema::Config;
-use zeroclaw_infra::acp_session_store::AcpSessionStore;
-use zeroclaw_infra::session_backend::SessionBackend;
 
 #[derive(Debug, Clone)]
 pub struct AgentDeletePreflight {
@@ -36,6 +35,26 @@ pub fn plan_agent_delete_with_acp_count(
     alias: &str,
     live_acp: Result<usize, String>,
 ) -> AgentDeletePreflight {
+    plan_agent_delete_inner(config, alias, live_acp, false)
+}
+
+/// Check a committed-delete retry without treating the absent config entry as
+/// permission to bypass hard references or the live ACP gate.
+#[must_use]
+pub fn plan_agent_delete_recovery_with_acp_count(
+    config: &Config,
+    alias: &str,
+    live_acp: Result<usize, String>,
+) -> AgentDeletePreflight {
+    plan_agent_delete_inner(config, alias, live_acp, true)
+}
+
+fn plan_agent_delete_inner(
+    config: &Config,
+    alias: &str,
+    live_acp: Result<usize, String>,
+    recovery: bool,
+) -> AgentDeletePreflight {
     if alias_refs::is_reserved_agent_alias(alias) {
         return AgentDeletePreflight {
             alias: alias.to_string(),
@@ -46,7 +65,7 @@ pub fn plan_agent_delete_with_acp_count(
             workspace: None,
         };
     }
-    if !config.agents.contains_key(alias) {
+    if !recovery && !config.agents.contains_key(alias) {
         return AgentDeletePreflight {
             alias: alias.to_string(),
             allowed: false,
@@ -101,379 +120,17 @@ pub fn plan_agent_delete_with_acp_count(
     }
 }
 
-pub fn live_acp_session_count(config: &Config, alias: &str) -> anyhow::Result<usize> {
-    let store = AcpSessionStore::new(&config.data_dir)
-        .context("open ACP session store to verify live sessions")?;
-    store
-        .count_live_sessions_by_agent(alias)
-        .context("count live ACP sessions for agent")
-}
-
-#[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct WorkspaceArchiveReport {
-    pub archive_dir: PathBuf,
-    pub warnings: Vec<String>,
-}
-
-pub async fn archive_agent_workspace(
-    config: &Config,
-    alias: &str,
-    workspace: &Path,
-) -> WorkspaceArchiveReport {
-    let archive_root = config.data_dir.join("agents").join("_deleted");
-    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let mut warnings = Vec::new();
-    if let Err(error) = tokio::fs::create_dir_all(&archive_root).await {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"agent": alias, "archive": archive_root.display().to_string(), "err": error.to_string()})),
-            "agent delete: archive dir creation failed"
-        );
-        warnings.push(format!(
-            "archive dir creation failed ({}): {error}",
-            archive_root.display()
-        ));
-    }
-    let archive_dir = archive_root.join(format!("{alias}-{ts}-{}", uuid::Uuid::new_v4()));
-    if let Err(error) = tokio::fs::create_dir(&archive_dir).await {
-        warnings.push(format!(
-            "archive dir allocation failed ({}): {error}",
-            archive_dir.display()
-        ));
-    }
-    if workspace.exists() {
-        let destination = archive_dir.join("workspace");
-        if let Err(error) = tokio::fs::rename(workspace, &destination).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"agent": alias, "from": workspace.display().to_string(), "to": destination.display().to_string(), "err": error.to_string()})),
-                "agent delete: workspace archive failed"
-            );
-            warnings.push(format!(
-                "workspace archive failed ({} -> {}): {error}",
-                workspace.display(),
-                destination.display()
-            ));
-        }
-    }
-    WorkspaceArchiveReport {
-        archive_dir,
-        warnings,
-    }
-}
-
-#[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct OwnedStateReport {
-    pub memory_purged: usize,
-    pub cron_removed: usize,
-    pub acp_removed: usize,
-    pub sessions_cleared: usize,
-    pub control_plane_tasks_removed: usize,
-    pub archived_to: Option<String>,
-    pub warnings: Vec<String>,
-}
-
-async fn write_json(path: &Path, bytes: Vec<u8>) {
-    if let Err(err) = tokio::fs::write(path, bytes).await {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"path": path.display().to_string(), "err": err.to_string()})),
-            "owned-state cascade: failed to write archive file"
-        );
-    }
-}
-
-pub async fn cascade_owned_state(
-    config: &Config,
-    mem: &Arc<dyn Memory>,
-    session_backend: Option<&Arc<dyn SessionBackend>>,
-    alias: &str,
-    archive_dir: &Path,
-) -> OwnedStateReport {
-    let cascade_dir = archive_dir.join("cascade");
-    let _ = tokio::fs::create_dir_all(&cascade_dir).await;
-    let mut warnings = Vec::new();
-
-    let mem_rows = match mem.export_agent(alias).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            warnings.push(format!("memory export: {error}"));
-            Vec::new()
-        }
-    };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&mem_rows) {
-        write_json(&cascade_dir.join("memory.json"), bytes).await;
-    }
-    let memory_purged = match mem.purge_agent(alias).await {
-        Ok(count) => count,
-        Err(error) => {
-            warnings.push(format!("memory purge: {error}"));
-            0
-        }
-    };
-
-    let cron_config = config.clone();
-    let cron_alias = alias.to_string();
-    let cron_jobs_result = match tokio::task::spawn_blocking(move || {
-        crate::cron::list_jobs_by_agent(&cron_config, &cron_alias)
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            warnings.push(format!("cron list task failed: {error}"));
-            Ok(Vec::new())
-        }
-    };
-    let cron_jobs = cron_jobs_result.unwrap_or_else(|error| {
-        warnings.push(format!("cron list: {error}"));
-        Vec::new()
-    });
-    if let Ok(bytes) = serde_json::to_vec_pretty(&cron_jobs) {
-        write_json(&cascade_dir.join("cron.json"), bytes).await;
-    }
-    let cron_config = config.clone();
-    let cron_alias = alias.to_string();
-    let cron_removed = match tokio::task::spawn_blocking(move || {
-        crate::cron::remove_jobs_by_agent(&cron_config, &cron_alias)
-    })
-    .await
-    {
-        Ok(Ok(count)) => count,
-        Ok(Err(error)) => {
-            warnings.push(format!("cron remove: {error}"));
-            0
-        }
-        Err(error) => {
-            warnings.push(format!("cron remove task failed: {error}"));
-            0
-        }
-    };
-
-    let acp_data_dir = config.data_dir.clone();
-    let acp_alias = alias.to_string();
-    let acp_export = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let store = AcpSessionStore::new(&acp_data_dir)?;
-        let sessions = store.list_sessions_by_agent(&acp_alias).unwrap_or_default();
-        let json = sessions
-            .iter()
-            .map(|session| {
-                serde_json::json!({
-                    "session_uuid": session.session_uuid,
-                    "agent_alias": session.agent_alias,
-                    "workspace_dir": session.workspace_dir,
-                    "token_count": session.token_count,
-                    "message_count": session.message_count,
-                    "created_at": session.created_at.to_rfc3339(),
-                    "last_activity": session.last_activity.to_rfc3339(),
-                })
-            })
-            .collect::<Vec<_>>();
-        Ok(json)
-    })
-    .await;
-    match acp_export {
-        Ok(Ok(json)) => {
-            if let Ok(bytes) = serde_json::to_vec_pretty(&json) {
-                write_json(&cascade_dir.join("acp.json"), bytes).await;
-            }
-        }
-        Ok(Err(error)) => {
-            warnings.push(format!("acp export: {error}"));
-        }
-        Err(error) => {
-            warnings.push(format!("acp export task failed: {error}"));
-        }
-    }
-    let acp_data_dir = config.data_dir.clone();
-    let acp_alias = alias.to_string();
-    let acp_removed = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        AcpSessionStore::new(&acp_data_dir)?.delete_sessions_by_agent(&acp_alias)
-    })
-    .await
-    {
-        Ok(Ok(count)) => count,
-        Ok(Err(error)) => {
-            warnings.push(format!("acp delete: {error}"));
-            0
-        }
-        Err(error) => {
-            warnings.push(format!("acp delete task failed: {error}"));
-            0
-        }
-    };
-
-    let sessions_cleared = match session_backend {
-        Some(backend) => {
-            let backend = Arc::clone(backend);
-            let alias = alias.to_string();
-            match tokio::task::spawn_blocking(move || backend.clear_agent_attribution(&alias)).await
-            {
-                Ok(Ok(count)) => count,
-                Ok(Err(error)) => {
-                    warnings.push(format!("session attribution clear: {error}"));
-                    0
-                }
-                Err(error) => {
-                    warnings.push(format!("session attribution task failed: {error}"));
-                    0
-                }
-            }
-        }
-        None => 0,
-    };
-
-    let control_plane_tasks_removed = if config.data_dir.join("control_plane.db").exists() {
-        let data_dir = config.data_dir.clone();
-        let alias = alias.to_string();
-        match tokio::task::spawn_blocking(move || {
-            crate::control_plane::SqliteTaskStore::new(&data_dir)?
-                .delete_by_agent(&alias)
-                .map(|count| count as usize)
-        })
-        .await
-        {
-            Ok(Ok(count)) => count,
-            Ok(Err(error)) => {
-                warnings.push(format!("control-plane task delete: {error}"));
-                0
-            }
-            Err(error) => {
-                warnings.push(format!("control-plane task delete task failed: {error}"));
-                0
-            }
-        }
-    } else {
-        0
-    };
-
-    if !warnings.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"agent": alias, "warnings": warnings})),
-            "owned-state cascade completed with warnings (some state may not have been removed)"
-        );
-    }
-
-    let report = OwnedStateReport {
-        memory_purged,
-        cron_removed,
-        acp_removed,
-        sessions_cleared,
-        control_plane_tasks_removed,
-        archived_to: Some(archive_dir.display().to_string()),
-        warnings,
-    };
-    let manifest = serde_json::json!({
-        "alias": alias,
-        "memory_rows": report.memory_purged,
-        "cron_jobs": report.cron_removed,
-        "acp_sessions": report.acp_removed,
-        "sessions_cleared": report.sessions_cleared,
-        "control_plane_tasks": report.control_plane_tasks_removed,
-        "warnings": report.warnings,
-    });
-    if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
-        write_json(&archive_dir.join("manifest.json"), bytes).await;
-    }
-    report
-}
-
-#[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct RenameStateReport {
-    pub memory_rows: usize,
-    pub cron_jobs: usize,
-    pub acp_sessions: usize,
-    pub sessions_repointed: usize,
-    pub warnings: Vec<String>,
-}
-
-pub async fn cascade_rename_agent(
-    config: &Config,
-    mem: Option<&Arc<dyn Memory>>,
-    session_backend: Option<&Arc<dyn SessionBackend>>,
-    from: &str,
-    to: &str,
-) -> RenameStateReport {
-    let mut warnings = Vec::new();
-    let memory_rows = match mem {
-        Some(mem) => mem.rename_agent(from, to).await.unwrap_or_else(|error| {
-            warnings.push(format!("memory rename: {error}"));
-            0
-        }),
-        None => 0,
-    };
-    let blocking_config = config.clone();
-    let blocking_backend = session_backend.cloned();
-    let blocking_from = from.to_string();
-    let blocking_to = to.to_string();
-    let blocking = tokio::task::spawn_blocking(move || {
-        let mut warnings = Vec::new();
-        let cron_jobs =
-            crate::cron::rename_jobs_by_agent(&blocking_config, &blocking_from, &blocking_to)
-                .unwrap_or_else(|error| {
-                    warnings.push(format!("cron rename: {error}"));
-                    0
-                });
-        let acp_sessions = match AcpSessionStore::new(&blocking_config.data_dir) {
-            Ok(store) => store
-                .rename_sessions_by_agent(&blocking_from, &blocking_to)
-                .unwrap_or_else(|error| {
-                    warnings.push(format!("acp rename: {error}"));
-                    0
-                }),
-            Err(error) => {
-                warnings.push(format!("acp store open: {error}"));
-                0
-            }
-        };
-        let sessions_repointed = match blocking_backend {
-            Some(backend) => backend
-                .rename_agent_attribution(&blocking_from, &blocking_to)
-                .unwrap_or_else(|error| {
-                    warnings.push(format!("session attribution rename: {error}"));
-                    0
-                }),
-            None => 0,
-        };
-        (cron_jobs, acp_sessions, sessions_repointed, warnings)
-    })
-    .await;
-    let (cron_jobs, acp_sessions, sessions_repointed, blocking_warnings) = match blocking {
-        Ok(result) => result,
-        Err(error) => (0, 0, 0, vec![format!("rename state task failed: {error}")]),
-    };
-    warnings.extend(blocking_warnings);
-    if !warnings.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"from": from, "to": to, "warnings": warnings})),
-            "rename owned-state cascade completed with warnings (some state may not have been re-pointed)"
-        );
-    }
-    RenameStateReport {
-        memory_rows,
-        cron_jobs,
-        acp_sessions,
-        sessions_repointed,
-        warnings,
-    }
-}
+// Cleanup is canonical in agent_owned_state. This module owns lifecycle
+// preflight only; compatibility exports do not allocate or persist state.
+pub use crate::agent_owned_state::{
+    archive_agent_workspace, cascade_owned_state, cascade_rename_agent, live_acp_session_count,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+    use zeroclaw_infra::acp_session_store::AcpSessionStore;
 
     #[test]
     fn preflight_refuses_reserved_and_missing_aliases() {
@@ -521,9 +178,9 @@ mod tests {
         let first = archive_agent_workspace(&config, "rapid", &missing).await;
         let second = archive_agent_workspace(&config, "rapid", &missing).await;
 
-        assert_ne!(first.archive_dir, second.archive_dir);
-        assert!(first.archive_dir.is_dir());
-        assert!(second.archive_dir.is_dir());
+        assert_ne!(first.path, second.path);
+        assert!(first.path.is_dir());
+        assert!(second.path.is_dir());
     }
 
     #[test]
@@ -596,7 +253,7 @@ mod tests {
         let report = archive_agent_workspace(&config, "victim", &workspace).await;
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
         assert!(!workspace.exists());
-        assert!(report.archive_dir.join("workspace/AGENTS.md").exists());
+        assert!(report.path.join("workspace/AGENTS.md").exists());
     }
 
     #[tokio::test]
@@ -606,10 +263,17 @@ mod tests {
         };
 
         let temp = tempfile::TempDir::new().unwrap();
-        let config = Config {
+        let mut config = Config {
+            config_path: temp.path().join("config.toml"),
             data_dir: temp.path().join("data"),
             ..Config::default()
         };
+        config.memory.backend = "none".into();
+        config.knowledge.db_path = temp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
         let store = SqliteTaskStore::new(&config.data_dir).unwrap();
         store
             .create(TaskRecord {
@@ -635,9 +299,32 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
         let archive_dir = temp.path().join("archive");
 
-        let report = cascade_owned_state(&config, &memory, None, "victim", &archive_dir).await;
+        assert_eq!(
+            SqliteTaskStore::count_existing_by_agent(&config.data_dir, "victim").unwrap(),
+            1
+        );
+        assert!(
+            crate::agent_owned_state::committed_delete_residue_exists(
+                &config,
+                Some(&memory),
+                None,
+                "victim"
+            )
+            .await
+        );
+        let report =
+            cascade_owned_state(&config, Some(&memory), None, "victim", &archive_dir).await;
 
         assert_eq!(report.control_plane_tasks_removed, 1);
         assert_eq!(store.count_by_agent("victim").unwrap(), 0);
+        assert!(
+            !crate::agent_owned_state::committed_delete_residue_exists(
+                &config,
+                Some(&memory),
+                None,
+                "victim"
+            )
+            .await
+        );
     }
 }

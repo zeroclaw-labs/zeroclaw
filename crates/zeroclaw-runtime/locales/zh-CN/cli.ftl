@@ -1197,6 +1197,7 @@ channel-runtime-fallback-footer =
     切换模型：/models
 channel-runtime-model-fallback-redacted = ⚡ 请求的模型不可用；此回复由备用模型生成。
 delegate-provider-fallback-warning = 警告：委派的代理已通过提供商回退机制恢复。提供商故障详细信息已记录日志，未包含在此结果中。
+delegate-knowledge-init-failed = 无法为委派目标 '{ $agent }' 初始化知识：{ $error }
 turn-tool-protocol-strict-mixed-error = 严格工具解析无法运行混合 native-tool 和 text-only 候选项的回退链。请将每个可到达的候选项配置为使用相同的工具协议，或将 strict_tool_parsing 设置为 false。
 delegate-provider-fallback-header = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }）]
 delegate-provider-fallback-header-agentic = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }，代理式）]
@@ -1220,6 +1221,8 @@ cli-alias-not-configured = {$path} 未配置
 cli-alias-delete-failed = 删除失败：{$error}
 cli-alias-delete-reserved-default = `default` agent 为保留项，无法删除
 cli-alias-create-reserved-default = `default` agent 为保留项，无法创建
+cli-alias-create-knowledge-retained = agent `{$alias}` 仍拥有知识；请先完成其退役，再重用该别名
+cli-alias-create-knowledge-uninspectable = 无法检查 agent `{$alias}` 的已退役知识：{$reason}
 cli-alias-renamed = 已重命名 {$section}.{$from} → {$section}.{$to}（重写了 {$count} 个引用路径）
 cli-alias-rename-invalid = 新别名无效：{$message}
 cli-alias-rename-reserved = 别名 `{$alias}` 为保留项，无法重命名

@@ -558,6 +558,86 @@ fn config_patch_add_materializes_new_map_alias_and_persists() {
     );
 }
 
+/// `config patch` resolves the default knowledge store under the config
+/// directory. An agent alias whose retired knowledge is still there must not
+/// be recreated by a patch until that knowledge is purged.
+#[test]
+fn config_patch_refuses_to_recreate_agent_with_retained_knowledge() {
+    use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let graph_path = config_dir.path().join("knowledge.db");
+    let graph = KnowledgeGraph::new(&graph_path, 100).expect("seed knowledge store");
+    graph
+        .add_node(
+            &KnowledgeScope::for_agent("retired", Vec::<String>::new()),
+            NodeType::Pattern,
+            "retained",
+            "retired agent knowledge",
+            &[],
+            None,
+        )
+        .expect("seed a retired agent's row");
+    drop(graph);
+    let patch = br#"[{"op":"add","path":"/agents/retired/enabled","value":true}]"#;
+    let persisted = |dir: &std::path::Path| -> bool {
+        std::fs::read_to_string(dir.join("config.toml"))
+            .ok()
+            .and_then(|saved| toml::from_str::<Config>(&saved).ok())
+            .is_some_and(|parsed| parsed.agents.contains_key("retired"))
+    };
+
+    let envelope = run_cli_patch(config_dir.path(), patch);
+    assert_eq!(envelope["code"], "validation_failed", "{envelope}");
+    assert_eq!(envelope["path"], "agents.retired.enabled");
+    assert_eq!(envelope["op_index"], 0);
+    assert!(
+        envelope["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("still owns knowledge")),
+        "{envelope}"
+    );
+    assert!(
+        !persisted(config_dir.path()),
+        "a refused patch must not persist"
+    );
+
+    let human = run_cli_patch_human(config_dir.path(), patch);
+    assert!(
+        human.contains("op[0]") && human.contains("agents.retired.enabled"),
+        "the human error must name the op and path: {human}"
+    );
+    assert!(!persisted(config_dir.path()));
+
+    let graph = KnowledgeGraph::new(&graph_path, 100).expect("reopen knowledge store");
+    let snapshot = graph.export_owner("retired").expect("export retired rows");
+    graph
+        .purge_archived_owner("retired", &snapshot)
+        .expect("converge the retirement");
+    drop(graph);
+    // A complete agent saves once the retirement has converged; the offline
+    // save validates the provider and profile references a new agent needs.
+    let recreate = br#"[
+        {"op":"add","path":"/providers/models/anthropic/default/model","value":"claude-sonnet-4-5"},
+        {"op":"add","path":"/risk_profiles/standard/workspace_only","value":true},
+        {"op":"add","path":"/runtime_profiles/standard/agentic","value":true},
+        {"op":"add","path":"/agents/retired/model_provider","value":"anthropic.default"},
+        {"op":"add","path":"/agents/retired/risk_profile","value":"standard"},
+        {"op":"add","path":"/agents/retired/runtime_profile","value":"standard"},
+        {"op":"add","path":"/agents/retired/enabled","value":true}
+    ]"#;
+    let output = run_cli_patch_output(config_dir.path(), recreate);
+    assert!(
+        output.status.success(),
+        "recreation must succeed after cleanup: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        persisted(config_dir.path()),
+        "recreation succeeds after cleanup"
+    );
+}
+
 #[test]
 fn config_patch_replace_materializes_new_map_alias_and_persists() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
