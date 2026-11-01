@@ -17,6 +17,7 @@ zeroclaw-config = { workspace = true, default-features = false }
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+jsonschema = { version = "0.48", default-features = false }
 parking_lot = "0.12"
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring"] }

@@ -2457,6 +2457,20 @@ impl ReliableModelProvider {
 
 #[async_trait]
 impl ModelProvider for ReliableModelProvider {
+    fn supports_forced_tool_choice(&self, model: &str) -> bool {
+        self.eligible_provider_count() > 0
+            && self.model_chain(model).iter().all(|model| {
+                self.model_providers
+                    .iter()
+                    .filter(|entry| Self::provider_allowed_for_turn(entry))
+                    .all(|entry| {
+                        entry
+                            .provider()
+                            .supports_forced_tool_choice(entry.served_model(model))
+                    })
+            })
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         if self.model_providers.len() != 1
             || self

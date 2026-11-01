@@ -45,6 +45,52 @@ default. A PR that makes one of those surfaces persistent must name the memory
 category, session scope, agent scope, retention behavior, and operator-visible
 control.
 
+## Consolidation extraction
+
+Memory consolidation validates a complete extraction before decoding or storing
+its fields. The canonical contract is
+`crates/zeroclaw-memory/src/consolidation.schema.json`, using JSON Schema Draft
+2020-12. It also supplies the internal extraction tool's schema.
+
+The result requires a nonblank `history_entry` and a nullable `memory_update`.
+Optional `facts`, `trend`, and `kind` keep their existing defaults. Facts contain
+at most five nonblank strings. Kind is `preference`, `fact`, `decision`,
+`entity`, or null, and must be absent or null when the update is null. Unknown
+fields, invalid types, blank required values, excess facts, and strings over
+these limits reject the complete extraction:
+
+| String field | Maximum Unicode characters |
+| --- | ---: |
+| `history_entry` | 2,000 |
+| `memory_update` | 4,000 |
+| Each `facts` item | 1,000 |
+| `trend` | 2,000 |
+| `kind` | 10 |
+
+Consolidation selects one [provider extraction mode](../providers/configuration.md#consolidation-tool-forcing)
+and makes at most two extraction invocations: the initial request and one
+repair. Existing provider transport retries and failover remain configured
+independently, so this is not a two-HTTP-request or physical-inference limit.
+Repair feedback contains at most eight schema keyword/path pairs within 256
+bytes. It includes neither candidate values nor unknown field names, and the
+failed response is not copied into the repair conversation.
+
+Native output must contain exactly one extraction call. Prompt output may
+contain one named tool envelope or one plain, fenced, or prefixed JSON object.
+Duplicate keys in raw JSON strings, multiple candidates, and partial JSON fail
+extraction. Native adapters may normalize object-valued tool arguments before
+consolidation receives them, so raw native duplicate keys cannot be detected
+here. Candidate
+JSON is capped at 256 KiB, including room for escaped Unicode at every field
+limit. The
+internal tool is never executed. Provider failure, missing output, or failed
+repair uses the existing UTF-8-safe, history-only raw-turn fallback. No partial
+memory update, fact, or trend is stored. Existing storage, policy, retention,
+deduplication, conflict resolution, and typed-memory controls still apply.
+
+There is no persisted migration. Reverting the extraction change restores the
+previous prompt-and-parse behavior without rewriting stored memories.
+
 ## Prompt context and recall
 
 At turn start, the runtime can recall relevant memories and inject a bounded

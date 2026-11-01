@@ -12,11 +12,14 @@ use crate::traits::{
 };
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_config::schema::MemoryConfig;
-use zeroclaw_providers::ProviderDispatch;
 use zeroclaw_providers::multimodal::strip_media_markers;
+
+mod extraction;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(deny_unknown_fields)]
 pub struct ConsolidationResult {
     /// Brief timestamped summary for the conversation history log.
     pub history_entry: String,
@@ -54,8 +57,6 @@ Reusable procedures, how-to workflows, and repeated operating steps belong in sk
 
 Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or null, "kind": "preference" | "fact" | "decision" | "entity" | null, "facts": ["..."], "trend": "..." or null}
 Do not include any text outside the JSON object."#;
-
-const MAX_TYPED_FACTS_PER_TURN: usize = 5;
 
 pub async fn consolidate_turn(
     model_provider: &dyn ModelProvider,
@@ -95,11 +96,15 @@ pub async fn consolidate_turn(
         CONSOLIDATION_SYSTEM_PROMPT
     };
 
-    let raw = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(Some(system_prompt), &truncated, model, temperature)
-        .await?;
-
-    let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
+    let result = extraction::extract(
+        model_provider,
+        model,
+        temperature,
+        system_prompt,
+        &truncated,
+    )
+    .await
+    .unwrap_or_else(|| consolidation_fallback(&turn_text));
 
     // Phase 1: Write history entry to Daily category. The gated arm tags the
     // write Episodic; the default arm keeps the exact legacy store call so the
@@ -281,18 +286,12 @@ async fn store_typed_facts(
         .then_some(MemoryKind::Semantic(SemanticSubtype::Fact));
     let policy = PolicyEnforcer::new(&memory_config.policy);
 
-    for fact in result
-        .facts
-        .iter()
-        .filter_map(|fact| {
-            let trimmed = fact.trim();
-            let overlaps_primary = primary_update.is_some_and(|primary| {
-                fact_overlaps_primary_update(trimmed, primary, memory_config)
-            });
-            (!trimmed.is_empty() && !overlaps_primary).then_some(trimmed)
-        })
-        .take(MAX_TYPED_FACTS_PER_TURN)
-    {
+    for fact in result.facts.iter().filter_map(|fact| {
+        let trimmed = fact.trim();
+        let overlaps_primary = primary_update
+            .is_some_and(|primary| fact_overlaps_primary_update(trimmed, primary, memory_config));
+        (!overlaps_primary).then_some(trimmed)
+    }) {
         // Same fail-closed policy write-gate as the primary core update; each
         // fact is an autonomous Core write.
         if let Err(e) =
@@ -439,43 +438,36 @@ fn fact_overlaps_primary_update(
     )
 }
 
-/// Parse the LLM's consolidation response, with fallback for malformed JSON.
-fn parse_consolidation_response(raw: &str, fallback_text: &str) -> ConsolidationResult {
-    // Try to extract JSON from the response (LLM may wrap in markdown code blocks).
-    let cleaned = raw
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-
-    serde_json::from_str(cleaned).unwrap_or_else(|_| {
-        // Fallback: use truncated turn text as history entry.
-        // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
-        let summary = if fallback_text.len() > 200 {
-            let end = fallback_text
-                .char_indices()
-                .map(|(i, _)| i)
-                .take_while(|&i| i <= 200)
-                .last()
-                .unwrap_or(0);
-            format!("{}…", &fallback_text[..end])
-        } else {
-            fallback_text.to_string()
-        };
-        ConsolidationResult {
-            history_entry: summary,
-            memory_update: None,
-            facts: Vec::new(),
-            trend: None,
-            kind: None,
-        }
-    })
+/// Safe history-only result, also used when the provider itself fails.
+fn consolidation_fallback(fallback_text: &str) -> ConsolidationResult {
+    // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
+    let summary = if fallback_text.len() > 200 {
+        let end = fallback_text
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= 200)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", &fallback_text[..end])
+    } else {
+        fallback_text.to_string()
+    };
+    ConsolidationResult {
+        history_entry: summary,
+        memory_update: None,
+        facts: Vec::new(),
+        trend: None,
+        kind: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_consolidation_response(raw: &str, fallback: &str) -> ConsolidationResult {
+        extraction::parse_prompt(raw).unwrap_or_else(|_| consolidation_fallback(fallback))
+    }
 
     #[test]
     fn parse_valid_json_response() {
@@ -710,10 +702,17 @@ mod tests {
 
         async fn chat_with_history(
             &self,
-            _messages: &[ChatMessage],
+            messages: &[ChatMessage],
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
+            self.system_prompts.lock().push(
+                messages
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .map(|message| message.content.clone())
+                    .unwrap_or_default(),
+            );
             Ok(self.response.to_string())
         }
     }
@@ -734,7 +733,7 @@ mod tests {
     /// A response that also carries the typed fields, as a compliant model
     /// would produce them under the typed prompt (and as a non-compliant model
     /// could produce them under the default prompt).
-    const TYPED_RESPONSE: &str = r#"{"history_entry": "Discussed rollout strategy.", "memory_update": "Use staged rollout for deploys.", "kind": "decision", "facts": ["Deploys use a staged rollout", "Rollbacks swap the previous binary back", "   "], "trend": null}"#;
+    const TYPED_RESPONSE: &str = r#"{"history_entry": "Discussed rollout strategy.", "memory_update": "Use staged rollout for deploys.", "kind": "decision", "facts": ["Deploys use a staged rollout", "Rollbacks swap the previous binary back"], "trend": null}"#;
 
     async fn run_consolidation(
         provider: &ScriptedProvider,
@@ -754,6 +753,455 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_invalid_candidate_never_reaches_core_storage() {
+        let provider = ScriptedProvider::new(
+            r#"{"history_entry":"Unchecked history","memory_update":"Unchecked core","kind":"unknown","facts":[],"trend":null}"#,
+        );
+        let memory = RecordingMemory::default();
+        run_consolidation(&provider, &memory, &MemoryConfig::default())
+            .await
+            .unwrap();
+
+        let writes = memory.writes.lock();
+        assert_eq!(
+            writes.len(),
+            1,
+            "invalid extraction must only write fallback history"
+        );
+        match &writes[0] {
+            RecordedWrite::Store {
+                content, category, ..
+            } => {
+                assert_eq!(*category, MemoryCategory::Daily);
+                assert_eq!(
+                    content,
+                    "User: How do we deploy?\nAssistant: We use a staged rollout."
+                );
+            }
+            other => panic!("expected fallback history, got {other:?}"),
+        }
+        assert_eq!(provider.system_prompts.lock().len(), 2);
+    }
+
+    mod extraction_scenarios {
+        use super::*;
+        use std::collections::VecDeque;
+        use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, ToolCall, ToolRoundPolicy};
+        use zeroclaw_api::tool::ToolSpec;
+
+        struct Request {
+            messages: Vec<ChatMessage>,
+            tools: Option<Vec<ToolSpec>>,
+            forcing: Option<String>,
+            policy: ToolRoundPolicy,
+        }
+
+        struct SequenceProvider {
+            replies: Mutex<VecDeque<Result<ChatResponse, ()>>>,
+            requests: Mutex<Vec<Request>>,
+            forced: bool,
+        }
+
+        impl SequenceProvider {
+            fn new(replies: Vec<Result<ChatResponse, ()>>, forced: bool) -> Self {
+                Self {
+                    replies: Mutex::new(replies.into()),
+                    requests: Mutex::new(Vec::new()),
+                    forced,
+                }
+            }
+        }
+
+        impl zeroclaw_api::attribution::Attributable for SequenceProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "extraction-fixture"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for SequenceProvider {
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+            fn supports_forced_tool_choice(&self, _model: &str) -> bool {
+                self.forced
+            }
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("fixture requires structured dispatch")
+            }
+            async fn chat_with_tool_round_policy(
+                &self,
+                request: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+                policy: ToolRoundPolicy,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests.lock().push(Request {
+                    messages: request.messages.to_vec(),
+                    tools: request.tools.map(<[_]>::to_vec),
+                    forcing: zeroclaw_api::TOOL_CHOICE_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                    policy,
+                });
+                self.replies
+                    .lock()
+                    .pop_front()
+                    .expect("unexpected extraction call")
+                    .map_err(|_| anyhow::Error::msg("private-provider-error-sentinel"))
+            }
+        }
+
+        fn text(raw: Option<&str>) -> Result<ChatResponse, ()> {
+            Ok(ChatResponse {
+                text: raw.map(String::from),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+        fn call(raw: &str) -> ToolCall {
+            ToolCall {
+                id: "extraction-1".into(),
+                name: "extract_consolidation".into(),
+                arguments: raw.into(),
+                extra_content: None,
+            }
+        }
+        fn native(calls: Vec<ToolCall>) -> Result<ChatResponse, ()> {
+            Ok(ChatResponse {
+                text: Some("Extraction result".into()),
+                tool_calls: calls,
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+        async fn run(provider: &dyn ModelProvider) -> RecordingMemory {
+            let memory = RecordingMemory::default();
+            let config = MemoryConfig {
+                types: MemoryTypesConfig { enabled: true },
+                consolidation_extract_facts: true,
+                ..MemoryConfig::default()
+            };
+            consolidate_turn(
+                provider,
+                "test-model",
+                None,
+                &memory,
+                &config,
+                "Discuss deployment.",
+                "Use staged deployment.",
+            )
+            .await
+            .unwrap();
+            memory
+        }
+        fn assert_fallback(memory: &RecordingMemory) {
+            let writes = memory.writes.lock();
+            assert_eq!(
+                writes.len(),
+                1,
+                "invalid output reached durable semantic storage"
+            );
+            match &writes[0] {
+                RecordedWrite::StoreWithOptions {
+                    content, category, ..
+                } => {
+                    assert_eq!(*category, MemoryCategory::Daily);
+                    assert_eq!(
+                        content,
+                        "User: Discuss deployment.\nAssistant: Use staged deployment."
+                    );
+                }
+                other => panic!("expected typed Daily fallback, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn unsupported_forcing_uses_prompt_mode_and_one_value_free_repair() {
+            let invalid = r#"{"history_entry":"private-value-sentinel","memory_update":"private-value-sentinel","private-key-sentinel":true}"#;
+            let provider =
+                SequenceProvider::new(vec![text(Some(invalid)), text(Some(TYPED_RESPONSE))], false);
+            let memory = run(&provider).await;
+            let requests = provider.requests.lock();
+            assert_eq!(requests.len(), 2);
+            for request in requests.iter() {
+                assert!(request.tools.is_none());
+                assert!(request.forcing.is_none());
+                assert_eq!(request.policy, ToolRoundPolicy::Batch);
+                assert!(
+                    !request
+                        .messages
+                        .iter()
+                        .any(|message| message.content.contains("sentinel"))
+                );
+            }
+            let repair = &requests[1].messages.last().unwrap().content;
+            assert!(repair.contains("additionalProperties /"));
+            assert!(repair.len() < 512);
+            assert!(memory.writes.lock().iter().all(|write| match write {
+                RecordedWrite::Store { content, .. }
+                | RecordedWrite::StoreWithOptions { content, .. } => !content.contains("sentinel"),
+            }));
+            assert!(
+                memory.writes.lock().len() > 1,
+                "repair should reach semantic storage"
+            );
+        }
+
+        #[tokio::test]
+        async fn malformed_or_partial_prompt_candidates_exhaust_at_two_calls() {
+            for invalid in [
+                r#"{"history_entry":" ","memory_update":"invalid core"}"#,
+                r#"{"history_entry":"h","memory_update":"invalid core","facts":[" "]}"#,
+                r#"{"history_entry":"h","memory_update":"invalid core","facts":["1","2","3","4","5","6"]}"#,
+                r#"{"history_entry":"h","memory_update":"invalid core","kind":"unknown"}"#,
+                r#"{"history_entry":"h","memory_update":null,"kind":"fact"}"#,
+                r#"{"history_entry":"h","memory_update":null} {"history_entry":"second","memory_update":"invalid core"}"#,
+                r#"{"history_entry":"h","memory_update":"invalid core","trend":false}"#,
+                "no JSON",
+                "{broken}",
+            ] {
+                let provider =
+                    SequenceProvider::new(vec![text(Some(invalid)), text(Some(invalid))], false);
+                assert_fallback(&run(&provider).await);
+                assert_eq!(provider.requests.lock().len(), 2);
+            }
+        }
+
+        #[tokio::test]
+        async fn provider_failure_or_missing_output_uses_fallback_without_repair() {
+            for reply in [Err(()), text(None), text(Some("  "))] {
+                let provider = SequenceProvider::new(vec![reply], false);
+                assert_fallback(&run(&provider).await);
+                assert_eq!(provider.requests.lock().len(), 1);
+            }
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn terminal_extraction_failures_log_bounded_reasons_without_payloads() {
+            let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+            let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+            zeroclaw_log::try_install_capture_subscriber();
+            let mut events = zeroclaw_log::subscribe_or_install();
+            let invalid = r#"{"history_entry":"private-candidate-sentinel","memory_update":"private-candidate-sentinel","private-key-sentinel":true}"#;
+            for (replies, forced, reason, attempt) in [
+                (vec![Err(())], false, "provider_error", 1),
+                (vec![text(None)], false, "missing_output", 1),
+                (vec![text(Some("  "))], false, "missing_output", 1),
+                (
+                    vec![native(vec![call(invalid)])],
+                    false,
+                    "unexpected_tool_calls",
+                    1,
+                ),
+                (
+                    vec![text(Some(invalid)), Err(())],
+                    false,
+                    "provider_error",
+                    2,
+                ),
+                (
+                    vec![text(Some(invalid)), text(Some(invalid))],
+                    false,
+                    "repair_exhausted",
+                    2,
+                ),
+                (
+                    vec![native(vec![call(invalid)]), native(vec![call(invalid)])],
+                    true,
+                    "repair_exhausted",
+                    2,
+                ),
+            ] {
+                let provider = SequenceProvider::new(replies, forced);
+                let memory = zeroclaw_log::scope!(
+                    trace_id: "extraction-failure-regression",
+                    => run(&provider)
+                )
+                .await;
+                assert_fallback(&memory);
+                assert_eq!(provider.requests.lock().len(), attempt);
+                let captured: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                    .filter(|event| {
+                        event["trace_id"] == "extraction-failure-regression"
+                            && event["attributes"]["error_key"]
+                                == "memory.consolidation_extraction_failed"
+                    })
+                    .collect();
+                assert_eq!(captured.len(), 1, "missing or duplicate failure event");
+                let event = &captured[0];
+                assert_eq!(event["severity_text"], "WARN");
+                assert_eq!(event["event"]["action"], "fail");
+                assert_eq!(event["event"]["outcome"], "failure");
+                assert_eq!(event["attributes"]["reason"], reason);
+                assert_eq!(event["attributes"]["attempt"], attempt);
+                let logged = event.to_string();
+                assert!(!logged.contains("sentinel"));
+                assert!(!logged.contains("Discuss deployment"));
+                assert!(!logged.contains("Use staged deployment"));
+            }
+
+            for replies in [
+                vec![text(Some(TYPED_RESPONSE))],
+                vec![text(Some(invalid)), text(Some(TYPED_RESPONSE))],
+            ] {
+                let provider = SequenceProvider::new(replies, false);
+                let memory = zeroclaw_log::scope!(
+                    trace_id: "extraction-success-regression",
+                    => run(&provider)
+                )
+                .await;
+                assert!(memory.writes.lock().len() > 1);
+                assert!(std::iter::from_fn(|| events.try_recv().ok()).all(|event| {
+                    event["trace_id"] != "extraction-success-regression"
+                        || event["attributes"]["error_key"]
+                            != "memory.consolidation_extraction_failed"
+                }));
+            }
+        }
+
+        #[tokio::test]
+        async fn native_success_forces_one_nonexecuted_projected_tool() {
+            let provider = SequenceProvider::new(vec![native(vec![call(TYPED_RESPONSE)])], true);
+            let memory = run(&provider).await;
+            assert_eq!(memory.writes.lock().len(), 4);
+            let requests = provider.requests.lock();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.forcing.as_deref(), Some("any"));
+            assert_eq!(request.policy, ToolRoundPolicy::Single);
+            let tools = request.tools.as_ref().unwrap();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].name, "extract_consolidation");
+            assert!(tools[0].parameters.get("$schema").is_none());
+            assert!(
+                tools[0].parameters["properties"]["memory_update"]
+                    .get("type")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn native_zero_duplicate_wrong_or_invalid_calls_never_reach_core() {
+            let mut wrong = call(TYPED_RESPONSE);
+            wrong.name = "unregistered-tool".into();
+            for calls in [
+                vec![],
+                vec![call(TYPED_RESPONSE), call(TYPED_RESPONSE)],
+                vec![wrong],
+                vec![call("{broken}")],
+                vec![call(
+                    r#"{"history_entry":"h","memory_update":null,"kind":"decision"}"#,
+                )],
+            ] {
+                let provider =
+                    SequenceProvider::new(vec![native(calls.clone()), native(calls)], true);
+                assert_fallback(&run(&provider).await);
+                assert_eq!(provider.requests.lock().len(), 2);
+            }
+        }
+
+        #[tokio::test]
+        async fn native_repair_keeps_mode_and_validates_complete_canonical_schema() {
+            let bad = r#"{"history_entry":"h","memory_update":null,"kind":"decision"}"#;
+            let good = r#"{"history_entry":"Repaired history","memory_update":null,"kind":null}"#;
+            let provider = SequenceProvider::new(
+                vec![native(vec![call(bad)]), native(vec![call(good)])],
+                true,
+            );
+            let memory = run(&provider).await;
+            assert_eq!(memory.writes.lock().len(), 1);
+            let requests = provider.requests.lock();
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(
+                |request| request.forcing.as_deref() == Some("any") && request.tools.is_some()
+            ));
+            assert!(
+                requests[1]
+                    .messages
+                    .last()
+                    .unwrap()
+                    .content
+                    .contains("/kind")
+            );
+        }
+
+        #[tokio::test]
+        async fn configured_transport_retry_does_not_add_an_extraction_repair_budget() {
+            let invalid =
+                r#"{"history_entry":"h","memory_update":"invalid core","kind":"unknown"}"#;
+            let leaf = Arc::new(SequenceProvider::new(
+                vec![Err(()), text(Some(invalid)), text(Some(invalid))],
+                false,
+            ));
+            let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+                "reliable-fixture",
+                vec![("scripted".into(), Box::new(Arc::clone(&leaf)))],
+                1,
+                50,
+            );
+            assert_fallback(&run(&reliable).await);
+            let requests = leaf.requests.lock();
+            assert_eq!(
+                requests.len(),
+                3,
+                "one transport retry plus two extraction invocations"
+            );
+            assert_eq!(requests[0].messages.len(), 2);
+            assert_eq!(requests[1].messages.len(), 2);
+            assert_eq!(requests[2].messages.len(), 2);
+            assert!(
+                requests[2].messages[1]
+                    .content
+                    .contains("Repair the extraction")
+            );
+            assert!(
+                requests[2].messages[1]
+                    .content
+                    .starts_with(&requests[0].messages[1].content)
+            );
+        }
+
+        #[test]
+        fn reliable_requires_forcing_on_every_reachable_route_and_arc_forwards() {
+            for support in [vec![], vec![true], vec![true, true], vec![true, false]] {
+                let expected = !support.is_empty() && support.iter().all(|supported| *supported);
+                let providers = support
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, forced)| {
+                        (
+                            format!("candidate-{index}"),
+                            Box::new(SequenceProvider::new(vec![], forced))
+                                as Box<dyn ModelProvider>,
+                        )
+                    })
+                    .collect();
+                let reliable = Arc::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                    "fixture", providers, 1, 50,
+                ));
+                assert_eq!(reliable.supports_forced_tool_choice("test-model"), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn flags_off_consolidation_keeps_master_write_shape() {
         let provider = ScriptedProvider::new(TYPED_RESPONSE);
         let memory = RecordingMemory::default();
@@ -763,10 +1211,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Exactly one provider call, with the unchanged default prompt.
+        // Exactly one extraction call, with default semantics and the tool schema.
         let prompts = provider.system_prompts.lock();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0], CONSOLIDATION_SYSTEM_PROMPT);
+        assert!(prompts[0].starts_with(CONSOLIDATION_SYSTEM_PROMPT));
+        assert!(prompts[0].contains("extract_consolidation"));
 
         // Exactly two writes: the Daily history entry through the plain
         // legacy store call, and the Core update with kind unset -- even
@@ -821,7 +1270,8 @@ mod tests {
             .unwrap();
 
         let prompts = provider.system_prompts.lock();
-        assert_eq!(prompts.as_slice(), [CONSOLIDATION_TYPED_SYSTEM_PROMPT]);
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].starts_with(CONSOLIDATION_TYPED_SYSTEM_PROMPT));
 
         let writes = memory.writes.lock();
         assert_eq!(writes.len(), 2);
@@ -1085,10 +1535,9 @@ mod tests {
         // The typed prompt replaces the default one.
         let prompts = provider.system_prompts.lock();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0], CONSOLIDATION_TYPED_SYSTEM_PROMPT);
+        assert!(prompts[0].starts_with(CONSOLIDATION_TYPED_SYSTEM_PROMPT));
 
-        // Daily + Core + the two non-blank facts (the whitespace-only third
-        // fact is filtered out).
+        // Daily + Core + the two validated facts.
         let writes = memory.writes.lock();
         let fact_writes: Vec<_> = writes
             .iter()
@@ -1117,8 +1566,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extract_facts_caps_per_turn_and_respects_types_gate() {
-        const MANY_FACTS: &str = r#"{"history_entry": "h", "memory_update": null, "facts": ["f1", "f2", "f3", "f4", "f5", "f6", "f7"]}"#;
+    async fn extract_facts_accepts_schema_limit_and_respects_types_gate() {
+        const MANY_FACTS: &str = r#"{"history_entry": "h", "memory_update": null, "facts": ["f1", "f2", "f3", "f4", "f5"]}"#;
         let provider = ScriptedProvider::new(MANY_FACTS);
         let memory = RecordingMemory::default();
         // extract_facts on, types off: fact writes land but stay untyped.
@@ -1143,7 +1592,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(fact_writes.len(), MAX_TYPED_FACTS_PER_TURN);
+        assert_eq!(fact_writes.len(), 5);
         for options in fact_writes {
             assert_eq!(options.kind, None);
         }
@@ -1641,15 +2090,15 @@ mod consolidate_turn_tests {
     }
 
     #[tokio::test]
-    async fn provider_failure_aborts_before_any_write() {
+    async fn provider_failure_writes_only_safe_history() {
         let tmp = TempDir::new().unwrap();
         let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
         let provider = ScriptedProvider::failing();
 
         let result = run(&provider, &memory, &MemoryConfig::default()).await;
 
-        assert!(result.is_err());
-        assert_eq!(count(&memory, MemoryCategory::Daily).await, 0);
+        assert!(result.is_ok());
+        assert_eq!(count(&memory, MemoryCategory::Daily).await, 1);
         assert_eq!(count(&memory, MemoryCategory::Core).await, 0);
     }
 }
