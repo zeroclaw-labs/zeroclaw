@@ -225,7 +225,7 @@ impl NativeSessionHub {
         ))
     }
     pub fn session_id(session_id: &str) -> Result<SessionId, ContractError> {
-        SessionId::parse(session_id.to_owned())
+        zeroclaw_infra::session_events::upgrade::session_id(session_id)
     }
 
     async fn read_owner(

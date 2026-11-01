@@ -44,7 +44,7 @@ impl EventStorePool {
         // A session key has one deterministic storage stream. The source
         // marker is metadata on the root event; it is never consulted for
         // routing or enumeration.
-        let root_stream = SessionId::parse(family.to_owned())
+        let root_stream = super::upgrade::session_id(family)
             .map_err(|error| AppendError::InvalidReference(error.to_string()))?;
         let head = store.head(&root_stream).map_err(super::upgrade::storage)?;
         if head.sequence == 0 {
