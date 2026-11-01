@@ -2117,6 +2117,7 @@ async fn prepare_messages_inner(
 
     // Undo the newest-first traversal: callers require original order.
     normalized_messages.reverse();
+    note_text_only_followups(messages, &mut normalized_messages);
 
     // No post-normalization trim: both the age trim and the per-request cap
     // already ran above, before any decode. Normalization emits at most one
@@ -2179,8 +2180,15 @@ fn omit_provider_image_ids_from_content(content: &str, omitted: &[ProviderImageI
     if retained.len() == references.len() {
         return content.to_string();
     }
-    if retained.is_empty() && text.trim().is_empty() {
-        text = "[image removed from history]".to_string();
+    if retained.is_empty() {
+        // Leave a fixed trace of the removed images, so a captioned message
+        // still reads as an image message rather than a text-only follow-up.
+        let caption = text.trim();
+        text = if caption.is_empty() {
+            IMAGE_REMOVED_PLACEHOLDER.to_string()
+        } else {
+            format!("{caption}\n\n{IMAGE_REMOVED_PLACEHOLDER}")
+        };
     }
     compose_multimodal_message(&text, &retained)
 }
@@ -2266,7 +2274,7 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
                     return m.clone();
                 }
                 let text = if parsed.cleaned.trim().is_empty() {
-                    "[image removed from history]".to_string()
+                    IMAGE_REMOVED_PLACEHOLDER.to_string()
                 } else {
                     parsed.cleaned
                 };
@@ -2394,7 +2402,7 @@ fn trim_image_markers(text: &str, drop_here: usize) -> String {
     let retained_spans = parsed.loadable_spans.get(drop_here..).unwrap_or(&[]);
     if retained_spans.is_empty() {
         if parsed.cleaned.trim().is_empty() {
-            "[image removed from history]".to_string()
+            IMAGE_REMOVED_PLACEHOLDER.to_string()
         } else {
             parsed.cleaned
         }
@@ -2603,6 +2611,62 @@ async fn normalize_image_references(
     }
 }
 
+/// Model-facing note appended to a text-only user message that follows an
+/// earlier user image (see `note_text_only_followups`). Provider context, not
+/// localized UI text.
+const EARLIER_IMAGES_NOTE: &str =
+    "Note: no new image is attached to this message; any images above were sent earlier.";
+
+/// Text left in place of a message's images once all of them are removed:
+/// the whole content of an image-only message, or the end of a captioned one.
+const IMAGE_REMOVED_PLACEHOLDER: &str = "[image removed from history]";
+
+/// Shared wording of the note for images that could not be loaded.
+const SKIPPED_IMAGE_NOTE_TAIL: &str = "attached image(s) could not be loaded";
+
+/// Whether `content` is what an earlier pass left of an image message: the
+/// removed-image placeholder, the rejected-marker note, or the could-not-load
+/// note, each in the form those passes write it. Such a message is not a
+/// text-only follow-up.
+fn shows_image_outcome(content: &str) -> bool {
+    let content = content.trim_end();
+    content.ends_with(IMAGE_REMOVED_PLACEHOLDER)
+        || content.contains(REJECTED_IMAGE_MARKER_NOTE)
+        || content
+            .strip_suffix('.')
+            .is_some_and(|rest| rest.ends_with(SKIPPED_IMAGE_NOTE_TAIL))
+}
+
+/// Earlier user images are re-sent on every turn (their path markers stay in
+/// history so a deferred image remains available), and nothing marks them as
+/// old, so a text-only user message after one gets a note saying no new image
+/// is attached. The decision reads only this request's input for that message
+/// and the ones before it, so the note never changes once written and the
+/// provider prompt-cache prefix stays stable. Providers prepare messages the
+/// runtime already prepared, so a message that already holds the note, or that
+/// an earlier pass reduced to an image outcome, is left unchanged.
+///
+/// A text-only user message is prepared verbatim, so `prepared[i]` still
+/// equals `input[i]` wherever the note is added.
+fn note_text_only_followups(input: &[ChatMessage], prepared: &mut [ChatMessage]) {
+    debug_assert_eq!(input.len(), prepared.len());
+    let mut earlier_image = false;
+    for (message, prepared) in input.iter().zip(prepared.iter_mut()) {
+        if message.role != "user" || is_tool_result_carrier(&message.role, &message.content) {
+            continue;
+        }
+        if message_image_marker_counts(message) != (0, 0) {
+            earlier_image = true;
+        } else if earlier_image
+            && !message.content.contains(EARLIER_IMAGES_NOTE)
+            && !shows_image_outcome(&message.content)
+        {
+            prepared.content.push_str("\n\n");
+            prepared.content.push_str(EARLIER_IMAGES_NOTE);
+        }
+    }
+}
+
 fn compose_multimodal_content(
     text: &str,
     data_uris: &[String],
@@ -2628,9 +2692,9 @@ fn append_skipped_image_note(text: &str, skipped_count: usize, total_refs: usize
 
     // This note is model-facing provider context, not direct localized UI text.
     let note = if skipped_count == total_refs {
-        format!("{skipped_count} attached image(s) could not be loaded")
+        format!("{skipped_count} {SKIPPED_IMAGE_NOTE_TAIL}")
     } else {
-        format!("{skipped_count} of {total_refs} attached image(s) could not be loaded")
+        format!("{skipped_count} of {total_refs} {SKIPPED_IMAGE_NOTE_TAIL}")
     };
 
     let trimmed = text.trim();
@@ -12348,5 +12412,385 @@ mod tests {
             zeroclaw_api::media::MarkerKind::Image
         );
         assert!(parsed.attachments[0].target.starts_with("data:image/"));
+    }
+
+    fn write_png(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, valid_png()).unwrap();
+        path
+    }
+
+    fn contents(prepared: &PreparedMessages) -> Vec<&str> {
+        prepared
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect()
+    }
+
+    fn image_turn_history(dir: &std::path::Path) -> Vec<ChatMessage> {
+        let path = write_png(dir, "photo.png");
+        vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(format!("[IMAGE:{}]\nwhat is this?", path.display())),
+            ChatMessage::assistant("a cat"),
+        ]
+    }
+
+    /// The follow-up keeps its text byte-for-byte, leading indentation
+    /// included, with the note appended after it.
+    #[tokio::test]
+    async fn text_only_followup_after_an_image_is_told_no_new_image_is_attached() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut history = image_turn_history(temp.path());
+        history.push(ChatMessage::user("    and this one?"));
+
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prepared.messages[3].content,
+            format!("    and this one?\n\n{EARLIER_IMAGES_NOTE}")
+        );
+        // The earlier image is still sent, for deferred access, and carries no note.
+        assert!(prepared.messages[1].content.contains("data:image"));
+        assert!(!prepared.messages[1].content.contains(EARLIER_IMAGES_NOTE));
+        assert_eq!(prepared.messages[0].content, "sys");
+        assert_eq!(prepared.messages[2].content, "a cat");
+        assert!(prepared.contains_images);
+        assert!(prepared.newest_user_image_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn text_before_the_first_image_gets_no_note() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_png(temp.path(), "photo.png");
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user(format!("[IMAGE:{}] look", path.display())),
+        ];
+
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.messages[0].content, "hello");
+        assert!(!prepared.messages[2].content.contains(EARLIER_IMAGES_NOTE));
+    }
+
+    /// The note depends only on a message and the ones before it, so a later
+    /// request leaves every earlier message byte-identical: the prompt-cache
+    /// contract the image-cap eviction test above pins as well.
+    #[tokio::test]
+    async fn earlier_images_note_is_stable_across_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = MultimodalConfig::default();
+        let mut history = image_turn_history(temp.path());
+        history.push(ChatMessage::user("and this one?"));
+        let first = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        history.push(ChatMessage::assistant("there is no new image"));
+        history.push(ChatMessage::user("how many photos did I send?"));
+        let second = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            contents(&first)[..],
+            contents(&second)[..first.messages.len()],
+            "earlier messages must stay byte-identical"
+        );
+        assert_eq!(
+            second.messages[5].content,
+            format!("how many photos did I send?\n\n{EARLIER_IMAGES_NOTE}")
+        );
+    }
+
+    /// The note is decided from the input, not from what the cap leaves: a
+    /// follow-up keeps its note after the image it followed is evicted.
+    #[tokio::test]
+    async fn earlier_images_note_survives_eviction_of_the_earlier_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let [a, b] = ["a.png", "b.png"].map(|name| write_png(temp.path(), name));
+        let config = MultimodalConfig {
+            max_images: 1,
+            ..Default::default()
+        };
+        let mut history = vec![
+            ChatMessage::user(format!("[IMAGE:{}]", a.display())),
+            ChatMessage::assistant("one"),
+            ChatMessage::user("follow-up"),
+        ];
+        let first = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        history.push(ChatMessage::assistant("two"));
+        history.push(ChatMessage::user(format!("[IMAGE:{}]", b.display())));
+        let second = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(second.messages[0].content, IMAGE_REMOVED_PLACEHOLDER);
+        assert_eq!(
+            first.messages[2].content,
+            format!("follow-up\n\n{EARLIER_IMAGES_NOTE}")
+        );
+        assert_eq!(first.messages[2].content, second.messages[2].content);
+    }
+
+    /// The same holds when the age limit strips the earlier image.
+    #[tokio::test]
+    async fn earlier_images_note_survives_the_age_trim_of_the_earlier_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = MultimodalConfig {
+            max_image_turns: 2,
+            ..Default::default()
+        };
+        let mut history = image_turn_history(temp.path());
+        history.push(ChatMessage::user("follow-up"));
+        let first = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        history.push(ChatMessage::assistant("two"));
+        history.push(ChatMessage::user("one more"));
+        let second = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        assert!(first.messages[1].content.contains("data:image"));
+        assert!(!second.messages[1].content.contains("data:image"));
+        assert_eq!(
+            first.messages[3].content,
+            format!("follow-up\n\n{EARLIER_IMAGES_NOTE}")
+        );
+        assert_eq!(first.messages[3].content, second.messages[3].content);
+    }
+
+    /// Quarantine and recovery drop images from prepared messages, which a
+    /// provider then prepares again; a message that lost its images there is
+    /// an image message, not a text-only follow-up.
+    #[tokio::test]
+    async fn a_message_whose_images_were_omitted_is_not_noted_on_a_second_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        // Image identity is the encoded payload, so each image needs its own
+        // bytes for the omission below to pick out only the later two.
+        let [a, b, c] = [1, 2, 3].map(|size| {
+            let path = temp.path().join(format!("{size}.png"));
+            std::fs::write(&path, real_png(size, size)).unwrap();
+            path
+        });
+        let history = vec![
+            ChatMessage::user(format!("[IMAGE:{}] first", a.display())),
+            ChatMessage::assistant("one"),
+            ChatMessage::user(format!("[IMAGE:{}] what about this?", b.display())),
+            ChatMessage::assistant("two"),
+            ChatMessage::user(format!("[IMAGE:{}]", c.display())),
+            ChatMessage::assistant("three"),
+            ChatMessage::user("next"),
+        ];
+        let config = MultimodalConfig::default();
+
+        let prepared = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        let omitted =
+            omit_provider_image_ids(&prepared.messages, &prepared.submitted_image_ids[1..]);
+        let again = prepare_messages_for_provider(&omitted, &config)
+            .await
+            .unwrap();
+
+        assert!(again.messages[0].content.contains("data:image"));
+        assert_eq!(
+            again.messages[2].content.trim_end(),
+            format!("what about this?\n\n{IMAGE_REMOVED_PLACEHOLDER}")
+        );
+        assert_eq!(
+            again.messages[4].content.trim_end(),
+            IMAGE_REMOVED_PLACEHOLDER
+        );
+        assert_eq!(
+            again.messages[6]
+                .content
+                .matches(EARLIER_IMAGES_NOTE)
+                .count(),
+            1
+        );
+    }
+
+    /// A message whose marker was refused keeps the fixed refusal note; a
+    /// second pass must not mistake it for a text-only follow-up.
+    #[tokio::test]
+    async fn a_refused_marker_after_an_earlier_image_is_not_noted_on_a_second_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_png(temp.path(), "photo.png");
+        let oversized = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+        let history = vec![
+            ChatMessage::user(format!("[IMAGE:{}]", path.display())),
+            ChatMessage::assistant("one"),
+            ChatMessage::user(format!("caption [IMAGE:data:image/png;base64,{oversized}]")),
+            ChatMessage::assistant("two"),
+            ChatMessage::user("and this one?"),
+        ];
+        let config = MultimodalConfig::default();
+
+        let once = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        let twice = prepare_messages_for_provider(&once.messages, &config)
+            .await
+            .unwrap();
+
+        assert!(
+            once.messages[2]
+                .content
+                .contains(REJECTED_IMAGE_MARKER_NOTE)
+        );
+        assert!(!twice.messages[2].content.contains(EARLIER_IMAGES_NOTE));
+        assert_eq!(contents(&once), contents(&twice));
+    }
+
+    /// Tool-result carriers are neither noted nor counted as earlier user
+    /// images: only an image the user sent makes a later message a follow-up.
+    #[tokio::test]
+    async fn tool_result_carriers_neither_get_nor_trigger_the_note() {
+        let temp = tempfile::tempdir().unwrap();
+        let [tool_image, user_image] =
+            ["tool.png", "user.png"].map(|name| write_png(temp.path(), name));
+        let history = vec![
+            ChatMessage::user("look this up"),
+            ChatMessage::assistant("calling"),
+            ChatMessage::user(prompt_carrier(
+                "Generated",
+                &[tool_image.display().to_string()],
+            )),
+            ChatMessage::assistant("done"),
+            ChatMessage::user("thanks"),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(format!("[IMAGE:{}] and this", user_image.display())),
+            ChatMessage::assistant("calling"),
+            ChatMessage::user(prompt_carrier("tool output", &[])),
+        ];
+
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.messages[4].content, "thanks");
+        assert!(!prepared.messages[8].content.contains(EARLIER_IMAGES_NOTE));
+    }
+
+    /// Quoting the could-not-load wording mid-sentence is still a text-only
+    /// follow-up; only the note as preparation writes it marks a failed image.
+    #[tokio::test]
+    async fn quoting_the_could_not_load_wording_does_not_suppress_the_note() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut history = image_turn_history(temp.path());
+        let question = format!("why did it say 2 {SKIPPED_IMAGE_NOTE_TAIL}?");
+        history.push(ChatMessage::user(question.clone()));
+
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prepared.messages[3].content,
+            format!("{question}\n\n{EARLIER_IMAGES_NOTE}")
+        );
+    }
+
+    /// Providers prepare messages the runtime already prepared, so a second
+    /// pass must leave the request unchanged: no repeated note, and no note on
+    /// a message whose image the first pass removed.
+    #[tokio::test]
+    async fn preparing_prepared_messages_again_changes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let [a, b, c] = ["a.png", "b.png", "c.png"].map(|name| write_png(temp.path(), name));
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(format!("[IMAGE:{}]", a.display())),
+            ChatMessage::assistant("one"),
+            ChatMessage::user(format!("[IMAGE:{}]\ncaption", b.display())),
+            ChatMessage::assistant("two"),
+            ChatMessage::user(format!("[IMAGE:{}]", c.display())),
+            ChatMessage::assistant("three"),
+            ChatMessage::user("and this one?"),
+        ];
+        let config = MultimodalConfig {
+            max_images: 2,
+            ..Default::default()
+        };
+
+        let once = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        let twice = prepare_messages_for_provider(&once.messages, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(contents(&once), contents(&twice));
+        assert_eq!(once.messages[1].content, IMAGE_REMOVED_PLACEHOLDER);
+        assert_eq!(once.messages[3].content, "caption");
+        assert_eq!(
+            once.messages[7].content,
+            format!("and this one?\n\n{EARLIER_IMAGES_NOTE}")
+        );
+    }
+
+    /// A message whose image failed to load keeps only text and the
+    /// could-not-load note; a second pass must not mistake it for a text-only
+    /// follow-up.
+    #[tokio::test]
+    async fn a_failed_image_after_an_earlier_one_is_not_noted_on_a_second_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_png(temp.path(), "photo.png");
+        let missing = temp.path().join("missing.png");
+        let history = vec![
+            ChatMessage::user(format!("[IMAGE:{}]", path.display())),
+            ChatMessage::assistant("one"),
+            ChatMessage::user(format!("[IMAGE:{}]\ncaption", missing.display())),
+            ChatMessage::assistant("two"),
+            ChatMessage::user("and this one?"),
+        ];
+        let config = MultimodalConfig::default();
+
+        let once = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        let twice = prepare_messages_for_provider(&once.messages, &config)
+            .await
+            .unwrap();
+
+        assert!(once.messages[2].content.contains(SKIPPED_IMAGE_NOTE_TAIL));
+        assert!(!once.messages[2].content.contains(EARLIER_IMAGES_NOTE));
+        assert_eq!(contents(&once), contents(&twice));
+    }
+
+    /// Prose that merely contains the marker prefix is not an earlier image. A
+    /// later real image keeps preparation off the no-image fast path, so the
+    /// text-only message in between is actually checked.
+    #[tokio::test]
+    async fn prose_that_only_contains_the_marker_prefix_is_not_an_earlier_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_png(temp.path(), "photo.png");
+        let history = vec![
+            ChatMessage::user("attach files with [IMAGE:<path>] markers"),
+            ChatMessage::assistant("noted"),
+            ChatMessage::user("thanks"),
+            ChatMessage::assistant("sure"),
+            ChatMessage::user(format!("[IMAGE:{}] look", path.display())),
+        ];
+
+        let prepared = prepare_messages_for_provider(&history, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.messages[2].content, "thanks");
+        assert!(prepared.messages[4].content.contains("data:image"));
     }
 }
