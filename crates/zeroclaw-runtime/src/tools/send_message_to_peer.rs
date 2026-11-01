@@ -380,6 +380,20 @@ impl Tool for SendMessageToPeerTool {
             });
         }
 
+        // Discord external peers are user allowlist entries, but Discord
+        // delivery posts to a channel or thread ID. Sending would fail with
+        // an opaque "Unknown Channel" error, so reject it with guidance.
+        if channel_ref_is_discord(&channel) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "peer-delivery-discord-external-peer",
+                    &[("target", &format!("{target:?}"))],
+                )),
+            });
+        }
+
         match deliver_announcement(&self.config, &channel, &target, None, &message).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
@@ -393,6 +407,16 @@ impl Tool for SendMessageToPeerTool {
             }),
         }
     }
+}
+
+/// Whether a `<type>.<alias>` channel ref (or a bare type) names a Discord
+/// channel. Mirrors the case-insensitive type match used by announcement
+/// delivery.
+fn channel_ref_is_discord(channel: &str) -> bool {
+    channel
+        .split_once('.')
+        .map_or(channel, |(channel_type, _)| channel_type)
+        .eq_ignore_ascii_case("discord")
 }
 
 fn peer_acceptance_output(recipient_alias: &str, task_id: &str) -> String {
@@ -1105,6 +1129,115 @@ mod tests {
             peer_acceptance_output("recipient", task_id),
             "accepted for in-process delivery to peer agent \"recipient\" (task_id=task-123)"
         );
+    }
+
+    /// A Discord external peer is a user ID, while announcement delivery on
+    /// Discord posts to a channel ID. The send must fail with an actionable
+    /// error before reaching delivery, not surface Discord's opaque 404.
+    #[tokio::test]
+    async fn discord_external_peer_is_rejected_before_channel_delivery() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "aa".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "friends".to_string(),
+            PeerGroupConfig {
+                channel: "discord.prod".into(),
+                agents: vec![AgentAlias::new("aa")],
+                external_peers: vec![PeerUsername::new("123456789012345678")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "aa");
+
+        let result = tool
+            .execute(json!({
+                "channel": "discord.prod",
+                "target": "123456789012345678",
+                "message": "hello",
+            }))
+            .await
+            .expect("validation failures are reported as a ToolResult");
+
+        assert!(
+            !result.success,
+            "a Discord user target must not report delivery"
+        );
+        let error = result.error.expect("rejection must carry an error");
+        assert_eq!(
+            error,
+            crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-discord-external-peer",
+                &[("target", "\"123456789012345678\"")],
+            ),
+            "the rejection must come from the Fluent catalogue"
+        );
+        assert!(error.contains("\"123456789012345678\""), "{error}");
+        assert!(error.contains("user ID"), "{error}");
+        assert!(error.contains("channel or thread"), "{error}");
+        assert!(!error.contains("delivery failed"), "{error}");
+    }
+
+    /// The Discord guard is scoped to Discord: an external peer on another
+    /// channel type passes validation and reaches announcement delivery. Unit
+    /// tests register no delivery handler, so delivery is a logged no-op that
+    /// returns `Ok`; the `delivered to external peer` output is produced only
+    /// by that delivery arm, so an earlier rejection (unknown target, Discord
+    /// guard) cannot pass.
+    #[tokio::test]
+    async fn non_discord_external_peer_still_reaches_delivery() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "aa".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "friends".to_string(),
+            PeerGroupConfig {
+                channel: "telegram.prod".into(),
+                agents: vec![AgentAlias::new("aa")],
+                external_peers: vec![PeerUsername::new("@operator")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "aa");
+
+        let result = tool
+            .execute(json!({
+                "channel": "telegram.prod",
+                "target": "@operator",
+                "message": "hello",
+            }))
+            .await
+            .expect("delivery outcomes are reported as a ToolResult");
+
+        assert!(
+            result.success,
+            "a non-Discord external peer must reach delivery: {:?}",
+            result.error
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            result.output.to_string(),
+            "delivered to external peer \"@operator\" on telegram.prod"
+        );
+    }
+
+    #[test]
+    fn channel_ref_is_discord_matches_type_case_insensitively() {
+        assert!(channel_ref_is_discord("discord.prod"));
+        assert!(channel_ref_is_discord("Discord.prod"));
+        assert!(channel_ref_is_discord("discord"));
+        assert!(!channel_ref_is_discord("telegram.discord"));
+        assert!(!channel_ref_is_discord("discordish.prod"));
     }
 
     #[test]
