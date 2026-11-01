@@ -113,6 +113,7 @@ pub(crate) fn localized_lifecycle_progress(event: ProgressEvent) -> String {
 /// Truncate a string to `max_chars` Unicode characters, appending "..." if truncated.
 /// Build a localized reaction error for the reaction tool. Reaction failures
 /// reach the agent as tool results, so their text comes from Fluent.
+#[cfg(feature = "channel-telegram")]
 pub(crate) fn reaction_error(key: &str, args: &[(&str, &str)]) -> anyhow::Error {
     anyhow::Error::msg(zeroclaw_runtime::i18n::get_required_cli_string_with_args(
         key, args,
