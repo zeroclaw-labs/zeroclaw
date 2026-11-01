@@ -1310,6 +1310,50 @@ impl WhatsAppWebChannel {
             .build())
     }
 
+    /// Show a pairing QR code in the terminal and emit it as a login event,
+    /// unless the listener that owns the client has stopped (`fence`
+    /// cancelled). whatsapp-rust rotates QR codes on a detached task that
+    /// neither `disconnect` nor the bot's shutdown ends, so a channel stopped
+    /// while unpaired would keep surfacing unscannable codes for minutes.
+    /// Returns whether the code was surfaced.
+    #[cfg(feature = "whatsapp-web")]
+    fn surface_pairing_qr(alias: &str, code: &str, fence: &CancellationToken) -> bool {
+        if fence.is_cancelled() {
+            return false;
+        }
+        crate::login_events::LoginEvent::Qr {
+            payload: code,
+            image_url: None,
+            attempt: None,
+            max_attempts: None,
+        }
+        .emit(
+            "whatsapp",
+            alias,
+            "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)",
+        );
+        match Self::render_pairing_qr(code) {
+            Ok(rendered) => {
+                eprintln!();
+                eprintln!("WhatsApp Web QR code (scan in WhatsApp > Linked Devices):");
+                eprintln!("{rendered}");
+                eprintln!();
+            }
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!("failed to render pairing QR in terminal: {}", err)
+                );
+                eprintln!();
+                eprintln!("WhatsApp Web QR payload: {code}");
+                eprintln!();
+            }
+        }
+        true
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn recipient_to_jid(&self, recipient: &str) -> Result<wacore_binary::jid::Jid> {
         let trimmed = recipient.trim();
@@ -3907,8 +3951,9 @@ impl Channel for WhatsAppWebChannel {
                 voice_chats: self.voice_chats.clone(),
             };
             let configured_push_name = self.push_name.clone();
-            // The SDK detaches event callbacks. Fence their config writes
-            // even when listener cancellation skips the shutdown code below.
+            // The SDK detaches event callbacks. Fence their config writes and
+            // pairing output even when listener cancellation skips the
+            // shutdown code below.
             let persistence_cancel = tokio_util::sync::CancellationToken::new();
             let persistence_guard = persistence_cancel.clone().drop_guard();
 
@@ -4040,34 +4085,11 @@ impl Channel for WhatsAppWebChannel {
                                 eprintln!();
                             }
                             Event::PairingQrCode(qr) => {
-                                let code = &qr.code;
-                                crate::login_events::LoginEvent::Qr {
-                                    payload: code.as_str(),
-                                    image_url: None,
-                                    attempt: None,
-                                    max_attempts: None,
-                                }
-                                .emit(
-                                    "whatsapp",
+                                Self::surface_pairing_qr(
                                     alias.as_ref(),
-                                    "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)",
+                                    &qr.code,
+                                    &persistence_cancel,
                                 );
-                                match Self::render_pairing_qr(code) {
-                                    Ok(rendered) => {
-                                        eprintln!();
-                                        eprintln!(
-                                            "WhatsApp Web QR code (scan in WhatsApp > Linked Devices):"
-                                        );
-                                        eprintln!("{rendered}");
-                                        eprintln!();
-                                    }
-                                    Err(err) => {
-                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to render pairing QR in terminal: {}", err));
-                                        eprintln!();
-                                        eprintln!("WhatsApp Web QR payload: {code}");
-                                        eprintln!();
-                                    }
-                                }
                             }
                             _ => {}
                         }
@@ -4713,6 +4735,32 @@ mod tests {
             .write_to(&mut bytes, format)
             .expect("encode test image");
         bytes.into_inner()
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn pairing_qr_is_surfaced_while_the_listener_runs() {
+        let fence = CancellationToken::new();
+        assert!(WhatsAppWebChannel::surface_pairing_qr(
+            "assistant",
+            "2@pairing-ref,noise,identity,adv",
+            &fence,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn pairing_qr_from_a_stopped_listener_is_not_surfaced() {
+        // whatsapp-rust keeps rotating QR codes after disconnect; once the
+        // listener's fence is cancelled they must not reach the terminal or
+        // the login event stream.
+        let fence = CancellationToken::new();
+        fence.cancel();
+        assert!(!WhatsAppWebChannel::surface_pairing_qr(
+            "assistant",
+            "2@pairing-ref,noise,identity,adv",
+            &fence,
+        ));
     }
 
     /// A JPEG whose EXIF block says "rotate 90° clockwise to display"
