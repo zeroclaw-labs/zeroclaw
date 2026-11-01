@@ -833,11 +833,31 @@ impl Channel for SpeechToSpeechChannel {
         };
         match sender {
             Some(sender) => {
-                let mut receipt = match sender.send_client_text(&message.content).await {
-                    Ok(receipt) => receipt,
+                // One budget for the whole relay, not just for the write.
+                // Getting into the driver's bounded command queue is itself a
+                // wait, and it happens before any receipt exists to time out:
+                // while the driver is parked inside a reconnect it drains
+                // nothing, so a queue that filled up holds this call for as
+                // long as that reconnect lasts.
+                let deadline = tokio::time::Instant::now() + CONTROL_ACK_TIMEOUT;
+                let queued =
+                    tokio::time::timeout_at(deadline, sender.send_client_text(&message.content))
+                        .await;
+                let mut receipt = match queued {
+                    // Never reached the queue, so there is nothing the driver
+                    // could write later: a definite non-delivery.
+                    Err(_) => {
+                        return Err(anyhow::Error::msg(format!(
+                            "speech_to_speech.{}: the reply waited {}s for room in the \
+                             provider's command queue; it will not be delivered",
+                            self.alias,
+                            CONTROL_ACK_TIMEOUT.as_secs()
+                        )));
+                    }
+                    Ok(Ok(receipt)) => receipt,
                     // The driver ended between attach and this call: a reply
                     // arriving after hangup is a race, not a failure.
-                    Err(SessionError::Closed) => {
+                    Ok(Err(SessionError::Closed)) => {
                         ::zeroclaw_log::record!(
                             DEBUG,
                             ::zeroclaw_log::Event::new(
@@ -849,14 +869,14 @@ impl Channel for SpeechToSpeechChannel {
                         );
                         return Ok(());
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         return Err(anyhow::Error::msg(format!(
                             "speech_to_speech.{}: failed to relay reply into live session: {e}",
                             self.alias
                         )));
                     }
                 };
-                match tokio::time::timeout(CONTROL_ACK_TIMEOUT, receipt.wait()).await {
+                match tokio::time::timeout_at(deadline, receipt.wait()).await {
                     Ok(outcome) => self.reply_verdict(outcome),
                     // Out of time. A reply the driver has not started writing
                     // is withdrawn, so it cannot be spoken later once the
