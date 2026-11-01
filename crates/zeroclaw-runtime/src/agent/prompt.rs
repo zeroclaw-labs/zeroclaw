@@ -136,6 +136,10 @@ pub struct PromptContext<'a> {
     /// Resolved from `RuntimeAdapter::shell_profile` so the reported shell
     /// cannot drift from the executed one.
     pub shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    /// True when this turn is running on a messaging channel surface, where
+    /// replies are delivered back through the user's channel and channel media
+    /// markers may be present. The prompt caller owns this per-turn fact.
+    pub is_messaging_channel_turn: bool,
 }
 
 /// Model-facing Full-autonomy approval contract used by [`SafetySection`].
@@ -586,7 +590,11 @@ impl PromptSection for ChannelMediaSection {
         "channel_media"
     }
 
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if !ctx.is_messaging_channel_turn {
+            return Ok(String::new());
+        }
+
         Ok("## Channel Media Markers\n\n\
             Messages from channels may contain media markers:\n\
             - `[Voice] <text>` — The user sent a voice/audio message that has already been transcribed to text. Respond to the transcribed content directly.\n\
@@ -774,6 +782,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = IdentitySection.build(&ctx).unwrap();
@@ -857,6 +866,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let section = IdentitySection;
@@ -894,6 +904,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -921,6 +932,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = InteractionSection.build(&ctx).unwrap();
@@ -960,6 +972,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -987,6 +1000,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(!prompt.contains("## Tools"));
@@ -1014,6 +1028,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1071,6 +1086,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1128,6 +1144,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1174,6 +1191,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1227,6 +1245,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1259,6 +1278,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         // The section is opt-in: it must still render when a builder adds it
@@ -1298,6 +1318,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         // The system prompt is the cached prefix of every long-lived session,
@@ -1363,6 +1384,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1403,6 +1425,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1444,6 +1467,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1477,6 +1501,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Full,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1527,6 +1552,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Full,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SafetySection
@@ -1566,6 +1592,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Full,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SafetySection
@@ -1601,6 +1628,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            is_messaging_channel_turn: false,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1636,6 +1664,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile,
+            is_messaging_channel_turn: false,
         }
     }
 
@@ -1762,5 +1791,64 @@ mod tests {
         // A shell-less runtime keeps the POSIX wording it rendered before.
         let none = SafetySection.build(&shell_ctx(&tools, None)).unwrap();
         assert!(none.contains("trash"), "{none}");
+    }
+
+    #[test]
+    fn channel_media_section_follows_per_turn_surface_context() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let channel_ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            interaction: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
+            shell_profile: None,
+            is_messaging_channel_turn: true,
+        };
+        let embedded_ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            interaction: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
+            shell_profile: None,
+            is_messaging_channel_turn: false,
+        };
+
+        let channel = ChannelMediaSection.build(&channel_ctx).unwrap();
+        let embedded = ChannelMediaSection.build(&embedded_ctx).unwrap();
+
+        assert!(
+            channel.contains("## Channel Media Markers"),
+            "messaging channel turns should receive channel media guidance"
+        );
+        assert!(
+            channel.contains("[Voice] <text>"),
+            "messaging channel turns should preserve media marker guidance"
+        );
+        assert!(
+            !embedded.contains("## Channel Media Markers"),
+            "embedded/direct prompt contexts must not receive channel media guidance"
+        );
+        assert!(
+            !embedded.contains("[Voice] <text>"),
+            "embedded/direct prompt contexts must not receive voice-note channel guidance"
+        );
     }
 }
