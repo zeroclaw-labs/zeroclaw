@@ -61,6 +61,17 @@ To send plain text only (no HTML part, for clients or setups that prefer it), se
 
 When attachments are present the body alternatives are wrapped in an outer `multipart/mixed`.
 
+The HTML part is built from Markdown structure only, because the agent's text can be steered by the mail it answers:
+
+- Raw HTML inside the Markdown is not sent as markup: inline tags are dropped (their text stays), `<br>` becomes a line break, and a raw HTML block is shown as text.
+- Images are kept only when they are inline attachments (`cid:`) or `https` URLs on `html_image_domains`; any other image is reduced to its alt text. A remote image is fetched by the reader's mail client, so an arbitrary one could carry data out in its URL.
+- Links are kept for `http`, `https`, `mailto` and `tel` targets only.
+
+```toml
+[channels.email.assistant]
+html_image_domains = ["example.com"]   # also covers www.example.com
+```
+
 ## Attachment handling
 
 Inbound attachments are stored under `<workspace>/attachments/<conversation>/`. The agent gets file paths in its context and can read them via the `file_read` tool. Filenames are taken from the `Content-Disposition` header first, falling back to the `Content-Type` `name` parameter.
