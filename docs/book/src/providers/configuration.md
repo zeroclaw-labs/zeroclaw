@@ -23,7 +23,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on. Without a configured vision provider, a non-vision turn proceeds with media markers replaced by a placeholder when none of the latest user message's image references pass the existence, data-URI-structure, or remote-fetch-policy checks (a missing file, a malformed data URI, or a remote URL while `multimodal.allow_remote_fetch` is off). A local path counts only when it is absolute, allowed by the agent's filesystem policy (the same check the file tools apply), and exists as a file; paths the policy rejects are never probed. If any reference does pass, the turn still fails with the vision capability error. The resolvability check evaluates at most 16 absolute local-path markers per turn; for those, the policy check and the existence probe run together on a blocking thread, off the async executor. A message with more such markers treats the rest as resolvable without any check, so an oversized message fails toward the capability error instead of a silent degrade.
 - `tool_result_image_policy`: handling for images attached to native `role = "tool"` results sent to compatible chat-completions providers. A tool result's images are declared in an `attachments` array beside the result text in the tool-result carrier, never recovered from the result text itself, so literal marker syntax in a tool's output is just text. Defaults to `"image_url"` (send declared images as `image_url` parts); set to `"omit"` to drop them and append a fixed notice. The policy reads the `attachments` array of native carriers only; a legacy tool result (no array key) passes verbatim under both settings, because it declares nothing and its body is text. This does not change direct user images or OpenAI Responses providers.
 - `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
-- `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default) or `"1h"`. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. Providers that emit their own cache markers by other means (openrouter) ignore the setting. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
+- `cache_ttl`: cache entry lifetime requested for Anthropic prompt-cache markers. `"5m"` (default), `"1h"`, or `"off"` to place no markers at all. Applies to the native Anthropic provider directly, and to chat-completions gateways behind `cache_passthrough`; without passthrough it is inert. Providers that emit their own cache markers by other means (openrouter) ignore the setting. See [Choosing a 1h cache lifetime](#choosing-a-1h-cache-lifetime).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -477,6 +477,41 @@ On a native Anthropic entry the same key works without `cache_passthrough`:
 model = "claude-sonnet-4-5"
 cache_ttl = "1h"
 ```
+
+### Turning the markers off
+
+`cache_ttl = "off"` places no cache breakpoints at all. A prefix that is
+never reused has no cache read to amortise the write premium, so marking
+it only adds cost: every request pays the 1.25x write for an entry that
+expires unread. That is the case for a workload whose every call carries
+a fresh prefix, and for a route where the gateway applies its own caching.
+`off` suppresses the native system, tool, and rolling-message markers and
+the compatible passthrough breakpoints alike. It does not touch
+operator-supplied `cache_control` (through `provider_extra` body fields or
+raw tool JSON), since this setting governs only the markers this
+implementation places.
+
+```toml
+[providers.models.anthropic.direct]
+model = "claude-sonnet-4-5"
+cache_ttl = "off"
+```
+
+### Bedrock and gateway translation
+
+Two observations from a Bedrock deployment reached through a LiteLLM
+gateway (the shape of the gateway example above):
+
+- LiteLLM passes the `ttl` field through to Bedrock unchanged: the request
+  Bedrock receives carries the same `cache_control` object the provider
+  emitted. A gateway that rewrites or drops the field falls back to the
+  five-minute default without saying so, so confirm the translated request
+  when qualifying a route.
+- The one-hour window refreshes on a read rather than counting from the
+  write. In one measurement a cache read landed 76 minutes after the write
+  that created the entry, which a window fixed at the write could not have
+  served. A hit extends the entry's life, which is what makes the
+  break-even arithmetic above hold for a conversation that keeps resuming.
 
 ## Image input limits
 
