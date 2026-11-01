@@ -859,6 +859,26 @@ fn print_no_command_help(cmd: clap::Command) -> Result<()> {
     Ok(())
 }
 
+/// Make a serving process the owner of every process it spawns, so that
+/// killing it, by any means, also ends its browser sessions, MCP servers and
+/// shell commands instead of leaving them holding its listening port open.
+/// Only Windows needs this: there, the kernel does it through a kill-on-close
+/// job object. A host that refuses the job leaves the process unconfined, as
+/// before, with a warning.
+#[cfg(any(feature = "agent-runtime", feature = "gateway"))]
+fn own_process_tree() {
+    #[cfg(windows)]
+    if let Err(error) = zeroclaw_config::platform::job_object::confine_process_tree() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+            "the process could not take ownership of its process tree; child processes may outlive it"
+        );
+    }
+}
+
 #[cfg(windows)]
 fn pause_after_no_command_help() {
     println!();
@@ -10597,6 +10617,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             // swap the binary on disk (after which `current_exe()` resolves to a
             // "(deleted)" path on Linux). Used by the post-loop self-respawn.
             zeroclaw_runtime::restart::record_launch();
+            own_process_tree();
 
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
             // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload after a
@@ -16516,6 +16537,7 @@ async fn run_gateway_if_enabled(
     // can self-respawn after the listener is released. Must mirror the same
     // call in the Daemon branch.
     zeroclaw_runtime::restart::record_launch();
+    own_process_tree();
     // With no daemon, this command owns what the daemon would: the
     // live-pricing refresher and the gateway-start hook, which fires once
     // the listener reports its bound address.

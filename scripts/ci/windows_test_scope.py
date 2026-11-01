@@ -462,7 +462,11 @@ def select_required_jobs(
         "windows_root": "zeroclaw" in selection.packages,
         "windows_voice_wake": "zeroclaw-channels" in selection.packages,
         "windows_recovery": manifests_affect_runtime or any(
-            path == "crates/zeroclaw-runtime/src/lib.rs"
+            path
+            in {
+                "crates/zeroclaw-runtime/src/lib.rs",
+                "crates/zeroclaw-config/src/platform/job_object.rs",
+            }
             or path.startswith("crates/zeroclaw-runtime/src/control_plane/")
             for path in changed_paths
         ),
