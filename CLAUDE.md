@@ -5,7 +5,9 @@
 
 ## Claude Code Settings
 
-Claude Code should read and follow all instructions in `AGENTS.md` at the repository root for project conventions, commands, risk tiers, workflow rules, and anti-patterns.
+@AGENTS.md
+
+The import above loads `AGENTS.md` into context, so there is no need to open it again. Add only Claude Code-specific notes below.
 
 ## Hooks
 
