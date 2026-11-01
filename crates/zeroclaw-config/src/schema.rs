@@ -14772,6 +14772,15 @@ pub struct RuntimeProfileConfig {
     /// Shell subprocess timeout in seconds. `0` inherits the global timeout.
     /// Parent-subset enforced for subagents.
     pub shell_timeout_secs: u64,
+    /// Opt-in native shell/skill subprocess RSS threshold in MiB. `0` disables
+    /// monitoring. Visible descendants are sampled while the command runs;
+    /// this is not a hard allocation ceiling and can overshoot between samples.
+    /// Shared resident pages may be counted more than once. Container runtimes
+    /// must use their own memory limits. A monitoring failure stops the
+    /// command; on macOS that includes a command that starts a descendant
+    /// under another user (for example `sudo` or a setuid helper), whose
+    /// memory cannot be read. Parent-subset enforced for subagents.
+    pub shell_max_memory_mb: u64,
     // ── Delegation tuning ──
     /// Maximum delegation recursion depth. `0` inherits the default.
     pub max_delegation_depth: u32,
@@ -14854,6 +14863,7 @@ impl Default for RuntimeProfileConfig {
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             shell_timeout_secs: 60,
+            shell_max_memory_mb: 0,
             max_delegation_depth: 0,
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
