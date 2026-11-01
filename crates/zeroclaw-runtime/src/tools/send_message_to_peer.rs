@@ -330,23 +330,36 @@ impl Tool for SendMessageToPeerTool {
             let task_id = task.id.clone();
             let task_owner_pid = task.owner_pid;
             let task_owner_boot_id = task.owner_boot_id.clone();
+            // Captured here and restored inside the task: a detached spawn does
+            // not inherit task-locals, so the recipient would otherwise rebuild
+            // its full tool surface and escape the headless step's boundary.
+            // Sibling tools (`delegate`, `spawn_subagent`) already carry the
+            // active step scope across the same spawn edge.
+            let parent_step_scope = crate::sop::active_scope::active_headless_step_scope();
             zeroclaw_spawn::spawn!(async move {
-                // Keep the admitted recipient turn out of the cost-scope wrappers.
-                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = Box::pin(
-                    crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
-                        cfg,
-                        live_config,
-                        &turn_recipient_alias,
-                        &body,
-                        None,
-                        zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                        admission,
-                        Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
-                            sender_alias: sender.clone(),
-                        }),
-                    ),
-                );
-                let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
+                let result = crate::sop::active_scope::with_inherited_headless_step_scope(
+                    parent_step_scope,
+                    async {
+                        // Keep the admitted recipient turn out of the cost-scope wrappers.
+                        let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
+                            Box::pin(
+                            crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
+                                cfg,
+                                live_config,
+                                &turn_recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                admission,
+                                Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                                    sender_alias: sender.clone(),
+                                }),
+                            ),
+                        );
+                        run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await
+                    },
+                )
+                .await;
                 if let Err(error) = settle_peer_inbox_task(
                     task_store.as_ref(),
                     &PeerInboxTask {
@@ -1800,6 +1813,166 @@ mod tests {
         .await
         .expect("recipient finishes persistence and releases admission");
         assert!(lifecycle.begin_delete("recipient").is_ok());
+        server.abort();
+    }
+
+    /// A headless SOP step that calls `send_message_to_peer` must keep the
+    /// recipient's turn inside the step's tool scope. Detached spawn drops
+    /// task-locals, so without restoring the scope the recipient rebuilds its
+    /// full surface (sibling tools `delegate` / `spawn_subagent` already carry
+    /// it).
+    #[tokio::test]
+    async fn peer_turn_started_inside_headless_step_keeps_step_tool_scope() {
+        use crate::control_plane::ControlPlaneHandle;
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig, SopConfig,
+        };
+
+        type Bodies = Arc<Mutex<Vec<serde_json::Value>>>;
+        async fn capture(
+            State(bodies): State<Bodies>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            bodies.lock().push(body);
+            Json(json!({
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let bodies: Bodies = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture))
+            .with_state(bodies.clone());
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{addr}")),
+                    timeout_secs: Some(5),
+                    pricing: HashMap::new(),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        // The step may only message a peer; everything else is scoped out.
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::SopStep {
+                number: 1,
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["send_message_to_peer".into()]),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            },
+            config: SopConfig {
+                step_scope_enforce: true,
+                ..SopConfig::default()
+            },
+        };
+
+        let control_plane = ControlPlaneHandle::open(workspace.path())
+            .expect("isolated control plane should initialize");
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let tool = SendMessageToPeerTool::new_with_capability(
+            Arc::new(config.clone()),
+            "sender",
+            Some(authority.execution_capability()),
+        )
+        .with_control_plane(control_plane);
+
+        let result = crate::sop::active_scope::with_active_headless_step_scope(
+            scope,
+            tool.execute(json!({
+                "channel": "telegram.prod",
+                "target": "recipient",
+                "message": "status?"
+            })),
+        )
+        .await
+        .expect("execute should accept the peer send");
+        assert!(result.success, "{result:?}");
+
+        let mut first = None;
+        for _ in 0..200_000 {
+            if let Some(body) = bodies.lock().first().cloned() {
+                first = Some(body);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let body = first.expect("the detached recipient turn must reach the provider");
+
+        let offered: Vec<String> = body["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !offered.is_empty(),
+            "precondition: the recipient request carried no native tool specs; body = {body}"
+        );
+        let outside: Vec<&String> = offered
+            .iter()
+            .filter(|name| name.as_str() != "send_message_to_peer")
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "a peer turn started from inside a scoped headless SOP step was offered tools \
+             outside the step scope: {outside:?}"
+        );
+
         server.abort();
     }
 }
