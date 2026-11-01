@@ -1359,6 +1359,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_receipt_withdraws_a_queued_control_but_not_a_started_write() {
+        // Dropping a receipt is how a cancelled caller gives up: the future
+        // holding it is destroyed without reaching `expire`. A control the
+        // driver has not started must be withdrawn all the same, or the reply
+        // nobody is waiting for any more gets spoken once the driver catches
+        // up. A write already handed to the transport is past withdrawing and
+        // must still go out.
+        let mut fake = FakeTransport::stalling_writes_after(1, true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        let sent = fake.sent.clone();
+        let stall = Arc::clone(&fake.stall);
+        let s = Session::connect_with_transport(cfg(), fake, no_reconnect())
+            .await
+            .unwrap();
+
+        let in_flight = s.send_client_text("already writing").await.unwrap();
+        let queued = s.send_client_text("abandoned").await.unwrap();
+        // Setup plus the first text are on the transport; the second is
+        // queued behind the stalled write.
+        wait_for_sent(&sent, 2).await;
+
+        drop(queued);
+        drop(in_flight);
+
+        // Three permits, not two: without the withdrawal the abandoned write
+        // takes one of them, and a budget of two would leave this test hanging
+        // on `live` instead of failing on the assertion below.
+        stall.add_permits(3);
+        s.send_client_text("live")
+            .await
+            .unwrap()
+            .outcome()
+            .await
+            .unwrap();
+        let sent = sent.lock().unwrap();
+        assert!(
+            !sent.iter().any(|f| f.contains("abandoned")),
+            "a dropped receipt withdraws its queued control, got {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|f| f.contains("already writing")),
+            "dropping a receipt cannot unsend a write already in progress, got {sent:?}"
+        );
+        assert!(sent.last().unwrap().contains("live"));
+    }
+
+    #[tokio::test]
     async fn send_audio_is_byte_identical_to_kutsu() {
         let fake = FakeTransport::new(true);
         let sent = fake.sent.clone();

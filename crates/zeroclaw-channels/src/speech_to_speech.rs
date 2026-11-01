@@ -1162,6 +1162,132 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_reply_whose_send_is_cancelled_is_never_written_after_the_reopen() {
+        // Nobody waits ten seconds for a cancelled reply: the generation
+        // shutdown gives message tasks five seconds to drain and then aborts
+        // them, so `send()` is commonly dropped mid-wait. The queued reply
+        // must be withdrawn by that drop alone, or the reopened connection
+        // speaks an answer whose caller is already gone.
+        let (session, second_sent, release_tx, entered_rx) = gated_reconnect_session().await;
+        let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string()));
+        let (tx, _rx) = mpsc::channel(8);
+        let (driver, target) = drive(&ch, session, tx).await;
+
+        entered_rx
+            .await
+            .expect("the driver must enter the reconnect");
+        // Enough for `send()` to reach the queue and park on the receipt,
+        // nowhere near its ten-second budget; dropping the future here is the
+        // cancellation under test.
+        let written_before = second_sent.lock().unwrap().len();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                ch.send(&SendMessage::new("it is three o'clock", &target)),
+            )
+            .await
+            .is_err(),
+            "the reply must still be queued when the send is cancelled"
+        );
+        // The queue is empty here, so the cancelled await was the wait for the
+        // write, not the enqueue: the reply IS queued, and the connection it
+        // would go out on has not opened yet.
+        assert_eq!(
+            second_sent.lock().unwrap().len(),
+            written_before,
+            "nothing can have reached the new connection before the reopen"
+        );
+
+        let _ = release_tx.send(());
+        assert!(
+            wait_for_sent(&second_sent, "\"setup\"").await,
+            "the reopen must complete so the skipped write is actually exercised"
+        );
+        // A live reply after the reopen is the barrier: it proves the driver
+        // worked through the queue past the cancelled command, so the absence
+        // below is a withdrawal and not a test that looked too early.
+        ch.send(&SendMessage::new("the barrier reply", &target))
+            .await
+            .expect("a reply sent after the reopen is delivered normally");
+        assert!(
+            !second_sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|frame| frame.contains("it is three o'clock")),
+            "a cancelled reply must never reach the reopened connection, got {:?}",
+            second_sent.lock().unwrap()
+        );
+
+        ch.stop().await;
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_that_waits_for_queue_room_fails_inside_the_same_budget() {
+        // The budget has to cover getting into the queue, not just the wait
+        // for the write: with the queue full the reply has no deadline of its
+        // own, and the orchestrator's relay would park there for as long as
+        // the queue stayed full.
+        let (session, _second_sent, _release_tx, entered_rx) = gated_reconnect_session().await;
+        let filler = session.text_sender();
+        let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string()));
+        let (tx, _rx) = mpsc::channel(8);
+        let (driver, target) = drive(&ch, session, tx).await;
+        // Only once the driver is parked inside the gated reconnect does it
+        // stop draining: before that it discards queued commands through the
+        // backoff, and a queue filled earlier would simply be emptied.
+        entered_rx
+            .await
+            .expect("the driver must enter the reconnect");
+        // Fill the queue to its bound. Capacity is the crate's business, so
+        // find the edge instead of naming it: push until one enqueue parks.
+        // These receipts are held, not dropped, so nothing frees a slot.
+        // Bounded: if a change ever lets the driver drain while it is parked,
+        // an unbounded loop would spin and CI would report a timeout with no
+        // diagnostic instead of naming the broken premise.
+        let mut _held = Vec::new();
+        let mut full = false;
+        for _ in 0..4096 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                filler.send_client_text("filler"),
+            )
+            .await
+            {
+                Ok(outcome) => _held.push(outcome.expect("the queue must still be open")),
+                // That enqueue parked: the queue is full, and cancelling it
+                // leaves nothing behind (no command was accepted).
+                Err(_) => {
+                    full = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            full && _held.len() > 1,
+            "the test only means anything with the queue actually full, got {} queued",
+            _held.len()
+        );
+
+        let err = tokio::time::timeout(
+            CONTROL_ACK_TIMEOUT * 3,
+            ch.send(&SendMessage::new("it is three o'clock", &target)),
+        )
+        .await
+        .expect("the reply must give up on its own, not park on the full queue")
+        .expect_err("a reply that never entered the queue is a failure");
+        assert!(
+            err.to_string().contains("command queue")
+                && err.to_string().contains("will not be delivered"),
+            "the failure must say the reply never got into the queue: {err}"
+        );
+
+        ch.stop().await;
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_reply_whose_write_is_still_in_progress_is_reported_as_unknown_not_lost() {
         // The transport takes the reply and then hangs. The caller cannot be
         // told the reply failed — it may well land — only that its outcome is
