@@ -183,6 +183,17 @@ impl AcceptedRoute {
             .map(|attribution| &attribution.fallback)
     }
 
+    /// Whether Reliable selected a fallback candidate for this response.
+    ///
+    /// A plain dispatch scope also records an accepted route, but that route
+    /// may carry only a provider implementation alias. Callers that already
+    /// have a configured route must retain that canonical context unless a
+    /// Reliable fallback explicitly superseded it.
+    #[must_use]
+    pub fn is_fallback(&self) -> bool {
+        self.fallback.is_some()
+    }
+
     pub(crate) fn into_fallback_attribution(
         self,
     ) -> Option<crate::reliable::ProviderFallbackAttribution> {
@@ -392,6 +403,15 @@ impl AccountedChatScope {
         self.inner.take().with_attempts(attempts, successful_route)
     }
 
+    /// Whether this scope is recovering a stream owned by Reliable. A direct
+    /// provider can make one pre-output non-streaming recovery call. Reliable
+    /// owns candidate selection: it advances to a distinct candidate when one
+    /// exists, otherwise its documented single-candidate exception decides
+    /// whether one same-entry non-stream recovery is permitted.
+    pub fn has_reliable_stream_recovery_context(&self) -> bool {
+        crate::reliable::has_reliable_stream_recovery_context()
+    }
+
     /// Preserve a semantic-empty stream cause across the exact-entry recovery walk.
     pub fn mark_stream_recovery_semantic_empty(&self) {
         crate::reliable::mark_stream_recovery_semantic_empty();
@@ -422,6 +442,12 @@ impl AccountedChatScope {
     /// completeness to an interrupted lower bound.
     pub fn record_stream_semantic_rejection_usage(&self, usage: crate::traits::TokenUsage) {
         accounting::record_stream_semantic_rejection_usage(usage);
+    }
+
+    /// Retain an informational terminal attempt in the physical report while
+    /// suppressing usage that must not enter rejected-attempt cost accounting.
+    pub fn suppress_informational_terminal_stream_usage(&self) {
+        accounting::suppress_informational_terminal_stream_usage();
     }
 }
 
@@ -818,6 +844,52 @@ impl ProviderDispatch {
         .boxed()
     }
 
+    /// Stream chat while preserving provider-owned terminal policy through the
+    /// dispatch boundary without changing the public response schema.
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        self.stream_chat_terminal_aware_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    /// Preserve terminal policy while forwarding the requested tool-round
+    /// cadence unchanged to the provider. Errors retain their typed terminal
+    /// context; selecting a cadence does not grant recovery permission.
+    pub fn stream_chat_terminal_aware_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let inner_stream =
+            self.stream_chat_with_tool_round_policy(request, model, temperature, options, policy);
+        drop(scope);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
+        })
+        .boxed()
+    }
+
     pub async fn simple_chat(
         &self,
         message: &str,
@@ -1196,6 +1268,50 @@ impl<'a> ProviderDispatchRef<'a> {
         .boxed()
     }
 
+    /// Borrowed equivalent of [`ProviderDispatch::stream_chat_terminal_aware`].
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        self.stream_chat_terminal_aware_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    /// Borrowed equivalent of
+    /// [`ProviderDispatch::stream_chat_terminal_aware_with_tool_round_policy`].
+    pub fn stream_chat_terminal_aware_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let inner_stream =
+            self.stream_chat_with_tool_round_policy(request, model, temperature, options, policy);
+        drop(scope);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
+        })
+        .boxed()
+    }
+
     /// Wrap the inner provider's `simple_chat`. Dispatched through
     /// `self.inner` so a concrete `simple_chat` override on the inner
     /// provider is honored (rather than the trait default that
@@ -1344,6 +1460,129 @@ mod tests {
         ChatRequest, ChatResponse, ModelProvider, StreamChunk, StreamEvent, StreamOptions,
         StreamResult,
     };
+
+    #[derive(Default)]
+    struct PolicyTerminalProvider {
+        policies: std::sync::Mutex<Vec<zeroclaw_api::model_provider::ToolRoundPolicy>>,
+    }
+
+    impl Attributable for PolicyTerminalProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "policy-terminal"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PolicyTerminalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("the dispatch regression exercises only explicit streaming")
+        }
+
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+            policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.policies.lock().unwrap().push(policy);
+            let slot = crate::terminal::capture_terminal_policy_slot();
+            stream::once(async move {
+                use crate::terminal::{
+                    TerminalCompletionPolicy, TerminalRecoveryDisposition,
+                    TerminalUsageChargeability,
+                };
+                use zeroclaw_api::model_provider::{
+                    TerminalCompletionError, TerminalCompletionFailure,
+                };
+                crate::terminal::publish_terminal_policy(
+                    &slot,
+                    TerminalCompletionError::Refusal,
+                    TerminalCompletionPolicy::new(
+                        TerminalRecoveryDisposition::NoReplay,
+                        TerminalUsageChargeability::Informational,
+                    ),
+                );
+                Err(TerminalCompletionFailure::new(
+                    TerminalCompletionError::Refusal,
+                    Some(crate::traits::TokenUsage {
+                        input_tokens: Some(12),
+                        output_tokens: Some(3),
+                        ..Default::default()
+                    }),
+                )
+                .into())
+            })
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_aware_dispatch_preserves_explicit_round_policy_and_terminal_context() {
+        use crate::terminal::{
+            TerminalRecoveryDisposition, TerminalUsageChargeability, terminal_completion_context,
+        };
+        use zeroclaw_api::model_provider::ToolRoundPolicy;
+
+        for borrowed in [false, true] {
+            for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+                let provider = Arc::new(PolicyTerminalProvider::default());
+                let messages = [ChatMessage::user("test")];
+                let request = ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                };
+                let mut stream = if borrowed {
+                    ProviderDispatch::from_ref(provider.as_ref())
+                        .stream_chat_terminal_aware_with_tool_round_policy(
+                            request,
+                            "model",
+                            None,
+                            StreamOptions::new(true),
+                            policy,
+                        )
+                } else {
+                    ProviderDispatch::new(provider.clone())
+                        .stream_chat_terminal_aware_with_tool_round_policy(
+                            request,
+                            "model",
+                            None,
+                            StreamOptions::new(true),
+                            policy,
+                        )
+                };
+                let error = stream.next().await.unwrap().unwrap_err();
+                assert!(stream.next().await.is_none());
+                assert_eq!(*provider.policies.lock().unwrap(), vec![policy]);
+                let context = terminal_completion_context(&error).unwrap();
+                assert_eq!(
+                    context.policy().recovery(),
+                    TerminalRecoveryDisposition::NoReplay
+                );
+                assert_eq!(
+                    context.policy().usage_chargeability(),
+                    TerminalUsageChargeability::Informational
+                );
+                let failure = zeroclaw_api::model_provider::terminal_completion_failure(&error)
+                    .expect("terminal failure remains in the error chain");
+                let usage = failure.usage.as_ref().unwrap();
+                assert_eq!(usage.input_tokens, Some(12));
+                assert_eq!(usage.output_tokens, Some(3));
+            }
+        }
+    }
 
     struct FakeAnthropic {
         alias: String,

@@ -14,7 +14,7 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
-use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
+use zeroclaw_tool_call_parser::normalize_terminal_display_text;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CompletionLimit {
@@ -39,7 +39,7 @@ impl CompletionLimit {
     }
 }
 
-/// Project a finished summary call's settled attempts as `TurnEvent::Usage`
+/// Project a summary call's settled attempts as `TurnEvent::Usage`
 /// so the gateway ledger includes the final-summary billed work. Mirrors
 /// `emit_rejected_attempt_usage`, but carries each summary's own `accepted`
 /// flag (the accepted leaf is `true`).
@@ -416,6 +416,11 @@ pub(crate) async fn finish_after_max_iterations(
         }
     };
 
+    // Dropping the query on timeout or cancellation settles known attempts into
+    // this list too. Flush before every controlled exit so the event ledger and
+    // internal charge agree. Like normal completion, this awaits backpressure;
+    // it does not transfer delivery ownership beyond this turn's lifetime.
+    emit_summary_attempt_usage(event_tx, &summary_attempts).await;
     let resp = match summary_call {
         SummaryCall::Cancelled => {
             return Err(ToolLoopCancelled.into());
@@ -442,7 +447,6 @@ pub(crate) async fn finish_after_max_iterations(
                     })),
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
-            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
             // The provider error stays the source; the stop rides alongside
             // it so the exit is typed without losing what actually failed.
             return Err(zeroclaw_api::turn_stop::tag(
@@ -451,25 +455,8 @@ pub(crate) async fn finish_after_max_iterations(
             ));
         }
         SummaryCall::Done(Ok(resp)) => {
-            // When the provider omitted `input_tokens` on the accepted
-            // summary, carry a display-only estimate of the summary request
-            // so the context meter keeps its numerator after the final-summary
-            // event. Rejected attempts and accounting stay provider-reported.
-            let accepted_estimate = resp
-                .usage
-                .as_ref()
-                .and_then(|u| u.input_tokens)
-                .is_none()
-                .then(|| crate::agent::history::estimate_history_tokens(history) as u64)
-                .filter(|&est| est > 0);
-            if let Some(est) = accepted_estimate {
-                for summary in &mut summary_attempts {
-                    if summary.accepted {
-                        summary.estimated_input_tokens = Some(est);
-                    }
-                }
-            }
-            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
+            // The query seam captured any display-only estimate from its final
+            // request; rejected attempts and accounting stay provider-reported.
             resp
         }
     };
@@ -486,7 +473,7 @@ pub(crate) async fn finish_after_max_iterations(
     // content and trailing terminal markers, then withhold text that looks
     // like an internal tool-protocol envelope. The summary call passes
     // `tools: None`, so the tools-free detector is the matching contract.
-    let display_text = strip_trailing_terminal_markers(&strip_think_tags(&raw_text));
+    let display_text = normalize_terminal_display_text(&raw_text);
     let protocol_suppressed =
         super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
     if protocol_suppressed {
@@ -701,6 +688,241 @@ mod graceful_summary_metering_tests {
 
     async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
         run_summary_with_events(provider, String::new(), None, None).await
+    }
+
+    struct InterruptedSummaryProvider {
+        calls: Arc<AtomicUsize>,
+        pending: bool,
+    }
+
+    impl Attributable for InterruptedSummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "summary-interruption-test"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for InterruptedSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("the summary must use structured dispatch")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.pending {
+                return std::future::pending().await;
+            }
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    ..TokenUsage::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn assert_interrupted_summary_usage(cancel: bool, backpressure: bool, closed: bool) {
+        let rejected_calls = Arc::new(AtomicUsize::new(0));
+        let pending_calls = Arc::new(AtomicUsize::new(0));
+        let provider = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![
+                (
+                    "custom.rejected".into(),
+                    Box::new(InterruptedSummaryProvider {
+                        calls: Arc::clone(&rejected_calls),
+                        pending: false,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "custom.pending".into(),
+                    Box::new(InterruptedSummaryProvider {
+                        calls: Arc::clone(&pending_calls),
+                        pending: true,
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let mut ctx = ToolLoopCostTrackingContext::usage_only();
+        ctx.model_provider_pricing = Arc::new(HashMap::from([(
+            "custom.rejected".into(),
+            HashMap::from([
+                ("summary-model.input".into(), 2.0),
+                ("summary-model.output".into(), 4.0),
+            ]),
+        )]));
+        let totals = Arc::clone(&ctx.turn_usage);
+        totals.lock().last_input_tokens = 999;
+        let token = tokio_util::sync::CancellationToken::new();
+        let pacing = PacingConfig {
+            step_timeout_secs: Some(1),
+            ..PacingConfig::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        if closed {
+            rx.close();
+        }
+        // A reserved slot applies deterministic backpressure without injecting
+        // an unrelated event or relying on wall-clock scheduling.
+        let permit = if backpressure {
+            Some(tx.reserve().await.unwrap())
+        } else {
+            None
+        };
+        let mut history = vec![ChatMessage::user("summarize completed work")];
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                let mut preamble = None;
+                let mut crumb_present = false;
+                let knobs = LoopKnobs::default();
+                let multimodal = MultimodalConfig::default();
+                let future = finish_after_max_iterations(
+                    &mut preamble,
+                    &provider,
+                    &mut history,
+                    "reliable",
+                    "summary-model",
+                    "summary-model",
+                    None,
+                    &pacing,
+                    cancel.then_some(&token),
+                    CompletionLimit::LocalIterations(2),
+                    String::new(),
+                    "summary-interruption-test",
+                    &knobs,
+                    Some(&tx),
+                    None,
+                    None,
+                    None,
+                    &multimodal,
+                    None,
+                    None,
+                    None,
+                    None,
+                    |_, _| ResolvedContextLimits::legacy_fallback(0),
+                    &mut crumb_present,
+                    None,
+                    &crate::observability::NoopObserver,
+                );
+                tokio::pin!(future);
+                assert!(futures_util::poll!(&mut future).is_pending());
+                assert_eq!(rejected_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(pending_calls.load(Ordering::SeqCst), 1);
+                if cancel {
+                    token.cancel();
+                } else {
+                    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                }
+                if backpressure {
+                    assert!(futures_util::poll!(&mut future).is_pending());
+                    assert_eq!(totals.lock().input_tokens, 10);
+                    assert!(rx.try_recv().is_err());
+                }
+                drop(permit);
+                let error = future
+                    .await
+                    .expect_err("summary interruption must stay an error");
+                if cancel {
+                    assert!(error.is::<super::ToolLoopCancelled>(), "{error:?}");
+                } else {
+                    let stop = error
+                        .downcast_ref::<zeroclaw_api::turn_stop::TurnStop>()
+                        .expect("timeout retains the typed iteration stop");
+                    assert_eq!(
+                        stop.code,
+                        zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+                    );
+                }
+            })
+            .await;
+
+        let recorded = *totals.lock();
+        assert_eq!((recorded.input_tokens, recorded.output_tokens), (10, 5));
+        assert_eq!(recorded.last_input_tokens, 999);
+        let expected_cost = 40.0 / 1_000_000.0;
+        assert!((recorded.cost_usd - expected_cost).abs() < 1e-12);
+        assert_eq!(rejected_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pending_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(history.len(), 1, "no synthetic success enters history");
+        if !closed {
+            let event = rx
+                .try_recv()
+                .expect("settled rejected usage must reach the ledger");
+            let TurnEvent::Usage {
+                provider_ref,
+                model,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                accepted,
+                estimated_input_tokens,
+                ..
+            } = event
+            else {
+                panic!("interrupted summary emitted non-usage output: {event:?}");
+            };
+            assert_eq!(provider_ref, "custom.rejected");
+            assert_eq!(model, "summary-model");
+            assert_eq!((input_tokens, output_tokens), (Some(10), Some(5)));
+            assert!((cost_usd.unwrap() - expected_cost).abs() < 1e-12);
+            assert!(!accepted);
+            assert_eq!(estimated_input_tokens, None);
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no duplicate usage or visible output"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_interruption_timeout_projects_rejected_usage() {
+        assert_interrupted_summary_usage(false, false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_interruption_cancel_projects_rejected_usage() {
+        assert_interrupted_summary_usage(true, false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_interruption_timeout_waits_for_usage_backpressure() {
+        assert_interrupted_summary_usage(false, true, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_interruption_cancel_waits_for_usage_backpressure() {
+        assert_interrupted_summary_usage(true, true, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_interruption_closed_sink_preserves_timeout_and_charge() {
+        assert_interrupted_summary_usage(false, false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_interruption_closed_sink_preserves_cancel_and_charge() {
+        assert_interrupted_summary_usage(true, false, true).await;
     }
 
     // The graceful summary now routes through the metered provider seam: under a
@@ -931,6 +1153,8 @@ mod graceful_summary_metering_tests {
         seen: Arc<std::sync::Mutex<Vec<String>>>,
         vision: bool,
         expected_request: Option<(&'static str, usize)>,
+        request_tokens: Arc<AtomicUsize>,
+        usage: Option<TokenUsage>,
     }
 
     #[async_trait]
@@ -958,6 +1182,10 @@ mod graceful_summary_metering_tests {
             model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
+            self.request_tokens.store(
+                crate::agent::history::estimate_history_tokens(request.messages),
+                Ordering::SeqCst,
+            );
             if let Some((expected_model, token_budget)) = self.expected_request {
                 assert_eq!(model, expected_model);
                 assert!(request.tools.is_none());
@@ -976,7 +1204,7 @@ mod graceful_summary_metering_tests {
             Ok(ChatResponse {
                 text: Some("wrap-up summary".to_string()),
                 tool_calls: Vec::new(),
-                usage: None,
+                usage: self.usage.clone(),
                 reasoning_content: None,
             })
         }
@@ -1007,11 +1235,19 @@ mod graceful_summary_metering_tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 *model = "summary-model".into();
                 messages.push(ChatMessage::user("hook context ".repeat(80)));
+                // This post-preparation marker is removed by the query seam,
+                // so its estimate must use the final sanitized request too.
+                messages.push(ChatMessage::user(format!(
+                    "[IMAGE:/tmp/{}.png]",
+                    "synthetic-hook-image".repeat(20)
+                )));
                 crate::hooks::HookResult::Continue(())
             }
         }
 
-        for budget in [512, 1] {
+        // The post-hook image is conservatively counted at 1,600 tokens before
+        // final sanitization; still force the obsolete history to be trimmed.
+        for budget in [2048, 1] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let provider = CapturingProvider {
                 seen: Arc::clone(&seen),
@@ -1028,6 +1264,7 @@ mod graceful_summary_metering_tests {
                 ChatMessage::assistant("latest completed work"),
             ];
             let mut crumb_present = false;
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
             let result = finish_after_max_iterations(
                 &mut None,
                 &provider,
@@ -1042,7 +1279,7 @@ mod graceful_summary_metering_tests {
                 String::new(),
                 "summary-hook-context",
                 &LoopKnobs::default(),
-                None,
+                Some(&event_tx),
                 None,
                 None,
                 None,
@@ -1071,12 +1308,31 @@ mod graceful_summary_metering_tests {
             assert!(!history.iter().any(|m| m.content.contains("obsolete")));
             assert!(!history.iter().any(|m| m.content.contains("hook context")));
             let captured = seen.lock().unwrap();
-            if budget == 512 {
+            if budget == 2048 {
                 assert!(result.unwrap().contains("execution-tree iteration budget"));
                 assert_eq!(captured.len(), 1);
                 assert!(captured[0].contains("latest real question"));
                 assert!(captured[0].contains("hook context"));
                 assert!(!captured[0].contains("obsolete"));
+                assert!(!captured[0].contains("synthetic-hook-image"));
+                let mut accepted_estimates = Vec::new();
+                while let Ok(event) = event_rx.try_recv() {
+                    if let TurnEvent::Usage {
+                        accepted: true,
+                        input_tokens,
+                        estimated_input_tokens,
+                        ..
+                    } = event
+                    {
+                        assert_eq!(input_tokens, None);
+                        accepted_estimates.push(estimated_input_tokens);
+                    }
+                }
+                assert_eq!(
+                    accepted_estimates,
+                    vec![Some(provider.request_tokens.load(Ordering::SeqCst) as u64)],
+                    "estimate must describe the dispatched post-hook, post-trim request"
+                );
             } else {
                 let error = result.unwrap_err();
                 let exceeded = super::super::context_window_exceeded_from_error(&error)
@@ -1090,6 +1346,61 @@ mod graceful_summary_metering_tests {
                         .any(|m| m.content.contains("execution-tree iteration budget"))
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_estimate_preserves_reported_usage_and_cached_floor() {
+        for (input_tokens, cached_input_tokens) in [
+            (None, None),
+            (None, Some(10_000)),
+            (Some(0), Some(0)),
+            (Some(17), Some(11)),
+        ] {
+            let provider = CapturingProvider {
+                usage: Some(TokenUsage {
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens: Some(3),
+                    cache_creation_input_tokens: None,
+                }),
+                ..Default::default()
+            };
+            let ctx = ToolLoopCostTrackingContext::usage_only();
+            let totals = Arc::clone(&ctx.turn_usage);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    Some(ctx),
+                    run_summary_with_events(&provider, String::new(), Some(&tx), None),
+                )
+                .await
+                .expect("summary succeeds");
+            let request_tokens = provider.request_tokens.load(Ordering::SeqCst) as u64;
+            let expected = input_tokens
+                .is_none()
+                .then_some(request_tokens.max(cached_input_tokens.unwrap_or(0)));
+            let mut usage = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let TurnEvent::Usage {
+                    input_tokens: reported,
+                    cached_input_tokens: cached,
+                    estimated_input_tokens,
+                    accepted,
+                    ..
+                } = event
+                {
+                    usage.push((reported, cached, estimated_input_tokens, accepted));
+                }
+            }
+            assert_eq!(
+                usage,
+                vec![(input_tokens, cached_input_tokens, expected, true)]
+            );
+            // Estimates never replace provider totals, even when larger.
+            let totals = *totals.lock();
+            assert_eq!(totals.input_tokens, input_tokens.unwrap_or(0));
+            assert_eq!(totals.output_tokens, 3);
         }
     }
 
@@ -1170,6 +1481,7 @@ mod graceful_summary_metering_tests {
                 seen: Arc::clone(&seen),
                 vision: true,
                 expected_request: Some(("summary-model", budget)),
+                ..Default::default()
             };
             let hook_calls = Arc::new(AtomicUsize::new(0));
             let mut hooks = crate::hooks::HookRunner::new();
