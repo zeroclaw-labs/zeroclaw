@@ -664,6 +664,10 @@ jobs:
         if: needs.windows-required-changes.outputs.windows_voice_wake == 'true'
         shell: bash
         run: cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target x86_64-pc-windows-msvc
+      - name: Test Windows SQLite session publication
+        if: needs.windows-required-changes.outputs.windows_root == 'true'
+        shell: bash
+        run: cargo test --locked -p zeroclaw-infra --lib --target x86_64-pc-windows-msvc session_events::upgrade::tests::sqlite_publication_supports_fresh_reopen_and_legacy_upgrade -- --exact
 
   # Split out of the Windows build leg so the recovery harness compiles in
   # parallel with `cargo check` and voice-wake instead of after them. The three

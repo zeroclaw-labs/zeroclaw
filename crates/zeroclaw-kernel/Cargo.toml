@@ -1,0 +1,30 @@
+[package]
+name = "zeroclaw-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+description = "Session coordination and execution ports for ZeroClaw"
+
+[dependencies]
+zeroclaw-api.workspace = true
+zeroclaw-tool-call-parser.workspace = true
+zeroclaw-config.workspace = true
+zeroclaw-log.workspace = true
+zeroclaw-spawn.workspace = true
+tokio-util = { version = "0.7", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+serde_json = "1.0"
+tokio = { version = "1.50", default-features = false, features = ["rt", "sync", "time", "macros"] }
+async-trait = "0.1"
+anyhow = "1.0"
+futures-util = {version = "0.3", default-features = false, features = ["std"]}
+
+[dev-dependencies]
+zeroclaw-infra.workspace = true
+tempfile = "3.26"

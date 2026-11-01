@@ -587,11 +587,11 @@ impl PromptSection for ChannelMediaSection {
     }
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok("## Channel Media Markers\n\n\
-            Messages from channels may contain media markers:\n\
-            - `[Voice] <text>` — The user sent a voice/audio message that has already been transcribed to text. Respond to the transcribed content directly.\n\
-            - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
-            - `[Document: <name>] <path>` — A file attachment saved to the workspace."
+        Ok("## Channel Media Attachments\n\n\
+            Messages from channels may include typed media attachments:\n\
+            - Voice/audio transcripts appear as ordinary message text. Respond to the transcribed content directly.\n\
+            - Image attachments are processed by the vision pipeline.\n\
+            - Document attachments carry their path and name in structured fields."
             .into())
     }
 }

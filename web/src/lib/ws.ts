@@ -1,4 +1,4 @@
-import type { ApprovalDecision, WsMessage } from '../types/api';
+import type { ApprovalDecision, AttachmentReference, WsMessage } from '../types/api';
 import { getToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
 import { isTauri } from './tauri';
@@ -106,11 +106,11 @@ export class WebSocketClient {
   }
 
   /** Send a chat message to the agent. */
-  sendMessage(content: string): void {
+  sendMessage(content: string, attachments: AttachmentReference[] = []): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket is not connected');
     }
-    this.ws.send(JSON.stringify({ type: 'message', content }));
+    this.ws.send(JSON.stringify({ type: 'message', content, attachments }));
   }
 
   /**

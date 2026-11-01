@@ -2132,7 +2132,7 @@ mod tests {
         let (mut reader, mut writer) = do_initialize(&sock_path).await;
 
         let (pending_tx, mut pending_rx) =
-            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         ctx.approval_pending
             .insert("test-req-1".to_string(), "unused".to_string(), pending_tx);
 
@@ -2151,7 +2151,7 @@ mod tests {
 
         let decision = pending_rx.try_recv().expect("decision should be resolved");
         assert_eq!(
-            decision,
+            decision.expect("approval reply").response,
             zeroclaw_api::channel::ChannelApprovalResponse::Approve
         );
 

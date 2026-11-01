@@ -29,13 +29,6 @@ fn chat_message_assistant_role_correct() {
 }
 
 #[test]
-fn chat_message_tool_role_correct() {
-    let msg = ChatMessage::tool("tool result");
-    assert_eq!(msg.role, "tool");
-    assert_eq!(msg.content, "tool result");
-}
-
-#[test]
 fn chat_message_serializes_to_json_with_required_fields() {
     let msg = ChatMessage::user("test message");
     let json = serde_json::to_value(&msg).unwrap();
@@ -120,27 +113,6 @@ fn tool_call_arguments_contain_valid_json() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tool message with tool_call_id (DeepSeek requirement)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn tool_response_message_can_embed_tool_call_id() {
-    // DeepSeek requires tool_call_id in tool response messages.
-    // The tool message content can embed the tool_call_id as JSON.
-    let tool_response =
-        ChatMessage::tool(r#"{"tool_call_id": "call_abc123", "content": "search results here"}"#);
-
-    let parsed: serde_json::Value = serde_json::from_str(&tool_response.content)
-        .expect("tool response content should be valid JSON");
-
-    assert!(
-        parsed.get("tool_call_id").is_some(),
-        "tool response should include tool_call_id for DeepSeek compatibility"
-    );
-    assert_eq!(parsed["tool_call_id"], "call_abc123");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // ChatResponse structure
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -151,6 +123,7 @@ fn chat_response_text_only() {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        output_blocks: vec![],
     };
 
     assert_eq!(resp.text_or_empty(), "Hello world");
@@ -169,6 +142,7 @@ fn chat_response_with_tool_calls() {
         }],
         usage: None,
         reasoning_content: None,
+        output_blocks: vec![],
     };
 
     assert!(resp.has_tool_calls());
@@ -183,6 +157,7 @@ fn chat_response_text_or_empty_handles_none() {
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
+        output_blocks: vec![],
     };
 
     assert_eq!(resp.text_or_empty(), "");
@@ -208,6 +183,7 @@ fn chat_response_multiple_tool_calls() {
         ],
         usage: None,
         reasoning_content: None,
+        output_blocks: vec![],
     };
 
     assert!(resp.has_tool_calls());
@@ -308,23 +284,4 @@ fn chat_messages_maintain_role_sequence() {
     assert_eq!(history[2].role, "assistant");
     assert_eq!(history[3].role, "user");
     assert_eq!(history[4].role, "assistant");
-}
-
-#[test]
-fn chat_messages_with_tool_calls_maintain_sequence() {
-    let history = [
-        ChatMessage::system("You are helpful"),
-        ChatMessage::user("Search for Rust"),
-        ChatMessage::assistant("I'll search for that"),
-        ChatMessage::tool(r#"{"tool_call_id": "tc_1", "content": "search results"}"#),
-        ChatMessage::assistant("Based on the search results..."),
-    ];
-
-    assert_eq!(history.len(), 5);
-    assert_eq!(history[3].role, "tool");
-    assert_eq!(history[4].role, "assistant");
-
-    // Verify tool message content is valid JSON with tool_call_id
-    let tool_content: serde_json::Value = serde_json::from_str(&history[3].content).unwrap();
-    assert!(tool_content.get("tool_call_id").is_some());
 }

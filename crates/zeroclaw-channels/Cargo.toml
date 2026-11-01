@@ -17,6 +17,8 @@ zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-runtime.workspace = true
+zeroclaw-kernel.workspace = true
+zeroclaw-session-host.workspace = true
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools = { workspace = true, optional = true }
 anyhow = "1.0"
@@ -177,7 +179,7 @@ thiserror = { version = "2.0", optional = true }
 
 [features]
 default = ["default-channels"]
-test-util = []
+test-util = ["zeroclaw-infra/test-util"]
 default-channels = [
   "channel-acp-server",
   "channel-discord",
@@ -291,6 +293,8 @@ voice-wake = ["dep:cpal"]
 libc = "0.2"
 
 [dev-dependencies]
+zeroclaw-infra = { workspace = true, features = ["test-util"] }
+zeroclaw-session-host.workspace = true
 # Enables the runtime crate's test-only `ScopedToolRegistry::from_raw_for_test`
 # so channel test fixtures can mint the now-sealed `ChannelRuntimeContext`
 # tools registry. dev-dependency only: never enabled in the shipped channels lib.

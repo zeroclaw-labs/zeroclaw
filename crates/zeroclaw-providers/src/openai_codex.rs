@@ -2,7 +2,6 @@ use crate::ModelProviderRuntimeOptions;
 use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
-use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
@@ -38,7 +37,7 @@ pub struct OpenAiCodexModelProvider {
     reasoning_effort: Option<String>,
     /// The configured `[multimodal]` policy.
     ///
-    /// This provider normalizes image markers on its own boundary, and that
+    /// This provider normalizes image references on its own boundary, and that
     /// normalization decodes pixels and applies `max_images` /
     /// `max_image_size_mb`. Holding the configured policy keeps the boundary
     /// pass on the same rules the runtime already applied instead of silently
@@ -90,6 +89,13 @@ struct ResponsesReasoningOptions {
 #[derive(Debug, Deserialize)]
 struct ResponsesResponse {
     #[serde(default)]
+    model: Option<String>,
+
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    incomplete_details: Option<Value>,
+    #[serde(default)]
     output: Vec<Value>,
     #[serde(default)]
     output_text: Option<String>,
@@ -99,15 +105,29 @@ struct ResponsesResponse {
 
 #[derive(Debug, Default)]
 pub(crate) struct ResponsesStreamState {
-    pub(crate) saw_text_delta: bool,
+    // This decoding cursor records which protocol text components have
+    // already crossed the output boundary; it never retains their bytes.
+    emitted_text_parts: HashMap<(String, usize), Vec<std::ops::Range<usize>>>,
     pub(crate) saw_completion: bool,
     pub(crate) text_accumulator: String,
     pub(crate) fallback_text: Option<String>,
     pub(crate) tool_calls: HashMap<String, PendingToolCall>,
     pub(crate) emitted_tool_call_ids: HashSet<String>,
     pub(crate) collected_tool_calls: Vec<ProviderToolCall>,
-    pub(crate) output_items: Vec<Value>,
+    output_items: Vec<ResponsesOutputItem>,
     pub(crate) usage: Option<TokenUsage>,
+}
+
+impl ResponsesStreamState {
+    pub(crate) fn saw_text_delta(&self) -> bool {
+        !self.emitted_text_parts.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct ResponsesOutputItem {
+    output_index: Option<u64>,
+    item: Value,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -120,6 +140,7 @@ pub(crate) struct PendingToolCall {
 
 #[derive(Debug, Default)]
 pub(crate) struct ResponsesTurnResult {
+    pub(crate) output_blocks: Vec<zeroclaw_api::model_provider::ProviderOutputBlock>,
     pub(crate) text: Option<String>,
     pub(crate) tool_calls: Vec<ProviderToolCall>,
     pub(crate) reasoning_content: Option<String>,
@@ -276,16 +297,6 @@ fn response_message_item(role: &str, content: Vec<Value>) -> Value {
     })
 }
 
-fn legacy_tool_output_message(content: &str) -> Value {
-    response_message_item(
-        "user",
-        vec![serde_json::json!({
-            "type": "input_text",
-            "text": format!("Legacy tool output without call_id:\n{content}"),
-        })],
-    )
-}
-
 fn response_item_type(item: &Value) -> Option<&str> {
     item.get("type").and_then(Value::as_str)
 }
@@ -359,6 +370,8 @@ pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
 }
 
 pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+    let projected = crate::multimodal::project_attachment_metadata(messages);
+    let messages = projected.as_ref();
     let mut system_parts: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
 
@@ -367,7 +380,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
             "system" => system_parts.push(&msg.content),
             "user" => {
                 let (cleaned_text, image_refs) =
-                    multimodal::parse_user_message_image_refs(&msg.content);
+                    (msg.content.clone(), multimodal::message_image_refs(msg));
 
                 let mut content_items = Vec::new();
 
@@ -395,7 +408,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                 input.push(response_message_item("user", content_items));
             }
             "assistant" => {
-                if let Ok(value) = serde_json::from_str::<Value>(&msg.content)
+                if let Some(value) = crate::tool_protocol::tool_message_value(msg)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
@@ -456,26 +469,21 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                 }
             }
             "tool" => {
-                if let Ok(value) = serde_json::from_str::<Value>(&msg.content) {
-                    if let Some(call_id) = value
+                if let Some(value) = crate::tool_protocol::tool_message_value(msg)
+                    && let Some(call_id) = value
                         .get("tool_call_id")
                         .and_then(Value::as_str)
                         .and_then(|id| first_nonempty(Some(id)))
-                    {
-                        let output = value
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        input.push(serde_json::json!({
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": output,
-                        }));
-                    } else if !msg.content.trim().is_empty() {
-                        input.push(legacy_tool_output_message(&msg.content));
-                    }
-                } else if !msg.content.trim().is_empty() {
-                    input.push(legacy_tool_output_message(&msg.content));
+                {
+                    let output = value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    }));
                 }
             }
             _ => {}
@@ -539,24 +547,24 @@ pub(crate) fn nonempty_preserve(text: Option<&str>) -> Option<String> {
 }
 
 fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
-    if let Some(text) = first_nonempty(response.output_text.as_deref()) {
+    if let Some(text) = nonempty_preserve(response.output_text.as_deref()) {
         return Some(text);
     }
-
-    for item in &response.output {
-        if response_item_type(item) != Some("message") {
-            continue;
-        }
-
-        if let Some(parts) = item.get("content").and_then(Value::as_array) {
-            for content in parts {
-                if response_item_type(content) == Some("output_text")
-                    && let Some(text) = first_nonempty(content.get("text").and_then(Value::as_str))
-                {
-                    return Some(text);
-                }
-            }
-        }
+    let text = response
+        .output
+        .iter()
+        .filter(|item| response_item_type(item) == Some("message"))
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|part| matches!(response_item_type(part), Some("text" | "output_text")))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    if !text.is_empty() {
+        return Some(text);
     }
 
     for item in &response.output {
@@ -576,27 +584,29 @@ fn extract_responses_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToo
     response
         .output
         .iter()
-        .filter(|item| response_item_type(item) == Some("function_call"))
-        .filter_map(|item| {
-            let name = item.get("name").and_then(Value::as_str)?.to_string();
-            let arguments = item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            Some(ProviderToolCall {
-                id: item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("id").and_then(Value::as_str))
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                name,
-                arguments,
-                extra_content: None,
-            })
-        })
+        .filter_map(responses_tool_call)
         .collect()
+}
+
+fn responses_tool_call(item: &Value) -> Option<ProviderToolCall> {
+    if response_item_type(item) != Some("function_call") {
+        return None;
+    }
+    Some(ProviderToolCall {
+        id: item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        name: item.get("name").and_then(Value::as_str)?.to_string(),
+        arguments: item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        extra_content: None,
+    })
 }
 
 fn responses_turn_from_response(response: &ResponsesResponse) -> ResponsesTurnResult {
@@ -604,7 +614,20 @@ fn responses_turn_from_response(response: &ResponsesResponse) -> ResponsesTurnRe
     let reasoning_content =
         encode_responses_history_items(&response.output, !tool_calls.is_empty());
 
+    let mut output_blocks = crate::output::responses_blocks(&response.output);
+    if let Some(model) = &response.model {
+        output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {metadata:serde_json::json!({"kind":"served_attribution","protocol":"responses","model":model})});
+    }
+    output_blocks.push(
+        zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+            metadata: serde_json::json!({
+                "kind":"finish", "protocol":"responses", "status":response.status,
+                "incomplete_details":response.incomplete_details,
+            }),
+        },
+    );
     ResponsesTurnResult {
+        output_blocks,
         text: extract_responses_text(response),
         tool_calls,
         reasoning_content,
@@ -634,58 +657,232 @@ pub(crate) fn parse_responses_usage(usage: Option<&Value>) -> Option<TokenUsage>
     )
 }
 
-fn record_responses_output_item(state: &mut ResponsesStreamState, item: Value) {
-    if !is_replayable_responses_output_item(&item) {
-        return;
-    }
-
+fn record_responses_output_item(
+    state: &mut ResponsesStreamState,
+    output_index: Option<u64>,
+    item: Value,
+) -> Option<Value> {
     let item_id = item
         .get("id")
         .and_then(Value::as_str)
         .or_else(|| item.get("call_id").and_then(Value::as_str));
-    if let Some(item_id) = item_id
-        && state.output_items.iter().any(|existing| {
-            existing
-                .get("id")
-                .and_then(Value::as_str)
-                .or_else(|| existing.get("call_id").and_then(Value::as_str))
-                == Some(item_id)
-        })
-    {
-        return;
+    // A protocol coordinate identifies the item even if a compatible server
+    // changes or omits its ID. Bind unidentified done items only once when
+    // their terminal coordinate becomes available.
+    if let Some(existing) = state.output_items.iter_mut().find(|existing| {
+        if let (Some(left), Some(right)) = (existing.output_index, output_index) {
+            return left == right;
+        }
+        let existing_id = existing
+            .item
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| existing.item.get("call_id").and_then(Value::as_str));
+        match (existing_id, item_id) {
+            (Some(left), Some(right)) => left == right,
+            _ => existing.output_index.is_none() && output_index.is_some() && existing.item == item,
+        }
+    }) {
+        if existing.output_index.is_none() {
+            existing.output_index = output_index;
+        }
+        return Some(std::mem::replace(&mut existing.item, item));
     }
-
-    state.output_items.push(item);
+    state
+        .output_items
+        .push(ResponsesOutputItem { output_index, item });
+    None
 }
 
 fn replace_responses_output_items(state: &mut ResponsesStreamState, items: &[Value]) {
-    let replay_items = items
-        .iter()
-        .filter(|item| is_replayable_responses_output_item(item))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if !replay_items.is_empty() {
-        state.output_items = replay_items;
+    if !items.is_empty() {
+        state.output_items = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| ResponsesOutputItem {
+                output_index: u64::try_from(index).ok(),
+                item: item.clone(),
+            })
+            .collect();
     }
 }
 
-fn response_output_text_from_event_item(item: &Value) -> Option<String> {
-    if item.get("type").and_then(Value::as_str) != Some("message") {
-        return None;
-    }
+fn text_part_key(
+    item_id: Option<&str>,
+    output_index: Option<u64>,
+    content_index: usize,
+) -> (String, usize) {
+    (
+        output_index
+            .map(|index| format!("output:{index}"))
+            .or_else(|| item_id.map(|id| format!("item:{id}")))
+            .unwrap_or_else(|| "unattributed".into()),
+        content_index,
+    )
+}
 
-    item.get("content")
-        .and_then(Value::as_array)
-        .and_then(|parts| {
-            parts.iter().find_map(|part| {
-                if part.get("type").and_then(Value::as_str) == Some("output_text") {
-                    first_nonempty(part.get("text").and_then(Value::as_str))
-                } else {
-                    None
-                }
+fn emit_content_position(
+    output_index: Option<u64>,
+    content_index: Option<u64>,
+    emitted: &mut Vec<StreamEvent>,
+) {
+    if let Some(output_index) = output_index {
+        emitted.push(StreamEvent::ContentPosition(
+            zeroclaw_api::model_provider::ProviderContentPosition {
+                output_index,
+                content_index,
+            },
+        ));
+    }
+}
+
+fn bind_responses_text_part(
+    item_id: Option<&str>,
+    output_index: Option<u64>,
+    content_index: usize,
+    state: &mut ResponsesStreamState,
+) -> (String, usize) {
+    let key = text_part_key(item_id, output_index, content_index);
+    if !state.emitted_text_parts.contains_key(&key) {
+        let prior = item_id
+            .and_then(|id| {
+                state
+                    .emitted_text_parts
+                    .remove(&(format!("item:{id}"), content_index))
             })
-        })
+            .or_else(|| {
+                // Older compatible streams omitted the component identity.
+                state
+                    .emitted_text_parts
+                    .remove(&("unattributed".into(), content_index))
+            });
+        if let Some(ranges) = prior {
+            state.emitted_text_parts.insert(key.clone(), ranges);
+        }
+    }
+    key
+}
+
+fn emit_responses_text_delta(
+    text: &str,
+    key: (String, usize),
+    output_index: Option<u64>,
+    state: &mut ResponsesStreamState,
+    emitted: &mut Vec<StreamEvent>,
+) {
+    let content_index = key.1;
+    let start = state.text_accumulator.len();
+    state.text_accumulator.push_str(text);
+    let end = state.text_accumulator.len();
+    let ranges = state.emitted_text_parts.entry(key).or_default();
+    if let Some(previous) = ranges.last_mut()
+        && previous.end == start
+    {
+        previous.end = end;
+    } else {
+        ranges.push(start..end);
+    }
+    emit_content_position(output_index, u64::try_from(content_index).ok(), emitted);
+    emitted.push(StreamEvent::TextDelta(StreamChunk::delta(text)));
+}
+
+fn emit_responses_text_part(
+    text: Option<&str>,
+    item_id: Option<&str>,
+    output_index: Option<u64>,
+    content_index: usize,
+    evidence: &Value,
+    state: &mut ResponsesStreamState,
+    emitted: &mut Vec<StreamEvent>,
+) -> anyhow::Result<()> {
+    let Some(text) = text else {
+        return Ok(());
+    };
+    let key = bind_responses_text_part(item_id, output_index, content_index, state);
+    let mut offset = 0;
+    // The cursor only indexes ranges in the existing canonical accumulator;
+    // a done frame can supply a suffix without retaining a second text copy.
+    for range in state.emitted_text_parts.get(&key).into_iter().flatten() {
+        let observed = &state.text_accumulator[range.clone()];
+        if !text
+            .get(offset..)
+            .is_some_and(|remaining| remaining.starts_with(observed))
+        {
+            let detail = serde_json::json!({
+                "item_id":item_id,
+                "output_index":output_index,
+                "content_index":content_index,
+                "completion":evidence,
+            });
+            return Err(StreamError::InvalidSse(format!(
+                "Responses text completion contradicts previously observed text ({}): {detail}",
+                evidence
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message")
+            ))
+            .into());
+        }
+        offset += observed.len();
+    }
+    if let Some(suffix) = text.get(offset..).filter(|suffix| !suffix.is_empty()) {
+        emit_responses_text_delta(suffix, key, output_index, state, emitted);
+    }
+    Ok(())
+}
+
+fn emit_responses_message_parts(
+    item: &Value,
+    output_index: Option<u64>,
+    previous_item: Option<&Value>,
+    state: &mut ResponsesStreamState,
+    emitted: &mut Vec<StreamEvent>,
+) -> anyhow::Result<()> {
+    let Some(parts) = item.get("content").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if crate::output::message_metadata(item)
+        != previous_item.and_then(crate::output::message_metadata)
+        && let Some(metadata) = crate::output::message_metadata(item)
+    {
+        emit_content_position(output_index, None, emitted);
+        emitted.push(StreamEvent::ProtocolMetadata(metadata));
+    }
+    for (content_index, part) in parts.iter().enumerate() {
+        if matches!(
+            part.get("type").and_then(Value::as_str),
+            Some("text" | "output_text")
+        ) {
+            emit_responses_text_part(
+                part.get("text").and_then(Value::as_str),
+                item.get("id").and_then(Value::as_str),
+                output_index,
+                content_index,
+                item,
+                state,
+                emitted,
+            )?;
+        } else if previous_item
+            .and_then(|item| item.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|parts| parts.get(content_index))
+            != Some(part)
+        {
+            emit_content_position(output_index, u64::try_from(content_index).ok(), emitted);
+            emitted.push(StreamEvent::OutputBlock(crate::output::content_block(part)));
+        }
+        if previous_item
+            .and_then(|item| item.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|parts| parts.get(content_index))
+            != Some(part)
+            && let Some(metadata) = crate::output::content_metadata(part)
+        {
+            emit_content_position(output_index, u64::try_from(content_index).ok(), emitted);
+            emitted.push(StreamEvent::OutputBlock(metadata));
+        }
+    }
+    Ok(())
 }
 
 fn pending_tool_call_key(item_id: Option<&str>, output_index: Option<u64>) -> Option<String> {
@@ -706,42 +903,112 @@ fn emit_tool_call(
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct ResponsesStreamApiError(pub(crate) String);
-
-impl std::fmt::Display for ResponsesStreamApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OpenAI responses stream error: {}", self.0)
-    }
-}
-
-impl std::error::Error for ResponsesStreamApiError {}
+pub(crate) type ResponsesStreamApiError = crate::dispatch::ProviderProtocolFailure;
 
 pub(crate) fn process_responses_stream_event(
     event: Value,
     state: &mut ResponsesStreamState,
 ) -> anyhow::Result<Vec<StreamEvent>> {
-    if let Some(message) = extract_stream_error_message(&event) {
-        return Err(ResponsesStreamApiError(message).into());
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("error" | "response.failed")
+    ) {
+        return Err(ResponsesStreamApiError::new(event).into());
     }
 
     let mut emitted = Vec::new();
+    if let Some(model) = event
+        .get("response")
+        .and_then(|r| r.get("model"))
+        .and_then(Value::as_str)
+    {
+        emitted.push(StreamEvent::ProtocolMetadata(
+            serde_json::json!({"kind":"served_attribution","protocol":"responses","model":model}),
+        ));
+    }
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("response.output_text.delta" | "response.output_text.done")
+    ) {
+        let fields: serde_json::Map<String, Value> = ["annotations", "logprobs"]
+            .into_iter()
+            .filter_map(|key| event.get(key).map(|value| (key.into(), value.clone())))
+            .collect();
+        if !fields.is_empty() {
+            emit_content_position(
+                event.get("output_index").and_then(Value::as_u64),
+                event.get("content_index").and_then(Value::as_u64),
+                &mut emitted,
+            );
+            emitted.push(StreamEvent::ProtocolMetadata(serde_json::json!({"kind":"content_metadata","type_name":"output_text","fields":fields})));
+        }
+    }
     match event.get("type").and_then(Value::as_str) {
         Some("response.output_text.delta") => {
             if let Some(text) = nonempty_preserve(event.get("delta").and_then(Value::as_str)) {
-                state.saw_text_delta = true;
-                state.text_accumulator.push_str(&text);
-                emitted.push(StreamEvent::TextDelta(StreamChunk::delta(text)));
+                let output_index = event.get("output_index").and_then(Value::as_u64);
+                let key = bind_responses_text_part(
+                    event.get("item_id").and_then(Value::as_str),
+                    output_index,
+                    event
+                        .get("content_index")
+                        .and_then(Value::as_u64)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .unwrap_or(0),
+                    state,
+                );
+                emit_responses_text_delta(&text, key, output_index, state, &mut emitted);
             }
         }
-        Some("response.output_text.done") if !state.saw_text_delta => {
-            state.fallback_text = nonempty_preserve(event.get("text").and_then(Value::as_str));
+        Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
+            if let Some(text) = nonempty_preserve(event.get("delta").and_then(Value::as_str)) {
+                emit_content_position(
+                    event.get("output_index").and_then(Value::as_u64),
+                    None,
+                    &mut emitted,
+                );
+                emitted.push(StreamEvent::ThinkingDelta(text));
+            }
+        }
+        Some("response.output_text.done") => {
+            emit_responses_text_part(
+                event.get("text").and_then(Value::as_str),
+                event.get("item_id").and_then(Value::as_str),
+                event.get("output_index").and_then(Value::as_u64),
+                event
+                    .get("content_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .unwrap_or(0),
+                &event,
+                state,
+                &mut emitted,
+            )?;
         }
         Some("response.output_item.added") => {
             let item = event.get("item");
             let item_type = item
                 .and_then(|value| value.get("type"))
                 .and_then(Value::as_str);
+            if let Some(item) = item {
+                let metadata = if item_type == Some("message") {
+                    crate::output::message_metadata(item).map(|metadata| {
+                        zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                            metadata,
+                        }
+                    })
+                } else {
+                    crate::output::content_metadata(item)
+                };
+                if let Some(metadata) = metadata {
+                    emit_content_position(
+                        event.get("output_index").and_then(Value::as_u64),
+                        None,
+                        &mut emitted,
+                    );
+                    emitted.push(StreamEvent::OutputBlock(metadata));
+                }
+            }
             if item_type == Some("function_call") {
                 let key = pending_tool_call_key(
                     item.and_then(|value| value.get("id"))
@@ -771,6 +1038,19 @@ pub(crate) fn process_responses_stream_event(
                 }
             }
         }
+        Some("response.output_text.annotation.added") => {
+            if let Some(annotation) = event.get("annotation") {
+                emit_content_position(
+                    event.get("output_index").and_then(Value::as_u64),
+                    event.get("content_index").and_then(Value::as_u64),
+                    &mut emitted,
+                );
+                emitted.push(StreamEvent::ProtocolMetadata(serde_json::json!({
+                    "kind":"content_metadata", "type_name":"output_text",
+                    "fields":{"annotations":[annotation]}, "annotation_index":event.get("annotation_index"),
+                })));
+            }
+        }
         Some("response.function_call_arguments.delta") => {
             if let Some(key) = pending_tool_call_key(
                 event.get("item_id").and_then(Value::as_str),
@@ -787,6 +1067,11 @@ pub(crate) fn process_responses_stream_event(
                         .and_then(Value::as_str)
                         .unwrap_or_default(),
                 );
+                emitted.push(StreamEvent::ProtocolMetadata(serde_json::json!({
+                    "kind":"tool_arguments_delta", "protocol":"responses",
+                    "item_id":event.get("item_id"), "output_index":event.get("output_index"),
+                    "delta":event.get("delta"),
+                })));
             }
         }
         Some("response.function_call_arguments.done") => {
@@ -831,65 +1116,173 @@ pub(crate) fn process_responses_stream_event(
                     extra_content: None,
                 };
                 if let Some(tool_call) = emit_tool_call(state, tool_call) {
+                    emit_content_position(
+                        event.get("output_index").and_then(Value::as_u64),
+                        None,
+                        &mut emitted,
+                    );
                     emitted.push(StreamEvent::ToolCall(tool_call));
                 }
             }
         }
         Some("response.output_item.done") => {
             if let Some(item) = event.get("item") {
-                record_responses_output_item(state, item.clone());
-                match item.get("type").and_then(Value::as_str) {
-                    Some("message") if !state.saw_text_delta && state.fallback_text.is_none() => {
-                        state.fallback_text = response_output_text_from_event_item(item);
+                let previous_item = record_responses_output_item(
+                    state,
+                    event.get("output_index").and_then(Value::as_u64),
+                    item.clone(),
+                );
+                let first_observation = previous_item.is_none();
+                if item.get("type").and_then(Value::as_str) == Some("function_call")
+                    && let Some(metadata) = crate::output::content_metadata(item)
+                {
+                    emit_content_position(
+                        event.get("output_index").and_then(Value::as_u64),
+                        None,
+                        &mut emitted,
+                    );
+                    emitted.push(StreamEvent::OutputBlock(metadata));
+                }
+                if item.get("type").and_then(Value::as_str) == Some("message") {
+                    emit_responses_message_parts(
+                        item,
+                        event.get("output_index").and_then(Value::as_u64),
+                        previous_item.as_ref(),
+                        state,
+                        &mut emitted,
+                    )?;
+                } else if first_observation
+                    && item.get("type").and_then(Value::as_str) != Some("function_call")
+                {
+                    for block in crate::output::content_blocks(item) {
+                        emit_content_position(
+                            event.get("output_index").and_then(Value::as_u64),
+                            None,
+                            &mut emitted,
+                        );
+                        emitted.push(StreamEvent::OutputBlock(block));
                     }
-                    Some("function_call") => {
-                        if let Some(name) = item.get("name").and_then(Value::as_str) {
-                            let tool_call = ProviderToolCall {
-                                id: item
-                                    .get("call_id")
-                                    .and_then(Value::as_str)
-                                    .or_else(|| item.get("id").and_then(Value::as_str))
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                name: name.to_string(),
-                                arguments: item
-                                    .get("arguments")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                extra_content: None,
-                            };
-                            if let Some(tool_call) = emit_tool_call(state, tool_call) {
-                                emitted.push(StreamEvent::ToolCall(tool_call));
-                            }
-                        }
-                    }
-                    _ => {}
+                }
+                if first_observation
+                    && let Some(tool_call) = responses_tool_call(item)
+                    && let Some(tool_call) = emit_tool_call(state, tool_call)
+                {
+                    emit_content_position(
+                        event.get("output_index").and_then(Value::as_u64),
+                        None,
+                        &mut emitted,
+                    );
+                    emitted.push(StreamEvent::ToolCall(tool_call));
                 }
             }
         }
         Some(event_type @ ("response.completed" | "response.done")) => {
             state.saw_completion = true;
+            emitted.push(StreamEvent::ProtocolMetadata(serde_json::json!({
+                "kind":"finish", "protocol":"responses", "event_type":event_type,
+                "status":event.get("response").and_then(|r|r.get("status")),
+                "incomplete_details":event.get("response").and_then(|r|r.get("incomplete_details")),
+            })));
             let is_completed = event_type == "response.completed";
             if let Some(response) = event
                 .get("response")
                 .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
             {
-                if !state.saw_text_delta && state.fallback_text.is_none() {
+                if !state.saw_text_delta() && state.fallback_text.is_none() {
                     state.fallback_text = extract_responses_text(&response);
                 }
-                replace_responses_output_items(state, &response.output);
-                for tool_call in extract_responses_tool_calls(&response) {
-                    if let Some(tool_call) = emit_tool_call(state, tool_call) {
-                        emitted.push(StreamEvent::ToolCall(tool_call));
+                // Only done items have entered output_items. A terminal-only
+                // response must deliver semantic blocks that had no item.done
+                // frame; reuse that canonical parser state for deduplication.
+                for (output_index, item) in response.output.iter().enumerate() {
+                    let previous_item = record_responses_output_item(
+                        state,
+                        u64::try_from(output_index).ok(),
+                        item.clone(),
+                    );
+                    let first_observation = previous_item.is_none();
+                    if item.get("type").and_then(Value::as_str) == Some("message") {
+                        emit_responses_message_parts(
+                            item,
+                            u64::try_from(output_index).ok(),
+                            previous_item.as_ref(),
+                            state,
+                            &mut emitted,
+                        )?;
+                        continue;
+                    }
+                    if first_observation {
+                        if let Some(tool_call) = responses_tool_call(item) {
+                            if let Some(metadata) = crate::output::content_metadata(item) {
+                                emit_content_position(
+                                    u64::try_from(output_index).ok(),
+                                    None,
+                                    &mut emitted,
+                                );
+                                emitted.push(StreamEvent::OutputBlock(metadata));
+                            }
+                            if let Some(tool_call) = emit_tool_call(state, tool_call) {
+                                emit_content_position(
+                                    u64::try_from(output_index).ok(),
+                                    None,
+                                    &mut emitted,
+                                );
+                                emitted.push(StreamEvent::ToolCall(tool_call));
+                            }
+                            continue;
+                        }
+                        for block in crate::output::responses_blocks(std::slice::from_ref(item)) {
+                            if !matches!(
+                                block,
+                                zeroclaw_api::model_provider::ProviderOutputBlock::Text { .. }
+                                    | zeroclaw_api::model_provider::ProviderOutputBlock::ToolCall { .. }
+                            ) {
+                                emit_content_position(
+                                    u64::try_from(output_index).ok(),
+                                    None,
+                                    &mut emitted,
+                                );
+                                emitted.push(StreamEvent::OutputBlock(block));
+                            }
+                        }
                     }
                 }
+                replace_responses_output_items(state, &response.output);
                 if is_completed && let Some(usage) = parse_responses_usage(response.usage.as_ref())
                 {
                     state.usage = Some(usage.clone());
                     emitted.push(StreamEvent::Usage(usage));
                 }
             }
+        }
+        Some(kind)
+            if kind.starts_with("response.")
+                && (kind.contains("_call.") || kind.contains("_call_")) =>
+        {
+            emit_content_position(
+                event.get("output_index").and_then(Value::as_u64),
+                event.get("content_index").and_then(Value::as_u64),
+                &mut emitted,
+            );
+            emitted.push(StreamEvent::ProtocolMetadata(serde_json::json!({
+                "kind":"provider_tool_activity", "protocol":"responses", "activity":event,
+            })));
+        }
+        Some(kind)
+            if kind.starts_with("response.output_")
+                || kind.starts_with("response.content_part.")
+                || kind.starts_with("response.reasoning_") =>
+        {
+            emit_content_position(
+                event.get("output_index").and_then(Value::as_u64),
+                event.get("content_index").and_then(Value::as_u64),
+                &mut emitted,
+            );
+            emitted.push(StreamEvent::ProtocolMetadata(serde_json::json!({
+                "kind":"partial_content", "protocol":"responses", "type_name":kind,
+                "component": if kind.contains("reasoning") {"reasoning"} else {"opaque"},
+                "activity":event,
+            })));
         }
         _ => {}
     }
@@ -945,14 +1338,24 @@ pub(crate) fn process_sse_chunk(
                     })),
                 "openai_codex: SSE data parse failed"
             );
-            anyhow::Error::msg(format!(
-                "OpenAI Codex SSE data parse failed: {err}. Payload: {sanitized}"
+            anyhow::Error::new(err).context(format!(
+                "OpenAI Codex SSE data parse failed. Payload: {sanitized}"
             ))
         })?;
         emitted.extend(process_responses_stream_event(event, state)?);
     }
 
     Ok(emitted)
+}
+
+pub(crate) fn incomplete_responses_sse_error(buffer: &str) -> Option<StreamError> {
+    if buffer.trim().is_empty() {
+        return None;
+    }
+    let detail = super::scrub_secret_patterns(buffer);
+    Some(StreamError::InvalidSse(format!(
+        "Responses stream ended before an SSE frame delimiter: {detail}"
+    )))
 }
 
 fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
@@ -969,62 +1372,71 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
         process_sse_chunk(&buffer, &mut state)?;
     }
 
-    Ok(ResponsesTurnResult {
-        text: if state.saw_text_delta {
+    Ok(responses_turn_from_state(state))
+}
+
+fn responses_turn_from_state(state: ResponsesStreamState) -> ResponsesTurnResult {
+    let saw_text_delta = state.saw_text_delta();
+    let mut output_items = state.output_items;
+    output_items.sort_by(
+        |left, right| match (left.output_index, right.output_index) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
+    );
+    let output_items: Vec<_> = output_items.into_iter().map(|entry| entry.item).collect();
+    ResponsesTurnResult {
+        output_blocks: crate::output::responses_blocks(&output_items),
+        text: if saw_text_delta {
             nonempty_preserve(Some(&state.text_accumulator))
         } else {
             state.fallback_text
         },
         reasoning_content: encode_responses_history_items(
-            &state.output_items,
+            &output_items,
             !state.collected_tool_calls.is_empty(),
         ),
         tool_calls: state.collected_tool_calls,
         usage: state.usage,
-    })
+    }
+}
+
+async fn observe_responses_sse_chunk(
+    chunk: &str,
+    state: &mut ResponsesStreamState,
+) -> anyhow::Result<()> {
+    let mut events = process_sse_chunk(chunk, state)?;
+    if state.saw_completion
+        && !state.saw_text_delta()
+        && let Some(text) = state.fallback_text.clone()
+    {
+        emit_responses_text_delta(&text, ("unattributed".into(), 0), None, state, &mut events);
+    }
+    for event in events {
+        crate::dispatch::capture::observe_adapter_event(&event).await?;
+    }
+    Ok(())
 }
 
 fn ensure_nonempty_responses_turn(
     result: ResponsesTurnResult,
     empty_error: impl FnOnce() -> anyhow::Error,
 ) -> anyhow::Result<ResponsesTurnResult> {
-    if result.text.as_deref().is_some_and(|text| !text.is_empty()) || !result.tool_calls.is_empty()
+    if result.text.as_deref().is_some_and(|text| !text.is_empty())
+        || !result.tool_calls.is_empty()
+        || result.output_blocks.iter().any(|block| {
+            matches!(
+                block,
+                zeroclaw_api::model_provider::ProviderOutputBlock::Media { .. }
+            )
+        })
     {
         Ok(result)
     } else {
         Err(empty_error())
     }
-}
-
-pub(crate) fn extract_stream_error_message(event: &Value) -> Option<String> {
-    let event_type = event.get("type").and_then(Value::as_str);
-
-    if event_type == Some("error") {
-        return first_nonempty(
-            event
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| event.get("code").and_then(Value::as_str))
-                .or_else(|| {
-                    event
-                        .get("error")
-                        .and_then(|error| error.get("message"))
-                        .and_then(Value::as_str)
-                }),
-        );
-    }
-
-    if event_type == Some("response.failed") {
-        return first_nonempty(
-            event
-                .get("response")
-                .and_then(|response| response.get("error"))
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str),
-        );
-    }
-
-    None
 }
 
 pub(crate) fn append_utf8_stream_chunk(
@@ -1073,9 +1485,8 @@ pub(crate) fn append_utf8_stream_chunk(
                         })),
                     "openai_codex: response contained invalid UTF-8"
                 );
-                return Err(anyhow::Error::msg(format!(
-                    "OpenAI Codex response contained invalid UTF-8: {err}"
-                )));
+                return Err(anyhow::Error::new(err)
+                    .context("OpenAI Codex response contained invalid UTF-8"));
             }
 
             // `error_len == None` means we have a valid prefix and an incomplete
@@ -1117,8 +1528,8 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
                 })),
             "openai_codex: JSON parse failed"
         );
-        anyhow::Error::msg(format!(
-            "OpenAI Codex JSON parse failed: {err}. Payload: {sanitized}"
+        anyhow::Error::new(err).context(format!(
+            "OpenAI Codex JSON parse failed. Payload: {sanitized}"
         ))
     })?;
     let result = responses_turn_from_response(&parsed);
@@ -1138,6 +1549,13 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<ResponsesTurnResult> {
     let mut body = String::new();
     let mut pending_utf8 = Vec::new();
+    let mut state = ResponsesStreamState::default();
+    let mut is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -1152,9 +1570,36 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
                     })),
                 "openai_codex: error reading response stream"
             );
-            anyhow::Error::msg(format!("error reading OpenAI Codex response stream: {err}"))
+            anyhow::Error::new(super::stream_read_error(
+                &err,
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+            ))
+            .context("error reading OpenAI Codex response stream")
         })?;
-        append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes)?;
+        let decode_result = append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes);
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some() {
+            anyhow::ensure!(
+                body.len() <= 32 * 1024 * 1024,
+                "session_capture_wire_frame_limit_exceeded"
+            );
+        }
+        is_sse |= body.trim_start().starts_with("event:") || body.trim_start().starts_with("data:");
+        if is_sse {
+            body = body.replace("\r\n", "\n");
+            while let Some(end) = body.find("\n\n") {
+                let chunk = body[..end].to_string();
+                body.drain(..end + 2);
+                observe_responses_sse_chunk(&chunk, &mut state).await?;
+                if state.saw_completion {
+                    body.clear();
+                    break;
+                }
+            }
+        }
+        decode_result?;
+        if state.saw_completion {
+            break;
+        }
     }
 
     if !pending_utf8.is_empty() {
@@ -1183,12 +1628,34 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
                 .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
             "openai_codex: response ended with incomplete UTF-8"
         );
-        return Err(anyhow::Error::msg(format!(
-            "OpenAI Codex response ended with incomplete UTF-8: {err}"
-        )));
+        return Err(
+            anyhow::Error::new(err).context("OpenAI Codex response ended with incomplete UTF-8")
+        );
     }
 
-    parse_responses_body(&body)
+    let result = if is_sse {
+        if let Some(error) = incomplete_responses_sse_error(&body) {
+            return Err(error.into());
+        }
+        anyhow::ensure!(state.saw_completion, "stream_eof_without_final");
+        ensure_nonempty_responses_turn(responses_turn_from_state(state), || {
+            anyhow::Error::msg("codex_empty_sse_response")
+        })?
+    } else {
+        parse_responses_body(&body)?
+    };
+    crate::dispatch::capture::observe_adapter_response(
+        &ProviderChatResponse {
+            output_blocks: result.output_blocks.clone(),
+            text: result.text.clone(),
+            tool_calls: result.tool_calls.clone(),
+            usage: result.usage.clone(),
+            reasoning_content: result.reasoning_content.clone(),
+        },
+        is_sse,
+    )
+    .await?;
+    Ok(result)
 }
 
 struct ResolvedCodexCredentials {
@@ -1422,6 +1889,12 @@ impl OpenAiCodexModelProvider {
         match decode_responses_body(response).await {
             Ok(result) => Ok(result),
             Err(stream_err) => {
+                // Native dispatch owns one physical attempt. An unresolved
+                // response must reach its recorder before any new request;
+                // never hide a second effect in this decoder fallback.
+                if zeroclaw_api::session_events::capture::current_provider_admission().is_some() {
+                    return Err(stream_err);
+                }
                 if stream_err
                     .downcast_ref::<ResponsesStreamApiError>()
                     .is_some()
@@ -1527,7 +2000,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        // Normalize image markers: convert file paths to data URIs, under the
+        // Normalize image references: convert file paths to data URIs, under the
         // configured policy rather than defaults.
         let prepared =
             crate::multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
@@ -1553,6 +2026,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             .await?;
 
         Ok(ProviderChatResponse {
+            output_blocks: response.output_blocks,
             text: response.text,
             tool_calls: response.tool_calls,
             usage: response.usage,
@@ -1586,7 +2060,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let count_tokens = options.count_tokens;
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        let parser = async move {
             let prepared = match crate::multimodal::prepare_messages_for_provider(
                 &messages,
                 &provider.multimodal,
@@ -1673,13 +2147,9 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
             )
             .await;
-        });
+        };
 
-        let guard = AbortOnDrop::new(handle.abort_handle());
-        stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            rx.recv().await.map(|event| (event, (rx, guard)))
-        })
-        .boxed()
+        crate::stream_guard::parser_stream(parser, rx)
     }
 }
 
@@ -1919,6 +2389,9 @@ mod tests {
     #[test]
     fn extracts_output_text_first() {
         let response = ResponsesResponse {
+            model: None,
+            status: None,
+            incomplete_details: None,
             output: vec![],
             output_text: Some("hello".into()),
             usage: None,
@@ -1929,6 +2402,9 @@ mod tests {
     #[test]
     fn extracts_nested_output_text() {
         let response = ResponsesResponse {
+            model: None,
+            status: None,
+            incomplete_details: None,
             output: vec![serde_json::json!({
                 "type": "message",
                 "role": "assistant",
@@ -1971,6 +2447,39 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_keeps_early_item_and_annotation_metadata() {
+        let mut state = ResponsesStreamState::default();
+        let mut metadata = Vec::new();
+        for frame in [
+            serde_json::json!({"type":"response.output_item.added","output_index":2,"item":{"type":"message","id":"msg_fixture","phase":"commentary","status":"in_progress","content":[]}}),
+            serde_json::json!({"type":"response.output_text.annotation.added","output_index":2,"content_index":0,"annotation_index":0,"annotation":{"type":"url_citation","url":"https://fixture.invalid"}}),
+            serde_json::json!({"type":"response.output_item.done","output_index":3,"item":{"type":"function_call","id":"fc_fixture","call_id":"call_fixture","namespace":"search","name":"lookup","arguments":"{}","status":"completed"}}),
+        ] {
+            for event in process_responses_stream_event(frame, &mut state).unwrap() {
+                match event {
+                    StreamEvent::ProtocolMetadata(value)
+                    | StreamEvent::OutputBlock(
+                        zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                            metadata: value,
+                        },
+                    ) => metadata.push(value),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(metadata.len(), 3);
+        assert_eq!(metadata[0]["fields"]["phase"], "commentary");
+        assert_eq!(metadata[0]["fields"]["status"], "in_progress");
+        assert!(metadata[0]["fields"].get("content").is_none());
+        assert_eq!(
+            metadata[1]["fields"]["annotations"][0]["type"],
+            "url_citation"
+        );
+        assert_eq!(metadata[2]["fields"]["id"], "fc_fixture");
+        assert_eq!(metadata[2]["fields"]["namespace"], "search");
+    }
+
+    #[test]
     fn completed_stream_event_emits_authoritative_usage() {
         let mut state = ResponsesStreamState::default();
         let events = process_sse_chunk(
@@ -1981,12 +2490,15 @@ mod tests {
 
         assert!(matches!(
             events.as_slice(),
-            [StreamEvent::Usage(TokenUsage {
-                input_tokens: Some(120),
-                cached_input_tokens: Some(45),
-                cache_creation_input_tokens: None,
-                output_tokens: Some(30),
-            })]
+            [
+                StreamEvent::ProtocolMetadata(_),
+                StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(120),
+                    cached_input_tokens: Some(45),
+                    cache_creation_input_tokens: None,
+                    output_tokens: Some(30),
+                })
+            ]
         ));
         assert_eq!(
             state.usage.as_ref().and_then(|usage| usage.input_tokens),
@@ -2003,7 +2515,10 @@ mod tests {
         )
         .expect("completed event should parse");
 
-        assert!(events.is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::ProtocolMetadata(_)]
+        ));
         assert!(state.usage.is_none());
     }
 
@@ -2018,7 +2533,12 @@ mod tests {
 
         assert!(matches!(
             events.as_slice(),
-            [StreamEvent::ToolCall(_), StreamEvent::Usage(_)]
+            [
+                StreamEvent::ProtocolMetadata(_),
+                StreamEvent::ContentPosition(position),
+                StreamEvent::ToolCall(_),
+                StreamEvent::Usage(_)
+            ] if position.output_index == 0 && position.content_index.is_none()
         ));
     }
 
@@ -2031,7 +2551,10 @@ mod tests {
         )
         .expect("done alias should parse");
 
-        assert!(events.is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::ProtocolMetadata(_)]
+        ));
         assert!(state.usage.is_none());
     }
 
@@ -2296,11 +2819,7 @@ mod tests {
             .await
             .expect_err("stream API errors should not be retried");
 
-        assert!(
-            err.to_string()
-                .contains("OpenAI responses stream error: quota exceeded"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("quota exceeded"), "{err}");
         assert_eq!(captured.lock().unwrap().len(), 1);
 
         server_handle.abort();
@@ -2534,18 +3053,34 @@ data: [DONE]
     fn build_responses_input_maps_content_types_by_role() {
         let messages = vec![
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "system".into(),
                 content: "You are helpful.".into(),
             },
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "user".into(),
                 content: "Hi".into(),
             },
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "assistant".into(),
                 content: "Hello!".into(),
             },
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "user".into(),
                 content: "Thanks".into(),
             },
@@ -2569,6 +3104,10 @@ data: [DONE]
     #[test]
     fn build_responses_input_uses_default_instructions_without_system() {
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".into(),
             content: "Hello".into(),
         }];
@@ -2580,11 +3119,18 @@ data: [DONE]
     #[test]
     fn build_responses_input_maps_tool_outputs() {
         let messages = vec![
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_123".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "result".into(),
+                attachments: Vec::new(),
+            }),
             ChatMessage {
-                role: "tool".into(),
-                content: r#"{"tool_call_id":"call_123","content":"result"}"#.into(),
-            },
-            ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "user".into(),
                 content: "Go".into(),
             },
@@ -2599,78 +3145,16 @@ data: [DONE]
     }
 
     #[test]
-    fn build_responses_input_replays_plain_tool_text_without_synthetic_call_id() {
-        let messages = vec![ChatMessage {
-            role: "tool".into(),
-            content: "legacy plain text result".into(),
-        }];
-
-        let (_, input) = build_responses_input(&messages);
-
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"][0]["type"], "input_text");
-        assert_eq!(
-            input[0]["content"][0]["text"],
-            "Legacy tool output without call_id:\nlegacy plain text result"
-        );
-        assert!(input[0].get("call_id").is_none());
-    }
-
-    #[test]
-    fn build_responses_input_replays_tool_json_without_call_id_as_text() {
-        let messages = vec![ChatMessage {
-            role: "tool".into(),
-            content: r#"{"content":"legacy result","status":"ok"}"#.into(),
-        }];
-
-        let (_, input) = build_responses_input(&messages);
-
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"][0]["type"], "input_text");
-        assert_eq!(
-            input[0]["content"][0]["text"],
-            r#"Legacy tool output without call_id:
-{"content":"legacy result","status":"ok"}"#
-        );
-        assert!(input[0].get("call_id").is_none());
-    }
-
-    #[test]
-    fn build_responses_input_replays_blank_tool_call_id_as_legacy_text() {
-        for raw_id in ["", "   "] {
-            let messages = vec![ChatMessage {
-                role: "tool".into(),
-                content: serde_json::json!({
-                    "tool_call_id": raw_id,
-                    "content": "legacy result"
-                })
-                .to_string(),
-            }];
-
-            let (_, input) = build_responses_input(&messages);
-
-            assert_eq!(input.len(), 1);
-            assert_eq!(input[0]["type"], "message");
-            assert_eq!(input[0]["role"], "user");
-            assert_eq!(input[0]["content"][0]["type"], "input_text");
-            assert!(input[0].get("call_id").is_none());
-            assert!(
-                input[0]["content"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("\"legacy result\"")
-            );
-        }
-    }
-
-    #[test]
     fn build_responses_input_maps_native_assistant_tool_calls() {
-        let messages = vec![ChatMessage::assistant(
-            r#"{"content":"Using shell","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "Using shell",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_abc".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"pwd\"}".into(),
+                extra_content: None,
+            }],
+            None,
         )];
         let (_, input) = build_responses_input(&messages);
 
@@ -2703,27 +3187,25 @@ data: [DONE]
             encode_responses_history_items(&[reasoning_item, function_call_item], true)
                 .expect("history envelope should encode");
         let messages = vec![
-            ChatMessage::assistant(
-                serde_json::json!({
-                    "content": null,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "name": "shell",
-                            "arguments": "{\"command\":\"pwd\"}"
-                        }
-                    ],
-                    "reasoning_content": reasoning_content
-                })
-                .to_string(),
+            ChatMessage::assistant_tool_calls(
+                String::new(),
+                serde_json::from_value(serde_json::json!([
+                    {
+                        "id": "call_1",
+                        "name": "shell",
+                        "arguments": "{\"command\":\"pwd\"}"
+                    }
+                ]))
+                .unwrap(),
+                Some((reasoning_content).to_string()),
             ),
-            ChatMessage::tool(
-                serde_json::json!({
-                    "tool_call_id": "call_1",
-                    "content": "ok"
-                })
-                .to_string(),
-            ),
+            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: ("call_1").to_string(),
+                tool_name: String::new(),
+                content: ("ok").to_string(),
+                success: None,
+                attachments: Vec::new(),
+            }),
         ];
 
         let (_, input) = build_responses_input(&messages);
@@ -2779,9 +3261,12 @@ data: [DONE]
 
     #[test]
     fn build_responses_input_handles_image_markers() {
-        let messages = vec![ChatMessage::user(
-            "Describe this\n\n[IMAGE:data:image/png;base64,abc]",
-        )];
+        let messages = vec![ChatMessage::user("Describe this").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/png;base64,abc".to_string(),
+            },
+        ])];
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);
@@ -2814,9 +3299,18 @@ data: [DONE]
 
     #[test]
     fn build_responses_input_handles_multiple_images() {
-        let messages = vec![ChatMessage::user(
-            "Compare these: [IMAGE:data:image/png;base64,img1] and [IMAGE:data:image/jpeg;base64,img2]",
-        )];
+        let messages = vec![
+            ChatMessage::user("Compare these:  and").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,img1".to_string(),
+                },
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/jpeg;base64,img2".to_string(),
+                },
+            ]),
+        ];
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);

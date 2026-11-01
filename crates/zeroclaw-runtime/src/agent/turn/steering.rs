@@ -36,7 +36,7 @@ pub type SteeringAdmit = Box<dyn Fn() -> SteeringAdmission + Send + Sync>;
 
 /// One mid-turn steering message.
 pub struct SteeringInput {
-    text: String,
+    message: zeroclaw_api::model_provider::ChatMessage,
     admit: Option<SteeringAdmit>,
     ingress: Option<IngressContext>,
 }
@@ -45,18 +45,21 @@ impl SteeringInput {
     /// A message whose sender's authority cannot change during the turn (the
     /// gateway chat socket authorizes its connection once). Always admitted,
     /// with no narrowing.
-    pub fn new(text: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<zeroclaw_api::model_provider::ChatMessage>) -> Self {
         Self {
-            text: text.into(),
+            message: message.into(),
             admit: None,
             ingress: None,
         }
     }
 
     /// A message whose sender must still be authorized when it is consumed.
-    pub fn with_admission(text: impl Into<String>, admit: SteeringAdmit) -> Self {
+    pub fn with_admission(
+        message: impl Into<zeroclaw_api::model_provider::ChatMessage>,
+        admit: SteeringAdmit,
+    ) -> Self {
         Self {
-            text: text.into(),
+            message: message.into(),
             admit: Some(admit),
             ingress: None,
         }
@@ -75,7 +78,11 @@ impl SteeringInput {
     }
 
     pub fn text(&self) -> &str {
-        &self.text
+        &self.message.content
+    }
+
+    pub fn message(&self) -> &zeroclaw_api::model_provider::ChatMessage {
+        &self.message
     }
 
     /// Evaluate the sender's authority now.
@@ -86,15 +93,15 @@ impl SteeringInput {
         }
     }
 
-    pub fn into_text(self) -> String {
-        self.text
+    pub fn into_message(self) -> zeroclaw_api::model_provider::ChatMessage {
+        self.message
     }
 }
 
 impl std::fmt::Debug for SteeringInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SteeringInput")
-            .field("len", &self.text.len())
+            .field("len", &self.message.content.len())
             .field("checked", &self.admit.is_some())
             .finish()
     }

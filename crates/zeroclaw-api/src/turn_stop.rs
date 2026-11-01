@@ -7,6 +7,20 @@
 //! existing string heuristics keep working as the fallback for errors that
 //! originate outside our code (raw transport errors, provider bodies).
 
+/// Evidence that the local turn executor cooperatively stopped. This does
+/// not assert that any external provider or tool was cancelled remotely.
+#[derive(Debug)]
+pub struct ToolLoopCancelled;
+impl std::fmt::Display for ToolLoopCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop cancelled")
+    }
+}
+impl std::error::Error for ToolLoopCancelled {}
+pub fn is_tool_loop_cancelled(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| source.is::<ToolLoopCancelled>())
+}
+
 /// How the turn should be treated once it stopped.
 ///
 /// Declarative metadata: nothing branches on it yet.

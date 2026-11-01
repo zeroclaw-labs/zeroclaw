@@ -1,20 +1,41 @@
 //! Channel infrastructure: session backends, debouncing, and stall watchdog.
 //! These are cross-cutting utilities used by multiple channel implementations.
 
-pub mod acp_session_store;
 pub mod conversation_owners;
 pub mod debounce;
 pub mod net_guard;
 pub mod session_backend;
+pub mod session_events;
 pub mod session_queue;
+pub mod session_repository;
 pub mod session_sqlite;
 pub mod session_store;
 pub mod stall_watchdog;
 
+/// Explicit bridge for pre-event-store protocol test harnesses. Shipped
+/// entrances must use the admitted execution port for transcript mutations.
+#[macro_export]
+macro_rules! legacy_fixture_call {
+    ($repository:expr, $method:ident($($argument:expr),* $(,)?)) => {
+        $crate::legacy_fixture_call!($repository, $method($($argument),*) => ())
+    };
+    ($repository:expr, $method:ident($($argument:expr),* $(,)?) => $result:ty) => {{
+        #[cfg(any(test, feature = "test-util"))]
+        { $repository.$method($($argument),*) }
+        #[cfg(not(any(test, feature = "test-util")))]
+        {
+            let _ = (&$repository, $(&$argument),*);
+            Err::<$result, anyhow::Error>(anyhow::Error::msg("legacy transcript operations require the session execution port"))
+        }
+    }};
+}
+
 use std::net::SocketAddr;
 use std::path::Path;
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-util"))]
 use crate::session_backend::SessionBackend;
 
 pub fn effective_gateway_bind_socket_addr(host: &str, port: u16) -> SocketAddr {
@@ -33,16 +54,33 @@ pub fn fallback_gateway_bind_socket_addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
+/// Constructs pre-upgrade fixtures only. Production opens the installation's native event store.
+#[cfg(any(test, feature = "test-util"))]
 pub fn make_session_backend(
     workspace_dir: &Path,
     backend: &str,
 ) -> std::io::Result<Arc<dyn SessionBackend>> {
+    let guard =
+        session_events::installation::InstallationGuard::acquire(&workspace_dir.join("sessions"))
+            .map_err(std::io::Error::other)?;
+    if let Err(error) = guard.require_legacy() {
+        if error.kind() != std::io::ErrorKind::PermissionDenied {
+            return Err(error);
+        }
+        // Compatibility-only consumers cannot recreate an old SQLite file.
+        // The directory reader shares the durable native writer fence; native
+        // entrances and tools read through their authorized event query port.
+        return Ok(Arc::new(session_store::SessionStore::new(workspace_dir)?));
+    }
     match backend {
         "jsonl" => {
             let store = session_store::SessionStore::new(workspace_dir)?;
             Ok(Arc::new(store))
         }
-        "sqlite" => Ok(Arc::new(open_sqlite_with_jsonl_import(workspace_dir)?)),
+        "sqlite" => Ok(Arc::new(open_sqlite_with_jsonl_import(
+            workspace_dir,
+            guard,
+        )?)),
         other => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -52,7 +90,10 @@ pub fn make_session_backend(
                 "Unknown session_backend ''; falling back to sqlite. \
                  Valid values: 'sqlite' (default), 'jsonl'."
             );
-            Ok(Arc::new(open_sqlite_with_jsonl_import(workspace_dir)?))
+            Ok(Arc::new(open_sqlite_with_jsonl_import(
+                workspace_dir,
+                guard,
+            )?))
         }
     }
 }
@@ -67,20 +108,19 @@ static STARTUP_RECOVERY_CLAIMED: std::sync::LazyLock<
 /// `data_dir`, and return how many there were.
 ///
 /// The caller must hold process ownership of `data_dir` and must not have
-/// admitted a turn yet. The first time a process owns a data directory is
-/// the one moment it knows no turn is running there: whoever marked them is
-/// gone. Each such turn is recorded as "error" with its history kept, and
-/// nothing is restarted.
+/// admitted a turn yet. The first time a process owns a data directory is the
+/// one moment it knows no turn is running there: whoever marked them is gone.
+/// Each such turn is recorded as "error" with its history kept, and nothing
+/// is restarted.
 ///
-/// It acts once per process for a directory. Every later call returns
-/// `Ok(0)` without looking, because by then a running turn may be this
-/// process's own. That holds after a failed attempt too: the error is
-/// returned once, and the turns stay as they are until the next process
-/// start.
+/// It acts once per process for a directory. Every later call returns `Ok(0)`
+/// without looking, because by then a running turn may be this process's own.
+/// That holds after a failed attempt too: the error is returned once, and the
+/// turns stay as they are until the next process start.
 ///
-/// Run state lives only in the SQLite store, so that store is settled
-/// whenever it exists, whichever backend is configured now: a later reload
-/// may switch to it. It is neither created nor migrated for this.
+/// Run state lives only in the SQLite store, so that store is settled whenever
+/// it exists, whichever backend is configured now: a later reload may switch
+/// to it. It is neither created nor migrated for this.
 pub fn recover_abandoned_session_turns(data_dir: &Path) -> std::io::Result<usize> {
     let identity = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     if !STARTUP_RECOVERY_CLAIMED
@@ -102,12 +142,14 @@ pub fn recover_abandoned_session_turns(data_dir: &Path) -> std::io::Result<usize
     }
     Ok(recovered)
 }
-
+#[cfg(any(test, feature = "test-util"))]
 fn open_sqlite_with_jsonl_import(
     workspace_dir: &Path,
+    guard: session_events::installation::InstallationGuard,
 ) -> std::io::Result<session_sqlite::SqliteSessionBackend> {
-    let backend = session_sqlite::SqliteSessionBackend::new(workspace_dir)
+    let backend = session_sqlite::SqliteSessionBackend::open_locked(&guard)
         .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+    drop(guard);
     match backend
         .migrate_from_jsonl(workspace_dir)
         .map_err(|e| std::io::Error::other(format!("{e:#}")))?

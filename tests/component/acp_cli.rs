@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use zeroclaw_infra::acp_session_store::AcpSessionStore;
+use zeroclaw_infra::session_repository::SessionRepository;
 
 #[test]
 fn standalone_acp_agent_flag_selects_alias_less_session_owner() {
@@ -129,8 +129,8 @@ runtime_profile = "default"
         "ACP should exit cleanly after stdin closes"
     );
 
-    let store =
-        AcpSessionStore::new(&config_dir.path().join("data")).expect("open persisted ACP sessions");
+    let store = SessionRepository::for_namespace(&config_dir.path().join("data"), "acp_")
+        .expect("open persisted ACP sessions");
     let session = store
         .load_session(session_id)
         .expect("load persisted session")

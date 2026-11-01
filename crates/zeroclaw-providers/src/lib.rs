@@ -6,6 +6,7 @@ pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
+mod cli_output;
 pub mod compatible;
 pub mod copilot;
 pub mod dispatch;
@@ -13,6 +14,7 @@ pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
 pub mod grok_cli;
+mod output;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;
@@ -32,6 +34,7 @@ pub mod router;
 pub mod safeguard_notice;
 pub(crate) mod stream_guard;
 pub mod telnyx;
+mod tool_protocol;
 pub mod traits;
 pub mod vision_override;
 
@@ -757,17 +760,17 @@ pub struct ModelProviderRuntimeOptions {
     pub tls_ca_cert_path: Option<String>,
     /// The configured `[multimodal]` policy.
     ///
-    /// Providers normalize image markers on their own boundary (a channel can
-    /// call `chat` with raw `[IMAGE:<path>]` markers that never passed through
+    /// Providers normalize image references on their own boundary (a channel can
+    /// call `chat` with raw image references that never passed through
     /// the runtime), and that normalization now decodes pixels and applies
     /// `max_images` / `max_image_size_mb`. Carrying the configured policy here
     /// keeps that second pass on the same rules the runtime already applied,
     /// instead of silently reverting to defaults and re-trimming history a
     /// configured request had legitimately accepted.
     pub multimodal: zeroclaw_config::schema::MultimodalConfig,
-    /// How compatible chat-completions providers handle images a native
-    /// role=`tool` result declared in its `attachments` array; legacy tool
-    /// results (no array key) pass verbatim under both settings.
+    /// How compatible chat-completions providers handle images a structured
+    /// role=`tool` result declares in its `attachments` array; results without
+    /// attachments pass their text verbatim under both settings.
     pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
 }
 
@@ -1118,11 +1121,11 @@ fn mentions_tools_token(message: &str) -> bool {
         let preceded_by_word_char = message[..start]
             .chars()
             .next_back()
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
         let followed_by_word_char = bytes
             .get(end)
             .map(|byte| *byte as char)
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
 
         if !preceded_by_word_char && !followed_by_word_char {
             return true;
@@ -1296,13 +1299,44 @@ pub(crate) fn stream_idle_error_message(
 }
 
 /// Build a sanitized model_provider error from a failed HTTP response.
+pub(crate) fn stream_read_error(
+    error: &reqwest::Error,
+    bound: StreamIdleBound,
+) -> traits::StreamError {
+    let message = stream_idle_error_message(error, bound);
+    if error.is_timeout() {
+        traits::StreamError::ResponseTimeout(message)
+    } else {
+        traits::StreamError::Http(message)
+    }
+}
+
 pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
+    let request_id = ["x-request-id", "request-id", "x-goog-request-id"]
+        .into_iter()
+        .find_map(|key| {
+            response
+                .headers()
+                .get(key)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        });
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let body = response
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
-    api_error_from_parts(model_provider, status, &body)
+    let mut error = api_error_from_parts(model_provider, status, &body);
+    if let Some(failure) = error.downcast_mut::<dispatch::ProviderHttpFailure>() {
+        failure.request_id = request_id;
+        failure.retry_after = retry_after;
+    }
+    error
 }
 
 /// Build a sanitized model_provider error after a caller has already consumed
@@ -1324,9 +1358,13 @@ pub(crate) fn api_error_from_parts(
             })),
         "providers: API error"
     );
-    anyhow::Error::msg(format!(
-        "{model_provider} API error ({status}): {sanitized}"
-    ))
+    anyhow::Error::new(dispatch::ProviderHttpFailure {
+        provider_ref: model_provider.into(),
+        status: status.as_u16(),
+        detail: sanitized,
+        request_id: None,
+        retry_after: None,
+    })
 }
 
 /// Resolve API key for a model_provider from the typed alias config/override.
@@ -1343,10 +1381,6 @@ fn resolve_model_provider_credential(
         .map(ToString::to_string)
 }
 
-/// Single source of truth for `(key_prefix, canonical_model_provider_family)`
-/// pairs used by `check_api_key_prefix`. Order matters: longer prefixes
-/// must come before shorter ones that share a head (`sk-ant-` and `sk-or-`
-/// must precede `sk-`).
 const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
     ("sk-ant-", "anthropic"),
     ("sk-or-", "openrouter"),
@@ -2024,7 +2058,9 @@ pub fn provider_runtime_options_for_bare_family(
     }
 }
 
-fn create_resilient_model_provider_from_ref_with_model_override(
+/// Build a profile's reliability chain with an explicit primary model pin.
+/// Fallback entries retain their own configured models and credentials.
+pub fn create_resilient_model_provider_from_ref_with_model_override(
     config: &zeroclaw_config::schema::Config,
     name: &str,
     api_key: Option<&str>,
@@ -3065,7 +3101,7 @@ mod tests {
             Some(&ModelProviderConfig::default()),
         );
 
-        // Operator limits must reach the adapter that expands `[IMAGE:...]`
+        // Operator limits must reach the adapter that expands image references
         // markers; library defaults here mean the section is inert.
         assert_eq!(opts.multimodal.max_images, 1);
         assert_eq!(opts.multimodal.max_image_size_mb, 2);
@@ -4078,22 +4114,23 @@ mod tests {
             0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
             0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
-        let mut markers = Vec::new();
+        let mut prompts = Vec::new();
         for index in 0..2 {
             let path = temp.path().join(format!("bare-{index}.png"));
             std::fs::write(&path, DECODABLE_PNG).unwrap();
-            markers.push(format!("[IMAGE:{}]", path.display()));
+            prompts.push(ChatMessage::user("look").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: path.display().to_string(),
+                },
+            ]));
         }
         // One image per message: `trim_old_images` evicts whole messages, so
         // co-locating both would measure that eviction granularity instead of
         // whether the operator policy reached this adapter at all.
-        let prompts: Vec<String> = markers
-            .iter()
-            .map(|marker| format!("look {marker}"))
-            .collect();
 
         // Same server, same ref, same messages; only the operator policy differs.
-        let outbound_images = |max_images: usize, prompts: Vec<String>| async move {
+        let outbound_images = |max_images: usize, messages: Vec<ChatMessage>| async move {
             let capture: Capture = Arc::new(Mutex::new(None));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -4115,7 +4152,6 @@ mod tests {
             )
             .expect("bare custom:<url> ref builds a provider");
 
-            let messages: Vec<ChatMessage> = prompts.into_iter().map(ChatMessage::user).collect();
             let _ = resolved
                 .provider
                 .chat(

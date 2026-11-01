@@ -25,6 +25,10 @@ pub(crate) struct PreparedToolCalls {
     pub(crate) executable_calls: Vec<ParsedToolCall>,
     /// Per-call immutable snapshot for draft start/completion events.
     pub(crate) stream_calls: Vec<Option<StreamToolCall>>,
+    pub(crate) capture_handles: Vec<(
+        String,
+        Arc<dyn zeroclaw_api::session_events::capture::PreparedToolPort>,
+    )>,
 }
 
 /// Per-call draft metadata retained only until the matching completion event.
@@ -112,17 +116,59 @@ pub(crate) async fn abandon_unexecuted_prepared_contexts(
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
     completed: &[usize],
-) {
-    let Some(hooks) = ctx.hooks else {
-        return;
-    };
+    capture_handles: &[(
+        String,
+        Arc<dyn zeroclaw_api::session_events::capture::PreparedToolPort>,
+    )],
+) -> Result<()> {
     for (call_idx, call) in executable_indices.iter().zip(executable_calls.iter()) {
         if completed.contains(call_idx) {
             continue;
         }
+        let id = super::events::resolve_tool_call_id(call);
+        if let Some((_, port)) = capture_handles.iter().find(|(key, _)| key == &id) {
+            port.invalidate("tool_batch_abandoned_before_execution")
+                .await?;
+        }
         let context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *call_idx);
-        hooks.fire_tool_call_abandoned(&context, &call.name).await;
+        abandon_prepared_context(ctx, &context, &call.name).await;
     }
+    Ok(())
+}
+
+async fn invalidate_prepared_batch(
+    handles: &[(
+        String,
+        Arc<dyn zeroclaw_api::session_events::capture::PreparedToolPort>,
+    )],
+    reason: &str,
+) -> Result<()> {
+    for (_, port) in handles {
+        port.invalidate(reason).await?;
+    }
+    Ok(())
+}
+
+/// Suppression happens before an executable preparation exists. Preserve the
+/// model proposal and the host's rejection without fabricating a tool start.
+async fn record_suppressed_proposal(
+    ctx: &TurnCtx<'_>,
+    call: &ParsedToolCall,
+    name: &str,
+    arguments: &serde_json::Value,
+    reason_key: &str,
+) -> Result<()> {
+    if let Some(port) = zeroclaw_api::session_events::capture::current_tool_admission() {
+        port.prepare(zeroclaw_api::session_events::capture::ToolPreparationIntent {
+            proposed_name: call.name.clone(),
+            provider_call_id: call.tool_call_id.clone(),
+            name: name.into(),
+            arguments: arguments.clone(),
+            approval_requirement: reason_key.into(),
+            trusted_route: serde_json::json!({"channel":ctx.channel_name,"recipient":ctx.channel_reply_target}),
+        }).await?;
+    }
+    Ok(())
 }
 
 /// Run per-call preparation over this round's parsed tool calls (upstream
@@ -142,6 +188,7 @@ pub(crate) async fn prepare_tool_calls(
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
     let mut executable_stream_calls = Vec::new();
+    let mut capture_handles = Vec::new();
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
     // Contexts whose before phase ran and that are still awaiting a terminal
     // lifecycle operation (before hook continued, no cancel/deny/dedup yet).
@@ -165,6 +212,8 @@ pub(crate) async fn prepare_tool_calls(
                 .await
             {
                 crate::hooks::HookResult::Cancel(reason) => {
+                    record_suppressed_proposal(ctx, call, &tool_name, &tool_args, "denied_by_hook")
+                        .await?;
                     // The before phase ran, so this context's only terminal
                     // lifecycle operation is abandonment.
                     abandon_prepared_context(ctx, &hook_context, &tool_name).await;
@@ -245,6 +294,14 @@ pub(crate) async fn prepare_tool_calls(
             let prompt_signature = tool_call_signature(&tool_name, &tool_args);
             pending_prompt_signature = Some(prompt_signature.clone());
             if !prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone()) {
+                record_suppressed_proposal(
+                    ctx,
+                    call,
+                    &tool_name,
+                    &tool_args,
+                    "duplicate_prompt_suppressed",
+                )
+                .await?;
                 let duplicate =
                     record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
                 abandon_prepared_context(ctx, &hook_context, &tool_name).await;
@@ -253,6 +310,14 @@ pub(crate) async fn prepare_tool_calls(
                 continue;
             }
             if !prompt_approval_tool_signatures.insert(prompt_signature) {
+                record_suppressed_proposal(
+                    ctx,
+                    call,
+                    &tool_name,
+                    &tool_args,
+                    "repeated_prompt_suppressed",
+                )
+                .await?;
                 let repeated = format!(
                     "Agent loop aborted: repeated prompt-required tool call '{tool_name}' with identical arguments before approval."
                 );
@@ -284,6 +349,11 @@ pub(crate) async fn prepare_tool_calls(
                 for (retained_context, retained_tool) in &retained_hook_contexts {
                     abandon_prepared_context(ctx, retained_context, retained_tool).await;
                 }
+                invalidate_prepared_batch(
+                    &capture_handles,
+                    "tool_preparation_repeated_prompt_abort",
+                )
+                .await?;
                 abandon_prepared_context(ctx, &hook_context, &tool_name).await;
                 return Err(
                     TurnStop::close_out(TurnStopCode::PromptRequiredRepeat, repeated).into(),
@@ -299,33 +369,79 @@ pub(crate) async fn prepare_tool_calls(
             index: u32::try_from(idx + 1).unwrap_or(u32::MAX),
             total: u32::try_from(tool_calls.len()).unwrap_or(u32::MAX),
         };
-        let approved =
-            match gate_tool_approval(ctx, &tool_name, &tool_args, iteration, position).await {
-                ApprovalGateOutcome::Proceed { approved } => approved,
-                ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
-                    // The before phase ran but this call will never execute:
-                    // its only terminal lifecycle operation is abandonment.
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    // Streaming consumers see the denied/replaced call and its
-                    // synthesized result (e.g. a DenyWithEdit replacement) as a
-                    // ToolCall/ToolResult pair, as the direct path always did.
-                    if let Some(tx) = ctx.event_tx {
-                        emit_tool_call_pair(tx, call, &outcome).await;
-                    }
-                    ordered_results[idx] =
-                        Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
-                    continue;
-                }
-                ApprovalGateOutcome::Cancelled => {
-                    // Preparation aborts before execution takes ownership of
-                    // the retained contexts or the call awaiting approval.
-                    for (retained_context, retained_tool) in &retained_hook_contexts {
-                        abandon_prepared_context(ctx, retained_context, retained_tool).await;
+        let capture = if let Some(port) =
+            zeroclaw_api::session_events::capture::current_tool_admission()
+        {
+            match port.prepare(zeroclaw_api::session_events::capture::ToolPreparationIntent {
+                proposed_name:call.name.clone(),provider_call_id:call.tool_call_id.clone(),
+                name:tool_name.clone(),arguments:tool_args.clone(),
+                approval_requirement:match ctx.approval.map(|manager|manager.approval_requirement(&tool_name)) {
+                    Some(crate::approval::ApprovalRequirement::Prompt)=>"prompt",
+                    Some(crate::approval::ApprovalRequirement::Approved)=>"approved",
+                    _=>"not_required",
+                }.into(),trusted_route:serde_json::json!({"channel":ctx.channel_name,"recipient":ctx.channel_reply_target}),
+            }).await {
+                Ok(prepared) => Some(prepared),
+                Err(error) => {
+                    for (context, tool) in &retained_hook_contexts {
+                        abandon_prepared_context(ctx, context, tool).await;
                     }
                     abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    return Err(ToolLoopCancelled.into());
+                    invalidate_prepared_batch(&capture_handles, "tool_preparation_failed").await?;
+                    return Err(error);
                 }
-            };
+            }
+        } else {
+            None
+        };
+        let gate = gate_tool_approval(ctx, &tool_name, &tool_args, iteration, position);
+        let gate_outcome = if let Some(port) = &capture {
+            zeroclaw_api::session_events::capture::scope_tool_preparation(Arc::clone(port), gate)
+                .await
+        } else {
+            gate.await
+        };
+        let approved = match gate_outcome {
+            ApprovalGateOutcome::Proceed { approved } => approved,
+            ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
+                // The before phase ran but this call will never execute:
+                // its only terminal lifecycle operation is abandonment.
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                // Streaming consumers see the denied/replaced call and its
+                // synthesized result (e.g. a DenyWithEdit replacement) as a
+                // ToolCall/ToolResult pair, as the direct path always did.
+                if let Some(tx) = ctx.event_tx {
+                    emit_tool_call_pair(tx, call, &outcome).await;
+                }
+                ordered_results[idx] =
+                    Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                continue;
+            }
+            ApprovalGateOutcome::Error(error) => {
+                for (retained_context, retained_tool) in &retained_hook_contexts {
+                    abandon_prepared_context(ctx, retained_context, retained_tool).await;
+                }
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                invalidate_prepared_batch(&capture_handles, "tool_preparation_failed").await?;
+                if let Some(port) = &capture {
+                    port.invalidate("tool_preparation_failed").await?;
+                }
+                return Err(error);
+            }
+            ApprovalGateOutcome::Cancelled => {
+                // Preparation aborts before execution takes ownership of
+                // the retained contexts or the call awaiting approval.
+                for (retained_context, retained_tool) in &retained_hook_contexts {
+                    abandon_prepared_context(ctx, retained_context, retained_tool).await;
+                }
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                invalidate_prepared_batch(&capture_handles, "tool_preparation_cancelled").await?;
+                if let Some(port) = &capture {
+                    port.invalidate("tool_preparation_cancelled").await?;
+                }
+                return Err(ToolLoopCancelled.into());
+            }
+        };
         // An approved call is not an approval loop: drop its signature from
         // the turn-scoped guard so a later identical call (a rerun the user
         // asked for, a re-check after an edit) gets a fresh approval prompt.
@@ -350,6 +466,9 @@ pub(crate) async fn prepare_tool_calls(
         let dedup_exempt =
             ctx.dedup_exempt_tools.iter().any(|e| e == &tool_name) || reentrant_agent_tool;
         if dedup_enabled && !dedup_exempt && !seen_tool_signatures.insert(signature) {
+            if let Some(port) = &capture {
+                port.invalidate("duplicate_tool_call_not_executed").await?;
+            }
             let duplicate =
                 record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
             abandon_prepared_context(ctx, &hook_context, &tool_name).await;
@@ -409,6 +528,9 @@ pub(crate) async fn prepare_tool_calls(
             arguments: tool_args.clone(),
             tool_call_id: call.tool_call_id.clone(),
         });
+        if let Some(port) = capture {
+            capture_handles.push((call_id.clone(), port));
+        }
         // Pin the resolved id onto the executable call so the pending ToolCall
         // and the terminal ToolResult (both emitted by the executor at dispatch
         // and completion) share one correlation id, even for id-less
@@ -425,6 +547,7 @@ pub(crate) async fn prepare_tool_calls(
         executable_indices,
         executable_calls,
         stream_calls: executable_stream_calls,
+        capture_handles,
     })
 }
 
@@ -1231,8 +1354,9 @@ mod tests {
             parsed_call("kept", serde_json::json!({"k": 1}), "call-1"),
             parsed_call("lost", serde_json::json!({"l": 1}), "call-3"),
         ];
-        super::abandon_unexecuted_prepared_contexts(&ctx, 0, &[0, 2], &executable_calls, &[2])
-            .await;
+        super::abandon_unexecuted_prepared_contexts(&ctx, 0, &[0, 2], &executable_calls, &[2], &[])
+            .await
+            .expect("abandon contexts");
 
         assert_eq!(
             *events.lock().unwrap(),
@@ -1258,7 +1382,9 @@ mod tests {
             parsed_call("first", serde_json::json!({"n": 1}), "call-1"),
             parsed_call("second", serde_json::json!({"n": 2}), "call-2"),
         ];
-        super::abandon_unexecuted_prepared_contexts(&ctx, 3, &[0, 1], &executable_calls, &[]).await;
+        super::abandon_unexecuted_prepared_contexts(&ctx, 3, &[0, 1], &executable_calls, &[], &[])
+            .await
+            .expect("abandon contexts");
 
         assert_eq!(
             *events.lock().unwrap(),

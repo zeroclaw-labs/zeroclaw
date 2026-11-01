@@ -681,13 +681,9 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
     }
 }
 
-/// Memory + optional session-backend handles opened from `data_dir` for the
-/// owned-state cascade.
+/// Memory handle retained across config deletion for the owned-state cascade.
 #[cfg(feature = "agent-runtime")]
-type OwnedStateHandles = (
-    std::sync::Arc<dyn zeroclaw_memory::Memory>,
-    Option<std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
-);
+type OwnedStateHandles = std::sync::Arc<dyn zeroclaw_memory::Memory>;
 
 #[cfg(not(feature = "agent-runtime"))]
 type OwnedStateHandles = ();
@@ -703,18 +699,7 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
                 .context("open memory backend for the owned-state cascade")?,
         )
     };
-    let session_backend = if config.gateway.session_persistence {
-        Some(
-            zeroclaw_infra::make_session_backend(
-                &config.data_dir,
-                &config.channels.session_backend,
-            )
-            .context("open session backend for the owned-state cascade")?,
-        )
-    } else {
-        None
-    };
-    Ok((mem, session_backend))
+    Ok(mem)
 }
 
 #[cfg(not(feature = "agent-runtime"))]
@@ -752,7 +737,7 @@ async fn agent_delete_owned_state(
     config: &Config,
     alias: &str,
     workspace: &std::path::Path,
-    (mem, session_backend): OwnedStateHandles,
+    mem: OwnedStateHandles,
 ) -> Result<()> {
     let archive =
         zeroclaw_runtime::agent_lifecycle::archive_agent_workspace(config, alias, workspace).await;
@@ -767,14 +752,9 @@ async fn agent_delete_owned_state(
         );
     }
     let archive_dir = archive.archive_dir;
-    let report = zeroclaw_runtime::agent_lifecycle::cascade_owned_state(
-        config,
-        &mem,
-        session_backend.as_ref(),
-        alias,
-        &archive_dir,
-    )
-    .await;
+    let report =
+        zeroclaw_runtime::agent_lifecycle::cascade_owned_state(config, &mem, alias, &archive_dir)
+            .await;
     let memory = report.memory_purged.to_string();
     let cron = report.cron_removed.to_string();
     let acp = report.acp_removed.to_string();
@@ -844,15 +824,9 @@ async fn agent_rename_owned_state(
             );
         }
     }
-    let (mem, session_backend) = build_owned_state_handles(config)?;
-    let report = zeroclaw_runtime::agent_lifecycle::cascade_rename_agent(
-        config,
-        Some(&mem),
-        session_backend.as_ref(),
-        from,
-        to,
-    )
-    .await;
+    let mem = build_owned_state_handles(config)?;
+    let report =
+        zeroclaw_runtime::agent_lifecycle::cascade_rename_agent(config, Some(&mem), from, to).await;
     let memory = report.memory_rows.to_string();
     let cron = report.cron_jobs.to_string();
     let acp = report.acp_sessions.to_string();

@@ -9,6 +9,8 @@ homepage.workspace = true
 publish = true
 
 [dependencies]
+sha2 = "0.10"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 anyhow = "1.0"
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }

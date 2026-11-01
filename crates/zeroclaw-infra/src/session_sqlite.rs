@@ -18,6 +18,7 @@ const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
+    sessions_dir: PathBuf,
     conn: Mutex<Connection>,
 }
 
@@ -64,31 +65,17 @@ const SETTLE_RUNNING_TURNS_SQL: &str = "UPDATE session_metadata \
      SET state = 'error', turn_started_at = NULL WHERE state = 'running'";
 
 impl SqliteSessionBackend {
-    /// Where the store for `workspace_dir` lives, whether or not it exists.
+    /// Where the legacy store for `workspace_dir` lives, whether or not it
+    /// exists. Startup recovery uses this path without opening the backend.
     pub fn db_path(workspace_dir: &Path) -> PathBuf {
         workspace_dir.join("sessions").join("sessions.db")
     }
 
-    /// Settle every turn left marked "running" in the store under
-    /// `workspace_dir` as "error", in one atomic statement, and return how
-    /// many there were. The turn id stays on the session so a client can
-    /// tell which turn ended, the session's messages are untouched, and
-    /// nothing is restarted. The store is not opened as a backend: none is
-    /// created, and an existing one gets this one statement and nothing
-    /// else (no schema work, no import). A store from before run state was
-    /// tracked has nothing to settle.
-    ///
-    /// A "running" row only says a turn started; it cannot say the process
-    /// that ran it is still alive. Only a process that has just become the
-    /// sole owner of the data directory knows that none is, so only that
-    /// process may call this, once, before it admits any turn of its own:
-    /// the startup path reaches it through `recover_abandoned_session_turns`,
-    /// behind the once-per-process claim. Opening a backend never does it
-    /// implicitly, and no backend handle exposes it.
+    /// Settle turns left marked `running` by a previous process. The caller
+    /// must already own the data directory and invoke this before admitting a
+    /// new turn. The transcript remains intact and no turn is restarted.
     pub fn recover_abandoned_turns_at(workspace_dir: &Path) -> std::io::Result<usize> {
         let db_path = Self::db_path(workspace_dir);
-        // Only a store that is known to be absent has nothing to settle. One
-        // that cannot be examined is an error for the caller to report.
         if !db_path.try_exists()? {
             return Ok(0);
         }
@@ -109,6 +96,83 @@ impl SqliteSessionBackend {
         conn.execute(SETTLE_RUNNING_TURNS_SQL, [])
             .map_err(std::io::Error::other)
     }
+}
+
+impl SqliteSessionBackend {
+    /// Read original rows and clocks without swallowing migration errors.
+    pub(crate) fn upgrade_messages(
+        &self,
+        session_key: &str,
+    ) -> Result<Vec<crate::session_backend::TimestampedMessage>> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare(
+            "SELECT role, content, created_at FROM sessions WHERE session_key=?1 ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map(params![session_key], |row| {
+            let raw: Option<String> = row.get(2)?;
+            Ok(crate::session_backend::TimestampedMessage {
+                message: ChatMessage {
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+
+                    attachments: Vec::new(),
+                },
+                created_at: raw
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|time| time.with_timezone(&Utc)),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub(crate) fn upgrade_keys(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare("SELECT session_key FROM session_metadata UNION SELECT session_key FROM sessions ORDER BY session_key")?;
+        let keys = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(keys)
+    }
+
+    pub(crate) fn upgrade_metadata(&self, session_key: &str) -> Result<Option<SessionMetadata>> {
+        let conn = self.conn.lock();
+        let raw = conn.query_row(
+            "SELECT created_at,last_activity,message_count,name,agent_alias,channel_id,room_id,sender_id,principal_id FROM session_metadata WHERE session_key=?1",
+            params![session_key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?)),
+        ).optional()?;
+        raw.map(
+            |(
+                created,
+                activity,
+                count,
+                name,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
+                principal_id,
+            )| {
+                Ok(SessionMetadata {
+                    key: session_key.into(),
+                    name,
+                    agent_alias,
+                    channel_id,
+                    room_id,
+                    sender_id,
+                    principal_id,
+                    created_at: DateTime::parse_from_rfc3339(&created)?.with_timezone(&Utc),
+                    last_activity: DateTime::parse_from_rfc3339(&activity)?.with_timezone(&Utc),
+                    message_count: usize::try_from(count)?,
+                })
+            },
+        )
+        .transpose()
+    }
 
     /// Open or create the sessions database.
     ///
@@ -118,9 +182,18 @@ impl SqliteSessionBackend {
     /// schema and column migration run in one IMMEDIATE transaction: a later
     /// opener waits for the first and then finds every column in place.
     pub fn new(workspace_dir: &Path) -> Result<Self> {
-        let db_path = Self::db_path(workspace_dir);
-        let sessions_dir = workspace_dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
+        let guard =
+            crate::session_events::installation::legacy_guard(&workspace_dir.join("sessions"))?;
+        Self::open_locked(&guard)
+    }
+
+    /// The borrowed installation fence covers schema initialization and source
+    /// reads during upgrade. Public constructors admit legacy mode first.
+    pub(crate) fn open_locked(
+        guard: &crate::session_events::installation::InstallationGuard,
+    ) -> Result<Self> {
+        let sessions_dir = guard.directory().to_owned();
+        let db_path = sessions_dir.join("sessions.db");
 
         let mut conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open session DB: {}", db_path.display()))?;
@@ -259,6 +332,7 @@ impl SqliteSessionBackend {
         tx.commit().context("Failed to commit the session schema")?;
 
         Ok(Self {
+            sessions_dir,
             conn: Mutex::new(conn),
         })
     }
@@ -571,6 +645,11 @@ impl SqliteSessionBackend {
         F: FnMut(&Path, &Path, &(String, i64)) -> Result<()>,
     {
         let sessions_dir = workspace_dir.join("sessions");
+        // Same publication lock as every legacy writer. Native-fenced
+        // families may not be staged, imported, or archived by this migrator.
+        let family_guard =
+            crate::session_events::installation::InstallationGuard::acquire(&sessions_dir)?;
+        family_guard.require_legacy()?;
         let mutation_lock = crate::session_store::mutation_lock_for(&sessions_dir)
             .context("Failed to acquire JSONL session mutation lock")?;
         let mut mutation_guard = mutation_lock.lock();
@@ -934,6 +1013,31 @@ impl SqliteSessionBackend {
 }
 
 impl SessionBackend for SqliteSessionBackend {
+    fn require_legacy_access(&self) -> std::io::Result<()> {
+        crate::session_events::installation::legacy_guard(&self.sessions_dir).map(|_| ())
+    }
+
+    fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .map_err(std::io::Error::other)?;
+        let rows = statement
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+
+                    attachments: Vec::new(),
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -945,8 +1049,13 @@ impl SessionBackend for SqliteSessionBackend {
 
         let rows = match stmt.query_map(params![session_key], |row| {
             Ok(ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
                 role: row.get(0)?,
                 content: row.get(1)?,
+
+                attachments: Vec::new(),
             })
         }) {
             Ok(r) => r,
@@ -978,7 +1087,14 @@ impl SessionBackend for SqliteSessionBackend {
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
             Ok(TimestampedMessage {
-                message: ChatMessage { role, content },
+                message: ChatMessage {
+                    tool_calls: Vec::new(),
+                    tool_result: None,
+                    reasoning_content: None,
+                    role,
+                    content,
+                    attachments: Vec::new(),
+                },
                 created_at,
             })
         }) {
@@ -990,12 +1106,14 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
     }
 
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(std::io::Error::other)?;
         Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
@@ -1016,6 +1134,7 @@ impl SessionBackend for SqliteSessionBackend {
         messages: &[ChatMessage],
         breadcrumb_present: bool,
     ) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(std::io::Error::other)?;
         Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
@@ -1040,6 +1159,7 @@ impl SessionBackend for SqliteSessionBackend {
         messages: &[ChatMessage],
         breadcrumb_present: bool,
     ) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(std::io::Error::other)?;
         let exists = tx
@@ -1062,6 +1182,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
 
         let last_id: Option<i64> = conn
@@ -1093,6 +1214,7 @@ impl SessionBackend for SqliteSessionBackend {
     /// Efficiently update the last message in-place (single UPDATE instead of
     /// DELETE + INSERT). Used for incremental persistence during streaming.
     fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
 
         let last_id: Option<i64> = conn
@@ -1196,6 +1318,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let cutoff = (Utc::now() - Duration::hours(i64::from(ttl_hours))).to_rfc3339();
 
@@ -1223,6 +1346,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
 
         conn.execute(
@@ -1247,6 +1371,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
 
         // Check if session exists
@@ -1284,6 +1409,7 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         owner_principal_id: &str,
     ) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         // The predicated metadata delete IS the ownership check: zero rows
         // means not-owned (or missing) and nothing else is touched.
@@ -1307,6 +1433,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let rows = conn
             .execute(
@@ -1318,6 +1445,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn rename_agent_attribution(&self, from: &str, to: &str) -> std::io::Result<usize> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let rows = conn
             .execute(
@@ -1353,6 +1481,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let name_val = if name.is_empty() { None } else { Some(name) };
         conn.execute(
@@ -1422,6 +1551,7 @@ impl SessionBackend for SqliteSessionBackend {
         state: &str,
         turn_id: Option<&str>,
     ) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         let started_at = if state == "running" {
@@ -1639,6 +1769,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let alias_val = if agent_alias.is_empty() {
             None
@@ -1657,6 +1788,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn set_session_principal(&self, session_key: &str, principal_id: &str) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let principal_val = if principal_id.is_empty() {
             None
@@ -1688,6 +1820,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         Self::set_session_trim_breadcrumb_on(&conn, session_key, present)
             .map_err(std::io::Error::other)
@@ -1712,6 +1845,7 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         context: SessionContext<'_>,
     ) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         fn normalize(v: Option<&str>) -> Option<&str> {
             v.map(str::trim).filter(|s| !s.is_empty())
@@ -3037,129 +3171,6 @@ mod tests {
         let state = backend.get_session_state("s1").unwrap().unwrap();
         assert_eq!(state.state, "error");
         assert_eq!(state.turn_id.as_deref(), Some("turn-1"));
-    }
-
-    #[test]
-    fn recovery_settles_running_turns_and_nothing_else() {
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        for key in ["abandoned", "finished", "failed"] {
-            backend.append(key, &ChatMessage::user("hello")).unwrap();
-            backend
-                .append(key, &ChatMessage::assistant("half an answer"))
-                .unwrap();
-        }
-        backend
-            .set_session_state("abandoned", "running", Some("turn-a"))
-            .unwrap();
-        backend.set_session_state("finished", "idle", None).unwrap();
-        backend
-            .set_session_state("failed", "error", Some("turn-f"))
-            .unwrap();
-
-        assert_eq!(
-            SqliteSessionBackend::recover_abandoned_turns_at(tmp.path()).unwrap(),
-            1
-        );
-
-        let abandoned = backend.get_session_state("abandoned").unwrap().unwrap();
-        assert_eq!(abandoned.state, "error");
-        assert_eq!(abandoned.turn_id.as_deref(), Some("turn-a"));
-        assert!(abandoned.turn_started_at.is_none());
-        assert_eq!(backend.load("abandoned").len(), 2, "history is kept");
-        assert_eq!(
-            backend
-                .get_session_state("finished")
-                .unwrap()
-                .unwrap()
-                .state,
-            "idle"
-        );
-        let failed = backend.get_session_state("failed").unwrap().unwrap();
-        assert_eq!(failed.state, "error");
-        assert_eq!(failed.turn_id.as_deref(), Some("turn-f"));
-        assert!(backend.list_running_sessions().is_empty());
-        assert_eq!(
-            SqliteSessionBackend::recover_abandoned_turns_at(tmp.path()).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn recovery_leaves_a_store_without_run_state_untouched() {
-        let tmp = TempDir::new().unwrap();
-        let db_path = SqliteSessionBackend::db_path(tmp.path());
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        // A store written before run state existed.
-        Connection::open(&db_path)
-            .unwrap()
-            .execute_batch(
-                "CREATE TABLE session_metadata (
-                    session_key TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL,
-                    last_activity TEXT NOT NULL,
-                    message_count INTEGER NOT NULL DEFAULT 0,
-                    name TEXT
-                 );",
-            )
-            .unwrap();
-
-        assert_eq!(
-            SqliteSessionBackend::recover_abandoned_turns_at(tmp.path()).unwrap(),
-            0
-        );
-        let columns: i64 = Connection::open(&db_path)
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('session_metadata')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(columns, 5, "recovery must not migrate the store");
-    }
-
-    /// A store that cannot be examined is not the same as no store: the
-    /// caller must hear about it.
-    #[cfg(unix)]
-    #[test]
-    fn recovery_reports_a_store_it_cannot_examine() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = TempDir::new().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-        std::fs::write(sessions_dir.join("sessions.db"), b"").unwrap();
-        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // Root reads through any mode; the check cannot fail for it.
-        let unreadable = std::fs::read_dir(&sessions_dir).is_err();
-
-        let result = SqliteSessionBackend::recover_abandoned_turns_at(tmp.path());
-
-        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        if unreadable {
-            assert!(result.is_err(), "got {result:?}");
-        }
-    }
-
-    #[test]
-    fn opening_the_store_does_not_settle_running_turns() {
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        backend.append("s1", &ChatMessage::user("hello")).unwrap();
-        backend
-            .set_session_state("s1", "running", Some("turn-1"))
-            .unwrap();
-
-        // A second handle on the same store, as every component that opens
-        // it gets, while the first is still in use.
-        let second = SqliteSessionBackend::new(tmp.path()).unwrap();
-        assert_eq!(second.list_running_sessions().len(), 1);
-        drop(backend);
-        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
-        assert_eq!(
-            reopened.get_session_state("s1").unwrap().unwrap().state,
-            "running"
-        );
     }
 
     #[test]

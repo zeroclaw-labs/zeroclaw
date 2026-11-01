@@ -75,6 +75,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use zeroclaw_api::model_provider::ChatMessage;
+
+// Keep classified protocol details available to capture without exposing child
+// free text through public error formatting, including the full source chain.
+pub(crate) fn protocol_failure<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a crate::dispatch::ProviderProtocolFailure> {
+    error.downcast_ref::<acp::AcpError>()?.protocol_failure()
+}
 
 #[cfg(windows)]
 use process_wrap::tokio::{ChildWrapper, CommandWrap, JobObject, KillOnDrop};
@@ -322,7 +331,7 @@ pub struct GrokCliModelProvider {
     max_acp_stdout_bytes: usize,
     /// Wall-clock timeout for the ACP request.
     timeout: Duration,
-    /// When true, serialize image markers as ACP `image` blocks and report
+    /// When true, serialize image attachments as ACP `image` blocks and report
     /// vision capability. Does **not** rewrite Grok's `promptCapabilities.image`
     /// advertise (still false through 0.2.118); only ZeroClaw's send path.
     /// Live probes: protocol accepts the blocks, model does not reliably use
@@ -852,10 +861,11 @@ impl GrokCliModelProvider {
     async fn invoke_acp(
         &self,
         system: Option<&str>,
-        message: &str,
+        message: impl Into<ChatMessage>,
         model: &str,
     ) -> anyhow::Result<String> {
-        let prompt = self.acp_prompt_content(system, message);
+        let message = message.into();
+        let prompt = self.acp_prompt_content(system, &message);
         let args = Self::build_cli_args(model, &self.extra_args);
         let permission_policy = Self::acp_permission_policy(&self.extra_args);
         let mut cmd = Command::new(&self.binary_path);
@@ -915,7 +925,7 @@ impl GrokCliModelProvider {
         };
         let stderr_drain = StderrDrain::start(stderr);
 
-        let request_result = timeout(
+        let request_result = acp::scope_deadline(
             self.timeout,
             acp::run_oneshot_prompt(
                 &mut stdin,
@@ -938,23 +948,23 @@ impl GrokCliModelProvider {
         let stderr_summary = stderr_drain.finish().await;
 
         match request_result {
-            Ok(Ok(text)) if reaped => Ok(text),
-            Ok(Ok(_)) => {
+            Ok(text) if reaped => Ok(text),
+            Ok(_) => {
                 log_acp_failure("reap", "grok_cli_reap_failed", stderr_summary);
                 Err(anyhow::Error::msg(
                     "Grok Build CLI ACP process could not be reaped after completion",
                 ))
             }
-            Ok(Err(error)) => {
-                log_acp_failure("protocol", error.error_key(), stderr_summary);
-                Err(anyhow::Error::new(error))
-            }
-            Err(_) => {
+            Err(error @ acp::AcpError::Timeout { .. }) => {
                 log_acp_failure("timeout", "grok_cli_timeout", stderr_summary);
-                Err(anyhow::Error::msg(format!(
+                Err(anyhow::Error::new(error).context(format!(
                     "Grok Build CLI ACP request timed out after {}s",
                     self.timeout.as_secs()
                 )))
+            }
+            Err(error) => {
+                log_acp_failure("protocol", error.error_key(), stderr_summary);
+                Err(anyhow::Error::new(error))
             }
         }
     }
@@ -962,13 +972,17 @@ impl GrokCliModelProvider {
     fn acp_prompt_content(
         &self,
         system: Option<&str>,
-        message: &str,
+        message: &ChatMessage,
     ) -> Vec<acp::AcpPromptContent> {
+        let projected =
+            crate::multimodal::project_attachment_metadata(std::slice::from_ref(message));
+        let message = &projected[0];
+        let content = message.content.as_str();
         let system_text = system.filter(|system| !system.is_empty());
         if !self.vision_enabled {
             return vec![acp::AcpPromptContent::Text(joined_prompt_text(
                 system_text,
-                message,
+                content,
             ))];
         }
 
@@ -980,17 +994,16 @@ impl GrokCliModelProvider {
         // true *and* a live recognition smoke passes; then prefer following
         // the advertise bit instead of a local override.
         //
-        // The user content is parsed BEFORE the system prompt is prepended: a
-        // prompt-mode carrier is only recognizable while the string still
-        // starts with the carrier prefix. Flattening first destroyed that
-        // prefix and dropped the helper onto its whole-string marker-scan
-        // fallback, which lifted a data URI quoted in a carrier body as an
-        // image block and removed it from the text.
-        let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(message);
+        // Attachments are explicit fields. Prepending the system text cannot
+        // turn quoted text in the body into an image.
+        let (text, image_refs) = (
+            message.content.clone(),
+            crate::multimodal::message_image_refs(message),
+        );
         if image_refs.is_empty() {
             return vec![acp::AcpPromptContent::Text(joined_prompt_text(
                 system_text,
-                message,
+                content,
             ))];
         }
 
@@ -1004,7 +1017,7 @@ impl GrokCliModelProvider {
             // rather than silently dropping an image reference we cannot send.
             return vec![acp::AcpPromptContent::Text(joined_prompt_text(
                 system_text,
-                message,
+                content,
             ))];
         };
 
@@ -1162,9 +1175,32 @@ impl ModelProvider for GrokCliModelProvider {
             Self::validate_temperature(temperature)?;
         }
 
-        // The system prompt rides separately: `acp_prompt_content` must parse
-        // the user content before any prefix flattens it (see its comment).
+        // Keep system text separate until the ACP prompt is assembled.
         self.invoke_acp(system_prompt, message, model).await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        if let Some(temperature) = temperature {
+            Self::validate_temperature(temperature)?;
+        }
+        let mut messages = messages.to_vec();
+        crate::tool_protocol::render_text_tool_protocol(&mut messages)?;
+        let system = messages
+            .iter()
+            .find(|message| message.role == "system")
+            .map(|message| message.content.as_str());
+        let message = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .cloned()
+            .unwrap_or_else(|| ChatMessage::user(""));
+        self.invoke_acp(system, message, model).await
     }
 
     async fn chat(
@@ -1176,13 +1212,18 @@ impl ModelProvider for GrokCliModelProvider {
         let text = self
             .chat_with_history(request.messages, model, temperature)
             .await?;
-        Ok(ChatResponse {
+        let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(text),
             tool_calls: Vec::new(),
             // ACP one-shot path does not surface reliable token accounting.
             usage: None,
             reasoning_content: None,
-        })
+        };
+        // ACP frames were captured while reading. Mark this projection as
+        // observed so dispatch does not append the final display text again.
+        crate::dispatch::capture::observe_adapter_response(&response, true).await?;
+        Ok(response)
     }
 }
 
@@ -1494,7 +1535,15 @@ mod tests {
 
         assert!(model_provider.capabilities().vision);
         assert_eq!(
-            model_provider.acp_prompt_content(None, "Describe [IMAGE:data:image/png;base64,cG5n]"),
+            model_provider.acp_prompt_content(
+                None,
+                &ChatMessage::user("Describe").with_attachments(vec![
+                    zeroclaw_api::media::AttachmentReference {
+                        kind: zeroclaw_api::media::AttachmentKind::Image,
+                        target: "data:image/png;base64,cG5n".to_string()
+                    }
+                ])
+            ),
             vec![
                 acp::AcpPromptContent::Text("Describe".to_string()),
                 acp::AcpPromptContent::Image {
@@ -1512,7 +1561,7 @@ mod tests {
         let message = "Describe [IMAGE:data:image/png;base64,cG5n]";
 
         assert_eq!(
-            model_provider.acp_prompt_content(None, message),
+            model_provider.acp_prompt_content(None, &ChatMessage::user(message)),
             vec![acp::AcpPromptContent::Text(message.to_string())]
         );
     }
@@ -2315,7 +2364,12 @@ if [ "${1-}" = --warm-up ]; then exit 0; fi
             let reply = model_provider
                 .invoke_acp(
                     None,
-                    "Describe [IMAGE:data:image/png;base64,cG5n]",
+                    ChatMessage::user("Describe").with_attachments(vec![
+                        zeroclaw_api::media::AttachmentReference {
+                            kind: zeroclaw_api::media::AttachmentKind::Image,
+                            target: "data:image/png;base64,cG5n".into(),
+                        },
+                    ]),
                     "default",
                 )
                 .await
@@ -2342,65 +2396,6 @@ if [ "${1-}" = --warm-up ]; then exit 0; fi
             assert_eq!(blocks[1]["type"], "image");
             assert_eq!(blocks[1]["data"], "cG5n");
             assert_eq!(blocks[1]["mimeType"], "image/png");
-        }
-
-        #[tokio::test]
-        async fn fake_child_chat_parses_carrier_before_system_prefix() {
-            // B3: `chat` -> `chat_with_history` -> `chat_with_system` used to
-            // flatten "{system}\n\n{message}" before ACP prompt assembly, so
-            // a prompt carrier lost its prefix and the carrier-aware helper
-            // fell back to whole-string marker scanning. With vision enabled
-            // and a nonempty system prompt, a count-zero carrier whose body
-            // quotes a structurally valid data URI must be delivered as one
-            // text block, byte for byte, with zero image parts.
-            let temp = TempDir::new().expect("tempdir");
-            let model_provider = fake_provider_with_vision(&temp, SUCCESS_BODY, 5);
-            let marker =
-                zeroclaw_api::tool_carrier::marker_line(&zeroclaw_api::media::RenderedMarker {
-                    target: "data:image/png;base64,QUJD".to_string(),
-                    kind: zeroclaw_api::media::MarkerKind::Image,
-                });
-            let body = format!("source example: {marker} quoted in prose");
-            let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
-            let messages = vec![
-                zeroclaw_api::model_provider::ChatMessage::system("You are terse."),
-                zeroclaw_api::model_provider::ChatMessage::user(carrier.clone()),
-            ];
-            let request = ChatRequest {
-                messages: &messages,
-                tools: None,
-                thinking: None,
-            };
-            let reply = model_provider
-                .chat(request, "default", None)
-                .await
-                .expect("fake ACP reply");
-            assert_eq!(reply.text.as_deref(), Some("FAKE_ACP_OK"));
-
-            let requests = std::fs::read_to_string(temp.path().join("requests.ndjson"))
-                .expect("captured requests");
-            let prompt_request: serde_json::Value = serde_json::from_str(
-                requests
-                    .lines()
-                    .nth(3)
-                    .expect("session/prompt request must be captured"),
-            )
-            .expect("session/prompt request is JSON");
-            assert_eq!(prompt_request["method"], "session/prompt");
-            let blocks = prompt_request["params"]["prompt"]
-                .as_array()
-                .expect("session prompt carries blocks");
-            assert_eq!(
-                blocks.len(),
-                1,
-                "zero image parts and one text part: {blocks:?}"
-            );
-            assert_eq!(blocks[0]["type"], "text");
-            assert_eq!(
-                blocks[0]["text"].as_str(),
-                Some(format!("You are terse.\n\n{carrier}").as_str()),
-                "system plus carrier body, byte for byte"
-            );
         }
 
         #[tokio::test]

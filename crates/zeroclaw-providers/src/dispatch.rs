@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
+use futures_util::FutureExt as _;
 use futures_util::stream::{self, StreamExt as _};
 use zeroclaw_api::model_provider::{
     ChatMessage, ChatRequest, ChatResponse, ModelInfo, ModelProvider, StreamEvent, StreamOptions,
@@ -13,6 +14,88 @@ use zeroclaw_api::model_provider::{
 };
 
 pub(crate) mod accounting;
+pub(crate) mod capture;
+
+/// Credential-free HTTP failure produced at the classified response boundary.
+#[derive(Debug, thiserror::Error)]
+#[error("{provider_ref} API error ({status}): {detail}")]
+pub struct ProviderHttpFailure {
+    pub(crate) provider_ref: String,
+    pub(crate) status: u16,
+    pub(crate) detail: String,
+    // Created from the allowlisted response headers at the HTTP boundary.
+    pub(crate) request_id: Option<String>,
+    pub(crate) retry_after: Option<String>,
+}
+
+impl ProviderHttpFailure {
+    /// The status observed at the physical HTTP response boundary.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+}
+
+/// A service explicitly rejected an invocation inside a successful protocol
+/// envelope. The classified body is the source for both display and codes;
+/// this must not be inferred from an arbitrary transport error string.
+#[derive(Debug)]
+pub(crate) struct ProviderProtocolFailure {
+    pub(crate) body: serde_json::Value,
+}
+
+impl ProviderProtocolFailure {
+    pub(crate) fn new(body: serde_json::Value) -> Self {
+        Self { body }
+    }
+    pub(crate) fn error(&self) -> &serde_json::Value {
+        self.body
+            .pointer("/response/error")
+            .or_else(|| self.body.get("error"))
+            .unwrap_or(&self.body)
+    }
+    pub(crate) fn code(&self) -> Option<String> {
+        let error = self.error();
+        error
+            .get("code")
+            .or_else(|| {
+                if std::ptr::eq(error, &self.body) {
+                    None
+                } else {
+                    error.get("type")
+                }
+            })
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string())
+            })
+    }
+}
+impl std::fmt::Display for ProviderProtocolFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(code) = self.code() {
+            write!(formatter, "{code}: ")?;
+        }
+        match self
+            .error()
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(message) => formatter.write_str(message),
+            None => write!(formatter, "{}", self.error()),
+        }
+    }
+}
+impl std::error::Error for ProviderProtocolFailure {}
+
+/// A panic payload may contain credentials. Preserve the typed failure and
+/// phase without copying that unclassified payload into history.
+#[derive(Debug, thiserror::Error)]
+#[error("provider_adapter_panicked")]
+pub(crate) struct ProviderAdapterPanic;
 
 /// Why a provider supplied usage observation cannot be billed as complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,22 +587,35 @@ pub struct ProviderDispatchRef<'a> {
 }
 
 fn provider_reference(provider: &dyn ModelProvider) -> String {
-    zeroclaw_api::attribution::Attributable::alias(provider).to_string()
+    provider.dispatch_reference().to_string()
 }
 
-fn accounted_chat_call<'a, F>(
+fn capture_messages(system_prompt: Option<&str>, message: &str) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+    if let Some(system) = system_prompt {
+        messages.push(ChatMessage::system(system));
+    }
+    messages.push(ChatMessage::user(message));
+    messages
+}
+
+async fn accounted_chat_call<'a, F>(
     provider: &'a dyn ModelProvider,
     model: &'a str,
+    intent: zeroclaw_api::session_events::capture::ProviderDispatchIntent,
     future: F,
-) -> impl Future<Output = anyhow::Result<ChatResponse>> + 'a
+) -> anyhow::Result<ChatResponse>
 where
     F: Future<Output = anyhow::Result<ChatResponse>> + 'a,
 {
+    let mut recorder = capture::Recorder::begin(provider, intent)
+        .await
+        .map_err(capture::stop)?;
     let provider_ref = provider_reference(provider);
     let model = model.to_string();
     let mut future = Box::pin(future);
     let mut attempt = accounting::AttemptState::unstarted(provider_ref, model);
-    futures_util::future::poll_fn(move |cx| {
+    let result = futures_util::future::poll_fn(move |cx| {
         attempt.start();
         let mut poll = || Pin::as_mut(&mut future).poll(cx);
         let result = match attempt.lease() {
@@ -537,22 +633,55 @@ where
             }
         }
         result
+    });
+    let result = capture::scope_adapter_capture(&mut recorder, async {
+        match std::panic::AssertUnwindSafe(result).catch_unwind().await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::Error::new(ProviderAdapterPanic)),
+        }
     })
+    .await;
+    let mut capture_unknown = false;
+    if let Some(recorder) = &mut recorder {
+        match &result {
+            Ok(response) => {
+                if let Err(error) = recorder.response(response).await {
+                    if error.to_string().starts_with("session_capture_") {
+                        recorder.error(&error).await.map_err(capture::stop)?;
+                    }
+                    return Err(capture::stop(error));
+                }
+            }
+            Err(error) => {
+                if !recorder.error(error).await.map_err(capture::stop)? {
+                    capture_unknown = true;
+                }
+            }
+        }
+    }
+    if capture_unknown {
+        return result.map_err(capture::stop);
+    }
+    result
 }
 
-fn accounted_string_call<'a, F>(
+async fn accounted_string_call<'a, F>(
     provider: &'a dyn ModelProvider,
     model: &'a str,
+    intent: zeroclaw_api::session_events::capture::ProviderDispatchIntent,
     future: F,
-) -> impl Future<Output = anyhow::Result<String>> + 'a
+) -> anyhow::Result<String>
 where
     F: Future<Output = anyhow::Result<String>> + 'a,
 {
+    let mut recorder = capture::Recorder::begin(provider, intent)
+        .await
+        .map_err(capture::stop)?;
     let provider_ref = provider_reference(provider);
     let model = model.to_string();
     let mut future = Box::pin(future);
     let mut attempt = accounting::AttemptState::unstarted(provider_ref, model);
-    futures_util::future::poll_fn(move |cx| {
+    let result = futures_util::future::poll_fn(move |cx| {
         attempt.start();
         let mut poll = || Pin::as_mut(&mut future).poll(cx);
         let result = match attempt.lease() {
@@ -570,7 +699,32 @@ where
             }
         }
         result
+    });
+    let result = capture::scope_adapter_capture(&mut recorder, async {
+        match std::panic::AssertUnwindSafe(result).catch_unwind().await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::Error::new(ProviderAdapterPanic)),
+        }
     })
+    .await;
+    let mut capture_unknown = false;
+    if let Some(recorder) = &mut recorder {
+        match &result {
+            Ok(response) => recorder
+                .text_response(response)
+                .await
+                .map_err(capture::stop)?,
+            Err(error) => {
+                if !recorder.error(error).await.map_err(capture::stop)? {
+                    capture_unknown = true;
+                }
+            }
+        }
+    }
+    if capture_unknown {
+        return result.map_err(capture::stop);
+    }
+    result
 }
 
 impl ProviderDispatch {
@@ -615,7 +769,16 @@ impl ProviderDispatch {
     ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        accounted_chat_call(&*self.inner, model, async move {
+        let mut intent = capture::intent(
+            &*self.inner,
+            model,
+            request.messages,
+            request.tools.map(serde_json::to_value).transpose()?,
+            temperature,
+            request.thinking,
+        );
+        intent.tool_round_policy = policy;
+        accounted_chat_call(&*self.inner, model, intent, async move {
             zeroclaw_log::scope!(
                 model: model,
                 => self.inner.chat_with_tool_round_policy(request, model, temperature, policy)
@@ -718,12 +881,25 @@ impl ProviderDispatch {
         );
         let provider_ref = provider_reference(&*self.inner);
         let model_name = model.to_string();
-        let inner_stream = self.inner.stream_chat_with_tool_round_policy(
-            request,
+        let mut intent = capture::intent(
+            &*self.inner,
             model,
+            request.messages,
+            request.tools.map(|tools| serde_json::json!(tools)),
             temperature,
-            options,
-            policy,
+            request.thinking,
+        );
+        intent.tool_round_policy = policy;
+        let inner_stream = capture::stream_events(
+            self.inner.stream_chat_with_tool_round_policy(
+                request,
+                model,
+                temperature,
+                options,
+                policy,
+            ),
+            &*self.inner,
+            intent,
         );
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
@@ -761,11 +937,39 @@ impl ProviderDispatch {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            let messages = capture_messages(system_prompt, message);
+            return capture::project_chunks(
+                self.stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                    options,
+                ),
+                options.count_tokens,
+            );
+        }
         let provider_ref = provider_reference(&*self.inner);
         let model_name = model.to_string();
-        let mut inner_stream =
+        let mut inner_stream = capture::stream_chunks(
             self.inner
-                .stream_chat_with_system(system_prompt, message, model, temperature, options);
+                .stream_chat_with_system(system_prompt, message, model, temperature, options),
+            &*self.inner,
+            capture::intent(
+                &*self.inner,
+                model,
+                &capture_messages(system_prompt, message),
+                None,
+                temperature,
+                None,
+            ),
+        );
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
             attempt.start();
@@ -793,11 +997,31 @@ impl ProviderDispatch {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            return capture::project_chunks(
+                self.stream_chat(
+                    ChatRequest {
+                        messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                    options,
+                ),
+                options.count_tokens,
+            );
+        }
         let provider_ref = provider_reference(&*self.inner);
         let model_name = model.to_string();
-        let mut inner_stream =
+        let mut inner_stream = capture::stream_chunks(
             self.inner
-                .stream_chat_with_history(messages, model, temperature, options);
+                .stream_chat_with_history(messages, model, temperature, options),
+            &*self.inner,
+            capture::intent(&*self.inner, model, messages, None, temperature, None),
+        );
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
             attempt.start();
@@ -824,15 +1048,46 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        // Native history must freeze the structured semantic response before
+        // this legacy string projection discards reasoning/media/tool blocks.
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            let messages = [ChatMessage::user(message)];
+            let response = self
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                )
+                .await?;
+            return Ok(response.text.unwrap_or_default());
+        }
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        accounted_string_call(&*self.inner, model, async move {
-            zeroclaw_log::scope!(
-                model: model,
-                => (*self.inner).simple_chat(message, model, temperature)
-            )
-            .await
-        })
+        accounted_string_call(
+            &*self.inner,
+            model,
+            capture::intent(
+                &*self.inner,
+                model,
+                &[ChatMessage::user(message)],
+                None,
+                temperature,
+                None,
+            ),
+            async move {
+                zeroclaw_log::scope!(
+                    model: model,
+                    => (*self.inner).simple_chat(message, model, temperature)
+                )
+                .await
+            },
+        )
         .instrument(span)
         .await
     }
@@ -845,15 +1100,46 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        // Native history must freeze the structured semantic response before
+        // this legacy string projection discards reasoning/media/tool blocks.
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            let messages = capture_messages(system_prompt, message);
+            let response = self
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                )
+                .await?;
+            return Ok(response.text.unwrap_or_default());
+        }
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        accounted_string_call(&*self.inner, model, async move {
-            zeroclaw_log::scope!(
-                model: model,
-                => self.inner.chat_with_system(system_prompt, message, model, temperature)
-            )
-            .await
-        })
+        accounted_string_call(
+            &*self.inner,
+            model,
+            capture::intent(
+                &*self.inner,
+                model,
+                &capture_messages(system_prompt, message),
+                None,
+                temperature,
+                None,
+            ),
+            async move {
+                zeroclaw_log::scope!(
+                    model: model,
+                    => self.inner.chat_with_system(system_prompt, message, model, temperature)
+                )
+                .await
+            },
+        )
         .instrument(span)
         .await
     }
@@ -865,15 +1151,38 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        // Native history must freeze the structured semantic response before
+        // this legacy string projection discards reasoning/media/tool blocks.
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            let response = self
+                .chat(
+                    ChatRequest {
+                        messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                )
+                .await?;
+            return Ok(response.text.unwrap_or_default());
+        }
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        accounted_string_call(&*self.inner, model, async move {
-            zeroclaw_log::scope!(
-                model: model,
-                => self.inner.chat_with_history(messages, model, temperature)
-            )
-            .await
-        })
+        accounted_string_call(
+            &*self.inner,
+            model,
+            capture::intent(&*self.inner, model, messages, None, temperature, None),
+            async move {
+                zeroclaw_log::scope!(
+                    model: model,
+                    => self.inner.chat_with_history(messages, model, temperature)
+                )
+                .await
+            },
+        )
         .instrument(span)
         .await
     }
@@ -888,13 +1197,25 @@ impl ProviderDispatch {
     ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        accounted_chat_call(&*self.inner, model, async move {
-            zeroclaw_log::scope!(
-                model: model,
-                => self.inner.chat_with_tools(messages, tools, model, temperature)
-            )
-            .await
-        })
+        accounted_chat_call(
+            &*self.inner,
+            model,
+            capture::intent(
+                &*self.inner,
+                model,
+                messages,
+                Some(serde_json::to_value(tools)?),
+                temperature,
+                None,
+            ),
+            async move {
+                zeroclaw_log::scope!(
+                    model: model,
+                    => self.inner.chat_with_tools(messages, tools, model, temperature)
+                )
+                .await
+            },
+        )
         .instrument(span)
         .await
     }
@@ -976,7 +1297,16 @@ impl<'a> ProviderDispatchRef<'a> {
     ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
-        accounted_chat_call(self.inner, model, async move {
+        let mut intent = capture::intent(
+            self.inner,
+            model,
+            request.messages,
+            request.tools.map(serde_json::to_value).transpose()?,
+            temperature,
+            request.thinking,
+        );
+        intent.tool_round_policy = policy;
+        accounted_chat_call(self.inner, model, intent, async move {
             zeroclaw_log::scope!(
                 model: model,
                 => self.inner.chat_with_tool_round_policy(request, model, temperature, policy)
@@ -1098,12 +1428,25 @@ impl<'a> ProviderDispatchRef<'a> {
         );
         let provider_ref = provider_reference(self.inner);
         let model_name = model.to_string();
-        let inner_stream = self.inner.stream_chat_with_tool_round_policy(
-            request,
+        let mut intent = capture::intent(
+            self.inner,
             model,
+            request.messages,
+            request.tools.map(|tools| serde_json::json!(tools)),
             temperature,
-            options,
-            policy,
+            request.thinking,
+        );
+        intent.tool_round_policy = policy;
+        let inner_stream = capture::stream_events(
+            self.inner.stream_chat_with_tool_round_policy(
+                request,
+                model,
+                temperature,
+                options,
+                policy,
+            ),
+            self.inner,
+            intent,
         );
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
@@ -1139,11 +1482,39 @@ impl<'a> ProviderDispatchRef<'a> {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            let messages = capture_messages(system_prompt, message);
+            return capture::project_chunks(
+                self.stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                    options,
+                ),
+                options.count_tokens,
+            );
+        }
         let provider_ref = provider_reference(self.inner);
         let model_name = model.to_string();
-        let mut inner_stream =
+        let mut inner_stream = capture::stream_chunks(
             self.inner
-                .stream_chat_with_system(system_prompt, message, model, temperature, options);
+                .stream_chat_with_system(system_prompt, message, model, temperature, options),
+            self.inner,
+            capture::intent(
+                self.inner,
+                model,
+                &capture_messages(system_prompt, message),
+                None,
+                temperature,
+                None,
+            ),
+        );
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
             attempt.start();
@@ -1171,11 +1542,31 @@ impl<'a> ProviderDispatchRef<'a> {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            return capture::project_chunks(
+                self.stream_chat(
+                    ChatRequest {
+                        messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                    options,
+                ),
+                options.count_tokens,
+            );
+        }
         let provider_ref = provider_reference(self.inner);
         let model_name = model.to_string();
-        let mut inner_stream =
+        let mut inner_stream = capture::stream_chunks(
             self.inner
-                .stream_chat_with_history(messages, model, temperature, options);
+                .stream_chat_with_history(messages, model, temperature, options),
+            self.inner,
+            capture::intent(self.inner, model, messages, None, temperature, None),
+        );
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
             attempt.start();
@@ -1206,15 +1597,46 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        // Native history must freeze the structured semantic response before
+        // this legacy string projection discards reasoning/media/tool blocks.
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            let messages = [ChatMessage::user(message)];
+            let response = self
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                )
+                .await?;
+            return Ok(response.text.unwrap_or_default());
+        }
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
-        accounted_string_call(self.inner, model, async move {
-            zeroclaw_log::scope!(
-                model: model,
-                => self.inner.simple_chat(message, model, temperature)
-            )
-            .await
-        })
+        accounted_string_call(
+            self.inner,
+            model,
+            capture::intent(
+                self.inner,
+                model,
+                &[ChatMessage::user(message)],
+                None,
+                temperature,
+                None,
+            ),
+            async move {
+                zeroclaw_log::scope!(
+                    model: model,
+                    => self.inner.simple_chat(message, model, temperature)
+                )
+                .await
+            },
+        )
         .instrument(span)
         .await
     }
@@ -1227,15 +1649,46 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        // Native history must freeze the structured semantic response before
+        // this legacy string projection discards reasoning/media/tool blocks.
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            let messages = capture_messages(system_prompt, message);
+            let response = self
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                )
+                .await?;
+            return Ok(response.text.unwrap_or_default());
+        }
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
-        accounted_string_call(self.inner, model, async move {
-            zeroclaw_log::scope!(
-                model: model,
-                => self.inner.chat_with_system(system_prompt, message, model, temperature)
-            )
-            .await
-        })
+        accounted_string_call(
+            self.inner,
+            model,
+            capture::intent(
+                self.inner,
+                model,
+                &capture_messages(system_prompt, message),
+                None,
+                temperature,
+                None,
+            ),
+            async move {
+                zeroclaw_log::scope!(
+                    model: model,
+                    => self.inner.chat_with_system(system_prompt, message, model, temperature)
+                )
+                .await
+            },
+        )
         .instrument(span)
         .await
     }
@@ -1247,15 +1700,38 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        // Native history must freeze the structured semantic response before
+        // this legacy string projection discards reasoning/media/tool blocks.
+        if zeroclaw_api::session_events::capture::current_provider_admission().is_some()
+            && !self.inner.is_dispatch_composite()
+        {
+            let response = self
+                .chat(
+                    ChatRequest {
+                        messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    temperature,
+                )
+                .await?;
+            return Ok(response.text.unwrap_or_default());
+        }
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
-        accounted_string_call(self.inner, model, async move {
-            zeroclaw_log::scope!(
-                model: model,
-                => self.inner.chat_with_history(messages, model, temperature)
-            )
-            .await
-        })
+        accounted_string_call(
+            self.inner,
+            model,
+            capture::intent(self.inner, model, messages, None, temperature, None),
+            async move {
+                zeroclaw_log::scope!(
+                    model: model,
+                    => self.inner.chat_with_history(messages, model, temperature)
+                )
+                .await
+            },
+        )
         .instrument(span)
         .await
     }
@@ -1270,13 +1746,25 @@ impl<'a> ProviderDispatchRef<'a> {
     ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
-        accounted_chat_call(self.inner, model, async move {
-            zeroclaw_log::scope!(
-                model: model,
-                => self.inner.chat_with_tools(messages, tools, model, temperature)
-            )
-            .await
-        })
+        accounted_chat_call(
+            self.inner,
+            model,
+            capture::intent(
+                self.inner,
+                model,
+                messages,
+                Some(serde_json::to_value(tools)?),
+                temperature,
+                None,
+            ),
+            async move {
+                zeroclaw_log::scope!(
+                    model: model,
+                    => self.inner.chat_with_tools(messages, tools, model, temperature)
+                )
+                .await
+            },
+        )
         .instrument(span)
         .await
     }
@@ -1382,6 +1870,7 @@ mod tests {
                 "fake-anthropic chat called"
             );
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -1423,6 +1912,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: self.usage.clone(),

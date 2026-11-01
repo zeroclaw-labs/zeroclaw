@@ -27,6 +27,143 @@ use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 use crate::traits::ModelProvider;
 use anyhow::Result;
 
+/// Constructed model binding. Provider identity and route-aware limits travel
+/// with the exact handle they describe; this is transient execution state.
+pub struct SessionModelProvider {
+    pub provider: Box<dyn ModelProvider>,
+    pub provider_ref: String,
+    pub model: String,
+    pub route_resolver: std::sync::Arc<crate::router::ModelRouteResolver>,
+}
+
+pub fn build_session_model_provider(
+    config: &zeroclaw_config::schema::Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<SessionModelProvider> {
+    let (model_provider_name, model_provider_alias) = model_provider_ref
+        .split_once('.')
+        .map(|(t, a)| (t.to_string(), a.to_string()))
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
+            ))
+        })?;
+
+    let entry = config
+        .providers
+        .models
+        .find(&model_provider_name, &model_provider_alias);
+    let model_name = model_override
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            entry
+                .and_then(|e| e.model.as_deref())
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "model_provider `{model_provider_ref}` has no `model` configured and no model \
+                 override was supplied"
+            ))
+        })?;
+
+    let model_provider_runtime_options = crate::provider_runtime_options_for_alias(
+        config,
+        &model_provider_name,
+        &model_provider_alias,
+    );
+
+    let (model_provider, model_route_resolver) =
+        crate::create_routed_model_provider_with_options_and_resolver(
+            config,
+            model_provider_ref,
+            entry.and_then(|e| e.api_key.as_deref()),
+            entry.and_then(|e| e.uri.as_deref()),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &model_provider_runtime_options,
+        )?;
+
+    Ok(SessionModelProvider {
+        provider: model_provider,
+        provider_ref: model_provider_ref.to_string(),
+        model: model_name,
+        route_resolver: model_route_resolver,
+    })
+}
+
+/// Rebuild a selected route using live profile and route credentials. Bare
+/// family requests preserve the legacy current-agent profile fallback.
+pub fn build_switched_model_provider(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    new_model_provider: &str,
+    new_model: &str,
+) -> Result<SessionModelProvider> {
+    let target_entry = new_model_provider
+        .split_once('.')
+        .and_then(|(family, alias)| config.providers.models.find(family, alias));
+    // A dotted target profile is the canonical source of endpoint
+    // and credentials. Falling back to the current agent profile is
+    // only retained for legacy bare-family switch requests.
+    let current_agent_entry = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .map(|(_ty, _alias, entry)| entry);
+    let target_or_current = target_entry.or(current_agent_entry);
+    let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
+    let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
+
+    // Prefer a route-specific api_key when the switched
+    // provider/model matches a configured model_route entry.
+    let route_api_key = config
+        .model_routes
+        .iter()
+        .find(|r| {
+            r.model_provider.eq_ignore_ascii_case(new_model_provider)
+                && (r.model.eq_ignore_ascii_case(new_model)
+                    || r.hint.eq_ignore_ascii_case(new_model))
+        })
+        .and_then(|r| r.api_key.as_deref());
+    let api_key = route_api_key.or(default_api_key);
+
+    let runtime_options = switch_runtime_options(config, new_model_provider);
+
+    let (provider, route_resolver) = crate::create_routed_model_provider_with_options_and_resolver(
+        config,
+        new_model_provider,
+        api_key,
+        default_base_url,
+        &config.reliability,
+        &config.model_routes,
+        new_model,
+        &runtime_options,
+    )?;
+    Ok(SessionModelProvider {
+        provider,
+        route_resolver,
+        provider_ref: new_model_provider.to_owned(),
+        model: new_model.to_owned(),
+    })
+}
+
+/// Dotted aliases use their profile options; legacy bare-family switches use
+/// the configured multimodal policy rather than resetting to narrower defaults.
+fn switch_runtime_options(
+    config: &zeroclaw_config::schema::Config,
+    new_model_provider: &str,
+) -> crate::ModelProviderRuntimeOptions {
+    match new_model_provider.split_once('.') {
+        Some((family, alias)) => crate::provider_runtime_options_for_alias(config, family, alias),
+        None => crate::provider_runtime_options_for_bare_family(config),
+    }
+}
+
 const XAI_DEFAULT_URL: &str = "https://api.x.ai/v1";
 const OLLAMA_COMPAT_DEFAULT_URL: &str = "http://localhost:11434/v1";
 const GROQ_DEFAULT_URL: &str = "https://api.groq.com/openai/v1";
@@ -2063,6 +2200,76 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+    #[test]
+    fn model_switch_options_carry_the_configured_policy_for_bare_families() {
+        // A live switch to a bare family rebuilds the provider from the
+        // config. Building it on `ModelProviderRuntimeOptions::default()`
+        // reset the provider boundary to `max_images = 4` /
+        // `max_image_size_mb = 5`, so a request the operator had configured
+        // for 8 images was re-trimmed to 4 after the switch. The switch path
+        // must resolve the config-owned policy for bare families, the same
+        // way dotted aliases resolve theirs.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.multimodal.max_images = 8;
+        config.multimodal.max_image_size_mb = 10;
+
+        let options = switch_runtime_options(&config, "ollama");
+
+        assert_eq!(
+            options.multimodal.max_images, 8,
+            "a bare-family switch must carry the configured max_images, not the default 4"
+        );
+        assert_eq!(
+            options.multimodal.max_image_size_mb, 10,
+            "a bare-family switch must carry the configured max_image_size_mb, not the default 5"
+        );
+    }
+
+    #[test]
+    fn build_session_model_provider_rejects_undotted_ref() {
+        let config = zeroclaw_config::schema::Config::default();
+        let err = match build_session_model_provider(&config, "anthropic", Some("m")) {
+            Ok(_) => panic!("undotted ref must error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("<type>.<alias>"), "got: {err}");
+    }
+
+    #[test]
+    fn build_session_model_provider_requires_a_model() {
+        // No configured entry and no override → cannot resolve a model name.
+        let config = zeroclaw_config::schema::Config::default();
+        let err = match build_session_model_provider(&config, "anthropic.default", None) {
+            Ok(_) => panic!("missing model must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("no `model` configured"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_session_model_provider_returns_full_canonical_ref() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let binding = build_session_model_provider(&config, "openai.fast", None).unwrap();
+
+        assert_eq!(binding.provider_ref, "openai.fast");
+        assert_eq!(binding.model, "gpt-4o-mini");
+    }
 
     #[test]
     fn cache_passthrough_runtime_option_reaches_provider_capability() {

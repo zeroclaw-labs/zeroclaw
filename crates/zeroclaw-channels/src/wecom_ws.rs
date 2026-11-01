@@ -173,7 +173,7 @@ impl AttachmentKind {
 
 #[derive(Debug)]
 enum NormalizedMessage {
-    Ready(String),
+    Ready(zeroclaw_api::model_provider::ChatMessage),
     VoiceMissingTranscript,
     Unsupported,
 }
@@ -821,13 +821,11 @@ impl WeComWsChannel {
         let channel_self = self.clone();
         let tx = tx.clone();
         zeroclaw_spawn::spawn!(async move {
-            let mut inbound = parsed;
-            channel_self
-                .materialize_quote_attachments(&mut inbound)
-                .await;
+            let inbound = parsed;
+            let quote_attachments = channel_self.materialize_quote_attachments(&inbound).await;
             let normalized = channel_self.normalize_message(&inbound).await;
 
-            let content = match normalized {
+            let mut content = match normalized {
                 NormalizedMessage::VoiceMissingTranscript => {
                     let msg = wecom_ws_cli_string_with_args(
                         "channel-wecom-ws-voice-unavailable",
@@ -851,8 +849,9 @@ impl WeComWsChannel {
             };
 
             let explicitly_addressed =
-                channel_self.message_explicitly_addresses_bot(&inbound, &content);
-            let composed = channel_self.compose_content_for_framework(&inbound, &content);
+                channel_self.message_explicitly_addresses_bot(&inbound, &content.content);
+            let composed = channel_self.compose_content_for_framework(&inbound, &content.content);
+            content.attachments.extend(quote_attachments);
 
             wecom_log_info!(
                 "WeCom: forwarding to framework: msg_id={} req_id={} scope={}",
@@ -861,16 +860,23 @@ impl WeComWsChannel {
                 scopes.reply_target
             );
 
-            let _ = tx
-                .send(scopes.channel_message(
-                    &channel_self.alias,
-                    inbound.msg_id.clone(),
-                    inbound.sender_userid.clone(),
-                    composed,
-                    Some(req_id),
-                    explicitly_addressed,
-                ))
-                .await;
+            let mut message = scopes.channel_message(
+                &channel_self.alias,
+                inbound.msg_id.clone(),
+                inbound.sender_userid.clone(),
+                composed,
+                Some(req_id),
+                explicitly_addressed,
+            );
+            message.attachments = content
+                .attachments
+                .into_iter()
+                .map(|reference| zeroclaw_api::media::MediaAttachment {
+                    reference: Some(reference),
+                    ..Default::default()
+                })
+                .collect();
+            let _ = tx.send(message).await;
         });
     }
 
@@ -930,170 +936,59 @@ impl WeComWsChannel {
 
     // ── Attachment handling ──────────────────────────────────────────
 
-    async fn materialize_quote_attachments(&self, inbound: &mut ParsedInbound) {
-        let quote_type = inbound
-            .raw_payload
-            .get("quote")
-            .and_then(|v| v.get("msgtype"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-
-        if quote_type == "image" {
-            let quote_obj = inbound
-                .raw_payload
-                .get("quote")
-                .and_then(|v| v.get("image"));
-            let quote_url = quote_obj
-                .and_then(|v| v.get("url"))
+    async fn materialize_quote_attachments(
+        &self,
+        inbound: &ParsedInbound,
+    ) -> Vec<zeroclaw_api::media::AttachmentReference> {
+        let mut requests = Vec::new();
+        if let Some(quote) = inbound.raw_payload.get("quote") {
+            let quote_kind = quote
+                .get("msgtype")
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToOwned::to_owned);
-            let aeskey = quote_obj
-                .and_then(|v| v.get("aeskey"))
-                .and_then(Value::as_str);
-            if let Some(url) = quote_url {
-                let marker = match self
-                    .download_and_store_attachment(&url, AttachmentKind::Image, inbound, aeskey)
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        log_attachment_processing_failure(
-                            "WeCom quote image processing failed",
-                            &err,
-                            inbound,
-                            AttachmentKind::Image,
-                            &url,
-                        );
-                        "[\u{5f15}\u{7528}\u{56fe}\u{7247}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]"
-                            .to_string()
-                    }
-                };
-                if let Some(quote) = inbound.raw_payload.get_mut("quote") {
-                    quote["image"] = serde_json::json!({ "local_path": marker });
-                }
-            }
-            return;
-        }
-
-        if quote_type == "file" {
-            let quote_obj = inbound.raw_payload.get("quote").and_then(|v| v.get("file"));
-            let quote_url = quote_obj
-                .and_then(|v| v.get("url"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToOwned::to_owned);
-            let aeskey = quote_obj
-                .and_then(|v| v.get("aeskey"))
-                .and_then(Value::as_str);
-            if let Some(url) = quote_url {
-                let marker = match self
-                    .download_and_store_attachment(&url, AttachmentKind::File, inbound, aeskey)
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        log_attachment_processing_failure(
-                            "WeCom quote file processing failed",
-                            &err,
-                            inbound,
-                            AttachmentKind::File,
-                            &url,
-                        );
-                        "[\u{5f15}\u{7528}\u{6587}\u{4ef6}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]"
-                            .to_string()
-                    }
-                };
-                if let Some(quote) = inbound.raw_payload.get_mut("quote") {
-                    quote["file"] = serde_json::json!({ "local_path": marker });
-                }
-            }
-            return;
-        }
-
-        if quote_type == "mixed" {
-            let quote_images: Vec<(usize, String, Option<String>)> = inbound
-                .raw_payload
-                .get("quote")
-                .and_then(|v| v.get("mixed"))
-                .and_then(|v| v.get("msg_item"))
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, item)| {
-                            let item_type = item
-                                .get("msgtype")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
-                            if item_type != "image" {
-                                return None;
-                            }
-                            let img = item.get("image")?;
-                            let url = img
-                                .get("url")
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|v| !v.is_empty())?;
-                            let aeskey = img
-                                .get("aeskey")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned);
-                            Some((idx, url.to_string(), aeskey))
-                        })
-                        .collect()
-                })
                 .unwrap_or_default();
-
-            if quote_images.is_empty() {
-                return;
-            }
-
-            let mut results: Vec<(usize, String)> = Vec::with_capacity(quote_images.len());
-            for (idx, url, aeskey) in &quote_images {
-                let marker = match self
-                    .download_and_store_attachment(
-                        url,
-                        AttachmentKind::Image,
-                        inbound,
-                        aeskey.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(err) => {
-                        log_attachment_processing_failure(
-                            "WeCom quote mixed image processing failed",
-                            &err,
-                            inbound,
-                            AttachmentKind::Image,
-                            url,
-                        );
-                        "[\u{5f15}\u{7528}\u{56fe}\u{7247}\u{4e0b}\u{8f7d}\u{5931}\u{8d25}]"
-                            .to_string()
-                    }
+            let items: Vec<&Value> = if quote_kind == "mixed" {
+                quote
+                    .get("mixed")
+                    .and_then(|v| v.get("msg_item"))
+                    .and_then(Value::as_array)
+                    .map(|items| items.iter().collect())
+                    .unwrap_or_default()
+            } else {
+                vec![quote]
+            };
+            for item in items {
+                let kind = match item.get("msgtype").and_then(Value::as_str) {
+                    Some("image") => AttachmentKind::Image,
+                    Some("file") => AttachmentKind::File,
+                    _ => continue,
                 };
-                results.push((*idx, marker));
-            }
-
-            if let Some(items) = inbound
-                .raw_payload
-                .get_mut("quote")
-                .and_then(|v| v.get_mut("mixed"))
-                .and_then(|v| v.get_mut("msg_item"))
-                .and_then(Value::as_array_mut)
-            {
-                for (idx, marker) in results {
-                    if let Some(item) = items.get_mut(idx) {
-                        item["image"] = serde_json::json!({ "local_path": marker });
-                    }
+                if let Some(value) = item.get(kind.as_str())
+                    && let Some(url) = value
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .filter(|url| !url.trim().is_empty())
+                {
+                    requests.push((kind, url, value.get("aeskey").and_then(Value::as_str)));
                 }
             }
         }
+        let mut attachments = Vec::new();
+        for (kind, url, aeskey) in requests {
+            match self
+                .download_and_store_attachment(url, kind, inbound, aeskey)
+                .await
+            {
+                Ok(reference) => attachments.push(reference),
+                Err(error) => log_attachment_processing_failure(
+                    "WeCom quote attachment processing failed",
+                    &error,
+                    inbound,
+                    kind,
+                    url,
+                ),
+            }
+        }
+        attachments
     }
 
     async fn normalize_message(&self, inbound: &ParsedInbound) -> NormalizedMessage {
@@ -1111,7 +1006,9 @@ impl WeComWsChannel {
                 if content.is_empty() {
                     NormalizedMessage::Unsupported
                 } else {
-                    NormalizedMessage::Ready(content)
+                    NormalizedMessage::Ready(zeroclaw_api::model_provider::ChatMessage::user(
+                        content,
+                    ))
                 }
             }
             "voice" => {
@@ -1127,7 +1024,9 @@ impl WeComWsChannel {
                 if content.is_empty() {
                     NormalizedMessage::VoiceMissingTranscript
                 } else {
-                    NormalizedMessage::Ready(format!("[Voice transcript]\n{content}"))
+                    NormalizedMessage::Ready(zeroclaw_api::model_provider::ChatMessage::user(
+                        format!("Voice transcript:\n{content}"),
+                    ))
                 }
             }
             "image" => {
@@ -1149,7 +1048,10 @@ impl WeComWsChannel {
                     .download_and_store_attachment(url, AttachmentKind::Image, inbound, aeskey)
                     .await
                 {
-                    Ok(marker) => NormalizedMessage::Ready(marker),
+                    Ok(reference) => NormalizedMessage::Ready(
+                        zeroclaw_api::model_provider::ChatMessage::user("")
+                            .with_attachments(vec![reference]),
+                    ),
                     Err(err) => {
                         log_attachment_processing_failure(
                             "WeCom image processing failed",
@@ -1158,10 +1060,9 @@ impl WeComWsChannel {
                             AttachmentKind::Image,
                             url,
                         );
-                        NormalizedMessage::Ready(
-                            "[Image attachment processing failed; please continue without this image.]"
-                                .to_string(),
-                        )
+                        NormalizedMessage::Ready(zeroclaw_api::model_provider::ChatMessage::user(
+                            "Image attachment processing failed; please continue without this image.",
+                        ))
                     }
                 }
             }
@@ -1184,7 +1085,10 @@ impl WeComWsChannel {
                     .download_and_store_attachment(url, AttachmentKind::File, inbound, aeskey)
                     .await
                 {
-                    Ok(marker) => NormalizedMessage::Ready(marker),
+                    Ok(reference) => NormalizedMessage::Ready(
+                        zeroclaw_api::model_provider::ChatMessage::user("")
+                            .with_attachments(vec![reference]),
+                    ),
                     Err(err) => {
                         log_attachment_processing_failure(
                             "WeCom file processing failed",
@@ -1193,15 +1097,15 @@ impl WeComWsChannel {
                             AttachmentKind::File,
                             url,
                         );
-                        NormalizedMessage::Ready(
-                            "[File attachment processing failed; please continue without this file.]"
-                                .to_string(),
-                        )
+                        NormalizedMessage::Ready(zeroclaw_api::model_provider::ChatMessage::user(
+                            "File attachment processing failed; please continue without this file.",
+                        ))
                     }
                 }
             }
             "mixed" => {
                 let mut text_parts = Vec::new();
+                let mut attachments = Vec::new();
                 if let Some(items) = inbound
                     .raw_payload
                     .get("mixed")
@@ -1238,7 +1142,7 @@ impl WeComWsChannel {
                                     )
                                     .await
                                 {
-                                    Ok(marker) => text_parts.push(marker),
+                                    Ok(reference) => attachments.push(reference),
                                     Err(err) => {
                                         log_attachment_processing_failure(
                                             "WeCom mixed image processing failed",
@@ -1258,10 +1162,13 @@ impl WeComWsChannel {
                     }
                 }
 
-                if text_parts.is_empty() {
+                if text_parts.is_empty() && attachments.is_empty() {
                     NormalizedMessage::Unsupported
                 } else {
-                    NormalizedMessage::Ready(text_parts.join("\n\n"))
+                    NormalizedMessage::Ready(
+                        zeroclaw_api::model_provider::ChatMessage::user(text_parts.join("\n\n"))
+                            .with_attachments(attachments),
+                    )
                 }
             }
             other => {
@@ -1280,7 +1187,7 @@ impl WeComWsChannel {
         kind: AttachmentKind,
         inbound: &ParsedInbound,
         aeskey: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<zeroclaw_api::media::AttachmentReference> {
         if self.cfg.max_file_size_bytes == 0 {
             anyhow::bail!("WeCom max_file_size_bytes is zero");
         }
@@ -1339,10 +1246,7 @@ impl WeComWsChannel {
                 len,
                 self.cfg.max_file_size_bytes
             );
-            return Ok(format!(
-                "[AttachmentTooLarge kind={:?} size={}B limit={}B]",
-                kind, len, self.cfg.max_file_size_bytes
-            ));
+            anyhow::bail!("WeCom attachment exceeds configured size limit");
         }
 
         let bytes = response
@@ -1366,12 +1270,7 @@ impl WeComWsChannel {
                 bytes.len(),
                 self.cfg.max_file_size_bytes
             );
-            return Ok(format!(
-                "[AttachmentTooLarge kind={:?} size={}B limit={}B]",
-                kind,
-                bytes.len(),
-                self.cfg.max_file_size_bytes
-            ));
+            anyhow::bail!("WeCom attachment exceeds configured size limit");
         }
 
         // Decrypt if aeskey is present; otherwise write the downloaded bytes directly.
@@ -1440,10 +1339,13 @@ impl WeComWsChannel {
             abs.display(),
             started.elapsed().as_millis()
         );
-        match kind {
-            AttachmentKind::Image => Ok(format!("[IMAGE:{}]", abs.display())),
-            AttachmentKind::File => Ok(format!("[Document: {}]", abs.display())),
-        }
+        Ok(zeroclaw_api::media::AttachmentReference {
+            kind: match kind {
+                AttachmentKind::Image => zeroclaw_api::media::AttachmentKind::Image,
+                AttachmentKind::File => zeroclaw_api::media::AttachmentKind::Document,
+            },
+            target: abs.display().to_string(),
+        })
     }
 
     async fn send_markdown_chunks_to_scope(&self, scope: &str, content: &str) -> Result<()> {

@@ -1,5 +1,10 @@
 import type { components } from "../lib/api-generated";
 
+export interface AttachmentReference {
+  target: string;
+  kind: 'image' | 'audio' | 'video' | 'document';
+}
+
 export type StatusResponse = components["schemas"]["StatusResponse"];
 
 export interface ProcessStats {
@@ -310,6 +315,8 @@ export interface PendingApproval {
 export interface SessionMessageRow {
   role: string;
   content: string;
+  files?: string[];
+  attachments?: AttachmentReference[];
   /** RFC 3339 timestamp recorded when the row was persisted. `null` for
    * backends that don't stamp per-row timestamps (JSONL / in-memory). */
   created_at: string | null;

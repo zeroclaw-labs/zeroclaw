@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelChoiceOutcome, ChannelMessage,
+    SendMessage,
 };
 use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
@@ -118,6 +119,17 @@ impl Channel for RpcApprovalChannel {
         choices: &[String],
         timeout: Duration,
     ) -> anyhow::Result<Option<String>> {
+        self.request_choice_outcome(question, choices, timeout)
+            .await?
+            .into_legacy_response()
+    }
+
+    async fn request_choice_outcome(
+        &self,
+        question: &str,
+        choices: &[String],
+        timeout: Duration,
+    ) -> anyhow::Result<ChannelChoiceOutcome> {
         if choices.is_empty() {
             // Defensive — callers should gate on `supports_free_form_ask`,
             // but a structured-choice request with zero options is always
@@ -125,7 +137,7 @@ impl Channel for RpcApprovalChannel {
             anyhow::bail!("RpcApprovalChannel.request_choice requires at least one choice")
         }
         if !self.client_caps.form {
-            return Ok(None);
+            return Ok(ChannelChoiceOutcome::Unavailable);
         }
         self.request_choice_via_elicitation(question, choices, timeout)
             .await
@@ -172,37 +184,53 @@ impl RpcApprovalChannel {
         timeout: Duration,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, mut rx) =
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         // Bind the approval to this channel's session so session/approve is
         // authorized against the session's owner.
         let mut pending_request =
             self.pending
                 .register(request_id.clone(), self.session_id.clone(), tx);
 
-        self.rpc
-            .notify(
-                "session/update",
-                json!({
-                    "type": "approval_request",
-                    "session_id": self.session_id,
-                    "request_id": request_id,
-                    "tool_name": request.tool_name,
-                    "arguments_summary": request.arguments_summary,
-                    "timeout_secs": timeout.as_secs(),
-                }),
-            )
-            .await;
+        let response = async {
+            let send_prompt = async {
+                self.rpc
+                    .notify(
+                        "session/update",
+                        json!({
+                            "type": "approval_request",
+                            "session_id": self.session_id,
+                            "request_id": request_id,
+                            "tool_name": request.tool_name,
+                            "arguments_summary": request.arguments_summary,
+                            "timeout_secs": timeout.as_secs(),
+                        }),
+                    )
+                    .await;
+                anyhow::Ok(())
+            };
+            match zeroclaw_api::channel::await_approval_prompt_send(send_prompt, &mut rx).await {
+                Ok(zeroclaw_api::channel::ApprovalPromptOutcome::Sent(())) => {}
+                Ok(zeroclaw_api::channel::ApprovalPromptOutcome::Replied(response)) => {
+                    return Some(Ok(response));
+                }
+                Err(error) => return Some(Err(error)),
+            }
+            tokio::select! {
+                biased;
+                response = &mut rx => response.ok(),
+                () = self.rpc.closed() => rx.try_recv().ok(),
+            }
+        };
 
         // Only the answered arm is an operator decision. The other two deny
         // because the client went away or never answered, and say so.
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(response)) => {
+        match tokio::time::timeout(timeout, response).await {
+            Ok(Some(response)) => {
                 pending_request.disarm();
-                Ok(Some(
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
-                ))
+                response.map(Some)
             }
-            Ok(Err(_)) => Ok(Some(
+            Ok(None) => Ok(Some(
                 zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     zeroclaw_api::channel::ApprovalSource::Unreachable,
@@ -222,7 +250,7 @@ impl RpcApprovalChannel {
         question: &str,
         choices: &[String],
         timeout: Duration,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<ChannelChoiceOutcome> {
         let req = ElicitationRequest {
             session_id: self.session_id.clone(),
             mode: ElicitationMode::Form,
@@ -240,16 +268,17 @@ impl RpcApprovalChannel {
             Ok(Err(e)) => {
                 anyhow::bail!("RPC elicitation/create failed: {} ({})", e.message, e.code)
             }
-            Err(_) => anyhow::bail!("RPC elicitation/create timed out after {timeout:?}"),
+            Err(_) => return Ok(ChannelChoiceOutcome::TimedOut),
         };
         let parsed: ElicitationResponse = serde_json::from_value(response_value)
             .map_err(|e| anyhow::Error::msg(format!("malformed elicitation response: {e}")))?;
         match parsed {
             ElicitationResponse::Accept { content } => {
                 let text = decode_single_select_accept(&content, choices)?;
-                Ok(Some(text))
+                Ok(ChannelChoiceOutcome::Answered(text))
             }
-            ElicitationResponse::Decline | ElicitationResponse::Cancel => Ok(None),
+            ElicitationResponse::Decline => Ok(ChannelChoiceOutcome::Declined),
+            ElicitationResponse::Cancel => Ok(ChannelChoiceOutcome::Cancelled),
         }
     }
 
@@ -407,6 +436,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnected_writer_is_unreachable_and_queued_operator_reply_wins() {
+        use zeroclaw_api::channel::ApprovalSource;
+        for queued in [
+            None,
+            Some(ChannelApprovalResponse::Approve),
+            Some(ChannelApprovalResponse::Deny),
+        ] {
+            let (rpc, mut wire) = make_rpc();
+            let pending = make_pending();
+            let channel = make_channel_no_caps(rpc, pending.clone());
+            let approval = ChannelApprovalRequest {
+                tool_name: "shell".into(),
+                arguments_summary: "fixture".into(),
+                raw_arguments: None,
+                position: None,
+            };
+            let mut request = Box::pin(channel.request_approval_attributed_with_timeout(
+                "operator",
+                &approval,
+                Duration::from_secs(30),
+            ));
+            let line = tokio::select! {
+                line = wire.recv() => line.expect("notification"),
+                result = &mut request => panic!("premature response: {result:?}"),
+            };
+            let frame: serde_json::Value = serde_json::from_str(&line).expect("frame");
+            let request_id = frame["params"]["request_id"].as_str().expect("request ID");
+            if let Some(response) = &queued {
+                assert!(pending.resolve(request_id, "sess-1", response.clone()));
+            }
+            drop(wire);
+            let result = tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .expect("disconnect resolves before approval deadline")
+                .expect("response")
+                .expect("attributed response");
+            assert_eq!(
+                result.source,
+                if queued.is_some() {
+                    ApprovalSource::Operator
+                } else {
+                    ApprovalSource::Unreachable
+                }
+            );
+            assert_eq!(
+                result.response,
+                queued.unwrap_or(ChannelApprovalResponse::Deny)
+            );
+            assert!(!pending.contains(request_id));
+        }
+    }
+
+    #[tokio::test]
     async fn dropped_request_future_removes_pending_request() {
         let (rpc, mut write_rx) = make_rpc();
         let pending = make_pending();
@@ -436,6 +518,37 @@ mod tests {
     }
 
     // ── Elicitation (request_choice / request_multi_choice) ────────
+
+    #[tokio::test]
+    async fn choice_outcome_preserves_wire_decline_cancel_and_timeout() {
+        for (action, expected) in [
+            (Some("decline"), ChannelChoiceOutcome::Declined),
+            (Some("cancel"), ChannelChoiceOutcome::Cancelled),
+            (None, ChannelChoiceOutcome::TimedOut),
+        ] {
+            let (rpc, mut rx) = make_rpc();
+            let ch = make_channel_form_caps(rpc.clone(), make_pending());
+            let timeout = if action.is_some() {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(50)
+            };
+            let task = zeroclaw_spawn::spawn!(async move {
+                ch.request_choice_outcome("Pick one", &["A".into()], timeout)
+                    .await
+            });
+            let line = rx.recv().await.unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if let Some(action) = action {
+                rpc.dispatch_response(
+                    frame["id"].as_str().unwrap(),
+                    Some(json!({"action": action})),
+                    None,
+                );
+            }
+            assert_eq!(task.await.unwrap().unwrap(), expected);
+        }
+    }
 
     #[tokio::test]
     async fn request_choice_without_capability_returns_none() {

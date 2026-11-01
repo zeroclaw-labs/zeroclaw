@@ -107,6 +107,13 @@ fn session_targeting_rpc_methods_authorize_ownership() {
 
     let src = repo_file("crates/zeroclaw-runtime/src/rpc/dispatch.rs");
 
+    // Native page/payload handlers share one ownership-and-live-policy reader.
+    // Validate its gate rather than requiring duplicate checks in callers.
+    let (reader_start, reader_end) = fn_body_span_from(&src, "fn session_event_reader", 0);
+    let reader = &src[reader_start..reader_end];
+    assert!(reader.contains("authorize_session_owner(sid, method).await?"));
+    assert!(reader.contains("native_history_query(&key, record.as_ref(), method)"));
+
     let mut ungated = Vec::new();
     let mut checked = 0usize;
     let mut from = 0usize;
@@ -129,7 +136,7 @@ fn session_targeting_rpc_methods_authorize_ownership() {
             continue;
         }
         checked += 1;
-        if !body.contains("authorize_session_owner") {
+        if !body.contains("authorize_session_owner") && !body.contains(".session_event_reader(") {
             let line_no = src[..at].bytes().filter(|b| *b == b'\n').count() + 1;
             ungated.push(format!("  dispatch.rs:{line_no}: {name}"));
         }

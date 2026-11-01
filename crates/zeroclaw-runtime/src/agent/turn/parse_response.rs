@@ -21,51 +21,17 @@ use zeroclaw_tool_call_parser::{
     strip_trailing_terminal_markers,
 };
 
-/// Build assistant history entry in JSON format for native tool-call APIs.
-/// `convert_messages` in the OpenRouter model_provider parses this JSON to reconstruct
-/// the proper `NativeMessage` with structured `tool_calls`.
+/// Preserve calls and opaque reasoning without encoding them in visible text.
 pub(crate) fn build_native_assistant_history(
     text: &str,
     tool_calls: &[ToolCall],
     reasoning_content: Option<&str>,
-) -> String {
-    let calls_json: Vec<serde_json::Value> = tool_calls
-        .iter()
-        .map(|tc| {
-            let mut call = serde_json::Map::from_iter([
-                ("id".to_string(), serde_json::json!(tc.id)),
-                ("name".to_string(), serde_json::json!(tc.name)),
-                ("arguments".to_string(), serde_json::json!(tc.arguments)),
-            ]);
-            if let Some(extra_content) = &tc.extra_content {
-                call.insert("extra_content".to_string(), extra_content.clone());
-            }
-            serde_json::Value::Object(call)
-        })
-        .collect();
-
-    let content = if text.trim().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(text.trim().to_string())
-    };
-
-    let mut obj = serde_json::Map::from_iter([
-        ("content".to_string(), content),
-        (
-            "tool_calls".to_string(),
-            serde_json::Value::Array(calls_json),
-        ),
-    ]);
-
-    if let Some(rc) = reasoning_content {
-        obj.insert(
-            "reasoning_content".to_string(),
-            serde_json::Value::String(rc.to_string()),
-        );
-    }
-
-    serde_json::Value::Object(obj).to_string()
+) -> ChatMessage {
+    ChatMessage::assistant_tool_calls(
+        text.trim(),
+        tool_calls.to_vec(),
+        reasoning_content.map(str::to_owned),
+    )
 }
 
 pub(crate) fn resolve_display_text(
@@ -115,7 +81,7 @@ pub(crate) struct InterpretedResponse {
     pub(crate) response_text: String,
     pub(crate) parsed_text: String,
     pub(crate) tool_calls: Vec<ParsedToolCall>,
-    pub(crate) assistant_history_content: String,
+    pub(crate) assistant_history_content: ChatMessage,
     pub(crate) native_tool_calls: Vec<ToolCall>,
     pub(crate) parse_issue_detected: bool,
     pub(crate) input_tokens: Option<u64>,
@@ -245,6 +211,11 @@ pub(crate) async fn interpret_chat_response(
     }
 
     for call in &mut calls {
+        // Text protocols do not supply IDs. Create identity once at admission
+        // so execution events, history and later native replay share it.
+        if call.tool_call_id.is_none() {
+            call.tool_call_id = Some(uuid::Uuid::new_v4().to_string());
+        }
         if let Some(spec) = specs.tool_specs.iter().find(|spec| spec.name == call.name) {
             recover_structured_arguments(&mut call.arguments, &spec.parameters, 0);
         }
@@ -301,16 +272,12 @@ pub(crate) async fn interpret_chat_response(
     // follow-up messages can reference the exact call id.
     let reasoning_content = resp.reasoning_content.clone();
     let assistant_history_content = if resp.tool_calls.is_empty() {
-        if specs.use_native_tools {
-            build_native_assistant_history_from_parsed_calls(
-                &response_text,
-                &calls,
-                reasoning_content.as_deref(),
-            )
-            .unwrap_or_else(|| response_text.clone())
-        } else {
-            response_text.clone()
-        }
+        build_native_assistant_history_from_parsed_calls(
+            &parsed_text,
+            &calls,
+            reasoning_content.as_deref(),
+        )
+        .unwrap_or_else(|| ChatMessage::assistant(&response_text))
     } else {
         build_native_assistant_history(
             &response_text,
@@ -489,7 +456,7 @@ mod tests {
             None,
         );
 
-        let value = serde_json::from_str::<serde_json::Value>(&history).unwrap();
+        let value = serde_json::to_value(&history).unwrap();
         assert_eq!(
             value["tool_calls"][0]["extra_content"],
             serde_json::json!({"google": {"thought_signature": "sig_1"}})
@@ -627,6 +594,7 @@ mod argument_preservation_tests {
         };
         let resp = if native {
             ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call-test".into(),
@@ -639,6 +607,7 @@ mod argument_preservation_tests {
             }
         } else {
             ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(format!(
                     "<tool_call>{}</tool_call>",
                     json!({"id": "call-test", "name": name, "arguments": arguments})
@@ -742,16 +711,13 @@ mod argument_preservation_tests {
             assert_eq!(recovered["params"], json!({"maxResults":3}));
             assert_eq!(recovered["items"], json!(["{\"id\":1}"]));
             assert_eq!(recovered["content"], "[1,2]");
-            if use_native_tools {
+            {
                 let history: Value =
-                    serde_json::from_str(&fallback.assistant_history_content).unwrap();
+                    serde_json::to_value(&fallback.assistant_history_content).unwrap();
                 let history_args: Value =
                     serde_json::from_str(history["tool_calls"][0]["arguments"].as_str().unwrap())
                         .unwrap();
                 assert_eq!(&history_args, recovered);
-            } else {
-                // Prompt-guided providers retain their original textual transcript.
-                assert_eq!(fallback.assistant_history_content, fallback.response_text);
             }
         }
         let native = interpret(
@@ -1017,6 +983,7 @@ mod cost_usd_regression_tests {
         };
 
         let resp = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("hello".to_string()),
             tool_calls: vec![],
             usage: Some(TokenUsage {
@@ -1175,6 +1142,7 @@ mod cost_usd_regression_tests {
             "served.provider",
             "served-model",
             ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(
                     "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}</tool_call>"
                         .to_string(),

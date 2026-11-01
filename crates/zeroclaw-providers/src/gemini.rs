@@ -128,12 +128,15 @@ struct InlineData {
     data: String,
 }
 
-/// Build Gemini Parts from a message content string.
-/// If the content contains [IMAGE:data:...] markers (already normalized by the
-/// multimodal pipeline), they are extracted as inline_data parts. The remaining
-/// text becomes a text part. Falls back to a single text part if no markers.
-fn build_parts(content: &str) -> Vec<Part> {
-    let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
+/// Build Gemini Parts from body text and explicit image attachments.
+/// Images normalized by the multimodal pipeline become inline_data parts.
+/// Falls back to a single text part when no image attachment is present.
+fn build_parts(message: &ChatMessage) -> Vec<Part> {
+    let content = message.content.as_str();
+    let (text, image_refs) = (
+        message.content.clone(),
+        crate::multimodal::message_image_refs(message),
+    );
     let mut parts = Vec::new();
     let trimmed = text.trim();
     if !trimmed.is_empty() {
@@ -170,6 +173,9 @@ struct GenerationConfig {
 
 #[derive(Debug, Deserialize)]
 struct GenerateContentResponse {
+    #[serde(default, rename = "modelVersion")]
+    model_version: Option<String>,
+
     candidates: Option<Vec<Candidate>>,
     error: Option<ApiError>,
     #[serde(default)]
@@ -188,22 +194,26 @@ struct GeminiUsageMetadata {
 
 #[derive(Debug, Deserialize)]
 struct Candidate {
+    #[serde(default, rename = "finishReason")]
+    finish_reason: Option<String>,
     #[serde(default)]
     content: Option<CandidateContent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct CandidateContent {
     parts: Vec<ResponsePart>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ResponsePart {
     #[serde(default)]
     text: Option<String>,
     /// Thinking models (e.g. gemini-3-pro-preview) mark reasoning parts with `thought: true`.
     #[serde(default)]
     thought: bool,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 impl CandidateContent {
@@ -232,9 +242,11 @@ impl CandidateContent {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, serde::Serialize, Deserialize)]
 struct ApiError {
     message: String,
+    #[serde(flatten)]
+    fields: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl GenerateContentResponse {
@@ -244,10 +256,14 @@ impl GenerateContentResponse {
             Self {
                 response: Some(mut inner),
                 usage_metadata,
+                model_version,
                 ..
             } => {
                 if inner.usage_metadata.is_none() {
                     inner.usage_metadata = usage_metadata;
+                }
+                if inner.model_version.is_none() {
+                    inner.model_version = model_version;
                 }
                 *inner
             }
@@ -1078,6 +1094,10 @@ impl GeminiModelProvider {
         messages: &[ChatMessage],
         tool_instructions: Option<&str>,
     ) -> anyhow::Result<(Vec<Content>, Option<Content>)> {
+        let mut messages = messages.to_vec();
+        crate::tool_protocol::render_text_tool_protocol(&mut messages)?;
+        let projected = crate::multimodal::project_attachment_metadata(&messages);
+        let messages = projected.as_ref();
         let mut system_parts: Vec<&str> = Vec::new();
         let mut contents: Vec<Content> = Vec::new();
         for msg in messages {
@@ -1085,7 +1105,7 @@ impl GeminiModelProvider {
                 "system" => system_parts.push(&msg.content),
                 "user" => contents.push(Content {
                     role: Some("user".to_string()),
-                    parts: build_parts(&msg.content),
+                    parts: build_parts(msg),
                 }),
                 "assistant" => contents.push(Content {
                     role: Some("model".to_string()),
@@ -1156,6 +1176,7 @@ impl GeminiModelProvider {
         let (contents, system_instruction) = Self::build_chat_contents(messages, None)?;
         self.send_generate_content(contents, system_instruction, model, temperature)
             .await
+            .map(|(text, usage, _)| (text, usage))
     }
 
     fn token_usage_from_metadata(usage: GeminiUsageMetadata) -> Option<TokenUsage> {
@@ -1176,7 +1197,11 @@ impl GeminiModelProvider {
         system_instruction: Option<Content>,
         model: &str,
         temperature: Option<f64>,
-    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+    ) -> anyhow::Result<(
+        String,
+        Option<TokenUsage>,
+        Vec<zeroclaw_api::model_provider::ProviderOutputBlock>,
+    )> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1346,7 +1371,7 @@ impl GeminiModelProvider {
                         .send()
                         .await?;
                 } else {
-                    anyhow::bail!("Gemini API error ({status}): {error_text}");
+                    return Err(super::api_error_from_parts("Gemini", status, &error_text));
                 }
             } else if auth.is_oauth()
                 && Self::should_retry_oauth_without_generation_config(status, &error_text)
@@ -1370,7 +1395,7 @@ impl GeminiModelProvider {
                     .send()
                     .await?;
             } else {
-                anyhow::bail!("Gemini API error ({status}): {error_text}");
+                return Err(super::api_error_from_parts("Gemini", status, &error_text));
             }
         }
 
@@ -1399,45 +1424,59 @@ impl GeminiModelProvider {
                     .send()
                     .await?;
             } else {
-                anyhow::bail!("Gemini API error ({status}): {error_text}");
+                return Err(super::api_error_from_parts("Gemini", status, &error_text));
             }
         }
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Gemini API error ({status}): {error_text}");
+            return Err(super::api_error_from_parts("Gemini", status, &error_text));
         }
 
         let result: GenerateContentResponse = response.json().await?;
         if let Some(err) = &result.error {
-            anyhow::bail!("Gemini API error: {}", err.message);
+            return Err(crate::dispatch::ProviderProtocolFailure::new(
+                serde_json::json!({"error":err}),
+            )
+            .into());
         }
         let result = result.into_effective_response();
         if let Some(err) = result.error {
-            anyhow::bail!("Gemini API error: {}", err.message);
+            return Err(crate::dispatch::ProviderProtocolFailure::new(
+                serde_json::json!({"error":err}),
+            )
+            .into());
         }
 
         let usage = result
             .usage_metadata
             .and_then(Self::token_usage_from_metadata);
 
-        let text = result
+        let candidate = result
             .candidates
             .and_then(|c| c.into_iter().next())
-            .and_then(|c| c.content)
-            .and_then(|c| c.effective_text())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "gemini: empty response text"
-                );
-                anyhow::Error::msg("No response from Gemini")
-            })?;
+            .ok_or_else(|| anyhow::Error::msg("No response from Gemini"))?;
+        let mut output_blocks = Vec::new();
+        if let Some(model) = result.model_version {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {metadata:serde_json::json!({"kind":"served_attribution","protocol":"gemini","model":model})});
+        }
+        if let Some(reason) = candidate.finish_reason {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"gemini", "finish_reason":reason}),
+            });
+        }
+        let candidate = candidate
+            .content
+            .ok_or_else(|| anyhow::Error::msg("No response from Gemini"))?;
+        for part in &candidate.parts {
+            output_blocks.extend(crate::output::gemini_blocks(&serde_json::to_value(part)?));
+        }
+        // Media-only responses are valid semantic output. Retain the legacy
+        // display projection independently from complete ordered blocks.
+        let text = candidate.effective_text().unwrap_or_default();
 
-        Ok((text, usage))
+        Ok((text, usage, output_blocks))
     }
 }
 
@@ -1471,10 +1510,10 @@ impl ModelProvider for GeminiModelProvider {
 
         let contents = vec![Content {
             role: Some("user".to_string()),
-            parts: build_parts(message),
+            parts: build_parts(&ChatMessage::user(message)),
         }];
 
-        let (text, _usage) = self
+        let (text, _usage, _blocks) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
         Ok(text)
@@ -1515,14 +1554,25 @@ impl ModelProvider for GeminiModelProvider {
         };
         let (contents, system_instruction) =
             Self::build_chat_contents(request.messages, tool_instructions.as_deref())?;
-        let (text, usage) = self
+        let (text, usage, output_blocks) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
+        let reasoning_content = output_blocks
+            .iter()
+            .filter_map(|block| match block {
+                zeroclaw_api::model_provider::ProviderOutputBlock::Reasoning { bytes, .. } => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         Ok(ProviderChatResponse {
+            output_blocks,
             text: Some(text),
             tool_calls: Vec::new(),
             usage,
-            reasoning_content: None,
+            reasoning_content: (!reasoning_content.is_empty())
+                .then(|| reasoning_content.join("\n")),
         })
     }
 
@@ -2633,7 +2683,7 @@ mod tests {
 
     #[test]
     fn build_parts_plain_text_returns_single_text_part() {
-        let parts = build_parts("Hello, world!");
+        let parts = build_parts(&ChatMessage::user("Hello, world!"));
         assert_eq!(parts.len(), 1);
         assert_eq!(
             serde_json::to_value(&parts[0]).unwrap(),
@@ -2643,7 +2693,7 @@ mod tests {
 
     #[test]
     fn build_parts_empty_string_returns_single_text_part() {
-        let parts = build_parts("");
+        let parts = build_parts(&ChatMessage::user(""));
         assert_eq!(parts.len(), 1);
         // Falls back to original content when no markers and trimmed is empty
         assert_eq!(
@@ -2654,8 +2704,11 @@ mod tests {
 
     #[test]
     fn build_parts_extracts_data_uri_as_inline_part() {
-        let content = "Check this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
-        let parts = build_parts(content);
+        let message = ChatMessage::user("Check this").with_attachments(vec![zeroclaw_api::media::AttachmentReference {
+            kind: zeroclaw_api::media::AttachmentKind::Image,
+            target: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC".into(),
+        }]);
+        let parts = build_parts(&message);
         assert_eq!(parts.len(), 2);
         // First part is text
         assert_eq!(
@@ -2671,8 +2724,16 @@ mod tests {
 
     #[test]
     fn build_parts_multiple_images() {
-        let content = "Image A: [IMAGE:data:image/png;base64,AAAA] Image B: [IMAGE:data:image/jpeg;base64,BBBB]";
-        let parts = build_parts(content);
+        let message = ChatMessage::user("Compare images A and B").with_attachments(
+            ["data:image/png;base64,AAAA", "data:image/jpeg;base64,BBBB"]
+                .into_iter()
+                .map(|target| zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: target.into(),
+                })
+                .collect(),
+        );
+        let parts = build_parts(&message);
         assert_eq!(parts.len(), 3); // text + 2 images
         // Verify both inline parts
         let inline_parts: Vec<_> = parts
@@ -2683,13 +2744,13 @@ mod tests {
     }
 
     #[test]
-    fn build_parts_ignores_non_data_uri_markers() {
-        // File paths and URLs are not data URIs — build_parts should only
-        // extract data: URIs, leaving non-data markers as stripped text.
+    fn build_parts_preserves_marker_text() {
         let content = "Look [IMAGE:/tmp/photo.png]";
-        let parts = build_parts(content);
-        // parse_image_markers extracts the marker, but build_parts only
-        // converts data: URIs to inline parts. The text remains.
+        let parts = build_parts(&ChatMessage::user(content));
+        assert_eq!(
+            serde_json::to_value(&parts[0]).unwrap(),
+            serde_json::json!({"text": content})
+        );
         for part in &parts {
             assert!(matches!(part, Part::Text { .. }));
         }
@@ -2697,9 +2758,13 @@ mod tests {
 
     #[test]
     fn build_parts_image_only_still_produces_inline_part() {
-        let content = "[IMAGE:data:image/gif;base64,R0lGODlh]";
-        let parts = build_parts(content);
-        // Should have just the inline part (text is empty after marker removal)
+        let message = ChatMessage::user("").with_attachments(vec![
+            zeroclaw_api::media::AttachmentReference {
+                kind: zeroclaw_api::media::AttachmentKind::Image,
+                target: "data:image/gif;base64,R0lGODlh".into(),
+            },
+        ]);
+        let parts = build_parts(&message);
         assert_eq!(parts.len(), 1);
         assert!(matches!(&parts[0], Part::Inline { .. }));
     }
@@ -2710,7 +2775,12 @@ mod tests {
     fn chat_with_history_maps_roles_correctly() {
         let messages = vec![
             ChatMessage::system("You are helpful"),
-            ChatMessage::user("Hello [IMAGE:data:image/png;base64,AA==]"),
+            ChatMessage::user("Hello").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,AA==".to_string(),
+                },
+            ]),
         ];
 
         let (contents, system_instruction) =

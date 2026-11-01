@@ -1,4 +1,4 @@
-use crate::media::RenderedMarker;
+use crate::media::AttachmentReference;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -102,13 +102,13 @@ macro_rules! mock_tool_attribution {
 ///
 /// `attachments` is the attachment identity contract: a tool that produced a
 /// file the model should see as media records it here, and nothing in `text`
-/// is ever scanned for marker syntax to recover that fact. See
-/// `tool_carrier` for the carrier grammar this feeds on the history side.
+/// is ever scanned for marker syntax to recover that fact. Conversation
+/// tool results retain these references as structured fields.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolOutput {
     text: String,
     data: Option<serde_json::Value>,
-    attachments: Vec<RenderedMarker>,
+    attachments: Vec<AttachmentReference>,
 }
 
 impl ToolOutput {
@@ -140,22 +140,22 @@ impl ToolOutput {
         }
     }
 
-    /// Declare one media attachment produced by this tool. The marker's
+    /// Declare one media attachment produced by this tool. The reference's
     /// `target` is the exact path or URI the multimodal loader should resolve;
     /// the attachment rides alongside the text and is never recovered by
     /// scanning it.
-    pub fn with_attachment(mut self, marker: RenderedMarker) -> Self {
-        self.attachments.push(marker);
+    pub fn with_attachment(mut self, attachment: AttachmentReference) -> Self {
+        self.attachments.push(attachment);
         self
     }
 
     /// The attachments this tool declared, in declaration order.
-    pub fn attachments(&self) -> &[RenderedMarker] {
+    pub fn attachments(&self) -> &[AttachmentReference] {
         &self.attachments
     }
 
     /// Take the declared attachments, leaving the text and structured value.
-    pub fn take_attachments(&mut self) -> Vec<RenderedMarker> {
+    pub fn take_attachments(&mut self) -> Vec<AttachmentReference> {
         std::mem::take(&mut self.attachments)
     }
 
@@ -284,7 +284,7 @@ impl<'de> Deserialize<'de> for ToolOutput {
                 #[serde(default, deserialize_with = "deserialize_present_data")]
                 data: Option<serde_json::Value>,
                 #[serde(default)]
-                attachments: Option<Vec<RenderedMarker>>,
+                attachments: Option<Vec<AttachmentReference>>,
             },
         }
         Ok(match Repr::deserialize(deserializer)? {
@@ -325,8 +325,8 @@ impl ToolResult {
 
     /// Attach one media reference to this result, marking it as a deliberate
     /// attachment rather than text the model happens to be able to read.
-    pub fn with_attachment(mut self, marker: RenderedMarker) -> Self {
-        self.output = self.output.with_attachment(marker);
+    pub fn with_attachment(mut self, attachment: AttachmentReference) -> Self {
+        self.output = self.output.with_attachment(attachment);
         self
     }
 
@@ -974,10 +974,11 @@ mod tests {
 
     #[test]
     fn attachments_ride_the_object_only_when_present() {
-        let output = ToolOutput::text("image read").with_attachment(crate::media::RenderedMarker {
-            target: "/tmp/shot.png".to_string(),
-            kind: crate::media::MarkerKind::Image,
-        });
+        let output =
+            ToolOutput::text("image read").with_attachment(crate::media::AttachmentReference {
+                target: "/tmp/shot.png".to_string(),
+                kind: crate::media::AttachmentKind::Image,
+            });
         let wire = serde_json::to_string(&output).expect("serializes");
         assert_eq!(
             wire,
@@ -999,11 +1000,12 @@ mod tests {
 
     #[test]
     fn with_attachment_declares_without_touching_text() {
-        let result =
-            ToolResult::ok("File: /tmp/shot.png").with_attachment(crate::media::RenderedMarker {
+        let result = ToolResult::ok("File: /tmp/shot.png").with_attachment(
+            crate::media::AttachmentReference {
                 target: "/tmp/shot.png".to_string(),
-                kind: crate::media::MarkerKind::Image,
-            });
+                kind: crate::media::AttachmentKind::Image,
+            },
+        );
         assert_eq!(result.output.as_str(), "File: /tmp/shot.png");
         assert_eq!(result.output.attachments().len(), 1);
         let mut output = result.output;
@@ -1032,9 +1034,9 @@ mod tests {
 
     #[test]
     fn map_text_keeps_data_and_attachments() {
-        let marker = crate::media::RenderedMarker {
+        let marker = crate::media::AttachmentReference {
             target: "/ws/images/out.png".into(),
-            kind: crate::media::MarkerKind::Image,
+            kind: crate::media::AttachmentKind::Image,
         };
         let mut output = ToolOutput::json_with_text(serde_json::json!({"k": 1}), "body")
             .with_attachment(marker.clone());

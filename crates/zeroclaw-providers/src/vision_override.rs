@@ -44,6 +44,10 @@ impl VisionOverrideProvider {
 
 #[async_trait]
 impl ModelProvider for VisionOverrideProvider {
+    fn is_dispatch_composite(&self) -> bool {
+        true
+    }
+
     fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
         self.inner.supports_exact_request_replay(request, model)
     }
@@ -536,6 +540,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,

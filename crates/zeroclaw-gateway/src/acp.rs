@@ -14,7 +14,6 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use zeroclaw_channels::orchestrator::acp_server::{AcpServer, AcpServerConfig};
-use zeroclaw_infra::acp_session_store::AcpSessionStore;
 
 const ACP_WS_PROTOCOL: &str = "zeroclaw.acp.v1";
 
@@ -55,11 +54,18 @@ pub async fn handle_ws_acp(
         ws
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, params.agent))
+    let subject = extract_ws_token(&headers, params.token.as_deref())
+        .and_then(|token| state.pairing.authenticate_and_hash(token));
+    ws.on_upgrade(move |socket| handle_socket(socket, state, params.agent, subject))
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option<String>) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    default_agent: Option<String>,
+    subject: Option<String>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let (input_tx, input_rx) = mpsc::channel::<String>(256);
     let (output_tx, mut output_rx) = mpsc::channel::<String>(256);
@@ -69,45 +75,63 @@ async fn handle_socket(socket: WebSocket, state: AppState, default_agent: Option
         max_sessions: config.acp.max_sessions,
         session_timeout_secs: config.acp.session_timeout_secs,
     };
-    let store = AcpSessionStore::new(&config.data_dir)
-        .map(Arc::new)
-        .inspect_err(|e| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                "Failed to open ACP session store"
-            );
-        })
-        .ok();
+    let store = tokio::task::spawn_blocking(move || {
+        zeroclaw_session_host::open_repository(&config, "acp_")
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result)
+    .map(Arc::new)
+    .inspect_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": e.to_string()})),
+            "Failed to open ACP session store"
+        );
+    })
+    .ok();
     let canvas_store = state.canvas_store.clone();
     let server = if let Some(store) = store {
-        Arc::new(
-            AcpServer::new_with_live_config_and_writer_and_store(
-                state.config.clone(),
-                state.agent_lifecycle.clone(),
-                acp_config,
-                output_tx,
-                store,
-            )
-            .with_canvas_store(canvas_store)
-            .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
-            .with_connection_default_agent(default_agent),
+        AcpServer::new_with_live_config_and_writer_and_store(
+            state.config.clone(),
+            state.agent_lifecycle.clone(),
+            acp_config,
+            output_tx,
+            store,
+        )
+        .with_canvas_store(canvas_store)
+        .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
+        .with_connection_default_agent(default_agent)
+    } else {
+        AcpServer::new_with_live_config_and_writer(
+            state.config.clone(),
+            state.agent_lifecycle.clone(),
+            acp_config,
+            output_tx,
+        )
+        .with_canvas_store(canvas_store)
+        .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
+        .with_connection_default_agent(default_agent)
+    };
+    let server = if let Some(source) = state.native_sessions.clone() {
+        let authorized_state = state.clone();
+        server.with_session_history(
+            source,
+            Arc::new(move |alias, stream| {
+                crate::session_history::authority(
+                    &authorized_state,
+                    stream,
+                    alias,
+                    subject.as_deref(),
+                )
+            }),
         )
     } else {
-        Arc::new(
-            AcpServer::new_with_live_config_and_writer(
-                state.config.clone(),
-                state.agent_lifecycle.clone(),
-                acp_config,
-                output_tx,
-            )
-            .with_canvas_store(canvas_store)
-            .with_sop_engine(state.sop_engine.clone(), state.sop_audit.clone())
-            .with_connection_default_agent(default_agent),
-        )
+        server
     };
+    let server = Arc::new(server);
 
     let server_task = zeroclaw_spawn::spawn!(Arc::clone(&server).run_messages(input_rx));
 

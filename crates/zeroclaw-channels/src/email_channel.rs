@@ -227,7 +227,7 @@ impl EmailChannel {
                 file_name,
                 data,
                 mime_type: mime_str,
-                marker: None,
+                reference: None,
             });
         }
         attachments
@@ -1176,7 +1176,7 @@ mod tests {
             file_name: file_name.into(),
             data,
             mime_type: None,
-            marker: None,
+            reference: None,
         }
     }
 

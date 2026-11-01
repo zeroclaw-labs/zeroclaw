@@ -1,5 +1,6 @@
 use crate::compatible::sse_bytes_to_events;
 use crate::multimodal;
+#[cfg(test)]
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -153,12 +154,16 @@ struct NativeToolCall {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     function: NativeFunctionCall,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct NativeFunctionCall {
     name: String,
     arguments: String,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,17 +195,85 @@ struct PromptTokensDetails {
 #[derive(Debug, Deserialize)]
 struct NativeChoice {
     message: NativeResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+impl NativeChoice {
+    fn into_message(mut self) -> NativeResponseMessage {
+        if let Some(reason) = self.finish_reason {
+            self.message.output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"chat_completions", "finish_reason":reason}),
+            });
+        }
+        self.message
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawNativeResponseMessage")]
 struct NativeResponseMessage {
-    #[serde(default)]
     content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<NativeToolCall>>,
+    output_blocks: Vec<zeroclaw_api::model_provider::ProviderOutputBlock>,
+}
+#[derive(Debug, Deserialize)]
+struct RawNativeResponseMessage {
+    #[serde(default)]
+    content: Option<serde_json::Value>,
     /// Reasoning/thinking models may return output in `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
+}
+impl From<RawNativeResponseMessage> for NativeResponseMessage {
+    fn from(raw: RawNativeResponseMessage) -> Self {
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
+        let (content, mut output_blocks) = crate::output::assistant_content(raw.content.as_ref());
+        if let Some(reasoning) = &raw.reasoning_content {
+            output_blocks.insert(
+                0,
+                ProviderOutputBlock::Reasoning {
+                    representation: "reasoning_content".into(),
+                    bytes: reasoning.to_owned().into_bytes(),
+                    replay_requirement: "provider_defined".into(),
+                },
+            );
+        }
+        if let Some(calls) = &raw.tool_calls {
+            for call in calls {
+                output_blocks.extend(crate::output::chat_tool_metadata(
+                    call.id.as_deref(),
+                    &call.extensions,
+                    Some(&call.function.extensions),
+                ));
+            }
+        }
+        for (name, content) in raw.extensions {
+            if name == "role" {
+                continue;
+            }
+            if name == "audio" {
+                output_blocks.extend(crate::output::content_blocks(
+                    &serde_json::json!({"type":"audio","source":content}),
+                ));
+            } else {
+                output_blocks.push(ProviderOutputBlock::Other {
+                    type_name: format!("assistant.{name}"),
+                    content,
+                });
+            }
+        }
+        Self {
+            content,
+            reasoning_content: raw.reasoning_content,
+            tool_calls: raw.tool_calls,
+            output_blocks,
+        }
+    }
 }
 
 /// Typed builder for [`OpenRouterModelProvider`].
@@ -309,11 +382,13 @@ impl OpenRouterModelProvider {
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+        let projected = crate::multimodal::project_attachment_metadata(messages);
+        let messages = projected.as_ref();
         messages
             .iter()
             .map(|m| {
                 if m.role == "assistant"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                     && let Some(tool_calls_value) = value.get("tool_calls")
                     && let Ok(parsed_calls) =
                         serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
@@ -323,9 +398,11 @@ impl OpenRouterModelProvider {
                         .map(|tc| {
                             let name = tc.name;
                             NativeToolCall {
+                                extensions: Default::default(),
                                 id: Some(tc.id),
                                 kind: Some("function".to_string()),
                                 function: NativeFunctionCall {
+                                    extensions: Default::default(),
                                     arguments: crate::compatible::sanitize_tool_arguments(
                                         &name,
                                         &tc.arguments,
@@ -351,7 +428,7 @@ impl OpenRouterModelProvider {
                 }
 
                 if m.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(value) = crate::tool_protocol::tool_message_value(m)
                 {
                     let tool_call_id = value
                         .get("tool_call_id")
@@ -373,7 +450,7 @@ impl OpenRouterModelProvider {
 
                 NativeMessage {
                     role: m.role.clone(),
-                    content: Some(Self::to_message_content(&m.role, &m.content)),
+                    content: Some(Self::to_message_content(m)),
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -394,13 +471,13 @@ impl OpenRouterModelProvider {
         if let Some(sys) = system_prompt {
             messages.push(Message {
                 role: "system".to_string(),
-                content: Self::to_message_content("system", sys),
+                content: Self::to_message_content(&ChatMessage::system(sys)),
             });
         }
 
         messages.push(Message {
             role: "user".to_string(),
-            content: Self::to_message_content("user", message),
+            content: Self::to_message_content(&ChatMessage::user(message)),
         });
 
         ChatRequest {
@@ -411,7 +488,9 @@ impl OpenRouterModelProvider {
         }
     }
 
-    fn to_message_content(role: &str, content: &str) -> MessageContent {
+    fn to_message_content(message: &ChatMessage) -> MessageContent {
+        let role = message.role.as_str();
+        let content = message.content.as_str();
         if role == "system" {
             return MessageContent::Parts(vec![MessagePart::Text {
                 text: content.to_string(),
@@ -424,7 +503,10 @@ impl OpenRouterModelProvider {
             return MessageContent::Text(content.to_string());
         }
 
-        let (cleaned_text, image_refs) = multimodal::parse_user_message_image_refs(content);
+        let (cleaned_text, image_refs) = (
+            message.content.clone(),
+            multimodal::message_image_refs(message),
+        );
         if image_refs.is_empty() {
             return MessageContent::Text(content.to_string());
         }
@@ -461,7 +543,15 @@ impl OpenRouterModelProvider {
             })
             .collect::<Vec<_>>();
 
+        let mut output_blocks = message.output_blocks;
+        output_blocks.extend(
+            tool_calls
+                .iter()
+                .cloned()
+                .map(|call| zeroclaw_api::model_provider::ProviderOutputBlock::ToolCall { call }),
+        );
         ProviderChatResponse {
+            output_blocks,
             text: message.content,
             tool_calls,
             usage: None,
@@ -732,7 +822,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content),
+                content: Self::to_message_content(m),
             })
             .collect();
 
@@ -850,7 +940,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
+            .map(NativeChoice::into_message)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -931,7 +1021,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        let parser = async move {
             let response = match client
                 .post(endpoint_url)
                 .header("Authorization", format!("Bearer {credential}"))
@@ -976,14 +1066,9 @@ impl ModelProvider for OpenRouterModelProvider {
                     break;
                 }
             }
-        });
+        };
 
-        let guard = AbortOnDrop::new(handle.abort_handle());
-
-        stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            rx.recv().await.map(|event| (event, (rx, guard)))
-        })
-        .boxed()
+        crate::stream_guard::parser_stream(parser, rx)
     }
 
     async fn chat_with_tools(
@@ -1087,7 +1172,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
+            .map(NativeChoice::into_message)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -1132,6 +1217,25 @@ mod tests {
     use crate::traits::{ChatMessage, ModelProvider};
 
     #[test]
+    fn native_plain_reasoning_is_preserved_without_inferring_signed_content() {
+        let reasoning =
+            r#"{"thinking":"ordinary token=fixture-token","signature":"sk-fixture-signature"}"#;
+        let message: NativeResponseMessage = serde_json::from_value(serde_json::json!({
+            "content":"answer", "reasoning_content":reasoning,
+        }))
+        .expect("native response");
+        assert_eq!(message.reasoning_content.as_deref(), Some(reasoning));
+        let zeroclaw_api::model_provider::ProviderOutputBlock::Reasoning { bytes, .. } =
+            &message.output_blocks[0]
+        else {
+            panic!("typed reasoning");
+        };
+        assert_eq!(bytes, reasoning.to_owned().as_bytes());
+        assert!(String::from_utf8_lossy(bytes).contains("fixture-token"));
+        assert!(String::from_utf8_lossy(bytes).contains("sk-fixture-signature"));
+    }
+
+    #[test]
     fn capabilities_report_vision_support() {
         let model_provider = OpenRouterModelProvider::builder("test")
             .credential(Some("openrouter-test-credential"))
@@ -1166,6 +1270,10 @@ mod tests {
             .credential(None)
             .build();
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".into(),
             content: "hello".into(),
         }];
@@ -1207,6 +1315,10 @@ mod tests {
             .credential(Some("key"))
             .build();
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".into(),
             content: "hello".into(),
         }];
@@ -1287,6 +1399,10 @@ data: [DONE]
             .streaming_base_url(&format!("http://{addr}"))
             .build();
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".into(),
             content: "hello".into(),
         }];
@@ -1302,26 +1418,48 @@ data: [DONE]
             crate::traits::StreamOptions::new(true),
         );
 
-        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("stream should yield the first SSE event")
-            .expect("stream should yield at least one event")
-            .expect("first SSE event should be readable");
+        let first = tokio::time::timeout(Duration::from_secs(1), async {
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(StreamEvent::ContentPosition(_)))
+            ));
+            stream.next().await
+        })
+        .await
+        .expect("stream should yield the first SSE event")
+        .expect("stream should yield at least one event")
+        .expect("first SSE event should be readable");
         match first {
             StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "first"),
             event => panic!("expected first text delta, got {event:?}"),
         }
 
-        let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
-            .await
-            .expect("stream should remain open past the request timeout")
-            .expect("stream should yield the second SSE event")
-            .expect("second SSE event should be readable");
+        let second = tokio::time::timeout(Duration::from_secs(3), async {
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(StreamEvent::ContentPosition(_)))
+            ));
+            stream.next().await
+        })
+        .await
+        .expect("stream should remain open past the request timeout")
+        .expect("stream should yield the second SSE event")
+        .expect("second SSE event should be readable");
         match second {
             StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "second"),
             event => panic!("expected second text delta, got {event:?}"),
         }
 
+        let evidence = stream
+            .next()
+            .await
+            .expect("stream should yield finish evidence");
+        assert!(matches!(evidence, Ok(StreamEvent::ProtocolMetadata(_))));
+        let boundary = stream
+            .next()
+            .await
+            .expect("stream should yield completion boundary");
+        assert!(matches!(boundary, Ok(StreamEvent::ProtocolMetadata(_))));
         let final_event = stream.next().await.expect("stream should yield Final");
         assert!(matches!(final_event, Ok(StreamEvent::Final)));
 
@@ -1525,10 +1663,18 @@ data: [DONE]
             .build();
         let messages = vec![
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "system".into(),
                 content: "be concise".into(),
             },
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "user".into(),
                 content: "hello".into(),
             },
@@ -1577,12 +1723,22 @@ data: [DONE]
     fn chat_request_serializes_history_messages() {
         let messages = [
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
                 role: "assistant".into(),
                 content: "Previous answer".into(),
+
+                attachments: Vec::new(),
             },
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
                 role: "user".into(),
                 content: "Follow-up".into(),
+
+                attachments: Vec::new(),
             },
         ];
 
@@ -1664,6 +1820,10 @@ data: [DONE]
             .credential(None)
             .build();
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".into(),
             content: "What is the date?".into(),
         }];
@@ -1738,12 +1898,15 @@ data: [DONE]
     #[test]
     fn parse_native_response_converts_to_chat_response() {
         let message = NativeResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("Here you go.".into()),
             reasoning_content: None,
             tool_calls: Some(vec![NativeToolCall {
+                extensions: Default::default(),
                 id: Some("call_789".into()),
                 kind: Some("function".into()),
                 function: NativeFunctionCall {
+                    extensions: Default::default(),
                     name: "file_read".into(),
                     arguments: r#"{"path":"test.txt"}"#.into(),
                 },
@@ -1760,11 +1923,16 @@ data: [DONE]
 
     #[test]
     fn convert_messages_parses_assistant_tool_call_payload() {
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"Using tool","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "Using tool",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_abc".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"pwd\"}".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(converted.len(), 1);
@@ -1789,10 +1957,15 @@ data: [DONE]
 
     #[test]
     fn convert_messages_parses_tool_result_payload() {
-        let messages = vec![ChatMessage {
-            role: "tool".into(),
-            content: r#"{"tool_call_id":"call_xyz","content":"done"}"#.into(),
-        }];
+        let messages = vec![ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_xyz".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "done".into(),
+                attachments: Vec::new(),
+            },
+        )];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(converted.len(), 1);
@@ -1812,11 +1985,16 @@ data: [DONE]
     }
 
     #[test]
-    fn to_message_content_converts_image_markers_to_openai_parts() {
-        let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
-        let value =
-            serde_json::to_value(OpenRouterModelProvider::to_message_content("user", content))
-                .unwrap();
+    fn to_message_content_converts_image_references_to_openai_parts() {
+        let value = serde_json::to_value(OpenRouterModelProvider::to_message_content(
+            &ChatMessage::user("Describe this").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,abcd".into(),
+                },
+            ]),
+        ))
+        .unwrap();
         let parts = value
             .as_array()
             .expect("multimodal content should be an array");
@@ -1852,7 +2030,8 @@ data: [DONE]
 
     #[test]
     fn system_message_serializes_as_content_block_with_cache_control() {
-        let content = OpenRouterModelProvider::to_message_content("system", "You are helpful.");
+        let content =
+            OpenRouterModelProvider::to_message_content(&ChatMessage::system("You are helpful."));
         let json = serde_json::to_value(&content).unwrap();
         let parts = json.as_array().expect("system content should be an array");
         assert_eq!(parts.len(), 1);
@@ -1863,7 +2042,7 @@ data: [DONE]
 
     #[test]
     fn user_message_without_images_serializes_as_plain_string() {
-        let content = OpenRouterModelProvider::to_message_content("user", "Hello");
+        let content = OpenRouterModelProvider::to_message_content(&ChatMessage::user("Hello"));
         let json = serde_json::to_value(&content).unwrap();
         assert!(json.is_string(), "user content should be a plain string");
         assert_eq!(json.as_str().unwrap(), "Hello");
@@ -1871,7 +2050,8 @@ data: [DONE]
 
     #[test]
     fn assistant_message_serializes_as_plain_string() {
-        let content = OpenRouterModelProvider::to_message_content("assistant", "Hi there.");
+        let content =
+            OpenRouterModelProvider::to_message_content(&ChatMessage::assistant("Hi there."));
         let json = serde_json::to_value(&content).unwrap();
         assert!(
             json.is_string(),
@@ -1882,10 +2062,15 @@ data: [DONE]
 
     #[test]
     fn tool_message_serializes_as_plain_string() {
-        let content = OpenRouterModelProvider::to_message_content(
-            "tool",
-            r#"{"tool_call_id":"call_1","content":"ok"}"#,
-        );
+        let content = OpenRouterModelProvider::to_message_content(&ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call_1".into(),
+                tool_name: "".into(),
+                success: None,
+                content: "ok".into(),
+                attachments: Vec::new(),
+            },
+        ));
         let json = serde_json::to_value(&content).unwrap();
         assert!(json.is_string(), "tool content should be a plain string");
     }
@@ -1893,8 +2078,12 @@ data: [DONE]
     #[test]
     fn cache_control_absent_on_user_image_text_part() {
         let content = OpenRouterModelProvider::to_message_content(
-            "user",
-            "Describe this\n\n[IMAGE:data:image/png;base64,abcd]",
+            &ChatMessage::user("Describe this").with_attachments(vec![
+                zeroclaw_api::media::AttachmentReference {
+                    kind: zeroclaw_api::media::AttachmentKind::Image,
+                    target: "data:image/png;base64,abcd".to_string(),
+                },
+            ]),
         );
         let json = serde_json::to_value(&content).unwrap();
         let parts = json
@@ -1913,10 +2102,18 @@ data: [DONE]
     fn full_native_request_serializes_system_as_blocks_user_as_string() {
         let messages = vec![
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "system".into(),
                 content: "Be helpful".into(),
             },
             ChatMessage {
+                tool_calls: Vec::new(),
+                tool_result: None,
+                reasoning_content: None,
+                attachments: Vec::new(),
                 role: "user".into(),
                 content: "Hi".into(),
             },
@@ -2041,12 +2238,15 @@ data: [DONE]
     #[test]
     fn parse_native_response_captures_reasoning_content() {
         let message = NativeResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("answer".into()),
             reasoning_content: Some("thinking step".into()),
             tool_calls: Some(vec![NativeToolCall {
+                extensions: Default::default(),
                 id: Some("call_1".into()),
                 kind: Some("function".into()),
                 function: NativeFunctionCall {
+                    extensions: Default::default(),
                     name: "shell".into(),
                     arguments: "{}".into(),
                 },
@@ -2060,6 +2260,7 @@ data: [DONE]
     #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
         let message = NativeResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("hello".into()),
             reasoning_content: None,
             tool_calls: None,
@@ -2088,20 +2289,16 @@ data: [DONE]
 
     #[test]
     fn convert_messages_round_trips_reasoning_content() {
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
-                "id": "tc_1",
-                "name": "shell",
-                "arguments": "{}"
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "I will check",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "tc_1".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: None,
             }],
-            "reasoning_content": "Let me think..."
-        });
-
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: history_json.to_string(),
-        }];
+            Some("Let me think...".into()),
+        )];
         let native = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert_eq!(
@@ -2112,19 +2309,16 @@ data: [DONE]
 
     #[test]
     fn convert_messages_no_reasoning_content_when_absent() {
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
-                "id": "tc_1",
-                "name": "shell",
-                "arguments": "{}"
-            }]
-        });
-
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: history_json.to_string(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "I will check",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "tc_1".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
         let native = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
@@ -2137,11 +2331,16 @@ data: [DONE]
         // 400 on strict upstreams. This test pins that the openrouter call site
         // of `sanitize_tool_arguments` is wired in; the helper contract itself
         // is covered in `compatible::tests::sanitize_tool_arguments_*`.
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "trying",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_bad".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"rm -rf".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
@@ -2156,11 +2355,16 @@ data: [DONE]
         // Companion regression: valid JSON object must round-trip byte-for-byte
         // so the openrouter call site cannot accidentally re-encode or strip
         // good payloads.
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "using",
+            vec![zeroclaw_api::model_provider::ToolCall {
+                id: "call_ok".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"pwd\"}".into(),
+                extra_content: None,
+            }],
+            None,
+        )];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
@@ -2172,11 +2376,30 @@ data: [DONE]
         // Strict providers (Cohere, OpenRouter auto-exacto) require a JSON
         // object for tool-call arguments. Null, arrays, strings, numbers, and
         // booleans are valid JSON but must not reach the upstream.
-        let messages = vec![ChatMessage {
-            role: "assistant".into(),
-            content: r#"{"content":"testing","tool_calls":[{"id":"c1","name":"f","arguments":"null"},{"id":"c2","name":"g","arguments":"[]"},{"id":"c3","name":"h","arguments":"42"}]}"#
-                .into(),
-        }];
+        let messages = vec![ChatMessage::assistant_tool_calls(
+            "testing",
+            vec![
+                zeroclaw_api::model_provider::ToolCall {
+                    id: "c1".into(),
+                    name: "f".into(),
+                    arguments: "null".into(),
+                    extra_content: None,
+                },
+                zeroclaw_api::model_provider::ToolCall {
+                    id: "c2".into(),
+                    name: "g".into(),
+                    arguments: "[]".into(),
+                    extra_content: None,
+                },
+                zeroclaw_api::model_provider::ToolCall {
+                    id: "c3".into(),
+                    name: "h".into(),
+                    arguments: "42".into(),
+                    extra_content: None,
+                },
+            ],
+            None,
+        )];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
@@ -2475,6 +2698,10 @@ data: [DONE]
             .extra_body(serde_json::json!(["invalid"]))
             .build();
         let messages = vec![ChatMessage {
+            tool_calls: Vec::new(),
+            tool_result: None,
+            reasoning_content: None,
+            attachments: Vec::new(),
             role: "user".into(),
             content: "hello".into(),
         }];

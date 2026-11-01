@@ -15,7 +15,7 @@ relates-to:
   - crates/zeroclaw-memory
   - crates/zeroclaw-infra/src/session_backend.rs
   - crates/zeroclaw-infra/src/session_store.rs
-  - crates/zeroclaw-infra/src/acp_session_store.rs
+  - crates/zeroclaw-infra/src/session_repository.rs
 ---
 
 # ADR-010: Separate Conversation History, Curated Memory, And Enrichment Authority
@@ -106,4 +106,4 @@ Negative consequences:
 - `crates/zeroclaw-memory`
 - `crates/zeroclaw-infra/src/session_backend.rs`
 - `crates/zeroclaw-infra/src/session_store.rs`
-- `crates/zeroclaw-infra/src/acp_session_store.rs`
+- `crates/zeroclaw-infra/src/session_repository.rs`

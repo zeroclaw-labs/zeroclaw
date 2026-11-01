@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use zeroclaw_api::media::{MarkerKind, RenderedMarker};
+use zeroclaw_api::media::{AttachmentKind, AttachmentReference};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -1247,9 +1247,9 @@ impl BrowserTool {
                         output: output.into(),
                         error: None,
                     }
-                    .with_attachment(RenderedMarker {
+                    .with_attachment(AttachmentReference {
                         target: path_str.to_string(),
-                        kind: MarkerKind::Image,
+                        kind: AttachmentKind::Image,
                     }));
                 }
 
@@ -1362,9 +1362,9 @@ impl BrowserTool {
         // rust-native path still inlines the PNG instead of saving it.)
         match (result, screenshot_target) {
             (Ok(mut result), Some(target)) if result.success => {
-                result = result.with_attachment(RenderedMarker {
+                result = result.with_attachment(AttachmentReference {
                     target,
-                    kind: MarkerKind::Image,
+                    kind: AttachmentKind::Image,
                 });
                 Ok(result)
             }
@@ -3818,110 +3818,6 @@ mod tests {
         bin
     }
 
-    /// Production-boundary proof for the pathless agent-browser screenshot:
-    /// `execute_action` must allocate a workspace target before dispatch
-    /// (the backend's own default directory is outside the allowlist and
-    /// its printed path may never be promoted), hand it to the real command
-    /// path, and declare the file the backend wrote. Deleting the
-    /// allocation `if` in `execute_action` fails the attachment assert; so
-    /// does deleting the declaration match below it.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn agent_browser_pathless_screenshot_declares_the_allocated_workspace_image() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let ws = tmp.path().join("ws");
-        tokio::fs::create_dir_all(&ws).await.unwrap();
-        let bin = write_fake_agent_browser(tmp.path());
-        let mut tool = screenshot_tool_with_workspace(&ws);
-        tool.set_agent_browser_bin_for_tests(bin);
-
-        let result = tool
-            .execute_action(
-                BrowserAction::Screenshot {
-                    path: None,
-                    full_page: false,
-                },
-                ResolvedBackend::AgentBrowser,
-            )
-            .await
-            .expect("a pathless agent-browser screenshot must succeed");
-
-        assert!(result.success);
-        let attachments = result.output.attachments();
-        assert_eq!(
-            attachments.len(),
-            1,
-            "the allocated workspace target must be declared as exactly one attachment"
-        );
-        assert_eq!(attachments[0].kind, MarkerKind::Image);
-        let target = attachments[0].target.as_str();
-        let target_path = std::path::Path::new(target);
-        assert!(
-            target_path.is_absolute(),
-            "the declared target must be the canonical absolute path, got: {target}"
-        );
-        let ws_canonical = std::fs::canonicalize(&ws).unwrap();
-        assert_eq!(
-            target_path.parent(),
-            Some(ws_canonical.as_path()),
-            "the target's parent must canonicalize to the workspace tempdir, got: {target}"
-        );
-        let filename = target_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("the allocated filename must be valid UTF-8");
-        assert!(
-            filename.starts_with("browser_screenshot_") && filename.ends_with(".png"),
-            "the allocated name must carry the browser_screenshot_ prefix and .png suffix, got: {filename}"
-        );
-
-        let written = std::fs::read(target_path).expect("the backend must write the target");
-        let png_signature: &[u8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        assert!(
-            written.starts_with(png_signature),
-            "the file at the allocated target must be a real PNG"
-        );
-
-        let text = result.output.as_str();
-        assert!(
-            text.contains(target),
-            "the text must carry agent-browser's own path echo, got: {text}"
-        );
-        assert!(
-            !text.contains("(media attachment omitted)"),
-            "the marker must ride the attachment declaration, never the tool text: {text}"
-        );
-
-        // The declaration must survive the carrier protocol in both shapes:
-        // the native envelope (`render_native_attachments` round trip) and
-        // the prompt carrier, with `image_refs` naming the same target.
-        let native_envelope = json!({
-            "tool_call_id": "call-1",
-            "content": text,
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(attachments),
-        })
-        .to_string();
-        let native_parts = zeroclaw_api::tool_carrier::parse_native_tool_carrier(&native_envelope)
-            .expect("the native envelope must parse");
-        assert!(native_parts.declared);
-        let native_classified = zeroclaw_api::tool_carrier::classify("tool", &native_envelope)
-            .expect("a tool-role message must classify");
-        assert_eq!(
-            zeroclaw_api::tool_carrier::image_refs(&native_classified),
-            vec![target.to_string()]
-        );
-
-        let prompt_carrier =
-            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(text, attachments);
-        let prompt_parts = zeroclaw_api::tool_carrier::classify("user", &prompt_carrier)
-            .expect("the prompt carrier must classify");
-        assert!(prompt_parts.declared);
-        assert_eq!(
-            zeroclaw_api::tool_carrier::image_refs(&prompt_parts),
-            vec![target.to_string()]
-        );
-    }
-
     /// The allocation only fills in a missing path: an explicit target must
     /// pass through unchanged. The backend writes the requested file and
     /// the declaration names exactly that file, with no allocated
@@ -3954,7 +3850,7 @@ mod tests {
             1,
             "the explicit target must still be declared exactly once"
         );
-        assert_eq!(attachments[0].kind, MarkerKind::Image);
+        assert_eq!(attachments[0].kind, AttachmentKind::Image);
         let ws_canonical = std::fs::canonicalize(&ws).unwrap();
         let target = std::path::Path::new(attachments[0].target.as_str());
         assert_eq!(
@@ -4002,69 +3898,6 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
             .expect("fake agent-browser script must be executable");
         bin
-    }
-
-    /// Negative control for the producer: a non-screenshot agent-browser
-    /// result whose text names a real, permitted PNG inside the workspace
-    /// declares nothing. The path reaches the model as text, and neither
-    /// carrier shape yields an image ref from it. Only the screenshot
-    /// producer declares images; no text is scanned.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn agent_browser_text_result_naming_a_png_declares_nothing() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let ws = tmp.path().join("ws");
-        tokio::fs::create_dir_all(&ws).await.unwrap();
-        let png_path = std::fs::canonicalize(&ws).unwrap().join("real.png");
-        std::fs::write(&png_path, MINIMAL_PNG).unwrap();
-        let png_str = png_path.to_str().expect("tempdir path is UTF-8");
-        assert!(
-            png_path.is_file(),
-            "precondition: a real PNG exists at {png_str}"
-        );
-
-        let bin = write_fake_agent_browser_title(tmp.path(), png_str);
-        let mut tool = screenshot_tool_with_workspace(&ws);
-        tool.set_agent_browser_bin_for_tests(bin);
-
-        let result = tool
-            .execute_action(BrowserAction::GetTitle, ResolvedBackend::AgentBrowser)
-            .await
-            .expect("the fake get-title call must succeed");
-
-        assert!(result.success);
-        let attachments = result.output.attachments();
-        assert!(
-            attachments.is_empty(),
-            "a text result naming a PNG must declare nothing, got: {attachments:?}"
-        );
-        let text = result.output.as_str();
-        assert!(
-            text.contains(png_str),
-            "the PNG path must reach the model as text verbatim, got: {text}"
-        );
-
-        let native_envelope = json!({
-            "tool_call_id": "call-1",
-            "content": text,
-            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(attachments),
-        })
-        .to_string();
-        let native_classified = zeroclaw_api::tool_carrier::classify("tool", &native_envelope)
-            .expect("a tool-role message must classify");
-        assert!(
-            zeroclaw_api::tool_carrier::image_refs(&native_classified).is_empty(),
-            "the native carrier must not turn the quoted path into an image ref"
-        );
-
-        let prompt_carrier =
-            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(text, attachments);
-        let prompt_parts = zeroclaw_api::tool_carrier::classify("user", &prompt_carrier)
-            .expect("the prompt carrier must classify");
-        assert!(
-            zeroclaw_api::tool_carrier::image_refs(&prompt_parts).is_empty(),
-            "the prompt carrier must not turn the quoted path into an image ref"
-        );
     }
 
     /// `Tool::execute` raw-input boundary: a present non-string `path` must be
@@ -4526,7 +4359,7 @@ mod tests {
         );
         assert_eq!(
             result.output.attachments()[0].kind,
-            zeroclaw_api::media::MarkerKind::Image
+            zeroclaw_api::media::AttachmentKind::Image
         );
         let expected_target = std::fs::canonicalize(ws.join("screenshot.png"))
             .expect("canonical target")
@@ -4782,5 +4615,133 @@ mod tests {
             "Expected success, got error: {:?}",
             result.error
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_browser_text_result_naming_a_png_declares_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let png_path = std::fs::canonicalize(&ws).unwrap().join("real.png");
+        std::fs::write(&png_path, MINIMAL_PNG).unwrap();
+        let png_str = png_path.to_str().expect("tempdir path is UTF-8");
+        assert!(
+            png_path.is_file(),
+            "precondition: a real PNG exists at {png_str}"
+        );
+
+        let bin = write_fake_agent_browser_title(tmp.path(), png_str);
+        let mut tool = screenshot_tool_with_workspace(&ws);
+        tool.set_agent_browser_bin_for_tests(bin);
+
+        let result = tool
+            .execute_action(BrowserAction::GetTitle, ResolvedBackend::AgentBrowser)
+            .await
+            .expect("the fake get-title call must succeed");
+
+        assert!(result.success);
+        let attachments = result.output.attachments();
+        assert!(
+            attachments.is_empty(),
+            "a text result naming a PNG must declare nothing, got: {attachments:?}"
+        );
+        let text = result.output.as_str();
+        assert!(
+            text.contains(png_str),
+            "the PNG path must reach the model as text verbatim, got: {text}"
+        );
+
+        let message = zeroclaw_api::model_provider::ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call-browser".into(),
+                tool_name: "browser".into(),
+                success: Some(true),
+                content: text,
+                attachments: Vec::new(),
+            },
+        );
+        assert!(message.attachments.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_browser_pathless_screenshot_declares_the_allocated_workspace_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let bin = write_fake_agent_browser(tmp.path());
+        let mut tool = screenshot_tool_with_workspace(&ws);
+        tool.set_agent_browser_bin_for_tests(bin);
+
+        let result = tool
+            .execute_action(
+                BrowserAction::Screenshot {
+                    path: None,
+                    full_page: false,
+                },
+                ResolvedBackend::AgentBrowser,
+            )
+            .await
+            .expect("a pathless agent-browser screenshot must succeed");
+
+        assert!(result.success);
+        let attachments = result.output.attachments();
+        assert_eq!(
+            attachments.len(),
+            1,
+            "the allocated workspace target must be declared as exactly one attachment"
+        );
+        assert_eq!(attachments[0].kind, AttachmentKind::Image);
+        let target = attachments[0].target.as_str();
+        let target_path = std::path::Path::new(target);
+        assert!(
+            target_path.is_absolute(),
+            "the declared target must be the canonical absolute path, got: {target}"
+        );
+        let ws_canonical = std::fs::canonicalize(&ws).unwrap();
+        assert_eq!(
+            target_path.parent(),
+            Some(ws_canonical.as_path()),
+            "the target's parent must canonicalize to the workspace tempdir, got: {target}"
+        );
+        let filename = target_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the allocated filename must be valid UTF-8");
+        assert!(
+            filename.starts_with("browser_screenshot_") && filename.ends_with(".png"),
+            "the allocated name must carry the browser_screenshot_ prefix and .png suffix, got: {filename}"
+        );
+
+        let written = std::fs::read(target_path).expect("the backend must write the target");
+        let png_signature: &[u8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        assert!(
+            written.starts_with(png_signature),
+            "the file at the allocated target must be a real PNG"
+        );
+
+        let text = result.output.as_str();
+        assert!(
+            text.contains(target),
+            "the text must carry agent-browser's own path echo, got: {text}"
+        );
+        assert!(
+            !text.contains("(media attachment omitted)"),
+            "the marker must ride the attachment declaration, never the tool text: {text}"
+        );
+
+        let message = zeroclaw_api::model_provider::ChatMessage::tool_result(
+            zeroclaw_api::model_provider::ToolResultMessage {
+                tool_call_id: "call-browser".into(),
+                tool_name: "browser".into(),
+                success: Some(true),
+                content: text,
+                attachments: attachments.to_vec(),
+            },
+        );
+        let restored: zeroclaw_api::model_provider::ChatMessage =
+            serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+        assert_eq!(restored.attachments, attachments);
+        assert_eq!(restored.content, text);
     }
 }

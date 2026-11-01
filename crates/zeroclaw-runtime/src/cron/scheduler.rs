@@ -831,15 +831,55 @@ async fn execute_job_with_retry(
     approved: bool,
     execution_admission: Option<AgentExecutionAdmission>,
 ) -> (bool, String) {
+    execute_job_with_retry_for_occurrence(
+        config,
+        security,
+        agent_alias,
+        job,
+        runtime,
+        approved,
+        execution_admission,
+        &CronOccurrence::Manual {
+            invocation_id: uuid::Uuid::new_v4().to_string(),
+        },
+    )
+    .await
+    .unwrap_or_else(|| (false, "cron_history_predecessor_pending".into()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CronOccurrence {
+    Scheduled { scheduled_for: DateTime<Utc> },
+    Manual { invocation_id: String },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CronReplyRoute {
+    version: u32,
+    occurrence: CronOccurrence,
+}
+
+// None leaves a scheduled occurrence due while an earlier job owns recovery.
+async fn execute_job_with_retry_for_occurrence(
+    config: &Config,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    job: &CronJob,
+    runtime: Option<&dyn RuntimeAdapter>,
+    approved: bool,
+    execution_admission: Option<AgentExecutionAdmission>,
+    occurrence: &CronOccurrence,
+) -> Option<(bool, String)> {
     if let Some(admission) = execution_admission.as_ref()
         && let Err(error) = admission.revalidate()
     {
-        return (false, format!("cron target admission failed: {error}"));
+        return Some((false, format!("cron target admission failed: {error}")));
     }
     let owned_runtime = if matches!(job.job_type, JobType::Shell) && runtime.is_none() {
         match crate::platform::create_runtime(&config.runtime) {
             Ok(runtime) => Some(runtime),
-            Err(error) => return (false, format!("shell setup error: {error}")),
+            Err(error) => return Some((false, format!("shell setup error: {error}"))),
         }
     } else {
         None
@@ -854,38 +894,42 @@ async fn execute_job_with_retry(
         if let Some(admission) = execution_admission.as_ref()
             && let Err(error) = admission.revalidate()
         {
-            return (false, format!("cron target admission failed: {error}"));
+            return Some((false, format!("cron target admission failed: {error}")));
         }
         let (success, output) = match job.job_type {
             JobType::Shell => {
                 let Some(runtime) = runtime else {
-                    return (
+                    return Some((
                         false,
                         "shell setup error: runtime missing for shell cron job".to_string(),
-                    );
+                    ));
                 };
                 run_job_command_with_runtime(config, runtime, security, job, approved).await
             }
             JobType::Agent => {
-                Box::pin(run_agent_job(
+                Box::pin(run_agent_job_for_occurrence(
                     config,
                     security,
                     agent_alias,
                     job,
                     execution_admission.clone(),
+                    occurrence,
                 ))
-                .await
+                .await?
             }
         };
         last_output = output;
 
         if success {
-            return (true, last_output);
+            return Some((true, last_output));
         }
 
-        if last_output.starts_with("blocked by security policy:") {
+        if last_output.starts_with("blocked by security policy:")
+            || (job.job_type == JobType::Agent
+                && zeroclaw_kernel::session::engine::current_engine_session_source().is_some())
+        {
             // Deterministic policy violations are not retryable.
-            return (false, last_output);
+            return Some((false, last_output));
         }
 
         if attempt < retries {
@@ -895,7 +939,7 @@ async fn execute_job_with_retry(
         }
     }
 
-    (false, last_output)
+    Some((false, last_output))
 }
 
 fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
@@ -986,7 +1030,10 @@ async fn process_due_jobs(
     }))
     .buffer_unordered(max_concurrent);
 
-    while let Some(((job_id, success, output), _execution_admission)) = in_flight.next().await {
+    while let Some((result, _execution_admission)) = in_flight.next().await {
+        let Some((job_id, success, output)) = result else {
+            continue;
+        };
         if !success {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1016,16 +1063,16 @@ async fn execute_and_persist_job(
     job: &CronJob,
     component: &str,
     execution_admission: Option<AgentExecutionAdmission>,
-) -> (String, bool, String) {
+) -> Option<(String, bool, String)> {
     if let Some(admission) = execution_admission.as_ref()
         && let Err(error) = admission.revalidate()
     {
         let _ = release_job(config, &job.id);
-        return (
+        return Some((
             job.id.clone(),
             false,
             format!("cron target admission failed: {error}"),
-        );
+        ));
     }
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
@@ -1037,7 +1084,7 @@ async fn execute_and_persist_job(
 
     let started_at = Utc::now();
     let span = zeroclaw_log::attribution_span!(job);
-    let (success, output) = Box::pin(execute_job_with_retry(
+    let result = Box::pin(execute_job_with_retry_for_occurrence(
         &effective_config,
         security,
         agent_alias,
@@ -1045,9 +1092,22 @@ async fn execute_and_persist_job(
         None,
         false,
         execution_admission.clone(),
+        &CronOccurrence::Scheduled {
+            scheduled_for: job.next_run,
+        },
     ))
     .instrument(span)
     .await;
+    let Some((success, output)) = result else {
+        if let Err(error) = release_job(&effective_config, &job.id) {
+            return Some((
+                job.id.clone(),
+                false,
+                format!("cron_deferred_claim_release_failed: {error}"),
+            ));
+        }
+        return None;
+    };
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         &effective_config,
@@ -1074,7 +1134,7 @@ async fn execute_and_persist_job(
         );
     }
 
-    (job.id.clone(), success, output)
+    Some((job.id.clone(), success, output))
 }
 
 fn agent_job_error_message(error: &anyhow::Error) -> String {
@@ -1082,6 +1142,141 @@ fn agent_job_error_message(error: &anyhow::Error) -> String {
         .unwrap_or_else(|| crate::i18n::get_required_cli_string("cron-agent-job-failed"))
 }
 
+async fn prepare_cron_history_input(
+    config: &Config,
+    agent_alias: &str,
+    job: &CronJob,
+    occurrence: &CronOccurrence,
+    prompt: &str,
+    history: &dyn zeroclaw_api::session_events::capture::SessionExecutionPort,
+) -> Result<Option<zeroclaw_api::session_events::capture::EngineTurnInput>> {
+    use zeroclaw_api::ingress::{IngressContext, InternalPrincipal, TurnOrigin};
+    use zeroclaw_api::session_events::capture::{
+        EngineInputPart, EngineTurnInput, ModelOverrideSelection,
+    };
+
+    let (provider_type, provider_alias, provider) = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .context("cron_history_model_provider_unresolved")?;
+    let mut provider_ref = format!("{provider_type}.{provider_alias}");
+    let mut model = job
+        .model
+        .as_ref()
+        .or(provider.model.as_ref())
+        .cloned()
+        .context("cron_history_model_unresolved")?;
+    if job.model.is_none()
+        && let Some(ModelOverrideSelection::Set {
+            provider_ref: restored_provider,
+            model: restored_model,
+            ..
+        }) = history.restore_model_override().await?
+    {
+        provider_ref = restored_provider;
+        model = restored_model;
+    }
+    let pending = history
+        .pending_inputs(provider_ref.clone(), model.clone())
+        .await?;
+    if !pending.is_empty() {
+        let jobs = super::store::list_jobs(config)?;
+        for input in pending {
+            anyhow::ensure!(
+                input.agent_alias.as_deref() == Some(agent_alias)
+                    && input.ingress.origin == TurnOrigin::Cron,
+                "cron_recovery_identity_mismatch"
+            );
+            let Some(InternalPrincipal::Cron { job_id, job_name }) =
+                input.ingress.internal_principal.as_ref()
+            else {
+                anyhow::bail!("cron_recovery_principal_missing");
+            };
+            let route = input
+                .reply_route
+                .clone()
+                .and_then(|value| serde_json::from_value::<CronReplyRoute>(value).ok())
+                .filter(|route| route.version == 1);
+            let Some(route) = route else {
+                history
+                    .reject_pending_input(&input.turn_id, "cron_recovery_occurrence_unavailable")
+                    .await?;
+                continue;
+            };
+            let Some(owner) = jobs.iter().find(|candidate| candidate.id == *job_id) else {
+                history
+                    .reject_pending_input(&input.turn_id, "cron_recovery_job_removed")
+                    .await?;
+                continue;
+            };
+            if !owner.enabled
+                || owner.job_type != JobType::Agent
+                || owner.session_target != SessionTarget::Main
+                || resolve_owning_agent(config, owner) != Some(agent_alias)
+                || (owner.source == "declarative"
+                    && !super::store::is_valid_declarative_owner(config, &owner.id))
+            {
+                history
+                    .reject_pending_input(&input.turn_id, "cron_recovery_owner_no_longer_active")
+                    .await?;
+                continue;
+            }
+            let CronOccurrence::Scheduled { scheduled_for } = route.occurrence else {
+                history
+                    .reject_pending_input(&input.turn_id, "cron_recovery_manual_owner_lost")
+                    .await?;
+                continue;
+            };
+            if owner.next_run != scheduled_for {
+                history
+                    .reject_pending_input(&input.turn_id, "cron_recovery_occurrence_obsolete")
+                    .await?;
+                continue;
+            }
+            let expected_prompt = format!(
+                "[cron:{} {}] {}",
+                owner.id,
+                job_name.as_deref().unwrap_or("cron-job"),
+                owner.prompt.as_deref().unwrap_or_default(),
+            );
+            let [EngineInputPart::Text(original_prompt)] = input.parts.as_slice() else {
+                history
+                    .reject_pending_input(&input.turn_id, "cron_recovery_input_unsupported")
+                    .await?;
+                continue;
+            };
+            if original_prompt != &expected_prompt.to_owned() {
+                history
+                    .reject_pending_input(&input.turn_id, "cron_recovery_input_revised")
+                    .await?;
+                continue;
+            }
+            if job.id != *job_id || *occurrence != (CronOccurrence::Scheduled { scheduled_for }) {
+                return Ok(None);
+            }
+            return Ok(Some(input));
+        }
+    }
+    let mut ingress = IngressContext::cron();
+    ingress.internal_principal = Some(InternalPrincipal::Cron {
+        job_id: job.id.clone(),
+        job_name: job.name.clone(),
+    });
+    Ok(Some(EngineTurnInput {
+        execution_workspace: None,
+        turn_id: uuid::Uuid::new_v4().to_string(),
+        agent_alias: Some(agent_alias.into()),
+        ingress,
+        reply_route: Some(serde_json::to_value(CronReplyRoute {
+            version: 1,
+            occurrence: occurrence.clone(),
+        })?),
+        parts: vec![EngineInputPart::Text(prompt.into())],
+        provider_ref,
+        model,
+    }))
+}
+
+#[cfg(test)]
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
@@ -1089,31 +1284,48 @@ async fn run_agent_job(
     job: &CronJob,
     execution_admission: Option<AgentExecutionAdmission>,
 ) -> (bool, String) {
+    run_agent_job_for_occurrence(
+        config,
+        security,
+        agent_alias,
+        job,
+        execution_admission,
+        &CronOccurrence::Manual {
+            invocation_id: uuid::Uuid::new_v4().to_string(),
+        },
+    )
+    .await
+    .unwrap_or_else(|| (false, "cron_history_predecessor_pending".into()))
+}
+
+async fn run_agent_job_for_occurrence(
+    config: &Config,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    job: &CronJob,
+    execution_admission: Option<AgentExecutionAdmission>,
+    occurrence: &CronOccurrence,
+) -> Option<(bool, String)> {
     if !security.can_act() {
-        return (
+        return Some((
             false,
             "blocked by security policy: autonomy is read-only".to_string(),
-        );
+        ));
     }
 
     if security.is_rate_limited() {
-        return (
+        return Some((
             false,
             "blocked by security policy: rate limit exceeded".to_string(),
-        );
+        ));
     }
 
-    if !security.record_action() {
-        return (
-            false,
-            "blocked by security policy: action budget exhausted".to_string(),
-        );
-    }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
 
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
-    let model_override = job.model.clone();
+    let mut prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+    let mut model_override = job.model.clone();
+    let mut provider_override = None;
 
     // Assign a unique run ID for tracing. Isolated jobs also use it in the
     // session path so failed-run memory purge stays scoped per execution.
@@ -1130,6 +1342,83 @@ async fn run_agent_job(
         run_id = %run_session_id,
         spawn_site = "cron",
     );
+
+    let history =
+        if let Some(source) = zeroclaw_kernel::session::engine::current_engine_session_source() {
+            let Some(admission) = execution_admission.clone() else {
+                return Some((false, "cron_history_target_admission_missing".into()));
+            };
+            let family = format!("cron:{agent_alias}:{}", session_path.display());
+            let opened = async {
+                let actor = zeroclaw_api::session_events::EventActor::System {
+                    component: "cron_scheduler".into(),
+                };
+                let authority = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
+                    admission: admission.clone().into(),
+                    actor,
+                    stream: source.stream_id(&family).await?,
+                    origin: zeroclaw_api::ingress::TurnOrigin::Cron,
+                    parent_alias: None,
+                });
+                source
+                    .open_system(
+                        family,
+                        agent_alias.into(),
+                        "cron_scheduler".into(),
+                        authority,
+                        zeroclaw_api::session_events::capture::ContextSnapshot {
+                            messages: vec![],
+                            history_has_trim_breadcrumb: Some(false),
+                        },
+                    )
+                    .await
+            }
+            .await;
+            match opened {
+                Ok(port) => Some(port),
+                Err(error) => {
+                    return Some((false, format!("cron_history_admission_failed: {error}")));
+                }
+            }
+        } else {
+            None
+        };
+
+    let engine_input = if let Some(history) = history.as_ref() {
+        match prepare_cron_history_input(
+            config,
+            agent_alias,
+            job,
+            occurrence,
+            &prefixed_prompt,
+            history.as_ref(),
+        )
+        .await
+        {
+            Ok(Some(input)) => {
+                let [zeroclaw_api::session_events::capture::EngineInputPart::Text(text)] =
+                    input.parts.as_slice()
+                else {
+                    return Some((false, "cron_recovery_input_unsupported".into()));
+                };
+                prefixed_prompt = text.clone();
+                provider_override = Some(input.provider_ref.clone());
+                model_override = Some(input.model.clone());
+                Some(input)
+            }
+            Ok(None) => return None,
+            Err(error) => return Some((false, format!("cron_history_recovery_failed: {error}"))),
+        }
+    } else {
+        None
+    };
+
+    if !security.record_action() {
+        return Some((
+            false,
+            "blocked by security policy: action budget exhausted".to_string(),
+        ));
+    }
 
     let run_security = cron_agent_run_policy(security, job);
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
@@ -1164,12 +1453,12 @@ async fn run_agent_job(
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
+            let engine = Box::pin(
                 crate::agent::run(
                     config.clone(),
                     agent_alias,
                     Some(prefixed_prompt),
-                    None,
+                    provider_override,
                     model_override,
                     config
                         .model_provider_for_agent(agent_alias)
@@ -1182,12 +1471,20 @@ async fn run_agent_job(
                     run_overrides,
                 )
                 .instrument(subagent_span),
-            )
-            .await
+            );
+            if let (Some(history), Some(input)) = (history, engine_input) {
+                zeroclaw_api::session_events::capture::scope_session_execution(
+                    history.clone(),
+                    history.execute(input, engine),
+                )
+                .await
+            } else {
+                engine.await
+            }
         }
     };
 
-    match run_result {
+    Some(match run_result {
         Ok(response) => (
             true,
             if response.trim().is_empty() {
@@ -1240,7 +1537,7 @@ async fn run_agent_job(
             }
             (false, agent_job_error_message(&e))
         }
-    }
+    })
 }
 
 async fn persist_job_result(
@@ -2866,6 +3163,354 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_cron_recovery_uses_occurrence_and_defers_other_main_jobs() {
+        use std::sync::Mutex;
+        use zeroclaw_api::principal::PrincipalId;
+        use zeroclaw_api::session_events::capture::{
+            ContextSnapshot, EngineTurnFuture, EngineTurnInput, SessionExecutionPort,
+        };
+        use zeroclaw_api::session_events::{ContractError, SessionStreamId};
+        use zeroclaw_kernel::session::engine::{
+            EngineSessionAuthority, EngineSessionSource, FamilyDescriptor, FamilyQuery,
+        };
+        use zeroclaw_kernel::session::query::SessionAccessPolicy;
+
+        #[derive(Default)]
+        struct Port {
+            pending: Mutex<Vec<EngineTurnInput>>,
+            rejected: Mutex<Vec<(String, String)>>,
+            executed: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl SessionExecutionPort for Port {
+            async fn pending_inputs(
+                &self,
+                provider_ref: String,
+                model: String,
+            ) -> Result<Vec<EngineTurnInput>> {
+                Ok(self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .map(|mut input| {
+                        input.provider_ref = provider_ref.clone();
+                        input.model = model.clone();
+                        input
+                    })
+                    .collect())
+            }
+            async fn reject_pending_input(&self, turn_id: &str, reason_key: &str) -> Result<()> {
+                self.rejected
+                    .lock()
+                    .unwrap()
+                    .push((turn_id.into(), reason_key.into()));
+                self.pending
+                    .lock()
+                    .unwrap()
+                    .retain(|input| input.turn_id != turn_id);
+                Ok(())
+            }
+            async fn execute(
+                &self,
+                input: EngineTurnInput,
+                _engine: EngineTurnFuture<'_>,
+            ) -> Result<String> {
+                self.pending
+                    .lock()
+                    .unwrap()
+                    .retain(|pending| pending.turn_id != input.turn_id);
+                self.executed.lock().unwrap().push(input.turn_id);
+                Ok("recovered occurrence result".into())
+            }
+        }
+        struct Source(Arc<Port>);
+        #[async_trait::async_trait]
+        impl EngineSessionSource for Source {
+            async fn stream_id(
+                &self,
+                family: &str,
+            ) -> std::result::Result<SessionStreamId, ContractError> {
+                zeroclaw_session_host::NativeSessionHub::stream_id(family)
+            }
+            async fn describe(&self, _family: String) -> Result<Option<FamilyDescriptor>> {
+                Ok(None)
+            }
+            async fn families(&self) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn open(
+                &self,
+                _family: String,
+                _alias: String,
+                _principal: PrincipalId,
+                _authority: Arc<dyn EngineSessionAuthority>,
+                _initial: ContextSnapshot,
+            ) -> Result<Arc<dyn SessionExecutionPort>> {
+                anyhow::bail!("unexpected principal open")
+            }
+            async fn open_system(
+                &self,
+                family: String,
+                alias: String,
+                component: String,
+                _authority: Arc<dyn EngineSessionAuthority>,
+                _initial: ContextSnapshot,
+            ) -> Result<Arc<dyn SessionExecutionPort>> {
+                assert_eq!(family, format!("cron:{TEST_AGENT}:main"));
+                assert_eq!(alias, TEST_AGENT);
+                assert_eq!(component, "cron_scheduler");
+                Ok(self.0.clone())
+            }
+            async fn query(
+                &self,
+                _family: String,
+                _principal: PrincipalId,
+                _policy: Arc<dyn SessionAccessPolicy>,
+            ) -> Result<Option<FamilyQuery>> {
+                Ok(None)
+            }
+        }
+
+        let directory = TempDir::new().expect("directory");
+        let config = test_config(&directory).await;
+        let add_job = |name: &str| {
+            super::super::store::add_agent_job(
+                &config,
+                TEST_AGENT,
+                Some(name.into()),
+                Schedule::Every { every_ms: 60_000 },
+                "fixture scheduled prompt",
+                SessionTarget::Main,
+                Some("fixture-model".into()),
+                None,
+                false,
+                Some(vec![]),
+                false,
+            )
+            .expect("job")
+        };
+        let first = add_job("first");
+        let second = add_job("second");
+        let first_occurrence = CronOccurrence::Scheduled {
+            scheduled_for: first.next_run,
+        };
+        let port = Arc::new(Port::default());
+        let original = prepare_cron_history_input(
+            &config,
+            TEST_AGENT,
+            &first,
+            &first_occurrence,
+            &format!("[cron:{} first] fixture scheduled prompt", first.id),
+            port.as_ref(),
+        )
+        .await
+        .expect("prepare")
+        .expect("input");
+        let old_turn = original.turn_id.clone();
+        port.pending.lock().unwrap().push(original.clone());
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let admission = authority
+            .execution_capability()
+            .admit(TEST_AGENT)
+            .expect("admission");
+        let source = Arc::new(Source(port.clone()));
+        let security = test_security(&config);
+
+        assert!(claim_job(&config, &second.id, Utc::now()).unwrap());
+        let deferred = zeroclaw_kernel::session::engine::scope_engine_session_source(
+            source.clone(),
+            Box::pin(execute_and_persist_job(
+                &config,
+                &security,
+                TEST_AGENT,
+                &second,
+                "cron-recovery-test",
+                Some(admission.clone()),
+            )),
+        )
+        .await;
+        assert!(deferred.is_none(), "expected deferral, got {deferred:?}");
+        assert!(port.executed.lock().unwrap().is_empty());
+        assert!(cron::list_runs(&config, &second.id, 10).unwrap().is_empty());
+        assert_eq!(
+            cron::get_job(&config, &second.id).unwrap().next_run,
+            second.next_run
+        );
+        assert!(claim_job(&config, &second.id, Utc::now()).unwrap());
+        release_job(&config, &second.id).unwrap();
+
+        let renamed = cron::update_job(
+            &config,
+            &first.id,
+            cron::CronJobPatch {
+                name: Some("renamed".into()),
+                ..Default::default()
+            },
+        )
+        .expect("rename");
+        let recovered = zeroclaw_kernel::session::engine::scope_engine_session_source(
+            source.clone(),
+            Box::pin(run_agent_job_for_occurrence(
+                &config,
+                &security,
+                TEST_AGENT,
+                &renamed,
+                Some(admission.clone()),
+                &first_occurrence,
+            )),
+        )
+        .await
+        .expect("completed");
+        assert!(recovered.0);
+        assert_eq!(
+            port.executed.lock().unwrap().as_slice(),
+            [old_turn.as_str()]
+        );
+        assert!(port.rejected.lock().unwrap().is_empty());
+
+        port.pending.lock().unwrap().push(original);
+        cron::update_job(
+            &config,
+            &first.id,
+            cron::CronJobPatch {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("disable");
+        let result = zeroclaw_kernel::session::engine::scope_engine_session_source(
+            source,
+            Box::pin(run_agent_job_for_occurrence(
+                &config,
+                &security,
+                TEST_AGENT,
+                &second,
+                Some(admission),
+                &CronOccurrence::Scheduled {
+                    scheduled_for: second.next_run,
+                },
+            )),
+        )
+        .await
+        .expect("completed");
+        assert!(result.0);
+        assert_eq!(port.executed.lock().unwrap().len(), 2);
+        assert_eq!(
+            port.rejected.lock().unwrap().as_slice(),
+            [(old_turn, "cron_recovery_owner_no_longer_active".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_cron_retains_provider_failure_without_scheduler_reexecution() {
+        use axum::{Router, http::StatusCode, routing::post};
+        use zeroclaw_api::session_events::{EventCursor, EventKind, SessionEventStore};
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+        for backend in ["sqlite", "jsonl"] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = calls.clone();
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { (StatusCode::BAD_REQUEST, "fixture_cron_invalid_request") }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let address = listener.local_addr().expect("address");
+            let server =
+                zeroclaw_spawn::spawn!(
+                    async move { axum::serve(listener, app).await.expect("server") }
+                );
+            let directory = TempDir::new().expect("directory");
+            let mut config = test_config(&directory).await;
+            config.channels.session_backend = backend.into();
+            config.memory.backend = "none".into();
+            config.memory.auto_save = false;
+            config.reliability.scheduler_retries = 3;
+            config.reliability.provider_retries = 0;
+            config.providers.models.ollama.insert(
+                "fixture".into(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some("fixture-model".into()),
+                        uri: Some(format!("http://{address}")),
+                        timeout_secs: Some(5),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            config
+                .agents
+                .get_mut(TEST_AGENT)
+                .expect("agent")
+                .model_provider = "ollama.fixture".into();
+            let security = test_security(&config);
+            let authority = crate::LiveConfigAuthority::new(config.clone());
+            let admission = authority
+                .execution_capability()
+                .admit(TEST_AGENT)
+                .expect("admission");
+            let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                authority.live_handle(),
+            ));
+            let mut job = test_job("");
+            job.job_type = JobType::Agent;
+            job.prompt = Some("fixture cron prompt".into());
+            job.allowed_tools = Some(vec![]);
+            job.uses_memory = false;
+            job.session_target = SessionTarget::Main;
+            let (success, _) = zeroclaw_kernel::session::engine::scope_engine_session_source(
+                source.clone(),
+                Box::pin(execute_job_with_retry(
+                    &config,
+                    &security,
+                    TEST_AGENT,
+                    &job,
+                    None,
+                    false,
+                    Some(admission),
+                )),
+            )
+            .await;
+            assert!(!success);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{backend}"
+            );
+            let family = format!("cron:{TEST_AGENT}:main");
+            let stream = source.stream_id(&family).await.expect("stream");
+            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                &config.data_dir,
+                &family,
+            )
+            .expect("family");
+            let page = store
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
+                .expect("events");
+            let count = |kind| {
+                page.events
+                    .iter()
+                    .filter(|event| event.body.kind() == kind)
+                    .count()
+            };
+            assert_eq!(count(EventKind::TurnAccepted), 1);
+            assert_eq!(count(EventKind::ProviderAttemptStarted), 1);
+            assert_eq!(count(EventKind::ProviderAttemptFailed), 1);
+            assert_eq!(count(EventKind::TurnCommitted), 1);
+            assert_eq!(count(EventKind::TurnOutcomeUnknown), 0);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn run_agent_job_blocks_readonly_mode() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -3062,7 +3707,8 @@ mod tests {
             "closed-cron",
             Some(admission),
         )
-        .await;
+        .await
+        .expect("closed admission is a failure");
         assert!(!success);
         assert!(output.contains("lifecycle generation is closing"));
         assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
