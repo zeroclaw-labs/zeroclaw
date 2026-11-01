@@ -42,6 +42,11 @@ impl SopExecuteTool {
 
 #[async_trait]
 impl Tool for SopExecuteTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // The SOP engine does not carry the caller's ceilings into its steps.
+        true
+    }
+
     fn name(&self) -> &str {
         "sop_execute"
     }
