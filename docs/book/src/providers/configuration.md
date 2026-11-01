@@ -619,7 +619,7 @@ The Bedrock provider uses the credential paths implemented in `crates/zeroclaw-p
 1. `api_key` on the Bedrock alias, or `BEDROCK_API_KEY`, uses Bedrock bearer-token auth and takes precedence over SigV4 credentials.
 2. `AWS_ACCESS_KEY_ID` plus `AWS_SECRET_ACCESS_KEY` uses SigV4. `AWS_SESSION_TOKEN` is optional. `AWS_REGION` or `AWS_DEFAULT_REGION` selects the signing region and falls back to `us-east-1`.
 3. `credential_process` in the active profile from `~/.aws/config`, or from `AWS_CONFIG_FILE`, uses SigV4. `AWS_PROFILE` selects the profile and defaults to `default`.
-4. EC2 IMDSv2 instance credentials are the final SigV4 fallback.
+4. EC2 IMDSv2 instance credentials are the final SigV4 fallback. Set `AWS_EC2_METADATA_DISABLED=true` to skip this fallback before it makes any network request; the value is trimmed and compared case-insensitively. This does not disable the earlier credential sources.
 
 The config schema additionally defines a `providers.models.bedrock.<alias>.region`
 field, but the current implementation does not read it. The endpoint region is
