@@ -1063,8 +1063,7 @@ mod tests {
     static CLAMP_LOG_LOCK: Mutex<()> = Mutex::new(());
 
     fn capture_log_events() -> tokio::sync::broadcast::Receiver<serde_json::Value> {
-        ::zeroclaw_log::try_install_capture_subscriber();
-        ::zeroclaw_log::subscribe_or_install()
+        crate::capture_log_events()
     }
 
     fn drain_captured_events(

@@ -67,7 +67,7 @@ async fn interactive_agent_renders_image_recovery_and_next_text_turn() {
     std::fs::write(
         config_dir.path().join("config.toml"),
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 locale = "en"
 
 [reliability]
@@ -216,7 +216,7 @@ async fn single_shot_agent_localizes_semantic_empty_terminal_failure() {
     std::fs::write(
         config_dir.path().join("config.toml"),
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [reliability]
 provider_retries = 0
@@ -302,7 +302,7 @@ async fn interactive_agent_localizes_semantic_empty_terminal_failure() {
     std::fs::write(
         config_dir.path().join("config.toml"),
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 4
 
 [reliability]
 provider_retries = 0
