@@ -2908,7 +2908,7 @@ async fn run_tool_call_loop_impl<'a>(
                 )
             }
             Err(e) => {
-                crate::agent::cost::settle_provider_attempts(&attempts, None);
+                crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
                 // This iteration's attempts never reach an accepted response
                 // (recovery continues with a fresh attempt vec, otherwise the
                 // turn fails) — project them now so the gateway ledger stays
@@ -2982,7 +2982,7 @@ async fn run_tool_call_loop_impl<'a>(
         // Any parser or stream-protocol guard finding rejects the transport
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
-            crate::agent::cost::settle_provider_attempts(&attempts, None);
+            crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
             // Same contract as the error branch: this iteration's attempts
             // are settled but never accepted — project them before retrying
             // with a fresh vec or returning the fallback.
@@ -3076,17 +3076,26 @@ async fn run_tool_call_loop_impl<'a>(
             return Ok(accumulated_display_text);
         }
 
+        // Both paths settle before response handling. A Goal operation gives
+        // the complete immutable report to its accounting owner; ordinary
+        // sessions retain the split settlement writer. Their non-ledger usage
+        // projections stay identical.
+        if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            crate::agent::cost::settle_provider_attempts(
+                &attempts,
+                Some(attempts.len().saturating_sub(1)),
+            )
+            .await?;
+        } else {
+            crate::agent::cost::settle_provider_attempts(
+                &attempts[..attempts.len().saturating_sub(1)],
+                None,
+            )
+            .await?;
+        }
         // Earlier physical leaves are rejected routing/retry work. The final
-        // accepted response remains settled by `record_accepted_chat_response`
-        // so only it updates context-window telemetry.
-        crate::agent::cost::settle_provider_attempts(
-            &attempts[..attempts.len().saturating_sub(1)],
-            None,
-        );
-        // Emit TurnEvent::Usage for each billable rejected attempt so the
-        // gateway's usage_by_provider breakdown includes all billable attempts
-        // (accepted + rejected). This makes the breakdown the single source of
-        // truth that the done-frame cost_usd can be derived from.
+        // accepted response is projected by `record_accepted_chat_response`,
+        // so only it carries accepted context-window fields.
         emit_rejected_attempt_usage(ctx.event_tx, &attempts[..attempts.len().saturating_sub(1)])
             .await;
         record_accepted_chat_response(

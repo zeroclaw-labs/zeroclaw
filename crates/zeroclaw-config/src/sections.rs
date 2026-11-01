@@ -904,6 +904,7 @@ mod tests {
             ("opencode_cli", SectionGroup::Integrations),
             ("sop", SectionGroup::Agent),
             ("verifiable_intent", SectionGroup::Agent),
+            ("goal", SectionGroup::Agent),
             ("shell_tool", SectionGroup::Tools),
             ("observability", SectionGroup::Operations),
             ("gateway", SectionGroup::Network),
