@@ -20,29 +20,25 @@ fn skill_key(skill: &AgentSkillEntry) -> String {
     )
 }
 
-async fn load_skills(
-    alias: String,
-    mut skills: Signal<Vec<AgentSkillEntry>>,
-    mut dropped: Signal<Vec<DroppedSkillEntry>>,
-) -> Result<(), String> {
-    let response = api::agent_skills(&alias).await?;
-    skills.set(response.skills);
-    dropped.set(response.dropped);
-    Ok(())
+async fn fetch_skills(
+    alias: &str,
+) -> Result<(Vec<AgentSkillEntry>, Vec<DroppedSkillEntry>), String> {
+    let response = api::agent_skills(alias).await?;
+    Ok((response.skills, response.dropped))
 }
 
 #[component]
 pub fn SkillsPage() -> Element {
     let mut agents: Signal<Vec<String>> = use_signal(Vec::new);
     let mut selected_alias: Signal<String> = use_signal(String::new);
-    let skills: Signal<Vec<AgentSkillEntry>> = use_signal(Vec::new);
-    let dropped: Signal<Vec<DroppedSkillEntry>> = use_signal(Vec::new);
+    let mut skills: Signal<Vec<AgentSkillEntry>> = use_signal(Vec::new);
+    let mut dropped: Signal<Vec<DroppedSkillEntry>> = use_signal(Vec::new);
     let mut search: Signal<String> = use_signal(String::new);
     let mut loading: Signal<bool> = use_signal(|| true);
     let mut reloading: Signal<bool> = use_signal(|| false);
     let mut error: Signal<Option<String>> = use_signal(|| None);
     let mut expanded_key: Signal<Option<String>> = use_signal(|| None);
-    let detail_map: Signal<HashMap<String, SkillDocument>> = use_signal(HashMap::new);
+    let mut detail_map: Signal<HashMap<String, SkillDocument>> = use_signal(HashMap::new);
 
     use_effect(move || {
         spawn(async move {
@@ -74,10 +70,22 @@ pub fn SkillsPage() -> Element {
             loading.set(true);
             error.set(None);
             expanded_key.set(None);
-            if let Err(e) = load_skills(alias, skills, dropped).await {
-                error.set(Some(e));
+            match fetch_skills(&alias).await {
+                Ok((new_skills, new_dropped)) => {
+                    if selected_alias() == alias {
+                        skills.set(new_skills);
+                        dropped.set(new_dropped);
+                    }
+                }
+                Err(e) => {
+                    if selected_alias() == alias {
+                        error.set(Some(e));
+                    }
+                }
             }
-            loading.set(false);
+            if selected_alias() == alias {
+                loading.set(false);
+            }
         });
     });
 
@@ -101,15 +109,6 @@ pub fn SkillsPage() -> Element {
         })
         .cloned()
         .collect();
-
-    if let Some(err) = error() {
-        let load_error = t("skills.load_error");
-        return rsx! {
-            div { class: "page",
-                div { class: "error-banner", "{load_error}: {err}" }
-            }
-        };
-    }
 
     if loading() {
         return rsx! {
@@ -158,8 +157,17 @@ pub fn SkillsPage() -> Element {
                         if alias.is_empty() { return; }
                         spawn(async move {
                             reloading.set(true);
-                            if let Err(e) = load_skills(alias, skills, dropped).await {
-                                error.set(Some(e));
+                            expanded_key.set(None);
+                            detail_map.write().clear();
+                            match fetch_skills(&alias).await {
+                                Ok((new_skills, new_dropped)) => {
+                                    if selected_alias() == alias {
+                                        skills.set(new_skills);
+                                        dropped.set(new_dropped);
+                                        error.set(None);
+                                    }
+                                }
+                                Err(e) => error.set(Some(e)),
                             }
                             reloading.set(false);
                         });
@@ -167,6 +175,10 @@ pub fn SkillsPage() -> Element {
                     span { class: if reloading() { "spin-icon spinning" } else { "spin-icon" } }
                     "{t(\"skills.reload\")}"
                 }
+            }
+
+            if let Some(err) = error() {
+                div { class: "error-banner", "{t(\"skills.load_error\")}: {err}" }
             }
 
             div { class: "section-header",
