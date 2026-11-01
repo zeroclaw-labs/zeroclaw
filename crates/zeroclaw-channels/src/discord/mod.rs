@@ -805,10 +805,16 @@ impl DiscordChannel {
         })
     }
 
+    /// Resolve a plaintext approval reply. Only a human allowlisted responder in
+    /// the prompt's destination may answer: with `listen_to_bots` enabled an
+    /// allowlisted peer bot can still talk to the agent, but it must not answer
+    /// the agent's tool approvals. Discord components already require a human
+    /// click, so this keeps the plaintext path consistent with them.
     async fn resolve_approval_reply(
         &self,
         content: &str,
         responder: &str,
+        responder_is_bot: bool,
         destination: &str,
     ) -> Option<crate::util::PendingApprovalResolution> {
         let (token, response) = crate::util::parse_approval_reply(content)?;
@@ -817,7 +823,7 @@ impl DiscordChannel {
                 &self.pending_approvals,
                 &token,
                 response,
-                self.is_user_allowed(responder),
+                !responder_is_bot && self.is_user_allowed(responder),
                 &Self::canonical_approval_destination(destination),
             )
             .await,
@@ -3196,7 +3202,8 @@ impl Channel for DiscordChannel {
                     }
 
                     // Skip bot messages (unless listen_to_bots is enabled)
-                    if !self.listen_to_bots && d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                    let author_is_bot = d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false);
+                    if !self.listen_to_bots && author_is_bot {
                         continue;
                     }
 
@@ -3345,7 +3352,7 @@ impl Channel for DiscordChannel {
 
                     // Intercept approval replies before forwarding to the agent.
                     if let Some(resolution) = self
-                        .resolve_approval_reply(&final_content, author_id, &channel_id)
+                        .resolve_approval_reply(&final_content, author_id, author_is_bot, &channel_id)
                         .await
                         && !matches!(
                             resolution,
@@ -8048,8 +8055,8 @@ mod tests {
             "token".into(),
             vec![],
             "discord_test_alias",
-            Arc::new(|| vec!["u1".to_string()]),
-            false,
+            Arc::new(|| vec!["u1".to_string(), "peer-bot".to_string()]),
+            true,
             false,
         );
         let (tx, mut rx) = oneshot::channel();
@@ -8063,26 +8070,63 @@ mod tests {
         );
 
         assert_eq!(
-            ch.resolve_approval_reply("tok123 yes", "intruder", "c1")
+            ch.resolve_approval_reply("tok123 yes", "intruder", false, "c1")
                 .await,
             Some(crate::util::PendingApprovalResolution::Rejected)
         );
         assert_eq!(
-            ch.resolve_approval_reply("tok123 yes", "u1", "c2").await,
+            ch.resolve_approval_reply("tok123 yes", "u1", false, "c2")
+                .await,
+            Some(crate::util::PendingApprovalResolution::Rejected)
+        );
+        // An allowlisted peer bot may talk to the agent but must not answer
+        // its approvals, even in the prompt's own destination.
+        assert_eq!(
+            ch.resolve_approval_reply("tok123 yes", "peer-bot", true, "c1")
+                .await,
             Some(crate::util::PendingApprovalResolution::Rejected)
         );
         assert!(ch.pending_approvals.lock().await.contains_key("tok123"));
         assert!(rx.try_recv().is_err());
 
         assert_eq!(
-            ch.resolve_approval_reply("tok123 yes", "u1", "c1:thread")
+            ch.resolve_approval_reply("tok123 yes", "u1", false, "c1:thread")
                 .await,
             Some(crate::util::PendingApprovalResolution::Resolved)
         );
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
         assert_eq!(
-            ch.resolve_approval_reply("tok123 no", "u1", "c1").await,
+            ch.resolve_approval_reply("tok123 no", "u1", false, "c1")
+                .await,
             Some(crate::util::PendingApprovalResolution::NotFound)
+        );
+    }
+
+    #[test]
+    fn gateway_plaintext_approval_passes_payload_bot_flag() {
+        let src = include_str!("mod.rs");
+        let prod = &src[..src.find("mod tests {").expect("test module present")];
+        let calls: Vec<usize> = prod
+            .match_indices(".resolve_approval_reply(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one production plaintext approval call site"
+        );
+        let call = &prod[calls[0]..];
+        let call = &call[..call.find(')').expect("call closes")];
+        assert!(
+            call.contains("author_is_bot"),
+            "the gateway must pass the author's bot flag to approval resolution"
+        );
+        let derived = prod
+            .find("let author_is_bot = d.get(\"author\").and_then(|a| a.get(\"bot\"))")
+            .expect("author_is_bot is derived from the payload author");
+        assert!(
+            derived < calls[0],
+            "bot flag is derived before the approval check"
         );
     }
 
