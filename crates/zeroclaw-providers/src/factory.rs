@@ -504,12 +504,22 @@ pub(crate) fn fallback_auth_ready_for_alias(
     key: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> bool {
+    let source_family = crate::canonicalize_v2_model_provider_name(family);
     let provider_kind = opts
         .provider_kind
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(family);
+        .map(crate::canonicalize_v2_model_provider_name)
+        .unwrap_or(source_family);
+
+    // A typed slot selecting the native Anthropic implementation remains on
+    // its legacy static-key path. It is not the canonical Anthropic alias that
+    // owns an OAuth profile with this spelling, so fallback admission must not
+    // borrow that profile either.
+    if provider_kind == "anthropic" && source_family != "anthropic" {
+        return has_api_key(key);
+    }
 
     // openai missing-entry fallback: keep construction symmetric with
     // `dispatch_family_factory`. `wire_api` does not influence auth-readiness,
@@ -559,10 +569,10 @@ pub(crate) fn fallback_auth_ready_for_alias(
 }
 
 use zeroclaw_config::schema::{
-    Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
-    AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
-    AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AuthMode,
-    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
+    Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicAuthMode,
+    AnthropicModelProviderConfig, AnyscaleModelProviderConfig, ArceeModelProviderConfig,
+    AstraiModelProviderConfig, AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig,
+    AuthMode, AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
     CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
     CrusoeModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
@@ -1071,6 +1081,7 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(crate::MINIMAX_OAUTH_DEFAULT_CLIENT_ID);
                 crate::refresh_minimax_oauth_access_token(refresh_token, client_id, self.endpoint)
+                    .map_err(crate::auth::ProviderCredentialRefreshError::new)
             })
             .transpose()?;
         let resolved_key = refreshed_key.as_deref().or(key);
@@ -1220,13 +1231,55 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
-            .credential(key)
-            .server_fallback_models(self.server_fallback_models.clone())
-            .single_tool_rounds_supported(
-                api_url.is_none_or(|url| url.trim_end_matches('/') == crate::anthropic::BASE_URL),
-            )
-            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
+        let oauth = self.auth_mode == Some(AnthropicAuthMode::OAuth);
+        // Config loading intentionally warns and continues after validation
+        // errors. OAuth aliases name stored-profile namespaces, so repeat the
+        // canonical-alias admission check at the construction boundary rather
+        // than allowing an invalid loaded key to reach credential selection.
+        if oauth && let Err(error) = zeroclaw_config::helpers::validate_alias_key(alias) {
+            anyhow::bail!(
+                "providers.models.anthropic.{alias}: auth_mode = \"oauth\" requires a canonical alias: {error}"
+            );
+        }
+        // Match schema admission exactly: OAuth aliases own their credential
+        // through AuthService, so the presence of an inline `api_key` is
+        // invalid even when that value is blank. Config::load logs validation
+        // failures and continues, therefore construction must keep the same
+        // fail-closed boundary.
+        if oauth && key.is_some() {
+            anyhow::bail!(
+                "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+            );
+        }
+        if oauth && !AnthropicModelProviderConfig::has_official_oauth_endpoint(api_url) {
+            anyhow::bail!(
+                "providers.models.anthropic.{alias}: auth_mode = \"oauth\" requires the official https://api.anthropic.com endpoint"
+            );
+        }
+
+        let mut b =
+            crate::anthropic::AnthropicModelProvider::builder(alias)
+                .server_fallback_models(self.server_fallback_models.clone())
+                .single_tool_rounds_supported(api_url.is_none_or(|url| {
+                    url.trim().trim_end_matches('/') == crate::anthropic::BASE_URL
+                }));
+        if oauth {
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
+            b = b.auth_profile(crate::auth::AuthService::new(
+                &state_dir,
+                opts.secrets_encrypt,
+            ));
+        } else {
+            b = b.credential(key);
+        }
+        // Use the centralized fixed endpoint for legacy aliases without an
+        // override; OAuth aliases above still reject every nonofficial URL.
+        b = b.base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);
         }
@@ -1237,6 +1290,10 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
             b = b.cache_ttl(cache_ttl);
         }
         Ok(Box::new(b.build()))
+    }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        self.auth_mode == Some(AnthropicAuthMode::OAuth) || has_api_key(key)
     }
 }
 
@@ -1636,6 +1693,7 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(crate::QWEN_OAUTH_DEFAULT_CLIENT_ID);
                 crate::refresh_qwen_oauth_access_token(refresh_token, client_id)
+                    .map_err(crate::auth::ProviderCredentialRefreshError::new)
             })
             .transpose()?;
 
@@ -2063,6 +2121,61 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+    #[test]
+    fn anthropic_oauth_factory_rejects_noncanonical_loaded_aliases() {
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let config = AnthropicModelProviderConfig {
+            auth_mode: Some(AnthropicAuthMode::OAuth),
+            ..Default::default()
+        };
+        for alias in [
+            "team:subscription",
+            " subscription",
+            "subscription ",
+            "Uppercase",
+        ] {
+            let error = match config.create_provider(
+                alias,
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            ) {
+                Ok(_) => panic!("OAuth construction must reject noncanonical alias {alias}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("requires a canonical alias"),
+                "unexpected error for {alias:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_oauth_factory_rejects_an_explicitly_empty_inline_key() {
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let config = AnthropicModelProviderConfig {
+            auth_mode: Some(AnthropicAuthMode::OAuth),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "subscription",
+            Some(""),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("OAuth construction must reject an explicitly empty api_key"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("must not be combined with api_key"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn cache_passthrough_runtime_option_reaches_provider_capability() {
@@ -2771,6 +2884,35 @@ mod tests {
                 .build()
                 .supports_single_tool_rounds("gpt-4o")
         );
+    }
+
+    #[test]
+    fn anthropic_oauth_factory_retains_single_tool_round_support() {
+        // Stored-profile selection must not bypass the native capability that
+        // upstream admits only for Anthropic's documented public endpoint.
+        let state_dir = tempfile::tempdir().unwrap();
+        let opts = ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(state_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..Default::default()
+        };
+        let config = AnthropicModelProviderConfig {
+            auth_mode: Some(zeroclaw_config::schema::AnthropicAuthMode::OAuth),
+            ..Default::default()
+        };
+        for endpoint in [
+            None,
+            Some("https://api.anthropic.com"),
+            Some(" https://api.anthropic.com "),
+        ] {
+            let provider = config
+                .create_provider("subscription", None, endpoint, &opts)
+                .unwrap();
+            assert!(
+                provider.supports_single_tool_rounds("claude-sonnet-4-6"),
+                "accepted official endpoint {endpoint:?} must retain Single support"
+            );
+        }
     }
 
     #[test]
