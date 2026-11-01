@@ -360,8 +360,9 @@ jobs:
     needs: [validate, web]
     runs-on: macos-15
     # Two kernel release builds (arm64 + x86_64) feed the universal sidecar,
-    # then the universal app build on top.
-    timeout-minutes: 180
+    # then the universal app build on top. With the `dist` selection the
+    # sidecar step took 108 minutes in the v0.8.6 run, so allow 240.
+    timeout-minutes: 240
     env:
       MACOS_DMG_PATH: desktop-assets/ZeroClaw.dmg
     steps:
@@ -775,7 +776,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin

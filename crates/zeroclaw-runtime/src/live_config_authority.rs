@@ -77,6 +77,7 @@ impl LiveConfigAuthority {
     /// Create an authority that exclusively owns this config across processes.
     pub fn new_owned(config: Config) -> Result<Self> {
         let ownership = ConfigOwnershipGuard::acquire(&config.data_dir)?;
+        ownership.recover_abandoned_turns_or_log();
         Ok(Self::new_with_ownership(config, ownership))
     }
 
@@ -540,26 +541,221 @@ impl AgentExecutionAdmission {
 #[derive(Debug)]
 pub struct ConfigOwnershipGuard {
     _file: File,
+    /// The data directory this guard locked.
+    data_dir: PathBuf,
 }
+
+/// The data-directory entry that holds the config lifecycle lock.
+///
+/// The data directory belongs to the operator: it is configurable and may be
+/// shared with a group, so this guard accepts it as it is. (When the daemon's
+/// local IPC endpoint lives there, the endpoint's `prepare_parent` then sets
+/// it to 0700, best-effort.) The owner-only checks apply to this
+/// subdirectory, which ZeroClaw creates for itself, and to the lock inside
+/// it. They protect the lock against other users who cannot write the data
+/// directory or its parents. A user who can write the data directory can
+/// still rename `.lifecycle` aside or create it first, splitting or blocking
+/// the lock; no check on this directory alone prevents that.
+const LIFECYCLE_DIR: &str = ".lifecycle";
+const LIFECYCLE_LOCK_FILE: &str = "config-lifecycle.lock";
 
 #[cfg(unix)]
 fn validate_lock_dir(path: &Path) -> Result<()> {
-    let metadata = std::fs::metadata(path)
+    let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("inspecting config lifecycle directory {}", path.display()))?;
     let euid = unsafe { libc::geteuid() };
+    check_lock_dir(path, &metadata, euid)
+}
+
+/// ZeroClaw creates the lifecycle directory as a real directory that only the
+/// current user can write, so a failure here means it was replaced or changed
+/// afterwards. Each refusal names the command that puts it right once the
+/// operator has checked its contents. Like the checks on the lock file, this
+/// protects the lock only against other users who cannot write the data
+/// directory or its parents (see [`LIFECYCLE_DIR`]).
+///
+/// This is deliberately stricter than the IPC endpoint's
+/// `require_trusted_lock_dir`, which must accept shared socket directories
+/// such as `/tmp`: it trusts root-owned and sticky world-writable directories
+/// and follows symlinks. None of those states is one ZeroClaw creates here.
+/// A sticky shared `.lifecycle` would let any user create the lock first and
+/// block startup, and a symlinked one would move the lock whenever the link
+/// is retargeted, so two processes could lock different files.
+#[cfg(unix)]
+fn check_lock_dir(path: &Path, metadata: &std::fs::Metadata, euid: u32) -> Result<()> {
+    let display = path.display().to_string();
     anyhow::ensure!(
-        metadata.uid() == euid,
-        "config lifecycle directory {} is owned by uid {}, not the current user",
-        path.display(),
-        metadata.uid()
+        metadata.file_type().is_dir(),
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-config-lifecycle-dir-not-directory",
+            &[("path", &display), ("command", &remedy_command("rm", path))],
+        )
     );
+    let owner_uid = metadata.uid();
+    if owner_uid != euid {
+        anyhow::bail!(owner_refusal(path, owner_uid, euid, OwnedDir::Lifecycle));
+    }
+    let mode = metadata.mode() & 0o7777;
     anyhow::ensure!(
-        metadata.mode() & 0o022 == 0,
-        "config lifecycle directory {} is writable by other users (mode {:o})",
-        path.display(),
-        metadata.mode() & 0o7777
+        mode & 0o022 == 0,
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-config-lifecycle-dir-writable",
+            &[
+                ("path", &display),
+                ("mode", &format!("{mode:o}")),
+                ("command", &remedy_command("chmod 700", path)),
+            ],
+        )
     );
     Ok(())
+}
+
+/// The directory an ownership refusal is about.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum OwnedDir {
+    /// `.lifecycle`, which ZeroClaw creates and holds only the lock.
+    Lifecycle,
+    /// The operator's data directory, when `.lifecycle` cannot be created in
+    /// it. It may belong to another account or a service on purpose.
+    Data,
+}
+
+/// The refusal for `dir` at `path` when it belongs to `owner_uid` rather than
+/// the effective user.
+#[cfg(unix)]
+fn owner_refusal(path: &Path, owner_uid: u32, euid: u32, dir: OwnedDir) -> String {
+    let (running_as_root, root_owner, foreign_owner) = match dir {
+        OwnedDir::Lifecycle => (
+            "cli-config-lifecycle-dir-running-as-root",
+            "cli-config-lifecycle-dir-root-owner",
+            "cli-config-lifecycle-dir-foreign-owner",
+        ),
+        OwnedDir::Data => (
+            "cli-config-data-dir-running-as-root",
+            "cli-config-data-dir-root-owner",
+            "cli-config-data-dir-foreign-owner",
+        ),
+    };
+    let display = path.display().to_string();
+    let owner = user_name(owner_uid).unwrap_or_else(|| format!("uid {owner_uid}"));
+    if euid == 0 {
+        // Handing the directory to root would only move the refusal to the
+        // owner's next run without sudo.
+        return crate::i18n::get_required_cli_string_with_args(
+            running_as_root,
+            &[("path", &display), ("owner", &owner)],
+        );
+    }
+    let current_name = user_name(euid);
+    let user = current_name
+        .clone()
+        .unwrap_or_else(|| format!("uid {euid}"));
+    let chown_to = current_name.unwrap_or_else(|| euid.to_string());
+    let command = remedy_command(
+        &format!(
+            "sudo chown -R {}",
+            crate::util::shell_escape(std::ffi::OsStr::new(&chown_to))
+        ),
+        path,
+    );
+    let key = if owner_uid == 0 {
+        root_owner
+    } else {
+        foreign_owner
+    };
+    crate::i18n::get_required_cli_string_with_args(
+        key,
+        &[
+            ("path", &display),
+            ("owner", &owner),
+            ("user", &user),
+            ("command", &command),
+        ],
+    )
+}
+
+/// Explains a refused `.lifecycle` creation when the data directory belongs
+/// to someone else, typically after a first run with sudo. Any other failure
+/// keeps the plain OS error.
+///
+/// This only explains a refusal the OS already made, so it follows a
+/// symlinked data directory, as creating `.lifecycle` did, and names the
+/// directory the link resolves to, which is the one a `chown` must change.
+#[cfg(unix)]
+fn lock_dir_creation_error(
+    data_dir: &Path,
+    lock_dir: &Path,
+    error: std::io::Error,
+) -> anyhow::Error {
+    let euid = unsafe { libc::geteuid() };
+    let refusal = if error.kind() == std::io::ErrorKind::PermissionDenied {
+        std::fs::metadata(data_dir)
+            .ok()
+            .filter(|metadata| metadata.uid() != euid)
+            .map(|metadata| {
+                let resolved =
+                    std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+                owner_refusal(&resolved, metadata.uid(), euid, OwnedDir::Data)
+            })
+    } else {
+        None
+    };
+    let context = refusal
+        .unwrap_or_else(|| format!("creating config lifecycle directory {}", lock_dir.display()));
+    anyhow::Error::new(error).context(context)
+}
+
+#[cfg(not(unix))]
+fn lock_dir_creation_error(
+    _data_dir: &Path,
+    lock_dir: &Path,
+    error: std::io::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(error).context(format!(
+        "creating config lifecycle directory {}",
+        lock_dir.display()
+    ))
+}
+
+#[cfg(unix)]
+fn remedy_command(command: &str, path: &Path) -> String {
+    format!("{command} {}", crate::util::shell_escape(path.as_os_str()))
+}
+
+/// The account name for `uid`, when the user database has one.
+#[cfg(unix)]
+fn user_name(uid: u32) -> Option<String> {
+    use std::ffi::CStr;
+
+    let mut capacity = 1024usize;
+    loop {
+        let mut buffer = vec![0u8; capacity];
+        // SAFETY: `passwd` is plain data that getpwuid_r fills in.
+        let mut passwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        // SAFETY: every pointer refers to a live local, and `buffer.len()` is
+        // the size of the buffer getpwuid_r may write strings into.
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut passwd,
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == 0 && !result.is_null() && !passwd.pw_name.is_null() {
+            // SAFETY: on success pw_name points at a NUL-terminated string
+            // inside `buffer`, which is still alive here.
+            let name = unsafe { CStr::from_ptr(passwd.pw_name) }.to_string_lossy();
+            return (!name.is_empty()).then(|| name.into_owned());
+        }
+        if status != libc::ERANGE || capacity >= 1024 * 1024 {
+            return None;
+        }
+        capacity *= 2;
+    }
 }
 
 #[cfg(not(unix))]
@@ -605,11 +801,18 @@ fn validate_lock_file(_file: &File, _path: &Path) -> Result<()> {
 
 impl ConfigOwnershipGuard {
     pub fn acquire(data_dir: &Path) -> std::result::Result<Self, ConfigOwnershipError> {
-        std::fs::create_dir_all(data_dir).with_context(|| {
-            format!("creating config lifecycle directory {}", data_dir.display())
-        })?;
-        validate_lock_dir(data_dir)?;
-        let path = data_dir.join("config-lifecycle.lock");
+        zeroclaw_config::schema::create_owner_only_dir(data_dir)
+            .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+        let lock_dir = data_dir.join(LIFECYCLE_DIR);
+        match zeroclaw_config::schema::create_owner_only_dir(&lock_dir) {
+            Ok(()) => {}
+            // Something other than a directory is in the way; the validation
+            // below names it and the remedy.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(lock_dir_creation_error(data_dir, &lock_dir, error).into()),
+        }
+        validate_lock_dir(&lock_dir)?;
+        let path = lock_dir.join(LIFECYCLE_LOCK_FILE);
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -649,13 +852,42 @@ impl ConfigOwnershipGuard {
                         )));
                     }
                 }
-                Ok(Self { _file: file })
+                Ok(Self {
+                    _file: file,
+                    data_dir: data_dir.to_path_buf(),
+                })
             }
             Err(TryLockError::WouldBlock) => Err(ConfigOwnershipError::AlreadyOwned { path }),
             Err(TryLockError::Error(error)) => Err(ConfigOwnershipError::Unavailable(
                 anyhow::Error::new(error)
                     .context(format!("locking config lifecycle at {}", path.display())),
             )),
+        }
+    }
+}
+
+impl ConfigOwnershipGuard {
+    /// Settle the session turns a previous process left marked "running" in
+    /// the data directory this guard locked. Holding the guard is what makes
+    /// that safe; see [`zeroclaw_infra::recover_abandoned_session_turns`],
+    /// which does the work and acts once per process. Call it before the
+    /// process admits a turn of its own.
+    pub fn recover_abandoned_turns(&self) -> std::io::Result<usize> {
+        zeroclaw_infra::recover_abandoned_session_turns(&self.data_dir)
+    }
+
+    /// [`Self::recover_abandoned_turns`] for a startup path: a store that
+    /// cannot be settled is no reason to refuse to start, so the failure is
+    /// logged and startup goes on.
+    pub fn recover_abandoned_turns_or_log(&self) {
+        if let Err(error) = self.recover_abandoned_turns() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                "could not settle session turns left running by a previous process"
+            );
         }
     }
 }
@@ -1584,8 +1816,16 @@ mod tests {
         assert!(lifecycle.reserve_admission("alpha").is_ok());
     }
 
+    /// Spawning a process copies every open descriptor into the child until
+    /// it execs, another test's config lock included. A test that re-acquires
+    /// the lock right after releasing it could then find it still held, so
+    /// those tests hold this for reading, and a test that spawns holds it for
+    /// writing while its child runs.
+    static SPAWN_VS_LOCK_REACQUIRE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
     #[test]
     fn config_ownership_is_exclusive_and_released_on_drop() {
+        let _no_spawn = SPAWN_VS_LOCK_REACQUIRE.blocking_read();
         let temp = tempfile::TempDir::new().unwrap();
         let first = ConfigOwnershipGuard::acquire(temp.path()).unwrap();
         assert!(matches!(
@@ -1594,6 +1834,578 @@ mod tests {
         ));
         drop(first);
         ConfigOwnershipGuard::acquire(temp.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_install_under_umask_0002_is_owner_only_and_acquired() {
+        const CHILD_ENV: &str = "ZEROCLAW_LIFECYCLE_UMASK_TEST_CHILD";
+        const TEST_NAME: &str = "live_config_authority::tests::fresh_install_under_umask_0002_is_owner_only_and_acquired";
+
+        // The umask is process-global. Run the behavioral part in a dedicated
+        // test subprocess so unrelated tests in the parent harness cannot
+        // observe it.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _spawning = SPAWN_VS_LOCK_REACQUIRE.blocking_write();
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable must be available"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("spawn umask test subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "umask test subprocess failed with status {}:\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let install = temp.path().join("install");
+        let data_dir = install.join("data");
+        // SAFETY: umask has no memory-safety preconditions, and this
+        // subprocess runs only the current test.
+        unsafe { libc::umask(0o002) };
+
+        let guard = ConfigOwnershipGuard::acquire(&data_dir)
+            .expect("ZeroClaw must accept the directories it creates itself");
+
+        assert_eq!(mode_of(&data_dir), 0o700);
+        assert_eq!(mode_of(&data_dir.join(LIFECYCLE_DIR)), 0o700);
+        assert_eq!(
+            mode_of(&data_dir.join(LIFECYCLE_DIR).join(LIFECYCLE_LOCK_FILE)),
+            0o600
+        );
+        // Missing parents keep the default mode.
+        assert_eq!(mode_of(&install), 0o775);
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_shared_data_dir_is_accepted_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The data directory is the operator's, as in v0.8.5 and on Windows:
+        // only the `.lifecycle` subdirectory is held to owner-only.
+        for mode in [0o775, 0o777] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let data_dir = temp.path().join("data");
+            std::fs::create_dir(&data_dir).unwrap();
+            std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let guard = ConfigOwnershipGuard::acquire(&data_dir)
+                .unwrap_or_else(|error| panic!("mode {mode:o} data dir refused: {error}"));
+
+            assert_eq!(mode_of(&data_dir), mode, "the data dir must not be changed");
+            assert_eq!(mode_of(&data_dir.join(LIFECYCLE_DIR)) & 0o022, 0);
+            drop(guard);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_lifecycle_dir_is_refused_unchanged_with_chmod_remedy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o775, 0o757] {
+            let temp = tempfile::TempDir::new().unwrap();
+            // The space proves the remedy quotes the path.
+            let data_dir = temp.path().join("data dir");
+            let lock_dir = data_dir.join(LIFECYCLE_DIR);
+            std::fs::create_dir_all(&lock_dir).unwrap();
+            std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let error = ConfigOwnershipGuard::acquire(&data_dir)
+                .expect_err("a lifecycle dir other users can write must be refused")
+                .to_string();
+
+            let quoted = crate::util::shell_escape(lock_dir.as_os_str());
+            assert!(
+                quoted.starts_with('\''),
+                "the path with a space must be quoted"
+            );
+            let command = format!("chmod 700 {quoted}");
+            assert!(error.contains(&command), "missing `{command}`: {error}");
+            assert_copyable(&error);
+            assert!(
+                error.contains(&format!("{mode:o}")),
+                "missing mode: {error}"
+            );
+            assert!(
+                error.contains("writable by its group or by other users"),
+                "{error}"
+            );
+            assert!(
+                error.contains("If chmod has no effect")
+                    && error.contains("does not keep Unix permissions"),
+                "missing the filesystem note: {error}"
+            );
+            assert_eq!(mode_of(&lock_dir), mode, "the refusal must not repair it");
+            assert!(!lock_dir.join(LIFECYCLE_LOCK_FILE).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_lifecycle_dir_is_refused_with_remove_remedy() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        // An owner-only directory of the current user would pass every other
+        // check if the link were followed. TempDir follows the umask, so pin
+        // its mode.
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(
+            elsewhere.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let lock_dir = data_dir.join(LIFECYCLE_DIR);
+        std::os::unix::fs::symlink(elsewhere.path(), &lock_dir).unwrap();
+
+        let error = ConfigOwnershipGuard::acquire(&data_dir)
+            .expect_err("a symlinked lifecycle dir must be refused")
+            .to_string();
+
+        let command = format!("rm {}", crate::util::shell_escape(lock_dir.as_os_str()));
+        assert!(error.contains(&command), "missing `{command}`: {error}");
+        assert_copyable(&error);
+        assert!(!elsewhere.path().join(LIFECYCLE_LOCK_FILE).exists());
+
+        // A dangling link gets the same answer, not a bare "File exists".
+        std::fs::remove_file(&lock_dir).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing"), &lock_dir).unwrap();
+        let error = ConfigOwnershipGuard::acquire(&data_dir)
+            .expect_err("a dangling lifecycle link must be refused")
+            .to_string();
+        assert!(error.contains(&command), "missing `{command}`: {error}");
+    }
+
+    /// Remedy commands are pasted into a shell, so the rendered text must not
+    /// carry Fluent's invisible bidi isolation marks around placeables.
+    #[cfg(unix)]
+    fn assert_copyable(error: &str) {
+        assert!(
+            !error.contains(['\u{2068}', '\u{2069}']),
+            "bidi isolation marks in: {error:?}"
+        );
+    }
+
+    /// Metadata of a real directory that belongs to a regular user. Under
+    /// root, the directory is handed to uid 65534 first.
+    #[cfg(unix)]
+    fn regular_user_dir(temp: &tempfile::TempDir) -> std::fs::Metadata {
+        let dir = temp.path().join("owned");
+        std::fs::create_dir(&dir).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&dir, Some(65534), None).unwrap();
+        }
+        std::fs::symlink_metadata(&dir).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_owned_lifecycle_dir_puts_the_chown_remedy_first() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Changing a real directory's owner needs root, so feed the check the
+        // metadata of a directory and a different effective uid.
+        let temp = tempfile::TempDir::new().unwrap();
+        let lock_dir = temp.path().join("data dir").join(LIFECYCLE_DIR);
+        let owned = regular_user_dir(&temp);
+        let owner_uid = owned.uid();
+        let euid = owner_uid + 1;
+        let quoted = crate::util::shell_escape(lock_dir.as_os_str());
+
+        let error = check_lock_dir(&lock_dir, &owned, euid)
+            .expect_err("a lifecycle dir owned by another user must be refused")
+            .to_string();
+
+        let owner = user_name(owner_uid).unwrap_or_else(|| format!("uid {owner_uid}"));
+        let chown_to = user_name(euid).unwrap_or_else(|| euid.to_string());
+        let chown = format!(
+            "sudo chown -R {} {quoted}",
+            crate::util::shell_escape(std::ffi::OsStr::new(&chown_to))
+        );
+        let run_as = format!("Otherwise run ZeroClaw as {owner}.");
+        let chown_at = error
+            .find(&chown)
+            .unwrap_or_else(|| panic!("missing `{chown}`: {error}"));
+        let run_as_at = error
+            .find(&run_as)
+            .unwrap_or_else(|| panic!("missing `{run_as}`: {error}"));
+        assert!(
+            chown_at < run_as_at,
+            "the chown remedy must come first: {error}"
+        );
+        assert!(
+            !error.contains("not with sudo"),
+            "no sudo was used: {error}"
+        );
+        assert!(
+            error.contains("only config-lifecycle.lock, with a link count of 1"),
+            "missing the contents check: {error}"
+        );
+        assert!(
+            error.contains("If chown has no effect")
+                && error.contains("does not keep Unix permissions"),
+            "missing the filesystem note: {error}"
+        );
+        assert_copyable(&error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_owned_lifecycle_dir_under_sudo_says_run_without_sudo() {
+        use std::os::unix::fs::MetadataExt;
+
+        // ZeroClaw run with sudo finds the user's own .lifecycle. Handing it
+        // to root would only break the user's next run without sudo.
+        let temp = tempfile::TempDir::new().unwrap();
+        let lock_dir = temp.path().join("data").join(LIFECYCLE_DIR);
+        let owned = regular_user_dir(&temp);
+        let owner_uid = owned.uid();
+        let owner = user_name(owner_uid).unwrap_or_else(|| format!("uid {owner_uid}"));
+
+        let error = check_lock_dir(&lock_dir, &owned, 0)
+            .expect_err("a run as root must refuse a user's lifecycle dir")
+            .to_string();
+
+        assert!(error.contains("but ZeroClaw is running as root"), "{error}");
+        assert!(
+            error.contains(&format!("Run ZeroClaw as {owner}, without sudo.")),
+            "{error}"
+        );
+        assert!(
+            !error.contains("chown"),
+            "root must not take it over: {error}"
+        );
+        assert_copyable(&error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_owned_lifecycle_dir_is_refused_through_the_effective_uid() {
+        use std::os::unix::fs::MetadataExt;
+
+        // validate_lock_dir reads the effective uid itself. A root-owned
+        // directory tests that wiring, and which owner message it picks,
+        // without changing any directory's owner.
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let root = Path::new("/");
+        if euid == 0 || std::fs::symlink_metadata(root).unwrap().uid() != 0 {
+            eprintln!("skipped: needs a non-root user and a root-owned /");
+            return;
+        }
+
+        let error = validate_lock_dir(root)
+            .expect_err("a root-owned lifecycle dir must be refused")
+            .to_string();
+
+        assert!(
+            error.contains("belongs to root, usually because ZeroClaw was run with sudo"),
+            "{error}"
+        );
+        assert!(
+            !error.to_lowercase().contains("run zeroclaw as root"),
+            "wrong advice: {error}"
+        );
+        let user = user_name(euid).unwrap_or_else(|| euid.to_string());
+        let chown = format!(
+            "sudo chown -R {} /",
+            crate::util::shell_escape(std::ffi::OsStr::new(&user))
+        );
+        assert!(error.contains(&chown), "missing `{chown}`: {error}");
+        assert_sentence_follows(&error, &chown);
+        assert!(
+            error.contains("If chown has no effect")
+                && error.contains("does not keep Unix permissions"),
+            "missing the filesystem note: {error}"
+        );
+        assert_copyable(&error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_run_refuses_a_lifecycle_dir_owned_by_another_user() {
+        // Only root can give a directory away. CI containers often run as
+        // root; elsewhere this test has nothing to check.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let lock_dir = data_dir.join(LIFECYCLE_DIR);
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        std::os::unix::fs::chown(&lock_dir, Some(65534), Some(65534)).unwrap();
+        let owner = user_name(65534).unwrap_or_else(|| "uid 65534".to_string());
+
+        let error = ConfigOwnershipGuard::acquire(&data_dir)
+            .expect_err("a run as root must refuse another user's lifecycle dir")
+            .to_string();
+
+        assert!(error.contains("but ZeroClaw is running as root"), "{error}");
+        assert!(
+            error.contains(&format!("Run ZeroClaw as {owner}, without sudo.")),
+            "{error}"
+        );
+        assert!(
+            !error.contains("chown"),
+            "root must not take it over: {error}"
+        );
+        assert!(!lock_dir.join(LIFECYCLE_LOCK_FILE).exists());
+    }
+
+    /// A cause printed after the message (as `{:#}` does) must never land on
+    /// the command line, so a sentence has to follow the command.
+    #[cfg(unix)]
+    fn assert_sentence_follows(error: &str, command: &str) {
+        let last = error.trim_end().lines().last().unwrap_or_default();
+        assert!(
+            !last.contains(command),
+            "the command must not end the message: {error}"
+        );
+    }
+
+    /// An existing root-owned directory that the current, non-root user
+    /// cannot write, standing in for a data directory left by a run with
+    /// sudo. `/` is read-only on macOS, where mkdir reports EROFS instead.
+    #[cfg(unix)]
+    fn unwritable_root_owned_dir() -> Option<&'static Path> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let denied = |path: &Path| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `path` is a NUL-terminated string that outlives the call.
+            let status = unsafe { libc::access(path.as_ptr(), libc::W_OK) };
+            status != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+        };
+        ["/", "/root", "/private/var/root"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| {
+                std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_dir() && metadata.uid() == 0)
+                    && denied(path)
+            })
+    }
+
+    /// The refusal for a data directory the user cannot create `.lifecycle`
+    /// in, after checking that the OS error is still its cause.
+    #[cfg(unix)]
+    fn data_dir_refusal(data_dir: &Path) -> String {
+        let error = match ConfigOwnershipGuard::acquire(data_dir) {
+            Err(ConfigOwnershipError::Unavailable(error)) => error,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "the OS error must stay the cause: {error:#}"
+        );
+        error.to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_owned_by_root_explains_the_refused_lifecycle_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            eprintln!("skipped: root can create .lifecycle anywhere");
+            return;
+        }
+
+        // A data directory the user owns but cannot write keeps the OS error.
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = ConfigOwnershipGuard::acquire(&data_dir)
+            .expect_err("an unwritable data dir must be refused")
+            .to_string();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            error.starts_with("creating config lifecycle directory"),
+            "{error}"
+        );
+
+        // After a first run with sudo, data/ belongs to root and the user
+        // cannot create .lifecycle in it.
+        let Some(root_dir) = unwritable_root_owned_dir() else {
+            eprintln!("skipped: no root-owned directory this user cannot write");
+            return;
+        };
+
+        let error = data_dir_refusal(root_dir);
+
+        assert!(
+            error.starts_with(&format!(
+                "Data directory {} belongs to root, so ZeroClaw cannot create its config lock directory there.",
+                root_dir.display()
+            )),
+            "{error}"
+        );
+        assert!(
+            !error.contains("Config lifecycle directory"),
+            "the data directory is not the lifecycle directory: {error}"
+        );
+        let user = user_name(euid).unwrap_or_else(|| euid.to_string());
+        let chown = format!(
+            "sudo chown -R {} {}",
+            crate::util::shell_escape(std::ffi::OsStr::new(&user)),
+            crate::util::shell_escape(root_dir.as_os_str())
+        );
+        assert!(error.contains(&chown), "missing `{chown}`: {error}");
+        assert_sentence_follows(&error, &chown);
+        assert!(
+            error.contains(
+                "If it belongs to root on purpose, run ZeroClaw as its owner or point data_dir elsewhere."
+            ),
+            "{error}"
+        );
+        assert_copyable(&error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_data_dir_is_explained_at_the_directory_it_resolves_to() {
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            eprintln!("skipped: root can create .lifecycle anywhere");
+            return;
+        }
+        let Some(root_dir) = unwritable_root_owned_dir() else {
+            eprintln!("skipped: no root-owned directory this user cannot write");
+            return;
+        };
+        // The link itself belongs to the user; the directory it resolves to,
+        // where creating .lifecycle failed, does not.
+        let temp = tempfile::TempDir::new().unwrap();
+        let link = temp.path().join("data");
+        std::os::unix::fs::symlink(root_dir, &link).unwrap();
+        let resolved = std::fs::canonicalize(root_dir).unwrap();
+
+        let error = data_dir_refusal(&link);
+
+        assert!(
+            error.starts_with(&format!(
+                "Data directory {} belongs to root",
+                resolved.display()
+            )),
+            "{error}"
+        );
+        // `chown -R` does not follow a symlink operand, so the command must
+        // name the resolved directory, never the link.
+        let user = user_name(euid).unwrap_or_else(|| euid.to_string());
+        let chown = format!(
+            "sudo chown -R {} {}",
+            crate::util::shell_escape(std::ffi::OsStr::new(&user)),
+            crate::util::shell_escape(resolved.as_os_str())
+        );
+        assert!(error.contains(&chown), "missing `{chown}`: {error}");
+        assert_copyable(&error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_owned_data_dir_offers_the_chown_only_if_it_is_yours() {
+        use std::os::unix::fs::MetadataExt;
+
+        // A data directory another regular user owns needs root to set up, so
+        // render the refusal from real metadata and a different effective uid.
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data dir");
+        let owner_uid = regular_user_dir(&temp).uid();
+        let euid = owner_uid + 1;
+
+        let error = owner_refusal(&data_dir, owner_uid, euid, OwnedDir::Data);
+
+        let owner = user_name(owner_uid).unwrap_or_else(|| format!("uid {owner_uid}"));
+        let user = user_name(euid).unwrap_or_else(|| format!("uid {euid}"));
+        let chown_to = user_name(euid).unwrap_or_else(|| euid.to_string());
+        assert!(
+            error.starts_with(&format!(
+                "Data directory {} belongs to {owner}, so ZeroClaw, running as {user}, cannot create its config lock directory there.",
+                data_dir.display()
+            )),
+            "{error}"
+        );
+        let chown = format!(
+            "sudo chown -R {} {}",
+            crate::util::shell_escape(std::ffi::OsStr::new(&chown_to)),
+            crate::util::shell_escape(data_dir.as_os_str())
+        );
+        let position = |needle: &str| {
+            error
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing `{needle}`: {error}"))
+        };
+        let run_as_at = position(&format!(
+            "Run ZeroClaw as {owner}, or point data_dir at a directory of your own."
+        ));
+        let yours_at = position("If the directory really is yours");
+        let chown_at = position(&chown);
+        assert!(
+            run_as_at < yours_at && yours_at < chown_at,
+            "running as the owner comes first, the chown only if it is yours: {error}"
+        );
+        assert!(
+            !error.contains("config-lifecycle.lock"),
+            "the lifecycle contents do not describe a data directory: {error}"
+        );
+        assert_sentence_follows(&error, &chown);
+        assert!(error.contains("If chown has no effect"), "{error}");
+        assert_copyable(&error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_owned_data_dir_under_sudo_says_run_without_sudo() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let owner_uid = regular_user_dir(&temp).uid();
+        let owner = user_name(owner_uid).unwrap_or_else(|| format!("uid {owner_uid}"));
+
+        let error = owner_refusal(&data_dir, owner_uid, 0, OwnedDir::Data);
+
+        assert_eq!(
+            error,
+            format!(
+                "Data directory {} belongs to {owner}, but ZeroClaw is running as root. Run ZeroClaw as {owner}, without sudo.",
+                data_dir.display()
+            )
+        );
+        assert_copyable(&error);
     }
 
     #[test]
@@ -1868,6 +2680,7 @@ mod tests {
 
     #[tokio::test]
     async fn generation_drain_retains_process_ownership_until_cleanup_finishes() {
+        let _no_spawn = SPAWN_VS_LOCK_REACQUIRE.read().await;
         let temp = tempfile::TempDir::new().unwrap();
         let config = Config {
             data_dir: temp.path().to_path_buf(),
@@ -1902,6 +2715,7 @@ mod tests {
 
     #[test]
     fn execution_capability_retains_process_ownership_after_authority_drop() {
+        let _no_spawn = SPAWN_VS_LOCK_REACQUIRE.blocking_read();
         let temp = tempfile::TempDir::new().unwrap();
         let config = Config {
             data_dir: temp.path().to_path_buf(),
@@ -1994,6 +2808,7 @@ mod tests {
 
     #[tokio::test]
     async fn reload_transfers_process_ownership_without_release() {
+        let _no_spawn = SPAWN_VS_LOCK_REACQUIRE.read().await;
         let temp = tempfile::TempDir::new().unwrap();
         let config = Config {
             data_dir: temp.path().to_path_buf(),
@@ -2027,5 +2842,136 @@ mod tests {
         assert!(next.agent_lifecycle().reserve_turn("alpha").is_ok());
         drop(next);
         assert!(ConfigOwnershipGuard::acquire(temp.path()).is_ok());
+    }
+
+    fn store_with_running_turn(
+        data_dir: &Path,
+    ) -> Arc<dyn zeroclaw_infra::session_backend::SessionBackend> {
+        use zeroclaw_api::model_provider::ChatMessage;
+        let backend = zeroclaw_infra::make_session_backend(data_dir, "sqlite").unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .set_session_state("s1", "running", Some("turn-1"))
+            .unwrap();
+        backend
+    }
+
+    fn owned_config(data_dir: &Path) -> Config {
+        Config {
+            data_dir: data_dir.to_path_buf(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn fresh_owner_settles_turns_a_killed_process_left_running() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // The previous process: it marked a turn running and never came back.
+        drop(store_with_running_turn(temp.path()));
+
+        let authority = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+
+        let store = zeroclaw_infra::make_session_backend(temp.path(), "sqlite").unwrap();
+        assert!(store.list_running_sessions().is_empty());
+        let state = store.get_session_state("s1").unwrap().unwrap();
+        assert_eq!(state.state, "error");
+        assert_eq!(state.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(store.load("s1").len(), 1, "the session's history is kept");
+        drop(authority);
+    }
+
+    #[test]
+    fn process_refused_ownership_settles_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let owner = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+        // The owner is running this turn right now.
+        let store = store_with_running_turn(temp.path());
+
+        assert!(LiveConfigAuthority::new_owned(owned_config(temp.path())).is_err());
+
+        assert_eq!(store.list_running_sessions().len(), 1);
+        assert_eq!(
+            store.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn reload_leaves_live_turns_running() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let authority = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+        // A turn this process started after it took ownership, still
+        // draining while the daemon reloads.
+        let store = store_with_running_turn(temp.path());
+
+        authority.close_agent_lifecycle();
+        authority.drain_agent_lifecycle_retaining_ownership().await;
+        let guard = authority
+            .take_process_ownership()
+            .expect("reload drain retains ownership for transfer");
+        // The next generation starts up exactly as the first one did.
+        assert_eq!(guard.recover_abandoned_turns().unwrap(), 0);
+        let next = LiveConfigAuthority::new_with_ownership(owned_config(temp.path()), guard);
+
+        assert_eq!(
+            store.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
+        drop(next);
+    }
+
+    #[test]
+    fn taking_ownership_again_in_the_same_process_settles_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+        // A turn started under the first acquisition and detached from it:
+        // it is still running when the surface that admitted it is torn
+        // down and started again.
+        let store = store_with_running_turn(temp.path());
+        drop(first);
+
+        let second = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
+
+        assert_eq!(
+            store.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
+        drop(second);
+    }
+
+    /// Run state lives in the SQLite store whichever backend is configured:
+    /// a process started on JSONL can reload onto SQLite later, and must not
+    /// find turns from before it started still marked running.
+    #[test]
+    fn fresh_owner_settles_the_sqlite_store_when_jsonl_is_configured() {
+        let temp = tempfile::TempDir::new().unwrap();
+        drop(store_with_running_turn(temp.path()));
+        let mut config = owned_config(temp.path());
+        config.channels.session_backend = "jsonl".to_string();
+
+        let authority = LiveConfigAuthority::new_owned(config).unwrap();
+
+        let store = zeroclaw_infra::make_session_backend(temp.path(), "sqlite").unwrap();
+        assert!(store.list_running_sessions().is_empty());
+        drop(authority);
+    }
+
+    #[test]
+    fn unreadable_store_does_not_stop_startup_and_the_error_is_returned() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = zeroclaw_infra::session_sqlite::SqliteSessionBackend::db_path(temp.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"not a database").unwrap();
+
+        let guard = ConfigOwnershipGuard::acquire(temp.path()).unwrap();
+        assert!(guard.recover_abandoned_turns().is_err());
+        drop(guard);
+
+        let other = tempfile::TempDir::new().unwrap();
+        let db_path = zeroclaw_infra::session_sqlite::SqliteSessionBackend::db_path(other.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(&db_path, b"not a database").unwrap();
+        assert!(LiveConfigAuthority::new_owned(owned_config(other.path())).is_ok());
     }
 }

@@ -77,6 +77,18 @@ A full process restart also rotates process-local state such as live RPC
 sessions, health snapshots, actor queues, and any ephemeral tool-receipt key.
 Durable stores survive restart according to the table above.
 
+A session's run state (`idle`, `running`, `error`) is one of those durable
+values, and a process that is killed mid-turn cannot clear it. The next
+process to take ownership of the data directory therefore settles it at
+startup, before it admits any turn: every session still marked `running` is
+recorded as `error`, with its turn id and its messages kept. The turn is not
+restarted. This happens once per process. A reload stays in the same process,
+so it leaves the run state of turns still in progress alone, and merely
+opening the session store never changes it. If the store cannot be written at
+that moment, the attempt is logged and not repeated until the next process
+start. Only the SQLite backend tracks run state, and its store is settled
+whenever it exists, whichever backend is configured.
+
 ## Session backend migration
 
 Selecting the SQLite session backend imports legacy `data/sessions/*.jsonl` files when a backend handle is constructed. The importer moves each source to a private `.jsonl.importing` generation while holding the process-local JSONL mutation lock, writes the messages, metadata, and a source-bound import receipt in one SQLite transaction, then retains the source as `.jsonl.migrated` for rollback.

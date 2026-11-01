@@ -12,6 +12,10 @@ use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::model_provider::ChatMessage;
 
+/// How long opening the session store waits on another connection that holds
+/// the database.
+const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
@@ -54,24 +58,86 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
     committed_jsonl_import_receipts_exist(&conn)
 }
 
+/// One statement, so the transition is atomic: every turn still marked
+/// running becomes an error, keeping its turn id.
+const SETTLE_RUNNING_TURNS_SQL: &str = "UPDATE session_metadata \
+     SET state = 'error', turn_started_at = NULL WHERE state = 'running'";
+
 impl SqliteSessionBackend {
+    /// Where the store for `workspace_dir` lives, whether or not it exists.
+    pub fn db_path(workspace_dir: &Path) -> PathBuf {
+        workspace_dir.join("sessions").join("sessions.db")
+    }
+
+    /// Settle every turn left marked "running" in the store under
+    /// `workspace_dir` as "error", in one atomic statement, and return how
+    /// many there were. The turn id stays on the session so a client can
+    /// tell which turn ended, the session's messages are untouched, and
+    /// nothing is restarted. The store is not opened as a backend: none is
+    /// created, and an existing one gets this one statement and nothing
+    /// else (no schema work, no import). A store from before run state was
+    /// tracked has nothing to settle.
+    ///
+    /// A "running" row only says a turn started; it cannot say the process
+    /// that ran it is still alive. Only a process that has just become the
+    /// sole owner of the data directory knows that none is, so only that
+    /// process may call this, once, before it admits any turn of its own:
+    /// the startup path reaches it through `recover_abandoned_session_turns`,
+    /// behind the once-per-process claim. Opening a backend never does it
+    /// implicitly, and no backend handle exposes it.
+    pub fn recover_abandoned_turns_at(workspace_dir: &Path) -> std::io::Result<usize> {
+        let db_path = Self::db_path(workspace_dir);
+        // Only a store that is known to be absent has nothing to settle. One
+        // that cannot be examined is an error for the caller to report.
+        if !db_path.try_exists()? {
+            return Ok(0);
+        }
+        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(std::io::Error::other)?;
+        let tracks_run_state = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('session_metadata') WHERE name = 'state'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .is_some();
+        if !tracks_run_state {
+            return Ok(0);
+        }
+        conn.execute(SETTLE_RUNNING_TURNS_SQL, [])
+            .map_err(std::io::Error::other)
+    }
+
     /// Open or create the sessions database.
+    ///
+    /// A daemon's gateway, channels and RPC plane each open this database
+    /// when they start, so on a fresh data dir their first opens race. The
+    /// switch to WAL is retried while another opener holds the file, and the
+    /// schema and column migration run in one IMMEDIATE transaction: a later
+    /// opener waits for the first and then finds every column in place.
     pub fn new(workspace_dir: &Path) -> Result<Self> {
+        let db_path = Self::db_path(workspace_dir);
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
-        let db_path = sessions_dir.join("sessions.db");
 
-        let conn = Connection::open(&db_path)
+        let mut conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open session DB: {}", db_path.display()))?;
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT)
+            .context("Failed to set the session DB busy timeout")?;
 
+        Self::enable_wal(&conn)?;
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+            "PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 4194304;",
         )?;
 
-        conn.execute_batch(
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to lock the session DB for schema setup")?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_key TEXT NOT NULL,
@@ -158,7 +224,7 @@ impl SqliteSessionBackend {
                 "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
             ),
         ] {
-            Self::ensure_metadata_column(&conn, column, ddl)?;
+            Self::ensure_metadata_column(&tx, column, ddl)?;
         }
         for (index, ddl) in [
             (
@@ -187,13 +253,41 @@ impl SqliteSessionBackend {
                  ON session_metadata(principal_id)",
             ),
         ] {
-            conn.execute(ddl, [])
+            tx.execute(ddl, [])
                 .with_context(|| format!("Failed to create session index {index}"))?;
         }
+        tx.commit().context("Failed to commit the session schema")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Switch the database to WAL, retrying while another connection holds it.
+    ///
+    /// A second first-time opener of a fresh file can get `SQLITE_BUSY` from
+    /// the journal-mode change at once: SQLite skips the busy handler where
+    /// waiting could deadlock, so the busy timeout alone does not cover it.
+    fn enable_wal(conn: &Connection) -> Result<()> {
+        let deadline = std::time::Instant::now() + OPEN_BUSY_TIMEOUT;
+        let mut pause = std::time::Duration::from_millis(5);
+        loop {
+            match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(_) => return Ok(()),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(100));
+                }
+                Err(error) => {
+                    return Err(error).context("Failed to switch the session DB to WAL");
+                }
+            }
+        }
     }
 
     fn ensure_metadata_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {
@@ -2821,6 +2915,40 @@ mod tests {
         assert!(err.to_string().contains("idx_session_metadata_agent_alias"));
     }
 
+    /// A daemon's gateway, channels and RPC plane open the store together
+    /// when it starts. On a fresh data dir every one of them must get a
+    /// working store, not a lost `ALTER` race or a busy journal-mode switch.
+    #[test]
+    fn concurrent_first_openers_of_a_fresh_store_all_succeed() {
+        const TRIALS: usize = 40;
+        const OPENERS: usize = 4;
+        for trial in 0..TRIALS {
+            let tmp = TempDir::new().unwrap();
+            let start = Arc::new(std::sync::Barrier::new(OPENERS));
+            let openers: Vec<_> = (0..OPENERS)
+                .map(|opener| {
+                    let (dir, start) = (tmp.path().to_path_buf(), Arc::clone(&start));
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let backend = SqliteSessionBackend::new(&dir).map_err(|error| {
+                            format!("trial {trial}, opener {opener}: {error:#}")
+                        })?;
+                        backend
+                            .append(&format!("opener-{opener}"), &ChatMessage::user("hello"))
+                            .map_err(|error| {
+                                format!("trial {trial}, opener {opener} append: {error:#}")
+                            })
+                    })
+                })
+                .collect();
+            for opener in openers {
+                opener.join().unwrap().unwrap();
+            }
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            assert_eq!(backend.list_sessions().len(), OPENERS);
+        }
+    }
+
     #[test]
     fn set_session_name_persists() {
         let tmp = TempDir::new().unwrap();
@@ -2909,6 +3037,129 @@ mod tests {
         let state = backend.get_session_state("s1").unwrap().unwrap();
         assert_eq!(state.state, "error");
         assert_eq!(state.turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn recovery_settles_running_turns_and_nothing_else() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        for key in ["abandoned", "finished", "failed"] {
+            backend.append(key, &ChatMessage::user("hello")).unwrap();
+            backend
+                .append(key, &ChatMessage::assistant("half an answer"))
+                .unwrap();
+        }
+        backend
+            .set_session_state("abandoned", "running", Some("turn-a"))
+            .unwrap();
+        backend.set_session_state("finished", "idle", None).unwrap();
+        backend
+            .set_session_state("failed", "error", Some("turn-f"))
+            .unwrap();
+
+        assert_eq!(
+            SqliteSessionBackend::recover_abandoned_turns_at(tmp.path()).unwrap(),
+            1
+        );
+
+        let abandoned = backend.get_session_state("abandoned").unwrap().unwrap();
+        assert_eq!(abandoned.state, "error");
+        assert_eq!(abandoned.turn_id.as_deref(), Some("turn-a"));
+        assert!(abandoned.turn_started_at.is_none());
+        assert_eq!(backend.load("abandoned").len(), 2, "history is kept");
+        assert_eq!(
+            backend
+                .get_session_state("finished")
+                .unwrap()
+                .unwrap()
+                .state,
+            "idle"
+        );
+        let failed = backend.get_session_state("failed").unwrap().unwrap();
+        assert_eq!(failed.state, "error");
+        assert_eq!(failed.turn_id.as_deref(), Some("turn-f"));
+        assert!(backend.list_running_sessions().is_empty());
+        assert_eq!(
+            SqliteSessionBackend::recover_abandoned_turns_at(tmp.path()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recovery_leaves_a_store_without_run_state_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = SqliteSessionBackend::db_path(tmp.path());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        // A store written before run state existed.
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE session_metadata (
+                    session_key TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    last_activity TEXT NOT NULL,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    name TEXT
+                 );",
+            )
+            .unwrap();
+
+        assert_eq!(
+            SqliteSessionBackend::recover_abandoned_turns_at(tmp.path()).unwrap(),
+            0
+        );
+        let columns: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_metadata')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 5, "recovery must not migrate the store");
+    }
+
+    /// A store that cannot be examined is not the same as no store: the
+    /// caller must hear about it.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_reports_a_store_it_cannot_examine() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(sessions_dir.join("sessions.db"), b"").unwrap();
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads through any mode; the check cannot fail for it.
+        let unreadable = std::fs::read_dir(&sessions_dir).is_err();
+
+        let result = SqliteSessionBackend::recover_abandoned_turns_at(tmp.path());
+
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if unreadable {
+            assert!(result.is_err(), "got {result:?}");
+        }
+    }
+
+    #[test]
+    fn opening_the_store_does_not_settle_running_turns() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .set_session_state("s1", "running", Some("turn-1"))
+            .unwrap();
+
+        // A second handle on the same store, as every component that opens
+        // it gets, while the first is still in use.
+        let second = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(second.list_running_sessions().len(), 1);
+        drop(backend);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.get_session_state("s1").unwrap().unwrap().state,
+            "running"
+        );
     }
 
     #[test]

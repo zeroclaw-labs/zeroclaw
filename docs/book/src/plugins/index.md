@@ -133,6 +133,14 @@ because verifying compiles and instantiates every component. A skill bundle
 ships no component, so it is reported as not applicable rather than as a
 failure.
 
+For a tool plugin whose component instantiates, both commands also apply the
+check the runtime makes on the tool's configuration before it registers the
+tool. `plugin remove` keeps the package's `[[plugins.entries]]` row and its
+values, so a reinstall can meet values its manifest does not accept: any value
+at all when the new package declares no `config_schema`. The runtime skips such
+a tool, so the verdict is that it does not load, with the runtime's reason and
+the row that holds the values.
+
 ### Recovering an incomplete installation
 
 `zeroclaw plugin install` builds a package in a unique hidden transaction
@@ -155,9 +163,11 @@ unlink, or the transaction entry if its package is absent or was already removed
 The message does not claim the original payload is still intact. Cleanup checks
 treat a replaced or removed plugins root or coordination lock as a namespace
 refusal before continuing. The reported hidden transaction belongs to this failed
-install and does not block a later one: `plugin remove` does not sweep it while no
-package of that name exists, so once no install is running you may inspect and
-delete that specific transaction by hand.
+install and does not block a later one. The next `plugin install` of that name
+removes it once no process holds its lease and whatever stopped the cleanup is
+resolved. `plugin remove` does not sweep it while no package of that name exists,
+so to clear it without installing, inspect and delete that specific transaction
+by hand once no install is running.
 
 Earlier builds wrote straight into the final directory, creating it and then
 writing `manifest.toml` first, so an interrupted install could leave an empty
@@ -166,6 +176,28 @@ Discovery skips such a directory, so it is not an installed package, yet it
 still holds the name. `zeroclaw plugin install` never overwrites anything
 already at a package name: it refuses and names
 `zeroclaw plugin remove <name>` as the recovery.
+
+For a package the host has loaded, `plugin remove` deletes the directory the
+package was loaded from, which need not carry the package's name, for example
+after a manual move. It claims that directory in a hidden recovery transaction,
+checks that it still holds the manifest and component the host loaded, and
+deletes it through the claim. A directory that only sits at the package's name
+is not touched. A package replaced on disk since the host loaded it is put back
+and the remove is refused. Like recovery, this needs the atomic no-replace move
+described above, and refuses where the platform or filesystem cannot provide
+one.
+
+A remove that stops after claiming the directory but before deleting it, or
+that cannot put back a directory that changed since it was loaded (it reports
+the retained files), leaves what it claimed in a hidden recovery transaction
+that records only the package name. The next `plugin remove <name>` puts that
+back at `<plugins_dir>/<name>`, not in the directory it was loaded from, and
+refuses for as long as something else occupies `<name>`. To finish, move
+whatever is at `<name>` aside and run `zeroclaw plugin remove <name>` twice:
+the first run puts the package back at `<name>` and leaves it there, because
+the host did not load it from there, and the second run removes it. Then move
+the other directory back if you still need it. A delete that had already begun
+is finished by the next remove instead.
 
 For a name the host has not loaded, `plugin remove` claims the selected
 directory generation in a hidden recovery transaction and applies the same
@@ -192,7 +224,13 @@ retained, and the command reports their paths. A PID in a filename does not
 prove abandonment. These retained stages do not prevent a fresh install after
 the incomplete final package is recovered. If no final package exists,
 `plugin remove` does not sweep staging directories, unless it finishes a
-delete that an earlier `plugin remove` had begun.
+delete that an earlier `plugin remove` had begun. An install stopped before it
+published its package leaves only such a stage, and the next `plugin install`
+of that name clears it before staging its own. Active and legacy stages are
+left as they are. An install whose source is inside one of that name's stages,
+such as the staged copy a failed install reports keeping, is refused before
+anything is cleared, whatever path names the source. To install that copy,
+copy the package out of the stage first and install from the copy.
 
 Other occupants are refused, and the command prints why: a symlink or a
 file at the name, a directory that holds files but no `manifest.toml`, one
@@ -363,6 +401,15 @@ channel guest code; unknown, malformed, or out-of-range values fail instead of
 reaching the plugin. Memory plugins do not yet have a config import and must
 not request `config_read` until that ABI is added.
 
+Every value in an instance's `config` map is encrypted at rest, whatever the
+schema says. `zeroclaw config set plugins.entries.<key>.config.<name>` asks for
+an `x-secret` value with masked input and, unless `--no-interactive` is given,
+does not take one from the command line. A property the installed package
+declares without `x-secret` takes the value given on the command line, or
+prompts with echo when none is given. A name `config set` cannot match to an
+installed package's schema, for example on a row whose package is not installed,
+is treated as secret.
+
 Tool and channel components can request `state_read` and/or `state_write` for
 the `state` import. The host, not the guest, supplies the admitted package,
 capability, and binding namespace. Portable logical keys address authenticated
@@ -463,7 +510,11 @@ state on the command line, as described in
 
 - For a row it **creates**, it seeds the declaration into `egress_hosts`,
   prints each destination it granted, and prints the `zeroclaw config set`
-  command that edits the grant later.
+  command that edits the grant later. A declaration counts only when the
+  manifest requests a transport that can use it: `http_client`,
+  `websocket_client`, or `socket_client`. A declaration without one is not
+  seeded, and a later version that adds a transport meets the existing row,
+  which is never extended.
 - For a row that **already exists** (an upgrade, a reinstall, or a row you
   authored), it changes nothing. It prints the difference instead: destinations
   the manifest declares that the row does not grant, destinations the row
@@ -530,9 +581,9 @@ expands inside its double quotes, and a single quote is an ordinary character
 there), so it is never trusted with one.
 
 `zeroclaw plugin list` repeats the same comparison as a standing diagnostic,
-one instance at a time: the default tool binding of every installed tool plugin
-holding `http_client`, and every bound channel alias whose package holds
-`http_client`, `websocket_client`, or `socket_client`, printed as
+one instance at a time, for every installed plugin holding `http_client`,
+`websocket_client`, or `socket_client`: a tool plugin's default tool binding,
+printed as the package name, and every bound channel alias, printed as
 `package (plugin.<alias>)`. For each, one line names the destinations it
 declares that its row does not grant, since requests there are denied, plus the
 command that closes the gap; for an instance with no row yet, that command
@@ -540,14 +591,13 @@ creates the row with the grant. A channel instance with no row yet whose alias
 the config alias grammar rejects, such as a hand-written
 `[channels.plugin.ops-team]`, gets the grammar's reason and the table to rename
 instead, since the command that creates the row validates the whole
-configuration and would refuse that alias. A channel instance counts every
-transport the egress authority governs because a channel that speaks only over
+configuration and would refuse that alias. Every instance counts every
+transport the egress authority governs because a plugin that speaks only over
 a socket or a WebSocket, such as IRC or MQTT, would otherwise never be
-reported; a tool row keeps the `http_client` rule it shipped with. The reverse
-is never flagged. A grant with no matching declaration is a first-class path,
-not a finding: the plugin whose destination is deployment configuration (a
-self-hosted Gitea, a LAN Nextcloud) cannot have that host declared by its
-author, so you author it.
+reported. The reverse is never flagged. A grant with no matching declaration
+is a first-class path, not a finding: the plugin whose destination is
+deployment configuration (a self-hosted Gitea, a LAN Nextcloud) cannot have
+that host declared by its author, so you author it.
 
 When the instance's row still carries a pre-1.0 key (a package name rather than
 the `zpi1_…` key), `plugin list` always prints the rename described above,
@@ -752,8 +802,8 @@ still apply:
 
 - **Declaration versus grant.** Quickstart shows you the manifest's `[egress]`
   declaration, which grants nothing by itself. Whenever it creates a row for a
-  package whose manifest requests `http_client` and declares destinations, the
-  only declaration a created row is seeded with, you choose whether the new
+  package whose manifest requests a network transport and declares destinations,
+  the only declaration a created row is seeded with, you choose whether the new
   row grants them, whether the package is new or was already installed
   without its row. The question starts on installing without network access,
   which leaves `egress_hosts` empty and prints the command that grants the
@@ -764,8 +814,8 @@ still apply:
   Quickstart prints to create a missing row never grants network access; a
   grant is always a command of its own. The `plugin install --no-verify`
   command Quickstart prints for a plugin that fails the load check is the
-  plugin CLI's install, which, as always, seeds a row it creates with the
-  destinations the manifest declares for `http_client`.
+  plugin CLI's install, which seeds a row it creates with the destinations the
+  manifest declares for `http_client`, `websocket_client`, or `socket_client`.
 - **An existing row is never extended.** When the instance's
   `[[plugins.entries]]` row already exists, Quickstart leaves its
   `egress_hosts`, `egress_allow_private`, and settings exactly as they are. It
