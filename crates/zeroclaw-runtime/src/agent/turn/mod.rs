@@ -19,6 +19,7 @@ pub(crate) mod progress;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
+pub(crate) mod repetition;
 pub(crate) mod results_collect;
 pub(crate) mod steering;
 pub(crate) mod stream_consume;
@@ -1726,19 +1727,30 @@ pub(crate) enum InitialIngressSubject<'a> {
 
 /// `reported_usage` is the last provider-reported usage from a run that
 /// yielded with `SteeringPending`, so the resumed run calibrates its first
-/// dispatch exactly as the yielded run would have.
+/// dispatch exactly as the yielded run would have. Agent owns the repetition
+/// guard for its API turn, including steering/model-switch reentry.
 pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     p: ToolLoop<'a>,
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage)
+    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard)
+}
+
+/// Non-streamed Agent turns own the guard without steering ingress.
+/// Low-level and nested SOP callers use the public wrapper without a guard.
+pub(crate) fn run_tool_call_loop_with_guard<'a>(
+    p: ToolLoop<'a>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    run_tool_call_loop_impl(p, None, None, repetition_guard)
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
 ) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None)
+    run_tool_call_loop_impl(p, None, None, None)
 }
 
 /// Evidence created by this invocation's structured tool lifecycle, never by
@@ -1896,6 +1908,7 @@ fn run_tool_call_loop_impl<'a>(
     p: ToolLoop<'a>,
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
     // A concrete Send return breaks the live-SOP recursive opaque-future
     // inference boundary. Everything, including task-local reads, remains on
@@ -1907,8 +1920,14 @@ fn run_tool_call_loop_impl<'a>(
                 .try_with(Option::is_some)
                 .unwrap_or(false);
         let mut phase = checked.then_some(GoalToolPhase::NoTools);
-        let result =
-            run_tool_call_loop_body(p, initial_ingress, seed_reported_usage, &mut phase).await;
+        let result = run_tool_call_loop_body(
+            p,
+            initial_ingress,
+            seed_reported_usage,
+            repetition_guard,
+            &mut phase,
+        )
+        .await;
         finish_goal_tool_phase(result, participating, phase)
     })
 }
@@ -2229,6 +2248,7 @@ async fn run_tool_call_loop_body<'a>(
     mut p: ToolLoop<'a>,
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
     goal_phase: &mut Option<GoalToolPhase>,
 ) -> Result<String> {
     let model_switch_state = p
@@ -2433,10 +2453,17 @@ async fn run_tool_call_loop_body<'a>(
         .collect();
     let mut consecutive_identical_outputs: usize = 0;
     let mut last_tool_output_hash: Option<u64> = None;
-
+    let mut warned_call = repetition_guard
+        .filter(|_| pacing.loop_detection_enabled)
+        .and_then(|guard| {
+            guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recovery_call_hash()
+        });
     let mut loop_detector = crate::agent::loop_detector::LoopDetector::new(
         crate::agent::loop_detector::LoopDetectorConfig {
-            enabled: pacing.loop_detection_enabled,
+            enabled: pacing.loop_detection_enabled && repetition_guard.is_none(),
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
             no_progress_min_calls: pacing.loop_detection_no_progress_min_calls,
@@ -3921,9 +3948,9 @@ async fn run_tool_call_loop_body<'a>(
         }
         let PreparedToolCalls {
             mut ordered_results,
-            executable_indices,
-            executable_calls,
-            stream_calls,
+            mut executable_indices,
+            mut executable_calls,
+            mut stream_calls,
         } = prepare_tool_calls(
             &ctx,
             tools_registry,
@@ -3975,7 +4002,8 @@ async fn run_tool_call_loop_body<'a>(
             }
             // Preparation owns rewrite/denial identities and generated IDs for
             // id-less protocols. Bind those actual facts to the original slot;
-            // never infer them later from flat provider history.
+            // never infer them later from flat provider history or only the
+            // executable subset retained by repetition recovery below.
             let mut identities: Vec<_> = tool_calls
                 .iter()
                 .map(|call| (call.name.clone(), call.tool_call_id.clone()))
@@ -4008,6 +4036,79 @@ async fn run_tool_call_loop_body<'a>(
                 identities[*idx] = (call.name.clone(), call.tool_call_id.clone());
             }
             expected_result_identities = Some(identities);
+        }
+
+        // Hooks and approvals have resolved the effective call. Admit one
+        // recovery dispatch for the warned identity; record the remaining
+        // identical requests as synthetic pairs rather than executing them.
+        if let Some(warned_call) = warned_call {
+            let mut recovery_admitted = false;
+            let dispatch = ToolDispatchContext {
+                tools_registry,
+                activated_tools,
+                excluded_tools,
+                model_switch_callback: model_switch_callback.as_ref(),
+            };
+            let mut retained_indices = Vec::new();
+            let mut retained_calls = Vec::new();
+            let mut retained_stream_calls = Vec::new();
+            for ((call_idx, call), stream_call) in executable_indices
+                .drain(..)
+                .zip(executable_calls.drain(..))
+                .zip(stream_calls.drain(..))
+            {
+                let recovery =
+                    crate::agent::tool_execution::dispatch_tool_name(&call.name, dispatch)
+                        .is_some_and(|name| {
+                            repetition::call_signature(&name, &call.arguments) == warned_call
+                        });
+                if recovery && recovery_admitted {
+                    call_prep::abandon_unexecuted_prepared_contexts(
+                        &ctx,
+                        iteration,
+                        &[call_idx],
+                        std::slice::from_ref(&call),
+                        &[],
+                    )
+                    .await;
+                    let outcome = crate::agent::tool_execution::ToolExecutionOutcome {
+                        output: crate::i18n::get_required_cli_string(
+                            "turn-repeated-failure-retry-skipped",
+                        ),
+                        output_data: None,
+                        success: false,
+                        error_reason: None,
+                        terminal_error: None,
+                        duration: std::time::Duration::ZERO,
+                        receipt: None,
+                        attachments: Vec::new(),
+                    };
+                    if let Some(tx) = ctx.event_tx {
+                        events::emit_tool_call_pair(tx, &call, &outcome).await;
+                    }
+                    if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call) {
+                        let _ = tx
+                            .send(StreamDelta::ToolComplete {
+                                tool: call.name.clone(),
+                                arguments: stream_call.arguments,
+                                tool_provenance: stream_call.tool_provenance,
+                                secs: 0,
+                                success: false,
+                                error: Some(outcome.output.clone()),
+                            })
+                            .await;
+                    }
+                    ordered_results[call_idx] = Some((call.name, call.tool_call_id, outcome));
+                } else {
+                    recovery_admitted |= recovery;
+                    retained_indices.push(call_idx);
+                    retained_calls.push(call);
+                    retained_stream_calls.push(stream_call);
+                }
+            }
+            executable_indices = retained_indices;
+            executable_calls = retained_calls;
+            stream_calls = retained_stream_calls;
         }
 
         // Hooks and preparation may rewrite tool names or arguments. Decide
@@ -4110,23 +4211,44 @@ async fn run_tool_call_loop_body<'a>(
                 .zip(executable_calls.iter())
                 .zip(stream_calls),
         ) {
-            if let Some(mut outcome) = slot {
-                if let Some(error) = outcome.terminal_error.take() {
+            if let Some(mut completed) = slot {
+                if let Some(error) = completed.outcome.terminal_error.take() {
                     child_terminal_error.get_or_insert(error);
                 }
                 executed_completed_indices.push(call_idx);
                 executed_completed_calls.push(call.clone());
                 executed_completed_stream_calls.push(stream_call);
-                executed_completed_outcomes.push(outcome);
+                executed_completed_outcomes.push(completed);
             }
         }
+
+        let repetition_disposition = if let Some(guard) = repetition_guard.filter(|_| {
+            pacing.loop_detection_enabled && !cancelled_mid_batch && child_terminal_error.is_none()
+        }) {
+            let mut guard = guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let disposition = guard.observe_round(
+                &executed_completed_calls,
+                &executed_completed_outcomes,
+                &loop_ignore_tools,
+                pacing.loop_detection_max_repeats,
+            );
+            warned_call = guard.recovery_call_hash();
+            disposition
+        } else {
+            repetition::RepetitionDisposition::default()
+        };
 
         record_executed_outcomes(
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
             &executed_completed_stream_calls,
-            executed_completed_outcomes,
+            executed_completed_outcomes
+                .into_iter()
+                .map(|completed| completed.outcome)
+                .collect(),
             &mut ordered_results,
             iteration,
         )
@@ -4289,6 +4411,7 @@ async fn run_tool_call_loop_body<'a>(
 
         if !cancelled_mid_batch
             && child_terminal_error.is_none()
+            && repetition_guard.is_none()
             && let Err(error) = check_identical_output_abort(
                 &detection_relevant_output,
                 loop_started_at,
@@ -4334,6 +4457,33 @@ async fn run_tool_call_loop_body<'a>(
         }
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
+        }
+
+        if let Some(key) = repetition_disposition.message_key {
+            if cancellation_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err(ToolLoopCancelled.into());
+            }
+            let reason = crate::i18n::get_required_cli_string(key);
+            let visible_reason = format!("{reason}\n\n");
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &visible_reason).await;
+            if let Some(ref tx) = on_delta {
+                events::stream_text_posthoc_chunks(
+                    tx,
+                    &visible_reason,
+                    cancellation_token.as_ref(),
+                )
+                .await?;
+            }
+            accumulated_display_text.push_str(&visible_reason);
+            if repetition_disposition.close {
+                turn_state.push_dual(ChatMessage::assistant(reason));
+                *history_has_trim_breadcrumb = turn_state.crumb_present;
+                return Ok(accumulated_display_text);
+            }
+            turn_state.push_dual(ChatMessage::system(reason));
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
@@ -11051,6 +11201,9 @@ mod tool_lifecycle_abandonment_tests {
             image_cache,
             None,
             None,
+            None,
+            None,
+            None,
         )
         .await
     }
@@ -11070,65 +11223,77 @@ mod tool_lifecycle_abandonment_tests {
         image_cache: Option<ToolLoopImageState<'_>>,
         event_tx: Option<tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
         new_messages_out: Option<&mut Vec<ChatMessage>>,
+        repetition_guard: Option<&Mutex<repetition::RepetitionGuard>>,
+        receipts: Option<&crate::agent::tool_receipts::ReceiptScope>,
+        activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
     ) -> anyhow::Result<String> {
         let mut crumb_present = false;
         let mut injected_preamble = None;
-        run_tool_call_loop(ToolLoop {
-            parent_agent_alias: None,
-            sop_reassembly: None,
-            exec: ResolvedAgentExecution {
-                model_access: ResolvedModelAccess {
-                    model_provider: provider,
-                    provider_name: "scripted",
-                    model: "scripted-model",
-                    dispatch_model: "scripted-model",
-                    temperature: Some(0.0),
+        // The configured guard fixture must reach recovery admission rather
+        // than having the independent legacy deduplicator suppress its calls.
+        let knobs = LoopKnobs {
+            dedup_enabled: repetition_guard.is_none(),
+            ..Default::default()
+        };
+        run_tool_call_loop_with_guard(
+            ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: provider,
+                        provider_name: "scripted",
+                        model: "scripted-model",
+                        dispatch_model: "scripted-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry,
+                    observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools,
+                    model_switch_callback: None,
+                    pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools,
+                    max_tool_result_chars: 0,
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                        context_token_budget,
+                        ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
+                    },
+                    context_limits_resolver: None,
+                    receipt_generator: receipts.map(|scope| scope.generator()),
+                    knobs: &knobs,
+                    security: None,
                 },
-                tools_registry,
-                observer,
-                silent: true,
-                approval: None,
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
-                max_tool_iterations: 3,
-                hooks,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing,
-                strict_tool_parsing: false,
-                parallel_tools,
-                max_tool_result_chars: 0,
-                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
-                    context_token_budget,
-                    ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
-                },
-                context_limits_resolver: None,
-                receipt_generator: None,
-                knobs: &LoopKnobs::default(),
-                security: None,
+                history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut injected_preamble,
+                channel_name: "cli",
+                channel_reply_target: None,
+                cancellation_token,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: receipts.map(|scope| scope.collector()),
+                event_tx,
+                steering: None,
+                new_messages_out,
+                image_cache,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id,
+                served_route_sink: None,
             },
-            history,
-            history_has_trim_breadcrumb: &mut crumb_present,
-            injected_memory_preamble: &mut injected_preamble,
-            channel_name: "cli",
-            channel_reply_target: None,
-            cancellation_token,
-            on_delta: None,
-            shared_budget: None,
-            channel: None,
-            collected_receipts: None,
-            event_tx,
-            steering: None,
-            new_messages_out,
-            image_cache,
-            memory: None,
-            ingress: IngressContext::sub_turn(),
-            agent_alias: None,
-            turn_id,
-            served_route_sink: None,
-        })
+            repetition_guard,
+        )
         .await
     }
 
@@ -11289,6 +11454,741 @@ mod tool_lifecycle_abandonment_tests {
                 ..Default::default()
             }),
             reasoning_content: None,
+        }
+    }
+
+    /// Records the next provider input without replacing the real loop,
+    /// preparation, accounting, or history owners under test.
+    struct RecordingScriptedProvider {
+        inner: ScriptedProvider,
+        prompt: bool,
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+    impl zeroclaw_api::attribution::Attributable for RecordingScriptedProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Attributable::role(&self.inner)
+        }
+        fn alias(&self) -> &str {
+            zeroclaw_api::attribution::Attributable::alias(&self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RecordingScriptedProvider {
+        fn supports_native_tools(&self) -> bool {
+            !self.prompt
+        }
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<String> {
+            self.inner
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            self.inner.chat(request, model, temperature).await
+        }
+    }
+
+    fn recovery_response(prompt: bool, calls: Vec<ToolCall>) -> ChatResponse {
+        if !prompt || calls.is_empty() {
+            return phase_response(calls);
+        }
+        let text = calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "<tool_call>{}</tool_call>",
+                    serde_json::json!({
+                        "name": call.name,
+                        "arguments": serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            .unwrap(),
+                    })
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut response = phase_response(Vec::new());
+        response.text = Some(text);
+        response
+    }
+
+    struct RecoveryRewrite(Arc<crate::cost::CostTracker>);
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for RecoveryRewrite {
+        fn name(&self) -> &str {
+            "recovery-rewrite"
+        }
+        async fn before_tool_call(
+            &self,
+            name: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            if name == "rewrite_echo" {
+                // Model concurrent ordinary spending after the second request
+                // is admitted. The next request must hit the real daily gate,
+                // not a fabricated provider/accountant refusal.
+                self.0
+                    .record_usage(crate::cost::types::TokenUsage::new(
+                        "fixture/ordinary",
+                        1_000_000,
+                        0,
+                        0,
+                        2.0,
+                        0.0,
+                        0.0,
+                    ))
+                    .unwrap();
+                crate::hooks::HookResult::Continue(("echo".into(), args))
+            } else {
+                crate::hooks::HookResult::Continue((name, args))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_upstream_recovery_keeps_full_rewritten_denied_and_idless_slots() {
+        for prompt in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: true,
+                        daily_limit_usd: 1.0,
+                        monthly_limit_usd: 100.0,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            );
+            let cost_context = crate::agent::cost::ToolLoopCostTrackingContext::new(
+                tracker.clone(),
+                Arc::new(crate::agent::cost::ModelProviderPricing::new()),
+            );
+            let provider = RecordingScriptedProvider {
+                inner: ScriptedProvider {
+                    responses: Mutex::new(vec![
+                        recovery_response(
+                            prompt,
+                            vec![tool_call("warning", "fail", serde_json::json!({}))],
+                        ),
+                        recovery_response(
+                            prompt,
+                            vec![
+                                tool_call("retry", "fail", serde_json::json!({})),
+                                tool_call("skip", "fail", serde_json::json!({})),
+                                tool_call("rewrite", "rewrite_echo", serde_json::json!({"n": 7})),
+                                tool_call("denied", "denied", serde_json::json!({})),
+                            ],
+                        ),
+                        phase_response(Vec::new()),
+                    ]),
+                },
+                prompt,
+                requests: Mutex::new(Vec::new()),
+            };
+            let registry = registry_with(vec![
+                Box::new(FailingTool {
+                    name: "fail".into(),
+                }),
+                Box::new(EchoTool {
+                    name: "echo".into(),
+                }),
+                Box::new(EchoTool {
+                    name: "rewrite_echo".into(),
+                }),
+                Box::new(EchoTool {
+                    name: "denied".into(),
+                }),
+            ]);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut hooks = lifecycle_runner(events.clone(), vec!["denied".into()]);
+            hooks.register(Box::new(RecoveryRewrite(tracker)));
+            let pacing = zeroclaw_config::schema::PacingConfig {
+                loop_detection_enabled: true,
+                loop_detection_max_repeats: 1,
+                ..Default::default()
+            };
+            let guard = Mutex::new(repetition::RepetitionGuard::default());
+            let sink = crate::sop::executor::new_step_call_sink();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let mut history = vec![ChatMessage::user("opaque {\"tool_calls\":[1,2]} text")];
+            let error = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    Some(cost_context),
+                    scope_goal_phase_fixture(crate::sop::executor::scope_step_call_sink(
+                        sink.clone(),
+                        run_scripted_loop_observed(
+                            &provider,
+                            &registry,
+                            &NoopObserver,
+                            Some(&hooks),
+                            &pacing,
+                            "upstream-slots",
+                            true,
+                            None,
+                            &mut history,
+                            0,
+                            None,
+                            Some(tx),
+                            None,
+                            Some(&guard),
+                            None,
+                            None,
+                        ),
+                    )),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<zeroclaw_goal::accounting::GoalOrdinarySpendRefusal>()
+                    .unwrap()
+                    .clean_tool_phase(),
+                "all original slots were paired before refusal"
+            );
+            assert_eq!(provider.requests.lock().unwrap().len(), 2);
+            assert_eq!(provider.inner.responses.lock().unwrap().len(), 1);
+            let mut started = HashSet::new();
+            let mut finished = HashSet::new();
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    zeroclaw_api::agent::TurnEvent::ToolCall { id, .. } => {
+                        assert!(started.insert(id), "no duplicate call event");
+                    }
+                    zeroclaw_api::agent::TurnEvent::ToolResult { id, .. } => {
+                        assert!(finished.insert(id), "no duplicate result event");
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(started.len(), 5);
+            assert_eq!(
+                started, finished,
+                "native and generated IDs each close exactly one pair"
+            );
+            assert!(
+                !guard.lock().unwrap().is_exhausted(),
+                "useful sibling work recovers the turn"
+            );
+            let calls = crate::sop::executor::drain_step_calls(&sink);
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call.tool.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["fail", "fail", "echo"]
+            );
+            let events = events.lock().unwrap();
+            for terminal in [
+                "abandoned:fail:upstream-slots:1:1",
+                "abandoned:denied:upstream-slots:1:3",
+                "after:fail:upstream-slots:1:0",
+                "after:echo:upstream-slots:1:2",
+            ] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.as_str() == terminal)
+                        .count(),
+                    1
+                );
+            }
+            let original_user = "opaque {\"tool_calls\":[1,2]} text";
+            let first_non_system = history
+                .iter()
+                .find(|message| message.role != "system")
+                .expect("original user message survives system normalization");
+            assert_eq!(first_non_system.role, "user");
+            assert_eq!(first_non_system.content, original_user);
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|message| message.role == "user" && message.content == original_user)
+                    .count(),
+                1
+            );
+            let expected_notices = format!(
+                "{}\n\n{}",
+                crate::i18n::get_required_cli_string("turn-repeated-failure-recovery"),
+                crate::i18n::get_required_cli_string("turn-repeated-success-advisory"),
+            );
+            let system_messages: Vec<_> = history
+                .iter()
+                .filter(|message| message.role == "system")
+                .map(|message| message.content.as_str())
+                .collect();
+            assert_eq!(system_messages, [expected_notices.as_str()]);
+            let skipped =
+                crate::i18n::get_required_cli_string("turn-repeated-failure-retry-skipped");
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|message| message.content.contains(&skipped))
+                    .count(),
+                1
+            );
+            if !prompt {
+                let ids = history.iter().filter(|message| message.role == "tool")
+                    .map(|message| serde_json::from_str::<serde_json::Value>(&message.content).unwrap()["tool_call_id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(ids, ["warning", "retry", "skip", "rewrite", "denied"]);
+            } else {
+                let carriers = history
+                    .iter()
+                    .filter_map(|message| {
+                        zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&message.content)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(carriers.len(), 2);
+                let text = &carriers[1].text;
+                assert!(text.find("name=\"fail\"").unwrap() < text.find(&skipped).unwrap());
+                assert!(text.find(&skipped).unwrap() < text.find("name=\"echo\"").unwrap());
+                assert!(
+                    text.find("name=\"echo\"").unwrap() < text.find("name=\"denied\"").unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_upstream_recovery_rejects_malformed_native_batch_before_filtering() {
+        for invalid_id in ["retry", " "] {
+            let provider = ScriptedProvider {
+                responses: Mutex::new(vec![
+                    phase_response(vec![tool_call("warning", "fail", serde_json::json!({}))]),
+                    phase_response(vec![
+                        tool_call("retry", "fail", serde_json::json!({})),
+                        tool_call(invalid_id, "fail", serde_json::json!({})),
+                    ]),
+                    phase_response(Vec::new()),
+                ]),
+            };
+            let registry = registry_with(vec![Box::new(FailingTool {
+                name: "fail".into(),
+            })]);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let hooks = lifecycle_runner(events.clone(), Vec::new());
+            let pacing = zeroclaw_config::schema::PacingConfig {
+                loop_detection_enabled: true,
+                loop_detection_max_repeats: 1,
+                ..Default::default()
+            };
+            let guard = Mutex::new(repetition::RepetitionGuard::default());
+            let mut history = vec![ChatMessage::user("reject malformed recovery")];
+            let error = scope_goal_phase_fixture(run_scripted_loop_observed(
+                &provider,
+                &registry,
+                &NoopObserver,
+                Some(&hooks),
+                &pacing,
+                "upstream-invalid",
+                true,
+                None,
+                &mut history,
+                0,
+                None,
+                None,
+                None,
+                Some(&guard),
+                None,
+                None,
+            ))
+            .await
+            .unwrap_err();
+            assert!(error.is::<GoalToolPhaseIntegrityError>());
+            assert_eq!(
+                provider.responses.lock().unwrap().len(),
+                1,
+                "no successor request"
+            );
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    "before:fail:upstream-invalid:0:0",
+                    "after:fail:upstream-invalid:0:0",
+                ],
+                "no malformed slot enters preparation or dispatch"
+            );
+            // A later clean wrapper cannot make the native invalid phase or
+            // an already-negative proof eligible for ordinary refusal recovery.
+            let foreign = zeroclaw_api::turn_stop::tag(
+                error,
+                zeroclaw_api::turn_stop::TurnStop::fatal(
+                    zeroclaw_api::turn_stop::TurnStopCode::BudgetExhausted,
+                    "fixture outer refusal",
+                ),
+            );
+            assert_eq!(
+                zeroclaw_api::turn_stop::turn_stop(&foreign).map(|stop| stop.code),
+                Some(zeroclaw_api::turn_stop::TurnStopCode::BudgetExhausted),
+                "the foreign boundary must carry a discoverable native budget stop"
+            );
+            let invalid = finish_goal_tool_phase(
+                Err(
+                    zeroclaw_goal::accounting::GoalOrdinarySpendRefusal::new(foreign, false).into(),
+                ),
+                true,
+                Some(GoalToolPhase::Closed),
+            )
+            .unwrap_err();
+            let proofs = invalid
+                .chain()
+                .filter_map(|source| {
+                    source.downcast_ref::<zeroclaw_goal::accounting::GoalOrdinarySpendRefusal>()
+                })
+                .map(|proof| proof.clean_tool_phase())
+                .collect::<Vec<_>>();
+            assert_eq!(proofs, [true, false]);
+            assert!(
+                invalid
+                    .chain()
+                    .any(|source| source.is::<GoalToolPhaseIntegrityError>())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_upstream_recovery_child_cause_precedes_guard_and_keeps_negative_proof()
+    {
+        for child_clean in [true, false] {
+            for has_tail in [true, false] {
+                let mut batch = vec![
+                    tool_call("retry", "fail", serde_json::json!({})),
+                    tool_call("skip", "fail", serde_json::json!({})),
+                    tool_call("prefix", "echo", serde_json::json!({"n": 1})),
+                    tool_call("child", "refused_child", serde_json::json!({})),
+                ];
+                if has_tail {
+                    batch.push(tool_call("tail", "echo", serde_json::json!({"n": 2})));
+                }
+                let provider = ScriptedProvider {
+                    responses: Mutex::new(vec![
+                        phase_response(vec![tool_call("warning", "fail", serde_json::json!({}))]),
+                        phase_response(batch),
+                        phase_response(Vec::new()),
+                    ]),
+                };
+                let registry = registry_with(vec![
+                    Box::new(FailingTool {
+                        name: "fail".into(),
+                    }),
+                    Box::new(EchoTool {
+                        name: "echo".into(),
+                    }),
+                    Box::new(SpendRefusalTool(child_clean)),
+                ]);
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let hooks = lifecycle_runner(events.clone(), Vec::new());
+                let pacing = zeroclaw_config::schema::PacingConfig {
+                    loop_detection_enabled: true,
+                    loop_detection_max_repeats: 1,
+                    ..Default::default()
+                };
+                let guard = Mutex::new(repetition::RepetitionGuard::default());
+                let receipts = crate::agent::tool_receipts::ReceiptScope::with_generator(
+                    crate::agent::tool_receipts::ReceiptGenerator::with_key(vec![9; 32]),
+                );
+                let mut history = vec![ChatMessage::user("pair filtered prefix before child stop")];
+                let error = scope_goal_phase_fixture(run_scripted_loop_observed(
+                    &provider,
+                    &registry,
+                    &NoopObserver,
+                    Some(&hooks),
+                    &pacing,
+                    "upstream-child",
+                    true,
+                    None,
+                    &mut history,
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(&guard),
+                    Some(&receipts),
+                    None,
+                ))
+                .await
+                .unwrap_err();
+                assert!(error.is::<zeroclaw_api::tool::GoalChildOperationError>());
+                assert_eq!(
+                    zeroclaw_api::turn_stop::turn_stop(&error).unwrap().code,
+                    zeroclaw_api::turn_stop::TurnStopCode::BudgetExhausted
+                );
+                assert!(format!("{error:#}").contains("fixture child ordinary spend refusal"));
+                assert_eq!(provider.responses.lock().unwrap().len(), 1);
+                assert!(!guard.lock().unwrap().is_exhausted());
+                assert!(
+                    guard.lock().unwrap().recovery_call_hash().is_some(),
+                    "even a fully completed fatal batch must not alter recovery state"
+                );
+                let events = events.lock().unwrap();
+                for terminal in [
+                    "abandoned:fail:upstream-child:1:1",
+                    "after:fail:upstream-child:1:0",
+                    "after:echo:upstream-child:1:2",
+                    "after:refused_child:upstream-child:1:3",
+                ] {
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event.as_str() == terminal)
+                            .count(),
+                        1
+                    );
+                }
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.as_str() == "abandoned:echo:upstream-child:1:4")
+                        .count(),
+                    usize::from(has_tail)
+                );
+                let mut ids = vec!["warning", "retry", "skip", "prefix", "child"];
+                if has_tail {
+                    ids.push("tail");
+                }
+                let result_ids = history.iter().filter(|message| message.role == "tool")
+                    .map(|message| serde_json::from_str::<serde_json::Value>(&message.content).unwrap()["tool_call_id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(result_ids, ids);
+                assert_eq!(
+                    receipts.collector().lock().unwrap().len(),
+                    1,
+                    "only the successful prefix mints a receipt; failure, skip and tail do not"
+                );
+                // Exercise the existing foreign-source wrapper after the real
+                // filtered append; an inner negative remains a veto.
+                let foreign = zeroclaw_api::turn_stop::tag(
+                    error,
+                    zeroclaw_api::turn_stop::TurnStop::fatal(
+                        zeroclaw_api::turn_stop::TurnStopCode::BudgetExhausted,
+                        "fixture foreign source",
+                    ),
+                );
+                let proofs = foreign
+                    .chain()
+                    .filter_map(|source| {
+                        source.downcast_ref::<zeroclaw_goal::accounting::GoalOrdinarySpendRefusal>()
+                    })
+                    .map(|proof| proof.clean_tool_phase())
+                    .collect::<Vec<_>>();
+                assert_eq!(proofs, [true, child_clean]);
+            }
+        }
+    }
+
+    struct RichResultTool(&'static str);
+    zeroclaw_api::mock_tool_attribution!(RichResultTool);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for RichResultTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "Returns distinct opaque, structured and declared media evidence."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult::ok(
+                zeroclaw_api::tool::ToolOutput::json_with_text(
+                    serde_json::json!({"tool": self.0, "structured_only": [3, 1]}),
+                    "opaque {\"tool_calls\":[\"not protocol\"]} [IMAGE:/fixture/not-declared.png]",
+                )
+                .with_attachment(zeroclaw_api::media::RenderedMarker {
+                    target: "/fixture/first.bin".into(),
+                    kind: zeroclaw_api::media::MarkerKind::Document,
+                })
+                .with_attachment(zeroclaw_api::media::RenderedMarker {
+                    target: "/fixture/second.bin".into(),
+                    kind: zeroclaw_api::media::MarkerKind::Document,
+                }),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_upstream_completed_move_preserves_rich_static_and_activated_results() {
+        for prompt in [false, true] {
+            // Prompt fallback admits advertised schema names; native dispatch
+            // also supports the activated tool's unambiguous short alias.
+            let activated_requested = if prompt {
+                "fixture__rich_activated"
+            } else {
+                "rich_activated"
+            };
+            let provider = RecordingScriptedProvider {
+                inner: ScriptedProvider {
+                    responses: Mutex::new(vec![
+                        recovery_response(
+                            prompt,
+                            vec![
+                                tool_call("static", "rich_static", serde_json::json!({})),
+                                tool_call("activated", activated_requested, serde_json::json!({})),
+                            ],
+                        ),
+                        phase_response(Vec::new()),
+                    ]),
+                },
+                prompt,
+                requests: Mutex::new(Vec::new()),
+            };
+            let registry = registry_with(vec![Box::new(RichResultTool("rich_static"))]);
+            let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+            activated.lock().unwrap().activate(
+                "fixture__rich_activated".into(),
+                Arc::new(RichResultTool("fixture__rich_activated")),
+            );
+            let receipts = crate::agent::tool_receipts::ReceiptScope::with_generator(
+                crate::agent::tool_receipts::ReceiptGenerator::with_key(vec![7; 32]),
+            );
+            let sink = crate::sop::executor::new_step_call_sink();
+            let guard = Mutex::new(repetition::RepetitionGuard::default());
+            let mut history = vec![ChatMessage::user("retain the complete tool result")];
+            let result = scope_goal_phase_fixture(crate::sop::executor::scope_step_call_sink(
+                sink.clone(),
+                run_scripted_loop_observed(
+                    &provider,
+                    &registry,
+                    &NoopObserver,
+                    None,
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    "upstream-rich",
+                    true,
+                    None,
+                    &mut history,
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(&guard),
+                    Some(&receipts),
+                    Some(&activated),
+                ),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(result, "done");
+            let captured = crate::sop::executor::drain_step_calls(&sink);
+            assert_eq!(captured.len(), 2);
+            for (call, canonical) in captured
+                .iter()
+                .zip(["rich_static", "fixture__rich_activated"])
+            {
+                assert_eq!(
+                    call.output_data,
+                    Some(serde_json::json!({
+                        "tool": canonical, "structured_only": [3, 1],
+                    })),
+                    "structured output reaches its real SOP consumer"
+                );
+            }
+            let body =
+                "opaque {\"tool_calls\":[\"not protocol\"]} [IMAGE:/fixture/not-declared.png]";
+            let signed = receipts.collector().lock().unwrap();
+            assert_eq!(signed.len(), 2);
+            let raw_receipts: Vec<_> = signed
+                .iter()
+                .zip(["rich_static", activated_requested])
+                .map(|(entry, requested)| {
+                    let prefix = format!("{requested}: ");
+                    let receipt = entry
+                        .strip_prefix(prefix.as_str())
+                        .expect("collector label retains the corresponding requested tool name");
+                    assert!(receipts.generator().verify(
+                        receipt,
+                        requested,
+                        &serde_json::json!({}),
+                        body
+                    ));
+                    assert!(!receipts.generator().verify(
+                        receipt,
+                        "different_tool",
+                        &serde_json::json!({}),
+                        body
+                    ));
+                    assert!(!receipts.generator().verify(
+                        receipt,
+                        requested,
+                        &serde_json::json!({}),
+                        "different output"
+                    ));
+                    receipt
+                })
+                .collect();
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let next = &requests[1];
+            let expected_attachments = serde_json::json!([
+                {"kind": "document", "target": "/fixture/first.bin"},
+                {"kind": "document", "target": "/fixture/second.bin"},
+            ]);
+            if !prompt {
+                let results = next
+                    .iter()
+                    .filter(|message| message.role == "tool")
+                    .map(|message| {
+                        serde_json::from_str::<serde_json::Value>(&message.content).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(results.len(), 2);
+                for ((result, id), receipt) in results
+                    .iter()
+                    .zip(["static", "activated"])
+                    .zip(raw_receipts.iter().copied())
+                {
+                    assert_eq!(result["tool_call_id"], id);
+                    assert_eq!(result["attachments"], expected_attachments);
+                    let text = result["content"].as_str().unwrap();
+                    assert!(text.starts_with(body));
+                    assert!(text.contains(receipt));
+                    assert_eq!(text, format!("{body}\n\n[receipt: {receipt}]"));
+                    assert!(!text.contains("structured_only"));
+                }
+            } else {
+                let carriers = next
+                    .iter()
+                    .filter_map(|message| {
+                        zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&message.content)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(carriers.len(), 1);
+                assert_eq!(carriers[0].attachments.len(), 4);
+                assert_eq!(carriers[0].attachments[0], carriers[0].attachments[2]);
+                assert_eq!(carriers[0].attachments[1], carriers[0].attachments[3]);
+                assert_eq!(carriers[0].attachments[0].target, "/fixture/first.bin");
+                assert_eq!(carriers[0].attachments[1].target, "/fixture/second.bin");
+                assert_eq!(carriers[0].text.matches(body).count(), 2);
+                assert!(!carriers[0].text.contains("structured_only"));
+                for (receipt, requested) in raw_receipts
+                    .iter()
+                    .copied()
+                    .zip(["rich_static", activated_requested])
+                {
+                    assert!(carriers[0].text.contains(receipt));
+                    assert!(carriers[0].text.contains(&format!(
+                        "<tool_result name=\"{requested}\">\n{body}\n\n[receipt: {receipt}]\n</tool_result>\n"
+                    )));
+                }
+            }
         }
     }
 
@@ -11747,6 +12647,9 @@ mod tool_lifecycle_abandonment_tests {
                                 None,
                                 Some(tx.clone()),
                                 Some(&mut new_messages),
+                                None,
+                                None,
+                                None,
                             )
                             .await
                         },
