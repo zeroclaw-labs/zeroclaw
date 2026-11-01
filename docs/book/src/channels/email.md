@@ -16,6 +16,15 @@ The general-purpose email channel. Polls IMAP for new messages, sends via SMTP. 
 
 {{#secret-config channels.email.<alias>.password}}
 
+### Mail servers signed by a private CA
+
+If the IMAP or SMTP server's certificate chains to an internal or corporate CA, set `tls_ca_cert_path` to the absolute path of a PEM file with that CA (a bundle is fine). It is trusted in addition to the bundled web PKI roots, for IMAP (the channel and the email tools) and for SMTP with `smtp_tls = true`; certificate and hostname checks stay on. The file follows the same rules as an MCP server's `tls_ca_cert_path`: absolute path (no `~`), a regular file of at most 1 MiB, and any problem with it fails the connection instead of falling back to the default roots.
+
+```toml
+[channels.email.<alias>]
+tls_ca_cert_path = "/etc/zeroclaw/mail-ca.pem"
+```
+
 ### Gmail gotchas
 
 - **App passwords required** if 2FA is on. Regular account password is rejected.
