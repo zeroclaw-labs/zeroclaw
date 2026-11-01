@@ -1509,6 +1509,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1534,6 +1535,7 @@ dependencies = [
  "chacha20 0.10.2",
  "cipher 0.5.2",
  "poly1305 0.9.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -14017,7 +14019,7 @@ version = "0.8.7"
 dependencies = [
  "anyhow",
  "async-trait",
- "chacha20poly1305 0.10.1",
+ "chacha20poly1305 0.11.0",
  "chrono",
  "clap",
  "directories",
@@ -14352,7 +14354,6 @@ dependencies = [
  "base64 0.22.1",
  "cap-fs-ext",
  "cap-std",
- "chacha20poly1305 0.10.1",
  "chrono",
  "directories",
  "futures-util",
@@ -14404,7 +14405,6 @@ dependencies = [
  "base64 0.22.1",
  "cap-fs-ext",
  "cap-std",
- "chacha20poly1305 0.10.1",
  "chardetng",
  "chrono",
  "chrono-tz",
@@ -14515,7 +14515,7 @@ name = "zeroclaw-tls"
 version = "0.8.7"
 dependencies = [
  "anyhow",
- "chacha20poly1305 0.10.1",
+ "chacha20poly1305 0.11.0",
  "filetime",
  "getrandom 0.2.17",
  "hex",
