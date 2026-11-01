@@ -552,6 +552,10 @@ Turning it on needs:
 - An identity provider client that uses Authorization Code with PKCE
   (S256), with `<dashboard origin><path_prefix>/oidc/callback` as a
   redirect URI (the same URI as the browser enrollment relay above).
+  Register that exact URI, with no wildcard or prefix pattern: until the
+  gateway checks the URI against a configured dashboard origin (#12048),
+  it builds it from the request's `Host`, and the identity provider's
+  exact match is what keeps a sign-in code from going to another address.
   Its client must be listed in `interactive_clients` (or classified by
   `actor_claim`), and its access tokens must carry the configured
   `audience`.
