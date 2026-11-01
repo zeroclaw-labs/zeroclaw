@@ -7967,13 +7967,15 @@ pub struct GatewayConfig {
     #[nested]
     pub tls: Option<GatewayTlsConfig>,
 
-    /// HTTP request timeout (seconds) for gateway routes other than the
-    /// long-running cron-trigger endpoint. Default: 30s.
+    /// HTTP request timeout (seconds) for ordinary gateway routes. Webhook,
+    /// manual cron and A2A task routes use `long_running_request_timeout_secs`.
+    /// Default: 30s.
     #[serde(default = "default_gateway_request_timeout_secs")]
     pub request_timeout_secs: u64,
 
-    /// HTTP request timeout (seconds) for `POST /api/cron/{id}/run`, which
-    /// runs jobs synchronously and routinely exceeds the 30s default.
+    /// HTTP request timeout (seconds) for `POST /webhook`, manual cron runs
+    /// and A2A task routes. Includes request-body extraction and response
+    /// creation, but not the lifetime of an SSE response body.
     /// Default: 600s (10 minutes).
     #[serde(default = "default_gateway_long_running_request_timeout_secs")]
     pub long_running_request_timeout_secs: u64,

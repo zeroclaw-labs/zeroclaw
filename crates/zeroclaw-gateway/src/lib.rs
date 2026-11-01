@@ -180,15 +180,13 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub const LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
 
-/// Gateway request timeout (seconds) for routes other than the long-running
-/// cron-trigger endpoint. Reads from typed config.
+/// Gateway request timeout (seconds) for ordinary routes. Reads from typed config.
 pub fn gateway_request_timeout_secs(cfg: &zeroclaw_config::schema::GatewayConfig) -> u64 {
     cfg.request_timeout_secs
 }
 
-/// Manual cron-trigger request timeout (seconds), exempt from the
-/// gateway-wide [`gateway_request_timeout_secs`] limit so synchronous agent
-/// jobs can run to completion. Reads from typed config.
+/// Request timeout (seconds) for webhook, manual cron and A2A task routes,
+/// exempt from [`gateway_request_timeout_secs`]. Reads from typed config.
 pub fn gateway_long_running_request_timeout_secs(
     cfg: &zeroclaw_config::schema::GatewayConfig,
 ) -> u64 {
@@ -2467,7 +2465,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
-        .route("/webhook", post(handle_webhook))
         .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
         .merge(optional_tool_routes())
@@ -2755,12 +2752,13 @@ pub async fn run_gateway_with_plugin_webhooks(
         ));
     let inner = inner.merge(upload_router);
 
-    // Manual cron-trigger and A2A task routes live on their own sub-router so
-    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
-    // synchronous agent turn inline. Layers attached here travel with the
-    // route through `merge`, so only these endpoints see the longer timeout.
-    let long_running_router: Router<AppState> =
-        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    // These routes can wait for a complete agent turn. Keep their timeout and
+    // body limit on the sub-router so both survive `merge`. For `/webhook`,
+    // this also bounds body extraction and SOP/SSE response creation; the SSE
+    // body and its cancellation remain owned by the streaming path.
+    let long_running_router: Router<AppState> = Router::new()
+        .route("/webhook", post(handle_webhook))
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run));
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
