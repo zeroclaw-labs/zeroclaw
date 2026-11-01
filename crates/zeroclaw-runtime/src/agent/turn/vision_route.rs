@@ -38,6 +38,13 @@ pub(crate) fn policy_permits_image_path(policy: &SecurityPolicy, path: &std::pat
 /// a configured provider that itself lacks vision is an operator
 /// misconfiguration and surfaces as a `ProviderCapabilityError`.
 ///
+/// A history whose only image markers are carried over from earlier turns —
+/// nothing in the CURRENT turn (latest user message or current-turn
+/// tool-result attachments) carries an image — degrades to the primary text
+/// provider with the stale markers stripped (`(None, true)`) instead of
+/// routing to the configured fallback, so a single image never pins the rest
+/// of the conversation to the vision provider.
+///
 /// `security` governs one thing: which local image-marker references in the
 /// latest user message count as "resolvable" for the no-vision, no-fallback
 /// refusal. A local reference counts only when it is absolute, the policy's
@@ -70,10 +77,19 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
 
     let mut degrade_strip_images = false;
+    let current_turn_image_marker_count = multimodal::count_current_turn_image_markers(history);
     let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
         && !model_provider.capabilities_for_model(dispatch_model).vision
     {
-        if let Some(ref vp) = multimodal_config.vision_model_provider {
+        if current_turn_image_marker_count == 0 {
+            // Only carried-over image markers remain (an image sent on an
+            // earlier turn): nothing in THIS turn needs vision. Degrade to
+            // the primary text provider with the stale markers stripped,
+            // rather than pinning the whole conversation to the configured
+            // vision fallback.
+            degrade_strip_images = true;
+            None
+        } else if let Some(ref vp) = multimodal_config.vision_model_provider {
             let provider_allowed = allowed_provider_refs.map_or_else(
                 || zeroclaw_providers::reliable::provider_ref_allowed_for_turn(vp),
                 |allowed| allowed.contains(vp),
@@ -1831,5 +1847,164 @@ model = "vision-model"
         .await
         .expect("no capability error");
         assert!(!degrade, "body markers alone must not degrade anything");
+    }
+
+    /// Regression: an image sent on an EARLIER turn must not
+    /// pin a later pure-text turn to the configured vision fallback. The
+    /// current turn carries no image (no marker in the latest user message,
+    /// no current-turn tool attachment), so the router degrades to the
+    /// primary text provider with the stale marker stripped.
+    #[tokio::test]
+    async fn configured_fallback_with_text_follow_up_degrades_instead_of_pinning() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"stale image bytes").unwrap();
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.custom.visionroute]
+uri = "http://127.0.0.1:9/v1"
+model = "vision-model"
+"#,
+        )
+        .expect("config parses");
+        let multimodal = MultimodalConfig {
+            vision_model_provider: Some("custom.visionroute".to_string()),
+            ..Default::default()
+        };
+        let history = vec![
+            ChatMessage::user(format!("look at this [IMAGE:{}]", image_path.display())),
+            ChatMessage::assistant("saw it"),
+            ChatMessage::user("ok, now summarize the embedded doc"),
+        ];
+
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            Some(&config),
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            None,
+        )
+        .await
+        .expect("a text-only follow-up must not fail the turn");
+        assert!(
+            vision_provider.is_none(),
+            "no vision fallback may be selected for a turn that carries no image"
+        );
+        assert!(
+            degrade_strip_images,
+            "the stale marker must be stripped for the text primary"
+        );
+    }
+
+    /// A tool-result attachment produced in the CURRENT turn must still
+    /// reach the configured vision fallback: tool images stay live for the
+    /// user turn that produced them and must not be caught by the
+    /// carried-over-only degrade guard.
+    #[tokio::test]
+    async fn configured_fallback_keeps_current_turn_tool_attachment_on_vision_route() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"fresh screenshot").unwrap();
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.custom.visionroute]
+uri = "http://127.0.0.1:9/v1"
+model = "vision-model"
+"#,
+        )
+        .expect("config parses");
+        let multimodal = MultimodalConfig {
+            vision_model_provider: Some("custom.visionroute".to_string()),
+            ..Default::default()
+        };
+        let history = vec![
+            ChatMessage::user("take a screenshot".to_string()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "tc1",
+                    "content": "captured",
+                    "attachments": [{"kind": "image", "target": image_path.display().to_string()}],
+                })
+                .to_string(),
+            ),
+        ];
+
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            Some(&config),
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+            "primary-model",
+            None,
+        )
+        .await
+        .expect("a current-turn tool image must resolve the configured fallback");
+        assert!(
+            vision_provider.is_some(),
+            "the current-turn tool attachment must route to the vision fallback"
+        );
+        assert!(
+            !degrade_strip_images,
+            "a live vision route must not degrade/strip images"
+        );
     }
 }
