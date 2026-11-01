@@ -19,11 +19,18 @@ use crate::agent::loop_::{
     mcp_allowed_tool_count, mcp_tool_access_policy, preactivate_always_filter_groups,
     register_eager_mcp_tool_if_allowed,
 };
+use crate::composition::RegistryConstruction;
 use crate::skills::Skill;
 use crate::tools::skill_tool::{PreparedSkill, PreparedSkillBuiltin, SlotId, TargetRef};
 use crate::tools::{
     self, ActivatedToolSet, AllToolsResult, DelegateParentToolsHandle, PerToolChannelHandle, Tool,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryOrigin {
+    Native,
+    Supplied,
+}
 
 // Stable positions survive every filter until the one final emission. Only the
 // concrete pipeline is kept after an outer filter: skills historically resolve
@@ -31,6 +38,8 @@ use crate::tools::{
 struct BuildEntry {
     value: Option<BuildSlot>,
     top_level: bool,
+    origin: EntryOrigin,
+    native_memory: Option<Arc<tools::NativeMemoryOrigin>>,
 }
 
 enum BuildSlot {
@@ -60,6 +69,17 @@ impl BuildSlot {
     }
 }
 
+/// A source tool lost its name to a native tool. `kept` names the native owner.
+fn log_retired_source_tool(name: &str, kept: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"tool": name, "kept": kept})),
+        "tool source supplied a tool whose name a native tool takes; keeping the native tool"
+    );
+}
+
 fn is_guest(tool: &dyn Tool) -> bool {
     matches!(
         tool.role(),
@@ -81,12 +101,32 @@ impl BuildRegistry {
         self.entries.push(BuildEntry {
             value: Some(value),
             top_level: true,
+            origin: EntryOrigin::Native,
+            native_memory: None,
         });
         id
     }
 
     fn push_ready(&mut self, tool: Box<dyn Tool>) {
         self.push(BuildSlot::Ready(Arc::from(tool)));
+    }
+
+    /// Drops source tools whose names `names` takes, logging each one with
+    /// the native owner that keeps the name.
+    fn retire_supplied_names(&mut self, names: &HashSet<String>, kept: &str) {
+        for entry in &mut self.entries {
+            if entry.origin == EntryOrigin::Supplied
+                && entry
+                    .value
+                    .as_ref()
+                    .is_some_and(|tool| names.contains(tool.name()))
+            {
+                if let Some(tool) = entry.value.take() {
+                    log_retired_source_tool(tool.name(), kept);
+                }
+                entry.top_level = false;
+            }
+        }
     }
 
     fn iter(&self) -> impl Iterator<Item = (SlotId, &BuildSlot)> {
@@ -139,6 +179,7 @@ impl BuildRegistry {
         unfiltered: &mut Vec<Arc<dyn Tool>>,
         context: &mut Vec<Arc<dyn Tool>>,
         delegate_handle: Option<&DelegateParentToolsHandle>,
+        origins: &tools::NativeMemoryOrigins,
     ) {
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         tools::late_tool_search_observer::record(
@@ -148,17 +189,27 @@ impl BuildRegistry {
             context.len(),
         );
         for entry in &mut self.entries {
-            let retired = match entry.value.as_ref() {
-                Some(BuildSlot::Ready(tool)) => is_search_guest(tool.as_ref()),
-                Some(BuildSlot::Elevated {
-                    target: TargetRef::Existing(tool),
-                    ..
-                }) => is_search_guest(tool.as_ref()),
-                _ => false,
-            };
+            let retired = (entry.origin == EntryOrigin::Supplied
+                && entry
+                    .value
+                    .as_ref()
+                    .is_some_and(|tool| tool.name() == "tool_search"))
+                || match entry.value.as_ref() {
+                    Some(BuildSlot::Ready(tool)) => is_search_guest(tool.as_ref()),
+                    Some(BuildSlot::Elevated {
+                        target: TargetRef::Existing(tool),
+                        ..
+                    }) => is_search_guest(tool.as_ref()),
+                    _ => false,
+                };
             if retired {
                 #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
                 tools::late_tool_search_observer::record("claim-retire", "slot", 0, 0);
+                if entry.origin == EntryOrigin::Supplied
+                    && let Some(tool) = entry.value.as_ref()
+                {
+                    log_retired_source_tool(tool.name(), "tool_search");
+                }
                 entry.value = None;
                 entry.top_level = false;
             } else if matches!(entry.value.as_ref(), Some(BuildSlot::Pipeline(_)))
@@ -208,7 +259,8 @@ impl BuildRegistry {
                 0,
             );
             parent.write().retain(|tool| {
-                let retired = is_search_guest(tool.as_ref());
+                let retired = is_search_guest(tool.as_ref())
+                    || (origins.is_supplied(tool) && tool.name() == "tool_search");
                 #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
                 tools::late_tool_search_observer::record(
                     "parent-child",
@@ -221,7 +273,18 @@ impl BuildRegistry {
         }
     }
 
-    fn seal(mut self, pipeline_id: Option<SlotId>) -> Vec<Box<dyn Tool>> {
+    fn seal(
+        mut self,
+        pipeline_id: Option<SlotId>,
+        projection: &mut tools::NativeMemoryProjection,
+        parent: Option<&DelegateParentToolsHandle>,
+    ) -> Vec<Box<dyn Tool>> {
+        if let Some(parent) = parent {
+            // Re-project the surviving source entries, never a denied stale view.
+            parent
+                .write()
+                .retain(|tool| !projection.origins.is_supplied(tool));
+        }
         let pipeline_needed = pipeline_id.is_some_and(|id| {
             self.entries[id.0].top_level
                 || self.iter().any(|(_, value)| {
@@ -271,7 +334,26 @@ impl BuildRegistry {
                 continue;
             }
             match entry.value {
-                Some(BuildSlot::Ready(tool)) => tools.push(Box::new(tools::ArcToolRef(tool))),
+                Some(BuildSlot::Ready(tool)) => {
+                    if entry.origin == EntryOrigin::Supplied {
+                        if let Some(parent) = parent {
+                            // Parent handle precedes origin ledger; no getter/await under either.
+                            let mut parent = parent.write();
+                            projection.origins.mark_supplied(&tool);
+                            if !parent.iter().any(|current| Arc::ptr_eq(current, &tool)) {
+                                parent.push(Arc::clone(&tool));
+                            }
+                        } else {
+                            projection.origins.mark_supplied(&tool);
+                        }
+                    }
+                    let boxed = projection.publish(
+                        tool,
+                        entry.native_memory,
+                        entry.origin == EntryOrigin::Supplied,
+                    );
+                    tools.push(boxed);
+                }
                 Some(BuildSlot::Elevated { prepared, target }) => {
                     let target = match target {
                         TargetRef::Existing(tool) => Some(tool),
@@ -303,6 +385,9 @@ impl BuildRegistry {
 pub struct ScopedToolRegistry(
     Vec<Box<dyn Tool>>,
     Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    RegistryConstruction,
+    tools::NativeMemoryProjection,
+    Option<DelegateParentToolsHandle>,
 );
 
 impl std::ops::Deref for ScopedToolRegistry {
@@ -328,6 +413,12 @@ impl ScopedToolRegistry {
     /// [`Self::assemble`] (or the test-only constructor).
     pub(crate) fn retain(&mut self, f: impl FnMut(&Box<dyn Tool>) -> bool) {
         self.0.retain(f);
+        if let Some(parent) = &self.4 {
+            parent.write().retain(|tool| {
+                !self.3.origins.is_supplied(tool) || self.3.retains_source(&self.0, tool)
+            });
+        }
+        self.3.retain(&self.0);
         self.refresh_builtin_schemas();
     }
 
@@ -356,50 +447,26 @@ impl ScopedToolRegistry {
         }
     }
 
-    /// Rebind the memory-backed tools of an ALREADY-sealed registry to a new
-    /// backend handle. Session memory follows its owner: when a session is
-    /// pinned to a principal's private plane the memory tools — which each
-    /// captured a clone of the shared handle at assembly — must be re-pointed
-    /// at the routed handle, or an owned session would keep issuing shared-plane
-    /// recall/store/export/delete while the agent reports its memory as private.
-    ///
-    /// This replaces the SAME named memory tools in place with fresh instances
-    /// over `memory`; it never introduces a new tool name, so the surface the
-    /// seal admitted is unchanged. Any memory tool already withdrawn by policy
-    /// narrowing stays withdrawn (only tools currently present are rebound).
+    /// Bind this build's genuine native memory captures to one target before
+    /// any operation begins. The concrete Tool Arcs, schemas and all existing
+    /// pipeline/skill/parent captures retain their identities. Unknown supplied
+    /// tools keep their original backends; no filtered name is reintroduced.
     pub(crate) fn rebind_memory_tools(
         &mut self,
+        original: &Arc<dyn zeroclaw_memory::Memory>,
         memory: Arc<dyn zeroclaw_memory::Memory>,
-        security: Arc<SecurityPolicy>,
-    ) {
-        use zeroclaw_tools::{
-            memory_export::MemoryExportTool, memory_forget::MemoryForgetTool,
-            memory_purge::MemoryPurgeTool, memory_recall::MemoryRecallTool,
-            memory_store::MemoryStoreTool,
-        };
-        for tool in self.0.iter_mut() {
-            let replacement: Option<Box<dyn Tool>> = match tool.name() {
-                "memory_store" => Some(Box::new(MemoryStoreTool::new(
-                    Arc::clone(&memory),
-                    Arc::clone(&security),
-                ))),
-                "memory_recall" => Some(Box::new(MemoryRecallTool::new(Arc::clone(&memory)))),
-                "memory_forget" => Some(Box::new(MemoryForgetTool::new(
-                    Arc::clone(&memory),
-                    Arc::clone(&security),
-                ))),
-                "memory_export" => Some(Box::new(MemoryExportTool::new(Arc::clone(&memory)))),
-                "memory_purge" => Some(Box::new(MemoryPurgeTool::new(
-                    Arc::clone(&memory),
-                    Arc::clone(&security),
-                ))),
-                _ => None,
-            };
-            if let Some(replacement) = replacement {
-                *tool = replacement;
-            }
+        security: &Arc<SecurityPolicy>,
+    ) -> anyhow::Result<()> {
+        if self.2 != RegistryConstruction::NativeCompat {
+            return Ok(());
         }
-        self.refresh_builtin_schemas();
+        // Only this graph's creator owner may bind. Family witnesses can include
+        // other targets; changing those would retarget an unrelated Agent.
+        if let Some(binding) = self.3.binding.upgrade() {
+            binding.bind(original, memory, security)?;
+        }
+        // The actual Tool Arcs/specs never changed, including captured views.
+        Ok(())
     }
 
     /// Test-only constructor that mints a registry directly from raw tools,
@@ -411,7 +478,13 @@ impl ScopedToolRegistry {
     /// in shipped builds and the seal holds where it matters.
     #[cfg(any(test, feature = "test-util"))]
     pub fn from_raw_for_test(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self(tools, None)
+        Self(
+            tools,
+            None,
+            RegistryConstruction::NativeCompat,
+            Default::default(),
+            None,
+        )
     }
 }
 
@@ -549,6 +622,71 @@ impl ScopedToolRegistry {
     /// Mint a scoped, gated registry from already-built eager tools. The single seam
     /// every construction path goes through.
     pub async fn assemble(spec: ScopedAssembly<'_>) -> ScopedAssembled {
+        Self::assemble_prepared(spec, RegistryConstruction::NativeCompat, 0..0).await
+    }
+
+    pub(crate) async fn assemble_prepared(
+        spec: ScopedAssembly<'_>,
+        construction: RegistryConstruction,
+        supplied_tail: std::ops::Range<usize>,
+    ) -> ScopedAssembled {
+        if construction == RegistryConstruction::SuppliedOnly {
+            let mut built = spec.built;
+            // The delegate's parent view gets the same memory/delivery context
+            // filter as the registry, as it does in native compatibility mode.
+            if let Some(parent) = built.delegate_handle.as_ref() {
+                parent.write().retain(|tool| {
+                    tool_allowed_in_context(tool.name(), spec.exclude_memory, spec.acp_delivery)
+                });
+            }
+            let mut registry = BuildRegistry {
+                entries: Vec::new(),
+            };
+            for (index, tool) in built.tools.into_iter().enumerate() {
+                let (actual, witness, inherited_supplied) = built.native_memory.take(tool.as_ref());
+                let id = registry.push(BuildSlot::Ready(actual.unwrap_or_else(|| Arc::from(tool))));
+                registry.entries[id.0].origin =
+                    if supplied_tail.contains(&index) || inherited_supplied {
+                        EntryOrigin::Supplied
+                    } else {
+                        EntryOrigin::Native
+                    };
+                registry.entries[id.0].native_memory = witness;
+            }
+            registry.retain(|tool| {
+                spec.security.is_tool_allowed(tool.name())
+                    && spec
+                        .caller_allowed
+                        .is_none_or(|allowed| allowed.iter().any(|name| name == tool.name()))
+                    && tool_allowed_in_context(tool.name(), spec.exclude_memory, spec.acp_delivery)
+            });
+            let tools = registry.seal(
+                None,
+                &mut built.native_memory,
+                built.delegate_handle.as_ref(),
+            );
+            return ScopedAssembled {
+                registry: Self(
+                    tools,
+                    None,
+                    construction,
+                    built.native_memory,
+                    built.delegate_handle.clone(),
+                ),
+                delegate_handle: built.delegate_handle,
+                ask_user_handle: built.ask_user_handle,
+                reaction_handle: built.reaction_handle,
+                poll_handle: built.poll_handle,
+                escalate_handle: built.escalate_handle,
+                channel_room_handle: built.channel_room_handle,
+                activated_handle: None,
+                tool_search_handle: None,
+                mcp_tool_names: HashSet::new(),
+                deferred_section: String::new(),
+                pinned_section: String::new(),
+                pinned_blocks: Vec::new(),
+            };
+        }
         let ScopedAssembly {
             config,
             agent_alias,
@@ -569,6 +707,7 @@ impl ScopedToolRegistry {
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         tools::late_tool_search_observer::record("phase", "factory", 1, 0);
         let AllToolsResult {
+            mut native_memory,
             tools: tools_registry,
             reserved_host_names: mut host_tool_names,
             delegate_handle,
@@ -578,6 +717,7 @@ impl ScopedToolRegistry {
             escalate_handle,
             channel_room_handle,
             mut unfiltered_tool_arcs,
+            capability_slots: _,
             // Test-only capture of the concrete delegate instance; `assemble`
             // has no use for it and must keep destructuring exhaustively so a
             // new field cannot be silently dropped here.
@@ -609,15 +749,28 @@ impl ScopedToolRegistry {
         // Builtin declarations own their names independently of whether the
         // current selection constructed them. Prebuilt inputs also retain the
         // canonical deferred/context-withdrawn owners.
-        let (plugin_tools, mut tools_registry): (Vec<_>, Vec<_>) = tools_registry
-            .into_iter()
-            .partition(|tool| is_guest(tool.as_ref()));
-        host_tool_names.extend(tools_registry.iter().map(|tool| tool.name().to_string()));
+        let inputs = tools_registry.into_iter().enumerate().map(|(index, tool)| {
+            let (actual, witness, inherited_supplied) = native_memory.take(tool.as_ref());
+            (
+                tool,
+                supplied_tail.contains(&index) || inherited_supplied,
+                witness,
+                actual,
+            )
+        });
+        let (plugin_tools, mut tools_registry): (Vec<_>, Vec<_>) =
+            inputs.partition(|(tool, supplied, _, _)| !supplied && is_guest(tool.as_ref()));
+        host_tool_names.extend(
+            tools_registry
+                .iter()
+                .filter(|(_, supplied, _, _)| !supplied)
+                .map(|(tool, _, _, _)| tool.name().to_string()),
+        );
         tools::reserve_deferred_host_names(config, &mut host_tool_names);
         // Peripheral and skill tools register after the guests, so the plugin
         // loader cannot see their names. A skill tool's composed name loses its
         // `__` separator when it is shortened, so the MCP-namespace refusal does
-        // not always cover it.
+        // not always cover it. Source tools give way to these names too.
         host_tool_names.extend(peripheral_tools.iter().map(|tool| tool.name().to_string()));
         host_tool_names.extend(skills.iter().flat_map(|skill| {
             skill
@@ -625,7 +778,14 @@ impl ScopedToolRegistry {
                 .iter()
                 .map(|tool| tools::skill_tool::composed_tool_name(&skill.name, &tool.name))
         }));
-        tools_registry.extend(plugin_tools.into_iter().filter(|tool| {
+        tools_registry.retain(|(tool, supplied, _, _)| {
+            let taken = *supplied && host_tool_names.contains(tool.name());
+            if taken {
+                log_retired_source_tool(tool.name(), "reserved");
+            }
+            !taken
+        });
+        tools_registry.extend(plugin_tools.into_iter().filter(|(tool, _, _, _)| {
             let taken = host_tool_names.contains(tool.name());
             if taken && emit_assembly_logs {
                 ::zeroclaw_log::record!(
@@ -644,25 +804,37 @@ impl ScopedToolRegistry {
         unfiltered_tool_arcs
             .retain(|tool| !is_guest(tool.as_ref()) || !host_tool_names.contains(tool.name()));
         if let Some(parent) = delegate_handle.as_ref() {
-            parent
-                .write()
-                .retain(|tool| !is_guest(tool.as_ref()) || !host_tool_names.contains(tool.name()));
+            parent.write().retain(|tool| {
+                !(is_guest(tool.as_ref()) || native_memory.origins.is_supplied(tool))
+                    || !host_tool_names.contains(tool.name())
+            });
         }
 
         let mut builtin_names: HashSet<String> = tools_registry
             .iter()
-            .map(|tool| tool.name().to_string())
+            .filter(|(_, supplied, _, _)| !supplied)
+            .map(|(tool, _, _, _)| tool.name().to_string())
             .collect();
 
         // Peripheral tools follow the guests and stay out of the views built above.
-        tools_registry.extend(peripheral_tools);
+        tools_registry.extend(
+            peripheral_tools
+                .into_iter()
+                .map(|tool| (tool, false, None, None)),
+        );
 
         let mut tools_registry = BuildRegistry {
             entries: tools_registry
                 .into_iter()
-                .map(|tool| BuildEntry {
-                    value: Some(BuildSlot::Ready(Arc::from(tool))),
+                .map(|(tool, supplied, native_memory, actual)| BuildEntry {
+                    value: Some(BuildSlot::Ready(actual.unwrap_or_else(|| Arc::from(tool)))),
                     top_level: true,
+                    origin: if supplied {
+                        EntryOrigin::Supplied
+                    } else {
+                        EntryOrigin::Native
+                    },
+                    native_memory,
                 })
                 .collect(),
         };
@@ -713,6 +885,8 @@ impl ScopedToolRegistry {
             #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
             tools::late_tool_search_observer::record("constructor-return", "pipeline", 0, 0);
             builtin_names.insert(tool.name().to_string());
+            // A same-name source tool is already gone: the pipeline's name is
+            // reserved whenever the pipeline is enabled (`reserve_deferred_host_names`).
             tools_registry.push(BuildSlot::Pipeline(tool))
         });
 
@@ -746,6 +920,11 @@ impl ScopedToolRegistry {
         //    recover memory or delivery tools removed from the outer registry.
         tools_registry
             .retain(|tool| tool_allowed_in_context(tool.name(), exclude_memory, acp_delivery));
+        if let Some(parent) = delegate_handle.as_ref() {
+            parent
+                .write()
+                .retain(|tool| tool_allowed_in_context(tool.name(), exclude_memory, acp_delivery));
+        }
 
         // 4. MCP: scope servers per `mcp_bundles` (omission is not a grant), then gate
         //    each tool. Skipped only when this path does not connect MCP (ACP) or MCP
@@ -1001,6 +1180,7 @@ impl ScopedToolRegistry {
                             &mut unfiltered_tool_arcs,
                             &mut context_filtered_tool_arcs,
                             delegate_handle.as_ref(),
+                            &native_memory.origins,
                         );
                         if let Some(mut policy) = mcp_policy {
                             // The caller ceiling already materialized the stub
@@ -1070,6 +1250,12 @@ impl ScopedToolRegistry {
                 }
             }
         }
+
+        // MCP names belong to the MCP registry, as `execute_pipeline` and
+        // `tool_search` belong to their native creators. A same-name source tool
+        // would otherwise come first in dispatch, ahead of the eager wrapper or a
+        // later deferred activation. The seal drops it from child views too.
+        tools_registry.retire_supplied_names(&mcp_tool_names, "mcp");
 
         // 5. Skills (uniform: the gateway used to skip them). Registered under the same
         //    `SecurityPolicy`, resolving builtin elevation against context-filtered arcs.
@@ -1295,6 +1481,7 @@ impl ScopedToolRegistry {
                         &mut unfiltered_tool_arcs,
                         &mut context_filtered_tool_arcs,
                         delegate_handle.as_ref(),
+                        &native_memory.origins,
                     );
                     if let Some(mut policy) = search_policy.take() {
                         // The registry already applied this ceiling. Later
@@ -1325,8 +1512,15 @@ impl ScopedToolRegistry {
 
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         tools::late_tool_search_observer::record("phase", "seal", 7, 0);
+        let sealed = tools_registry.seal(pipeline_id, &mut native_memory, delegate_handle.as_ref());
         ScopedAssembled {
-            registry: ScopedToolRegistry(tools_registry.seal(pipeline_id), builtin_schema_handle),
+            registry: ScopedToolRegistry(
+                sealed,
+                builtin_schema_handle,
+                construction,
+                native_memory,
+                delegate_handle.clone(),
+            ),
             delegate_handle,
             ask_user_handle,
             reaction_handle,
@@ -1415,6 +1609,7 @@ mod tests {
 
     fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
         AllToolsResult {
+            native_memory: Default::default(),
             tools,
             reserved_host_names: HashSet::new(),
             delegate_handle: None,
@@ -1424,6 +1619,7 @@ mod tests {
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            capability_slots: Vec::new(),
             delegate_tool: None,
         }
     }
@@ -1447,6 +1643,7 @@ mod tests {
             .map(|tool| Box::new(tools::ArcToolRef(tool)) as Box<dyn Tool>)
             .collect();
         AllToolsResult {
+            native_memory: Default::default(),
             tools,
             reserved_host_names: HashSet::new(),
             delegate_handle: None,
@@ -1456,6 +1653,7 @@ mod tests {
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs,
+            capability_slots: Vec::new(),
             delegate_tool: None,
         }
     }
@@ -2142,7 +2340,6 @@ mod tests {
     #[tokio::test]
     async fn deferred_memory_selection_uses_rebound_backend() {
         use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
-        use zeroclaw_tools::memory_export::MemoryExportTool;
 
         let original_dir = tempfile::TempDir::new().unwrap();
         let current_dir = tempfile::TempDir::new().unwrap();
@@ -2158,16 +2355,37 @@ mod tests {
             .store("private", "current-backend", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let config = builtin_deferral_config(true);
+        let mut config = builtin_deferral_config(true);
+        config.tools.optional.push("memory_export".into());
         let security = Arc::new(SecurityPolicy::default());
-        let mut assembled = assemble_builtin_catalog(
-            &config,
+        let mut built = tools::all_tools_with_runtime_context(
+            Arc::new(config.clone()),
             &security,
-            built_with(vec![Box::new(MemoryExportTool::new(Arc::clone(&original)))]),
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "default",
+            Arc::new(crate::platform::NativeRuntime::new()),
+            Arc::clone(&original),
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
             None,
             false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
-        .await;
+        .unwrap();
+        built.tools.retain(|tool| tool.name() == "memory_export");
+        let mut assembled = assemble_builtin_catalog(&config, &security, built, None, false).await;
         assert!(
             assembled
                 .registry
@@ -2185,7 +2403,8 @@ mod tests {
         assert!(assembled.registry.hidden_builtin_names().is_empty());
         assembled
             .registry
-            .rebind_memory_tools(Arc::clone(&current), Arc::clone(&security));
+            .rebind_memory_tools(&original, Arc::clone(&current), &security)
+            .unwrap();
         assert!(assembled.registry.hidden_builtin_names().is_empty());
         assert!(
             assembled
@@ -2206,6 +2425,367 @@ mod tests {
         assert_eq!(entries.as_array().unwrap().len(), 1);
         assert_eq!(entries[0]["content"], "current-backend");
         assert!(!result.output.contains("original-backend"));
+    }
+
+    #[tokio::test]
+    async fn supplied_memory_keeps_its_store_through_seal_rebind_and_parent_withdrawal() {
+        use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new("source", &tmp.path().join("source")).unwrap());
+        let other: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new("other", &tmp.path().join("other")).unwrap());
+        original
+            .store(
+                "source-key",
+                "source-owned-plane",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        other
+            .store("other-key", "other-plane", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let config = builtin_deferral_config(false);
+        let security = Arc::new(SecurityPolicy::default());
+        for construction in [
+            RegistryConstruction::SuppliedOnly,
+            RegistryConstruction::NativeCompat,
+        ] {
+            let parent = Arc::new(parking_lot::RwLock::new(Vec::new()));
+            let mut built = AllToolsResult::from_prebuilt_tools(vec![Box::new(
+                zeroclaw_tools::memory_export::MemoryExportTool::new(Arc::clone(&original)),
+            )]);
+            built.delegate_handle = Some(Arc::clone(&parent));
+            let mut assembled = ScopedToolRegistry::assemble_prepared(
+                ScopedAssembly {
+                    config: &config,
+                    agent_alias: "test-agent",
+                    security: &security,
+                    built,
+                    skills: &[],
+                    runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                    caller_allowed: None,
+                    connect_mcp: false,
+                    connect_peripherals: false,
+                    exclude_memory: false,
+                    acp_delivery: false,
+                    list_deferred_mcp_specs: false,
+                    emit_assembly_logs: false,
+                    mcp_registry: None,
+                },
+                construction,
+                0..1,
+            )
+            .await;
+            assert_eq!(parent.read().len(), 1);
+            let actual_source = Arc::clone(&parent.read()[0]);
+            assert!(
+                assembled.registry.3.origins.prove(&actual_source).is_none(),
+                "actual native implementation type is not a creator witness"
+            );
+            assembled
+                .registry
+                .rebind_memory_tools(&original, Arc::clone(&other), &security)
+                .unwrap();
+            let result = assembled
+                .registry
+                .iter()
+                .find(|tool| tool.name() == "memory_export")
+                .unwrap()
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(result.success);
+            assert!(result.output.contains("source-owned-plane"));
+            assert!(!result.output.contains("other-plane"));
+            assert!(Arc::ptr_eq(&actual_source, &parent.read()[0]));
+            assembled.registry.retain(|_| false);
+            assert!(
+                parent.read().is_empty(),
+                "withdrawn source tools cannot remain in the child's parent view"
+            );
+        }
+    }
+
+    /// A supplied-only build with a delegate parent handle filters that view by
+    /// the memory/delivery context too.
+    #[tokio::test]
+    async fn supplied_only_context_filters_the_parent_view() {
+        let config = builtin_deferral_config(false);
+        let security = Arc::new(SecurityPolicy::default());
+        let mut built = tools::AllToolsResult::from_prebuilt_tools(Vec::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let parent: DelegateParentToolsHandle = Arc::new(parking_lot::RwLock::new(vec![
+            Arc::new(CountingTool {
+                name: "memory_store",
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn Tool>,
+            Arc::new(CountingTool {
+                name: "calculator",
+                calls,
+            }),
+        ]));
+        built.delegate_handle = Some(Arc::clone(&parent));
+        ScopedToolRegistry::assemble_prepared(
+            ScopedAssembly {
+                config: &config,
+                agent_alias: "default",
+                security: &security,
+                built,
+                skills: &[],
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: true,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            },
+            RegistryConstruction::SuppliedOnly,
+            0..0,
+        )
+        .await;
+        let names: Vec<_> = parent
+            .read()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["calculator"],
+            "memory tools leave a memory-free parent view"
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_binding_reaches_actual_pipeline_skill_and_parent_captures_without_replacing_arcs()
+     {
+        assert_principal_binding_actual_captures(false).await;
+    }
+
+    #[tokio::test]
+    async fn principal_binding_acp_parent_retains_context_survivors_in_order() {
+        assert_principal_binding_actual_captures(true).await;
+    }
+
+    async fn assert_principal_binding_actual_captures(acp_delivery: bool) {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original: Arc<dyn Memory> = Arc::new(SqliteMemory::new("capture", tmp.path()).unwrap());
+        original
+            .store("shared", "shared-sentinel", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let mut config = builtin_deferral_config(false);
+        config.tools.optional = vec![
+            "execute_pipeline".into(),
+            "delegate".into(),
+            "memory_export".into(),
+            "deliver_file".into(),
+        ];
+        config.pipeline.enabled = true;
+        config.pipeline.allowed_tools = vec!["memory_store".into(), "memory_recall".into()];
+        let security = Arc::new(SecurityPolicy {
+            autonomy: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        });
+        let skill = Skill {
+            name: "capture".into(),
+            description: "native capture".into(),
+            description_localizations: Default::default(),
+            version: "1".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![SkillTool {
+                name: "store".into(),
+                description: "write".into(),
+                kind: "builtin".into(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some("memory_store".into()),
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let built = tools::all_tools_with_runtime_context(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "default",
+            Arc::new(crate::platform::NativeRuntime::new()),
+            Arc::clone(&original),
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &security.workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let parent = Arc::clone(built.delegate_handle.as_ref().unwrap());
+        let before = parent.read().clone();
+        assert!(before.iter().any(|tool| tool.name() == "deliver_file"));
+        let survivors = before
+            .iter()
+            .filter(|tool| tool_allowed_in_context(tool.name(), false, acp_delivery))
+            .cloned()
+            .collect::<Vec<_>>();
+        let actual_store = Arc::clone(
+            before
+                .iter()
+                .find(|tool| tool.name() == "memory_store")
+                .unwrap(),
+        );
+        let owner = built
+            .native_memory
+            .origins
+            .prove(&actual_store)
+            .unwrap()
+            .binding
+            .upgrade()
+            .unwrap();
+        let mut assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built,
+            skills: std::slice::from_ref(&skill),
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+        let scope = PrincipalScope::new("owner:capture");
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&original),
+            scope.clone(),
+        ));
+        assembled
+            .registry
+            .rebind_memory_tools(&original, Arc::clone(&routed), &security)
+            .unwrap();
+        assert!(Arc::ptr_eq(owner.routed.get().unwrap(), &routed));
+        assert_eq!(survivors.len(), parent.read().len());
+        assert_eq!(
+            parent
+                .read()
+                .iter()
+                .any(|tool| tool.name() == "deliver_file"),
+            acp_delivery
+        );
+        assert!(
+            survivors
+                .iter()
+                .zip(parent.read().iter())
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        );
+        for (name, args) in [
+            (
+                "memory_store",
+                serde_json::json!({"key":"direct", "content":"direct-private"}),
+            ),
+            (
+                "execute_pipeline",
+                serde_json::json!({"steps":[{"tool":"memory_store", "args":{"key":"pipeline", "content":"pipeline-private"}}]}),
+            ),
+            (
+                "capture__store",
+                serde_json::json!({"key":"skill", "content":"skill-private"}),
+            ),
+        ] {
+            let result = assembled
+                .registry
+                .iter()
+                .find(|tool| tool.name() == name)
+                .unwrap()
+                .execute(args)
+                .await
+                .unwrap();
+            assert!(result.success, "{name}: {result:?}");
+        }
+        assert!(
+            actual_store
+                .execute(serde_json::json!({"key":"parent", "content":"parent-private"}))
+                .await
+                .unwrap()
+                .success
+        );
+        // Retiring a top-level export must not recreate it, nor strand a still
+        // legal captured/parent target on the old store.
+        assembled
+            .registry
+            .retain(|tool| tool.name() != "memory_store");
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .all(|tool| tool.name() != "memory_store")
+        );
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .find(|tool| tool.name() == "capture__store")
+                .unwrap()
+                .execute(serde_json::json!({"key":"retained", "content":"retained-private"}))
+                .await
+                .unwrap()
+                .success
+        );
+        for key in ["direct", "pipeline", "skill", "parent", "retained"] {
+            assert!(original.get(key).await.unwrap().is_none(), "shared/{key}");
+            assert_eq!(
+                original
+                    .get_for_principal(&scope, key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                format!("{key}-private")
+            );
+        }
+        let exported = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "memory_export")
+            .unwrap()
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(exported.success);
+        assert!(!exported.output.contains("shared-sentinel"));
+        assert_eq!(
+            original.get("shared").await.unwrap().unwrap().content,
+            "shared-sentinel"
+        );
     }
 
     #[tokio::test]
@@ -2548,6 +3128,295 @@ mod tests {
         out.registry.iter().map(|t| t.name().to_string()).collect()
     }
 
+    const SOURCE_DESCRIPTION: &str = "source tool reusing a native name";
+
+    /// A source extension that reuses a native tool's name.
+    struct NamedSourceTool(&'static str);
+
+    impl zeroclaw_api::attribution::Attributable for NamedSourceTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            self.0
+        }
+    }
+
+    #[async_trait]
+    impl Tool for NamedSourceTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            SOURCE_DESCRIPTION
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "source answered".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Answers `tools/call` with the request's own id, so a dispatched MCP call
+    /// can be told apart from the source tool.
+    struct McpCallReply;
+
+    impl wiremock::Respond for McpCallReply {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| body.get("id").cloned())
+                .unwrap_or(serde_json::Value::Null);
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"content": [{"type": "text", "text": "mcp answered"}], "isError": false}
+            }))
+        }
+    }
+
+    async fn mcp_server_answering_calls() -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        let server = mock_mcp_http_server().await;
+        wiremock::Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "tools/call"}),
+            ))
+            .respond_with(McpCallReply)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Assemble `native` tools followed by `source` tools in native
+    /// compatibility mode, with a delegate parent handle.
+    async fn assemble_native_compat(
+        config: &Config,
+        native: Vec<Box<dyn Tool>>,
+        source: Vec<Box<dyn Tool>>,
+    ) -> (ScopedAssembled, DelegateParentToolsHandle) {
+        let tail = native.len()..native.len() + source.len();
+        let mut tools = native;
+        tools.extend(source);
+        let mut built = built_with(tools);
+        let parent: DelegateParentToolsHandle = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        built.delegate_handle = Some(Arc::clone(&parent));
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ScopedToolRegistry::assemble_prepared(
+                ScopedAssembly {
+                    config,
+                    agent_alias: "scoped",
+                    security: &security,
+                    built,
+                    skills: &[],
+                    runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                    caller_allowed: None,
+                    connect_mcp: true,
+                    connect_peripherals: false,
+                    exclude_memory: false,
+                    acp_delivery: false,
+                    list_deferred_mcp_specs: false,
+                    emit_assembly_logs: false,
+                    mcp_registry: None,
+                },
+                RegistryConstruction::NativeCompat,
+                tail,
+            ),
+        )
+        .await
+        .expect("assemble must not hang");
+        (out, parent)
+    }
+
+    fn assert_parent_has_no_source(parent: &DelegateParentToolsHandle, name: &str) {
+        assert!(
+            !parent
+                .read()
+                .iter()
+                .any(|tool| tool.name() == name && tool.description() == SOURCE_DESCRIPTION),
+            "{name}: the delegate's parent view holds no source tool with the name"
+        );
+    }
+
+    /// Exactly one tool owns `name`, dispatch reaches it rather than the source
+    /// tool, and the delegate's parent view holds no source tool with the name.
+    fn assert_native_owns<'a>(
+        out: &'a ScopedAssembled,
+        parent: &DelegateParentToolsHandle,
+        name: &str,
+    ) -> &'a dyn Tool {
+        let named = out
+            .registry
+            .iter()
+            .filter(|tool| tool.name() == name)
+            .count();
+        assert_eq!(named, 1, "{name}: exactly one tool owns the name");
+        let found = crate::agent::tool_execution::find_tool(&out.registry, name)
+            .expect("the native tool is registered");
+        assert_ne!(
+            found.description(),
+            SOURCE_DESCRIPTION,
+            "{name}: dispatch reaches the native tool, not the source tool"
+        );
+        assert_parent_has_no_source(parent, name);
+        found
+    }
+
+    /// Eager MCP: the wrapper owns its `<server>__<tool>` name and a call
+    /// reaches the MCP server.
+    #[tokio::test]
+    async fn native_compat_eager_mcp_tool_retires_a_same_name_source_tool() {
+        let server = mcp_server_answering_calls().await;
+        let server2 = mock_mcp_http_server().await;
+        let mut config = config_with_bundled_mcp(server.uri(), server2.uri());
+        config.mcp.deferred_loading = false;
+        let (out, parent) = assemble_native_compat(
+            &config,
+            Vec::new(),
+            vec![Box::new(NamedSourceTool("remote__echo"))],
+        )
+        .await;
+        let tool = assert_native_owns(&out, &parent, "remote__echo");
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(
+            result.output.to_string().contains("mcp answered"),
+            "the call reached the MCP server: {result:?}"
+        );
+        assert!(out.mcp_tool_names.contains("remote__echo"));
+    }
+
+    /// Deferred MCP: no static source tool answers under the MCP name, and the
+    /// tool activates through the native `tool_search` and reaches the server.
+    #[tokio::test]
+    async fn native_compat_deferred_mcp_tool_retires_a_same_name_source_tool() {
+        let server = mcp_server_answering_calls().await;
+        let server2 = mock_mcp_http_server().await;
+        let mut config = config_with_bundled_mcp(server.uri(), server2.uri());
+        config.mcp.deferred_loading = true;
+        let (out, parent) = assemble_native_compat(
+            &config,
+            Vec::new(),
+            vec![Box::new(NamedSourceTool("remote__echo"))],
+        )
+        .await;
+        assert!(
+            crate::agent::tool_execution::find_tool(&out.registry, "remote__echo").is_none(),
+            "no static tool answers before the deferred MCP tool activates"
+        );
+        assert_parent_has_no_source(&parent, "remote__echo");
+        let search = assert_native_owns(&out, &parent, "tool_search");
+        let selected = search
+            .execute(serde_json::json!({"query": "select:remote__echo"}))
+            .await
+            .unwrap();
+        assert!(selected.success, "{selected:?}");
+        let activated = out
+            .activated_handle
+            .as_ref()
+            .expect("deferred MCP tools activate through tool_search")
+            .lock()
+            .unwrap()
+            .get_resolved("remote__echo")
+            .expect("the MCP tool is activated");
+        let result = activated.execute(serde_json::json!({})).await.unwrap();
+        assert!(
+            result.output.to_string().contains("mcp answered"),
+            "the activated call reached the MCP server: {result:?}"
+        );
+        assert_parent_has_no_source(&parent, "remote__echo");
+    }
+
+    /// An MCP capability tool keeps its name too.
+    #[tokio::test]
+    async fn native_compat_mcp_capability_tool_retires_a_same_name_source_tool() {
+        let server = mock_mcp_http_server().await;
+        let server2 = mock_mcp_http_server().await;
+        let mut config = config_with_bundled_mcp(server.uri(), server2.uri());
+        config.mcp.deferred_loading = false;
+        let (out, parent) = assemble_native_compat(
+            &config,
+            Vec::new(),
+            vec![Box::new(NamedSourceTool("mcp_resources"))],
+        )
+        .await;
+        assert_native_owns(&out, &parent, "mcp_resources");
+    }
+
+    /// Deferred MCP builds `tool_search`; a source `tool_search` gives way.
+    #[tokio::test]
+    async fn native_compat_mcp_search_retires_a_source_tool_search() {
+        let server = mock_mcp_http_server().await;
+        let server2 = mock_mcp_http_server().await;
+        let mut config = config_with_bundled_mcp(server.uri(), server2.uri());
+        config.mcp.deferred_loading = true;
+        let (out, parent) = assemble_native_compat(
+            &config,
+            Vec::new(),
+            vec![Box::new(NamedSourceTool("tool_search"))],
+        )
+        .await;
+        assert_native_owns(&out, &parent, "tool_search");
+    }
+
+    /// Builtin schema deferral builds `tool_search` without MCP; a source
+    /// `tool_search` gives way there as well.
+    #[tokio::test]
+    async fn native_compat_builtin_search_retires_a_source_tool_search() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            "deferral".into(),
+            RuntimeProfileConfig {
+                deferred_builtin_tools: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "scoped".into(),
+            AliasedAgentConfig {
+                runtime_profile: "deferral".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (out, parent) = assemble_native_compat(
+            &config,
+            vec![Box::new(CountingTool {
+                name: "calculator",
+                calls,
+            })],
+            vec![Box::new(NamedSourceTool("tool_search"))],
+        )
+        .await;
+        assert_native_owns(&out, &parent, "tool_search");
+    }
+
+    /// With the pipeline enabled, a source `execute_pipeline` gives way to the
+    /// native pipeline (its name is reserved for the pipeline).
+    #[tokio::test]
+    async fn native_compat_pipeline_retires_a_source_execute_pipeline() {
+        let mut config = Config::default();
+        config.pipeline.enabled = true;
+        config.tools.optional.push("execute_pipeline".into());
+        let (out, parent) = assemble_native_compat(
+            &config,
+            Vec::new(),
+            vec![Box::new(NamedSourceTool("execute_pipeline"))],
+        )
+        .await;
+        assert_native_owns(&out, &parent, "execute_pipeline");
+    }
+
     #[tokio::test]
     async fn assemble_lists_bundled_mcp_tools_in_both_loading_modes() {
         let server = mock_mcp_http_server().await;
@@ -2618,7 +3487,13 @@ mod tests {
 
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
         ScopedAssembled {
-            registry: ScopedToolRegistry(Vec::new(), None),
+            registry: ScopedToolRegistry(
+                Vec::new(),
+                None,
+                RegistryConstruction::NativeCompat,
+                Default::default(),
+                None,
+            ),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),

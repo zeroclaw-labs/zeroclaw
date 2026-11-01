@@ -206,6 +206,10 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
+use zeroclaw_api::memory_traits::{
+    ExportFilter, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope, ProceduralMessage,
+    StoreOptions,
+};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
@@ -213,7 +217,10 @@ pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
 
 /// Shared handle to the delegate tool's parent-tools list.
-/// Callers can push additional tools (e.g. MCP wrappers) after construction.
+/// Assembly narrows the existing entries with its canonical context predicate
+/// at gate time, preserving surviving Arcs and their order. This remains a live
+/// handle: trusted later writers must apply the context relevant to their own
+/// additions. It is not a continuously filtered view or a native-origin proof.
 pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
 
 /// Thin wrapper that makes an `Arc<dyn Tool>` usable as `Box<dyn Tool>`.
@@ -453,10 +460,6 @@ pub(crate) fn reserve_deferred_host_names(
     reserved_host_names.extend(["mcp_resources", "mcp_prompts"].map(String::from));
 }
 
-fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
-    tools.into_iter().map(ArcDelegatingTool::boxed).collect()
-}
-
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
@@ -624,7 +627,7 @@ pub(crate) fn register_prepared_skill_tools<T>(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!(
-                    "Skill tool '{}' shadows built-in tool, skipping",
+                    "Skill tool '{}' has the name of a registered native tool, skipping",
                     name(&tool)
                 )
             );
@@ -732,6 +735,9 @@ pub use shell_env::ForwardedEnvironment;
 /// to destructure across many callers.
 #[allow(clippy::type_complexity)]
 pub struct AllToolsResult {
+    /// Private creator identity and wrapper projections. External prebuilt
+    /// inputs use `from_prebuilt_tools` and begin with unknown provenance.
+    pub(crate) native_memory: NativeMemoryProjection,
     /// The eager registry retained by this factory, before the per-agent
     /// `allowed_tools`/`excluded_tools` filter.
     ///
@@ -759,6 +765,12 @@ pub struct AllToolsResult {
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+    /// The capability slots of the tools this factory registered that start
+    /// child operations (delegate, `spawn_subagent`, `send_message_to_peer`, `cron_run`),
+    /// so the entry point that owns the registry can bind its capabilities
+    /// and principal (`RuntimeCapabilities::prepare_registry`) and those
+    /// children run through them.
+    pub capability_slots: Vec<crate::composition::CapabilitySlot>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
     /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
@@ -774,9 +786,10 @@ impl AllToolsResult {
     /// Wrap an already-built tool vector as `assemble` INPUT, with every
     /// side-channel handle empty. This mints an `AllToolsResult` (the input to
     /// [`crate::tools::scoped::ScopedToolRegistry::assemble`]), NOT a
-    /// `ScopedToolRegistry` - it does not touch the seal. (`AllToolsResult`'s
-    /// fields are all `pub`, so a caller could already hand-roll this literal;
-    /// the helper just centralizes the "all handles empty" shape.) Used by the
+    /// `ScopedToolRegistry` - it does not touch the seal. Prebuilt inputs have
+    /// unknown creator provenance. Use this constructor instead of an exhaustive
+    /// literal: the private provenance transport deliberately prevents external
+    /// callers from minting native creator identity. Used by the
     /// paths that already own a fixed / pre-filtered tool set (the skill-review
     /// harness, bounded delegation, and the `zeroclaw-eval` replay harness) and
     /// route it through `assemble` only to seal it: they pass `skills: &[]`,
@@ -785,6 +798,7 @@ impl AllToolsResult {
     /// out-of-crate `zeroclaw-eval` harness can reach it.
     pub fn from_prebuilt_tools(tools: Vec<Box<dyn Tool>>) -> Self {
         Self {
+            native_memory: NativeMemoryProjection::default(),
             tools,
             reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
@@ -794,9 +808,724 @@ impl AllToolsResult {
             poll_handle: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            capability_slots: Vec::new(),
             #[cfg(test)]
             delegate_tool: None,
         }
+    }
+
+    pub(crate) fn from_inherited_tools(
+        tools: &[Arc<dyn Tool>],
+        origins: NativeMemoryOrigins,
+        binding: std::sync::Weak<NativeMemoryBinding>,
+    ) -> Self {
+        let mut built = Self::from_prebuilt_tools(Vec::new());
+        built.native_memory.origins = origins;
+        built.native_memory.binding = binding;
+        built.tools = built.native_memory.wrap_actual_tools(tools);
+        built
+    }
+}
+
+/// Supplied-only construction warms generic parsers on the existing bounded
+/// builder stack without constructing native tools or integrations.
+pub(crate) fn supplied_registry_base() -> anyhow::Result<AllToolsResult> {
+    // The parsers only need warming once per process. Two first builds may
+    // both warm them; that is harmless and keeps a failed warmup retryable.
+    static WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARMED.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::Builder::new()
+            .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
+            .spawn(warm_lazy_regexes)?
+            .join()
+            .map_err(|_| anyhow::Error::msg("tool parser warmup panicked"))?;
+        WARMED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    Ok(AllToolsResult::from_prebuilt_tools(Vec::new()))
+}
+
+/// Resource ownership for one canonical native-memory construction batch.
+/// The family origin ledger only holds Weak identity; it never owns this cell.
+/// A target is installed once, before any operation starts. Native Tool Arcs
+/// and all of their existing captures therefore keep their exact identities.
+/// `health_check` and `refresh_embedder` also start use; even an eager probe
+/// therefore makes later principal routing fail closed.
+pub(crate) struct NativeMemoryBinding {
+    original: Arc<dyn Memory>,
+    security: Arc<SecurityPolicy>,
+    routed: std::sync::OnceLock<Arc<dyn Memory>>,
+    operation_started: parking_lot::Mutex<bool>,
+}
+
+impl NativeMemoryBinding {
+    fn new(original: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            original,
+            security,
+            routed: std::sync::OnceLock::new(),
+            operation_started: parking_lot::Mutex::new(false),
+        }
+    }
+
+    fn selected(&self) -> &Arc<dyn Memory> {
+        self.routed.get().unwrap_or(&self.original)
+    }
+
+    fn begin_operation(&self) -> Arc<dyn Memory> {
+        let mut started = self.operation_started.lock();
+        *started = true;
+        Arc::clone(self.selected())
+    }
+
+    fn bind(
+        &self,
+        original: &Arc<dyn Memory>,
+        target: Arc<dyn Memory>,
+        security: &Arc<SecurityPolicy>,
+    ) -> anyhow::Result<()> {
+        let started = self.operation_started.lock();
+        anyhow::ensure!(
+            Arc::ptr_eq(original, &self.original) && Arc::ptr_eq(security, &self.security),
+            "native_memory_binding_owner_mismatch"
+        );
+        if let Some(current) = self.routed.get() {
+            anyhow::ensure!(
+                Arc::ptr_eq(current, &target),
+                "native_memory_binding_already_routed"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(!*started, "native_memory_binding_operation_already_started");
+        self.routed
+            .set(target)
+            .map_err(|_| anyhow::Error::msg("native_memory_binding_already_routed"))
+    }
+}
+
+impl zeroclaw_api::attribution::Attributable for NativeMemoryBinding {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        self.selected().role()
+    }
+    fn alias(&self) -> &str {
+        self.selected().alias()
+    }
+    fn tool_provenance(&self) -> zeroclaw_api::attribution::ToolProvenance {
+        self.selected().tool_provenance()
+    }
+}
+
+// Explicitly forward every override. Relying on a Memory default here could
+// replace a backend's scoped lookup or refusal with a different operation.
+#[async_trait]
+impl Memory for NativeMemoryBinding {
+    fn name(&self) -> &str {
+        self.selected().name()
+    }
+
+    async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual.store(key, content, category, session_id).await
+    }
+
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.recall(query, limit, session_id, since, until).await
+    }
+
+    async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.get(key).await
+    }
+
+    async fn get_for_agent(
+        &self,
+        key: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.get_for_agent(key, agent_id).await
+    }
+
+    async fn list(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.list(category, session_id).await
+    }
+
+    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+        let actual = self.begin_operation();
+        actual.forget(key).await
+    }
+
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+        let actual = self.begin_operation();
+        actual.forget_for_agent(key, agent_id).await
+    }
+
+    async fn store_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_for_principal(scope, key, content, category, session_id)
+            .await
+    }
+
+    async fn recall_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual
+            .recall_for_principal(scope, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn list_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.list_for_principal(scope, category, session_id).await
+    }
+
+    async fn get_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.get_for_principal(scope, key).await
+    }
+
+    async fn forget_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let actual = self.begin_operation();
+        actual.forget_for_principal(scope, key).await
+    }
+
+    async fn count_for_principal(&self, scope: &PrincipalScope) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.count_for_principal(scope).await
+    }
+
+    async fn export_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        filter: &ExportFilter,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.export_for_principal(scope, filter).await
+    }
+
+    async fn purge_namespace_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        namespace: &str,
+    ) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_namespace_for_principal(scope, namespace).await
+    }
+
+    async fn purge_session_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        session_id: &str,
+    ) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_session_for_principal(scope, session_id).await
+    }
+
+    async fn purge_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_namespace(namespace).await
+    }
+
+    async fn purge_session(&self, session_id: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_session(session_id).await
+    }
+
+    async fn purge_session_for_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_session_for_agent(session_id, agent_id).await
+    }
+
+    async fn purge_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.purge_agent(agent_alias).await
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.export_agent(agent_alias).await
+    }
+
+    async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.rename_agent(from, to).await
+    }
+
+    async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.count_agent(agent_alias).await
+    }
+
+    async fn count(&self) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.count().await
+    }
+
+    async fn health_check(&self) -> bool {
+        let actual = self.begin_operation();
+        actual.health_check().await
+    }
+
+    async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual.supersede(superseded_ids, new_id).await
+    }
+
+    async fn store_procedural(
+        &self,
+        messages: &[ProceduralMessage],
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual.store_procedural(messages, session_id).await
+    }
+
+    async fn count_in_scope(
+        &self,
+        namespace: Option<&str>,
+        category: Option<&MemoryCategory>,
+    ) -> anyhow::Result<u64> {
+        let actual = self.begin_operation();
+        actual.count_in_scope(namespace, category).await
+    }
+
+    async fn stats(&self) -> anyhow::Result<MemoryStats> {
+        let actual = self.begin_operation();
+        actual.stats().await
+    }
+
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        let actual = self.begin_operation();
+        actual.reindex().await
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        let actual = self.begin_operation();
+        actual.refresh_embedder(model_provider, api_key, model, dimensions)
+    }
+
+    async fn recall_namespaced(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual
+            .recall_namespaced(namespace, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual.export(filter).await
+    }
+
+    async fn store_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_with_metadata(key, content, category, session_id, namespace, importance)
+            .await
+    }
+
+    async fn store_with_options(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_with_options(key, content, category, session_id, options)
+            .await
+    }
+
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_with_options_and_agent(key, content, category, session_id, options, agent_id)
+            .await
+    }
+
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let actual = self.begin_operation();
+        actual
+            .store_with_agent(
+                key, content, category, session_id, namespace, importance, agent_id,
+            )
+            .await
+    }
+
+    async fn recall_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let actual = self.begin_operation();
+        actual
+            .recall_for_agents(allowed_agent_ids, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
+        let actual = self.begin_operation();
+        actual.ensure_agent_uuid(alias).await
+    }
+}
+
+/// These kinds are stamped only by the actual fixed native constructors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NativeMemoryKind {
+    Store,
+    Recall,
+    Forget,
+    Export,
+    Purge,
+}
+
+pub(crate) struct NativeMemoryOrigin {
+    binding: std::sync::Weak<NativeMemoryBinding>,
+    pub(crate) kind: NativeMemoryKind,
+    actual: std::sync::Weak<dyn Tool>,
+}
+
+type NativeMemorySnapshotEntry = (Arc<dyn Tool>, Option<Arc<NativeMemoryOrigin>>);
+
+#[derive(Default)]
+struct MemoryOriginRecords {
+    native: Vec<Arc<NativeMemoryOrigin>>,
+    supplied: Vec<std::sync::Weak<dyn Tool>>,
+    #[cfg(test)]
+    constructed: Vec<NativeMemoryKind>,
+    /// Observations only: weak actual constructor inputs add no policy lifetime.
+    #[cfg(test)]
+    constructed_policy_chains: Vec<(NativeMemoryKind, Vec<std::sync::Weak<SecurityPolicy>>)>,
+}
+
+/// Metadata shares the existing registry family's lifetime, never Tool ownership.
+#[derive(Clone, Default)]
+pub(crate) struct NativeMemoryOrigins(Arc<parking_lot::Mutex<MemoryOriginRecords>>);
+
+impl NativeMemoryOrigins {
+    /// Root-family construction only: there are no delegated ancestors yet.
+    /// Bounded replacements must use `construct_bounded` with their actual chain.
+    fn construct(
+        &self,
+        kind: NativeMemoryKind,
+        binding: &Arc<NativeMemoryBinding>,
+    ) -> Arc<dyn Tool> {
+        self.construct_with_bounded_policies(kind, binding, None)
+    }
+
+    pub(crate) fn construct_bounded(
+        &self,
+        kind: NativeMemoryKind,
+        binding: &Arc<NativeMemoryBinding>,
+        policies: Arc<delegate::BoundedMemoryPolicyChain>,
+    ) -> Arc<dyn Tool> {
+        self.construct_with_bounded_policies(kind, binding, Some(policies))
+    }
+
+    fn construct_with_bounded_policies(
+        &self,
+        kind: NativeMemoryKind,
+        binding: &Arc<NativeMemoryBinding>,
+        policies: Option<Arc<delegate::BoundedMemoryPolicyChain>>,
+    ) -> Arc<dyn Tool> {
+        let memory: Arc<dyn Memory> = Arc::clone(binding) as Arc<dyn Memory>;
+        let security = Arc::clone(&binding.security);
+        #[cfg(test)]
+        let observed_policies = policies
+            .as_ref()
+            .map(|chain| chain.weak_policy_observations());
+        let actual: Arc<dyn Tool> = match kind {
+            NativeMemoryKind::Store => Arc::new(MemoryStoreTool::new(memory, security)),
+            NativeMemoryKind::Recall => Arc::new(MemoryRecallTool::new(memory)),
+            NativeMemoryKind::Forget => Arc::new(MemoryForgetTool::new(memory, security)),
+            NativeMemoryKind::Export => Arc::new(MemoryExportTool::new(memory)),
+            NativeMemoryKind::Purge => Arc::new(MemoryPurgeTool::new(memory, security)),
+        };
+        // Only the sealed creator's actual mutating kinds gain this guard.
+        // Neither an arbitrary same-named tool nor a read is reclassified.
+        let actual = if matches!(
+            kind,
+            NativeMemoryKind::Store | NativeMemoryKind::Forget | NativeMemoryKind::Purge
+        ) && let Some(policies) = policies
+        {
+            policies.wrap_act_tool(actual)
+        } else {
+            actual
+        };
+        let witness = Arc::new(NativeMemoryOrigin {
+            kind,
+            actual: Arc::downgrade(&actual),
+            binding: Arc::downgrade(binding),
+        });
+        let mut records = self.0.lock();
+        records
+            .native
+            .retain(|entry| entry.actual.strong_count() != 0);
+        records.native.push(witness);
+        #[cfg(test)]
+        records.constructed.push(kind);
+        #[cfg(test)]
+        if let Some(chain) = observed_policies {
+            records.constructed_policy_chains.push((kind, chain));
+        }
+        actual
+    }
+
+    pub(crate) fn prove(&self, actual: &Arc<dyn Tool>) -> Option<Arc<NativeMemoryOrigin>> {
+        let mut records = self.0.lock();
+        records
+            .native
+            .retain(|entry| entry.actual.strong_count() != 0);
+        records
+            .native
+            .iter()
+            .find(|entry| {
+                entry.binding.upgrade().is_some()
+                    && entry
+                        .actual
+                        .upgrade()
+                        .is_some_and(|owned| Arc::ptr_eq(&owned, actual))
+            })
+            .cloned()
+    }
+
+    pub(crate) fn snapshot(&self, tools: &[Arc<dyn Tool>]) -> Vec<NativeMemorySnapshotEntry> {
+        let mut records = self.0.lock();
+        records
+            .native
+            .retain(|entry| entry.actual.strong_count() != 0);
+        tools
+            .iter()
+            .map(|actual| {
+                let witness = records
+                    .native
+                    .iter()
+                    .find(|entry| {
+                        entry.binding.upgrade().is_some()
+                            && entry
+                                .actual
+                                .upgrade()
+                                .is_some_and(|owned| Arc::ptr_eq(&owned, actual))
+                    })
+                    .cloned();
+                (Arc::clone(actual), witness)
+            })
+            .collect()
+    }
+
+    pub(crate) fn mark_supplied(&self, actual: &Arc<dyn Tool>) {
+        let mut records = self.0.lock();
+        records.supplied.retain(|entry| entry.strong_count() != 0);
+        if !records.supplied.iter().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|owned| Arc::ptr_eq(&owned, actual))
+        }) {
+            records.supplied.push(Arc::downgrade(actual));
+        }
+    }
+
+    pub(crate) fn is_supplied(&self, actual: &Arc<dyn Tool>) -> bool {
+        let mut records = self.0.lock();
+        records.supplied.retain(|entry| entry.strong_count() != 0);
+        records.supplied.iter().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|owned| Arc::ptr_eq(&owned, actual))
+        })
+    }
+}
+
+/// Per-view wrapper identity points to the SAME creator witness as the parent
+/// handle. The private pointer key never establishes native origin by itself.
+#[derive(Default)]
+pub(crate) struct NativeMemoryProjection {
+    pub(crate) origins: NativeMemoryOrigins,
+    wrappers: HashMap<usize, MemoryWrapperOrigin>,
+    binding: std::sync::Weak<NativeMemoryBinding>,
+}
+
+struct MemoryWrapperOrigin {
+    wrapper: std::sync::Weak<dyn Tool>,
+    actual: std::sync::Weak<dyn Tool>,
+    native_memory: Option<Arc<NativeMemoryOrigin>>,
+    supplied: bool,
+}
+
+impl NativeMemoryProjection {
+    fn key(tool: &dyn Tool) -> usize {
+        tool as *const dyn Tool as *const () as usize
+    }
+
+    pub(crate) fn wrap_actual_tools(&mut self, tools: &[Arc<dyn Tool>]) -> Vec<Box<dyn Tool>> {
+        tools
+            .iter()
+            .map(|actual| {
+                let witness = self.origins.prove(actual);
+                let supplied = self.origins.is_supplied(actual);
+                self.publish(Arc::clone(actual), witness, supplied)
+            })
+            .collect()
+    }
+
+    pub(crate) fn publish(
+        &mut self,
+        actual: Arc<dyn Tool>,
+        witness: Option<Arc<NativeMemoryOrigin>>,
+        supplied: bool,
+    ) -> Box<dyn Tool> {
+        if witness.is_none() && !supplied {
+            return ArcDelegatingTool::boxed(actual);
+        }
+        let wrapper: Arc<dyn Tool> = Arc::new(ArcToolRef(Arc::clone(&actual)));
+        let boxed: Box<dyn Tool> = Box::new(ArcToolRef(Arc::clone(&wrapper)));
+        self.wrappers.insert(
+            Self::key(boxed.as_ref()),
+            MemoryWrapperOrigin {
+                wrapper: Arc::downgrade(&wrapper),
+                actual: Arc::downgrade(&actual),
+                native_memory: witness,
+                supplied,
+            },
+        );
+        boxed
+    }
+
+    pub(crate) fn take(
+        &mut self,
+        tool: &dyn Tool,
+    ) -> (Option<Arc<dyn Tool>>, Option<Arc<NativeMemoryOrigin>>, bool) {
+        let Some(entry) = self.wrappers.remove(&Self::key(tool)) else {
+            return (None, None, false);
+        };
+        // The private wrapper is strongly owned only by the original Box.
+        // Removing that Box expires this witness, so allocator address reuse
+        // cannot promote a replacement Box or replay its creator metadata.
+        let (Some(wrapper), Some(actual)) = (entry.wrapper.upgrade(), entry.actual.upgrade())
+        else {
+            return (None, None, false);
+        };
+        drop(wrapper);
+        (Some(actual), entry.native_memory, entry.supplied)
+    }
+
+    pub(crate) fn retains_source(
+        &self,
+        tools: &[Box<dyn Tool>],
+        candidate: &Arc<dyn Tool>,
+    ) -> bool {
+        tools.iter().any(|tool| {
+            self.wrappers
+                .get(&Self::key(tool.as_ref()))
+                .is_some_and(|entry| {
+                    entry.supplied
+                        && entry.wrapper.upgrade().is_some()
+                        && entry
+                            .actual
+                            .upgrade()
+                            .is_some_and(|actual| Arc::ptr_eq(&actual, candidate))
+                })
+        })
+    }
+
+    pub(crate) fn retain(&mut self, tools: &[Box<dyn Tool>]) {
+        let live: std::collections::HashSet<_> =
+            tools.iter().map(|tool| Self::key(tool.as_ref())).collect();
+        self.wrappers.retain(|key, _| live.contains(key));
     }
 }
 
@@ -1602,6 +2331,20 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
+    let mut capability_slots = Vec::new();
+    let mut native_memory = NativeMemoryProjection::default();
+    let memory_origins = native_memory.origins.clone();
+    let memory_binding = std::sync::OnceLock::<Arc<NativeMemoryBinding>>::new();
+    let mut construct_memory = |kind| {
+        let binding = memory_binding.get_or_init(|| {
+            Arc::new(NativeMemoryBinding::new(
+                Arc::clone(&memory),
+                Arc::clone(security),
+            ))
+        });
+        native_memory.binding = Arc::downgrade(binding);
+        memory_origins.construct(kind, binding)
+    };
     let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
     let mut reserved_host_names = std::collections::HashSet::new();
     reserve_deferred_host_names(root_config, &mut reserved_host_names);
@@ -1716,40 +2459,26 @@ fn all_tools_with_runtime_on_thread(
             runtime.clone(),
         ))
     );
-    register_tool!(
-        "cron_run",
-        Arc::new(CronRunTool::new_with_runtime_and_capability(
+    register_tool!("cron_run", {
+        let tool = CronRunTool::new_with_runtime_and_capability(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
             execution_capability.clone(),
-        ))
-    );
+        );
+        capability_slots.push(tool.capabilities_slot());
+        Arc::new(tool)
+    });
     register_tool!(
         "cron_runs",
         Arc::new(CronRunsTool::new(config.clone(), agent_alias))
     );
-    register_tool!(
-        "memory_store",
-        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone()))
-    );
-    register_tool!(
-        "memory_recall",
-        Arc::new(MemoryRecallTool::new(memory.clone()))
-    );
-    register_tool!(
-        "memory_forget",
-        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone()))
-    );
-    register_tool!(
-        "memory_export",
-        Arc::new(MemoryExportTool::new(memory.clone()))
-    );
-    register_tool!(
-        "memory_purge",
-        Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone()))
-    );
+    register_tool!("memory_store", construct_memory(NativeMemoryKind::Store));
+    register_tool!("memory_recall", construct_memory(NativeMemoryKind::Recall));
+    register_tool!("memory_forget", construct_memory(NativeMemoryKind::Forget));
+    register_tool!("memory_export", construct_memory(NativeMemoryKind::Export));
+    register_tool!("memory_purge", construct_memory(NativeMemoryKind::Purge));
     register_tool!(
         "schedule",
         Arc::new(ScheduleTool::new_with_runtime(
@@ -1759,27 +2488,27 @@ fn all_tools_with_runtime_on_thread(
             runtime.clone(),
         ))
     );
-    register_tool!(
-        "spawn_subagent",
-        Arc::new(
-            SpawnSubagentTool::new(
-                Arc::clone(&root_config_shared),
-                agent_alias,
-                security.clone(),
-            )
-            .with_subagent_caller(is_subagent_caller)
-            .with_execution_capability(execution_capability.clone()),
+    register_tool!("spawn_subagent", {
+        let tool = SpawnSubagentTool::new(
+            Arc::clone(&root_config_shared),
+            agent_alias,
+            security.clone(),
         )
-    );
-    register_tool!(
-        "send_message_to_peer",
-        Arc::new(SendMessageToPeerTool::new_with_live_config_and_capability(
+        .with_subagent_caller(is_subagent_caller)
+        .with_execution_capability(execution_capability.clone());
+        capability_slots.push(tool.capabilities_slot());
+        Arc::new(tool)
+    });
+    register_tool!("send_message_to_peer", {
+        let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
             Arc::clone(&root_config_shared),
             agent_alias,
             live_config.clone(),
             execution_capability.clone(),
-        ))
-    );
+        );
+        capability_slots.push(tool.capabilities_slot());
+        Arc::new(tool)
+    });
     register_tool!(
         "model_routing_config",
         Arc::new(ModelRoutingConfigTool::new(
@@ -2906,11 +3635,14 @@ fn all_tools_with_runtime_on_thread(
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
                 );
+                let tools = native_memory.wrap_actual_tools(&tool_arcs);
                 return Ok(AllToolsResult {
-                    unfiltered_tool_arcs: tool_arcs.clone(),
-                    tools: boxed_registry_from_arcs(tool_arcs),
+                    native_memory,
+                    unfiltered_tool_arcs: tool_arcs,
+                    tools,
                     reserved_host_names,
                     delegate_handle: None,
+                    capability_slots,
                     #[cfg(test)]
                     delegate_tool: None,
                     ask_user_handle,
@@ -3017,7 +3749,7 @@ fn all_tools_with_runtime_on_thread(
             security.clone(),
             provider_runtime_options.clone(),
         )
-        .with_parent_tools(Arc::clone(&parent_tools))
+        .with_owned_parent_tools(Arc::clone(&parent_tools), memory_origins.clone())
         .with_runtime(runtime.clone())
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
@@ -3047,6 +3779,7 @@ fn all_tools_with_runtime_on_thread(
         .with_live_config(live_config.clone())
         .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
+            capability_slots.push(delegate_tool.capabilities_slot());
             let delegate_tool = Arc::new(delegate_tool);
             #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
             late_tool_search_observer::record(
@@ -3139,11 +3872,14 @@ fn all_tools_with_runtime_on_thread(
     // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
     // effective per-agent policy and optional caller allowlist are both known.
 
+    let tools = native_memory.wrap_actual_tools(&tool_arcs);
     Ok(AllToolsResult {
-        unfiltered_tool_arcs: tool_arcs.clone(),
-        tools: boxed_registry_from_arcs(tool_arcs),
+        native_memory,
+        unfiltered_tool_arcs: tool_arcs,
+        tools,
         reserved_host_names,
         delegate_handle,
+        capability_slots,
         ask_user_handle,
         channel_room_handle,
         reaction_handle,
@@ -4730,37 +5466,6 @@ permissions = ["http_client"]
         );
     }
 
-    /// Stands in for a tool a connected peripheral registers.
-    #[cfg(feature = "plugins-wasm-cranelift")]
-    struct PeripheralGpioRead;
-
-    #[cfg(feature = "plugins-wasm-cranelift")]
-    zeroclaw_api::mock_tool_attribution!(PeripheralGpioRead);
-
-    #[cfg(feature = "plugins-wasm-cranelift")]
-    #[async_trait::async_trait]
-    impl Tool for PeripheralGpioRead {
-        fn name(&self) -> &str {
-            "gpio_read"
-        }
-
-        fn description(&self) -> &str {
-            "Read a GPIO pin on a connected board"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            Ok(ToolResult {
-                success: true,
-                output: "peripheral".into(),
-                error: None,
-            })
-        }
-    }
-
     /// Peripheral and skill tools register during assembly, after plugin
     /// tools, so the loader cannot reserve their names. Assembly does: a guest
     /// that declares a connected peripheral's tool name, or a skill tool's name
@@ -4811,29 +5516,12 @@ permissions = ["http_client"]
         config.memory.backend = "none".into();
         config.peripherals.enabled = true;
         config.peripherals.boards = vec![zeroclaw_config::schema::PeripheralBoardConfig {
-            board: "late-name-probe".into(),
+            board: "native-trap-tool-gpio_read".into(),
             ..Default::default()
         }];
-        // The factory is process-wide; it answers only for this test's board.
-        crate::agent::loop_::register_peripheral_tools_fn(Box::new(|peripherals| {
-            let tools: anyhow::Result<Vec<Box<dyn Tool>>> = Ok(
-                if peripherals
-                    .boards
-                    .iter()
-                    .any(|board| board.board == "late-name-probe")
-                {
-                    vec![Box::new(PeripheralGpioRead)]
-                } else {
-                    Vec::new()
-                },
-            );
-            Box::pin(std::future::ready(tools))
-                as std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = anyhow::Result<Vec<Box<dyn Tool>>>> + Send,
-                    >,
-                >
-        }));
+        // The peripheral factory is process-wide; the shared trap builds a tool
+        // named after this test's board.
+        crate::composition::test_support::register_peripheral_trap();
         let security = Arc::new(SecurityPolicy {
             workspace_dir: tmp.path().into(),
             ..Default::default()
@@ -8142,5 +8830,955 @@ pub(crate) mod late_tool_search_observer {
                 .filter(|row| row.kind == kind && row.label == label)
                 .count()
         }
+    }
+}
+
+#[cfg(test)]
+mod native_memory_binding_tests {
+    use super::*;
+    use zeroclaw_api::attribution::{Attributable, MemoryKind, Role, ToolProvenance};
+
+    #[derive(Default)]
+    struct ForwardingProbe {
+        calls: parking_lot::Mutex<Vec<&'static str>>,
+        backing: Option<Arc<dyn Memory>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    fn assert_default_export_filter(filter: &ExportFilter) {
+        assert!(filter.namespace.is_none());
+        assert!(filter.session_id.is_none());
+        assert!(filter.category.is_none());
+        assert!(filter.since.is_none());
+        assert!(filter.until.is_none());
+    }
+
+    impl Attributable for ForwardingProbe {
+        fn role(&self) -> Role {
+            Role::Memory(MemoryKind::None)
+        }
+        fn alias(&self) -> &str {
+            "forwarded-alias"
+        }
+        fn tool_provenance(&self) -> ToolProvenance {
+            ToolProvenance::Native
+        }
+    }
+
+    #[async_trait]
+    impl Memory for ForwardingProbe {
+        fn name(&self) -> &str {
+            self.calls.lock().push("name");
+            "forwarded-backend"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(
+                session_id,
+                if self.backing.is_some() {
+                    None
+                } else {
+                    Some("sentinel")
+                }
+            );
+            self.calls.lock().push("store");
+            if let Some(backing) = &self.backing {
+                self.entered.notify_one();
+                self.release.notified().await;
+                return backing.store(key, content, category, session_id).await;
+            }
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(query, "sentinel");
+            assert_eq!(limit, 3);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(since, Some("sentinel"));
+            assert_eq!(until, Some("sentinel"));
+            self.calls.lock().push("recall");
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            assert_eq!(key, "sentinel");
+            self.calls.lock().push("get");
+            Ok(None)
+        }
+
+        async fn get_for_agent(
+            &self,
+            key: &str,
+            agent_id: &str,
+        ) -> anyhow::Result<Option<MemoryEntry>> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(agent_id, "sentinel");
+            self.calls.lock().push("get_for_agent");
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            category: Option<&MemoryCategory>,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(category, Some(&MemoryCategory::Core));
+            assert_eq!(session_id, Some("sentinel"));
+            self.calls.lock().push("list");
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+            assert_eq!(key, "sentinel");
+            self.calls.lock().push("forget");
+            Ok(true)
+        }
+
+        async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(agent_id, "sentinel");
+            self.calls.lock().push("forget_for_agent");
+            Ok(true)
+        }
+
+        async fn store_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            self.calls.lock().push("store_for_principal");
+            Ok(())
+        }
+
+        async fn recall_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(query, "sentinel");
+            assert_eq!(limit, 3);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(since, Some("sentinel"));
+            assert_eq!(until, Some("sentinel"));
+            self.calls.lock().push("recall_for_principal");
+            Ok(Vec::new())
+        }
+
+        async fn list_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            category: Option<&MemoryCategory>,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(category, Some(&MemoryCategory::Core));
+            assert_eq!(session_id, Some("sentinel"));
+            self.calls.lock().push("list_for_principal");
+            Ok(Vec::new())
+        }
+
+        async fn get_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            key: &str,
+        ) -> anyhow::Result<Option<MemoryEntry>> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(key, "sentinel");
+            self.calls.lock().push("get_for_principal");
+            Ok(None)
+        }
+
+        async fn forget_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            key: &str,
+        ) -> anyhow::Result<bool> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(key, "sentinel");
+            self.calls.lock().push("forget_for_principal");
+            Ok(true)
+        }
+
+        async fn count_for_principal(&self, scope: &PrincipalScope) -> anyhow::Result<usize> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            self.calls.lock().push("count_for_principal");
+            Ok(7)
+        }
+
+        async fn export_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            filter: &ExportFilter,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_default_export_filter(filter);
+            self.calls.lock().push("export_for_principal");
+            Ok(Vec::new())
+        }
+
+        async fn purge_namespace_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            namespace: &str,
+        ) -> anyhow::Result<usize> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(namespace, "sentinel");
+            self.calls.lock().push("purge_namespace_for_principal");
+            Ok(7)
+        }
+
+        async fn purge_session_for_principal(
+            &self,
+            scope: &PrincipalScope,
+            session_id: &str,
+        ) -> anyhow::Result<usize> {
+            assert_eq!(scope.principal_id, "owner:sentinel");
+            assert_eq!(session_id, "sentinel");
+            self.calls.lock().push("purge_session_for_principal");
+            Ok(7)
+        }
+
+        async fn purge_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
+            assert_eq!(namespace, "sentinel");
+            self.calls.lock().push("purge_namespace");
+            Ok(7)
+        }
+
+        async fn purge_session(&self, session_id: &str) -> anyhow::Result<usize> {
+            assert_eq!(session_id, "sentinel");
+            self.calls.lock().push("purge_session");
+            Ok(7)
+        }
+
+        async fn purge_session_for_agent(
+            &self,
+            session_id: &str,
+            agent_id: &str,
+        ) -> anyhow::Result<usize> {
+            assert_eq!(session_id, "sentinel");
+            assert_eq!(agent_id, "sentinel");
+            self.calls.lock().push("purge_session_for_agent");
+            Ok(7)
+        }
+
+        async fn purge_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+            assert_eq!(agent_alias, "sentinel");
+            self.calls.lock().push("purge_agent");
+            Ok(7)
+        }
+
+        async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(agent_alias, "sentinel");
+            self.calls.lock().push("export_agent");
+            Ok(Vec::new())
+        }
+
+        async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+            assert_eq!(from, "sentinel");
+            assert_eq!(to, "sentinel");
+            self.calls.lock().push("rename_agent");
+            Ok(7)
+        }
+
+        async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+            assert_eq!(agent_alias, "sentinel");
+            self.calls.lock().push("count_agent");
+            Ok(7)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            self.calls.lock().push("count");
+            Ok(7)
+        }
+
+        async fn health_check(&self) -> bool {
+            self.calls.lock().push("health_check");
+            true
+        }
+
+        async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
+            assert_eq!(superseded_ids[0], "sentinel");
+            assert_eq!(new_id, "sentinel");
+            self.calls.lock().push("supersede");
+            Ok(())
+        }
+
+        async fn store_procedural(
+            &self,
+            messages: &[ProceduralMessage],
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(messages[0].content, "sentinel");
+            assert_eq!(session_id, Some("sentinel"));
+            self.calls.lock().push("store_procedural");
+            Ok(())
+        }
+
+        async fn count_in_scope(
+            &self,
+            namespace: Option<&str>,
+            category: Option<&MemoryCategory>,
+        ) -> anyhow::Result<u64> {
+            assert_eq!(namespace, Some("sentinel"));
+            assert_eq!(category, Some(&MemoryCategory::Core));
+            self.calls.lock().push("count_in_scope");
+            Ok(9)
+        }
+
+        async fn stats(&self) -> anyhow::Result<MemoryStats> {
+            self.calls.lock().push("stats");
+            Ok(MemoryStats {
+                total_rows: 7,
+                ..Default::default()
+            })
+        }
+
+        async fn reindex(&self) -> anyhow::Result<usize> {
+            self.calls.lock().push("reindex");
+            Ok(7)
+        }
+
+        fn refresh_embedder(
+            &self,
+            model_provider: &str,
+            api_key: Option<&str>,
+            model: &str,
+            dimensions: usize,
+        ) {
+            assert_eq!(model_provider, "sentinel");
+            assert_eq!(api_key, Some("sentinel"));
+            assert_eq!(model, "sentinel");
+            assert_eq!(dimensions, 3);
+            self.calls.lock().push("refresh_embedder");
+        }
+
+        async fn recall_namespaced(
+            &self,
+            namespace: &str,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(namespace, "sentinel");
+            assert_eq!(query, "sentinel");
+            assert_eq!(limit, 3);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(since, Some("sentinel"));
+            assert_eq!(until, Some("sentinel"));
+            self.calls.lock().push("recall_namespaced");
+            Ok(Vec::new())
+        }
+
+        async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_default_export_filter(filter);
+            self.calls.lock().push("export");
+            Ok(Vec::new())
+        }
+
+        async fn store_with_metadata(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            namespace: Option<&str>,
+            importance: Option<f64>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(namespace, Some("sentinel"));
+            assert_eq!(importance, Some(0.75));
+            self.calls.lock().push("store_with_metadata");
+            Ok(())
+        }
+
+        async fn store_with_options(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            options: StoreOptions,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(options.namespace.as_deref(), Some("sentinel"));
+            self.calls.lock().push("store_with_options");
+            Ok(())
+        }
+
+        async fn store_with_options_and_agent(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            options: StoreOptions,
+            agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(options.namespace.as_deref(), Some("sentinel"));
+            assert_eq!(agent_id, Some("sentinel"));
+            self.calls.lock().push("store_with_options_and_agent");
+            Ok(())
+        }
+
+        async fn store_with_agent(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            namespace: Option<&str>,
+            importance: Option<f64>,
+            agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(key, "sentinel");
+            assert_eq!(content, "sentinel");
+            assert_eq!(category, MemoryCategory::Core);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(namespace, Some("sentinel"));
+            assert_eq!(importance, Some(0.75));
+            assert_eq!(agent_id, Some("sentinel"));
+            self.calls.lock().push("store_with_agent");
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            assert_eq!(allowed_agent_ids[0], "sentinel");
+            assert_eq!(query, "sentinel");
+            assert_eq!(limit, 3);
+            assert_eq!(session_id, Some("sentinel"));
+            assert_eq!(since, Some("sentinel"));
+            assert_eq!(until, Some("sentinel"));
+            self.calls.lock().push("recall_for_agents");
+            Ok(Vec::new())
+        }
+
+        async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
+            assert_eq!(alias, "sentinel");
+            self.calls.lock().push("ensure_agent_uuid");
+            Ok("forwarded-value".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_memory_binding_forwards_all_actual_overrides_and_arguments() {
+        let actual = Arc::new(ForwardingProbe::default());
+        let original: Arc<dyn Memory> = actual.clone();
+        let binding = NativeMemoryBinding::new(original, Arc::new(SecurityPolicy::default()));
+        assert_eq!(binding.role(), actual.role());
+        assert_eq!(binding.alias(), "forwarded-alias");
+        assert_eq!(binding.tool_provenance(), actual.tool_provenance());
+        assert_eq!(binding.name(), "forwarded-backend");
+        binding
+            .store(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            binding
+                .recall(
+                    "sentinel",
+                    3,
+                    Some("sentinel"),
+                    Some("sentinel"),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(binding.get("sentinel").await.unwrap().is_none());
+        assert!(
+            binding
+                .get_for_agent("sentinel", "sentinel")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            binding
+                .list(Some(&MemoryCategory::Core), Some("sentinel"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(binding.forget("sentinel").await.unwrap());
+        assert!(
+            binding
+                .forget_for_agent("sentinel", "sentinel")
+                .await
+                .unwrap()
+        );
+        binding
+            .store_for_principal(
+                &PrincipalScope::new("owner:sentinel"),
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            binding
+                .recall_for_principal(
+                    &PrincipalScope::new("owner:sentinel"),
+                    "sentinel",
+                    3,
+                    Some("sentinel"),
+                    Some("sentinel"),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            binding
+                .list_for_principal(
+                    &PrincipalScope::new("owner:sentinel"),
+                    Some(&MemoryCategory::Core),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            binding
+                .get_for_principal(&PrincipalScope::new("owner:sentinel"), "sentinel")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            binding
+                .forget_for_principal(&PrincipalScope::new("owner:sentinel"), "sentinel")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            binding
+                .count_for_principal(&PrincipalScope::new("owner:sentinel"))
+                .await
+                .unwrap(),
+            7
+        );
+        assert!(
+            binding
+                .export_for_principal(
+                    &PrincipalScope::new("owner:sentinel"),
+                    &ExportFilter::default()
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            binding
+                .purge_namespace_for_principal(&PrincipalScope::new("owner:sentinel"), "sentinel")
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            binding
+                .purge_session_for_principal(&PrincipalScope::new("owner:sentinel"), "sentinel")
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(binding.purge_namespace("sentinel").await.unwrap(), 7);
+        assert_eq!(binding.purge_session("sentinel").await.unwrap(), 7);
+        assert_eq!(
+            binding
+                .purge_session_for_agent("sentinel", "sentinel")
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(binding.purge_agent("sentinel").await.unwrap(), 7);
+        assert!(binding.export_agent("sentinel").await.unwrap().is_empty());
+        assert_eq!(
+            binding.rename_agent("sentinel", "sentinel").await.unwrap(),
+            7
+        );
+        assert_eq!(binding.count_agent("sentinel").await.unwrap(), 7);
+        assert_eq!(binding.count().await.unwrap(), 7);
+        assert!(binding.health_check().await);
+        binding
+            .supersede(&["sentinel".to_owned()], "sentinel")
+            .await
+            .unwrap();
+        binding
+            .store_procedural(
+                &[ProceduralMessage {
+                    role: "sentinel".into(),
+                    content: "sentinel".into(),
+                    name: None,
+                }],
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            binding
+                .count_in_scope(Some("sentinel"), Some(&MemoryCategory::Core))
+                .await
+                .unwrap(),
+            9
+        );
+        assert_eq!(binding.stats().await.unwrap().total_rows, 7);
+        assert_eq!(binding.reindex().await.unwrap(), 7);
+        binding.refresh_embedder("sentinel", Some("sentinel"), "sentinel", 3);
+        assert!(
+            binding
+                .recall_namespaced(
+                    "sentinel",
+                    "sentinel",
+                    3,
+                    Some("sentinel"),
+                    Some("sentinel"),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            binding
+                .export(&ExportFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        binding
+            .store_with_metadata(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+                Some("sentinel"),
+                Some(0.75),
+            )
+            .await
+            .unwrap();
+        binding
+            .store_with_options(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+                StoreOptions::default().with_namespace("sentinel"),
+            )
+            .await
+            .unwrap();
+        binding
+            .store_with_options_and_agent(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+                StoreOptions::default().with_namespace("sentinel"),
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        binding
+            .store_with_agent(
+                "sentinel",
+                "sentinel",
+                MemoryCategory::Core,
+                Some("sentinel"),
+                Some("sentinel"),
+                Some(0.75),
+                Some("sentinel"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            binding
+                .recall_for_agents(
+                    &["sentinel"],
+                    "sentinel",
+                    3,
+                    Some("sentinel"),
+                    Some("sentinel"),
+                    Some("sentinel")
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            binding.ensure_agent_uuid("sentinel").await.unwrap(),
+            "forwarded-value"
+        );
+        assert_eq!(
+            *actual.calls.lock(),
+            vec![
+                "name",
+                "store",
+                "recall",
+                "get",
+                "get_for_agent",
+                "list",
+                "forget",
+                "forget_for_agent",
+                "store_for_principal",
+                "recall_for_principal",
+                "list_for_principal",
+                "get_for_principal",
+                "forget_for_principal",
+                "count_for_principal",
+                "export_for_principal",
+                "purge_namespace_for_principal",
+                "purge_session_for_principal",
+                "purge_namespace",
+                "purge_session",
+                "purge_session_for_agent",
+                "purge_agent",
+                "export_agent",
+                "rename_agent",
+                "count_agent",
+                "count",
+                "health_check",
+                "supersede",
+                "store_procedural",
+                "count_in_scope",
+                "stats",
+                "reindex",
+                "refresh_embedder",
+                "recall_namespaced",
+                "export",
+                "store_with_metadata",
+                "store_with_options",
+                "store_with_options_and_agent",
+                "store_with_agent",
+                "recall_for_agents",
+                "ensure_agent_uuid"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_memory_binding_refuses_after_use_and_preserves_failed_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("old", tmp.path()).unwrap());
+        let other: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("other"));
+        let security = Arc::new(SecurityPolicy::default());
+        let binding = NativeMemoryBinding::new(Arc::clone(&original), Arc::clone(&security));
+        assert_eq!(
+            binding
+                .bind(&other, Arc::clone(&other), &security)
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_owner_mismatch"
+        );
+        assert!(binding.routed.get().is_none());
+        assert_eq!(
+            binding
+                .bind(
+                    &original,
+                    Arc::clone(&other),
+                    &Arc::new(SecurityPolicy::default())
+                )
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_owner_mismatch"
+        );
+        assert!(
+            binding.routed.get().is_none(),
+            "same-valued policy is not the actual creator's Arc"
+        );
+        binding
+            .store("used", "old-store", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            binding
+                .bind(&original, Arc::clone(&other), &security)
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_operation_already_started"
+        );
+        assert!(binding.routed.get().is_none());
+        assert_eq!(
+            original.get("used").await.unwrap().unwrap().content,
+            "old-store"
+        );
+        // The synchronous mutator must also make later rebinding ineligible.
+        let fresh = NativeMemoryBinding::new(Arc::clone(&original), Arc::clone(&security));
+        fresh.refresh_embedder("none", None, "none", 0);
+        assert_eq!(
+            fresh
+                .bind(&original, other, &security)
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_operation_already_started"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_memory_inflight_operation_refuses_binding_without_holding_a_lock_across_await()
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backing: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("inflight", tmp.path()).unwrap());
+        let actual = Arc::new(ForwardingProbe {
+            backing: Some(Arc::clone(&backing)),
+            ..Default::default()
+        });
+        let original: Arc<dyn Memory> = actual.clone();
+        let security = Arc::new(SecurityPolicy::default());
+        let binding = Arc::new(NativeMemoryBinding::new(
+            Arc::clone(&original),
+            Arc::clone(&security),
+        ));
+        let origins = NativeMemoryOrigins::default();
+        let running = origins.construct(NativeMemoryKind::Store, &binding);
+        assert!(origins.prove(&running).is_some());
+        let task = ::zeroclaw_spawn::spawn!(async move {
+            running
+                .execute(serde_json::json!({"key":"sentinel", "content":"sentinel"}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), actual.entered.notified())
+            .await
+            .unwrap();
+        let target: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("private"));
+        assert_eq!(
+            binding
+                .bind(&original, target, &security)
+                .unwrap_err()
+                .to_string(),
+            "native_memory_binding_operation_already_started",
+            "do not wait for or retarget an in-flight operation"
+        );
+        assert!(binding.routed.get().is_none());
+        actual.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(
+            backing.get("sentinel").await.unwrap().unwrap().content,
+            "sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_memory_bind_before_use_preserves_override_refusal_and_weak_lifetime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("old", tmp.path()).unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let binding = Arc::new(NativeMemoryBinding::new(
+            Arc::clone(&original),
+            Arc::clone(&security),
+        ));
+        let weak = Arc::downgrade(&binding);
+        let origins = NativeMemoryOrigins::default();
+        let native = origins.construct(NativeMemoryKind::Store, &binding);
+        let witness = origins.prove(&native).unwrap();
+        let scope = PrincipalScope::new("owner:one");
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&original),
+            scope.clone(),
+        ));
+        binding
+            .bind(&original, Arc::clone(&routed), &security)
+            .unwrap();
+        binding
+            .bind(&original, Arc::clone(&routed), &security)
+            .unwrap();
+        let foreign: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("foreign"));
+        assert!(binding.bind(&original, foreign, &security).is_err());
+        binding
+            .store("private", "bound-store", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert!(original.get("private").await.unwrap().is_none());
+        assert_eq!(
+            original
+                .get_for_principal(&scope, "private")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            "bound-store"
+        );
+        assert!(
+            binding.purge_agent("any").await.is_err(),
+            "forward the actual private-plane refusal"
+        );
+        drop(binding);
+        assert!(
+            weak.upgrade().is_some(),
+            "actual native Tool owns its Memory binding"
+        );
+        drop(native);
+        assert!(witness.actual.upgrade().is_none());
+        assert!(witness.binding.upgrade().is_none());
+        assert!(
+            weak.upgrade().is_none(),
+            "origin metadata must not own the resource"
+        );
     }
 }
