@@ -1464,7 +1464,7 @@ impl Channel for WasmChannel {
         {
             // Fail closed like the trait default: reporting success here
             // would tell the agent a reaction landed when nothing was sent.
-            anyhow::bail!("reactions are not supported by this channel");
+            return Err(zeroclaw_api::channel::ReactionsUnsupported.into());
         }
         let (channel_id, message_id, emoji) = (
             channel_id.to_string(),
@@ -1491,7 +1491,7 @@ impl Channel for WasmChannel {
         {
             // Fail closed like the trait default: reporting success here
             // would tell the agent a reaction landed when nothing was sent.
-            anyhow::bail!("reactions are not supported by this channel");
+            return Err(zeroclaw_api::channel::ReactionsUnsupported.into());
         }
         let (channel_id, message_id, emoji) = (
             channel_id.to_string(),

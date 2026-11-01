@@ -23,6 +23,21 @@ pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 /// same matcher serves agent-loop message triggers and forge event triggers.
 pub struct ChannelSopTopic;
 
+/// Returned by a channel's reaction methods when the channel cannot send
+/// reactions at all. A typed error rather than message text, so the
+/// `reaction` tool can recognise it and render a localized message without
+/// this crate depending on the runtime's i18n.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReactionsUnsupported;
+
+impl fmt::Display for ReactionsUnsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("reactions are not supported by this channel")
+    }
+}
+
+impl std::error::Error for ReactionsUnsupported {}
+
 impl ChannelSopTopic {
     const ALIAS_SEP: char = '.';
     const EVENT_SEP: char = ':';
@@ -1314,7 +1329,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _message_id: &str,
         _emoji: &str,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("reactions are not supported by this channel")
+        Err(ReactionsUnsupported.into())
     }
 
     /// Remove a reaction (emoji) from a message previously added by this bot.
@@ -1324,7 +1339,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _message_id: &str,
         _emoji: &str,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("reactions are not supported by this channel")
+        Err(ReactionsUnsupported.into())
     }
 
     /// Add or remove an agent-driven (explicit) reaction from the `reaction`
