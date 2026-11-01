@@ -106,8 +106,15 @@ its console/log on start. The code is **single-use and expires 10 minutes after
 it is minted** - it is the only bearer credential for certificate issuance, and
 it lands in consoles and logs, so a copied code must stop working shortly after
 the operator has used it. An expired code is refused and cleared; mint a
-replacement from the gateway's pairing API when you need a fresh one. Then, on
-the workstation:
+replacement with `zeroclaw security enroll-paircode --new`.
+
+This **enrollment code** issues a certificate and nothing else: `POST /pair`
+refuses it, so a party that sees it cannot turn it into a bearer token. It is
+separate from the gateway's pairing code, and minting either one leaves the
+other pending. Enrollment always requires a code, even when
+`[gateway].require_pairing` is off. A gateway pairing code is also accepted by
+`POST /enroll`, once: enrolling with it spends it, so it can no longer pair.
+Then, on the workstation:
 
 ```sh
 # Interactive: a certless client auto-enrolls on first connect.
@@ -134,8 +141,9 @@ auto-renews at ~50% of its lifetime (~15 days) over the live mTLS session; a
 revoked cert cannot self-renew.
 
 Enrollment issues a certificate only, not a bearer token. Before the daemon
-accepts a session, pair with the gateway for a `zc_...` token and give it to
-zerocode via `ZEROCLAW_AUTH_TOKEN`, `auth_token_file`, or `auth_token` (see
+accepts a session, pair with the gateway for a `zc_...` token using a gateway
+pairing code (`zeroclaw gateway get-paircode --new`), not the enrollment code,
+and give it to zerocode via `ZEROCLAW_AUTH_TOKEN`, `auth_token_file`, or `auth_token` (see
 [Bearer token](./remote.md#bearer-token-required-for-every-connection)). With the
 token in place, `zerocode --connect wss://<remote-host>:9781` (or just `zerocode`
 if `uri` is in config) needs no more flags.
@@ -485,7 +493,10 @@ the browsers that use it, in two distinct ways:
   performs it on the browser's behalf: it fetches the daemon CA, then makes the
   CA-pinned `POST /enroll` carrying the pairing code. **The relay sees the
   pairing code and the issued certificate, and could use an observed pairing
-  code to enrol a client of its own.**
+  code to enrol a client of its own.** Give the frontdoor an enrollment code
+  (`zeroclaw security enroll-paircode --new`): the gateway's `POST /pair`
+  refuses it. A gateway pairing code also enrolls here, but a relay that saw
+  one could pair a bearer token with it instead, if it can reach the gateway.
 
 What the relay does **not** get is the private key: the browser generates the
 keypair with WebCrypto and transmits only a CSR.
