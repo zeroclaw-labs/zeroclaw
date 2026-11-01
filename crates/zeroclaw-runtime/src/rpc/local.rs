@@ -323,6 +323,7 @@ pub struct LocalTransport {
     /// when the kernel query fails — absence of a credential, never a
     /// credential of its own.
     peer_uid: Option<u32>,
+    peer_pid: Option<u32>,
     /// Deadline for one frame, counted from its first byte.
     frame_read_timeout: Duration,
 }
@@ -446,6 +447,7 @@ impl LocalTransport {
     ) -> Self {
         let peer_label = platform::peer_label_from(&stream);
         let peer_uid = platform::peer_uid_from(&stream);
+        let peer_pid = platform::peer_pid_from(&stream);
         let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
@@ -474,6 +476,7 @@ impl LocalTransport {
             terminal_tx,
             peer_label,
             peer_uid,
+            peer_pid,
             frame_read_timeout,
         }
     }
@@ -783,7 +786,8 @@ async fn run_local_listener_with_factory_and_limits(
                     .with_initialize_deadline(initialize_deadline)
                     // The transport's kind and kernel-supplied peer credential
                     // feed principal authentication at `initialize`.
-                    .with_transport(transport.kind(), transport.credential());
+                    .with_transport(transport.kind(), transport.credential())
+                    .with_peer_process_id(transport.peer_pid);
                     tokio::select! {
                         _ = dispatcher.run(&mut transport) => {}
                         _ = conn_cancel.cancelled() => {}
@@ -1210,9 +1214,17 @@ mod platform {
         "unix:unknown".to_string()
     }
 
-    /// Kernel-reported peer uid (`SO_PEERCRED` on Linux, `getpeereid`-
-    /// equivalent on macOS/BSD via tokio's `peer_cred`). `None` when the
-    /// query fails — the caller treats that as no credential.
+    /// Kernel-reported peer process ID. Unknown credentials fail closed for cost grants.
+    pub fn peer_pid_from(stream: &LocalStream) -> Option<u32> {
+        stream
+            .peer_cred()
+            .ok()?
+            .pid()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+    }
+
+    /// Kernel-reported peer UID. A failed query supplies no credential.
     pub fn peer_uid_from(stream: &LocalStream) -> Option<u32> {
         stream.peer_cred().ok().map(|cred| cred.uid())
     }
@@ -1281,6 +1293,10 @@ mod platform {
     /// Named pipes carry no portable peer uid; the connection presents no
     /// transport-intrinsic credential and authenticates explicitly (or
     /// through the no-roster local compatibility path).
+    pub fn peer_pid_from(_stream: &LocalStream) -> Option<u32> {
+        None
+    }
+
     pub fn peer_uid_from(_stream: &LocalStream) -> Option<u32> {
         None
     }
@@ -2132,7 +2148,7 @@ mod tests {
         let (mut reader, mut writer) = do_initialize(&sock_path).await;
 
         let (pending_tx, mut pending_rx) =
-            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::AttributedApprovalResponse>();
         ctx.approval_pending
             .insert("test-req-1".to_string(), "unused".to_string(), pending_tx);
 
@@ -2151,7 +2167,7 @@ mod tests {
 
         let decision = pending_rx.try_recv().expect("decision should be resolved");
         assert_eq!(
-            decision,
+            decision.response,
             zeroclaw_api::channel::ChannelApprovalResponse::Approve
         );
 

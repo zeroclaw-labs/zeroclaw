@@ -318,14 +318,16 @@ impl SignalChannel {
         let (token, response) = crate::util::parse_approval_reply(&message.content)?;
         let destination = Self::canonical_destination(&message.reply_target);
         Some(
-            crate::util::resolve_pending_approval(
+            crate::util::resolve_pending_approval_attributed_with_tool(
                 &self.pending_approvals,
                 &token,
-                response,
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                    .with_user(Some(message.sender.clone())),
                 self.is_sender_allowed(&message.sender),
                 &destination,
             )
-            .await,
+            .await
+            .0,
         )
     }
 
@@ -1560,7 +1562,7 @@ impl Channel for SignalChannel {
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(resp)) => {
                     guard.disarm();
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                    resp
                 }
                 Ok(Err(_)) => {
                     guard.remove().await;
@@ -2592,7 +2594,7 @@ mod tests {
         )
         .await;
         assert_eq!(resolution, crate::util::PendingApprovalResolution::Resolved);
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
     }
 
     #[tokio::test]
@@ -2632,7 +2634,10 @@ mod tests {
             ch.resolve_approval_reply(&right_msg).await,
             Some(crate::util::PendingApprovalResolution::Resolved)
         );
-        assert_eq!(approval_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approval_rx.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert_eq!(
             ch.resolve_approval_reply(&right_msg).await,
             Some(crate::util::PendingApprovalResolution::NotFound)
@@ -2657,7 +2662,7 @@ mod tests {
             ch.resolve_approval_reply(&msg).await,
             Some(crate::util::PendingApprovalResolution::Resolved)
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
     }
 
     fn make_reaction_channel() -> SignalChannel {

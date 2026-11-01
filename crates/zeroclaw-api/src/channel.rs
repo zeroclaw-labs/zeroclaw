@@ -106,6 +106,13 @@ pub struct ApprovalPosition {
     pub total: u32,
 }
 
+/// `ChannelApprovalRequest::tool_name` of the runtime's budget-override
+/// prompt. Not a real tool: the runtime sends it when a turn would exceed a
+/// shared cost limit and `cost.allow_override` is on, and clients match it to
+/// show the prompt as a cost-limit notice instead of a tool card. Approve
+/// lifts the limit for the rest of the period; anything else stops the turn.
+pub const COST_LIMIT_OVERRIDE_APPROVAL: &str = "cost_limit_override";
+
 /// Compact description of a tool call presented to the user for approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelApprovalRequest {
@@ -170,6 +177,8 @@ pub enum ChannelApprovalResponse {
 pub struct AttributedApprovalResponse {
     pub response: ChannelApprovalResponse,
     pub decided_by: Option<String>,
+    /// Channel-native identity observed on the response, never the session owner.
+    pub decided_by_user: Option<String>,
     /// WHO produced this response — an operator, or the runtime failing closed.
     ///
     /// This cannot be inferred from the other two fields, which is why it is
@@ -231,6 +240,7 @@ impl AttributedApprovalResponse {
         Self {
             response,
             decided_by: None,
+            decided_by_user: None,
             source: ApprovalSource::Operator,
         }
     }
@@ -240,8 +250,24 @@ impl AttributedApprovalResponse {
         Self {
             response,
             decided_by: None,
+            decided_by_user: None,
             source,
         }
+    }
+
+    /// Preserve the responding user's channel-native identity, when available.
+    #[must_use]
+    pub fn with_user(mut self, user: Option<String>) -> Self {
+        self.decided_by_user = user.filter(|user| !user.is_empty());
+        self
+    }
+
+    /// Resolve audit identity from the response, falling back to its back-channel.
+    pub fn user_or_channel<'a>(&'a self, channel: &'a str) -> &'a str {
+        self.decided_by_user
+            .as_deref()
+            .or(self.decided_by.as_deref())
+            .unwrap_or(channel)
     }
 
     /// Name the back-channel that produced this decision (fan-out attribution).
@@ -263,6 +289,12 @@ impl AttributedApprovalResponse {
     pub fn with_decider_opt(mut self, decider: Option<String>) -> Self {
         self.decided_by = decider;
         self
+    }
+}
+
+impl From<ChannelApprovalResponse> for AttributedApprovalResponse {
+    fn from(response: ChannelApprovalResponse) -> Self {
+        Self::operator(response)
     }
 }
 
@@ -1501,6 +1533,17 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_audit_identity_prefers_responder_and_preserves_channel_fallback() {
+        let answer = AttributedApprovalResponse::operator(ChannelApprovalResponse::Approve);
+        assert_eq!(answer.user_or_channel("origin"), "origin");
+        let answer = answer.with_decider("back-channel");
+        assert_eq!(answer.user_or_channel("origin"), "back-channel");
+        let answer = answer.with_user(Some("user-42".into()));
+        assert_eq!(answer.user_or_channel("origin"), "user-42");
+        assert_eq!(answer.decided_by.as_deref(), Some("back-channel"));
+    }
 
     #[test]
     fn gate_choice_kind_ids_round_trip_and_reject_unknown() {

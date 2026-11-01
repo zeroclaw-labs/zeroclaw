@@ -48,14 +48,14 @@ struct ApprovalBinding {
 #[cfg(feature = "whatsapp-web")]
 struct PendingApproval {
     registration_id: uuid::Uuid,
-    responder: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+    responder: tokio::sync::oneshot::Sender<zeroclaw_api::channel::AttributedApprovalResponse>,
     binding: ApprovalBinding,
 }
 
 #[cfg(feature = "whatsapp-web")]
 struct PendingApprovalRegistration {
     token: String,
-    receiver: tokio::sync::oneshot::Receiver<ChannelApprovalResponse>,
+    receiver: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse>,
     binding: ApprovalBinding,
     guard: PendingApprovalGuard,
 }
@@ -219,7 +219,7 @@ enum ApprovalRefusal {
 #[cfg(feature = "whatsapp-web")]
 async fn resolve_approval_reply(
     token: &str,
-    response: ChannelApprovalResponse,
+    response: impl Into<zeroclaw_api::channel::AttributedApprovalResponse>,
     from_alias: &str,
     from_chat: &str,
     responder_is_allowlisted: bool,
@@ -260,7 +260,7 @@ async fn resolve_approval_reply(
     // logs each refusal distinctly.
     pending
         .responder
-        .send(response)
+        .send(response.into())
         .map_err(|_| ApprovalRefusal::ReceiverGone)?;
     Ok(())
 }
@@ -269,7 +269,7 @@ async fn resolve_approval_reply(
 #[cfg(feature = "whatsapp-web")]
 async fn resolve_approval_reply_with_group_admission(
     token: &str,
-    response: ChannelApprovalResponse,
+    response: impl Into<zeroclaw_api::channel::AttributedApprovalResponse>,
     from_alias: &str,
     from_chat: &str,
     is_group: bool,
@@ -937,7 +937,8 @@ impl WhatsAppWebChannel {
             // computed above for the message path.
             match resolve_approval_reply_with_group_admission(
                 &token,
-                response,
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                    .with_user(Some(sender_jid.to_string())),
                 &context.alias,
                 &reply_target,
                 is_group,
@@ -4380,6 +4381,17 @@ impl Channel for WhatsAppWebChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|answer| answer.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         // Bind the token to the issuing alias AND the chat it is about to be
         // posted into, so a reply from anywhere else cannot answer it. The
         // alias matters because the map is process-wide: without it, a second
@@ -4463,7 +4475,10 @@ impl Channel for WhatsAppWebChannel {
                         })),
                     "approval request denied: no reply before approval_timeout_secs"
                 );
-                ChannelApprovalResponse::Deny
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                )
             }
         };
         // Both arms above reached a decision through a normal path and own their
@@ -7431,7 +7446,7 @@ mod tests {
         token: &str,
         chat: &str,
         is_group: bool,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse> {
         park_token_as("default", token, chat, is_group).await
     }
 
@@ -7442,7 +7457,7 @@ mod tests {
         token: &str,
         chat: &str,
         is_group: bool,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::AttributedApprovalResponse> {
         let (responder, rx) = tokio::sync::oneshot::channel();
         PENDING_APPROVALS.lock().await.insert(
             token.to_string(),
@@ -7842,7 +7857,7 @@ mod tests {
             .expect("the interception must resolve the pending approval")
             .expect("the approval sender must still be live");
         assert_eq!(
-            decision,
+            decision.response,
             ChannelApprovalResponse::Approve,
             "a `<token> yes` reply must approve the pending request"
         );
@@ -8256,7 +8271,10 @@ mod tests {
         )
         .await;
         assert_eq!(accepted, Ok(()));
-        assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            receiver.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     /// Emptying `allowed_groups` entirely is a revocation too, not a reset to
@@ -8304,7 +8322,10 @@ mod tests {
         )
         .await;
         assert_eq!(accepted, Ok(()));
-        assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            receiver.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     /// An approval reply executes a pending tool, so it has to clear the same
@@ -8367,7 +8388,10 @@ mod tests {
                 Ok(()),
                 "{policy:?} answers groups and must resolve"
             );
-            assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+            assert_eq!(
+                receiver.await.unwrap().response,
+                ChannelApprovalResponse::Approve
+            );
             receiver = park_token("aaa015", GROUP, true).await;
         }
         PENDING_APPROVALS.lock().await.remove("aaa015");
@@ -8423,7 +8447,10 @@ mod tests {
             )
             .await;
             assert_eq!(accepted, Ok(()), "{policy:?} answers DMs and must resolve");
-            assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+            assert_eq!(
+                receiver.await.unwrap().response,
+                ChannelApprovalResponse::Approve
+            );
             receiver = park_token("aaa016", DM, false).await;
         }
         PENDING_APPROVALS.lock().await.remove("aaa016");
@@ -8463,7 +8490,10 @@ mod tests {
             Ok(()),
             "an enabled personal self-chat must resolve its own approval"
         );
-        assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            receiver.await.unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
 
         // CONTROL: the identical call, same policy, differing only in the
         // verdict, must still refuse. Without this the acceptance above would
@@ -8649,7 +8679,8 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
                 .await
                 .expect("the self-chat approval must resolve, not time out")
-                .expect("the responder must still be open"),
+                .expect("the responder must still be open")
+                .response,
             ChannelApprovalResponse::Approve,
             "an enabled personal self-chat must resolve its own approval"
         );
@@ -8744,7 +8775,7 @@ mod tests {
         )
         .await;
         assert!(out.is_ok());
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
     }
 
     #[tokio::test]
@@ -8762,7 +8793,7 @@ mod tests {
             .await
             .is_ok()
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Deny);
     }
 
     #[tokio::test]
@@ -8780,7 +8811,10 @@ mod tests {
             .await
             .is_ok()
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(
+            rx.await.unwrap().response,
+            ChannelApprovalResponse::AlwaysApprove
+        );
     }
 
     /// A reply carrying a VALID token, from the right chat, but from a number
@@ -8816,7 +8850,7 @@ mod tests {
             .await
             .is_ok()
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(rx.await.unwrap().response, ChannelApprovalResponse::Approve);
     }
 
     /// A valid token replayed from a DIFFERENT chat is not this request's
