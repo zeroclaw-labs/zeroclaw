@@ -113,6 +113,7 @@ pub enum Method {
     SessionConfigure,
     SessionCancel,
     SessionGitBranch,
+    SessionReloadContext,
     SessionList,
     SessionListAcp,
     SessionMessages,
@@ -252,6 +253,7 @@ impl Method {
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
+        (Method::SessionReloadContext, "session/reload_context"),
         (Method::SessionList, "session/list"),
         (Method::SessionListAcp, "session/list-acp"),
         (Method::SessionMessages, "session/messages"),
@@ -412,9 +414,11 @@ impl Method {
             M::SessionPrompt | M::SessionSteer | M::SessionRunOnce => {
                 (Resource::Sessions, Verb::Execute)
             }
-            M::SessionConfigure | M::SessionApprove | M::SessionAppend | M::SessionRename => {
-                (Resource::Sessions, Verb::Update)
-            }
+            M::SessionConfigure
+            | M::SessionApprove
+            | M::SessionAppend
+            | M::SessionRename
+            | M::SessionReloadContext => (Resource::Sessions, Verb::Update),
             M::SessionList
             | M::SessionListAcp
             | M::SessionMessages
@@ -2873,6 +2877,7 @@ impl RpcDispatcher {
                 | Method::SessionConfigure
                 | Method::SessionCancel
                 | Method::SessionGitBranch
+                | Method::SessionReloadContext
                 | Method::SessionMessages
                 | Method::SessionState
                 | Method::SessionDelete
@@ -3572,6 +3577,7 @@ impl RpcDispatcher {
             Method::SessionConfigure => self.handle_session_configure(params).await,
             Method::SessionCancel => self.handle_session_cancel(params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(params).await,
+            Method::SessionReloadContext => self.handle_session_reload_context(params).await,
             Method::SessionList => self.handle_session_list(params).await,
             Method::SessionListAcp => self.handle_session_list_acp(params).await,
             Method::SessionMessages => self.handle_session_messages(params).await,
@@ -8205,6 +8211,63 @@ impl RpcDispatcher {
             stop_reason: result.stop_reason,
             content: result.content,
             usage,
+        })
+    }
+
+    /// Re-read the session agent's personality files and rebuild its system
+    /// prompt. Refused while a turn holds the agent, so the turn's
+    /// cached prefix is never swapped out from under it.
+    async fn handle_session_reload_context(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        let authorized = self
+            .authorize_session_owner(&req.session_id, Method::SessionReloadContext)
+            .await?;
+        self.ctx.sessions.wait_test_control_pause().await;
+        let expected_generation = self.capture_session_access(&req.session_id).await?;
+        // Fence on the incarnation that was authorized, as `session/configure`
+        // does: a same-ID replacement installed between the ownership check
+        // and the capture above must not be reloaded on this caller's behalf.
+        if authorized
+            .as_ref()
+            .and_then(|record| record.live_generation)
+            .is_some_and(|generation| Some(generation) != expected_generation)
+        {
+            return Err(self.stale_session_incarnation_error());
+        }
+        let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await else {
+            return to_result(SessionReloadContextResult {
+                session_id: req.session_id,
+                live: false,
+                changed: false,
+            });
+        };
+        self.ensure_session_incarnation(&req.session_id, expected_generation)
+            .await?;
+        let admitted = self
+            .revalidate_admitted_session(&req.session_id, authorized.as_ref())
+            .await?;
+        // The lookups above awaited, and the gate decided on the grants
+        // stamped at admission. Re-resolve the caller against the policy in
+        // force now: a revoked `sessions:update` refuses the reload, and an
+        // administrator demoted meanwhile is held to ownership again. Nothing
+        // below awaits, so this decision covers the mutation.
+        let grants = self.recheck_authority_after_admission(Method::SessionReloadContext)?;
+        self.require_ownership_under(grants.as_ref(), admitted.as_ref())?;
+        let changed = {
+            let mut agent = agent.try_lock().map_err(|_| {
+                rpc_err(
+                    SESSION_BUSY,
+                    "a turn is running; reload the context after it finishes",
+                )
+            })?;
+            agent
+                .reload_personality()
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to reload context: {e}")))?
+        };
+        to_result(SessionReloadContextResult {
+            session_id: req.session_id,
+            live: true,
+            changed,
         })
     }
 
@@ -40877,6 +40940,7 @@ mod tests {
             "session/configure",
             "session/cancel",
             "session/git_branch",
+            "session/reload_context",
             "session/messages",
             "session/state",
             "session/delete",
@@ -45899,6 +45963,185 @@ mod tests {
         assert_eq!(steer["error"]["code"], json!(SESSION_NOT_FOUND), "{steer}");
     }
 
+    /// `session/reload_context` reaches the live agent, re-reads its
+    /// personality files, and reports whether the text changed.
+    #[tokio::test]
+    async fn session_reload_context_rereads_personality_for_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let workspace = config.agent_workspace_dir("test-agent");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({"agent_alias": "test-agent"}))
+            .await
+            .expect("session/new");
+        let sid = created["session_id"].as_str().unwrap().to_string();
+        let agent = sessions.get_agent(&sid).await.expect("live agent");
+        let agents_md = workspace.join("AGENTS.md");
+        std::fs::write(&agents_md, "RELOAD_V1_11696").unwrap();
+        // Prime the snapshot the way a first turn does.
+        assert!(!agent.lock().await.reload_personality().unwrap());
+        std::fs::write(&agents_md, "RELOAD_V2_11696").unwrap();
+
+        let result = dispatcher
+            .handle_session_reload_context(&json!({"session_id": sid}))
+            .await
+            .expect("session/reload_context");
+        assert_eq!(result["live"], json!(true), "{result}");
+        assert_eq!(result["changed"], json!(true), "{result}");
+
+        let again = dispatcher
+            .handle_session_reload_context(&json!({"session_id": sid}))
+            .await
+            .expect("second reload");
+        assert_eq!(again["changed"], json!(false), "{again}");
+    }
+
+    #[tokio::test]
+    async fn session_reload_context_reports_failed_personality_read_without_replacing_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let workspace = config.agent_workspace_dir("test-agent");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({"agent_alias": "test-agent"}))
+            .await
+            .expect("session/new");
+        let sid = created["session_id"].as_str().unwrap().to_string();
+        let agent = sessions.get_agent(&sid).await.expect("live agent");
+        // Isolate the deletion case from any personality templates seeded by
+        // session construction: AGENTS.md is the only captured file.
+        for file in crate::agent::personality::PERSONALITY_FILES {
+            let path = workspace.join(file);
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let agents_md = workspace.join("AGENTS.md");
+        std::fs::write(&agents_md, "ORIGINAL_RPC_IDENTITY").unwrap();
+        assert!(!agent.lock().await.reload_personality().unwrap());
+
+        for invalid_utf8 in [false, true] {
+            if invalid_utf8 {
+                std::fs::write(&agents_md, [0xff]).unwrap();
+            } else {
+                std::fs::remove_file(&agents_md).unwrap();
+            }
+            let error = dispatcher
+                .handle_session_reload_context(&json!({"session_id": sid}))
+                .await
+                .expect_err("bad personality reload fails at the RPC boundary");
+            assert_eq!(error.code, INTERNAL_ERROR);
+            assert!(error.message.contains("Failed to reload context"));
+            std::fs::write(&agents_md, "ORIGINAL_RPC_IDENTITY").unwrap();
+            let restored = dispatcher
+                .handle_session_reload_context(&json!({"session_id": sid}))
+                .await
+                .expect("restore original file");
+            assert_eq!(restored["changed"], json!(false), "prior snapshot survived");
+        }
+    }
+
+    /// Alice's `session/reload_context` on `sid`, paused after its gate
+    /// while `change` runs. `AGENTS.md` changes between the first snapshot
+    /// and the reload, so a reload that goes through reports `changed`.
+    /// Returns the reload's result and whether the agent still holds the
+    /// first snapshot afterwards.
+    async fn reload_after_paused_change(
+        ctx: &Arc<RpcContext>,
+        sid: &str,
+        change: impl FnOnce(&Arc<RpcContext>),
+    ) -> (RpcResult, bool) {
+        let workspace = ctx.config.read().agent_workspace_dir("test-agent");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agents_md = workspace.join("AGENTS.md");
+        std::fs::write(&agents_md, "RELOAD_GATE_V1").unwrap();
+        let agent = ctx.sessions.get_agent(sid).await.expect("live agent");
+        assert!(!agent.lock().await.reload_personality().unwrap());
+        std::fs::write(&agents_md, "RELOAD_GATE_V2").unwrap();
+
+        let (alice, _rx) = roster_peer(ctx, 4242).await;
+        let (entered, release) = ctx.sessions.set_test_control_pause();
+        let params = json!({"session_id": sid});
+        let task =
+            zeroclaw_spawn::spawn!(
+                async move { alice.handle_session_reload_context(&params).await }
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the reload reaches its pause after the gate");
+        change(ctx);
+        release.notify_one();
+        let result = task.await.expect("the reload task does not panic");
+        // A reload that went through left V2 in the snapshot, so re-reading
+        // now finds nothing new.
+        let still_first = agent.lock().await.reload_personality().unwrap();
+        (result, still_first)
+    }
+
+    #[tokio::test]
+    async fn a_reload_is_refused_when_its_grant_is_revoked_while_it_waits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-reload-revoked";
+        let (ctx, _backend, _key) = append_review_fixture(&tmp, sid, "user:alice", false).await;
+
+        let (result, still_first) = reload_after_paused_change(&ctx, sid, |ctx| {
+            republish_session_scoped(ctx, |profile| {
+                profile.grants.insert(
+                    zeroclaw_api::grants::Resource::Sessions,
+                    vec![zeroclaw_api::grants::Verb::Read],
+                );
+            });
+        })
+        .await;
+
+        assert_eq!(result.expect_err("revoked while waiting").code, FORBIDDEN);
+        assert!(still_first, "the agent was not reloaded");
+    }
+
+    #[tokio::test]
+    async fn a_reload_by_a_demoted_administrator_is_held_to_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-reload-demoted";
+        // Alice reloads Bob's session as an administrator and loses admin,
+        // but not sessions:update, while the reload waits.
+        let (ctx, _backend, _key) = append_review_fixture(&tmp, sid, "user:bob", true).await;
+
+        let (result, still_first) = reload_after_paused_change(&ctx, sid, |ctx| {
+            republish_session_scoped(ctx, |profile| profile.admin = false);
+        })
+        .await;
+
+        assert_eq!(result.expect_err("demoted while waiting").code, FORBIDDEN);
+        assert!(still_first, "Bob's agent was not reloaded");
+    }
+
+    #[tokio::test]
+    async fn a_reload_of_an_own_session_survives_an_unrelated_policy_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-reload-own";
+        let (ctx, _backend, _key) = append_review_fixture(&tmp, sid, "user:alice", false).await;
+
+        // An unrelated grant moves the policy generation; the recheck must
+        // re-resolve rather than refuse on any change.
+        let (result, still_first) = reload_after_paused_change(&ctx, sid, |ctx| {
+            republish_session_scoped(ctx, |profile| {
+                profile.grants.insert(
+                    zeroclaw_api::grants::Resource::Memory,
+                    vec![zeroclaw_api::grants::Verb::Read],
+                );
+            });
+        })
+        .await;
+
+        let result = result.expect("the owner still reloads");
+        assert_eq!(result["live"], json!(true), "{result}");
+        assert_eq!(result["changed"], json!(true), "{result}");
+        assert!(!still_first, "the agent holds the new text");
+    }
+
     #[test]
     fn new_session_methods_are_classified() {
         use zeroclaw_api::grants::{Resource, Verb};
@@ -45907,6 +46150,7 @@ mod tests {
             ("session/run-once", Verb::Execute),
             ("session/append", Verb::Update),
             ("session/rename", Verb::Update),
+            ("session/reload_context", Verb::Update),
             ("session/abort", Verb::Delete),
         ] {
             let method = Method::from_wire(wire).unwrap_or_else(|| panic!("{wire} is registered"));
