@@ -909,10 +909,31 @@ fn runtime_shell_assembly(
     root_config: &Config,
 ) -> RuntimeShellAssembly {
     let sandbox_cfg = risk_profile.sandbox_config();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let forbidden = security
+        .forbidden_paths
+        .iter()
+        .map(|raw| {
+            if let Some(rest) = raw.strip_prefix("~/") {
+                match &home {
+                    Some(home) => home.join(rest),
+                    None => std::path::PathBuf::from(raw),
+                }
+            } else if raw == "~" {
+                home.clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from(raw))
+            } else {
+                std::path::PathBuf::from(raw)
+            }
+        })
+        .collect();
     let sandbox_extra_roots = crate::security::SandboxExtraRoots {
         read_write: security.allowed_roots.clone(),
         read_only: security.allowed_roots_read_only.clone(),
         write_only: security.allowed_roots_write_only.clone(),
+        forbidden,
     };
     let sandbox = create_sandbox(
         &sandbox_cfg,

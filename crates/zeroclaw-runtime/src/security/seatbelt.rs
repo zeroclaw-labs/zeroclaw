@@ -28,7 +28,7 @@ impl SeatbeltSandbox {
     /// If no workspace is provided, falls back to the process current
     /// directory for compatibility with direct construction.
     pub fn with_workspace(workspace: Option<&Path>) -> std::io::Result<Self> {
-        Self::with_roots(workspace, &[], &[], &[])
+        Self::with_roots(workspace, &[], &[], &[], &[])
     }
 
     /// Create a new Seatbelt sandbox for the provided workspace root plus the
@@ -51,6 +51,28 @@ impl SeatbeltSandbox {
         read_write: &[PathBuf],
         read_only: &[PathBuf],
         write_only: &[PathBuf],
+        forbidden: &[PathBuf],
+    ) -> std::io::Result<Self> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        Self::with_roots_for_home(
+            workspace,
+            read_write,
+            read_only,
+            write_only,
+            forbidden,
+            home.as_deref(),
+        )
+    }
+
+    /// [`Self::with_roots`] with an explicit account home, so the home-dotfile
+    /// grant does not depend on reading process-global `$HOME`.
+    fn with_roots_for_home(
+        workspace: Option<&Path>,
+        read_write: &[PathBuf],
+        read_only: &[PathBuf],
+        write_only: &[PathBuf],
+        forbidden: &[PathBuf],
+        home: Option<&Path>,
     ) -> std::io::Result<Self> {
         if !Self::is_installed() {
             return Err(std::io::Error::new(
@@ -74,7 +96,14 @@ impl SeatbeltSandbox {
         let read_write = resolve_roots(read_write)?;
         let read_only = resolve_roots(read_only)?;
         let write_only = resolve_roots(write_only)?;
-        let mut policy = generate_policy(&workspace, &read_write, &read_only, &write_only);
+        let mut policy = generate_policy_for_home(
+            &workspace,
+            &read_write,
+            &read_only,
+            &write_only,
+            forbidden,
+            home,
+        );
         // Traversal must survive tier denials, without granting the contents of
         // a regular file that replaces a configured symlink after construction.
         policy.push_str(&ancestor_metadata_rules(
@@ -269,11 +298,100 @@ fn ancestor_metadata_rules<'a>(roots: impl IntoIterator<Item = &'a Path>) -> Str
     rules
 }
 
+/// Home-relative credential paths that stay closed under the home-dotfile
+/// grant: the canonical `~/...` entries from `default_forbidden_paths()` plus
+/// dotfiles that commonly hold saved passwords or tokens.
+const HOME_CREDENTIAL_PATHS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".config",
+    ".netrc",
+    ".git-credentials",
+];
+
+/// Read grant for the given account's home dotfiles (tool configs such as
+/// `~/.cargo` or `~/.gitconfig`), followed by deny rules for the credential
+/// paths that grant would otherwise open. Seatbelt last-match wins, so the
+/// denies follow the allow. Only the given home is granted; other accounts'
+/// homes stay closed. Returns an empty string when no absolute home is known
+/// (no `/Users/[^/]+` fallback).
+///
+/// The grant uses a `prefix` filter on `<home>/.` instead of a regex, so the
+/// home goes through the same string-literal escaping seam as every other
+/// path and cannot break out of its literal.
+fn home_dotfile_rules(home: Option<&Path>, forbidden: &[PathBuf]) -> String {
+    let Some(home) = home.filter(|home| home.is_absolute()) else {
+        return String::new();
+    };
+
+    // A forbidden path equal to HOME, or an ancestor of HOME, would otherwise
+    // lose to this more-specific `HOME/.` convenience grant under the
+    // canonical depth rule. Skip the grant entirely in that case; explicit
+    // allowed_roots still arrive through the extra-root path.
+    for path in forbidden {
+        if path == home || home.starts_with(path) {
+            return String::new();
+        }
+    }
+
+    let home_literal = seatbelt_string_literal(&home.to_string_lossy());
+    let mut rules = format!(
+        "\n;; Allow reading the current user's home dotfiles for tool configs\n\
+         (allow file-read* (prefix \"{home_literal}/.\"))\n"
+    );
+    let mut denied = BTreeSet::new();
+    for name in HOME_CREDENTIAL_PATHS {
+        denied.insert(home.join(name));
+    }
+    // Configured forbidden paths whose first home-relative component is a
+    // dotfile/dir would otherwise ride the Seatbelt `HOME/.` string prefix.
+    // Path::starts_with("/home/.") does not match "/home/.private" because
+    // "." and ".private" are distinct components, so compare components.
+    for path in forbidden {
+        let Ok(rel) = path.strip_prefix(home) else {
+            continue;
+        };
+        let Some(std::path::Component::Normal(name)) = rel.components().next() else {
+            continue;
+        };
+        if name.to_string_lossy().starts_with('.') {
+            denied.insert(path.to_path_buf());
+        }
+    }
+    for path in denied {
+        let literal = seatbelt_string_literal(&path.to_string_lossy());
+        rules.push_str(&format!("(deny file-read* (subpath \"{literal}\"))\n"));
+        rules.push_str(&format!("(deny file-write* (subpath \"{literal}\"))\n"));
+    }
+    rules
+}
+
+#[cfg(test)]
 fn generate_policy(
     workspace: &Path,
     read_write: &[PathBuf],
     read_only: &[PathBuf],
     write_only: &[PathBuf],
+) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    generate_policy_for_home(
+        workspace,
+        read_write,
+        read_only,
+        write_only,
+        &[],
+        home.as_deref(),
+    )
+}
+
+fn generate_policy_for_home(
+    workspace: &Path,
+    read_write: &[PathBuf],
+    read_only: &[PathBuf],
+    write_only: &[PathBuf],
+    forbidden: &[PathBuf],
+    home: Option<&Path>,
 ) -> String {
     let workspace_str = seatbelt_string_literal(&workspace.to_string_lossy());
     let root_ancestor_rules = ancestor_metadata_rules(
@@ -338,9 +456,7 @@ fn generate_policy(
 (allow file-read*
     (regex #"^/private/var/folders/"))
 
-;; Allow reading user home for tool configs
-(allow file-read*
-    (regex #"^/Users/[^/]+/\\."))
+{home_dotfile_rules}
 
 ;; ── Filesystem writes ──────────────────────────────────────
 ;; Only allow writes to workspace and temp directories
@@ -393,6 +509,7 @@ fn generate_policy(
 (allow mach-task-name)
 "#,
         workspace = workspace_str,
+        home_dotfile_rules = home_dotfile_rules(home, forbidden),
     )
 }
 
@@ -472,7 +589,7 @@ mod tests {
     /// RAII fixture directory under the user's home directory.
     ///
     /// Deliberately NOT under the policy's broad `/tmp`, `/private/tmp`,
-    /// `/private/var/folders`, system, or hidden-dotfile (`^/Users/<name>/\.`)
+    /// `/private/var/folders`, system, or hidden-dotfile (`$HOME/.` prefix)
     /// grants: a fixture the baseline policy can already touch would make the
     /// negative sibling assertions vacuous.
     struct HomeFixture {
@@ -599,6 +716,129 @@ mod tests {
         assert!(policy.contains("(subpath \"/usr\")"));
         assert!(policy.contains("(subpath \"/bin\")"));
         assert!(policy.contains("(subpath \"/System\")"));
+    }
+
+    #[test]
+    fn generate_policy_home_dotfile_grant_is_scoped_to_home_with_path_boundary() {
+        let home = Path::new("/Users/alice.smith");
+        let policy =
+            generate_policy_for_home(&PathBuf::from("/tmp/test"), &[], &[], &[], &[], Some(home));
+        assert!(
+            policy.contains(r#"(allow file-read* (prefix "/Users/alice.smith/."))"#),
+            "grant must cover dotfiles below the home, not a dot in the account name; policy={policy}"
+        );
+        assert!(
+            !policy.contains("/Users/[^/]+"),
+            "must not grant every account's home via /Users/[^/]+"
+        );
+        for name in HOME_CREDENTIAL_PATHS {
+            let path = format!("/Users/alice.smith/{name}");
+            assert!(
+                policy.contains(&format!(r#"(deny file-read* (subpath "{path}"))"#)),
+                "must deny reads of {path}"
+            );
+            assert!(
+                policy.contains(&format!(r#"(deny file-write* (subpath "{path}"))"#)),
+                "must deny writes of {path}"
+            );
+        }
+        let grant = policy.find("(prefix \"/Users/alice.smith/.\")").unwrap();
+        let deny = policy
+            .find("(deny file-read* (subpath \"/Users/alice.smith/.ssh\"))")
+            .unwrap();
+        assert!(
+            grant < deny,
+            "credential denies must follow the grant (last match wins)"
+        );
+    }
+
+    #[test]
+    fn generate_policy_home_dotfile_grant_honours_configured_forbidden_paths() {
+        let home = Path::new("/Users/alice");
+        let forbidden = vec![PathBuf::from("/Users/alice/.private-secrets")];
+        let policy = generate_policy_for_home(
+            &PathBuf::from("/tmp/test"),
+            &[],
+            &[],
+            &[],
+            &forbidden,
+            Some(home),
+        );
+        assert!(
+            policy.contains(r#"(allow file-read* (prefix "/Users/alice/."))"#),
+            "grant must remain; policy={policy}"
+        );
+        assert!(
+            policy.contains(r#"(deny file-read* (subpath "/Users/alice/.private-secrets"))"#),
+            "configured forbidden path must be denied; policy={policy}"
+        );
+        assert!(
+            policy.contains(r#"(deny file-write* (subpath "/Users/alice/.private-secrets"))"#),
+            "configured forbidden path must deny writes; policy={policy}"
+        );
+        let grant = policy.find(r#"(prefix "/Users/alice/.")"#).unwrap();
+        let deny = policy
+            .find(r#"(deny file-read* (subpath "/Users/alice/.private-secrets"))"#)
+            .unwrap();
+        assert!(grant < deny, "configured deny must follow the grant");
+    }
+
+    #[test]
+    fn generate_policy_home_dotfile_grant_skips_when_home_itself_is_forbidden() {
+        let home = Path::new("/Users/alice");
+        let forbidden = vec![PathBuf::from("/Users/alice")];
+        let policy = generate_policy_for_home(
+            &PathBuf::from("/tmp/workspace-outside"),
+            &[],
+            &[],
+            &[],
+            &forbidden,
+            Some(home),
+        );
+        assert!(
+            !policy.contains(r#"(allow file-read* (prefix "/Users/alice/."))"#),
+            "HOME forbidden must suppress the convenience grant; policy={policy}"
+        );
+    }
+
+    #[test]
+    fn generate_policy_home_dotfile_grant_skips_when_home_ancestor_is_forbidden() {
+        let home = Path::new("/Users/alice");
+        let forbidden = vec![PathBuf::from("/Users")];
+        let policy = generate_policy_for_home(
+            &PathBuf::from("/tmp/workspace-outside"),
+            &[],
+            &[],
+            &[],
+            &forbidden,
+            Some(home),
+        );
+        assert!(
+            !policy.contains(r#"(allow file-read* (prefix "/Users/alice/."))"#),
+            "ancestor forbidden must suppress the convenience grant; policy={policy}"
+        );
+    }
+
+    #[test]
+    fn generate_policy_home_dotfile_grant_escapes_home_literal() {
+        let home = Path::new(r#"/Users/o"brien\x"#);
+        let policy =
+            generate_policy_for_home(&PathBuf::from("/tmp/test"), &[], &[], &[], &[], Some(home));
+        assert!(
+            policy.contains(r#"(allow file-read* (prefix "/Users/o\"brien\\x/."))"#),
+            "home must be escaped as an SBPL string literal; policy={policy}"
+        );
+        assert!(policy.contains(r#"(deny file-read* (subpath "/Users/o\"brien\\x/.ssh"))"#));
+    }
+
+    #[test]
+    fn generate_policy_without_absolute_home_omits_home_dotfile_grant() {
+        for home in [None, Some(Path::new("relative/home"))] {
+            let policy =
+                generate_policy_for_home(&PathBuf::from("/tmp/test"), &[], &[], &[], &[], home);
+            assert!(!policy.contains("(prefix "), "home={home:?}");
+            assert!(!policy.contains("/Users/"), "home={home:?}");
+        }
     }
 
     #[test]
@@ -886,6 +1126,7 @@ mod tests {
                     std::slice::from_ref(&cycle),
                     &[],
                     &[],
+                    &[],
                 )
                 .is_err()
             );
@@ -922,6 +1163,7 @@ mod tests {
                 &aliases[0..1],
                 &aliases[1..2],
                 &aliases[2..3],
+                &[],
             )
             .unwrap();
             for paths in [&canonical, &aliases] {
@@ -968,9 +1210,14 @@ mod tests {
         std::fs::write(outside.join("secret.txt"), "secret").unwrap();
         let alias = fixture.path.join("alias");
         std::os::unix::fs::symlink(&target, &alias).unwrap();
-        let sandbox =
-            SeatbeltSandbox::with_roots(Some(&workspace), std::slice::from_ref(&alias), &[], &[])
-                .unwrap();
+        let sandbox = SeatbeltSandbox::with_roots(
+            Some(&workspace),
+            std::slice::from_ref(&alias),
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
         std::fs::remove_file(&alias).unwrap();
         std::fs::write(&alias, "replacement-secret").unwrap();
         let out = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &alias);
@@ -989,6 +1236,198 @@ mod tests {
         assert!(
             !out.status.success(),
             "retargeted alias must not authorize an unlisted root"
+        );
+    }
+
+    #[test]
+    fn seatbelt_home_dotfile_allows_tools_and_denies_credentials() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        // Synthetic account home with a dot and a quote in its name, so the
+        // test covers the path boundary and literal escaping without touching
+        // the real user's dotfiles.
+        let fixture = HomeFixture::new("dotfile");
+        let home = fixture.child(r#"o"brien.smith"#);
+        let workspace = fixture.child("workspace");
+        let write = |relative: &str, contents: &str| {
+            let path = home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        };
+        let tool_file = write(".cargo/config.toml", "tool-ok");
+        let private_file = write("Documents/private.txt", "private");
+        let credential_files = [
+            write(".ssh/id_test", "secret"),
+            write(".aws/credentials", "secret"),
+            write(".config/gh/hosts.yml", "secret"),
+            write(".netrc", "secret"),
+            write(".git-credentials", "secret"),
+        ];
+
+        let sandbox =
+            SeatbeltSandbox::with_roots_for_home(Some(&workspace), &[], &[], &[], &[], Some(&home))
+                .unwrap();
+
+        let allow = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &tool_file);
+        assert!(
+            allow.status.success(),
+            "home dotfile tool config must be readable: {}",
+            String::from_utf8_lossy(&allow.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&allow.stdout), "tool-ok");
+
+        let private = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &private_file);
+        assert!(
+            !private.status.success(),
+            "non-dot files in a dotted account home must stay denied"
+        );
+
+        for credential in &credential_files {
+            let deny = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, credential);
+            assert!(
+                !deny.status.success(),
+                "credential path {} must stay denied",
+                credential.display()
+            );
+        }
+    }
+
+    #[test]
+    fn seatbelt_home_dotfile_denies_configured_forbidden_hidden_path() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        let fixture = HomeFixture::new("forbidden-dot");
+        let home = fixture.child("alice");
+        let workspace = fixture.child("workspace");
+        let tool_file = {
+            let path = home.join(".cargo/config.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "tool-ok").unwrap();
+            path
+        };
+        let secrets = {
+            let path = home.join(".private-secrets/token");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "secret").unwrap();
+            path
+        };
+        let forbidden = vec![home.join(".private-secrets")];
+        let sandbox = SeatbeltSandbox::with_roots_for_home(
+            Some(&workspace),
+            &[],
+            &[],
+            &[],
+            &forbidden,
+            Some(&home),
+        )
+        .unwrap();
+
+        let allow = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &tool_file);
+        assert!(
+            allow.status.success(),
+            "tool config must stay readable: {}",
+            String::from_utf8_lossy(&allow.stderr)
+        );
+        let deny = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &secrets);
+        assert!(
+            !deny.status.success(),
+            "configured forbidden hidden path must stay denied"
+        );
+    }
+
+    #[test]
+    fn seatbelt_home_dotfile_denies_when_home_itself_is_forbidden() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        let fixture = HomeFixture::new("forbidden-home");
+        let home = fixture.child("alice");
+        let workspace = fixture.child("workspace");
+        let secrets = {
+            let path = home.join(".private-secrets/token");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "secret-token").unwrap();
+            path
+        };
+        let tool = home.join(".cargo");
+        std::fs::create_dir_all(&tool).unwrap();
+        let tool_file = tool.join("config.toml");
+        std::fs::write(&tool_file, "ok").unwrap();
+
+        let forbidden = vec![home.clone()];
+        let sandbox = SeatbeltSandbox::with_roots_for_home(
+            Some(&workspace),
+            &[],
+            &[],
+            &[],
+            &forbidden,
+            Some(&home),
+        )
+        .unwrap();
+        let deny_secret = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &secrets);
+        assert!(
+            !deny_secret.status.success(),
+            "HOME as forbidden must keep hidden secrets closed"
+        );
+        let deny_tool = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &tool_file);
+        assert!(
+            !deny_tool.status.success(),
+            "HOME as forbidden must suppress the home-dotfile grant"
+        );
+        // Allowed tool-config root still wins over the omitted grant.
+        let sandbox_allowed = SeatbeltSandbox::with_roots_for_home(
+            Some(&workspace),
+            &[],
+            std::slice::from_ref(&tool),
+            &[],
+            &forbidden,
+            Some(&home),
+        )
+        .unwrap();
+        let allow = sandboxed_sh(&sandbox_allowed, &workspace, r#"cat "$0""#, &tool_file);
+        assert!(
+            allow.status.success(),
+            "explicit allowed_roots must still grant the tool config: {}",
+            String::from_utf8_lossy(&allow.stderr)
+        );
+    }
+
+    #[test]
+    fn seatbelt_home_dotfile_denies_when_home_ancestor_is_forbidden() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        let fixture = HomeFixture::new("forbidden-ancestor");
+        let home = fixture.child("alice");
+        let workspace = fixture.child("workspace");
+        let ancestor = home
+            .parent()
+            .expect("fixture child home must have a parent")
+            .to_path_buf();
+        let secrets = {
+            let path = home.join(".private-secrets/token");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "secret-token").unwrap();
+            path
+        };
+
+        let forbidden = vec![ancestor];
+        let sandbox = SeatbeltSandbox::with_roots_for_home(
+            Some(&workspace),
+            &[],
+            &[],
+            &[],
+            &forbidden,
+            Some(&home),
+        )
+        .unwrap();
+        let deny = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &secrets);
+        assert!(
+            !deny.status.success(),
+            "ancestor forbidden must keep home hidden paths closed"
         );
     }
 
@@ -1013,6 +1452,7 @@ mod tests {
             std::slice::from_ref(&read_write),
             std::slice::from_ref(&read_only),
             std::slice::from_ref(&write_only),
+            &[],
         )
         .unwrap();
         assert!(sandbox.is_available());
@@ -1130,6 +1570,7 @@ mod tests {
             &[],
             std::slice::from_ref(&read_only),
             std::slice::from_ref(&write_only),
+            &[],
         )
         .unwrap();
 
@@ -1214,6 +1655,7 @@ mod tests {
         let sandbox = SeatbeltSandbox::with_roots(
             Some(worktree.as_path()),
             std::slice::from_ref(&main),
+            &[],
             &[],
             &[],
         )
