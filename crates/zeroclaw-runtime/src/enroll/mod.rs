@@ -195,6 +195,12 @@ pub struct EnrollServer {
     /// endpoint's lifetime; never written or returned.
     pub ca_key_pem: zeroize::Zeroizing<String>,
     pub ledger: Arc<CertLedger>,
+    /// The daemon's canonical pairing authority (`RpcInboundAuth::pairing`),
+    /// shared with `/pair` and RPC auth so one code policy, lifetime and
+    /// brute-force budget govern every surface. Enrollment codes live in their
+    /// own slot of it and never pair a bearer; a gateway pairing code may also
+    /// enroll. Never a private guard: a second guard would hide enrollment
+    /// from the authority that later binds codes to principals.
     pub pairing: Arc<PairingGuard>,
     /// Resolve the pairing-code policy from the canonical live config at the
     /// instant an operator asks the admin loop to mint another code.
@@ -247,7 +253,7 @@ impl EnrollServer {
         let pairing = match class {
             // Direct clients have a real network identity: per-client
             // brute-force lockout applies as before.
-            PeerClass::Direct => match self.pairing.reserve_pair(pairing_code, peer).await {
+            PeerClass::Direct => match self.pairing.reserve_enrollment(pairing_code, peer).await {
                 Ok(Some(pairing)) => pairing,
                 Ok(None) => {
                     return Err((401, "invalid or already-used pairing code".to_string()));
@@ -260,7 +266,7 @@ impl EnrollServer {
             // per-peer lockout would be shared-fate: one hostile client's five
             // failures would freeze enrollment for every relay client. Bound
             // their SUM with the class bucket instead, and skip lockout
-            // accounting (see PairingGuard::reserve_pair_unkeyed).
+            // accounting (see PairingGuard::reserve_enrollment_unkeyed).
             PeerClass::RelayBridge => {
                 if !self.relay_attempt_bucket.try_take() {
                     return Err((
@@ -268,7 +274,7 @@ impl EnrollServer {
                         "relay enrollment attempt budget exhausted; retry shortly".to_string(),
                     ));
                 }
-                match self.pairing.reserve_pair_unkeyed(pairing_code).await {
+                match self.pairing.reserve_enrollment_unkeyed(pairing_code).await {
                     Some(pairing) => pairing,
                     None => {
                         return Err((401, "invalid or already-used pairing code".to_string()));
@@ -276,7 +282,9 @@ impl EnrollServer {
                 }
             }
         };
-        let token_hash = pairing.token_hash();
+        // Enrollment pairs no bearer token; the reservation's opaque issuance
+        // id is what correlates the ledger row and audit event to this code.
+        let token_hash = pairing.issuance_id();
 
         // 2. The daemon assigns the device identity (never the client/CSR): a
         //    stable, unguessable id that becomes the cert CN and the ledger key.
@@ -309,7 +317,7 @@ impl EnrollServer {
         self.ledger
             .record_issued(&entry, false)
             .map_err(|e| (500, format!("ledger error: {e}")))?;
-        pairing.commit();
+        pairing.consume();
 
         // The row is active from here, but the client does not hold the
         // certificate yet - `deliver_enroll_response` marks it delivered only
@@ -862,6 +870,99 @@ mod tests {
             .await
             .expect("an honest relay client must still enroll despite another's failures");
         assert!(resp.cert_pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[tokio::test]
+    async fn enrollment_redeems_codes_from_the_shared_pairing_authority() {
+        // The daemon hands enrollment its canonical pairing guard, so a code
+        // the gateway minted must enroll, and enrolling must neither pair a
+        // bearer token (it would be persisted to gateway.paired_tokens with no
+        // holder) nor leave the code redeemable at /pair.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing = PairingGuard::new(
+            true,
+            &[String::from("zc_already_paired")],
+            PairingCodePolicy::default(),
+        );
+        let code = pairing
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("pairing is required");
+        let server = test_server(pairing.clone(), None);
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("device");
+        let req = EnrollRequest {
+            pairing_code: code.clone(),
+            csr_pem: csr,
+        };
+        server
+            .process(&req, "198.51.100.7", PeerClass::Direct)
+            .await
+            .expect("a gateway-minted code must enroll");
+        assert_eq!(
+            pairing.tokens().len(),
+            1,
+            "enrollment must not add a paired token"
+        );
+        assert_eq!(
+            pairing.try_pair(&code, "198.51.100.7").await.unwrap(),
+            None,
+            "the enrollment consumed the one-time code"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_enrollment_code_enrolls_but_never_pairs_a_bearer() {
+        // An enrollment code reaches parties that must not get a principal
+        // credential (the relay-terminated frontdoor, a shared link or QR), so
+        // it is redeemable at /enroll only, never at /pair.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
+        let code = pairing.mint_enrollment_code(PairingCodePolicy::default());
+        assert_eq!(
+            pairing.try_pair(&code, "198.51.100.7").await.unwrap(),
+            None,
+            "an enrollment code must not pair a bearer"
+        );
+        let server = test_server(pairing.clone(), None);
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("device");
+        let req = EnrollRequest {
+            pairing_code: code,
+            csr_pem: csr,
+        };
+        server
+            .process(&req, "198.51.100.7", PeerClass::Direct)
+            .await
+            .expect("the refused /pair attempt must not burn the code");
+        assert!(pairing.tokens().is_empty());
+        assert!(
+            pairing.pairing_code().is_some(),
+            "the gateway's own startup code is untouched by enrollment"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_issuance_restores_the_enrollment_code() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
+        let code = pairing.enrollment_code(PairingCodePolicy::default());
+        let server = test_server(pairing.clone(), None);
+        let bad = EnrollRequest {
+            pairing_code: code.clone(),
+            csr_pem: "not-a-csr".into(),
+        };
+        let err = server
+            .process(&bad, "198.51.100.7", PeerClass::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, 400);
+        let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("device");
+        let good = EnrollRequest {
+            pairing_code: code,
+            csr_pem: csr,
+        };
+        server
+            .process(&good, "198.51.100.7", PeerClass::Direct)
+            .await
+            .expect("a rejected CSR must not spend the code");
     }
 
     #[tokio::test]

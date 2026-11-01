@@ -358,12 +358,14 @@ cli-update-long-about =
     Use --check to only check for updates without installing.
     Use --force to skip the confirmation prompt.
     Use --version to target a specific release instead of latest.
+    Use --standard in a CLI-only build to switch it to the standard build, which adds the dashboard and web gateway.
 
     Examples:
       zeroclaw update                      # download and install latest
       zeroclaw update --check              # check only, don't install
       zeroclaw update --force              # install without confirmation
       zeroclaw update --version 0.6.0      # install specific version
+      zeroclaw update --standard           # CLI-only build: switch to the standard build
 
 cli-self-test-long-about =
     Run diagnostic self-tests to verify the ZeroClaw installation.
@@ -460,6 +462,8 @@ channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} f
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
+channel-signal-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
+channel-signal-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-line-bind-success = ✅ Paired! You can now chat.
 channel-line-bind-persist-failed = Pairing could not be saved. Ask the bot administrator for a new pairing code and try again.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
@@ -472,6 +476,26 @@ channel-telegram-cmd-stop-desc = Cancel the current in-flight task
 channel-telegram-cmd-model-desc = Show or switch the current model
 channel-telegram-cmd-models-desc = List available model_providers or switch model_provider
 channel-telegram-cmd-config-desc = Show current configuration
+
+# ── Telegram: unauthorized-sender notice ──
+# Sent to a sender who is not on this channel's allowlist. Two variants: the
+# bind form while startup pairing is active, and the allowlist form when the
+# allowlist already resolves peers — that deployment authorizes from
+# configuration, so the sender has no operator terminal to reach.
+# `channels.telegram.<alias>.unauthorized_message` overrides both.
+channel-telegram-unauthorized-bind =
+    🔐 This bot requires operator approval.
+
+    Copy this command to the operator terminal:
+    `{ $bindCommand }`
+
+    After the operator runs it, send your message again.
+channel-telegram-unauthorized-allowlist =
+    🔐 This bot requires operator approval.
+
+    Ask the operator to authorize this Telegram account: { $identity }
+
+    After the operator authorizes it, send your message again.
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
@@ -519,6 +543,7 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
 cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
 cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+cli-self-test-gateway-not-in-build = not included in this build (CLI-only)
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
@@ -987,6 +1012,9 @@ cli-status-agent-no-risk-profile-summary = {$alias}=<no risk_profile>
 cli-status-runtime = ⚙️  Runtime:       {$v}
 cli-status-web-ui-found = 🌐 Web UI:        FOUND ({$path})
 cli-status-web-ui-missing = 🌐 Web UI:        MISSING
+cli-status-web-ui-not-in-build = 🌐 Web UI:        not included in this build (CLI-only)
+# A build without the gateway answers this for `zeroclaw gateway …` and `zeroclaw desktop`.
+cli-no-dashboard-in-build = This ZeroClaw build has no dashboard or web gateway (CLI-only build). To use them, install the standard build: curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 cli-status-heartbeat = 💓 Heartbeat:      {$v}
 cli-status-heartbeat-every-minutes = every {$minutes}min
 cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
@@ -1242,6 +1270,12 @@ cli-update-prebuilt-channel-note = Pre-built updates use the lean standard distr
 cli-update-available = Update available: v{$current} -> v{$latest}
 cli-update-forcing-reinstall = Forcing reinstall: v{$current} -> v{$latest}
 cli-update-not-writable = install directory {$dir} is not writable ({$error}); re-run `zeroclaw update` with elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)
+# A CLI-only build (no gateway) answers `zeroclaw update` with this unless --standard is given.
+cli-update-cli-only-needs-standard =
+    This is a CLI-only build, and releases publish only the standard build. The standard build adds the dashboard and web gateway, which start with the daemon, by default on {$address} with pairing required.
+    To switch to the standard build, run: zeroclaw update --standard
+    To stay CLI-only, re-run the installer: install.sh --cli-only
+cli-update-switching-to-standard = Switching this CLI-only build to the standard build, which adds the dashboard and web gateway.
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
@@ -1683,3 +1717,9 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 skill-http-request-timeout = HTTP request timed out
+
+# Result-aware Agent loop recovery
+turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
+turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
+turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
+turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
