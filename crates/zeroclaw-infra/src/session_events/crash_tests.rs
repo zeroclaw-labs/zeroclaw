@@ -34,7 +34,7 @@ fn power_loss_worker() {
     let backend = std::env::var("ZEROCLAW_SESSION_CRASH_BACKEND").expect("backend");
     if stage == "prepare" {
         fs::create_dir_all(directory).expect("fixture directory");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let store = open_event_store(directory, &backend).expect("store");
         store
             .append_batch(super::tests::request(&stream, "root", 0))
@@ -60,7 +60,7 @@ fn power_loss_worker() {
             })
             .collect();
         let request = AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: store.head(&stream).expect("head"),
             idempotency_key: "frozen-power-loss-batch".into(),
             events,
@@ -87,14 +87,14 @@ fn power_loss_worker() {
         let visible = std::env::var("ZEROCLAW_SESSION_EXPECT_VISIBLE").as_deref() == Ok("true");
         assert_eq!(
             store
-                .head(&request.stream_id)
+                .head(&request.session_id)
                 .expect("recovered head")
                 .sequence,
             if visible { 3 } else { 1 }
         );
         assert_eq!(
             store
-                .lookup_receipt(&request.stream_id, &request.idempotency_key)
+                .lookup_receipt(&request.session_id, &request.idempotency_key)
                 .expect("receipt")
                 .is_some(),
             visible
@@ -109,13 +109,16 @@ fn power_loss_worker() {
             receipt
         );
         assert_eq!(
-            store.head(&request.stream_id).expect("final head").sequence,
+            store
+                .head(&request.session_id)
+                .expect("final head")
+                .sequence,
             3
         );
         let page = store
             .read_page(
-                &request.stream_id,
-                &EventCursor::beginning(request.stream_id.clone()),
+                &request.session_id,
+                &EventCursor::beginning(request.session_id.clone()),
                 None,
                 10,
             )
@@ -156,7 +159,7 @@ fn process_interruption_is_atomic_and_receipt_retry_never_duplicates() {
         ("jsonl", "jsonl_root_published", true),
     ] {
         let directory = tempfile::TempDir::new().expect("directory");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let store = open_event_store(directory.path(), backend).expect("store");
         store
             .append_batch(super::tests::request(&stream, "root", 0))
@@ -182,7 +185,7 @@ fn process_interruption_is_atomic_and_receipt_retry_never_duplicates() {
             })
             .collect();
         let request = AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: store.head(&stream).expect("head"),
             idempotency_key: "frozen-crash-batch".into(),
             events,

@@ -5,14 +5,14 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Clone)]
 struct TurnState {
-    stream: SessionStreamId,
+    stream: SessionId,
     branch: BranchId,
     started: bool,
     terminal: bool,
     // Disposable index of the canonical, not-yet-consumed recovery marker.
     pending_requeue: Option<EventId>,
 }
-type InvocationScope = (SessionStreamId, Option<BranchId>, Option<TurnId>, bool);
+type InvocationScope = (SessionId, Option<BranchId>, Option<TurnId>, bool);
 
 /// Historical eligibility only. Restart still requires current authorization
 /// and proof from the live execution owner that every previous writer stopped.
@@ -47,41 +47,41 @@ pub fn can_requeue_turn<'a>(
 #[derive(Default)]
 pub struct HistoryIndex {
     pub(super) prior: HashMap<EventId, SessionEvent>,
-    branches: HashMap<BranchId, SessionStreamId>,
+    branches: HashMap<BranchId, SessionId>,
     turns: HashMap<TurnId, TurnState>,
     invocations: HashMap<InvocationId, (EventKind, bool)>,
     invocation_scopes: HashMap<InvocationId, InvocationScope>,
     turn_invocations: HashMap<TurnId, Vec<InvocationId>>,
     turn_unknowns: HashMap<TurnId, Vec<EventId>>,
-    by_cursor: HashMap<(SessionStreamId, u64), EventId>,
+    by_cursor: HashMap<(SessionId, u64), EventId>,
     child_derivations: HashMap<EventId, EventId>,
     start_events: HashMap<InvocationId, EventId>,
-    files: HashSet<(SessionStreamId, String)>,
+    files: HashSet<(SessionId, String)>,
     transforms: HashMap<EventId, bool>,
-    elicitations: HashMap<(SessionStreamId, String), (Option<BranchId>, bool)>,
+    elicitations: HashMap<(SessionId, String), (Option<BranchId>, bool)>,
     consumed: HashSet<String>,
     reconciled: HashSet<EventId>,
-    streams: HashSet<SessionStreamId>,
-    closed: HashSet<SessionStreamId>,
+    streams: HashSet<SessionId>,
+    closed: HashSet<SessionId>,
 }
 pub struct HistoryDelta {
     prior: HashMap<EventId, SessionEvent>,
-    branches: HashMap<BranchId, SessionStreamId>,
+    branches: HashMap<BranchId, SessionId>,
     turns: HashMap<TurnId, TurnState>,
     invocations: HashMap<InvocationId, (EventKind, bool)>,
     invocation_scopes: HashMap<InvocationId, InvocationScope>,
     turn_invocations: HashMap<TurnId, Vec<InvocationId>>,
     turn_unknowns: HashMap<TurnId, Vec<EventId>>,
-    by_cursor: HashMap<(SessionStreamId, u64), EventId>,
+    by_cursor: HashMap<(SessionId, u64), EventId>,
     child_derivations: HashMap<EventId, EventId>,
     start_events: HashMap<InvocationId, EventId>,
-    files: HashSet<(SessionStreamId, String)>,
+    files: HashSet<(SessionId, String)>,
     transforms: HashMap<EventId, bool>,
-    elicitations: HashMap<(SessionStreamId, String), (Option<BranchId>, bool)>,
+    elicitations: HashMap<(SessionId, String), (Option<BranchId>, bool)>,
     consumed: HashSet<String>,
     reconciled: HashSet<EventId>,
-    streams: HashSet<SessionStreamId>,
-    closed: HashSet<SessionStreamId>,
+    streams: HashSet<SessionId>,
+    closed: HashSet<SessionId>,
 }
 impl HistoryIndex {
     pub fn from_history(history: &[SessionEvent]) -> Result<Self, AppendError> {
@@ -127,7 +127,7 @@ impl HistoryIndex {
                 .filter(|event| event.sequence > 0)
                 .map(|event| {
                     (
-                        (event.stream_id.clone(), event.sequence),
+                        (event.session_id.clone(), event.sequence),
                         event.event_id.clone(),
                     )
                 }),
@@ -194,7 +194,7 @@ impl HistoryIndex {
                         "causation must reference prior committed or batch event",
                     ));
                 }
-                if closed.contains(&event.stream_id)
+                if closed.contains(&event.session_id)
                     && (matches!(
                         event.body.kind(),
                         EventKind::TurnAccepted
@@ -217,7 +217,7 @@ impl HistoryIndex {
                 if !matches!(
                     event.body.kind(),
                     EventKind::SessionStarted | EventKind::DerivedSessionStarted
-                ) && !streams.contains(&event.stream_id)
+                ) && !streams.contains(&event.session_id)
                 {
                     return Err(invalid("stream has not been created"));
                 }
@@ -235,7 +235,7 @@ impl HistoryIndex {
                         .and_then(|id| prior.get(id))
                         .is_none_or(|cause| {
                             cause.body.kind() != EventKind::ControlInputRecorded
-                                || cause.stream_id != event.stream_id
+                                || cause.session_id != event.session_id
                                 || cause.branch_id != event.branch_id
                         })
                 {
@@ -249,7 +249,7 @@ impl HistoryIndex {
                         | EventKind::DerivedSessionStarted
                         | EventKind::BranchCreated
                 ) && let Some(branch) = &event.branch_id
-                    && branches.get(branch) != Some(&event.stream_id)
+                    && branches.get(branch) != Some(&event.session_id)
                 {
                     return Err(reference("branch does not belong to stream"));
                 }
@@ -258,7 +258,7 @@ impl HistoryIndex {
                         return Err(reference("turn has not been accepted"));
                     }
                     if let Some(state) = turns.get(turn)
-                        && (state.stream != event.stream_id
+                        && (state.stream != event.session_id
                             || event.branch_id.as_ref() != Some(&state.branch))
                     {
                         return Err(reference("turn is bound to another stream or branch"));
@@ -286,7 +286,7 @@ impl HistoryIndex {
                     if !kinds.is_empty() && !kinds.contains(&target.body.kind()) {
                         return Err(reference("event role target has incorrect kind"));
                     }
-                    if target.stream_id != event.stream_id
+                    if target.session_id != event.session_id
                         && !matches!(
                             event.body.kind(),
                             EventKind::DerivedSessionStarted
@@ -329,7 +329,7 @@ impl HistoryIndex {
                 if let Some(id) = &event.invocation_id
                     && let Some((stream, branch, turn, background)) = invocation_scopes.get(id)
                 {
-                    if stream != &event.stream_id
+                    if stream != &event.session_id
                         || branch != &event.branch_id
                         || (turn != &event.turn_id
                             && event.body.kind() != EventKind::ChildResultConsumed)
@@ -446,7 +446,7 @@ impl HistoryIndex {
                             .and_then(|id| prior.get(id))
                             .is_none_or(|cause| {
                                 cause.body.kind() != EventKind::ControlInputRecorded
-                                    || cause.stream_id != event.stream_id
+                                    || cause.session_id != event.session_id
                                     || cause.branch_id != event.branch_id
                                     || cause.turn_id != event.turn_id
                             }) =>
@@ -457,7 +457,7 @@ impl HistoryIndex {
                     }
                     EventData::FileAttached { file_id, .. }
                     | EventData::FileUsed { file_id, .. }
-                        if !files.contains(&(event.stream_id.clone(), file_id.clone())) =>
+                        if !files.contains(&(event.session_id.clone(), file_id.clone())) =>
                     {
                         return Err(reference(
                             "file use requires registered FileId in session scope",
@@ -479,7 +479,7 @@ impl HistoryIndex {
                     {
                         return Err(invalid("invalid elicitation request"));
                     }
-                    let key = (event.stream_id.clone(), request_id.clone());
+                    let key = (event.session_id.clone(), request_id.clone());
                     if elicitations.contains_key(&key) {
                         return Err(invalid("elicitation request identity already exists"));
                     }
@@ -487,7 +487,7 @@ impl HistoryIndex {
                 }
                 EventData::ElicitationResolved { request_id, .. } => {
                     let state = elicitations
-                        .get_mut(&(event.stream_id.clone(), request_id.clone()))
+                        .get_mut(&(event.session_id.clone(), request_id.clone()))
                         .ok_or_else(|| invalid("elicitation resolution has no request"))?;
                     if state.1 || state.0 != event.branch_id {
                         return Err(invalid(
@@ -499,14 +499,14 @@ impl HistoryIndex {
                 _ => {}
             }
             if let EventData::FileRegistered { file_id, .. } = &event.body.data {
-                if incoming && files.contains(&(event.stream_id.clone(), file_id.clone())) {
+                if incoming && files.contains(&(event.session_id.clone(), file_id.clone())) {
                     return Err(invalid("file identity already registered"));
                 }
-                files.insert((event.stream_id.clone(), file_id.clone()));
+                files.insert((event.session_id.clone(), file_id.clone()));
             }
             match &event.body.kind() {
                 EventKind::SessionStarted | EventKind::DerivedSessionStarted => {
-                    if incoming && streams.contains(&event.stream_id) {
+                    if incoming && streams.contains(&event.session_id) {
                         return Err(invalid("stream already created"));
                     }
                     if incoming && event.body.kind() == EventKind::DerivedSessionStarted {
@@ -532,12 +532,12 @@ impl HistoryIndex {
                             return Err(invalid("parent request already created a child"));
                         }
                     }
-                    streams.insert(event.stream_id.clone());
+                    streams.insert(event.session_id.clone());
                     if let Some(branch) = &event.branch_id {
                         if incoming && branches.contains_key(branch) {
                             return Err(invalid("branch identity already exists"));
                         }
-                        branches.insert(branch.clone(), event.stream_id.clone());
+                        branches.insert(branch.clone(), event.session_id.clone());
                     }
                 }
                 EventKind::BranchCreated => {
@@ -545,7 +545,7 @@ impl HistoryIndex {
                         if incoming && branches.contains_key(branch) {
                             return Err(invalid("branch already exists"));
                         }
-                        branches.insert(branch.clone(), event.stream_id.clone());
+                        branches.insert(branch.clone(), event.session_id.clone());
                     }
                 }
                 EventKind::TurnAccepted => {
@@ -558,13 +558,13 @@ impl HistoryIndex {
                             .clone()
                             .ok_or_else(|| reference("accepted turn missing branch"))?;
                         if incoming && child_derivations.values().filter_map(|id| prior.get(id)).any(|item| matches!(&item.body.data, EventData::DerivedSessionStarted { execution_turn_id: Some(bound) } if bound == turn)
-                            && (item.stream_id != event.stream_id || item.branch_id.as_ref() != Some(&branch))) {
+                            && (item.session_id != event.session_id || item.branch_id.as_ref() != Some(&branch))) {
                             return Err(reference("child execution is bound to another stream or branch"));
                         }
                         turns.insert(
                             turn.clone(),
                             TurnState {
-                                stream: event.stream_id.clone(),
+                                stream: event.session_id.clone(),
                                 branch,
                                 started: false,
                                 terminal: false,
@@ -711,7 +711,7 @@ impl HistoryIndex {
                         invocation_scopes.insert(
                             id.clone(),
                             (
-                                event.stream_id.clone(),
+                                event.session_id.clone(),
                                 event.branch_id.clone(),
                                 event.turn_id.clone(),
                                 background,
@@ -801,7 +801,7 @@ impl HistoryIndex {
                 }
                 EventKind::SessionClosed if !matches!(&event.body.data, EventData::SessionClosed { reason_key } if reason_key == "session_ttl_expired") =>
                 {
-                    closed.insert(event.stream_id.clone());
+                    closed.insert(event.session_id.clone());
                 }
                 _ => {}
             }
@@ -848,7 +848,7 @@ impl HistoryIndex {
             }
             if event.sequence > 0 {
                 by_cursor.insert(
-                    (event.stream_id.clone(), event.sequence),
+                    (event.session_id.clone(), event.sequence),
                     event.event_id.clone(),
                 );
             }
@@ -1171,8 +1171,8 @@ fn event_refs(data: &EventData) -> Vec<(&EventId, &'static [EventKind], bool)> {
 fn validate_coordinates(
     event: &SessionEvent,
     prior: &OverlayMap<'_, EventId, SessionEvent>,
-    branches: &OverlayMap<'_, BranchId, SessionStreamId>,
-    by_cursor: &OverlayMap<'_, (SessionStreamId, u64), EventId>,
+    branches: &OverlayMap<'_, BranchId, SessionId>,
+    by_cursor: &OverlayMap<'_, (SessionId, u64), EventId>,
     child_derivations: &OverlayMap<'_, EventId, EventId>,
     start_events: &OverlayMap<'_, InvocationId, EventId>,
 ) -> Result<(), AppendError> {
@@ -1201,7 +1201,7 @@ fn validate_coordinates(
                 ));
             }
             let lineage =
-                super::lineage::frozen_lineage(prior.values(), &event.stream_id, branch, u64::MAX)
+                super::lineage::frozen_lineage(prior.values(), &event.session_id, branch, u64::MAX)
                     .map_err(|error| reference(&error.to_string()))?;
             if !super::lineage::includes(&lineage, target) {
                 return Err(reference(
@@ -1213,8 +1213,8 @@ fn validate_coordinates(
             parent_branch_id,
             parent_cursor,
         } => {
-            if branches.get(parent_branch_id) != Some(&parent_cursor.stream_id)
-                || parent_cursor.stream_id != event.stream_id
+            if branches.get(parent_branch_id) != Some(&parent_cursor.session_id)
+                || parent_cursor.session_id != event.session_id
             {
                 return Err(reference(
                     "branch seed does not identify a committed parent prefix",
@@ -1222,12 +1222,12 @@ fn validate_coordinates(
             }
             if parent_cursor.sequence > 0 {
                 let item = by_cursor
-                    .get(&(parent_cursor.stream_id.clone(), parent_cursor.sequence))
+                    .get(&(parent_cursor.session_id.clone(), parent_cursor.sequence))
                     .and_then(|id| prior.get(id))
                     .ok_or_else(|| reference("branch cursor missing"))?;
                 let lineage = super::lineage::frozen_lineage(
                     prior.values(),
-                    &event.stream_id,
+                    &event.session_id,
                     parent_branch_id,
                     u64::MAX,
                 )
@@ -1241,7 +1241,7 @@ fn validate_coordinates(
             for range in source_ranges {
                 if range.from_seq == 0
                     || range.from_seq > range.to_seq
-                    || !by_cursor.contains_key(&(range.stream_id.clone(), range.to_seq))
+                    || !by_cursor.contains_key(&(range.session_id.clone(), range.to_seq))
                 {
                     return Err(reference("context range is not a frozen committed prefix"));
                 }
@@ -1252,9 +1252,9 @@ fn validate_coordinates(
             disposition,
             ..
         } => {
-            if through_cursor.stream_id != event.stream_id
+            if through_cursor.session_id != event.session_id
                 || !by_cursor
-                    .contains_key(&(through_cursor.stream_id.clone(), through_cursor.sequence))
+                    .contains_key(&(through_cursor.session_id.clone(), through_cursor.sequence))
             {
                 return Err(reference("recovery cursor is not a committed prefix"));
             }
@@ -1316,7 +1316,7 @@ fn validate_coordinates(
                 .ok_or_else(|| reference("child request missing"))?;
             let terminal = by_cursor
                 .get(&(
-                    child_terminal_cursor.stream_id.clone(),
+                    child_terminal_cursor.session_id.clone(),
                     child_terminal_cursor.sequence,
                 ))
                 .and_then(|id| prior.get(id))
@@ -1344,7 +1344,7 @@ pub(super) fn validate_child_terminal(
         return Err(reference("invalid child derivation"));
     };
     if derived.causation_id.as_ref() != Some(&origin.event_id)
-        || terminal.stream_id != derived.stream_id
+        || terminal.session_id != derived.session_id
         || terminal.branch_id != derived.branch_id
         || terminal.turn_id.as_ref() != Some(execution_turn_id)
         || !matches!(

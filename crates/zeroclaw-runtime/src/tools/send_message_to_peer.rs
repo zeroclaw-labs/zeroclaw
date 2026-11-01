@@ -1842,7 +1842,7 @@ mod tests {
             );
             let family = format!("peer-inbox:{task_id}");
             let source = source.expect("native source");
-            let stream = zeroclaw_kernel::session::engine::EngineSessionSource::stream_id(
+            let stream = zeroclaw_kernel::session::engine::EngineSessionSource::session_id(
                 source.as_ref(),
                 &family,
             )
@@ -1936,7 +1936,7 @@ mod tests {
         assert_eq!(terminal_snapshot.task.status, TaskStatus::Completed);
         if let Some(source) = &source {
             let family = format!("peer-inbox:{task_id}");
-            let stream = zeroclaw_kernel::session::engine::EngineSessionSource::stream_id(
+            let stream = zeroclaw_kernel::session::engine::EngineSessionSource::session_id(
                 source.as_ref(),
                 &family,
             )

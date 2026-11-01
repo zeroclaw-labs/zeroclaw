@@ -28,7 +28,7 @@ pub trait EngineSessionAuthority: SessionAccessPolicy + PermissionResolver {
 /// current authority; kernel never constructs a physical backend.
 #[async_trait::async_trait]
 pub trait EngineSessionSource: Send + Sync {
-    async fn stream_id(&self, family: &str) -> Result<SessionStreamId, ContractError>;
+    async fn session_id(&self, family: &str) -> Result<SessionId, ContractError>;
     /// Routing metadata for the trusted authorization resolver. A transport
     /// must authorize before disclosing this descriptor to a caller.
     async fn describe(&self, family: String) -> anyhow::Result<Option<SessionDescriptor>>;
@@ -75,13 +75,13 @@ pub trait EngineSessionSource: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct SessionDescriptor {
-    pub stream: SessionStreamId,
+    pub stream: SessionId,
     pub owning_agent: String,
     pub owner: Option<String>,
 }
 
 pub struct SessionReadHandle {
-    pub stream: SessionStreamId,
+    pub stream: SessionId,
     pub query: SessionQuery,
 }
 
@@ -93,15 +93,15 @@ impl views::SessionHistoryReadPort for EngineSession {
 
     async fn list(&self, limit: usize) -> anyhow::Result<Vec<views::SessionSummary>> {
         let current = self.query().summary(self.stream.clone()).await?;
-        let current_key = current.session_key().map(str::to_owned);
+        let current_id = self.stream.as_str().to_owned();
         let mut summaries = vec![current];
         if let (Some(source), EventActor::Principal { principal_id }) = (&self.source, &self.actor)
         {
             for family in source.sessions().await? {
-                if Some(&family) == current_key.as_ref() {
+                if family == current_id {
                     continue;
                 }
-                let stream = source.stream_id(&family).await?;
+                let stream = source.session_id(&family).await?;
                 match SessionAccessPolicy::authorize_actor(
                     self.authority.as_ref(),
                     &self.actor,
@@ -131,7 +131,7 @@ impl views::SessionHistoryReadPort for EngineSession {
             SessionAccessPolicy::authorize_actor(
                 self.authority.as_ref(),
                 &self.actor,
-                &summary.head.stream_id,
+                &summary.head.session_id,
                 SessionAccess::Read,
             )?;
         }
@@ -143,11 +143,7 @@ impl views::SessionHistoryReadPort for EngineSession {
         family: &str,
         limit: usize,
     ) -> anyhow::Result<Option<views::HistoricalMessagePage>> {
-        let summary = self.query().summary(self.stream.clone()).await?;
-        if summary.session_key() == Some(family)
-            || family == self.stream.as_str()
-            || summary.session_key() == Some(format!("gw_{family}").as_str())
-        {
+        if family == self.stream.as_str() {
             return Ok(Some(
                 self.query()
                     .message_page(self.stream.clone(), None, limit)
@@ -156,7 +152,7 @@ impl views::SessionHistoryReadPort for EngineSession {
         }
         if let (Some(source), EventActor::Principal { principal_id }) = (&self.source, &self.actor)
         {
-            let stream = source.stream_id(family).await?;
+            let stream = source.session_id(family).await?;
             match SessionAccessPolicy::authorize_actor(
                 self.authority.as_ref(),
                 &self.actor,
@@ -190,7 +186,7 @@ impl views::SessionHistoryReadPort for EngineSession {
 #[derive(Clone)]
 pub struct EngineSession {
     pub(super) owner: Arc<SessionCoordinator>,
-    pub(super) stream: SessionStreamId,
+    pub(super) stream: SessionId,
     pub(super) branch: BranchId,
     pub(super) actor: EventActor,
     pub(super) authority: Arc<dyn EngineSessionAuthority>,
@@ -217,7 +213,7 @@ impl EngineSession {
     }
     pub fn new(
         owner: Arc<SessionCoordinator>,
-        stream: SessionStreamId,
+        stream: SessionId,
         branch: BranchId,
         principal: PrincipalId,
         authority: Arc<dyn EngineSessionAuthority>,
@@ -265,7 +261,7 @@ impl EngineSession {
         input_payloads.extend(route);
         let context = self.latest_context().await?;
         Ok(UserTurnCommand {
-            stream_id: self.stream.clone(),
+            session_id: self.stream.clone(),
             branch_id: self.branch.clone(),
             turn_id: turn.clone(),
             message_id: MessageId::parse(format!("message-{turn}"))?,
@@ -280,7 +276,7 @@ impl EngineSession {
     }
     pub fn with_actor(
         owner: Arc<SessionCoordinator>,
-        stream: SessionStreamId,
+        stream: SessionId,
         branch: BranchId,
         actor: EventActor,
         authority: Arc<dyn EngineSessionAuthority>,
@@ -650,7 +646,7 @@ impl SessionExecutionPort for EngineSession {
             .read_page(
                 self.stream.clone(),
                 EventCursor {
-                    stream_id: self.stream.clone(),
+                    session_id: self.stream.clone(),
                     sequence: receipt.first.sequence - 1,
                 },
                 Some(receipt.last),
@@ -732,7 +728,7 @@ tokio::task_local! {
     static ENGINE_SESSION_SOURCE: Arc<dyn EngineSessionSource>;
     // A task-bound execution coordinate, derived from the admitted command.
     // It never owns history, policy or scheduling state.
-    static ACTIVE_ENGINE_SESSION: (SessionStreamId, BranchId);
+    static ACTIVE_ENGINE_SESSION: (SessionId, BranchId);
 }
 pub async fn scope_engine_session_source<F: std::future::Future>(
     source: Arc<dyn EngineSessionSource>,
@@ -772,7 +768,7 @@ impl SessionAccessPolicy for EngineContextReader {
     fn authorize(
         &self,
         principal: &PrincipalId,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         SessionAccessPolicy::authorize(self.authority.as_ref(), principal, stream, access)
@@ -780,7 +776,7 @@ impl SessionAccessPolicy for EngineContextReader {
     fn authorize_actor(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         self.authority.authorize_actor(actor, stream, access)
@@ -788,7 +784,7 @@ impl SessionAccessPolicy for EngineContextReader {
     fn authorize_reasoning(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<(), SessionError> {
         self.authority
             .authorize_actor(actor, stream, SessionAccess::Read)?;

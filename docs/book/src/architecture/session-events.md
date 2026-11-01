@@ -476,13 +476,13 @@ writer generation and either `upgrading`, `switching` or `ready` state, with no
 per-session routing records. Before opening execution or history readers, the
 host imports all legacy SQLite/JSONL sessions into the configured native backend.
 Read-only enumeration therefore includes old history before a session is resumed.
-The root session metadata records `session_key` and the immutable
-`creation_source` separately. The key identifies the user-facing session and
-is independent of its creation protocol. Stream coordinates are derived from
-the key, while the source only records the first entrance protocol. Channel
-entrances record their actual protocol name. Legacy SQLite/JSONL imports record
-`legacy` when the original entrance is unknown; ACP and CLI imports retain
-their known protocol. Session-key prefixes never supply the source.
+The event envelope's `session_id` is the sole session identity and storage
+coordinate. Cursors, append receipts and the session index use that same ID;
+there is no second session key or stream ID. The immutable `creation_source`
+metadata only records the first entrance protocol. Channel entrances record
+their actual protocol name. Legacy SQLite/JSONL imports record `legacy` when
+the original entrance is unknown; ACP and CLI imports retain their known
+protocol. Session ID prefixes never supply the source.
 
 Legacy writers, including read-side repairs of old ACP derived columns,
 share the installation publication lock and are fenced before import starts.

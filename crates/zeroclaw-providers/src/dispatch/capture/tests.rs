@@ -676,11 +676,11 @@ async fn native_codex_buffered_api_checkpoints_wire_reasoning_and_never_retries_
                 let calls = Arc::new(AtomicUsize::new(0));
                 let seen = calls.clone();
                 let store = h.store.clone();
-                let stream_id = h.stream.clone();
+                let session_id = h.stream.clone();
                 let app = axum::Router::new().route("/responses", axum::routing::post(move || {
                     let seen = seen.clone();
                     let store = store.clone();
-                    let stream_id = stream_id.clone();
+                    let session_id = session_id.clone();
                     async move {
                         seen.fetch_add(1, Ordering::SeqCst);
                         let output = serde_json::json!([
@@ -695,7 +695,7 @@ async fn native_codex_buffered_api_checkpoints_wire_reasoning_and_never_retries_
                         let first = "data: {\"type\":\"response.output_audio.delta\",\"delta\":\"AAEC\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"reason-1\",\"delta\":\"thinking fixture\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer fixture\"}\n\n".to_string();
                         let second = format!("data: {}\n\ndata: {}\n\n", serde_json::json!({"type":"response.output_item.done","item":output[0]}), serde_json::json!({"type":"response.completed","response":{"status":"completed","output":output,"usage":{"input_tokens":7,"output_tokens":9}}}));
                         let chunks = futures_util::stream::unfold(0, move |phase| {
-                            let first=first.clone(); let second=second.clone(); let store=store.clone(); let stream_id=stream_id.clone();
+                            let first=first.clone(); let second=second.clone(); let store=store.clone(); let session_id=session_id.clone();
                             async move {
                                 if phase == 0 {
                                     return Some((Ok::<_, std::io::Error>(first.into_bytes()), 1));
@@ -706,7 +706,7 @@ async fn native_codex_buffered_api_checkpoints_wire_reasoning_and_never_retries_
                                     // earlier deltas are durable, while chat() is pending.
                                     tokio::time::timeout(std::time::Duration::from_secs(10), async {
                                         loop {
-                                            let page=store.read_page(&stream_id,&EventCursor::beginning(stream_id.clone()),None,100).expect("history");
+                                            let page=store.read_page(&session_id,&EventCursor::beginning(session_id.clone()),None,100).expect("history");
                                             if page.events.iter().filter(|e|e.body.kind()==EventKind::ProviderResponseProgressObserved).count() >= 3 { break; }
                                             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                                         }
@@ -978,14 +978,14 @@ impl PermissionResolver for Allow {
 struct Harness {
     _dir: tempfile::TempDir,
     store: Arc<dyn SessionEventStore>,
-    stream: SessionStreamId,
+    stream: SessionId,
     admission: Arc<dyn zeroclaw_api::session_events::capture::ProviderAdmissionPort>,
 }
 impl Harness {
     fn new(backend: &str) -> Self {
         let dir = tempfile::TempDir::new().expect("dir");
         let store = open_event_store(dir.path(), backend).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let branch = BranchId::new();
         let turn = TurnId::new();
         let ingress = PayloadRecord::json(
@@ -1022,7 +1022,6 @@ impl Harness {
         };
         let root = make(
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -1059,7 +1058,7 @@ impl Harness {
         let context_id = projection.event_id.clone();
         store
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: EventCursor::beginning(stream.clone()),
                 idempotency_key: "fixture".into(),
                 events: vec![root, accepted, started, projection],
@@ -1112,7 +1111,7 @@ impl Harness {
 
 struct Leaf {
     store: Arc<dyn SessionEventStore>,
-    stream: SessionStreamId,
+    stream: SessionId,
     error: bool,
 }
 impl Attributable for Leaf {

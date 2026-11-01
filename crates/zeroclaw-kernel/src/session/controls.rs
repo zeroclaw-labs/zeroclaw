@@ -38,7 +38,7 @@ impl EngineSession {
             authority.authorize_context(&stream,&branch)?;
             let key=format!("file-observation:{}:{operation}",file.file_id);
             if let Some(receipt)=owner.store.lookup_receipt(&stream,&key)? {
-                let page=owner.store.read_page(&stream,&EventCursor {stream_id:stream.clone(),sequence:receipt.first.sequence-1},Some(&receipt.last),16)?;
+                let page=owner.store.read_page(&stream,&EventCursor {session_id:stream.clone(),sequence:receipt.first.sequence-1},Some(&receipt.last),16)?;
                 let previous=page.events.iter().find_map(|event|match &event.body.data {
                     EventData::FileUsed {representation_ref,..}=>Some(representation_ref),_=>None
                 }).ok_or_else(||SessionError::StoreUnhealthy("file receipt missing rendition".into()))?;
@@ -73,7 +73,7 @@ impl EngineSession {
             let mut used=SessionEvent::typed(stream.clone(),EventData::FileUsed {file_id:file.file_id,operation,representation_ref:StoredPayloadRef::from(&file.representation),policy_evidence_ref:StoredPayloadRef::from(&evidence)},actor).map_err(AppendError::from)?;
             used.branch_id=Some(branch);
             events.push(used);
-            owner.store.append_batch(AppendRequest {stream_id:stream.clone(),expected_head:through,idempotency_key:key,events,payloads,erasure_reference_commitment:None})?;
+            owner.store.append_batch(AppendRequest {session_id:stream.clone(),expected_head:through,idempotency_key:key,events,payloads,erasure_reference_commitment:None})?;
             let _=owner.wakeups.send(stream);
             Ok(())
         }).await?;
@@ -200,7 +200,7 @@ impl EngineSession {
                 event.branch_id = Some(branch);
                 let key = format!("approval-reply-rejected:{}", event.event_id);
                 owner.store.append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: owner.store.head(&stream)?,
                     idempotency_key: key,
                     events: vec![event],
@@ -243,7 +243,7 @@ impl EngineSession {
                 .read_page(
                     self.stream.clone(),
                     EventCursor {
-                        stream_id: self.stream.clone(),
+                        session_id: self.stream.clone(),
                         sequence: receipt.first.sequence - 1,
                     },
                     Some(receipt.last),
@@ -413,7 +413,7 @@ impl EngineSession {
                     ));
                 }
                 owner.store.append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: owner.store.head(&stream)?,
                     idempotency_key: outcome_key,
                     events,
@@ -448,7 +448,7 @@ impl EngineSession {
             EventData::ControlInputRecorded {
                 control_ref: StoredPayloadRef::from(&control),
                 expected_target_ref: TargetRef::Session {
-                    stream_id: self.stream.clone(),
+                    session_id: self.stream.clone(),
                 },
                 ingress_ref: StoredPayloadRef::from(&ingress),
             },
@@ -503,7 +503,7 @@ impl EngineSession {
                     }
                 }
                 owner.store.append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: owner.store.head(&stream)?,
                     idempotency_key: format!("session-control:{key}"),
                     events,
@@ -660,7 +660,7 @@ impl EngineSession {
             self.stream.clone(),
             EventData::ContextProjectionCreated {
                 source_ranges: vec![SourceRange {
-                    stream_id: self.stream.clone(),
+                    session_id: self.stream.clone(),
                     from_seq: input.sequence,
                     to_seq: input.sequence,
                     disposition: RangeDisposition::Included,
@@ -696,7 +696,7 @@ impl EngineSession {
         let turn = turn.map(TurnId::parse).transpose()?;
         let target = turn.as_ref().map_or_else(
             || TargetRef::Session {
-                stream_id: self.stream.clone(),
+                session_id: self.stream.clone(),
             },
             |turn| TargetRef::Turn {
                 turn_id: turn.clone(),

@@ -5,10 +5,10 @@ use zeroclaw_api::principal::PrincipalId;
 use zeroclaw_api::session_events::capture::{EngineTurnInput, SessionExecutionPort};
 use zeroclaw_api::session_events::{
     AppendRequest, BranchId, CaptureMode, Digest, EventActor, EventCursor, EventData, EventKind,
-    PayloadRecord, SessionEvent, SessionId, SessionStreamId, StoredPayloadRef,
+    PayloadRecord, SessionEvent, SessionId, StoredPayloadRef,
 };
 use zeroclaw_infra::session_events::installation::{
-    InstallationGuard, NativeBackend, creation_source, session_key,
+    InstallationGuard, NativeBackend, creation_source,
 };
 use zeroclaw_kernel::session::engine::{EngineSession, EngineSessionAuthority};
 use zeroclaw_kernel::session::query::{SessionAccess, SessionAccessPolicy};
@@ -18,7 +18,7 @@ use zeroclaw_runtime::live_config_authority::AgentExecutionCapability;
 struct CliAuthority {
     capability: AgentExecutionCapability,
     alias: String,
-    stream: SessionStreamId,
+    stream: SessionId,
     origin: zeroclaw_api::ingress::TurnOrigin,
     parent_alias: Option<String>,
 }
@@ -43,14 +43,14 @@ impl SessionAccessPolicy for CliAuthority {
     fn authorize_reasoning(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<(), SessionError> {
         self.authorize_actor(actor, stream, SessionAccess::Read)
     }
     fn authorize(
         &self,
         principal: &PrincipalId,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         if *principal != PrincipalId::shared_operator()
@@ -67,7 +67,7 @@ impl SessionAccessPolicy for CliAuthority {
 impl PermissionResolver for CliAuthority {
     fn tool_authority_evidence(
         &self,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
         name: &str,
     ) -> Result<serde_json::Value, zeroclaw_kernel::session::SessionError> {
         if stream != &self.stream {
@@ -97,7 +97,7 @@ impl PermissionResolver for CliAuthority {
     fn child_authority(
         &self,
         target: &str,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<Arc<dyn EngineSessionAuthority>, SessionError> {
         self.current()?;
         let handle = self.capability.config_handle();
@@ -119,11 +119,7 @@ impl PermissionResolver for CliAuthority {
         Ok(Arc::new(child))
     }
 
-    fn authorize_context(
-        &self,
-        stream: &SessionStreamId,
-        _: &BranchId,
-    ) -> Result<(), SessionError> {
+    fn authorize_context(&self, stream: &SessionId, _: &BranchId) -> Result<(), SessionError> {
         if stream != &self.stream {
             return Err(SessionError::PermissionDenied(
                 "CLI context scope mismatch".into(),
@@ -132,7 +128,7 @@ impl PermissionResolver for CliAuthority {
         self.current()
     }
     fn authorize(&self, intent: &EffectIntent) -> Result<(), SessionError> {
-        if intent.stream_id != self.stream
+        if intent.session_id != self.stream
             || !matches!(
                 intent.event.body.kind(),
                 EventKind::ProviderAttemptStarted
@@ -219,11 +215,11 @@ pub async fn open_cli_session(
             format!("cli-state-{}", Digest::from_bytes(&zeroclaw_api::session_events::canonical_json(
                 &serde_json::json!({"path":lease.path(),"agent":alias}),
             )?).as_str())
-        } else { SessionStreamId::new().to_string() };
-        let family = format!("cli:{alias}:{identity}");
-        let stream = zeroclaw_infra::session_events::upgrade::stream_id(&family)?;
+        } else { SessionId::new().to_string() };
+        let family = format!("cli-{alias}-{identity}");
+        let stream = SessionId::parse(family.clone())?;
         let branch = BranchId::parse(format!("branch-{stream}"))?;
-        let session_id = SessionId::parse(format!("session-{stream}"))?;
+        let session_id = stream.clone();
         zeroclaw_infra::session_events::upgrade::upgrade_installation(&data_dir, backend, |channel| {
             zeroclaw_session_host::legacy_session_owner(&capability.config_handle().read(), channel)
         })?;
@@ -237,7 +233,7 @@ pub async fn open_cli_session(
         };
         if let Some(lease) = &mut lease {
             anyhow::ensure!(published || !lease.has_backup()?, "CLI backup has no matching family in this installation");
-            lease.bind(CliStateBinding {version:1, data_dir:data_dir.clone(), session_key:family.clone()})?;
+            lease.bind(CliStateBinding {version:1, data_dir:data_dir.clone(), session_id:family.clone()})?;
         }
         let legacy = !published && lease.as_ref().is_some_and(|lease| lease.path().exists());
         if legacy {
@@ -272,7 +268,7 @@ pub async fn open_cli_session(
             let key = format!("native-family-create:{stream}");
             if store.lookup_receipt(&stream, &key)?.is_none() {
                 let mut root = SessionEvent::typed(stream.clone(), EventData::SessionStarted {
-                    session_id, owning_agent:alias.clone(), capture_mode:CaptureMode::Native,
+                    owning_agent:alias.clone(), capture_mode:CaptureMode::Native,
                 }, EventActor::Principal {principal_id:PrincipalId::shared_operator().0})?;
                 root.branch_id=Some(branch.clone());
                 let context_payload=PayloadRecord::json("session.context/v1", &serde_json::json!({"messages":[],"history_has_trim_breadcrumb":false}))?;
@@ -282,11 +278,10 @@ pub async fn open_cli_session(
                     summary_source_refs:vec![], transform_started_event_id:None,
                 }, EventActor::default())?;
                 context.branch_id=Some(branch.clone());
-                let (identity, identity_payload) = session_key(stream.clone(), &family)?;
                 let (source, source_payload) = creation_source(stream.clone(), "cli")?;
                 SessionCoordinator::new(Arc::clone(&store)).append(AppendRequest {
-                    stream_id:stream.clone(), expected_head:EventCursor::beginning(stream.clone()), idempotency_key:key.clone(),
-                    events:vec![root,identity,source,context], payloads:vec![context_payload,identity_payload,source_payload], erasure_reference_commitment:None,
+                    session_id:stream.clone(), expected_head:EventCursor::beginning(stream.clone()), idempotency_key:key.clone(),
+                    events:vec![root,source,context], payloads:vec![context_payload,source_payload], erasure_reference_commitment:None,
                 })?;
             }
             drop(installation);
@@ -327,7 +322,7 @@ struct CliOwnershipRecovery;
 impl zeroclaw_kernel::session::recovery::StreamExecutionLossVerifier for CliOwnershipRecovery {
     fn verify_stream_loss(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         through: &EventCursor,
     ) -> Result<PayloadRecord, SessionError> {
         Ok(PayloadRecord::json(

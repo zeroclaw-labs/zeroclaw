@@ -1,6 +1,6 @@
 //! Transport-neutral session metadata projected from the active event store.
 //! The installation lock serializes conditional metadata changes and cutover.
-use super::installation::{InstallationGuard, creation_source, session_key};
+use super::installation::{InstallationGuard, creation_source};
 use super::*;
 use std::collections::BTreeMap;
 use zeroclaw_api::session_events::{
@@ -25,7 +25,6 @@ fn bounded_preview(value: &str) -> String {
 
 fn residual_metadata(fields: &BTreeMap<String, serde_json::Value>) -> serde_json::Value {
     const INDEXED: &[&str] = &[
-        "session_key",
         "creation_source",
         "title",
         "cwd",
@@ -140,25 +139,18 @@ impl SessionCatalog {
 }
 
 impl SessionQuery<'_> {
-    pub fn sessions(&self) -> Result<BTreeMap<String, SessionStreamId>, AppendError> {
+    pub fn sessions(&self) -> Result<BTreeMap<String, SessionId>, AppendError> {
         Ok(self
             .index_records()
             .map_err(super::upgrade::storage)?
             .into_iter()
-            .map(|record| {
-                (
-                    record
-                        .session_key
-                        .unwrap_or_else(|| record.stream_id.as_str().to_owned()),
-                    record.stream_id,
-                )
-            })
+            .map(|record| (record.session_id.as_str().to_owned(), record.session_id))
             .collect())
     }
 
     pub(crate) fn index_record(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<Option<SessionIndexRecord>, ReadError> {
         let Some(detail) = self.project(stream, false)? else {
             return Ok(None);
@@ -166,7 +158,7 @@ impl SessionQuery<'_> {
         let session = &detail.session;
         let mut first_user_message_id = None;
         let mut first_user_preview = None;
-        let mut parent_stream_id = None;
+        let mut parent_session_id = None;
         let mut parent_thread_id = None;
         let mut parent_agent = None;
         let mut indexed_cwd = None;
@@ -302,9 +294,9 @@ impl SessionQuery<'_> {
                         if let Some(causation) = &event.causation_id
                             && let Some(parent) = self.catalog.store.read_event(causation)?
                         {
-                            parent_stream_id = Some(parent.stream_id.clone());
-                            if let Some(parent_session) = self.project(&parent.stream_id, false)? {
-                                parent_thread_id = parent_session.session_id.clone();
+                            parent_session_id = Some(parent.session_id.clone());
+                            if let Some(parent_session) = self.project(&parent.session_id, false)? {
+                                parent_thread_id = Some(parent.session_id.clone());
                                 parent_agent = parent_session.owning_agent.clone();
                             }
                         }
@@ -318,9 +310,7 @@ impl SessionQuery<'_> {
             }
         }
         Ok(Some(SessionIndexRecord {
-            stream_id: stream.clone(),
-            session_id: session.session_id.clone(),
-            session_key: session.session_key().map(str::to_owned),
+            session_id: stream.clone(),
             creation_source: session.creation_source().map(str::to_owned),
             title: session
                 .fields
@@ -350,7 +340,7 @@ impl SessionQuery<'_> {
                 .or_else(|| string_field(&session.fields, &["model", "model_name"])),
             category: string_field(&session.fields, &["category", "session_category"]),
             project: string_field(&session.fields, &["project", "project_id"]),
-            parent_stream_id,
+            parent_session_id,
             parent_thread_id,
             parent_agent,
             owning_agent: session.owning_agent.clone(),
@@ -392,15 +382,11 @@ impl SessionQuery<'_> {
     ) -> Result<Vec<(String, zeroclaw_api::session_events::catalog::Session)>, ReadError> {
         let mut result = Vec::new();
         for record in self.index_records()? {
-            let key = record
-                .session_key
-                .clone()
-                .unwrap_or_else(|| record.stream_id.as_str().to_owned());
+            let key = record.session_id.as_str().to_owned();
             let mut fields = match record.metadata {
                 serde_json::Value::Object(values) => values.into_iter().collect(),
                 _ => BTreeMap::new(),
             };
-            fields.insert("session_key".into(), serde_json::Value::String(key.clone()));
             if let Some(source) = &record.creation_source {
                 fields.insert(
                     "creation_source".into(),
@@ -432,7 +418,6 @@ impl SessionQuery<'_> {
             result.push((
                 key,
                 zeroclaw_api::session_events::catalog::Session {
-                    session_id: record.session_id,
                     owning_agent: record.owning_agent,
                     fields,
                     closed: record.closed,
@@ -440,7 +425,7 @@ impl SessionQuery<'_> {
                     created_at: record.created_at,
                     last_activity: record.last_activity,
                     head: EventCursor {
-                        stream_id: record.stream_id,
+                        session_id: record.session_id,
                         sequence: record.head_sequence,
                     },
                     message_count: record.message_count,
@@ -470,17 +455,17 @@ impl SessionQuery<'_> {
         Ok(bounded_preview(&preview))
     }
 
-    pub fn detail(&self, stream: &SessionStreamId) -> Result<Option<SessionDetail>, ReadError> {
+    pub fn detail(&self, stream: &SessionId) -> Result<Option<SessionDetail>, ReadError> {
         self.project(stream, true)
     }
 
-    pub fn summary(&self, stream: &SessionStreamId) -> Result<Option<Session>, ReadError> {
+    pub fn summary(&self, stream: &SessionId) -> Result<Option<Session>, ReadError> {
         Ok(self.project(stream, false)?.map(|detail| detail.session))
     }
 
     fn project(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         include_context: bool,
     ) -> Result<Option<SessionDetail>, ReadError> {
         let head = self.catalog.store.head(stream)?;
@@ -578,8 +563,7 @@ pub(crate) fn metadata_payload(
 ) -> Result<PayloadRecord, AppendError> {
     let structural = matches!(
         field,
-        "session_key"
-            | "creation_source"
+        "creation_source"
             | "principal_id"
             | "created_at"
             | "last_activity"
@@ -603,7 +587,7 @@ impl SessionCommand<'_> {
         alias: &str,
         fields: Vec<(&str, serde_json::Value)>,
     ) -> Result<(), AppendError> {
-        let stream = upgrade::stream_id(family)?;
+        let stream = SessionId::parse(family.to_owned())?;
         if self
             .catalog
             .store
@@ -620,7 +604,6 @@ impl SessionCommand<'_> {
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::parse(format!("session-{stream}"))?,
                 owning_agent: alias.into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -629,7 +612,6 @@ impl SessionCommand<'_> {
             },
         )?;
         root.branch_id = Some(branch.clone());
-        let (identity, identity_payload) = session_key(stream.clone(), family)?;
         let (source, source_payload) = creation_source(stream.clone(), source)?;
         let body = PayloadRecord::json(
             "session.context/v1",
@@ -650,8 +632,8 @@ impl SessionCommand<'_> {
             EventActor::default(),
         )?;
         context.branch_id = Some(branch);
-        let mut events = vec![root, identity, source];
-        let mut payloads = vec![identity_payload, source_payload, body];
+        let mut events = vec![root, source];
+        let mut payloads = vec![source_payload, body];
         Self::metadata_events(&stream, fields, &mut events, &mut payloads)?;
         events.push(context);
         self.append(
@@ -674,13 +656,13 @@ impl SessionCommand<'_> {
     }
 
     fn metadata_events(
-        stream: &SessionStreamId,
+        stream: &SessionId,
         fields: Vec<(&str, serde_json::Value)>,
         events: &mut Vec<SessionEvent>,
         payloads: &mut Vec<PayloadRecord>,
     ) -> Result<(), AppendError> {
         for (field, value) in fields {
-            if matches!(field, "creation_source" | "session_key") {
+            if field == "creation_source" {
                 return Err(AppendError::InvalidReference(
                     "session creation identity is immutable".into(),
                 ));
@@ -716,7 +698,7 @@ impl SessionCommand<'_> {
 
     fn append(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         head: EventCursor,
         events: Vec<SessionEvent>,
         payloads: Vec<PayloadRecord>,
@@ -725,7 +707,7 @@ impl SessionCommand<'_> {
             return Ok(());
         }
         self.catalog.store.append_batch(AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: head,
             idempotency_key: format!("catalog:{}", EventId::new()),
             events,

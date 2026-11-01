@@ -6,7 +6,7 @@ impl SessionAccessPolicy for Authority {
     fn authorize(
         &self,
         _: &PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: SessionAccess,
     ) -> Result<(), SessionError> {
         if self.0.load(Ordering::SeqCst) {
@@ -74,7 +74,7 @@ fn replacement_resolution(h: &Harness, reply: &SessionEvent) -> AppendRequest {
     event.invocation_id = reply.invocation_id.clone();
     event.causation_id = Some(reply.event_id.clone());
     AppendRequest {
-        stream_id: h.stream.clone(),
+        session_id: h.stream.clone(),
         expected_head: h.store.head(&h.stream).expect("head"),
         idempotency_key: format!("direct-replacement-resolution:{}", event.event_id),
         events: vec![event],
@@ -118,7 +118,7 @@ async fn new_replacement_reply_requires_content_but_legacy_history_is_readable_a
         let error = h
             .store
             .append_batch(AppendRequest {
-                stream_id: h.stream.clone(),
+                session_id: h.stream.clone(),
                 expected_head: h.store.head(&h.stream).expect("head"),
                 idempotency_key: "new-incomplete-replacement".into(),
                 events: vec![incoming],
@@ -410,7 +410,7 @@ async fn replacement_uses_live_payload_authorization_and_erasure_blocks_adoption
                 principal,
                 h.authority.clone(),
                 AppendRequest {
-                    stream_id: h.stream.clone(),
+                    session_id: h.stream.clone(),
                     expected_head: h.store.head(&h.stream).expect("head"),
                     idempotency_key: "erase-approval-replacement".into(),
                     events: vec![intent],
@@ -446,7 +446,7 @@ async fn replacement_uses_live_payload_authorization_and_erasure_blocks_adoption
         assert_eq!(h.store.head(&h.stream).expect("unchanged head"), head);
         h.owner
             .append(AppendRequest {
-                stream_id: h.stream.clone(),
+                session_id: h.stream.clone(),
                 expected_head: head,
                 idempotency_key: "confirm-approval-replacement-erasure".into(),
                 events: vec![

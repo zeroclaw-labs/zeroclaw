@@ -1748,7 +1748,7 @@ struct RpcHistoryAuthority {
     method: Method,
     target_agent: Option<String>,
     principal: zeroclaw_api::principal::PrincipalId,
-    stream: zeroclaw_api::session_events::SessionStreamId,
+    stream: zeroclaw_api::session_events::SessionId,
 }
 impl RpcHistoryAuthority {
     fn binding_evidence(
@@ -1848,7 +1848,7 @@ impl RpcHistoryAuthority {
     }
     fn check_scope(
         &self,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         let lease = self.admission.dispatcher.ctx.auth.hold_authority();
         self.check_scope_under(&lease, stream).map(|_| ())
@@ -1857,7 +1857,7 @@ impl RpcHistoryAuthority {
     fn check_scope_under(
         &self,
         lease: &crate::rpc::auth::AuthorityLease<'_>,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
     ) -> Result<Option<zeroclaw_api::grants::ResolvedGrants>, zeroclaw_kernel::session::SessionError>
     {
         if stream != &self.stream {
@@ -1872,7 +1872,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryAuthorit
     fn authorize_reasoning(
         &self,
         actor: &zeroclaw_api::session_events::EventActor,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         use zeroclaw_kernel::session::query::SessionAccessPolicy;
         SessionAccessPolicy::authorize_actor(
@@ -1902,7 +1902,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryAuthorit
     fn authorize(
         &self,
         principal: &zeroclaw_api::principal::PrincipalId,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
         access: zeroclaw_kernel::session::query::SessionAccess,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         if principal != &self.principal
@@ -1921,7 +1921,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryAuthorit
 impl zeroclaw_kernel::session::PermissionResolver for RpcHistoryAuthority {
     fn tool_authority_evidence(
         &self,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
         name: &str,
     ) -> Result<serde_json::Value, zeroclaw_kernel::session::SessionError> {
         let lease = self.admission.dispatcher.ctx.auth.hold_authority();
@@ -1963,7 +1963,7 @@ impl zeroclaw_kernel::session::PermissionResolver for RpcHistoryAuthority {
     fn child_authority(
         &self,
         target: &str,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
     ) -> Result<
         Arc<dyn zeroclaw_kernel::session::engine::EngineSessionAuthority>,
         zeroclaw_kernel::session::SessionError,
@@ -1992,11 +1992,11 @@ impl zeroclaw_kernel::session::PermissionResolver for RpcHistoryAuthority {
                 "control handle cannot start effects".into(),
             ));
         }
-        self.check_scope(&intent.stream_id)
+        self.check_scope(&intent.session_id)
     }
     fn authorize_context(
         &self,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
         _branch: &zeroclaw_api::session_events::BranchId,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         self.check_scope(stream)
@@ -2007,7 +2007,7 @@ impl zeroclaw_kernel::session::PermissionResolver for RpcHistoryAuthority {
         name: &str,
         _arguments: &Value,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
-        self.tool_authority_evidence(&intent.stream_id, name)
+        self.tool_authority_evidence(&intent.session_id, name)
             .map(|_| ())
     }
 }
@@ -2057,14 +2057,14 @@ struct RpcHistoryReader {
     agent_alias: String,
     record: Option<crate::rpc::session::SessionRecord>,
     principal: zeroclaw_api::principal::PrincipalId,
-    stream: zeroclaw_api::session_events::SessionStreamId,
+    stream: zeroclaw_api::session_events::SessionId,
     method: Method,
 }
 impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryReader {
     fn authorize_reasoning(
         &self,
         actor: &zeroclaw_api::session_events::EventActor,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         use zeroclaw_kernel::session::query::SessionAccessPolicy;
         SessionAccessPolicy::authorize_actor(
@@ -2093,7 +2093,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryReader {
     fn authorize(
         &self,
         principal: &zeroclaw_api::principal::PrincipalId,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
         access: zeroclaw_kernel::session::query::SessionAccess,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         if principal != &self.principal
@@ -5521,7 +5521,7 @@ impl RpcDispatcher {
                     ChatMode::Chat => format!("rpc_{session_id}"),
                 });
             let stream = source
-                .stream_id(&family)
+                .session_id(&family)
                 .await
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
             let authority = Arc::new(RpcHistoryAuthority {
@@ -6799,7 +6799,7 @@ impl RpcDispatcher {
                 target_agent: None,
                 principal: principal.clone(),
                 stream: source
-                    .stream_id(&family)
+                    .session_id(&family)
                     .await
                     .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?,
             });
@@ -7629,7 +7629,7 @@ impl RpcDispatcher {
                     )
                 })?;
             let stream = source
-                .stream_id(&session_key)
+                .session_id(&session_key)
                 .await
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
             let authority = Arc::new(RpcHistoryAuthority {
@@ -9891,7 +9891,7 @@ impl RpcDispatcher {
             target_agent: None,
             principal: principal.clone(),
             stream: source
-                .stream_id(key)
+                .session_id(key)
                 .await
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?,
         });
@@ -10045,7 +10045,7 @@ impl RpcDispatcher {
                 })?;
             return to_result(page);
         }
-        if after.stream_id != native.stream {
+        if after.session_id != native.stream {
             return Err(rpc_err(INVALID_PARAMS, "foreign subscription cursor"));
         }
         let mut subscription = native.query.subscribe(after.clone());
@@ -10078,7 +10078,7 @@ impl RpcDispatcher {
                             .events
                             .last()
                             .map(|event| EventCursor {
-                                stream_id: page.stream_id.clone(),
+                                session_id: page.session_id.clone(),
                                 sequence: event.sequence,
                             })
                             .unwrap_or(page.after.clone());
@@ -32309,7 +32309,7 @@ mod tests {
                 .principal
                 .id
                 .clone(),
-            stream: zeroclaw_api::session_events::SessionStreamId::new(),
+            stream: zeroclaw_api::session_events::SessionId::new(),
         };
         authority
             .tool_authority_evidence(&authority.stream, "calculator")
@@ -32365,7 +32365,7 @@ mod tests {
             let source =
                 zeroclaw_session_host::NativeSessionHub::new(dispatcher.ctx.config.clone());
             let family = "rpc_authority-revisions";
-            let stream = source.stream_id(family).await.expect("stream");
+            let stream = source.session_id(family).await.expect("stream");
             let authority = Arc::new(RpcHistoryAuthority {
                 admission: PromptAdmission {
                     dispatcher: dispatcher.spawn_handle(),
@@ -32786,8 +32786,8 @@ mod tests {
                 assert!(compacted.get("error").is_none(), "{compacted}");
                 let compact_events = store
                     .read_page(
-                        &source.stream_id(&family).await.expect("stream"),
-                        &EventCursor::beginning(source.stream_id(&family).await.expect("stream")),
+                        &source.session_id(&family).await.expect("stream"),
+                        &EventCursor::beginning(source.session_id(&family).await.expect("stream")),
                         None,
                         256,
                     )
@@ -32915,7 +32915,7 @@ mod tests {
                 actor: EventActor::Principal {
                     principal_id: principal.0.clone(),
                 },
-                stream: source.stream_id(family).await.expect("stream"),
+                stream: source.session_id(family).await.expect("stream"),
                 origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
                 parent_alias: None,
             });
@@ -32951,9 +32951,8 @@ mod tests {
                     .len(),
                 1
             );
-            let stream = source.stream_id(family).await.expect("stream");
-            let foreign =
-                EventCursor::beginning(zeroclaw_api::session_events::SessionStreamId::new());
+            let stream = source.session_id(family).await.expect("stream");
+            let foreign = EventCursor::beginning(zeroclaw_api::session_events::SessionId::new());
             dispatcher.process_line(&json!({"jsonrpc":"2.0","id":2,"method":"session/events-subscribe","params":{"session_id":"wire-fixture","after":foreign}}).to_string()).await;
             let response: Value =
                 serde_json::from_str(&rx.recv().await.expect("response")).expect("json");
@@ -42996,7 +42995,7 @@ mod tests {
                     .expect("reader");
                 assert_eq!(
                     query.stream,
-                    source.stream_id(&family).await.expect("family stream")
+                    source.session_id(&family).await.expect("family stream")
                 );
                 let page = query
                     .query

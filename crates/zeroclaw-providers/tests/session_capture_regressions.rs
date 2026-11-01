@@ -39,7 +39,7 @@ impl PermissionResolver for Allow {
 struct Harness {
     _dir: tempfile::TempDir,
     store: Arc<dyn SessionEventStore>,
-    stream: SessionStreamId,
+    stream: SessionId,
     admission: Arc<dyn zeroclaw_api::session_events::capture::ProviderAdmissionPort>,
 }
 
@@ -82,7 +82,7 @@ impl Harness {
     fn new(backend: &str) -> Self {
         let dir = tempfile::TempDir::new().expect("dir");
         let store = open_event_store(dir.path(), backend).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let branch = BranchId::new();
         let turn = TurnId::new();
         let ingress = PayloadRecord::json(
@@ -119,7 +119,6 @@ impl Harness {
         };
         let root = make(
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -156,7 +155,7 @@ impl Harness {
         let context_id = projection.event_id.clone();
         store
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: EventCursor::beginning(stream.clone()),
                 idempotency_key: "fixture".into(),
                 events: vec![root, accepted, started, projection],
@@ -291,14 +290,14 @@ async fn captured_session_regressions_both_backends() {
 }
 struct RevokeAfterAccepted {
     store: Arc<dyn SessionEventStore>,
-    stream: SessionStreamId,
+    stream: SessionId,
     turn: TurnId,
 }
 impl zeroclaw_kernel::session::query::SessionAccessPolicy for RevokeAfterAccepted {
     fn authorize(
         &self,
         _: &zeroclaw_api::principal::PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         access: zeroclaw_kernel::session::query::SessionAccess,
     ) -> Result<(), SessionError> {
         let events = self
@@ -328,7 +327,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for ReadAllow {
     fn authorize(
         &self,
         _: &zeroclaw_api::principal::PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: zeroclaw_kernel::session::query::SessionAccess,
     ) -> Result<(), SessionError> {
         Ok(())
@@ -362,7 +361,7 @@ async fn audit_live(backend: &str) {
     };
     let turn = TurnId::new();
     let command = zeroclaw_kernel::session::execution::UserTurnCommand {
-        stream_id: h.stream.clone(),
+        session_id: h.stream.clone(),
         branch_id: events[0].branch_id.clone().unwrap(),
         turn_id: turn.clone(),
         message_id: MessageId::new(),
@@ -423,7 +422,7 @@ async fn audit_live(backend: &str) {
     e.turn_id = events[1].turn_id.clone();
     h.store
         .append_batch(AppendRequest {
-            stream_id: h.stream.clone(),
+            session_id: h.stream.clone(),
             expected_head: h.store.head(&h.stream).unwrap(),
             idempotency_key: "audit-future-part".into(),
             events: vec![e],
@@ -612,7 +611,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for ChildAuthority {
     fn authorize(
         &self,
         _: &zeroclaw_api::principal::PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: zeroclaw_kernel::session::query::SessionAccess,
     ) -> Result<(), SessionError> {
         Ok(())
@@ -622,13 +621,13 @@ impl PermissionResolver for ChildAuthority {
     fn authorize(&self, _: &EffectIntent) -> Result<(), SessionError> {
         Ok(())
     }
-    fn authorize_context(&self, _: &SessionStreamId, _: &BranchId) -> Result<(), SessionError> {
+    fn authorize_context(&self, _: &SessionId, _: &BranchId) -> Result<(), SessionError> {
         Ok(())
     }
     fn child_authority(
         &self,
         _: &str,
-        _: &SessionStreamId,
+        _: &SessionId,
     ) -> Result<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionAuthority>, SessionError>
     {
         Ok(Arc::new(ChildAuthority))

@@ -1,9 +1,7 @@
 //! Installation-wide upgrade. All legacy writers share the publication fence;
 //! source files remain intact until every imported family has a final receipt.
 use super::import::{LegacyImport, LegacySnapshot, import_snapshot};
-use super::installation::{
-    FormatPhase, InstallationGuard, NativeBackend, creation_source, session_key,
-};
+use super::installation::{FormatPhase, InstallationGuard, NativeBackend, creation_source};
 use super::*;
 use crate::session_backend::SessionBackend;
 use std::collections::BTreeSet;
@@ -34,7 +32,7 @@ pub fn upgrade_installation(
                 .map_err(jsonl::storage)? =>
         {
             let backend = *backend;
-            upgrade_leases = installation::session_keys(data_dir, backend)?
+            upgrade_leases = installation::session_ids(data_dir, backend)?
                 .keys()
                 .map(|family| ownership::SessionExecutionLease::acquire(data_dir, family))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -52,7 +50,7 @@ pub fn upgrade_installation(
     };
     let store = open_event_store(data_dir, target.name())?;
     import_previous_catalog(data_dir, target, store.as_ref(), guard.generation())?;
-    let mut existing = installation::session_keys(data_dir, target)?;
+    let mut existing = installation::session_ids(data_dir, target)?;
     let mut sqlite_keys = BTreeSet::new();
     if directory
         .join("sessions.db")
@@ -118,7 +116,7 @@ pub fn upgrade_installation(
                     metadata: fields,
                 },
             )?;
-            existing.insert(family.clone(), stream_id(&family)?);
+            existing.insert(family.clone(), session_id(&family)?);
         }
     }
     // Inspect disk directly: listing a corrupt source must never become an
@@ -250,7 +248,7 @@ fn import_one(
     source_kind: &str,
     snapshot: LegacySnapshot,
 ) -> Result<(), AppendError> {
-    let stream = stream_id(family)?;
+    let stream = session_id(family)?;
     import_snapshot(
         store,
         LegacyImport {
@@ -259,7 +257,7 @@ fn import_one(
             owning_agent: alias,
             target,
             branch: BranchId::parse(format!("branch-{stream}"))?,
-            session: SessionId::parse(format!("session-{stream}"))?,
+            session: stream.clone(),
             stream,
             source_kind,
         },
@@ -268,11 +266,15 @@ fn import_one(
     Ok(())
 }
 
-pub fn stream_id(family: &str) -> Result<SessionStreamId, ContractError> {
-    SessionStreamId::parse(format!(
-        "family-{}",
-        Digest::from_bytes(family.as_bytes()).as_str()
-    ))
+pub fn session_id(family: &str) -> Result<SessionId, ContractError> {
+    // Old storage accepted keys outside the native ID grammar. Normal paths
+    // parse their session ID directly; only import normalizes a legacy key.
+    SessionId::parse(family.to_owned()).or_else(|_| {
+        SessionId::parse(format!(
+            "legacy-{}",
+            Digest::from_bytes(family.as_bytes()).as_str()
+        ))
+    })
 }
 
 // Compatibility with the earlier worktree format is one upgrade step. Its
@@ -296,7 +298,7 @@ fn import_previous_catalog(
     let records = old["families"]
         .as_object()
         .ok_or_else(|| AppendError::Corrupt("old family catalog missing".into()))?;
-    let known = installation::session_keys(data_dir, target)?;
+    let known = installation::session_ids(data_dir, target)?;
     let mut archived = BTreeSet::new();
     for (family, location) in records {
         let phase = location["phase"]
@@ -324,7 +326,7 @@ fn import_previous_catalog(
             // before the prior process exited.
             archived.insert(source);
         }
-        let root: SessionStreamId =
+        let root: SessionId =
             serde_json::from_value(location["root_stream"].clone()).map_err(storage)?;
         if let Some(existing) = known.get(family) {
             if existing != &root {
@@ -342,20 +344,19 @@ fn import_previous_catalog(
                 NativeBackend::Jsonl => JsonlEventStore::open(data_dir)?.import_native(&image)?,
             }
         }
-        let key = format!("family-identity:{root}");
+        let key = format!("creation-source:{root}");
         if store
             .lookup_receipt(&root, &key)
             .map_err(storage)?
             .is_none()
         {
-            let (event, payload) = session_key(root.clone(), family)?;
             let (source_event, source_payload) = creation_source(root.clone(), "legacy")?;
             store.append_batch(AppendRequest {
-                stream_id: root.clone(),
+                session_id: root.clone(),
                 expected_head: store.head(&root).map_err(storage)?,
                 idempotency_key: key,
-                events: vec![event, source_event],
-                payloads: vec![payload, source_payload],
+                events: vec![source_event],
+                payloads: vec![source_payload],
                 erasure_reference_commitment: None,
             })?;
             #[cfg(test)]

@@ -20042,7 +20042,7 @@ Let me check the result."#;
             let live = LiveConfigAuthority::new(config);
             let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
             let family = "native-post-turn-skills";
-            let stream = source.stream_id(family).await.unwrap();
+            let stream = source.session_id(family).await.unwrap();
             let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
             let authority = Arc::new(AgentHistoryAuthority {
                 admission: live
@@ -20242,7 +20242,7 @@ Let me check the result."#;
                             index > committed,
                             "post-turn child completed before main response committed"
                         );
-                        Some(child_terminal_cursor.stream_id.clone())
+                        Some(child_terminal_cursor.session_id.clone())
                     }
                     _ => None,
                 })
@@ -20440,7 +20440,7 @@ Let me check the result."#;
                 let live = LiveConfigAuthority::new(config);
                 let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
                 let family = "native-skill-child-interruption";
-                let stream = source.stream_id(family).await.unwrap();
+                let stream = source.session_id(family).await.unwrap();
                 let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
                 let authority = Arc::new(AgentHistoryAuthority {
                     admission: live
@@ -20607,8 +20607,8 @@ Let me check the result."#;
                     };
                     let page = store
                         .read_page(
-                            &cursor.stream_id,
-                            &EventCursor::beginning(cursor.stream_id.clone()),
+                            &cursor.session_id,
+                            &EventCursor::beginning(cursor.session_id.clone()),
                             Some(&cursor),
                             256,
                         )

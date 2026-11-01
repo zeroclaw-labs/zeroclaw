@@ -35,7 +35,7 @@ fn sqlite_publication_supports_fresh_reopen_and_legacy_upgrade() {
                     .is_file()
             );
             assert_eq!(
-                installation::session_keys(directory.path(), NativeBackend::Sqlite)
+                installation::session_ids(directory.path(), NativeBackend::Sqlite)
                     .expect("families")
                     .len(),
                 1
@@ -69,7 +69,7 @@ fn sqlite_message_timestamps_survive_upgrade_to_each_native_backend() {
         drop(source);
         upgrade_installation(directory.path(), target, |_| "fixture".into()).expect("upgrade");
         let store = open_event_store(directory.path(), target.name()).expect("store");
-        let stream = stream_id("gw_clocks").expect("stream");
+        let stream = session_id("gw_clocks").expect("stream");
         let page = store
             .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
             .expect("events");
@@ -149,7 +149,7 @@ fn legacy_tool_metadata_survives_storage_upgrade_and_context_reconstruction() {
             drop(source);
             upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
             let store = open_event_store(directory.path(), target.name()).unwrap();
-            let stream = stream_id("gw_fixture").unwrap();
+            let stream = session_id("gw_fixture").unwrap();
             let page = store
                 .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
                 .unwrap();
@@ -302,7 +302,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
             SessionRestore::Killed
         ));
         assert_eq!(current.list_sessions().unwrap().len(), 1);
-        let stream = stream_id("acp_live").unwrap();
+        let stream = session_id("acp_live").unwrap();
         let store = open_event_store(directory.path(), target.name()).unwrap();
         let root = store
             .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
@@ -401,7 +401,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
 }
 
 fn imported_count(directory: &Path, target: NativeBackend) -> usize {
-    let catalog = installation::session_keys(directory, target).expect("catalog");
+    let catalog = installation::session_ids(directory, target).expect("catalog");
     let stream = catalog
         .get("gw_fixture")
         .expect("read-visible imported family");
@@ -494,11 +494,10 @@ fn previous_catalog_upgrade_resumes_source_archival_after_identity_publication()
         (NativeBackend::Jsonl, NativeBackend::Sqlite),
     ] {
         let directory = tempfile::tempdir().expect("directory");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -511,7 +510,7 @@ fn previous_catalog_upgrade_resumes_source_archival_after_identity_publication()
         let store = open_event_store(directory.path(), source.name()).expect("old store");
         let receipt = store
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: EventCursor::beginning(stream.clone()),
                 idempotency_key: "old-root".into(),
                 events: vec![root],
@@ -551,8 +550,7 @@ fn previous_catalog_upgrade_resumes_source_archival_after_identity_publication()
         let original = fs::read(&locator).expect("original catalog");
         let mut conflicting: serde_json::Value =
             serde_json::from_slice(&original).expect("catalog");
-        conflicting["families"]["fixture"]["root_stream"] =
-            serde_json::json!(SessionStreamId::new());
+        conflicting["families"]["fixture"]["root_stream"] = serde_json::json!(SessionId::new());
         fs::write(
             &locator,
             serde_json::to_vec(&conflicting).expect("conflicting bytes"),
@@ -574,7 +572,7 @@ fn previous_catalog_upgrade_resumes_source_archival_after_identity_publication()
                 .is_file()
         );
         assert_eq!(
-            installation::session_keys(directory.path(), target).expect("families")["fixture"],
+            installation::session_ids(directory.path(), target).expect("families")["fixture"],
             stream
         );
         let store = open_event_store(directory.path(), target.name()).expect("current store");
@@ -661,11 +659,10 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
     for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
         let directory = tempfile::tempdir().unwrap();
         upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
-        let stream = stream_id("acp_registration").unwrap();
+        let stream = session_id("acp_registration").unwrap();
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -675,15 +672,14 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
         )
         .unwrap();
         root.branch_id = Some(BranchId::parse(format!("branch-{stream}")).unwrap());
-        let (identity, body) = session_key(stream.clone(), "acp_registration").unwrap();
         let store = open_event_store(directory.path(), target.name()).unwrap();
         store
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: EventCursor::beginning(stream.clone()),
                 idempotency_key: "root".into(),
-                events: vec![root, identity],
-                payloads: vec![body],
+                events: vec![root],
+                payloads: vec![],
                 erasure_reference_commitment: None,
             })
             .unwrap();
@@ -774,12 +770,11 @@ fn earlier_native_acp_installation_merges_protocol_data_without_replacing_newer_
         legacy
             .persist_retained_context_seed("existing", &old_history[10..], false)
             .unwrap();
-        let stream = stream_id("acp_existing").unwrap();
+        let stream = session_id("acp_existing").unwrap();
         let branch = BranchId::parse(format!("branch-{stream}")).unwrap();
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -789,7 +784,6 @@ fn earlier_native_acp_installation_merges_protocol_data_without_replacing_newer_
         )
         .unwrap();
         root.branch_id = Some(branch.clone());
-        let (identity, identity_payload) = session_key(stream.clone(), "acp_existing").unwrap();
         let messages = vec![ConversationMessage::Chat(ChatMessage::assistant(
             "newer native context",
         ))];
@@ -826,11 +820,11 @@ fn earlier_native_acp_installation_merges_protocol_data_without_replacing_newer_
         let store = open_event_store(directory.path(), target.name()).unwrap();
         store
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: EventCursor::beginning(stream.clone()),
                 idempotency_key: "prior-native-root".into(),
-                events: vec![root, identity, projection, token_event],
-                payloads: vec![identity_payload, conversation, context, tokens],
+                events: vec![root, projection, token_event],
+                payloads: vec![conversation, context, tokens],
                 erasure_reference_commitment: None,
             })
             .unwrap();
@@ -984,7 +978,7 @@ fn interrupted_upgrade_resumes_chunks_and_partial_backup_renames() {
 fn native_sqlite_schema_zero_upgrades_without_rewriting_events_and_future_schema_is_refused() {
     let directory = tempfile::tempdir().expect("directory");
     let store = SqliteEventStore::open(directory.path()).expect("store");
-    let stream = SessionStreamId::new();
+    let stream = SessionId::new();
     store
         .append_batch(super::super::tests::request(&stream, "root", 0))
         .expect("root");
@@ -995,7 +989,7 @@ fn native_sqlite_schema_zero_upgrades_without_rewriting_events_and_future_schema
     drop(store);
     let path = directory.path().join("sessions/session-events.db");
     let conn = Connection::open(&path).expect("old database");
-    conn.execute_batch("PRAGMA user_version=0; CREATE INDEX session_events_stream_seq ON session_events(stream_id,sequence);").expect("old schema");
+    conn.execute_batch("PRAGMA user_version=0; CREATE INDEX session_events_stream_seq ON session_events(session_id,sequence);").expect("old schema");
     drop(conn);
     let store = SqliteEventStore::open(directory.path()).expect("automatic schema upgrade");
     assert_eq!(
@@ -1040,7 +1034,7 @@ fn legacy_history_larger_than_a_commit_and_a_single_fragment_is_preserved() {
         upgrade_installation(directory.path(), target, |_| "fixture".into())
             .expect("bounded upgrade");
         let store = open_event_store(directory.path(), target.name()).expect("store");
-        let stream = stream_id("large").expect("stream");
+        let stream = session_id("large").expect("stream");
         let receipt = store
             .lookup_receipt(&stream, &format!("legacy-family-import:{stream}"))
             .expect("receipt")

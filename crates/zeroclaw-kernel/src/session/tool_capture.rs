@@ -14,7 +14,7 @@ mod tests;
 
 struct ToolScope {
     owner: Arc<SessionCoordinator>,
-    stream: SessionStreamId,
+    stream: SessionId,
     branch: BranchId,
     turn: TurnId,
     resolver: Arc<dyn PermissionResolver>,
@@ -36,7 +36,7 @@ struct PreparedTool {
 impl SessionCoordinator {
     pub fn tool_capture(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
         branch: BranchId,
         turn: TurnId,
         resolver: Arc<dyn PermissionResolver>,
@@ -79,7 +79,7 @@ impl ToolScope {
         payloads: Vec<PayloadRecord>,
     ) -> anyhow::Result<AppendReceipt> {
         let receipt = self.owner.store.append_batch(AppendRequest {
-            stream_id: self.stream.clone(),
+            session_id: self.stream.clone(),
             expected_head: self.owner.store.head(&self.stream)?,
             idempotency_key: key,
             events,
@@ -456,7 +456,7 @@ impl PreparedToolPort for PreparedTool {
                         let page = scope.owner.store.read_page(
                             &scope.stream,
                             &EventCursor {
-                                stream_id: scope.stream.clone(),
+                                session_id: scope.stream.clone(),
                                 sequence: receipt.first.sequence - 1,
                             },
                             Some(&receipt.last),
@@ -484,7 +484,7 @@ impl PreparedToolPort for PreparedTool {
                     let key = format!("tool-start:{policy_id}");
                     scope.resolver.authorize_tool(
                         &EffectIntent {
-                            stream_id: scope.stream.clone(),
+                            session_id: scope.stream.clone(),
                             expected_head: head,
                             idempotency_key: key.clone(),
                             event: started.clone(),
@@ -520,7 +520,7 @@ impl PreparedToolPort for PreparedTool {
                     Ok(EffectObservationHandle {
                         started_event_id,
                         coordinator: Arc::clone(&scope.owner),
-                        stream_id: scope.stream.clone(),
+                        session_id: scope.stream.clone(),
                         branch_id: Some(scope.branch.clone()),
                         turn_id: Some(scope.turn.clone()),
                         invocation_id: invocation,
@@ -539,7 +539,7 @@ impl ToolObservationPort for EffectObservationHandle {
     }
     async fn has_outcome(&self) -> anyhow::Result<bool> {
         let owner = self.coordinator.clone();
-        let stream = self.stream_id.clone();
+        let stream = self.session_id.clone();
         let invocation = self.invocation_id.clone();
         Ok(self
             .coordinator
@@ -565,7 +565,7 @@ impl ToolObservationPort for EffectObservationHandle {
         evidence: serde_json::Value,
     ) -> anyhow::Result<AppendReceipt> {
         let owner = self.coordinator.clone();
-        let stream = self.stream_id.clone();
+        let stream = self.session_id.clone();
         let branch = self.branch_id.clone();
         let turn = self.turn_id.clone();
         let invocation = self.invocation_id.clone();
@@ -625,7 +625,7 @@ impl ToolObservationPort for EffectObservationHandle {
                 cancelled.invocation_id = Some(invocation.clone());
                 cancelled.causation_id = Some(requested.event_id.clone());
                 let receipt = owner.store.append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: owner.store.head(&stream)?,
                     idempotency_key: key,
                     events: vec![requested, cancelled],
@@ -652,7 +652,7 @@ impl ToolObservationPort for EffectObservationHandle {
             anyhow::bail!("tool_observation_kind_mismatch");
         }
         let mut event = SessionEvent::typed(
-            self.stream_id.clone(),
+            self.session_id.clone(),
             data,
             EventActor::System {
                 component: "tool_capture".into(),
@@ -662,7 +662,7 @@ impl ToolObservationPort for EffectObservationHandle {
         event.turn_id = self.turn_id.clone();
         event.invocation_id = Some(self.invocation_id.clone());
         let owner = Arc::clone(&self.coordinator);
-        let stream = self.stream_id.clone();
+        let stream = self.session_id.clone();
         let invocation = self.invocation_id.clone();
         Ok(self
             .coordinator

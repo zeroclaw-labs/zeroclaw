@@ -31255,7 +31255,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 &family,
             )
             .expect("store");
-            let stream = source.stream_id(&family).await.expect("stream");
+            let stream = source.session_id(&family).await.expect("stream");
             let events = store
                 .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                 .expect("events")
@@ -31537,7 +31537,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         &family,
                     )
                     .unwrap();
-                    let stream = source.stream_id(&family).await.unwrap();
+                    let stream = source.session_id(&family).await.unwrap();
                     let events = store
                         .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                         .unwrap()
@@ -36149,7 +36149,7 @@ BTC is currently around $65,000 based on latest tool output."#
         use zeroclaw_api::session_events::capture::{
             ContextSnapshot, EngineTurnFuture, EngineTurnInput, SessionExecutionPort,
         };
-        use zeroclaw_api::session_events::{BranchId, ContractError, SessionStreamId};
+        use zeroclaw_api::session_events::{BranchId, ContractError, SessionId};
         use zeroclaw_kernel::session::engine::{
             EngineSessionAuthority, EngineSessionSource, SessionDescriptor, SessionReadHandle,
         };
@@ -36191,8 +36191,8 @@ BTC is currently around $65,000 based on latest tool output."#
         }
         #[async_trait::async_trait]
         impl EngineSessionSource for PendingSource {
-            async fn stream_id(&self, _: &str) -> Result<SessionStreamId, ContractError> {
-                SessionStreamId::parse("channel-recovery-fixture")
+            async fn session_id(&self, _: &str) -> Result<SessionId, ContractError> {
+                SessionId::parse("channel-recovery-fixture")
             }
             async fn describe(&self, _: String) -> anyhow::Result<Option<SessionDescriptor>> {
                 Ok(None)
@@ -36229,7 +36229,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 _: ContextSnapshot,
             ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
                 authority.authorize_context(
-                    &self.stream_id(&family).await?,
+                    &self.session_id(&family).await?,
                     &BranchId::parse("fixture-branch")?,
                 )?;
                 Ok(Arc::new(PendingPort {
@@ -36484,7 +36484,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     &family,
                 )
                 .expect("published family");
-                let stream = source.stream_id(&family).await.expect("stream");
+                let stream = source.session_id(&family).await.expect("stream");
                 let events = store
                     .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                     .expect("events")
@@ -36569,7 +36569,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     &family,
                 )
                 .expect("family");
-                let stream = source.stream_id(&family).await.expect("stream");
+                let stream = source.session_id(&family).await.expect("stream");
                 let events = store
                     .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                     .expect("events")

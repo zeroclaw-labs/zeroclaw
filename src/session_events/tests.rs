@@ -12,7 +12,7 @@ impl SessionAccessPolicy for Access {
     fn authorize(
         &self,
         _: &zeroclaw_api::principal::PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: SessionAccess,
     ) -> Result<(), SessionError> {
         Ok(())
@@ -22,13 +22,13 @@ impl PermissionResolver for Access {
     fn child_authority(
         &self,
         _target: &str,
-        _stream: &SessionStreamId,
+        _stream: &SessionId,
     ) -> Result<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionAuthority>, SessionError>
     {
         Ok(Arc::new(Access))
     }
 
-    fn authorize_context(&self, _: &SessionStreamId, _: &BranchId) -> Result<(), SessionError> {
+    fn authorize_context(&self, _: &SessionId, _: &BranchId) -> Result<(), SessionError> {
         Ok(())
     }
     fn authorize(&self, _: &EffectIntent) -> Result<(), SessionError> {
@@ -375,12 +375,11 @@ async fn existing_agent_executes_through_coordinator_and_does_not_replay_effects
     for backend in ["sqlite", "jsonl"] {
         let dir = tempfile::TempDir::new().expect("dir");
         let store = open_event_store(dir.path(), backend).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let branch = BranchId::new();
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -420,7 +419,7 @@ async fn existing_agent_executes_through_coordinator_and_does_not_replay_effects
         let context_event_id = projection.event_id.clone();
         store
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: EventCursor::beginning(stream.clone()),
                 idempotency_key: "root".into(),
                 events: vec![root, projection],
@@ -508,7 +507,7 @@ async fn existing_agent_executes_through_coordinator_and_does_not_replay_effects
         let mut executor = EmbeddedTurnExecutor::new(&mut agent);
         let owner = Arc::new(SessionCoordinator::new(Arc::clone(&store)));
         let command = UserTurnCommand {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             branch_id: branch,
             turn_id: TurnId::new(),
             message_id: MessageId::new(),
@@ -938,7 +937,7 @@ async fn child_capture_uses_a_distinct_stream_and_parent_receipt_never_replays()
                 }
             })
             .expect("parent child settlement");
-        assert_ne!(completed.stream_id, native.stream);
+        assert_ne!(completed.session_id, native.stream);
         assert_eq!(
             events
                 .iter()
@@ -953,8 +952,8 @@ async fn child_capture_uses_a_distinct_stream_and_parent_receipt_never_replays()
         .expect("family store");
         let child = store
             .read_page(
-                &completed.stream_id,
-                &EventCursor::beginning(completed.stream_id.clone()),
+                &completed.session_id,
+                &EventCursor::beginning(completed.session_id.clone()),
                 Some(&completed),
                 100,
             )
@@ -1150,7 +1149,7 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
             &family,
         )
         .expect("store");
-        let root = EngineSessionSource::stream_id(&reopened, &family)
+        let root = EngineSessionSource::session_id(&reopened, &family)
             .await
             .expect("root");
         let parent = store
@@ -1162,7 +1161,7 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
             .find(|event| event.body.kind() == EventKind::ChildInvocationRequested)
             .and_then(|event| event.invocation_id.as_ref())
             .expect("child invocation");
-        let child = SessionStreamId::parse(format!("child-{invocation}")).expect("child stream");
+        let child = SessionId::parse(format!("child-{invocation}")).expect("child stream");
         let events = store
             .read_page(&child, &EventCursor::beginning(child.clone()), None, 256)
             .expect("child")

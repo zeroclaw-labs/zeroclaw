@@ -6,7 +6,7 @@ use std::fs::File;
 
 pub struct SessionExecutionLease {
     directory: std::path::PathBuf,
-    session_key: String,
+    session_id: String,
     lock: File,
 }
 impl SessionExecutionLease {
@@ -29,12 +29,12 @@ impl SessionExecutionLease {
         }
         Ok(Some(Self {
             directory,
-            session_key: family.into(),
+            session_id: family.into(),
             lock,
         }))
     }
     pub(super) fn matches(&self, data_dir: &Path, family: &str) -> bool {
-        self.directory == data_dir.join("sessions") && self.session_key == family
+        self.directory == data_dir.join("sessions") && self.session_id == family
     }
 }
 impl Drop for SessionExecutionLease {

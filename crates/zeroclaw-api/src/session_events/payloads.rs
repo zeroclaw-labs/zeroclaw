@@ -196,7 +196,7 @@ pub fn erasure_scope(
     history: &[SessionEvent],
     payloads: &[StoredPayload],
     targets: &[StoredPayloadRef],
-) -> Result<(Vec<SessionStreamId>, Digest), AppendError> {
+) -> Result<(Vec<SessionId>, Digest), AppendError> {
     let target_ids: HashSet<_> = targets
         .iter()
         .map(|target| target.payload_id.clone())
@@ -250,7 +250,7 @@ pub fn erasure_scope(
                 &mut HashSet::new(),
             )
         }) {
-            references.push((event.stream_id.clone(), event.event_id.clone()));
+            references.push((event.session_id.clone(), event.event_id.clone()));
         }
     }
     references.sort();
@@ -276,14 +276,14 @@ struct ApprovalState {
 pub struct PayloadIndex {
     records: HashMap<PayloadId, StoredPayload>,
     message_ids: HashSet<MessageId>,
-    approvals: HashMap<(SessionStreamId, String), ApprovalState>,
+    approvals: HashMap<(SessionId, String), ApprovalState>,
     dispositions: HashMap<PayloadId, PayloadDisposition>,
     provider_observations: super::provider_observation::ObservationIndex,
 }
 pub struct PayloadDelta {
     records: HashMap<PayloadId, StoredPayload>,
     message_ids: HashSet<MessageId>,
-    approvals: HashMap<(SessionStreamId, String), ApprovalState>,
+    approvals: HashMap<(SessionId, String), ApprovalState>,
     dispositions: HashMap<PayloadId, PayloadDisposition>,
     deleting: Vec<PayloadId>,
     provider_observations: super::provider_observation::ObservationDelta,
@@ -380,7 +380,7 @@ impl PayloadIndex {
                 }
                 EventData::ApprovalRequested { request_id, .. } => {
                     self.approvals.insert(
-                        (event.stream_id.clone(), request_id.clone()),
+                        (event.session_id.clone(), request_id.clone()),
                         ApprovalState {
                             requested: event.event_id.clone(),
                             resolved: false,
@@ -391,7 +391,7 @@ impl PayloadIndex {
                 EventData::ApprovalResolved { request_id, .. } => {
                     if let Some(state) = self
                         .approvals
-                        .get_mut(&(event.stream_id.clone(), request_id.clone()))
+                        .get_mut(&(event.session_id.clone(), request_id.clone()))
                     {
                         state.resolved = true;
                     }
@@ -399,7 +399,7 @@ impl PayloadIndex {
                 EventData::ApprovalInvalidated { request_id, .. } => {
                     if let Some(state) = self
                         .approvals
-                        .get_mut(&(event.stream_id.clone(), request_id.clone()))
+                        .get_mut(&(event.session_id.clone(), request_id.clone()))
                     {
                         state.invalidated = true;
                     }
@@ -589,7 +589,7 @@ impl PayloadIndex {
                 }
                 EventData::ApprovalRequested { request_id, .. } => {
                     approvals.insert(
-                        (event.stream_id.clone(), request_id.clone()),
+                        (event.session_id.clone(), request_id.clone()),
                         ApprovalState {
                             requested: event.event_id.clone(),
                             resolved: false,
@@ -599,14 +599,14 @@ impl PayloadIndex {
                 }
                 EventData::ApprovalResolved { request_id, .. } => {
                     if let Some(value) =
-                        approvals.get_mut(&(event.stream_id.clone(), request_id.clone()))
+                        approvals.get_mut(&(event.session_id.clone(), request_id.clone()))
                     {
                         value.resolved = true;
                     }
                 }
                 EventData::ApprovalInvalidated { request_id, .. } => {
                     if let Some(value) =
-                        approvals.get_mut(&(event.stream_id.clone(), request_id.clone()))
+                        approvals.get_mut(&(event.session_id.clone(), request_id.clone()))
                     {
                         value.invalidated = true;
                     }
@@ -710,7 +710,7 @@ fn validate_semantic_payloads(
     history: &super::index::OverlayMap<'_, EventId, SessionEvent>,
     payloads: &super::index::OverlayMap<'_, PayloadId, StoredPayload>,
     message_ids: &super::index::OverlaySet<'_, MessageId>,
-    approvals: &super::index::OverlayMap<'_, (SessionStreamId, String), ApprovalState>,
+    approvals: &super::index::OverlayMap<'_, (SessionId, String), ApprovalState>,
     event: &SessionEvent,
     request: &AppendRequest,
 ) -> Result<(), AppendError> {
@@ -774,49 +774,20 @@ fn validate_semantic_payloads(
         EventData::SessionMetadataChanged {
             field,
             new_value_ref,
-        } if field == "session_key" => {
-            let family: String = decode(payloads, new_value_ref, "session.authority/v1")?;
-            if family.is_empty() || family.len() > 512 {
-                return Err(invalid("invalid session key"));
-            }
-            let root = history.values().find(|prior| {
-                prior.stream_id == event.stream_id && prior.body.kind() == EventKind::SessionStarted
-            });
-            if root.is_none() || history.values().any(|prior| prior.event_id != event.event_id
-                && prior.stream_id == event.stream_id
-                && matches!(&prior.body.data, EventData::SessionMetadataChanged { field, .. } if field == "session_key")) {
-                return Err(invalid("session key requires an unbound root stream"));
-            }
-            for prior in history.values().filter(|prior| {
-                prior.event_id != event.event_id && prior.stream_id != event.stream_id
-            }) {
-                if let EventData::SessionMetadataChanged {
-                    field,
-                    new_value_ref,
-                } = &prior.body.data
-                    && field == "session_key"
-                    && decode::<String>(payloads, new_value_ref, "session.authority/v1")? == family
-                {
-                    return Err(invalid("session key already belongs to another root"));
-                }
-            }
-        }
-        EventData::SessionMetadataChanged {
-            field,
-            new_value_ref,
         } if field == "creation_source" => {
             let source: String = decode(payloads, new_value_ref, "session.authority/v1")?;
             if source.is_empty() || source.len() > 128 {
                 return Err(invalid("invalid session creation source"));
             }
             if !history.values().any(|prior| {
-                prior.stream_id == event.stream_id && prior.body.kind() == EventKind::SessionStarted
+                prior.session_id == event.session_id
+                    && prior.body.kind() == EventKind::SessionStarted
             }) {
                 return Err(invalid("session creation source requires a root stream"));
             }
             if history.values().any(|prior| {
                 prior.event_id != event.event_id
-                    && prior.stream_id == event.stream_id
+                    && prior.session_id == event.session_id
                     && matches!(&prior.body.data, EventData::SessionMetadataChanged { field, .. } if field == "creation_source")
             }) {
                 return Err(invalid("session creation source is immutable"));
@@ -874,7 +845,7 @@ fn validate_semantic_payloads(
                     .map(|branch| {
                         super::lineage::frozen_lineage(
                             history.values(),
-                            &event.stream_id,
+                            &event.session_id,
                             branch,
                             u64::MAX,
                         )
@@ -965,7 +936,7 @@ fn validate_semantic_payloads(
                                 && let Some(source) = history.get(&origin)
                                 && source.event_id != event.event_id
                                 && source.sequence > 0
-                                && source.stream_id == event.stream_id
+                                && source.session_id == event.session_id
                                 && lineage.as_ref().is_some_and(|lineage| {
                                     super::lineage::includes(lineage, source)
                                 })
@@ -1103,13 +1074,13 @@ fn validate_semantic_payloads(
             let EventData::ApprovalRequested { request_id, .. } = &requested.body.data else {
                 return Err(invalid("approval reply cause is not its request"));
             };
-            if event.stream_id != requested.stream_id
+            if event.session_id != requested.session_id
                 || event.branch_id != requested.branch_id
                 || event.turn_id != requested.turn_id
                 || event.invocation_id != requested.invocation_id
                 || !matches!(expected_target_ref, TargetRef::Invocation { invocation_id } if Some(invocation_id) == event.invocation_id.as_ref())
                 || approvals
-                    .get(&(event.stream_id.clone(), request_id.clone()))
+                    .get(&(event.session_id.clone(), request_id.clone()))
                     .is_none_or(|state| {
                         state.requested != requested.event_id || state.resolved || state.invalidated
                     })
@@ -1175,7 +1146,7 @@ fn validate_semantic_payloads(
                 ));
             }
             if approvals
-                .get(&(event.stream_id.clone(), request_id.clone()))
+                .get(&(event.session_id.clone(), request_id.clone()))
                 .is_none_or(|state| state.resolved || state.invalidated)
             {
                 return Err(invalid("approval request absent or already resolved"));
@@ -1191,9 +1162,9 @@ fn validate_semantic_payloads(
                     decode(payloads, control_ref, "session.approval-reply/v1")?;
                 validate_replacement(&reply_payload, payloads)?;
                 let approval = approvals
-                    .get(&(event.stream_id.clone(), request_id.clone()))
+                    .get(&(event.session_id.clone(), request_id.clone()))
                     .ok_or_else(|| invalid("approval request absent"))?;
-                if reply.stream_id != event.stream_id
+                if reply.session_id != event.session_id
                     || reply.branch_id != event.branch_id
                     || reply.turn_id != event.turn_id
                     || reply.invocation_id != event.invocation_id
@@ -1253,7 +1224,7 @@ fn validate_semantic_payloads(
                 }
             };
             let approval = approvals
-                .get(&(event.stream_id.clone(), request_id.clone()))
+                .get(&(event.session_id.clone(), request_id.clone()))
                 .ok_or_else(|| invalid("approval request absent"))?;
             let approved_request = history
                 .get(&approval.requested)
@@ -1298,7 +1269,7 @@ fn validate_semantic_payloads(
                     .child_derivation(&origin.event_id)
                     .ok_or_else(|| invalid("child derivation missing"))?;
                 super::rules::validate_child_terminal(origin, derived, terminal)?;
-                if terminal.stream_id != evidence.child_terminal_cursor.stream_id
+                if terminal.session_id != evidence.child_terminal_cursor.session_id
                     || terminal.sequence != evidence.child_terminal_cursor.sequence
                 {
                     return Err(invalid("child terminal evidence cursor mismatch"));
@@ -1341,7 +1312,7 @@ fn validate_semantic_payloads(
             };
             for id in ids {
                 if history.get(&id).is_none_or(|item| {
-                    item.stream_id != event.stream_id || item.turn_id != event.turn_id
+                    item.session_id != event.session_id || item.turn_id != event.turn_id
                 }) {
                     return Err(invalid("turn completion result belongs to another turn"));
                 }

@@ -10,7 +10,7 @@ use zeroclaw_api::session_events::{EventData, RecoveryDisposition, StoredPayload
 pub trait StreamExecutionLossVerifier: Send + Sync {
     fn verify_stream_loss(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         through: &EventCursor,
     ) -> Result<PayloadRecord, SessionError>;
 }
@@ -21,7 +21,7 @@ pub trait StreamExecutionLossVerifier: Send + Sync {
 pub trait ExecutionLossVerifier: Send + Sync {
     fn verify_loss(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         invocation: &InvocationId,
     ) -> Result<StoredPayloadRef, SessionError>;
 }
@@ -30,7 +30,7 @@ impl SessionCoordinator {
     /// Recover a whole session family without replaying any external effect.
     pub async fn recover_session(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
         verifier: Arc<dyn StreamExecutionLossVerifier>,
     ) -> Result<(), SessionError> {
         let recovery_key = format!("family-owner-{}", EventId::new());
@@ -66,7 +66,7 @@ impl SessionCoordinator {
                             .invocation_id
                             .as_ref()
                             .ok_or(SessionError::InvocationMismatch)?;
-                        let child = SessionStreamId::parse(format!("child-{invocation}"))
+                        let child = SessionId::parse(format!("child-{invocation}"))
                             .map_err(AppendError::from)?;
                         let child = if self.head(&child)?.sequence == 0 {
                             self.recover_requested_child(event.clone(), Arc::clone(&verifier))
@@ -109,7 +109,7 @@ impl SessionCoordinator {
     /// `recovery_key` identifies the ownership recovery command across retries.
     pub async fn recover_interrupted_stream(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
         recovery_key: String,
         verifier: Arc<dyn StreamExecutionLossVerifier>,
     ) -> Result<Option<AppendReceipt>, SessionError> {
@@ -339,7 +339,7 @@ impl SessionCoordinator {
                 events.push(terminal);
             }
             let receipt = owner.store.append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: through,
                 idempotency_key: key,
                 events,
@@ -357,7 +357,7 @@ impl SessionCoordinator {
     /// its bound observer; this path handles only verified worker loss.
     pub async fn recover_interrupted_invocation(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
         invocation: InvocationId,
         verifier: Arc<dyn ExecutionLossVerifier>,
     ) -> Result<AppendReceipt, SessionError> {
@@ -430,7 +430,7 @@ impl SessionCoordinator {
             unknown.invocation_id = Some(invocation.clone());
             unknown.causation_id = Some(recovered.event_id.clone());
             let receipt = coordinator.store.append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: head,
                 idempotency_key: key,
                 events: vec![recovered, unknown],

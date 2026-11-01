@@ -59,9 +59,9 @@ pub struct HistoryProjection {
 }
 
 impl HistoryProjection {
-    pub fn empty(stream_id: SessionStreamId) -> Self {
+    pub fn empty(session_id: SessionId) -> Self {
         Self {
-            source_cursor: EventCursor::beginning(stream_id),
+            source_cursor: EventCursor::beginning(session_id),
             turns: BTreeMap::new(),
             invocations: BTreeMap::new(),
             content: Vec::new(),
@@ -87,14 +87,14 @@ impl HistoryProjection {
         page: &EventPage,
         turn: Option<&TurnId>,
     ) -> Result<(), ReadError> {
-        if self.source_cursor != page.after || page.stream_id != self.source_cursor.stream_id {
+        if self.source_cursor != page.after || page.session_id != self.source_cursor.session_id {
             return Err(ReadError::Gap(
                 "projection prefix does not match page".into(),
             ));
         }
         // Stage only keys touched by this page. Copying the entire accumulated
         // projection on every page made bounded replay quadratic in history size.
-        let mut next = Self::empty(self.source_cursor.stream_id.clone());
+        let mut next = Self::empty(self.source_cursor.session_id.clone());
         next.source_cursor = self.source_cursor.clone();
         for event in page
             .events
@@ -113,7 +113,7 @@ impl HistoryProjection {
             }
         }
         for event in &page.events {
-            if event.stream_id != next.source_cursor.stream_id
+            if event.session_id != next.source_cursor.session_id
                 || Some(event.sequence) != next.source_cursor.sequence.checked_add(1)
             {
                 return Err(ReadError::Gap(

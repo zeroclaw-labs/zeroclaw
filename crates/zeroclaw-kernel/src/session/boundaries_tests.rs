@@ -7,13 +7,13 @@ use zeroclaw_infra::session_events::open_event_store;
 
 struct Policy {
     allowed: AtomicBool,
-    denied_scope: Option<SessionStreamId>,
+    denied_scope: Option<SessionId>,
 }
 impl SessionAccessPolicy for Policy {
     fn authorize(
         &self,
         _principal: &PrincipalId,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         _access: SessionAccess,
     ) -> Result<(), SessionError> {
         if !self.allowed.load(Ordering::SeqCst) || self.denied_scope.as_ref() == Some(stream) {
@@ -24,11 +24,10 @@ impl SessionAccessPolicy for Policy {
         Ok(())
     }
 }
-fn root(stream: &SessionStreamId) -> SessionEvent {
+fn root(stream: &SessionId) -> SessionEvent {
     let mut root = SessionEvent::typed(
         stream.clone(),
         EventData::SessionStarted {
-            session_id: SessionId::new(),
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
         },
@@ -40,12 +39,12 @@ fn root(stream: &SessionStreamId) -> SessionEvent {
 }
 fn batch(
     store: &dyn SessionEventStore,
-    stream: &SessionStreamId,
+    stream: &SessionId,
     events: Vec<SessionEvent>,
     payloads: Vec<PayloadRecord>,
 ) -> AppendRequest {
     AppendRequest {
-        stream_id: stream.clone(),
+        session_id: stream.clone(),
         expected_head: store.head(stream).expect("head"),
         idempotency_key: EventId::new().to_string(),
         events,
@@ -53,7 +52,7 @@ fn batch(
         erasure_reference_commitment: None,
     }
 }
-fn metadata(stream: &SessionStreamId, reference: StoredPayloadRef) -> SessionEvent {
+fn metadata(stream: &SessionId, reference: StoredPayloadRef) -> SessionEvent {
     SessionEvent::typed(
         stream.clone(),
         EventData::SessionMetadataChanged {
@@ -68,7 +67,7 @@ fn metadata(stream: &SessionStreamId, reference: StoredPayloadRef) -> SessionEve
 #[tokio::test]
 async fn child_settlement_requires_the_bound_turn_after_reopen() {
     fn fact(
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &BranchId,
         turn: Option<&TurnId>,
         data: EventData,
@@ -79,12 +78,7 @@ async fn child_settlement_requires_the_bound_turn_after_reopen() {
         event.turn_id = turn.cloned();
         event
     }
-    fn start(
-        store: &dyn SessionEventStore,
-        stream: &SessionStreamId,
-        branch: &BranchId,
-        turn: &TurnId,
-    ) {
+    fn start(store: &dyn SessionEventStore, stream: &SessionId, branch: &BranchId, turn: &TurnId) {
         let record =
             PayloadRecord::json("session.evidence/v1", &serde_json::json!({})).expect("binding");
         let reference = StoredPayloadRef::from(&record);
@@ -113,7 +107,7 @@ async fn child_settlement_requires_the_bound_turn_after_reopen() {
     }
     fn finish(
         store: &dyn SessionEventStore,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &BranchId,
         turn: &TurnId,
     ) -> SessionEvent {
@@ -144,7 +138,7 @@ async fn child_settlement_requires_the_bound_turn_after_reopen() {
         for reconcile in [false, true] {
             let directory = tempfile::TempDir::new().expect("directory");
             let mut store = open_event_store(directory.path(), backend).expect("store");
-            let parent = SessionStreamId::new();
+            let parent = SessionId::new();
             let parent_root = root(&parent);
             let branch = parent_root.branch_id.clone().expect("branch");
             store
@@ -178,7 +172,7 @@ async fn child_settlement_requires_the_bound_turn_after_reopen() {
                     vec![evidence],
                 ))
                 .expect("request");
-            let child = SessionStreamId::new();
+            let child = SessionId::new();
             let child_branch = BranchId::new();
             let bound_turn = TurnId::new();
             let mut derived = fact(
@@ -240,7 +234,7 @@ async fn child_settlement_requires_the_bound_turn_after_reopen() {
             store = open_event_store(directory.path(), backend).expect("reopen");
             let settlement = |terminal: &SessionEvent, wrong_resolution: bool| {
                 let cursor = EventCursor {
-                    stream_id: child.clone(),
+                    session_id: child.clone(),
                     sequence: terminal.sequence,
                 };
                 let (data, payloads) = if let Some(unknown_event_id) = &unknown {
@@ -320,7 +314,7 @@ async fn erased_middle_part_preserves_other_text_without_inventing_search_terms(
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::TempDir::new().expect("directory");
         let store = open_event_store(directory.path(), backend).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let root = root(&stream);
         let branch = root.branch_id.clone().expect("branch");
         let actor = EventActor::Principal {
@@ -441,7 +435,7 @@ async fn read_authorization_is_current_and_payload_paths_are_bounded() {
     for backend in ["sqlite", "jsonl"] {
         let dir = tempfile::TempDir::new().expect("dir");
         let store = open_event_store(dir.path(), backend).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let title = PayloadRecord::new(
             PayloadId::new(),
             "session.text/v1".into(),
@@ -507,8 +501,8 @@ async fn shared_leaf_erasure_requires_every_scope_and_freezes_indirect_reads() {
     for backend in ["sqlite", "jsonl"] {
         let dir = tempfile::TempDir::new().expect("dir");
         let store = open_event_store(dir.path(), backend).expect("store");
-        let a = SessionStreamId::new();
-        let b = SessionStreamId::new();
+        let a = SessionId::new();
+        let b = SessionId::new();
         let leaf = PayloadRecord::new(
             PayloadId::new(),
             "session.text/v1".into(),
@@ -595,7 +589,7 @@ async fn shared_leaf_erasure_requires_every_scope_and_freezes_indirect_reads() {
 async fn subscription_uses_history_and_requires_acknowledgement() {
     let dir = tempfile::TempDir::new().expect("dir");
     let store = open_event_store(dir.path(), "sqlite").expect("store");
-    let stream = SessionStreamId::new();
+    let stream = SessionId::new();
     let coordinator = Arc::new(SessionCoordinator::new(Arc::clone(&store)));
     let policy = Arc::new(Policy {
         allowed: AtomicBool::new(true),
@@ -607,7 +601,7 @@ async fn subscription_uses_history_and_requires_acknowledgement() {
     assert!(
         subscription
             .acknowledge(EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence: 1
             })
             .is_err()
@@ -628,7 +622,7 @@ async fn subscription_uses_history_and_requires_acknowledgement() {
     assert!(
         subscription
             .acknowledge(EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence: 2
             })
             .is_err()
@@ -646,7 +640,7 @@ async fn ordinary_history_permission_does_not_disclose_reasoning_leaves() {
     for backend in ["sqlite", "jsonl"] {
         let dir = tempfile::tempdir().expect("directory");
         let store = open_event_store(dir.path(), backend).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let leaf = PayloadRecord::new(
             PayloadId::new(),
             "session.text/v1".into(),
@@ -727,13 +721,13 @@ impl SessionEventStore for FutureResponseStore {
     }
     fn read_page(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         after: &EventCursor,
         through: Option<&EventCursor>,
         _: usize,
     ) -> Result<EventPage, ReadError> {
         Ok(EventPage {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             after: after.clone(),
             through: through.cloned().unwrap_or(self.head(stream)?),
             events: vec![self.event.clone()],
@@ -741,17 +735,13 @@ impl SessionEventStore for FutureResponseStore {
             has_more: false,
         })
     }
-    fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
+    fn head(&self, stream: &SessionId) -> Result<EventCursor, ReadError> {
         Ok(EventCursor {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             sequence: self.event.sequence,
         })
     }
-    fn lookup_receipt(
-        &self,
-        _: &SessionStreamId,
-        _: &str,
-    ) -> Result<Option<AppendReceipt>, ReadError> {
+    fn lookup_receipt(&self, _: &SessionId, _: &str) -> Result<Option<AppendReceipt>, ReadError> {
         Ok(None)
     }
     fn read_payload(&self, id: &PayloadId) -> Result<PayloadRead, ReadError> {
@@ -764,7 +754,7 @@ impl SessionEventStore for FutureResponseStore {
     fn erasure_scope(
         &self,
         _: &[StoredPayloadRef],
-    ) -> Result<(Vec<SessionStreamId>, Digest), AppendError> {
+    ) -> Result<(Vec<SessionId>, Digest), AppendError> {
         Err(AppendError::UnresolvedReachability(
             "future response fixture".into(),
         ))
@@ -773,7 +763,7 @@ impl SessionEventStore for FutureResponseStore {
 
 #[tokio::test]
 async fn future_response_blocks_do_not_hide_later_text_or_grant_payload_access() {
-    let stream = SessionStreamId::new();
+    let stream = SessionId::new();
     let text = PayloadRecord::new(
         PayloadId::new(),
         "session.text/v1".into(),

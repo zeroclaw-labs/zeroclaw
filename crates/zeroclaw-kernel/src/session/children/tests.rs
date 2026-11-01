@@ -8,7 +8,7 @@ impl SessionAccessPolicy for Authority {
     fn authorize(
         &self,
         _: &PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: SessionAccess,
     ) -> Result<(), SessionError> {
         Ok(())
@@ -18,13 +18,13 @@ impl PermissionResolver for Authority {
     fn authorize(&self, _: &EffectIntent) -> Result<(), SessionError> {
         Ok(())
     }
-    fn authorize_context(&self, _: &SessionStreamId, _: &BranchId) -> Result<(), SessionError> {
+    fn authorize_context(&self, _: &SessionId, _: &BranchId) -> Result<(), SessionError> {
         Ok(())
     }
     fn child_authority(
         &self,
         _: &str,
-        _: &SessionStreamId,
+        _: &SessionId,
     ) -> Result<Arc<dyn EngineSessionAuthority>, SessionError> {
         Ok(Arc::new(Self))
     }
@@ -81,19 +81,19 @@ impl SessionEventStore for PausedChildStore {
     }
     fn read_page(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
     ) -> Result<EventPage, ReadError> {
         self.inner.read_page(stream, after, through, max_events)
     }
-    fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
+    fn head(&self, stream: &SessionId) -> Result<EventCursor, ReadError> {
         self.inner.head(stream)
     }
     fn lookup_receipt(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError> {
         self.inner.lookup_receipt(stream, key)
@@ -104,19 +104,18 @@ impl SessionEventStore for PausedChildStore {
     fn erasure_scope(
         &self,
         targets: &[StoredPayloadRef],
-    ) -> Result<(Vec<SessionStreamId>, Digest), AppendError> {
+    ) -> Result<(Vec<SessionId>, Digest), AppendError> {
         self.inner.erasure_scope(targets)
     }
 }
 
 fn session(store: Arc<dyn SessionEventStore>) -> EngineSession {
     let owner = Arc::new(SessionCoordinator::new(store));
-    let stream = SessionStreamId::new();
+    let stream = SessionId::new();
     let branch = BranchId::new();
     let mut root = SessionEvent::typed(
         stream.clone(),
         EventData::SessionStarted {
-            session_id: SessionId::new(),
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
         },
@@ -147,7 +146,7 @@ fn session(store: Arc<dyn SessionEventStore>) -> EngineSession {
     projection.branch_id = Some(branch.clone());
     owner
         .append(AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: EventCursor::beginning(stream.clone()),
             idempotency_key: "root".into(),
             events: vec![root, projection],
@@ -245,7 +244,7 @@ async fn dropped_child_initializer_waiter_settles_a_later_worker_result() {
                 .find(|event| event.body.kind() == EventKind::TurnCommitted)
                 .expect("parent terminal");
             assert!(committed.sequence < terminals[0].sequence);
-            let child = SessionStreamId::parse(format!(
+            let child = SessionId::parse(format!(
                 "child-{}",
                 requested.invocation_id.as_ref().expect("invocation")
             ))

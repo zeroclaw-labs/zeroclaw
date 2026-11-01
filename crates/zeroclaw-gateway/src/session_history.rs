@@ -314,7 +314,7 @@ impl SessionAccessPolicy for IngressAuthority {
     fn authorize(
         &self,
         principal: &PrincipalId,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         self.current()?;
@@ -323,7 +323,7 @@ impl SessionAccessPolicy for IngressAuthority {
     fn authorize_actor(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         self.current()?;
@@ -333,17 +333,13 @@ impl SessionAccessPolicy for IngressAuthority {
 impl PermissionResolver for IngressAuthority {
     fn tool_authority_evidence(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         name: &str,
     ) -> Result<serde_json::Value, SessionError> {
         self.current()?;
         self.base.tool_authority_evidence(stream, name)
     }
-    fn authorize_context(
-        &self,
-        stream: &SessionStreamId,
-        branch: &BranchId,
-    ) -> Result<(), SessionError> {
+    fn authorize_context(&self, stream: &SessionId, branch: &BranchId) -> Result<(), SessionError> {
         self.current()?;
         self.base.authorize_context(stream, branch)
     }
@@ -363,7 +359,7 @@ impl PermissionResolver for IngressAuthority {
     fn child_authority(
         &self,
         target: &str,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<Arc<dyn EngineSessionAuthority>, SessionError> {
         self.current()?;
         Ok(Arc::new(Self {
@@ -418,7 +414,7 @@ pub(crate) async fn open_ingress(
             actor: EventActor::System {
                 component: component.into(),
             },
-            stream: source.stream_id(family).await?,
+            stream: source.session_id(family).await?,
             origin,
             parent_alias: None,
         }),
@@ -482,7 +478,7 @@ impl SessionAccessPolicy for GatewayAuthority {
     fn authorize_reasoning(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<(), SessionError> {
         self.current()?;
         self.base.authorize_reasoning(actor, stream)
@@ -490,7 +486,7 @@ impl SessionAccessPolicy for GatewayAuthority {
     fn authorize(
         &self,
         principal: &PrincipalId,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         self.current()?;
@@ -499,7 +495,7 @@ impl SessionAccessPolicy for GatewayAuthority {
     fn authorize_actor(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         self.current()?;
@@ -509,17 +505,13 @@ impl SessionAccessPolicy for GatewayAuthority {
 impl PermissionResolver for GatewayAuthority {
     fn tool_authority_evidence(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         name: &str,
     ) -> Result<serde_json::Value, SessionError> {
         self.current()?;
         self.base.tool_authority_evidence(stream, name)
     }
-    fn authorize_context(
-        &self,
-        stream: &SessionStreamId,
-        branch: &BranchId,
-    ) -> Result<(), SessionError> {
+    fn authorize_context(&self, stream: &SessionId, branch: &BranchId) -> Result<(), SessionError> {
         self.current()?;
         self.base.authorize_context(stream, branch)
     }
@@ -539,7 +531,7 @@ impl PermissionResolver for GatewayAuthority {
     fn child_authority(
         &self,
         target: &str,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<Arc<dyn EngineSessionAuthority>, SessionError> {
         self.current()?;
         Ok(Arc::new(Self {
@@ -564,7 +556,7 @@ impl EngineSessionAuthority for GatewayAuthority {
 }
 pub(crate) fn authority(
     state: &AppState,
-    stream: SessionStreamId,
+    stream: SessionId,
     alias: &str,
     subject: Option<&str>,
 ) -> anyhow::Result<Arc<dyn EngineSessionAuthority>> {
@@ -611,7 +603,7 @@ pub(crate) async fn open(
     let Some(source) = &state.native_sessions else {
         return Ok(None);
     };
-    let authority = authority(state, source.stream_id(family).await?, alias, subject)?;
+    let authority = authority(state, source.session_id(family).await?, alias, subject)?;
     Ok(Some(
         source
             .open(
@@ -812,7 +804,7 @@ pub(crate) mod tests {
             .pairing
             .authenticate_and_hash("fixture-bearer")
             .expect("authenticate");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let gateway = authority(&state, stream.clone(), "web", Some(&subject)).expect("authority");
         let ingress = IngressAuthority {
             base: gateway.clone(),
@@ -857,7 +849,7 @@ pub(crate) mod tests {
         }
         assert!(
             gateway
-                .tool_authority_evidence(&SessionStreamId::new(), "shell")
+                .tool_authority_evidence(&SessionId::new(), "shell")
                 .is_err()
         );
         assert!(state.pairing.revoke_token_hash(&subject));
@@ -922,7 +914,7 @@ pub(crate) mod tests {
     // Only application family routing is reduced to one fixture family.
     pub(crate) struct Source {
         pub owner: Arc<SessionCoordinator>,
-        pub stream: SessionStreamId,
+        pub stream: SessionId,
         branch: BranchId,
         family: String,
     }
@@ -932,12 +924,11 @@ pub(crate) mod tests {
                 zeroclaw_infra::session_events::open_event_store(directory, backend)
                     .expect("store"),
             ));
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             let branch = BranchId::new();
             let mut root = SessionEvent::typed(
                 stream.clone(),
                 EventData::SessionStarted {
-                    session_id: SessionId::new(),
                     owning_agent: "web".into(),
                     capture_mode: CaptureMode::Native,
                 },
@@ -970,7 +961,7 @@ pub(crate) mod tests {
             projection.branch_id = Some(branch.clone());
             owner
                 .append(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: EventCursor::beginning(stream.clone()),
                     idempotency_key: "fixture-root".into(),
                     events: vec![root, projection],
@@ -988,7 +979,7 @@ pub(crate) mod tests {
     }
     #[async_trait::async_trait]
     impl EngineSessionSource for Source {
-        async fn stream_id(&self, family: &str) -> Result<SessionStreamId, ContractError> {
+        async fn session_id(&self, family: &str) -> Result<SessionId, ContractError> {
             assert_eq!(family, self.family);
             Ok(self.stream.clone())
         }
@@ -1170,7 +1161,7 @@ pub(crate) mod tests {
                     PrincipalId::shared_operator(),
                     policy,
                     AppendRequest {
-                        stream_id: source.stream.clone(),
+                        session_id: source.stream.clone(),
                         expected_head: page.through,
                         idempotency_key: "erase-gateway-message".into(),
                         events: vec![intent],
@@ -1490,7 +1481,7 @@ pub(crate) mod tests {
         fn authorize(
             &self,
             _principal: &PrincipalId,
-            _stream: &SessionStreamId,
+            _stream: &SessionId,
             _access: SessionAccess,
         ) -> Result<(), SessionError> {
             Ok(())

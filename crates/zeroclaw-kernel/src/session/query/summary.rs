@@ -3,7 +3,7 @@ use super::*;
 use zeroclaw_api::session_events::ModelResolution;
 
 impl SessionQuery {
-    pub async fn summary(&self, stream: SessionStreamId) -> Result<SessionSummary, SessionError> {
+    pub async fn summary(&self, stream: SessionId) -> Result<SessionSummary, SessionError> {
         use zeroclaw_api::session_events::catalog::SessionReducer;
         let mut reducer = SessionReducer::new(stream.clone(), false);
         let mut after = EventCursor::beginning(stream.clone());
@@ -77,7 +77,7 @@ impl SessionQuery {
                 .events
                 .last()
                 .map_or(page.after.clone(), |event| EventCursor {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     sequence: event.sequence,
                 });
             if !page.has_more {
@@ -131,7 +131,7 @@ impl SessionQuery {
     /// Rejected selections are observations, never the effective override.
     pub async fn model_selection(
         &self,
-        stream: SessionStreamId,
+        stream: SessionId,
     ) -> Result<Option<zeroclaw_api::session_events::capture::ModelOverrideSelection>, SessionError>
     {
         let mut after = EventCursor::beginning(stream.clone());
@@ -206,7 +206,7 @@ impl SessionQuery {
             .await?;
         self.policy
             .authorize_actor(&self.actor, &stream, SessionAccess::Read)?;
-        if control.stream_id != stream || control.body.kind() != EventKind::ControlInputRecorded {
+        if control.session_id != stream || control.body.kind() != EventKind::ControlInputRecorded {
             return Err(ReadError::Corrupt("model selection input scope mismatch".into()).into());
         }
         let PayloadRead::Present(value) = self

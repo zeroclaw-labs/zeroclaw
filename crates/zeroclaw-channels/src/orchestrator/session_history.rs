@@ -37,7 +37,7 @@ fn message_identity(msg: &ChannelMessage) -> anyhow::Result<Digest> {
 struct ChannelAuthority {
     ctx: Arc<ChannelRuntimeContext>,
     message: ChannelMessage,
-    stream: SessionStreamId,
+    stream: SessionId,
     agent: String,
     child: bool,
 }
@@ -97,7 +97,7 @@ impl SessionAccessPolicy for ChannelAuthority {
     fn authorize(
         &self,
         _: &PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: SessionAccess,
     ) -> Result<(), SessionError> {
         Err(SessionError::PermissionDenied(
@@ -107,7 +107,7 @@ impl SessionAccessPolicy for ChannelAuthority {
     fn authorize_actor(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         if stream != &self.stream
@@ -122,11 +122,7 @@ impl SessionAccessPolicy for ChannelAuthority {
     }
 }
 impl PermissionResolver for ChannelAuthority {
-    fn authorize_context(
-        &self,
-        stream: &SessionStreamId,
-        _: &BranchId,
-    ) -> Result<(), SessionError> {
+    fn authorize_context(&self, stream: &SessionId, _: &BranchId) -> Result<(), SessionError> {
         if stream != &self.stream {
             return Err(SessionError::PermissionDenied(
                 "channel context scope mismatch".into(),
@@ -137,7 +133,7 @@ impl PermissionResolver for ChannelAuthority {
     fn authorize(&self, intent: &EffectIntent) -> Result<(), SessionError> {
         PermissionResolver::authorize_context(
             self,
-            &intent.stream_id,
+            &intent.session_id,
             intent
                 .event
                 .branch_id
@@ -169,7 +165,7 @@ impl PermissionResolver for ChannelAuthority {
     fn child_authority(
         &self,
         target: &str,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<Arc<dyn EngineSessionAuthority>, SessionError> {
         self.current()?;
         let config = self.ctx.live_config.read();
@@ -224,7 +220,7 @@ pub(super) async fn open(
     let authority = Arc::new(ChannelAuthority {
         ctx: ctx.clone(),
         message: msg.clone(),
-        stream: source.stream_id(family).await?,
+        stream: source.session_id(family).await?,
         agent: ctx.agent_alias.to_string(),
         child: false,
     });

@@ -296,7 +296,7 @@ pub struct WeComWsChannel {
     respond_msg_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     last_cleanup: Arc<Mutex<Instant>>,
     idempotency: Arc<SimpleIdempotencyStore>,
-    req_id_map: Arc<Mutex<HashMap<String, String>>>, // stream_id → req_id
+    req_id_map: Arc<Mutex<HashMap<String, String>>>, // session_id → req_id
 }
 
 // ── Construction + WS helpers ────────────────────────────────────────
@@ -510,9 +510,9 @@ impl WeComWsChannel {
         decision: AccessDecision,
     ) {
         let message = build_access_denied_message(inbound, decision, &self.alias);
-        let stream_id = next_stream_id();
+        let session_id = next_stream_id();
         if let Err(err) = self
-            .ws_queue_respond_msg(req_id, &stream_id, &message, true)
+            .ws_queue_respond_msg(req_id, &session_id, &message, true)
             .await
         {
             wecom_log_warn!(
@@ -527,12 +527,12 @@ impl WeComWsChannel {
     /// Send an `aibot_respond_msg` streaming frame.
     fn build_respond_msg_frame(
         req_id: &str,
-        stream_id: &str,
+        session_id: &str,
         content: &str,
         finish: bool,
     ) -> Value {
         let stream_obj = serde_json::json!({
-            "id": stream_id,
+            "id": session_id,
             "finish": finish,
             "content": normalize_stream_content(content),
         });
@@ -549,22 +549,22 @@ impl WeComWsChannel {
     async fn ws_queue_respond_msg(
         &self,
         req_id: &str,
-        stream_id: &str,
+        session_id: &str,
         content: &str,
         finish: bool,
     ) -> Result<()> {
-        let frame = Self::build_respond_msg_frame(req_id, stream_id, content, finish);
+        let frame = Self::build_respond_msg_frame(req_id, session_id, content, finish);
         self.ws_send_frame(frame).await
     }
 
     async fn ws_send_respond_msg(
         &self,
         req_id: &str,
-        stream_id: &str,
+        session_id: &str,
         content: &str,
         finish: bool,
     ) -> Result<()> {
-        let frame = Self::build_respond_msg_frame(req_id, stream_id, content, finish);
+        let frame = Self::build_respond_msg_frame(req_id, session_id, content, finish);
         if req_id.is_empty() {
             return self.ws_send_frame(frame).await;
         }
@@ -587,7 +587,7 @@ impl WeComWsChannel {
                         WECOM_STREAM_CONFLICT_RETRY_BASE_MILLIS.saturating_mul(1u64 << attempt);
                     attempt += 1;
                     wecom_log_warn!(
-                        "WeCom stream reply hit data-version conflict; retrying req_id={req_id} stream_id={stream_id} attempt={attempt} retry_in_ms={retry_in_ms}"
+                        "WeCom stream reply hit data-version conflict; retrying req_id={req_id} session_id={session_id} attempt={attempt} retry_in_ms={retry_in_ms}"
                     );
                     tokio::time::sleep(Duration::from_millis(retry_in_ms)).await;
                 }
@@ -756,9 +756,9 @@ impl WeComWsChannel {
         // Stop command
         if contains_stop_command(&stop_text) {
             let msg = wecom_ws_cli_string("channel-wecom-ws-stop-ack");
-            let stream_id = next_stream_id();
+            let session_id = next_stream_id();
             let _ = self
-                .ws_queue_respond_msg(&req_id, &stream_id, &msg, true)
+                .ws_queue_respond_msg(&req_id, &session_id, &msg, true)
                 .await;
             let _ = tx
                 .send(scopes.channel_message(
@@ -799,9 +799,9 @@ impl WeComWsChannel {
                 "channel-wecom-ws-voice-unavailable",
                 &[("emoji", random_emoji())],
             );
-            let stream_id = next_stream_id();
+            let session_id = next_stream_id();
             let _ = self
-                .ws_queue_respond_msg(&req_id, &stream_id, &msg, true)
+                .ws_queue_respond_msg(&req_id, &session_id, &msg, true)
                 .await;
             return;
         }
@@ -831,17 +831,17 @@ impl WeComWsChannel {
                         "channel-wecom-ws-voice-unavailable",
                         &[("emoji", random_emoji())],
                     );
-                    let stream_id = next_stream_id();
+                    let session_id = next_stream_id();
                     let _ = channel_self
-                        .ws_queue_respond_msg(&req_id, &stream_id, &msg, true)
+                        .ws_queue_respond_msg(&req_id, &session_id, &msg, true)
                         .await;
                     return;
                 }
                 NormalizedMessage::Unsupported => {
                     let msg = wecom_ws_cli_string("channel-wecom-ws-unsupported-message");
-                    let stream_id = next_stream_id();
+                    let session_id = next_stream_id();
                     let _ = channel_self
-                        .ws_queue_respond_msg(&req_id, &stream_id, &msg, true)
+                        .ws_queue_respond_msg(&req_id, &session_id, &msg, true)
                         .await;
                     return;
                 }
@@ -1425,10 +1425,10 @@ impl Channel for WeComWsChannel {
             .as_deref()
             .filter(|req_id| !req_id.is_empty())
         {
-            let stream_id = next_stream_id();
+            let session_id = next_stream_id();
             let (stream_content, overflow) = split_stream_content_and_overflow(&message.content);
 
-            self.ws_send_respond_msg(req_id, &stream_id, &stream_content, true)
+            self.ws_send_respond_msg(req_id, &session_id, &stream_content, true)
                 .await?;
 
             if let Some(extra) = overflow {
@@ -1678,15 +1678,15 @@ impl Channel for WeComWsChannel {
         if req_id.is_empty() {
             return Ok(None);
         }
-        let stream_id = next_stream_id();
+        let session_id = next_stream_id();
 
         let bootstrap = wecom_ws_cli_string("channel-wecom-ws-stream-bootstrap");
-        self.ws_send_respond_msg(req_id, &stream_id, &bootstrap, false)
+        self.ws_send_respond_msg(req_id, &session_id, &bootstrap, false)
             .await?;
         self.req_id_map
             .lock()
-            .insert(stream_id.clone(), req_id.to_string());
-        Ok(Some(stream_id))
+            .insert(session_id.clone(), req_id.to_string());
+        Ok(Some(session_id))
     }
 
     async fn update_draft(&self, _recipient: &str, message_id: &str, content: &str) -> Result<()> {

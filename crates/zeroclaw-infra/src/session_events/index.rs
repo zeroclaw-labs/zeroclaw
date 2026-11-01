@@ -19,11 +19,9 @@ pub(crate) fn ensure_sqlite_schema(connection: &Connection) -> Result<(), Append
     connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS session_index (
-               stream_id TEXT PRIMARY KEY,
-               session_id TEXT,
+               session_id TEXT PRIMARY KEY,
                creation_source TEXT,
                title TEXT,
-               session_key TEXT UNIQUE,
                created_at INTEGER NOT NULL,
                last_activity INTEGER NOT NULL,
                first_user_message_id TEXT,
@@ -36,7 +34,7 @@ pub(crate) fn ensure_sqlite_schema(connection: &Connection) -> Result<(), Append
                model TEXT,
                category TEXT,
                project TEXT,
-               parent_stream_id TEXT,
+               parent_session_id TEXT,
                parent_thread_id TEXT,
                parent_agent TEXT,
                owning_agent TEXT,
@@ -60,11 +58,11 @@ pub(crate) fn synchronize<F>(
     data_dir: &Path,
     backend: NativeBackend,
     store: &dyn SessionEventStore,
-    streams: &[SessionStreamId],
+    streams: &[SessionId],
     project: F,
 ) -> Result<(), AppendError>
 where
-    F: Fn(&SessionStreamId) -> Result<Option<SessionIndexRecord>, ReadError>,
+    F: Fn(&SessionId) -> Result<Option<SessionIndexRecord>, ReadError>,
 {
     match backend {
         NativeBackend::Sqlite => synchronize_sqlite(data_dir, store, streams, project),
@@ -96,7 +94,7 @@ pub(crate) fn read_records(
         right
             .last_activity
             .cmp(&left.last_activity)
-            .then_with(|| left.stream_id.cmp(&right.stream_id))
+            .then_with(|| left.session_id.cmp(&right.session_id))
     });
     Ok(records)
 }
@@ -104,11 +102,11 @@ pub(crate) fn read_records(
 fn synchronize_sqlite<F>(
     data_dir: &Path,
     store: &dyn SessionEventStore,
-    streams: &[SessionStreamId],
+    streams: &[SessionId],
     project: F,
 ) -> Result<(), AppendError>
 where
-    F: Fn(&SessionStreamId) -> Result<Option<SessionIndexRecord>, ReadError>,
+    F: Fn(&SessionId) -> Result<Option<SessionIndexRecord>, ReadError>,
 {
     let native = SqliteEventStore::open(data_dir)?;
     let connection = native.conn.lock();
@@ -135,7 +133,7 @@ where
         upsert_sqlite(&tx, &record)?;
     }
     let mut statement = tx
-        .prepare("SELECT stream_id FROM session_index")
+        .prepare("SELECT session_id FROM session_index")
         .map_err(map_sqlite)?;
     let stale = statement
         .query_map([], |row| row.get::<_, String>(0))
@@ -146,7 +144,7 @@ where
     for stream in stale {
         if !seen.contains(&stream) {
             tx.execute(
-                "DELETE FROM session_index WHERE stream_id=?1",
+                "DELETE FROM session_index WHERE session_id=?1",
                 params![stream],
             )
             .map_err(map_sqlite)?;
@@ -158,11 +156,11 @@ where
 fn synchronize_jsonl<F>(
     data_dir: &Path,
     store: &dyn SessionEventStore,
-    streams: &[SessionStreamId],
+    streams: &[SessionId],
     project: F,
 ) -> Result<(), AppendError>
 where
-    F: Fn(&SessionStreamId) -> Result<Option<SessionIndexRecord>, ReadError>,
+    F: Fn(&SessionId) -> Result<Option<SessionIndexRecord>, ReadError>,
 {
     let path = data_dir
         .join("sessions/session-events-jsonl")
@@ -207,25 +205,24 @@ fn upsert_sqlite(
         .map_err(|error| AppendError::Corrupt(error.to_string()))?;
     tx.execute(
         "INSERT INTO session_index (
-            stream_id,session_id,creation_source,title,created_at,last_activity,
+            session_id,creation_source,title,created_at,last_activity,
             first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,
-            provider,model,category,project,parent_stream_id,parent_thread_id,parent_agent,
-            owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json,session_key
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
-         ON CONFLICT(stream_id) DO UPDATE SET
-            session_id=excluded.session_id,creation_source=excluded.creation_source,title=excluded.title,session_key=excluded.session_key,
+            provider,model,category,project,parent_session_id,parent_thread_id,parent_agent,
+            owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+         ON CONFLICT(session_id) DO UPDATE SET
+            creation_source=excluded.creation_source,title=excluded.title,
             created_at=excluded.created_at,last_activity=excluded.last_activity,
             first_user_message_id=excluded.first_user_message_id,first_user_preview=excluded.first_user_preview,
             cwd=excluded.cwd,git_remote=excluded.git_remote,git_branch=excluded.git_branch,
             git_commit=excluded.git_commit,provider=excluded.provider,model=excluded.model,
-            category=excluded.category,project=excluded.project,parent_stream_id=excluded.parent_stream_id,
+            category=excluded.category,project=excluded.project,parent_session_id=excluded.parent_session_id,
             parent_thread_id=excluded.parent_thread_id,parent_agent=excluded.parent_agent,
             owning_agent=excluded.owning_agent,closed=excluded.closed,deleted=excluded.deleted,
             head_sequence=excluded.head_sequence,message_count=excluded.message_count,
             running=excluded.running,metadata_json=excluded.metadata_json",
         params![
-            record.stream_id.as_str(),
-            record.session_id.as_ref().map(ToString::to_string),
+            record.session_id.as_str(),
             record.creation_source,
             record.title,
             record.created_at,
@@ -240,7 +237,7 @@ fn upsert_sqlite(
             record.model,
             record.category,
             record.project,
-            record.parent_stream_id.as_ref().map(ToString::to_string),
+            record.parent_session_id.as_ref().map(ToString::to_string),
             record.parent_thread_id.as_ref().map(ToString::to_string),
             record.parent_agent,
             record.owning_agent,
@@ -250,7 +247,6 @@ fn upsert_sqlite(
             i64::try_from(record.message_count).map_err(|_| AppendError::Corrupt("message count exceeds SQLite integer".into()))?,
             record.running,
             metadata,
-            record.session_key,
         ],
     )
     .map_err(map_sqlite)?;
@@ -271,19 +267,19 @@ fn load_sqlite_records(
         return Ok(BTreeMap::new());
     }
     let mut statement = connection
-        .prepare("SELECT stream_id,session_id,creation_source,title,created_at,last_activity,first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,provider,model,category,project,parent_stream_id,parent_thread_id,parent_agent,owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json,session_key FROM session_index")
+        .prepare("SELECT session_id,creation_source,title,created_at,last_activity,first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,provider,model,category,project,parent_session_id,parent_thread_id,parent_agent,owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json FROM session_index")
         .map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
-            let metadata: Vec<u8> = row.get(25)?;
-            let head: i64 = row.get(22)?;
-            let message_count: i64 = row.get(23)?;
+            let metadata: Vec<u8> = row.get(24)?;
+            let head: i64 = row.get(21)?;
+            let message_count: i64 = row.get(22)?;
             let head_sequence = u64::try_from(head)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(22, head))?;
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(21, head))?;
             let message_count = usize::try_from(message_count)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(23, message_count))?;
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(22, message_count))?;
             Ok(SessionIndexRecord {
-                stream_id: zeroclaw_api::session_events::SessionStreamId::parse(
+                session_id: zeroclaw_api::session_events::SessionId::parse(
                     row.get::<_, String>(0)?,
                 )
                 .map_err(|error| {
@@ -293,34 +289,32 @@ fn load_sqlite_records(
                         Box::new(error),
                     )
                 })?,
-                session_id: parse_optional(row.get(1)?),
-                session_key: row.get(26)?,
-                creation_source: row.get(2)?,
-                title: row.get(3)?,
-                created_at: row.get(4)?,
-                last_activity: row.get(5)?,
-                first_user_message_id: parse_optional(row.get(6)?),
-                first_user_preview: row.get(7)?,
-                cwd: row.get(8)?,
-                git_remote: row.get(9)?,
-                git_branch: row.get(10)?,
-                git_commit: row.get(11)?,
-                provider: row.get(12)?,
-                model: row.get(13)?,
-                category: row.get(14)?,
-                project: row.get(15)?,
-                parent_stream_id: parse_optional(row.get(16)?),
-                parent_thread_id: parse_optional(row.get(17)?),
-                parent_agent: row.get(18)?,
-                owning_agent: row.get(19)?,
-                closed: row.get(20)?,
-                deleted: row.get(21)?,
+                creation_source: row.get(1)?,
+                title: row.get(2)?,
+                created_at: row.get(3)?,
+                last_activity: row.get(4)?,
+                first_user_message_id: parse_optional(row.get(5)?),
+                first_user_preview: row.get(6)?,
+                cwd: row.get(7)?,
+                git_remote: row.get(8)?,
+                git_branch: row.get(9)?,
+                git_commit: row.get(10)?,
+                provider: row.get(11)?,
+                model: row.get(12)?,
+                category: row.get(13)?,
+                project: row.get(14)?,
+                parent_session_id: parse_optional(row.get(15)?),
+                parent_thread_id: parse_optional(row.get(16)?),
+                parent_agent: row.get(17)?,
+                owning_agent: row.get(18)?,
+                closed: row.get(19)?,
+                deleted: row.get(20)?,
                 head_sequence,
                 message_count,
-                running: row.get(24)?,
+                running: row.get(23)?,
                 metadata: serde_json::from_slice(&metadata).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        25,
+                        24,
                         rusqlite::types::Type::Blob,
                         Box::new(error),
                     )
@@ -331,7 +325,7 @@ fn load_sqlite_records(
     let mut out = BTreeMap::new();
     for row in rows {
         let record = row.map_err(read_error)?;
-        out.insert(record.stream_id.as_str().to_owned(), record);
+        out.insert(record.session_id.as_str().to_owned(), record);
     }
     Ok(out)
 }
@@ -356,7 +350,7 @@ fn load_jsonl_records(path: &Path) -> Result<BTreeMap<String, SessionIndexRecord
     {
         let record: SessionIndexRecord =
             serde_json::from_slice(line).map_err(|error| ReadError::Corrupt(error.to_string()))?;
-        out.insert(record.stream_id.as_str().to_owned(), record);
+        out.insert(record.session_id.as_str().to_owned(), record);
     }
     Ok(out)
 }
@@ -428,14 +422,18 @@ mod tests {
             Connection::open(directory.path().join("sessions/session-events.db")).expect("db");
         let row: (String, String, String) = connection
             .query_row(
-                "SELECT session_key,cwd,category FROM session_index WHERE stream_id=?1",
+                "SELECT session_id,cwd,category FROM session_index WHERE session_id=?1",
                 params![sources["gw_indexed"].as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("index row");
         assert_eq!(
             row,
-            ("gw_indexed".into(), "/workspace".into(), "project".into())
+            (
+                sources["gw_indexed"].to_string(),
+                "/workspace".into(),
+                "project".into()
+            )
         );
         let session = catalog
             .query()
@@ -505,7 +503,7 @@ mod tests {
         assert!(
             String::from_utf8(bytes)
                 .expect("utf8")
-                .contains("\"session_key\":\"gw_jsonl\"")
+                .contains("\"session_id\":\"gw_jsonl\"")
         );
         let index = directory
             .path()
@@ -554,7 +552,7 @@ mod tests {
             assert_eq!(rows[0].title.as_deref(), Some("Migrated title"));
             let session = catalog
                 .query()
-                .summary(&rows[0].stream_id)
+                .summary(&rows[0].session_id)
                 .expect("summary")
                 .expect("session");
             assert_eq!(session.title(), Some("Migrated title"));

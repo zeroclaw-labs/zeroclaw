@@ -19472,7 +19472,7 @@ model_provider = "custom.only"
                 agent.model_provider = Box::new(ThinkingProbe(Arc::clone(&observed)));
                 let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
                 let family = "agent-thinking";
-                let stream = source.stream_id(family).await.unwrap();
+                let stream = source.session_id(family).await.unwrap();
                 let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
                 let port = source
                     .open(
@@ -19697,7 +19697,7 @@ model_provider = "custom.only"
             let live = LiveConfigAuthority::new(config);
             let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
             let family = "observed-model-switch";
-            let stream = source.stream_id(family).await.unwrap();
+            let stream = source.session_id(family).await.unwrap();
             let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
             let port = source
                 .open(
@@ -20552,7 +20552,7 @@ model_provider = "custom.only"
                     )]);
                 let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
                 let family = "scoped-model-switch";
-                let stream = source.stream_id(family).await.unwrap();
+                let stream = source.session_id(family).await.unwrap();
                 let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
                 let port = source
                     .open(

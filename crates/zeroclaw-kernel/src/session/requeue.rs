@@ -77,7 +77,7 @@ fn present(
 impl SessionCoordinator {
     pub(super) async fn requeue_for_dispatch(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
         branch: BranchId,
         turn: TurnId,
     ) -> Result<Option<SessionEvent>, SessionError> {
@@ -118,7 +118,7 @@ impl SessionCoordinator {
 
     pub(super) fn turn_execution_binding(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &BranchId,
         turn: &TurnId,
     ) -> Result<StoredPayloadRef, SessionError> {
@@ -255,7 +255,7 @@ impl EngineSession {
                 cancelled.turn_id = Some(turn.clone());
                 cancelled.causation_id = Some(recovered.event_id.clone());
                 session.owner.store.append_batch(AppendRequest {
-                    stream_id: session.stream.clone(),
+                    session_id: session.stream.clone(),
                     expected_head: session.owner.store.head(&session.stream)?,
                     idempotency_key: format!("turn-outcome:{turn}"),
                     events: vec![cancelled],

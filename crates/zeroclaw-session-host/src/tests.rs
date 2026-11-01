@@ -7,7 +7,7 @@ use zeroclaw_kernel::session::{EffectIntent, PermissionResolver, SessionError};
 struct Authority(AtomicBool);
 
 #[tokio::test]
-async fn creation_source_is_independent_of_session_key_and_preserved_on_reopen() {
+async fn creation_source_is_preserved_on_reopen() {
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
         let mut config = zeroclaw_config::schema::Config {
@@ -36,7 +36,7 @@ async fn creation_source_is_independent_of_session_key_and_preserved_on_reopen()
             )
             .await
             .expect("create without protocol prefix");
-        let stream = hub.stream_id(key).await.expect("stream");
+        let stream = hub.session_id(key).await.expect("stream");
         drop(port);
         drop(hub);
 
@@ -55,8 +55,11 @@ async fn creation_source_is_independent_of_session_key_and_preserved_on_reopen()
             )
             .await
             .expect("reopen through another entrance");
-        assert_eq!(hub.stream_id(key).await.expect("same stream"), stream);
-        assert_eq!(hub.sessions().await.expect("sessions"), vec![key]);
+        assert_eq!(hub.session_id(key).await.expect("same stream"), stream);
+        assert_eq!(
+            hub.sessions().await.expect("sessions"),
+            vec![stream.to_string()]
+        );
         let restored = port
             .restore_context()
             .await
@@ -70,66 +73,29 @@ async fn creation_source_is_independent_of_session_key_and_preserved_on_reopen()
             .expect("native store");
         let records = catalog.query().index_records().expect("index");
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].stream_id, stream);
-        assert_eq!(records[0].session_key.as_deref(), Some(key));
+        assert_eq!(records[0].session_id, stream);
         assert_eq!(records[0].creation_source.as_deref(), Some("cron"));
         let summaries = catalog
             .query()
             .indexed_summaries()
             .expect("indexed summaries");
-        assert_eq!(summaries[0].1.session_key(), Some(key));
         assert_eq!(summaries[0].1.creation_source(), Some("cron"));
         let store = catalog.store();
-        let page = store
-            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
-            .expect("creation events");
-        let mut metadata = Vec::new();
-        for event in &page.events {
-            if let EventData::SessionMetadataChanged {
-                field,
-                new_value_ref,
-            } = &event.body.data
-                && matches!(field.as_str(), "session_key" | "creation_source")
-            {
-                let PayloadRead::Present(payload) = store
-                    .read_payload(&new_value_ref.payload_id)
-                    .expect("metadata payload")
-                else {
-                    panic!("metadata present");
-                };
-                let value: String = serde_json::from_slice(&payload.body).expect("plain string");
-                metadata.push((field.as_str(), value));
-            }
-        }
-        assert_eq!(
-            metadata,
-            vec![
-                ("session_key", key.into()),
-                ("creation_source", "cron".into())
-            ]
-        );
         let head = store.head(&stream).expect("head");
-        for (event, payload) in [
-            zeroclaw_infra::session_events::installation::session_key(
-                stream.clone(),
-                "another-key",
-            )
-            .expect("replacement key"),
+        let (event, payload) =
             zeroclaw_infra::session_events::installation::creation_source(stream.clone(), "rpc")
-                .expect("replacement source"),
-        ] {
-            assert!(matches!(
-                store.append_batch(AppendRequest {
-                    stream_id: stream.clone(),
-                    expected_head: head.clone(),
-                    idempotency_key: format!("replace-{}", event.event_id),
-                    events: vec![event],
-                    payloads: vec![payload],
-                    erasure_reference_commitment: None,
-                }),
-                Err(AppendError::InvalidReference(_))
-            ));
-        }
+                .expect("replacement source");
+        assert!(matches!(
+            store.append_batch(AppendRequest {
+                session_id: stream.clone(),
+                expected_head: head.clone(),
+                idempotency_key: format!("replace-{}", event.event_id),
+                events: vec![event],
+                payloads: vec![payload],
+                erasure_reference_commitment: None,
+            }),
+            Err(AppendError::InvalidReference(_))
+        ));
         assert_eq!(store.head(&stream).expect("unchanged head"), head);
     }
 }
@@ -343,7 +309,7 @@ async fn stream_resolution_waits_for_installation_without_blocking_reactor() {
     locked_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("lock acquired");
-    let resolution = hub.stream_id("pending");
+    let resolution = hub.session_id("pending");
     tokio::pin!(resolution);
     let started = std::time::Instant::now();
     tokio::select! {
@@ -355,7 +321,7 @@ async fn stream_resolution_waits_for_installation_without_blocking_reactor() {
     holder.join().expect("lock holder");
     assert_eq!(
         resolution.await.expect("resolved stream"),
-        NativeSessionHub::stream_id("pending").expect("new identity")
+        NativeSessionHub::session_id("pending").expect("new identity")
     );
     assert!(
         reactor_delay < std::time::Duration::from_secs(1),
@@ -650,7 +616,7 @@ impl SessionAccessPolicy for Authority {
     fn authorize(
         &self,
         _: &PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: SessionAccess,
     ) -> Result<(), SessionError> {
         if self.0.load(Ordering::SeqCst) {
@@ -664,7 +630,7 @@ impl PermissionResolver for Authority {
     fn child_authority(
         &self,
         _: &str,
-        _: &SessionStreamId,
+        _: &SessionId,
     ) -> Result<Arc<dyn EngineSessionAuthority>, SessionError> {
         Ok(Arc::new(Authority(AtomicBool::new(
             self.0.load(Ordering::SeqCst),
@@ -674,15 +640,11 @@ impl PermissionResolver for Authority {
         SessionAccessPolicy::authorize(
             self,
             &PrincipalId::shared_operator(),
-            &intent.stream_id,
+            &intent.session_id,
             SessionAccess::Write,
         )
     }
-    fn authorize_context(
-        &self,
-        stream: &SessionStreamId,
-        _: &BranchId,
-    ) -> Result<(), SessionError> {
+    fn authorize_context(&self, stream: &SessionId, _: &BranchId) -> Result<(), SessionError> {
         SessionAccessPolicy::authorize(
             self,
             &PrincipalId::shared_operator(),
@@ -760,7 +722,7 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
         .expect("turn");
         drop(port);
         drop(hub);
-        let stream = NativeSessionHub::stream_id("child-fixture").expect("root");
+        let stream = NativeSessionHub::session_id("child-fixture").expect("root");
         let source = ScopedEventStore::open(directory.path(), "child-fixture").expect("source");
         let parent = source
             .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
@@ -778,8 +740,8 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
             .expect("child terminal");
         let child = source
             .read_page(
-                &terminal.stream_id,
-                &EventCursor::beginning(terminal.stream_id.clone()),
+                &terminal.session_id,
+                &EventCursor::beginning(terminal.session_id.clone()),
                 None,
                 256,
             )
@@ -803,8 +765,8 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
             .expect("parent after");
         let child_after = migrated
             .read_page(
-                &terminal.stream_id,
-                &EventCursor::beginning(terminal.stream_id.clone()),
+                &terminal.session_id,
+                &EventCursor::beginning(terminal.session_id.clone()),
                 None,
                 256,
             )
@@ -904,7 +866,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
         drop(hub);
         let store: Arc<dyn SessionEventStore> =
             Arc::new(ScopedEventStore::open(directory.path(), family).expect("family store"));
-        let root = NativeSessionHub::stream_id(family).expect("root stream");
+        let root = NativeSessionHub::session_id(family).expect("root stream");
         let before = store
             .read_page(&root, &EventCursor::beginning(root.clone()), None, 256)
             .expect("parent history");
@@ -915,7 +877,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
                 EventData::ChildInvocationCompleted {
                     child_terminal_cursor,
                     ..
-                } => Some(child_terminal_cursor.stream_id.clone()),
+                } => Some(child_terminal_cursor.session_id.clone()),
                 _ => None,
             })
             .expect("derived stream");
@@ -941,7 +903,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
             let metadata_id = metadata.event_id.clone();
             owner
                 .append(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: store.head(&stream).expect("head"),
                     idempotency_key: format!("erasure-fixture-metadata:{stream}"),
                     events: vec![metadata],
@@ -965,7 +927,7 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
             .expect("intent");
             owner
                 .append(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: store.head(&stream).expect("head"),
                     idempotency_key: format!("erasure-fixture-intent:{stream}"),
                     events: vec![intent],
@@ -1277,7 +1239,7 @@ async fn host_seed_preserves_canonical_context_and_stable_public_ids_without_rea
                 PrincipalId::shared_operator(),
                 authority.clone(),
                 AppendRequest {
-                    stream_id: native.stream.clone(),
+                    session_id: native.stream.clone(),
                     expected_head: store.head(&native.stream).expect("head"),
                     idempotency_key: "erase-host-seed".into(),
                     events: vec![intent],

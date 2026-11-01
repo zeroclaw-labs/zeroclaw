@@ -9,7 +9,7 @@ impl SessionAccessPolicy for Policy {
     fn authorize(
         &self,
         _: &PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: SessionAccess,
     ) -> Result<(), SessionError> {
         if self.0 {
@@ -24,7 +24,7 @@ struct Fixture {
     directory: tempfile::TempDir,
     owner: Arc<SessionCoordinator>,
     store: Arc<dyn SessionEventStore>,
-    stream: SessionStreamId,
+    stream: SessionId,
     message: MessageId,
     target: StoredPayloadRef,
     request: AppendRequest,
@@ -34,7 +34,7 @@ fn fixture(backend: &str) -> Fixture {
     let directory = tempfile::tempdir().expect("directory");
     let store = open_event_store(directory.path(), backend).expect("store");
     let owner = Arc::new(SessionCoordinator::new(store.clone()));
-    let stream = SessionStreamId::new();
+    let stream = SessionId::new();
     let branch = BranchId::new();
     let turn = TurnId::new();
     let message = MessageId::new();
@@ -63,7 +63,6 @@ fn fixture(backend: &str) -> Fixture {
     let mut root = SessionEvent::typed(
         stream.clone(),
         EventData::SessionStarted {
-            session_id: SessionId::new(),
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
         },
@@ -97,7 +96,7 @@ fn fixture(backend: &str) -> Fixture {
     recorded.causation_id = Some(accepted.event_id.clone());
     owner
         .append(AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: EventCursor::beginning(stream.clone()),
             idempotency_key: "fixture".into(),
             events: vec![root, accepted, recorded],
@@ -116,7 +115,7 @@ fn fixture(backend: &str) -> Fixture {
     .expect("intent");
     intent.event_id = EventId::parse("e".repeat(256)).expect("maximum-length intent identity");
     let request = AppendRequest {
-        stream_id: stream.clone(),
+        session_id: stream.clone(),
         expected_head: store.head(&stream).expect("head"),
         idempotency_key: "erase-request".into(),
         events: vec![intent],

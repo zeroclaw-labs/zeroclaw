@@ -13,7 +13,7 @@ impl SessionCoordinator {
     /// and durability; failures preserve the intent for the next retry.
     pub async fn resume_pending_erasures(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
     ) -> Result<(), SessionError> {
         let owner = Arc::clone(self);
         self.blocking(move || {
@@ -24,10 +24,7 @@ impl SessionCoordinator {
         .await
     }
 
-    pub(super) fn finish_erasures_locked(
-        &self,
-        stream: &SessionStreamId,
-    ) -> Result<(), SessionError> {
+    pub(super) fn finish_erasures_locked(&self, stream: &SessionId) -> Result<(), SessionError> {
         let owner = self;
         let history = owner.stream_history(stream)?;
         let mut intents = BTreeMap::new();
@@ -81,7 +78,7 @@ impl SessionCoordinator {
                     .read_event(&receipt.event_ids[0])?
                     .ok_or_else(|| ReadError::Gap("erasure confirmation missing".into()))?;
                 if prior.event_id != event.event_id
-                    || prior.stream_id != event.stream_id
+                    || prior.session_id != event.session_id
                     || prior.branch_id != event.branch_id
                     || prior.causation_id != event.causation_id
                     || prior.actor != event.actor
@@ -96,7 +93,7 @@ impl SessionCoordinator {
             // Retrying completed confirmations also resumes a SQLite WAL
             // checkpoint that failed after the redaction transaction.
             owner.store.append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: owner.store.head(stream)?,
                 idempotency_key: key,
                 events: vec![event],

@@ -34,8 +34,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, broadcast};
 use zeroclaw_api::session_events::{
     AppendError, AppendReceipt, AppendRequest, BranchId, EventActor, EventCursor, EventId,
-    EventKind, InvocationId, PayloadRecord, ReadError, SessionEvent, SessionEventStore,
-    SessionStreamId, TurnId,
+    EventKind, InvocationId, PayloadRecord, ReadError, SessionEvent, SessionEventStore, SessionId,
+    TurnId,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -71,7 +71,7 @@ pub trait PermissionResolver: Send + Sync {
     fn child_authority(
         &self,
         _target: &str,
-        _stream: &SessionStreamId,
+        _stream: &SessionId,
     ) -> Result<Arc<dyn engine::EngineSessionAuthority>, SessionError> {
         Err(SessionError::PermissionDenied(
             "child scope is not authorized".into(),
@@ -80,7 +80,7 @@ pub trait PermissionResolver: Send + Sync {
     fn authorize(&self, intent: &EffectIntent) -> Result<(), SessionError>;
     fn authorize_context(
         &self,
-        _stream: &SessionStreamId,
+        _stream: &SessionId,
         _branch: &BranchId,
     ) -> Result<(), SessionError> {
         Err(SessionError::PermissionDenied(
@@ -91,7 +91,7 @@ pub trait PermissionResolver: Send + Sync {
     /// snapshot. Production resolvers read policy and revision under one guard.
     fn tool_authority_evidence(
         &self,
-        _stream: &SessionStreamId,
+        _stream: &SessionId,
         _name: &str,
     ) -> Result<serde_json::Value, SessionError> {
         Ok(serde_json::json!({"source":"embedding_permission_resolver","revision":"not_reported"}))
@@ -110,7 +110,7 @@ pub trait PermissionResolver: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct EffectIntent {
-    pub stream_id: SessionStreamId,
+    pub session_id: SessionId,
     pub expected_head: EventCursor,
     pub idempotency_key: String,
     pub event: SessionEvent,
@@ -119,7 +119,7 @@ pub struct EffectIntent {
 
 impl EffectIntent {
     pub fn validate(&self) -> Result<(), SessionError> {
-        if self.event.stream_id != self.stream_id {
+        if self.event.session_id != self.session_id {
             return Err(SessionError::InvalidAdmission(
                 "effect event belongs to another stream".to_owned(),
             ));
@@ -149,10 +149,10 @@ impl EffectIntent {
 pub struct SessionCoordinator {
     store: Arc<dyn SessionEventStore>,
     search: Option<Arc<dyn zeroclaw_api::session_events::search::SessionSearchPort>>,
-    stream_locks: Mutex<HashMap<SessionStreamId, std::sync::Weak<Mutex<()>>>>,
+    stream_locks: Mutex<HashMap<SessionId, std::sync::Weak<Mutex<()>>>>,
     workers: Arc<Semaphore>,
-    wakeups: broadcast::Sender<SessionStreamId>,
-    foreground: Mutex<HashMap<SessionStreamId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    wakeups: broadcast::Sender<SessionId>,
+    foreground: Mutex<HashMap<SessionId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Creates the identity of this execution owner, independent of turn IDs.
     /// Reopening a coordinator never reuses a historical approval incarnation.
     execution_incarnation: String,
@@ -163,7 +163,7 @@ impl SessionCoordinator {
     /// admission. An adapter swallowing an Unknown error cannot restart work.
     pub(super) fn require_known_turn(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &BranchId,
         turn: Option<&TurnId>,
     ) -> Result<(), SessionError> {
@@ -233,17 +233,17 @@ impl SessionCoordinator {
         .map_err(|error| SessionError::StoreUnhealthy(error.to_string()))?
     }
 
-    fn lock_for(&self, stream_id: &SessionStreamId) -> Arc<Mutex<()>> {
+    fn lock_for(&self, session_id: &SessionId) -> Arc<Mutex<()>> {
         let mut locks = self
             .stream_locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         locks.retain(|_, value| value.strong_count() > 0);
-        if let Some(lock) = locks.get(stream_id).and_then(std::sync::Weak::upgrade) {
+        if let Some(lock) = locks.get(session_id).and_then(std::sync::Weak::upgrade) {
             return lock;
         }
         let lock = Arc::new(Mutex::new(()));
-        locks.insert(stream_id.clone(), Arc::downgrade(&lock));
+        locks.insert(session_id.clone(), Arc::downgrade(&lock));
         lock
     }
 
@@ -251,29 +251,29 @@ impl SessionCoordinator {
     /// not expose the backend object to callers, so every caller shares the
     /// same per-stream admission boundary.
     pub fn append(&self, request: AppendRequest) -> Result<AppendReceipt, SessionError> {
-        let lock = self.lock_for(&request.stream_id);
+        let lock = self.lock_for(&request.session_id);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let stream = request.stream_id.clone();
+        let stream = request.session_id.clone();
         let receipt = self.store.append_batch(request)?;
         let _ = self.wakeups.send(stream);
         Ok(receipt)
     }
 
-    pub fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, SessionError> {
+    pub fn head(&self, stream: &SessionId) -> Result<EventCursor, SessionError> {
         Ok(self.store.head(stream)?)
     }
 
     #[cfg(test)]
     fn read_page(
         &self,
-        stream_id: &SessionStreamId,
+        session_id: &SessionId,
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
     ) -> Result<zeroclaw_api::session_events::EventPage, SessionError> {
         Ok(self
             .store
-            .read_page(stream_id, after, through, max_events)?)
+            .read_page(session_id, after, through, max_events)?)
     }
 
     /// Resolve current permission and durably append the start boundary before
@@ -286,13 +286,13 @@ impl SessionCoordinator {
         resolver: &dyn PermissionResolver,
     ) -> Result<EffectObservationHandle, SessionError> {
         intent.validate()?;
-        let lock = self.lock_for(&intent.stream_id);
+        let lock = self.lock_for(&intent.session_id);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let (Some(branch), turn) = (
             intent.event.branch_id.as_ref(),
             intent.event.turn_id.as_ref(),
         ) {
-            self.require_known_turn(&intent.stream_id, branch, turn)?;
+            self.require_known_turn(&intent.session_id, branch, turn)?;
         }
         resolver.authorize(&intent)?;
         let event = intent.event;
@@ -301,7 +301,7 @@ impl SessionCoordinator {
             .clone()
             .ok_or_else(|| SessionError::InvalidAdmission("missing invocation_id".to_owned()))?;
         let request = AppendRequest {
-            stream_id: intent.stream_id.clone(),
+            session_id: intent.session_id.clone(),
             expected_head: intent.expected_head,
             idempotency_key: intent.idempotency_key,
             events: vec![event],
@@ -312,11 +312,11 @@ impl SessionCoordinator {
         let turn_id = request.events[0].turn_id.clone();
         let started_event_id = request.events[0].event_id.clone();
         self.store.append_batch(request)?;
-        let _ = self.wakeups.send(intent.stream_id.clone());
+        let _ = self.wakeups.send(intent.session_id.clone());
         Ok(EffectObservationHandle {
             started_event_id,
             coordinator: Arc::clone(self),
-            stream_id: intent.stream_id,
+            session_id: intent.session_id,
             invocation_id,
             branch_id,
             turn_id,
@@ -325,12 +325,12 @@ impl SessionCoordinator {
 
     fn append_observation(
         &self,
-        stream_id: &SessionStreamId,
+        session_id: &SessionId,
         invocation_id: &InvocationId,
         event: SessionEvent,
         payloads: Vec<PayloadRecord>,
     ) -> Result<AppendReceipt, SessionError> {
-        if event.stream_id != *stream_id || event.invocation_id.as_ref() != Some(invocation_id) {
+        if event.session_id != *session_id || event.invocation_id.as_ref() != Some(invocation_id) {
             return Err(SessionError::InvocationMismatch);
         }
         if !matches!(
@@ -351,19 +351,19 @@ impl SessionCoordinator {
                 "event kind is not an observation or outcome".to_owned(),
             ));
         }
-        let lock = self.lock_for(stream_id);
+        let lock = self.lock_for(session_id);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let head = self.store.head(stream_id)?;
+        let head = self.store.head(session_id)?;
         let key = format!("observation:{}", event.event_id);
         let receipt = self.store.append_batch(AppendRequest {
-            stream_id: stream_id.clone(),
+            session_id: session_id.clone(),
             expected_head: head,
             idempotency_key: key,
             events: vec![event],
             payloads,
             erasure_reference_commitment: None,
         })?;
-        let _ = self.wakeups.send(stream_id.clone());
+        let _ = self.wakeups.send(session_id.clone());
         Ok(receipt)
     }
 }
@@ -374,7 +374,7 @@ impl SessionCoordinator {
 pub struct EffectObservationHandle {
     started_event_id: EventId,
     coordinator: Arc<SessionCoordinator>,
-    stream_id: SessionStreamId,
+    session_id: SessionId,
     invocation_id: InvocationId,
     branch_id: Option<BranchId>,
     turn_id: Option<TurnId>,
@@ -397,7 +397,7 @@ impl EffectObservationHandle {
         payloads: Vec<PayloadRecord>,
     ) -> Result<AppendReceipt, SessionError> {
         let mut event = SessionEvent::new(
-            self.stream_id.clone(),
+            self.session_id.clone(),
             kind,
             fields,
             EventActor::System {
@@ -409,7 +409,7 @@ impl EffectObservationHandle {
         event.branch_id = self.branch_id.clone();
         event.turn_id = self.turn_id.clone();
         let receipt = self.coordinator.append_observation(
-            &self.stream_id,
+            &self.session_id,
             &self.invocation_id,
             event,
             payloads,
@@ -438,12 +438,11 @@ mod tests {
         let dir = TempDir::new().expect("temp");
         let store = Arc::new(SqliteEventStore::open(dir.path()).expect("store"));
         let coordinator = Arc::new(SessionCoordinator::new(store));
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let branch = BranchId::new();
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "test".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -453,7 +452,7 @@ mod tests {
         root.branch_id = Some(branch.clone());
         let receipt = coordinator
             .append(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: EventCursor::beginning(stream.clone()),
                 idempotency_key: "root".into(),
                 events: vec![root],
@@ -483,7 +482,7 @@ mod tests {
         let handle = coordinator
             .admit_effect(
                 EffectIntent {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: receipt.last,
                     idempotency_key: "start".into(),
                     event,

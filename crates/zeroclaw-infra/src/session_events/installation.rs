@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use zeroclaw_api::session_events::{EventActor, EventData, StoredPayloadRef};
+use zeroclaw_api::session_events::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,32 +210,10 @@ pub(crate) fn legacy_guard(directory: &Path) -> std::io::Result<InstallationGuar
     Ok(guard)
 }
 
-/// Immutable session identity. The key is the only value needed to resolve a
-/// stream; creation provenance is stored by the separate metadata event below.
-pub fn session_key(
-    stream: SessionStreamId,
-    key: &str,
-) -> Result<(SessionEvent, PayloadRecord), AppendError> {
-    if key.is_empty() || key.len() > 512 {
-        return Err(AppendError::InvalidReference("invalid session key".into()));
-    }
-    let value = PayloadRecord::json("session.authority/v1", &key)?;
-    let event = SessionEvent::typed(
-        stream,
-        EventData::SessionMetadataChanged {
-            field: "session_key".into(),
-            new_value_ref: StoredPayloadRef::from(&value),
-        },
-        EventActor::System {
-            component: "session_key".into(),
-        },
-    )?;
-    Ok((event, value))
-}
-
-/// Immutable protocol provenance captured when a session is first created.
+/// Enumerate native sessions from their canonical root event. Legacy session keys
+/// are resolved only by the migration readers before they become SessionStarted IDs.
 pub fn creation_source(
-    stream: SessionStreamId,
+    session_id: SessionId,
     source: &str,
 ) -> Result<(SessionEvent, PayloadRecord), AppendError> {
     if source.is_empty() || source.len() > 128 {
@@ -245,7 +223,7 @@ pub fn creation_source(
     }
     let value = PayloadRecord::json("session.authority/v1", &source)?;
     let event = SessionEvent::typed(
-        stream,
+        session_id,
         EventData::SessionMetadataChanged {
             field: "creation_source".into(),
             new_value_ref: StoredPayloadRef::from(&value),
@@ -257,21 +235,23 @@ pub fn creation_source(
     Ok((event, value))
 }
 
-pub fn session_keys(
+pub fn session_ids(
     data_dir: &Path,
     backend: NativeBackend,
-) -> Result<BTreeMap<String, SessionStreamId>, AppendError> {
-    let (store, streams): (Arc<dyn SessionEventStore>, Vec<SessionStreamId>) = match backend {
+) -> Result<BTreeMap<String, SessionId>, AppendError> {
+    let (store, streams): (Arc<dyn SessionEventStore>, Vec<SessionId>) = match backend {
         NativeBackend::Sqlite => {
             let store = SqliteEventStore::open(data_dir)?;
             let streams = {
                 let conn = store.conn.lock();
-                let mut stmt = conn.prepare("SELECT stream_id FROM session_events WHERE sequence=1 AND json_extract(event_json,'$.kind')='session_started'").map_err(map_sqlite)?;
+                let mut stmt = conn
+                    .prepare("SELECT session_id FROM session_events WHERE sequence=1 AND json_extract(event_json,'$.kind')='session_started'")
+                    .map_err(map_sqlite)?;
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(0))
                     .map_err(map_sqlite)?;
                 rows.map(|row| {
-                    SessionStreamId::parse(row.map_err(map_sqlite)?).map_err(AppendError::from)
+                    SessionId::parse(row.map_err(map_sqlite)?).map_err(AppendError::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?
             };
@@ -279,61 +259,15 @@ pub fn session_keys(
         }
         NativeBackend::Jsonl => {
             let store = JsonlEventStore::open(data_dir)?;
-            let streams = store.root_streams()?;
+            let streams = store.root_sessions()?;
             (Arc::new(store), streams)
         }
     };
     let mut result = BTreeMap::new();
-    for stream in streams {
-        let mut after = EventCursor::beginning(stream.clone());
-        let mut through = None;
-        loop {
-            let page = store
-                .read_page(&stream, &after, through.as_ref(), 256)
-                .map_err(|error| AppendError::Corrupt(error.to_string()))?;
-            through = Some(page.through.clone());
-            let mut found = false;
-            for event in &page.events {
-                if let EventData::SessionMetadataChanged {
-                    field,
-                    new_value_ref,
-                } = &event.body.data
-                    && field == "session_key"
-                {
-                    let PayloadRead::Present(value) = store
-                        .read_payload(&new_value_ref.payload_id)
-                        .map_err(|error| AppendError::Corrupt(error.to_string()))?
-                    else {
-                        return Err(AppendError::Corrupt("session identity unavailable".into()));
-                    };
-                    if StoredPayloadRef::from(&value) != *new_value_ref
-                        || value.codec != "session.authority/v1"
-                    {
-                        return Err(AppendError::Corrupt(
-                            "session identity reference mismatch".into(),
-                        ));
-                    }
-                    let family: String = serde_json::from_slice(&value.body)
-                        .map_err(|error| AppendError::Corrupt(error.to_string()))?;
-                    if family.is_empty() || family.len() > 512 {
-                        return Err(AppendError::Corrupt("invalid session key".into()));
-                    }
-                    if result.insert(family, stream.clone()).is_some() {
-                        return Err(AppendError::Corrupt("duplicate session identity".into()));
-                    }
-                    found = true;
-                }
-            }
-            if found || !page.has_more {
-                break;
-            }
-            after.sequence = page
-                .events
-                .last()
-                .ok_or_else(|| AppendError::Corrupt("empty session inventory page".into()))?
-                .sequence;
-        }
+    for session_id in streams {
+        result.insert(session_id.as_str().to_owned(), session_id);
     }
+    let _ = store;
     Ok(result)
 }
 
@@ -342,20 +276,20 @@ pub fn session_keys(
 pub(crate) fn streams(
     data_dir: &Path,
     backend: NativeBackend,
-) -> Result<Vec<SessionStreamId>, AppendError> {
+) -> Result<Vec<SessionId>, AppendError> {
     match backend {
         NativeBackend::Sqlite => {
             let store = SqliteEventStore::open(data_dir)?;
             let conn = store.conn.lock();
             let mut statement = conn
-                .prepare("SELECT stream_id FROM session_events WHERE sequence=1 ORDER BY stream_id")
+                .prepare(
+                    "SELECT session_id FROM session_events WHERE sequence=1 ORDER BY session_id",
+                )
                 .map_err(map_sqlite)?;
             statement
                 .query_map([], |row| row.get::<_, String>(0))
                 .map_err(map_sqlite)?
-                .map(|row| {
-                    SessionStreamId::parse(row.map_err(map_sqlite)?).map_err(AppendError::from)
-                })
+                .map(|row| SessionId::parse(row.map_err(map_sqlite)?).map_err(AppendError::from))
                 .collect()
         }
         NativeBackend::Jsonl => JsonlEventStore::open(data_dir)?.session_streams(),

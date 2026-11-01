@@ -5,9 +5,6 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Session {
-    /// Protocol identity from the root event. The stream id remains the
-    /// storage coordinate; this is the user-facing session id.
-    pub session_id: Option<SessionId>,
     /// Derived streams have no local owner until an attribution event exists.
     /// Their execution authority is resolved from the committed parent request.
     pub owning_agent: Option<String>,
@@ -26,11 +23,7 @@ pub struct Session {
 /// session discovery and carries no execution authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionIndexRecord {
-    pub stream_id: SessionStreamId,
-    pub session_id: Option<SessionId>,
-    /// Adapter session identity. This is independent of creation provenance.
-    pub session_key: Option<String>,
-    /// Protocol that originally created the session; never a routing key.
+    pub session_id: SessionId,
     pub creation_source: Option<String>,
     pub title: Option<String>,
     pub created_at: i64,
@@ -45,7 +38,7 @@ pub struct SessionIndexRecord {
     pub model: Option<String>,
     pub category: Option<String>,
     pub project: Option<String>,
-    pub parent_stream_id: Option<SessionStreamId>,
+    pub parent_session_id: Option<SessionId>,
     pub parent_thread_id: Option<SessionId>,
     pub parent_agent: Option<String>,
     pub owning_agent: Option<String>,
@@ -58,8 +51,8 @@ pub struct SessionIndexRecord {
 }
 
 impl Session {
-    pub fn stream(&self) -> &SessionStreamId {
-        &self.head.stream_id
+    pub fn stream(&self) -> &SessionId {
+        &self.head.session_id
     }
     pub fn title(&self) -> Option<&str> {
         self.fields.get("title").and_then(Value::as_str)
@@ -70,10 +63,6 @@ impl Session {
     pub fn creation_source(&self) -> Option<&str> {
         self.fields.get("creation_source").and_then(Value::as_str)
     }
-    pub fn session_key(&self) -> Option<&str> {
-        self.fields.get("session_key").and_then(Value::as_str)
-    }
-
     pub fn field<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,
@@ -103,7 +92,7 @@ impl std::ops::Deref for SessionDetail {
 /// Storage-independent reduction of a contiguous event prefix. Only the last
 /// effective value of each metadata field is resolved, avoiding repeated plan/body reads.
 pub struct SessionReducer {
-    stream: SessionStreamId,
+    stream: SessionId,
     record: Option<SessionDetail>,
     metadata: BTreeMap<String, (u64, StoredPayloadRef, bool)>,
     importing: bool,
@@ -116,7 +105,7 @@ pub struct SessionReducer {
 }
 
 impl SessionReducer {
-    pub fn new(stream: SessionStreamId, include_context: bool) -> Self {
+    pub fn new(stream: SessionId, include_context: bool) -> Self {
         Self {
             history: projection::HistoryProjection::empty(stream.clone()),
             imported_messages: 0,
@@ -138,7 +127,7 @@ impl SessionReducer {
         event: &SessionEvent,
         seed_count: Option<usize>,
     ) -> Result<(), ReadError> {
-        if event.stream_id != self.stream || self.sequence.checked_add(1) != Some(event.sequence) {
+        if event.session_id != self.stream || self.sequence.checked_add(1) != Some(event.sequence) {
             return Err(ReadError::Gap(
                 "session projection received noncontiguous events".into(),
             ));
@@ -166,10 +155,6 @@ impl SessionReducer {
             }
             self.record = Some(SessionDetail {
                 session: Session {
-                    session_id: match &event.body.data {
-                        EventData::SessionStarted { session_id, .. } => Some(session_id.clone()),
-                        _ => None,
-                    },
                     owning_agent: owning_agent.map(str::to_owned),
                     fields,
                     closed: false,
@@ -190,7 +175,7 @@ impl SessionReducer {
         let state = &mut detail.session;
         if !self.importing
             && !matches!(&event.actor, EventActor::System {component} if component == "session_upgrade")
-            && !matches!(&event.body.data, EventData::SessionMetadataChanged {field, ..} if matches!(field.as_str(), "session_key" | "creation_source"))
+            && !matches!(&event.body.data, EventData::SessionMetadataChanged {field, ..} if field == "creation_source")
         {
             state.last_activity = event.committed_at;
             self.last_activity_sequence = event.sequence;
@@ -314,14 +299,6 @@ impl SessionReducer {
             .ok_or_else(|| ReadError::Corrupt("session root missing".into()))?
             .session;
         match field {
-            "session_key" => {
-                let key = value
-                    .as_str()
-                    .ok_or_else(|| ReadError::Corrupt("session key missing".into()))?;
-                state
-                    .fields
-                    .insert("session_key".into(), Value::String(key.into()));
-            }
             "creation_source" => {
                 let source = value
                     .as_str()
@@ -382,7 +359,7 @@ impl SessionReducer {
 mod tests {
     use super::*;
 
-    fn event(stream: &SessionStreamId, sequence: u64, data: EventData) -> SessionEvent {
+    fn event(stream: &SessionId, sequence: u64, data: EventData) -> SessionEvent {
         let mut event =
             SessionEvent::typed(stream.clone(), data, EventActor::default()).expect("event");
         event.sequence = sequence;
@@ -390,12 +367,11 @@ mod tests {
         event
     }
 
-    fn root(stream: &SessionStreamId, legacy: bool) -> SessionEvent {
+    fn root(stream: &SessionId, legacy: bool) -> SessionEvent {
         event(
             stream,
             1,
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "agent".into(),
                 capture_mode: if legacy {
                     CaptureMode::LegacyMessageOnly
@@ -407,7 +383,7 @@ mod tests {
     }
 
     fn metadata(
-        stream: &SessionStreamId,
+        stream: &SessionId,
         sequence: u64,
         field: &str,
         value: Value,
@@ -442,7 +418,7 @@ mod tests {
     #[test]
     fn ingress_attribution_preserves_order_and_ignores_late_legacy_metadata() {
         for explicit_override in [false, true] {
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             let mut reducer = SessionReducer::new(stream.clone(), false);
             reducer.apply(&root(&stream, false), None).expect("root");
             let (old, old_value) = metadata(&stream, 2, "channel_id", serde_json::json!("old"));
@@ -500,7 +476,7 @@ mod tests {
 
     #[test]
     fn summary_and_detail_share_metadata_and_resolve_only_latest_fields() {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let mut summary = SessionReducer::new(stream.clone(), false);
         let mut detail = SessionReducer::new(stream.clone(), true);
         let payload =
@@ -540,7 +516,7 @@ mod tests {
 
     #[test]
     fn imported_metadata_fills_missing_fields_without_replacing_native_values() {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let mut reducer = SessionReducer::new(stream.clone(), false);
         reducer.apply(&root(&stream, false), None).expect("root");
         let mut values = BTreeMap::new();
@@ -574,7 +550,7 @@ mod tests {
 
     #[test]
     fn summary_matches_paged_history_for_content_and_supersession() {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let payload =
             PayloadRecord::json("session.content/v1", &serde_json::json!({})).expect("content");
         let content = event(
@@ -604,10 +580,10 @@ mod tests {
             let after = history.source_cursor.clone();
             history
                 .apply_page(&EventPage {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     after,
                     through: EventCursor {
-                        stream_id: stream.clone(),
+                        session_id: stream.clone(),
                         sequence: item.sequence,
                     },
                     events: vec![item.clone()],
@@ -630,7 +606,7 @@ mod tests {
 
     #[test]
     fn derived_session_does_not_invent_an_owner() {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let mut reducer = SessionReducer::new(stream.clone(), false);
         reducer
             .apply(
@@ -651,7 +627,7 @@ mod tests {
 
     #[test]
     fn imported_timestamps_do_not_override_later_native_activity() {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let mut reducer = SessionReducer::new(stream.clone(), true);
         reducer.apply(&root(&stream, true), None).expect("root");
         let (created, _) = metadata(&stream, 2, "created_at", serde_json::json!(7));
@@ -706,7 +682,7 @@ mod tests {
     #[test]
     fn ttl_observations_keep_family_open_and_do_not_undo_explicit_closure() {
         for explicit in [false, true] {
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             let mut reducer = SessionReducer::new(stream.clone(), false);
             reducer.apply(&root(&stream, false), None).expect("root");
             reducer
@@ -744,7 +720,7 @@ mod tests {
 
     #[test]
     fn missing_root_and_noncontiguous_prefix_are_errors() {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let mut reducer = SessionReducer::new(stream.clone(), false);
         assert!(matches!(
             reducer.apply(

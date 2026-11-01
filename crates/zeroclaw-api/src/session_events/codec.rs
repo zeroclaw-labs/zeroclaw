@@ -30,7 +30,7 @@ pub struct ProviderBlockRef {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRange {
-    pub stream_id: SessionStreamId,
+    pub session_id: SessionId,
     pub from_seq: u64,
     pub to_seq: u64,
     pub disposition: RangeDisposition,
@@ -46,7 +46,7 @@ pub enum RangeDisposition {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetRef {
-    Session { stream_id: SessionStreamId },
+    Session { session_id: SessionId },
     Branch { branch_id: BranchId },
     Turn { turn_id: TurnId },
     Invocation { invocation_id: InvocationId },
@@ -114,7 +114,8 @@ pub enum ChildExecutionMode {
 }
 
 // Named enum fields are public as part of the variant; no independent kind can
-// be paired with another body's fields.
+// be paired with another body's fields. The envelope's `session_id` is the
+// sole session identity; the root body deliberately carries no duplicate.
 macro_rules! event_data {
     ($($name:ident { $($field:ident : $type:ty),* $(,)? }),* $(,)?) => {
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -126,7 +127,7 @@ macro_rules! event_data {
     }
 }
 event_data! {
-    SessionStarted { session_id: SessionId, owning_agent: String, capture_mode: CaptureMode },
+    SessionStarted { owning_agent: String, capture_mode: CaptureMode },
     SessionMetadataChanged { field: String, new_value_ref: StoredPayloadRef },
     BranchCreated { parent_branch_id: BranchId, parent_cursor: EventCursor },
     TurnAccepted { input_ref: StoredPayloadRef, ingress_ref: StoredPayloadRef, reply_route_ref: Option<StoredPayloadRef> },

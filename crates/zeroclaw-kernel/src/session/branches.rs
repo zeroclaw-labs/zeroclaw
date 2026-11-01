@@ -7,7 +7,7 @@ use zeroclaw_api::session_events::*;
 impl SessionCoordinator {
     pub(super) fn stream_history(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<Vec<SessionEvent>, SessionError> {
         let head = self.store.head(stream)?;
         let mut after = EventCursor::beginning(stream.clone());
@@ -25,7 +25,7 @@ impl SessionCoordinator {
     }
     pub(super) fn branch_context(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &BranchId,
     ) -> Result<Option<SessionEvent>, SessionError> {
         // The common path remains indexed; ancestors need a frozen lookup.
@@ -80,7 +80,7 @@ impl EngineSession {
                 projection.branch_id = Some(child); projection.causation_id = Some(events[0].event_id.clone());
                 events.push(projection); payloads.push(context);
             }
-            owner.store.append_batch(AppendRequest { stream_id: stream.clone(), expected_head: owner.store.head(&stream)?, idempotency_key: key, events, payloads, erasure_reference_commitment: None })?;
+            owner.store.append_batch(AppendRequest { session_id: stream.clone(), expected_head: owner.store.head(&stream)?, idempotency_key: key, events, payloads, erasure_reference_commitment: None })?;
             let _ = owner.wakeups.send(stream); Ok(())
         }).await?;
         let mut fork = self.clone();
@@ -211,12 +211,12 @@ impl EngineSession {
                     let mut started = SessionEvent::typed(stream.clone(), EventData::ContextTransformStarted {input_projection_event_id:input.event_id,transform_spec_ref:StoredPayloadRef::from(&spec),execution_binding_ref:StoredPayloadRef::from(&binding)},events[0].actor.clone()).map_err(AppendError::from)?;
                     started.branch_id=Some(branch.clone());started.causation_id=Some(events[0].event_id.clone());
                     let context = PayloadRecord::json("session.context/v1", &serde_json::json!({"message_refs":refs,"history_has_trim_breadcrumb":true})).map_err(AppendError::from)?;
-                    let mut projection = SessionEvent::typed(stream.clone(),EventData::ContextProjectionCreated {source_ranges:vec![SourceRange {stream_id:stream.clone(),from_seq:target_event.sequence,to_seq:target_event.sequence,disposition:RangeDisposition::Superseded}],summary_ref,budget:0,reason_key:"content_superseded".into(),algorithm_version:"branch-edit/v1".into(),result_ref:StoredPayloadRef::from(&context),summary_source_refs,transform_started_event_id:Some(started.event_id.clone())},events[0].actor.clone()).map_err(AppendError::from)?;
+                    let mut projection = SessionEvent::typed(stream.clone(),EventData::ContextProjectionCreated {source_ranges:vec![SourceRange {session_id:stream.clone(),from_seq:target_event.sequence,to_seq:target_event.sequence,disposition:RangeDisposition::Superseded}],summary_ref,budget:0,reason_key:"content_superseded".into(),algorithm_version:"branch-edit/v1".into(),result_ref:StoredPayloadRef::from(&context),summary_source_refs,transform_started_event_id:Some(started.event_id.clone())},events[0].actor.clone()).map_err(AppendError::from)?;
                     projection.branch_id=Some(branch.clone());projection.causation_id=Some(started.event_id.clone());
                     events.extend([started,projection]);payloads.extend([binding,spec,context]);
                 }
                 owner.store.append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: owner.store.head(&stream)?,
                     idempotency_key: key,
                     events,

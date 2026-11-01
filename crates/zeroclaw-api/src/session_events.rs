@@ -85,7 +85,6 @@ macro_rules! opaque_id {
 }
 
 opaque_id!(SessionId);
-opaque_id!(SessionStreamId);
 opaque_id!(BranchId);
 opaque_id!(TurnId);
 opaque_id!(InvocationId);
@@ -99,15 +98,15 @@ pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// A stream-local durable cursor. Sequence zero denotes the empty prefix.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventCursor {
-    pub stream_id: SessionStreamId,
+    pub session_id: SessionId,
     pub sequence: u64,
 }
 
 impl EventCursor {
     #[must_use]
-    pub fn beginning(stream_id: SessionStreamId) -> Self {
+    pub fn beginning(session_id: SessionId) -> Self {
         Self {
-            stream_id,
+            session_id,
             sequence: 0,
         }
     }
@@ -392,7 +391,7 @@ impl EventBody {
 pub struct SessionEvent {
     pub schema_version: u32,
     pub event_id: EventId,
-    pub stream_id: SessionStreamId,
+    pub session_id: SessionId,
     pub sequence: u64,
     pub branch_id: Option<BranchId>,
     pub turn_id: Option<TurnId>,
@@ -417,7 +416,7 @@ impl Serialize for SessionEvent {
         struct Wire<'a> {
             schema_version: u32,
             event_id: &'a EventId,
-            stream_id: &'a SessionStreamId,
+            session_id: &'a SessionId,
             sequence: u64,
             branch_id: &'a Option<BranchId>,
             turn_id: &'a Option<TurnId>,
@@ -432,7 +431,7 @@ impl Serialize for SessionEvent {
         Wire {
             schema_version: self.schema_version,
             event_id: &self.event_id,
-            stream_id: &self.stream_id,
+            session_id: &self.session_id,
             sequence: self.sequence,
             branch_id: &self.branch_id,
             turn_id: &self.turn_id,
@@ -453,7 +452,7 @@ impl<'de> Deserialize<'de> for SessionEvent {
         struct Wire {
             schema_version: u32,
             event_id: EventId,
-            stream_id: SessionStreamId,
+            session_id: SessionId,
             sequence: u64,
             branch_id: Option<BranchId>,
             turn_id: Option<TurnId>,
@@ -479,7 +478,7 @@ impl<'de> Deserialize<'de> for SessionEvent {
         Ok(Self {
             schema_version: wire.schema_version,
             event_id: wire.event_id,
-            stream_id: wire.stream_id,
+            session_id: wire.session_id,
             sequence: wire.sequence,
             branch_id: wire.branch_id,
             turn_id: wire.turn_id,
@@ -516,14 +515,14 @@ impl SessionEvent {
         Ok(())
     }
     pub fn typed(
-        stream_id: SessionStreamId,
+        session_id: SessionId,
         data: EventData,
         actor: EventActor,
     ) -> Result<Self, ContractError> {
         let event = Self {
             schema_version: 1,
             event_id: EventId::new(),
-            stream_id,
+            session_id,
             sequence: 0,
             branch_id: None,
             turn_id: None,
@@ -542,7 +541,7 @@ impl SessionEvent {
     }
 
     pub fn new(
-        stream_id: SessionStreamId,
+        session_id: SessionId,
         kind: EventKind,
         fields: Value,
         actor: EventActor,
@@ -550,7 +549,7 @@ impl SessionEvent {
         let event = Self {
             schema_version: 1,
             event_id: EventId::new(),
-            stream_id,
+            session_id,
             sequence: 0,
             branch_id: None,
             turn_id: None,
@@ -582,7 +581,7 @@ impl SessionEvent {
             ));
         }
         validate_id(self.event_id.as_str())?;
-        validate_id(self.stream_id.as_str())?;
+        validate_id(self.session_id.as_str())?;
         for id in [
             self.branch_id.as_ref().map(BranchId::as_str),
             self.turn_id.as_ref().map(TurnId::as_str),
@@ -619,9 +618,9 @@ impl SessionEvent {
                 "invalid actor attribution".into(),
             ));
         }
-        if self.event_id.as_str().is_empty() || self.stream_id.as_str().is_empty() {
+        if self.event_id.as_str().is_empty() || self.session_id.as_str().is_empty() {
             return Err(ContractError::InvalidEnvelope(
-                "event_id and stream_id are required".to_owned(),
+                "event_id and session_id are required".to_owned(),
             ));
         }
         if self.body.kind().requires_invocation() && self.invocation_id.is_none() {
@@ -674,7 +673,7 @@ impl PayloadRecord {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppendRequest {
-    pub stream_id: SessionStreamId,
+    pub session_id: SessionId,
     pub expected_head: EventCursor,
     pub idempotency_key: String,
     pub events: Vec<SessionEvent>,
@@ -716,7 +715,7 @@ impl AppendRequest {
                 "idempotency_key is empty".to_owned(),
             ));
         }
-        if self.expected_head.stream_id != self.stream_id {
+        if self.expected_head.session_id != self.session_id {
             return Err(ContractError::InvalidRequest(
                 "expected_head belongs to another stream".to_owned(),
             ));
@@ -729,7 +728,7 @@ impl AppendRequest {
         let mut event_ids = std::collections::HashSet::new();
         for event in events {
             event.validate_for_append()?;
-            if event.stream_id != self.stream_id {
+            if event.session_id != self.session_id {
                 return Err(ContractError::InvalidEnvelope(
                     "event belongs to another stream".to_owned(),
                 ));
@@ -757,7 +756,7 @@ impl AppendRequest {
         // payload or reference. Hash binary bodies as bytes, not JSON arrays.
         #[derive(Serialize)]
         struct Commitment<'a> {
-            stream_id: &'a SessionStreamId,
+            session_id: &'a SessionId,
             idempotency_key: &'a str,
             events: Vec<SessionEvent>,
             payloads: Vec<StoredPayloadRef>,
@@ -770,7 +769,7 @@ impl AppendRequest {
         self.validate_events(&events)?;
         let mut hash = Sha256::new();
         hash.update(canonical_json(&Commitment {
-            stream_id: &self.stream_id,
+            session_id: &self.session_id,
             idempotency_key: &self.idempotency_key,
             events,
             payloads: self.payloads.iter().map(StoredPayloadRef::from).collect(),
@@ -794,7 +793,7 @@ pub struct AppendReceipt {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EventPage {
-    pub stream_id: SessionStreamId,
+    pub session_id: SessionId,
     pub after: EventCursor,
     pub through: EventCursor,
     pub events: Vec<SessionEvent>,
@@ -888,7 +887,7 @@ pub trait SessionEventStore: Send + Sync {
     /// context/status owner. Backends may index these canonical coordinates.
     fn read_latest_event(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &BranchId,
         turn: Option<&TurnId>,
         kind: &EventKind,
@@ -896,7 +895,7 @@ pub trait SessionEventStore: Send + Sync {
         let mut through = self.head(stream)?;
         while through.sequence > 0 {
             let after = EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence: through.sequence.saturating_sub(256),
             };
             let page = self.read_page(stream, &after, Some(&through), 256)?;
@@ -913,15 +912,15 @@ pub trait SessionEventStore: Send + Sync {
     }
     fn read_page(
         &self,
-        stream_id: &SessionStreamId,
+        session_id: &SessionId,
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
     ) -> Result<EventPage, ReadError>;
-    fn head(&self, stream_id: &SessionStreamId) -> Result<EventCursor, ReadError>;
+    fn head(&self, session_id: &SessionId) -> Result<EventCursor, ReadError>;
     fn lookup_receipt(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError>;
     fn read_payload(&self, payload_id: &PayloadId) -> Result<PayloadRead, ReadError>;
@@ -929,7 +928,7 @@ pub trait SessionEventStore: Send + Sync {
     fn erasure_scope(
         &self,
         targets: &[StoredPayloadRef],
-    ) -> Result<(Vec<SessionStreamId>, Digest), AppendError>;
+    ) -> Result<(Vec<SessionId>, Digest), AppendError>;
 }
 
 fn validate_id(value: &str) -> Result<(), ContractError> {
@@ -997,9 +996,8 @@ mod tests {
     #[test]
     fn event_kind_is_in_the_outer_envelope() {
         let event = SessionEvent::typed(
-            SessionStreamId::new(),
+            SessionId::new(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -1060,7 +1058,7 @@ mod tests {
 
     #[test]
     fn invocation_events_require_invocation_id() {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let event = SessionEvent::new(
             stream,
             EventKind::ProviderAttemptStarted,
@@ -1073,14 +1071,13 @@ mod tests {
 
     #[test]
     fn request_commitment_binds_payload_metadata() {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let payload =
             PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), vec![1; 1024])
                 .expect("payload");
         let event = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -1088,7 +1085,7 @@ mod tests {
         )
         .expect("root");
         let request = AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: EventCursor::beginning(stream),
             idempotency_key: "fixture".into(),
             events: vec![event],
@@ -1128,7 +1125,7 @@ mod tests {
 
     #[test]
     fn request_commitment_excludes_backend_fields() {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let mut event = SessionEvent::new(
             stream.clone(),
             EventKind::SessionStarted,
@@ -1137,7 +1134,7 @@ mod tests {
         )
         .expect("event");
         let request = AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: EventCursor::beginning(stream),
             idempotency_key: "input-1".to_owned(),
             events: vec![event.clone()],

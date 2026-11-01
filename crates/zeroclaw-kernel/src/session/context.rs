@@ -14,7 +14,7 @@ use zeroclaw_api::session_events::*;
 
 struct Transform {
     owner: Arc<SessionCoordinator>,
-    stream: SessionStreamId,
+    stream: SessionId,
     branch: BranchId,
     turn: Option<TurnId>,
     input: EventId,
@@ -24,7 +24,7 @@ struct Transform {
 }
 
 pub struct ContextMaintenanceCommand {
-    pub stream: SessionStreamId,
+    pub stream: SessionId,
     pub branch: BranchId,
     pub input_projection: EventId,
     pub execution_binding: PayloadRecord,
@@ -32,7 +32,7 @@ pub struct ContextMaintenanceCommand {
 }
 
 pub(super) struct ContextTransformCommand {
-    pub stream: SessionStreamId,
+    pub stream: SessionId,
     pub branch: BranchId,
     pub turn: Option<TurnId>,
     /// None selects the current projection inside the admitted turn. A result
@@ -73,13 +73,13 @@ impl SessionCoordinator {
     }
     pub(super) fn latest_context(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &BranchId,
     ) -> Result<SessionEvent, SessionError> {
         let latest = self
             .branch_context(stream, branch)?
             .ok_or_else(|| SessionError::StaleTarget("context projection missing".into()))?;
-        if latest.stream_id != *stream || latest.body.kind() != EventKind::ContextProjectionCreated
+        if latest.session_id != *stream || latest.body.kind() != EventKind::ContextProjectionCreated
         {
             return Err(SessionError::InvalidAdmission(
                 "context scope mismatch".into(),
@@ -132,7 +132,7 @@ impl SessionCoordinator {
             },EventActor::System {component:"context_transform".into()}).map_err(AppendError::from)?;
             started.branch_id=Some(branch.clone());started.turn_id=turn.clone();
             let started_id=started.event_id.clone();
-            owner.store.append_batch(AppendRequest {stream_id:stream.clone(),expected_head:through.clone(),idempotency_key:format!("context-transform:{started_id}"),events:vec![started],payloads,erasure_reference_commitment:None})?;
+            owner.store.append_batch(AppendRequest {session_id:stream.clone(),expected_head:through.clone(),idempotency_key:format!("context-transform:{started_id}"),events:vec![started],payloads,erasure_reference_commitment:None})?;
             let _=owner.wakeups.send(stream.clone());
             Ok(Arc::new(Transform {owner:Arc::clone(&owner),stream,branch,turn,input:input.event_id,started:started_id,intent,resolver}) as Arc<dyn ContextTransformPort>)
         }).await
@@ -285,7 +285,7 @@ impl Transform {
                 events.extend(preceding);
                 events.push(event);
                 owner.store.append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: owner.store.head(&stream)?,
                     idempotency_key: key,
                     events,

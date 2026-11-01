@@ -23,7 +23,7 @@ impl SessionCoordinator {
         key: &str,
         candidate: &SessionEvent,
     ) -> Result<Option<AppendReceipt>, SessionError> {
-        let Some(receipt) = self.store.lookup_receipt(&candidate.stream_id, key)? else {
+        let Some(receipt) = self.store.lookup_receipt(&candidate.session_id, key)? else {
             return Ok(None);
         };
         if receipt.event_ids.len() != 1 {
@@ -35,7 +35,7 @@ impl SessionCoordinator {
             .store
             .read_event(&receipt.event_ids[0])?
             .ok_or_else(|| SessionError::StaleTarget("observation receipt event missing".into()))?;
-        if event.stream_id != candidate.stream_id
+        if event.session_id != candidate.session_id
             || event.branch_id != candidate.branch_id
             || event.turn_id != candidate.turn_id
             || event.invocation_id != candidate.invocation_id

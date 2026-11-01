@@ -7,7 +7,7 @@ mod approval_replacement;
 
 struct Authority(AtomicBool);
 impl PermissionResolver for Authority {
-    fn authorize_context(&self, _: &SessionStreamId, _: &BranchId) -> Result<(), SessionError> {
+    fn authorize_context(&self, _: &SessionId, _: &BranchId) -> Result<(), SessionError> {
         if self.0.load(Ordering::SeqCst) {
             Ok(())
         } else {
@@ -53,19 +53,19 @@ impl SessionEventStore for RejectionFailureStore {
     }
     fn read_page(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
     ) -> Result<EventPage, ReadError> {
         self.inner.read_page(stream, after, through, max_events)
     }
-    fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
+    fn head(&self, stream: &SessionId) -> Result<EventCursor, ReadError> {
         self.inner.head(stream)
     }
     fn lookup_receipt(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError> {
         self.inner.lookup_receipt(stream, key)
@@ -76,7 +76,7 @@ impl SessionEventStore for RejectionFailureStore {
     fn erasure_scope(
         &self,
         targets: &[StoredPayloadRef],
-    ) -> Result<(Vec<SessionStreamId>, Digest), AppendError> {
+    ) -> Result<(Vec<SessionId>, Digest), AppendError> {
         self.inner.erasure_scope(targets)
     }
 }
@@ -85,7 +85,7 @@ struct Harness {
     _dir: tempfile::TempDir,
     store: Arc<dyn SessionEventStore>,
     owner: Arc<SessionCoordinator>,
-    stream: SessionStreamId,
+    stream: SessionId,
     branch: BranchId,
     turn: TurnId,
     context: EventId,
@@ -103,7 +103,7 @@ impl Harness {
             fail_rejection: Arc::clone(&fail_rejection),
             append_time: Arc::clone(&append_time),
         });
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let branch = BranchId::new();
         let turn = TurnId::new();
         let content = PayloadRecord::json(
@@ -120,7 +120,6 @@ impl Harness {
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -162,7 +161,7 @@ impl Harness {
         let context = projection.event_id.clone();
         store
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: EventCursor::beginning(stream.clone()),
                 idempotency_key: "fixture".into(),
                 events: vec![root, accepted, started, projection],
@@ -492,7 +491,7 @@ async fn approval_deadlines_follow_owner_intent_and_preserve_legacy_values() {
 struct ApprovalOwnerChannel {
     unsupported: bool,
     store: Arc<dyn SessionEventStore>,
-    stream: SessionStreamId,
+    stream: SessionId,
     append_time: Arc<AtomicI64>,
     response_time: Timestamp,
     source: zeroclaw_api::channel::ApprovalSource,
@@ -748,7 +747,7 @@ async fn rejected_replies_keep_bound_approval_identity_without_resolving_it() {
         assert_eq!(rejections.len(), 2);
         assert_ne!(rejections[0].event_id, rejections[1].event_id);
         for event in rejections {
-            assert_eq!(event.stream_id, request.stream_id);
+            assert_eq!(event.session_id, request.session_id);
             assert_eq!(event.branch_id, request.branch_id);
             assert_eq!(event.turn_id, request.turn_id);
             assert_eq!(event.invocation_id, request.invocation_id);
@@ -1075,7 +1074,7 @@ async fn approval_resolution_preserves_the_exact_authenticated_reply_decision() 
                 let error = h
                     .store
                     .append_batch(AppendRequest {
-                        stream_id: h.stream.clone(),
+                        session_id: h.stream.clone(),
                         expected_head: head.clone(),
                         idempotency_key: format!("mismatched-resolution:{attempted_decision:?}"),
                         events: vec![event],
@@ -1466,7 +1465,7 @@ struct OwnershipLost;
 impl super::super::recovery::StreamExecutionLossVerifier for OwnershipLost {
     fn verify_stream_loss(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         through: &EventCursor,
     ) -> Result<PayloadRecord, SessionError> {
         PayloadRecord::json(

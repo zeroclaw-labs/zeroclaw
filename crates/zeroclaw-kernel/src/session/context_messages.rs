@@ -19,7 +19,7 @@ pub(super) fn context_refs(
 
 pub(super) fn resolve_message(
     store: &dyn SessionEventStore,
-    stream: &SessionStreamId,
+    stream: &SessionId,
     item: &MessageRef,
 ) -> Result<Option<ConversationMessage>, SessionError> {
     zeroclaw_api::session_events::context_read::resolve_message(store, stream, item)
@@ -47,7 +47,7 @@ impl SessionCoordinator {
     /// Context projections and final settlement only reference that creation.
     pub(super) fn record_context_assistants(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &BranchId,
         turn: &TurnId,
         creation: &EventId,
@@ -183,7 +183,7 @@ impl SessionCoordinator {
         extra: &[SessionEvent],
         extra_payloads: &[PayloadRecord],
     ) -> Result<ContextPlan, SessionError> {
-        let stream = &input.stream_id;
+        let stream = &input.session_id;
         let mut candidates = Vec::new();
         for item in context_refs(self.store.as_ref(), input)? {
             let Some(message) = resolve_message(self.store.as_ref(), stream, &item)? else {
@@ -323,7 +323,7 @@ impl SessionCoordinator {
         let ranges = coordinates
             .into_iter()
             .map(|(sequence, included)| SourceRange {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 from_seq: sequence,
                 to_seq: sequence,
                 disposition: if included {

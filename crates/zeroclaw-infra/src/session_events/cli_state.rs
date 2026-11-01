@@ -16,7 +16,7 @@ pub struct CliStateBinding {
     /// Stable session key used to reopen the deterministic event stream.
     /// `family` is accepted only when reading a pre-index binding.
     #[serde(alias = "family")]
-    pub session_key: String,
+    pub session_id: String,
 }
 
 /// Lock order: CLI path lease -> installation format -> physical store.
@@ -98,8 +98,8 @@ impl CliStateGuard {
                     .map_err(|error| AppendError::Corrupt(error.to_string()))?;
                 if binding.version != 1
                     || !binding.data_dir.is_absolute()
-                    || binding.session_key.is_empty()
-                    || binding.session_key.len() > 512
+                    || binding.session_id.is_empty()
+                    || binding.session_id.len() > 512
                 {
                     return Err(AppendError::Corrupt(
                         "invalid CLI state family binding".into(),
@@ -140,8 +140,8 @@ impl CliStateGuard {
     pub fn bind(&mut self, binding: CliStateBinding) -> Result<(), AppendError> {
         if binding.version != 1
             || !binding.data_dir.is_absolute()
-            || binding.session_key.is_empty()
-            || binding.session_key.len() > 512
+            || binding.session_id.is_empty()
+            || binding.session_id.len() > 512
         {
             return Err(AppendError::InvalidReference(
                 "invalid CLI state family binding".into(),
@@ -225,7 +225,7 @@ mod tests {
         let binding = CliStateBinding {
             version: 1,
             data_dir: directory.path().into(),
-            session_key: "fixture".into(),
+            session_id: "fixture".into(),
         };
         lease
             .bind(binding.clone())

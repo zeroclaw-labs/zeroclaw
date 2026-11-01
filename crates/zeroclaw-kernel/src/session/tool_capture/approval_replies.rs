@@ -38,7 +38,7 @@ fn verify_reply(
         .read_event(reply_event_id)?
         .ok_or_else(|| anyhow::Error::msg("approval_reply_event_missing"))?;
     anyhow::ensure!(
-        event.stream_id == requested.stream_id
+        event.session_id == requested.session_id
             && event.branch_id == requested.branch_id
             && event.turn_id == requested.turn_id
             && event.invocation_id == requested.invocation_id
@@ -83,7 +83,7 @@ fn verify_reply(
 fn has_prior_reply(scope: &ToolScope, requested: &SessionEvent) -> anyhow::Result<bool> {
     let through = scope.owner.store.head(&scope.stream)?;
     let mut after = EventCursor {
-        stream_id: scope.stream.clone(),
+        session_id: scope.stream.clone(),
         sequence: requested.sequence,
     };
     while after.sequence < through.sequence {

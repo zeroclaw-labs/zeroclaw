@@ -17,7 +17,7 @@ pub(super) fn import_all(
     let source = super::legacy_acp::LegacyAcpStore::open_import(guard).map_err(storage)?;
     for id in source.list_session_ids().map_err(storage)? {
         let family = format!("acp_{id}");
-        let stream = stream_id(&family)?;
+        let stream = session_id(&family)?;
         let key = format!("legacy-acp-complete:{stream}");
         if store
             .lookup_receipt(&stream, &key)
@@ -78,7 +78,7 @@ fn upgrade_actor() -> EventActor {
 // Reuse its canonical messages and preserve only missing legacy observations.
 fn import_existing(
     store: &dyn SessionEventStore,
-    stream: &SessionStreamId,
+    stream: &SessionId,
     imported: AcpImport,
 ) -> Result<(), AppendError> {
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -292,7 +292,7 @@ fn import_existing(
 }
 
 fn legacy_evidence(
-    stream: &SessionStreamId,
+    stream: &SessionId,
     body: &PayloadRecord,
     kind: &str,
 ) -> Result<SessionEvent, AppendError> {
@@ -319,7 +319,7 @@ fn import_one(
         closed,
         metadata,
     } = imported;
-    let stream = stream_id(family)?;
+    let stream = session_id(family)?;
     let branch = BranchId::parse(format!("branch-{stream}"))?;
     let history = data.messages.clone();
     let context = data.retained_context.take().unwrap_or_else(|| {
@@ -358,7 +358,6 @@ fn import_one(
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::parse(format!("session-{stream}"))?,
                 owning_agent: data.agent_alias,
                 capture_mode: zeroclaw_api::session_events::CaptureMode::LegacyMessageOnly,
             },
@@ -460,10 +459,9 @@ fn import_one(
     )?;
     let mut final_context = projection(&stream, &branch, &body, "legacy_acp_context")?;
     final_context.event_id = EventId::parse(format!("legacy-acp-final-{stream}"))?;
-    let (identity, identity_payload) = session_key(stream.clone(), family)?;
     let (source, source_payload) = creation_source(stream.clone(), "acp")?;
     let mut events = Vec::new();
-    let mut payloads = vec![body, identity_payload, source_payload];
+    let mut payloads = vec![body, source_payload];
     if let Some(checkpoint) = checkpoint {
         events.push(SessionEvent::typed(
             stream.clone(),
@@ -486,7 +484,7 @@ fn import_one(
             EventActor::default(),
         )?);
     }
-    events.extend([final_context, identity, source]);
+    events.extend([final_context, source]);
     append(
         store,
         &stream,
@@ -498,7 +496,7 @@ fn import_one(
 
 fn import_metadata(
     store: &dyn SessionEventStore,
-    stream: &SessionStreamId,
+    stream: &SessionId,
     fields: &[(String, serde_json::Value)],
 ) -> Result<(), AppendError> {
     let mut offset = 0;
@@ -542,7 +540,7 @@ fn import_metadata(
 
 struct ImportWriter<'a> {
     store: &'a dyn SessionEventStore,
-    stream: &'a SessionStreamId,
+    stream: &'a SessionId,
     branch: &'a BranchId,
     refs: Vec<MessageRef>,
     trim: bool,
@@ -639,7 +637,7 @@ impl ImportWriter<'_> {
 }
 
 fn projection(
-    stream: &SessionStreamId,
+    stream: &SessionId,
     branch: &BranchId,
     body: &PayloadRecord,
     reason: &str,
@@ -664,13 +662,13 @@ fn projection(
 
 fn append(
     store: &dyn SessionEventStore,
-    stream: &SessionStreamId,
+    stream: &SessionId,
     key: String,
     events: Vec<SessionEvent>,
     payloads: Vec<PayloadRecord>,
 ) -> Result<(), AppendError> {
     store.append_batch(AppendRequest {
-        stream_id: stream.clone(),
+        session_id: stream.clone(),
         expected_head: store.head(stream).map_err(storage)?,
         idempotency_key: key,
         events,

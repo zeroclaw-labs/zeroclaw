@@ -129,7 +129,7 @@ enum ConfigSource {
 pub type SessionHistoryAuthorityFactory = Arc<
     dyn Fn(
             &str,
-            zeroclaw_api::session_events::SessionStreamId,
+            zeroclaw_api::session_events::SessionId,
         )
             -> anyhow::Result<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionAuthority>>
         + Send
@@ -2113,7 +2113,7 @@ impl AcpServer {
                 }
             };
             let admitted = async {
-                let authority = factory(&agent_alias, source.stream_id(&family).await?)?;
+                let authority = factory(&agent_alias, source.session_id(&family).await?)?;
                 source
                     .open(
                         family,
@@ -7627,7 +7627,7 @@ mod tests {
             let result = response(&mut rx, 2).await;
             assert!(result.get("error").is_none(), "{backend}: {result}");
             let family = format!("acp_{sid}");
-            let stream = source.stream_id(&family).await.expect("stream");
+            let stream = source.session_id(&family).await.expect("stream");
             let native = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 directory.path(),
                 &family,

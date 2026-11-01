@@ -2,7 +2,6 @@ use super::*;
 use zeroclaw_infra::session_events::installation::creation_source;
 
 pub(super) struct SessionSeed<'a> {
-    pub session_key: &'a str,
     pub source: &'a str,
     pub alias: &'a str,
     pub actor: EventActor,
@@ -10,11 +9,7 @@ pub(super) struct SessionSeed<'a> {
 }
 
 impl SessionSeed<'_> {
-    pub fn publish(
-        self,
-        store: &dyn SessionEventStore,
-        stream: &SessionStreamId,
-    ) -> anyhow::Result<()> {
+    pub fn publish(self, store: &dyn SessionEventStore, stream: &SessionId) -> anyhow::Result<()> {
         if store.head(stream)?.sequence != 0 {
             return Ok(());
         }
@@ -22,7 +17,6 @@ impl SessionSeed<'_> {
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::parse(format!("session-{stream}"))?,
                 owning_agent: self.alias.into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -70,10 +64,9 @@ impl SessionSeed<'_> {
             self.actor.clone(),
         )?;
         projection.branch_id = Some(branch);
-        let (identity, identity_payload) = session_key(stream.clone(), self.session_key)?;
         let (source, source_payload) = creation_source(stream.clone(), self.source)?;
-        let mut events = vec![root, identity, source];
-        let mut payloads = vec![identity_payload, source_payload];
+        let mut events = vec![root, source];
+        let mut payloads = vec![source_payload];
         if seeded {
             let evidence = PayloadRecord::json(
                 "session.evidence/v1",
@@ -94,7 +87,7 @@ impl SessionSeed<'_> {
         events.push(projection);
         payloads.extend([conversation, context]);
         store.append_batch(AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: EventCursor::beginning(stream.clone()),
             idempotency_key: format!("native-family-create:{stream}"),
             events,

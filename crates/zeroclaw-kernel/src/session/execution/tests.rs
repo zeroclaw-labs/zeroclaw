@@ -7,14 +7,14 @@ impl SessionAccessPolicy for Access {
     fn authorize(
         &self,
         _: &PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: SessionAccess,
     ) -> Result<(), SessionError> {
         Ok(())
     }
 }
 impl PermissionResolver for Access {
-    fn authorize_context(&self, _: &SessionStreamId, _: &BranchId) -> Result<(), SessionError> {
+    fn authorize_context(&self, _: &SessionId, _: &BranchId) -> Result<(), SessionError> {
         Ok(())
     }
     fn authorize(&self, _: &EffectIntent) -> Result<(), SessionError> {
@@ -261,7 +261,7 @@ struct LossProof;
 impl crate::session::recovery::StreamExecutionLossVerifier for LossProof {
     fn verify_stream_loss(
         &self,
-        _: &SessionStreamId,
+        _: &SessionId,
         through: &EventCursor,
     ) -> Result<PayloadRecord, SessionError> {
         Ok(PayloadRecord::json(
@@ -300,12 +300,11 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
     for backend in ["sqlite", "jsonl"] {
         let dir = tempfile::TempDir::new().expect("dir");
         let store = open_event_store(dir.path(), backend).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let branch = BranchId::new();
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -345,7 +344,7 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
         let context_event_id = projection.event_id.clone();
         store
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: EventCursor::beginning(stream.clone()),
                 idempotency_key: "root".into(),
                 events: vec![root, projection],
@@ -355,7 +354,7 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
             .expect("initialize");
         let coordinator = Arc::new(SessionCoordinator::new(store));
         let command = UserTurnCommand {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             branch_id: branch,
             turn_id: TurnId::new(),
             message_id: MessageId::new(),
@@ -726,7 +725,7 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
             .read_page(
                 &stream,
                 &EventCursor {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     sequence: context_receipt.first.sequence - 1,
                 },
                 Some(&context_receipt.last),
@@ -912,7 +911,7 @@ async fn input_retry_returns_original_receipt_without_reexecuting() {
             .read_page(
                 &stream,
                 &EventCursor {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     sequence: receipt.first.sequence - 1,
                 },
                 Some(&receipt.last),

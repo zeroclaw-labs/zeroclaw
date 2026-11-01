@@ -51,10 +51,10 @@ impl SessionCoordinator {
         for (invocation, (started, progress)) in pending {
             let request = history.iter().rev().find(|event| {
                 event.sequence >= boundary.sequence
-                    && event.stream_id == boundary.stream_id
+                    && event.session_id == boundary.session_id
                     && match &event.body.data {
                         EventData::CancellationRequested { target_ref, .. } => match target_ref {
-                            TargetRef::Session { stream_id } => stream_id == &boundary.stream_id,
+                            TargetRef::Session { session_id } => session_id == &boundary.session_id,
                             TargetRef::Branch { branch_id } => {
                                 boundary.branch_id.as_ref() == Some(branch_id)
                             }
@@ -89,7 +89,7 @@ impl SessionCoordinator {
                     }
                 };
                 let mut request = SessionEvent::typed(
-                    boundary.stream_id.clone(),
+                    boundary.session_id.clone(),
                     EventData::CancellationRequested {
                         target_ref,
                         expected_incarnation: self.execution_incarnation.clone(),
@@ -129,7 +129,7 @@ impl SessionCoordinator {
             )
             .map_err(AppendError::from)?;
             let mut observed = SessionEvent::typed(
-                boundary.stream_id.clone(),
+                boundary.session_id.clone(),
                 EventData::ProviderResponseProgressObserved {
                     observation_ref: StoredPayloadRef::from(&observation),
                 },
@@ -143,7 +143,7 @@ impl SessionCoordinator {
             observed.invocation_id = Some(invocation.clone());
             observed.causation_id = Some(request_event_id);
             let mut unknown = SessionEvent::typed(
-                boundary.stream_id.clone(),
+                boundary.session_id.clone(),
                 EventData::InvocationOutcomeUnknown {
                     last_observed_event_id: observed.event_id.clone(),
                     reason_key: "cancelled_remote_outcome_unconfirmed".into(),

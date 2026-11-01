@@ -13,7 +13,7 @@ mod tests;
 
 #[derive(Clone)]
 pub(super) struct ChildDispatchCommand {
-    pub stream: SessionStreamId,
+    pub stream: SessionId,
     pub branch: BranchId,
     pub turn: TurnId,
     pub context: EventId,
@@ -43,7 +43,7 @@ pub(super) struct ChildBinding {
     parent: SessionEvent,
     session: EngineSession,
     input: EngineTurnInput,
-    stream: SessionStreamId,
+    stream: SessionId,
     authority: Arc<dyn EngineSessionAuthority>,
     parent_resolver: Arc<dyn PermissionResolver>,
 }
@@ -85,7 +85,7 @@ impl SessionCoordinator {
         self: &Arc<Self>,
         request: SessionEvent,
         verifier: Arc<dyn super::recovery::StreamExecutionLossVerifier>,
-    ) -> Result<SessionStreamId, SessionError> {
+    ) -> Result<SessionId, SessionError> {
         let owner = self.clone();
         self.blocking(move || {
             let invocation = request
@@ -93,7 +93,7 @@ impl SessionCoordinator {
                 .as_ref()
                 .ok_or(SessionError::InvocationMismatch)?;
             let child =
-                SessionStreamId::parse(format!("child-{invocation}")).map_err(AppendError::from)?;
+                SessionId::parse(format!("child-{invocation}")).map_err(AppendError::from)?;
             let lock = owner.lock_for(&child);
             let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             if owner.store.head(&child)?.sequence > 0 {
@@ -107,7 +107,7 @@ impl SessionCoordinator {
                 return Err(SessionError::InvocationMismatch);
             }
             if owner
-                .stream_history(&request.stream_id)?
+                .stream_history(&request.session_id)?
                 .iter()
                 .any(|event| {
                     event.invocation_id == request.invocation_id
@@ -117,7 +117,7 @@ impl SessionCoordinator {
                 return Ok(child);
             }
             let proof = verifier
-                .verify_stream_loss(&request.stream_id, &owner.store.head(&request.stream_id)?)?;
+                .verify_stream_loss(&request.session_id, &owner.store.head(&request.session_id)?)?;
             if proof.codec != "session.evidence/v1" {
                 return Err(SessionError::InvalidAdmission(
                     "child recovery requires ownership proof".into(),
@@ -168,7 +168,7 @@ impl SessionCoordinator {
             evidence.branch_id = Some(branch);
             evidence.causation_id = Some(root.event_id.clone());
             owner.store.append_batch(AppendRequest {
-                stream_id: child.clone(),
+                session_id: child.clone(),
                 expected_head: EventCursor::beginning(child.clone()),
                 idempotency_key: format!("child-create:{}", request.event_id),
                 events: vec![root, projection, evidence],
@@ -206,7 +206,7 @@ impl SessionCoordinator {
             requested.branch_id=Some(branch.clone());requested.turn_id=Some(turn.clone());requested.invocation_id=Some(invocation.clone());
             let mut rejected=SessionEvent::typed(stream.clone(),EventData::ChildInvocationRejected {requested_event_id:requested.event_id.clone(),reason_key:"child_authority_denied".into(),policy_evidence_ref:Some(StoredPayloadRef::from(&proof))},actor).map_err(AppendError::from)?;
             rejected.branch_id=Some(branch);rejected.turn_id=Some(turn);rejected.invocation_id=Some(invocation);rejected.causation_id=Some(requested.event_id.clone());
-            owner.store.append_batch(AppendRequest {stream_id:stream.clone(),expected_head:owner.store.head(&stream)?,idempotency_key:format!("child-rejection:{}",requested.event_id),events:vec![requested,rejected],payloads:vec![target,input,proof],erasure_reference_commitment:None})?;let _=owner.wakeups.send(stream);Ok(())
+            owner.store.append_batch(AppendRequest {session_id:stream.clone(),expected_head:owner.store.head(&stream)?,idempotency_key:format!("child-rejection:{}",requested.event_id),events:vec![requested,rejected],payloads:vec![target,input,proof],erasure_reference_commitment:None})?;let _=owner.wakeups.send(stream);Ok(())
         }).await
     }
     pub(super) async fn begin_child(
@@ -216,7 +216,7 @@ impl SessionCoordinator {
     ) -> Result<Arc<dyn ChildExecutionPort>, SessionError> {
         let invocation = InvocationId::new();
         let child_stream =
-            SessionStreamId::parse(format!("child-{invocation}")).map_err(AppendError::from)?;
+            SessionId::parse(format!("child-{invocation}")).map_err(AppendError::from)?;
         let child_branch =
             BranchId::parse(format!("branch-{child_stream}")).map_err(AppendError::from)?;
         let authority = match resolver.child_authority(&command.intent.target_agent, &child_stream)
@@ -336,7 +336,7 @@ impl SessionCoordinator {
                         .ok_or(SessionError::InvocationMismatch)?,
                     owner.store.head(&stream)?.sequence,
                 )?;
-                if seed.stream_id != stream
+                if seed.session_id != stream
                     || !lineage::includes(&lineage, &seed)
                     || seed.body.kind() != EventKind::ContextProjectionCreated
                 {
@@ -346,7 +346,7 @@ impl SessionCoordinator {
                 }
                 owner.admit_effect(
                     EffectIntent {
-                        stream_id: stream.clone(),
+                        session_id: stream.clone(),
                         expected_head: owner.store.head(&stream)?,
                         idempotency_key: format!("child-request:{}", requested.event_id),
                         event: requested.clone(),
@@ -373,7 +373,7 @@ impl SessionCoordinator {
                     child_scope.clone(),
                     EventData::ContextProjectionCreated {
                         source_ranges: vec![SourceRange {
-                            stream_id: seed.stream_id,
+                            session_id: seed.session_id,
                             from_seq: seed.sequence,
                             to_seq: seed.sequence,
                             disposition: RangeDisposition::Omitted,
@@ -391,7 +391,7 @@ impl SessionCoordinator {
                 .map_err(AppendError::from)?;
                 projection.branch_id = Some(child_initial_branch);
                 if let Err(error) = owner.append(AppendRequest {
-                    stream_id: child_scope.clone(),
+                    session_id: child_scope.clone(),
                     expected_head: EventCursor::beginning(child_scope),
                     idempotency_key: format!("child-create:{}", requested.event_id),
                     events: vec![derived, projection],
@@ -466,10 +466,10 @@ impl SessionCoordinator {
         requested: &SessionEvent,
         error: &SessionError,
     ) -> Result<(), SessionError> {
-        let lock = self.lock_for(&requested.stream_id);
+        let lock = self.lock_for(&requested.session_id);
         let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
         if self
-            .stream_history(&requested.stream_id)?
+            .stream_history(&requested.session_id)?
             .iter()
             .any(|event| {
                 event.invocation_id == requested.invocation_id
@@ -488,7 +488,7 @@ impl SessionCoordinator {
         )
         .map_err(AppendError::from)?;
         let mut unknown = SessionEvent::typed(
-            requested.stream_id.clone(),
+            requested.session_id.clone(),
             EventData::InvocationOutcomeUnknown {
                 last_observed_event_id: requested.event_id.clone(),
                 reason_key: "child_initialization_write_failed".into(),
@@ -503,14 +503,14 @@ impl SessionCoordinator {
         unknown.invocation_id = requested.invocation_id.clone();
         unknown.causation_id = Some(requested.event_id.clone());
         self.store.append_batch(AppendRequest {
-            stream_id: requested.stream_id.clone(),
-            expected_head: self.store.head(&requested.stream_id)?,
+            session_id: requested.session_id.clone(),
+            expected_head: self.store.head(&requested.session_id)?,
             idempotency_key: format!("child-initialization-failed:{}", requested.event_id),
             events: vec![unknown],
             payloads: vec![detail],
             erasure_reference_commitment: None,
         })?;
-        let _ = self.wakeups.send(requested.stream_id.clone());
+        let _ = self.wakeups.send(requested.session_id.clone());
         Ok(())
     }
 }
@@ -530,7 +530,7 @@ impl ChildExecutionPort for ChildBinding {
         {
             self.owner
                 .consume_child_request(
-                    self.parent.stream_id.clone(),
+                    self.parent.session_id.clone(),
                     self.parent
                         .branch_id
                         .clone()
@@ -555,16 +555,16 @@ impl ChildExecutionPort for ChildBinding {
         self.owner
             .blocking(move || {
                 resolver.authorize_context(
-                    &parent.stream_id,
+                    &parent.session_id,
                     parent
                         .branch_id
                         .as_ref()
                         .ok_or(SessionError::InvocationMismatch)?,
                 )?;
-                let lock = owner.lock_for(&parent.stream_id);
+                let lock = owner.lock_for(&parent.session_id);
                 let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
                 let mut event = SessionEvent::typed(
-                    parent.stream_id.clone(),
+                    parent.session_id.clone(),
                     EventData::ChildCancellationRequested {
                         requested_event_id: parent.event_id.clone(),
                         reason_key: reason,
@@ -585,14 +585,14 @@ impl ChildExecutionPort for ChildBinding {
                 let key = format!("child-cancel:{}", parent.event_id);
                 if owner.observation_retry(&key, &event)?.is_none() {
                     owner.store.append_batch(AppendRequest {
-                        stream_id: parent.stream_id.clone(),
-                        expected_head: owner.store.head(&parent.stream_id)?,
+                        session_id: parent.session_id.clone(),
+                        expected_head: owner.store.head(&parent.session_id)?,
                         idempotency_key: key,
                         events: vec![event],
                         payloads: vec![],
                         erasure_reference_commitment: None,
                     })?;
-                    let _ = owner.wakeups.send(parent.stream_id);
+                    let _ = owner.wakeups.send(parent.session_id);
                 }
                 Ok(())
             })
@@ -622,7 +622,7 @@ struct StoppedChildFuture {
 impl super::recovery::StreamExecutionLossVerifier for StoppedChildFuture {
     fn verify_stream_loss(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         through: &EventCursor,
     ) -> Result<PayloadRecord, SessionError> {
         PayloadRecord::json(
@@ -669,7 +669,7 @@ impl ChildBinding {
                     closed.branch_id=derived.branch_id.clone();
                     closed.causation_id=Some(derived.event_id.clone());
                     let receipt=owner.store.append_batch(AppendRequest {
-                        stream_id:child.clone(), expected_head:owner.store.head(&child)?,
+                        session_id:child.clone(), expected_head:owner.store.head(&child)?,
                         idempotency_key:format!("child-unadmitted-close:{}",parent.event_id),
                         events:vec![closed], payloads:vec![], erasure_reference_commitment:None,
                     })?;
@@ -679,9 +679,9 @@ impl ChildBinding {
                 };
                 (derived.clone(),closed)
             };
-            let lock=owner.lock_for(&parent.stream_id);
+            let lock=owner.lock_for(&parent.session_id);
             let _guard=lock.lock().unwrap_or_else(|error|error.into_inner());
-            let history=owner.stream_history(&parent.stream_id)?;
+            let history=owner.stream_history(&parent.session_id)?;
             let mut cancellation=None;
             for event in history.iter().filter(|event|event.invocation_id==parent.invocation_id) {
                 match &event.body.data {
@@ -699,7 +699,7 @@ impl ChildBinding {
                 }
             }
             let build=|data| {
-                let mut event=SessionEvent::typed(parent.stream_id.clone(),data,parent.actor.clone()).map_err(AppendError::from)?;
+                let mut event=SessionEvent::typed(parent.session_id.clone(),data,parent.actor.clone()).map_err(AppendError::from)?;
                 event.branch_id=parent.branch_id.clone(); event.turn_id=parent.turn_id.clone();
                 event.invocation_id=parent.invocation_id.clone(); event.causation_id=Some(parent.event_id.clone());
                 Ok::<_,SessionError>(event)
@@ -718,17 +718,17 @@ impl ChildBinding {
             let evidence=super::retry::payload(&parent.event_id,"child-unadmitted-cancellation","session.evidence/v1",&serde_json::json!({
                 "source":"host_child_future_stopped_before_admission", "reason_key":reason,
                 "derived_event_id":derived.event_id, "closed_event_id":closed.event_id,
-                "child_closed_cursor":EventCursor {stream_id:child,sequence:closed.sequence},
+                "child_closed_cursor":EventCursor {session_id:child,sequence:closed.sequence},
             }))?;
             events.push(build(EventData::InvocationCancelled {
                 cancellation_event_id,verification_evidence_ref:StoredPayloadRef::from(&evidence),observed_partial_ref:None,
             })?);
             owner.store.append_batch(AppendRequest {
-                stream_id:parent.stream_id.clone(),expected_head:owner.store.head(&parent.stream_id)?,
+                session_id:parent.session_id.clone(),expected_head:owner.store.head(&parent.session_id)?,
                 idempotency_key:format!("child-unadmitted-outcome:{}",parent.event_id),
                 events,payloads:vec![evidence],erasure_reference_commitment:None,
             })?;
-            let _=owner.wakeups.send(parent.stream_id);
+            let _=owner.wakeups.send(parent.session_id);
             Ok(true)
         }).await
     }
@@ -765,7 +765,7 @@ impl ChildBinding {
                     )?)
                 {
                     EventCursor {
-                        stream_id: child.clone(),
+                        session_id: child.clone(),
                         sequence: event.sequence,
                     }
                 } else {
@@ -774,7 +774,7 @@ impl ChildBinding {
                 let page = owner.store.read_page(
                     &child,
                     &EventCursor {
-                        stream_id: child.clone(),
+                        session_id: child.clone(),
                         sequence: terminal.sequence - 1,
                     },
                     Some(&terminal),
@@ -789,14 +789,14 @@ impl ChildBinding {
                         SessionError::StoreUnhealthy("child terminal branch missing".into())
                     })?,
                 )?;
-                let lock = owner.lock_for(&parent.stream_id);
+                let lock = owner.lock_for(&parent.session_id);
                 let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let committed = owner.store.read_event(&parent.event_id)?.ok_or_else(|| {
                     SessionError::StoreUnhealthy("parent child request missing".into())
                 })?;
-                let head = owner.store.head(&parent.stream_id)?;
+                let head = owner.store.head(&parent.session_id)?;
                 let mut after = EventCursor {
-                    stream_id: parent.stream_id.clone(),
+                    session_id: parent.session_id.clone(),
                     sequence: committed.sequence,
                 };
                 let mut unknown = None;
@@ -804,7 +804,7 @@ impl ChildBinding {
                     let page =
                         owner
                             .store
-                            .read_page(&parent.stream_id, &after, Some(&head), 256)?;
+                            .read_page(&parent.session_id, &after, Some(&head), 256)?;
                     for observed in &page.events {
                         if observed.invocation_id != parent.invocation_id {
                             continue;
@@ -897,7 +897,7 @@ impl ChildBinding {
                     }
                 };
                 let mut outcome =
-                    SessionEvent::typed(parent.stream_id.clone(), data, parent.actor.clone())
+                    SessionEvent::typed(parent.session_id.clone(), data, parent.actor.clone())
                         .map_err(AppendError::from)?;
                 outcome.branch_id = parent.branch_id;
                 outcome.turn_id = parent.turn_id;
@@ -910,14 +910,14 @@ impl ChildBinding {
                     return Ok(());
                 }
                 owner.store.append_batch(AppendRequest {
-                    stream_id: parent.stream_id.clone(),
+                    session_id: parent.session_id.clone(),
                     expected_head: head,
                     idempotency_key: key,
                     events: vec![outcome],
                     payloads,
                     erasure_reference_commitment: None,
                 })?;
-                let _ = owner.wakeups.send(parent.stream_id);
+                let _ = owner.wakeups.send(parent.session_id);
                 Ok(())
             })
             .await?;
@@ -928,7 +928,7 @@ impl ChildBinding {
 impl SessionCoordinator {
     pub(super) async fn consume_child_result(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
         branch: BranchId,
         turn: TurnId,
         task_id: String,
@@ -948,7 +948,7 @@ impl SessionCoordinator {
 
     async fn consume_child_request(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
         branch: BranchId,
         turn: TurnId,
         target: ChildResultTarget,
@@ -1008,7 +1008,7 @@ impl SessionCoordinator {
             let mut event=SessionEvent::typed(stream.clone(),EventData::ChildResultConsumed {child_outcome_event_id:outcome.event_id,consumed_result_ref:StoredPayloadRef::from(&payload),consumer_event_id:accepted_event_id},EventActor::System {component:"child_result_consumer".into()}).map_err(AppendError::from)?;
             event.branch_id=Some(branch.clone());event.turn_id=Some(turn);event.invocation_id=request.invocation_id;event.causation_id=Some(request.event_id);
             resolver.authorize_context(&stream,&branch)?;
-            owner.store.append_batch(AppendRequest {stream_id:stream.clone(),expected_head:head,idempotency_key:key,events:vec![event],payloads:vec![payload],erasure_reference_commitment:None})?;
+            owner.store.append_batch(AppendRequest {session_id:stream.clone(),expected_head:head,idempotency_key:key,events:vec![event],payloads:vec![payload],erasure_reference_commitment:None})?;
             let _=owner.wakeups.send(stream);
             Ok(())
         }).await

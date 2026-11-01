@@ -38,7 +38,7 @@ fn million_event_append_read_and_index_reconstruction() {
     assert!(count >= 1000);
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::TempDir::new().expect("directory");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let store = open_event_store(directory.path(), backend).expect("store");
         store
             .append_batch(super::tests::request(&stream, "root", 0))
@@ -70,9 +70,9 @@ fn million_event_append_read_and_index_reconstruction() {
             let started = Instant::now();
             store
                 .append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: EventCursor {
-                        stream_id: stream.clone(),
+                        session_id: stream.clone(),
                         sequence,
                     },
                     idempotency_key: format!("measurement-{batch}"),
@@ -133,7 +133,7 @@ fn million_event_append_read_and_index_reconstruction() {
         .expect("event");
         reopened
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: through,
                 idempotency_key: "measurement-reopen".into(),
                 events: vec![event],
@@ -228,7 +228,7 @@ fn payload_read_peak_and_complete_content() {
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::TempDir::new().expect("directory");
         let store = open_event_store(directory.path(), backend).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         store
             .append_batch(super::tests::request(&stream, "root", 0))
             .expect("root");
@@ -250,7 +250,7 @@ fn payload_read_peak_and_complete_content() {
         .expect("event");
         store
             .append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: store.head(&stream).expect("head"),
                 idempotency_key: "payload".into(),
                 events: vec![event],

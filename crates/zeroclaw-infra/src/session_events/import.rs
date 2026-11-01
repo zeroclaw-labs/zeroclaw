@@ -1,6 +1,6 @@
 //! Bounded, resumable import into the installation's selected event format.
 //! The caller holds the installation or CLI source lease until publication.
-use super::installation::{NativeBackend, creation_source, session_key};
+use super::installation::{NativeBackend, creation_source};
 use super::*;
 use crate::session_backend::TimestampedMessage;
 use zeroclaw_api::session_events::*;
@@ -10,7 +10,7 @@ pub struct LegacyImport<'a> {
     pub creation_source: &'a str,
     pub owning_agent: &'a str,
     pub target: NativeBackend,
-    pub stream: SessionStreamId,
+    pub stream: SessionId,
     pub branch: BranchId,
     pub session: SessionId,
     pub source_kind: &'a str,
@@ -27,7 +27,7 @@ pub fn import_legacy_snapshot(
     data_dir: &Path,
     command: LegacyImport<'_>,
     read_source: impl FnOnce() -> Result<LegacySnapshot, AppendError>,
-) -> Result<SessionStreamId, AppendError> {
+) -> Result<SessionId, AppendError> {
     let guard = installation::InstallationGuard::acquire(&data_dir.join("sessions"))?;
     if guard.active()?.0 != command.target {
         return Err(AppendError::InvalidTransition(
@@ -42,7 +42,7 @@ pub(super) fn import_snapshot(
     store: &dyn SessionEventStore,
     command: LegacyImport<'_>,
     snapshot: LegacySnapshot,
-) -> Result<SessionStreamId, AppendError> {
+) -> Result<SessionId, AppendError> {
     let completed = format!("legacy-family-import:{}", command.stream);
     if store
         .lookup_receipt(&command.stream, &completed)
@@ -94,8 +94,9 @@ pub(super) fn import_snapshot(
             return Err(AppendError::Corrupt("import evidence unavailable".into()));
         };
         let value: serde_json::Value = serde_json::from_slice(&record.body).map_err(corrupt)?;
-        let root_matches = matches!(page.events.first().map(|event| &event.body.data),
-            Some(EventData::SessionStarted { owning_agent, session_id, .. }) if owning_agent == command.owning_agent && session_id == &command.session);
+        let root_matches = matches!(page.events.first(),
+            Some(event) if event.session_id == command.session
+                && matches!(&event.body.data, EventData::SessionStarted { owning_agent, .. } if owning_agent == command.owning_agent));
         if !root_matches
             || page
                 .events
@@ -116,7 +117,6 @@ pub(super) fn import_snapshot(
         let mut root = SessionEvent::typed(
             command.stream.clone(),
             EventData::SessionStarted {
-                session_id: command.session.clone(),
                 owning_agent: command.owning_agent.into(),
                 capture_mode: CaptureMode::LegacyMessageOnly,
             },
@@ -266,15 +266,14 @@ pub(super) fn import_snapshot(
         EventActor::default(),
     )?;
     projection.branch_id = Some(command.branch.clone());
-    let (identity, identity_payload) = session_key(command.stream.clone(), command.family)?;
     let (source, source_payload) =
         creation_source(command.stream.clone(), command.creation_source)?;
     append(
         store,
         &command.stream,
         completed,
-        vec![projection, identity, source],
-        vec![context, identity_payload, source_payload],
+        vec![projection, source],
+        vec![context, source_payload],
     )?;
     Ok(command.stream)
 }
@@ -282,18 +281,18 @@ pub(super) fn import_snapshot(
 fn corrupt(error: impl std::fmt::Display) -> AppendError {
     AppendError::Corrupt(error.to_string())
 }
-fn stable_payload(stream: &SessionStreamId, kind: &str) -> Result<PayloadId, AppendError> {
+fn stable_payload(stream: &SessionId, kind: &str) -> Result<PayloadId, AppendError> {
     Ok(PayloadId::parse(format!("legacy-{stream}-{kind}"))?)
 }
 fn append(
     store: &dyn SessionEventStore,
-    stream: &SessionStreamId,
+    stream: &SessionId,
     key: String,
     events: Vec<SessionEvent>,
     payloads: Vec<PayloadRecord>,
 ) -> Result<(), AppendError> {
     store.append_batch(AppendRequest {
-        stream_id: stream.clone(),
+        session_id: stream.clone(),
         expected_head: store.head(stream).map_err(corrupt)?,
         idempotency_key: key,
         events,

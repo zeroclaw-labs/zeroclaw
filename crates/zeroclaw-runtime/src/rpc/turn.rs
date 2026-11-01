@@ -869,7 +869,7 @@ mod tests {
             scope_engine_input, scope_provider_capture, scope_session_execution,
         };
         use zeroclaw_api::session_events::{
-            AppendReceipt, EventCursor, EventData, EventId, PayloadRecord, SessionStreamId,
+            AppendReceipt, EventCursor, EventData, EventId, PayloadRecord, SessionId,
         };
 
         struct EchoProvider(Arc<StdMutex<Vec<String>>>);
@@ -941,7 +941,7 @@ mod tests {
                 _data: EventData,
                 _payloads: Vec<PayloadRecord>,
             ) -> anyhow::Result<AppendReceipt> {
-                let cursor = EventCursor::beginning(SessionStreamId::new());
+                let cursor = EventCursor::beginning(SessionId::new());
                 Ok(AppendReceipt {
                     first: cursor.clone(),
                     last: cursor,

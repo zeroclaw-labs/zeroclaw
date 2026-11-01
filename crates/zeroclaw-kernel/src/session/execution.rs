@@ -18,7 +18,7 @@ mod tests;
 
 #[derive(Clone, Debug)]
 pub struct UserTurnCommand {
-    pub stream_id: SessionStreamId,
+    pub session_id: SessionId,
     pub branch_id: BranchId,
     pub turn_id: TurnId,
     pub message_id: MessageId,
@@ -95,7 +95,7 @@ impl Drop for QueuedTurnGuard {
 }
 
 impl SessionCoordinator {
-    pub(super) fn foreground_lock(&self, stream: &SessionStreamId) -> Arc<tokio::sync::Mutex<()>> {
+    pub(super) fn foreground_lock(&self, stream: &SessionId) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self
             .foreground
             .lock()
@@ -138,11 +138,11 @@ impl SessionCoordinator {
         resolver: Arc<dyn PermissionResolver>,
         executor: &mut dyn TurnExecutorPort,
     ) -> Result<AppendReceipt, SessionError> {
-        policy.authorize_actor(&actor, &command.stream_id, SessionAccess::Write)?;
+        policy.authorize_actor(&actor, &command.session_id, SessionAccess::Write)?;
         // An ordering refusal must not cancel an already recovered waiter or
         // admit newer work ahead of the persisted recovery queue.
         self.requeue_for_dispatch(
-            command.stream_id.clone(),
+            command.session_id.clone(),
             command.branch_id.clone(),
             command.turn_id.clone(),
         )
@@ -152,10 +152,10 @@ impl SessionCoordinator {
             .admit_user_input(&command, &actor, &actor, Arc::clone(&policy))
             .await?;
         let accepted_id = queued.accepted.clone();
-        let lock = self.foreground_lock(&command.stream_id);
+        let lock = self.foreground_lock(&command.session_id);
         let _permit = lock.lock().await;
         if let Err(error) =
-            policy.authorize_actor(&principal, &command.stream_id, SessionAccess::Write)
+            policy.authorize_actor(&principal, &command.session_id, SessionAccess::Write)
         {
             self.cancel_unstarted_turn(
                 &command,
@@ -166,7 +166,7 @@ impl SessionCoordinator {
             return Err(error);
         }
         let store = Arc::clone(&self.store);
-        let stream = command.stream_id.clone();
+        let stream = command.session_id.clone();
         let turn = command.turn_id.clone();
         let (outcome, started, context_only) = self
             .blocking(move || {
@@ -187,7 +187,7 @@ impl SessionCoordinator {
         }
         let requeued = self
             .requeue_for_dispatch(
-                command.stream_id.clone(),
+                command.session_id.clone(),
                 command.branch_id.clone(),
                 command.turn_id.clone(),
             )
@@ -211,7 +211,7 @@ impl SessionCoordinator {
                 EventData::RecoveryObserved {
                     prior_execution_ref: prior_execution_ref.clone(),
                     through_cursor: EventCursor {
-                        stream_id: command.stream_id.clone(),
+                        session_id: command.session_id.clone(),
                         sequence: recovered.sequence,
                     },
                     disposition: zeroclaw_api::session_events::RecoveryDisposition::Rescheduled {
@@ -230,7 +230,7 @@ impl SessionCoordinator {
                 format!("turn-start:{}", command.turn_id),
             )
         };
-        let mut started = SessionEvent::typed(command.stream_id.clone(), data, actor.clone())
+        let mut started = SessionEvent::typed(command.session_id.clone(), data, actor.clone())
             .map_err(AppendError::from)?;
         started.branch_id = Some(command.branch_id.clone());
         started.turn_id = Some(command.turn_id.clone());
@@ -238,7 +238,7 @@ impl SessionCoordinator {
         let context_id = command.context_event_id.clone();
         let start_result = self
             .append_current(
-                command.stream_id.clone(),
+                command.session_id.clone(),
                 start_key,
                 vec![started],
                 command
@@ -266,14 +266,14 @@ impl SessionCoordinator {
         }
         queued.armed = false;
         let admission = self.provider_capture(
-            command.stream_id.clone(),
+            command.session_id.clone(),
             command.branch_id.clone(),
             command.turn_id.clone(),
             context_id,
             Arc::clone(&resolver),
         );
         let tool_admission = self.tool_capture(
-            command.stream_id.clone(),
+            command.session_id.clone(),
             command.branch_id.clone(),
             command.turn_id.clone(),
             resolver,
@@ -316,19 +316,19 @@ impl SessionCoordinator {
         let accepted = accepted.clone();
         let reason = reason.to_owned();
         self.blocking(move || {
-            let lock = owner.lock_for(&command.stream_id);
+            let lock = owner.lock_for(&command.session_id);
             let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if owner
                 .store
                 .lookup_receipt(
-                    &command.stream_id,
+                    &command.session_id,
                     &format!("turn-outcome:{}", command.turn_id),
                 )?
                 .is_some()
                 || owner
                     .store
                     .lookup_receipt(
-                        &command.stream_id,
+                        &command.session_id,
                         &format!("context-input-outcome:{}", command.turn_id),
                     )?
                     .is_some()
@@ -338,7 +338,7 @@ impl SessionCoordinator {
             if owner
                 .store
                 .lookup_receipt(
-                    &command.stream_id,
+                    &command.session_id,
                     &format!("turn-start:{}", command.turn_id),
                 )?
                 .is_some()
@@ -349,7 +349,7 @@ impl SessionCoordinator {
                 .store
                 .read_event(&accepted)?
                 .ok_or_else(|| SessionError::StoreUnhealthy("accepted turn missing".into()))?;
-            if admission.stream_id != command.stream_id
+            if admission.session_id != command.session_id
                 || admission.turn_id.as_ref() != Some(&command.turn_id)
                 || admission.body.kind() != EventKind::TurnAccepted
             {
@@ -358,7 +358,7 @@ impl SessionCoordinator {
                 ));
             }
             let mut terminal = SessionEvent::typed(
-                command.stream_id.clone(),
+                command.session_id.clone(),
                 EventData::TurnCancelled {
                     reason_key: reason,
                     unresolved_invocation_ids: vec![],
@@ -372,14 +372,14 @@ impl SessionCoordinator {
             terminal.turn_id = Some(command.turn_id.clone());
             terminal.causation_id = Some(accepted);
             owner.store.append_batch(AppendRequest {
-                stream_id: command.stream_id.clone(),
-                expected_head: owner.store.head(&command.stream_id)?,
+                session_id: command.session_id.clone(),
+                expected_head: owner.store.head(&command.session_id)?,
                 idempotency_key: format!("turn-outcome:{}", command.turn_id),
                 events: vec![terminal],
                 payloads: vec![],
                 erasure_reference_commitment: None,
             })?;
-            let _ = owner.wakeups.send(command.stream_id);
+            let _ = owner.wakeups.send(command.session_id);
             Ok(())
         })
         .await
@@ -397,17 +397,17 @@ impl SessionCoordinator {
         let actor = actor.clone();
         let principal = principal.clone();
         self.blocking(move || {
-            policy.authorize_actor(&principal, &command.stream_id, SessionAccess::Write)?;
-            let lock = owner.lock_for(&command.stream_id);
+            policy.authorize_actor(&principal, &command.session_id, SessionAccess::Write)?;
+            let lock = owner.lock_for(&command.session_id);
             let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(receipt) = owner
                 .store
-                .lookup_receipt(&command.stream_id, &command.ingress_key)?
+                .lookup_receipt(&command.session_id, &command.ingress_key)?
             {
                 let page = owner.store.read_page(
-                    &command.stream_id,
+                    &command.session_id,
                     &EventCursor {
-                        stream_id: command.stream_id.clone(),
+                        session_id: command.session_id.clone(),
                         sequence: receipt.first.sequence - 1,
                     },
                     Some(&receipt.first),
@@ -467,10 +467,10 @@ impl SessionCoordinator {
                     EngineInputPart::Text(_) | EngineInputPart::Opaque {..} => None,
                 }).collect();
                 if !files.is_empty() {
-                    let mut after = EventCursor {stream_id: command.stream_id.clone(), sequence: receipt.first.sequence.saturating_sub(1)};
+                    let mut after = EventCursor {session_id: command.session_id.clone(), sequence: receipt.first.sequence.saturating_sub(1)};
                     let mut recorded = Vec::new();
                     loop {
-                        let page = owner.store.read_page(&command.stream_id, &after, Some(&receipt.last), 10_000)?;
+                        let page = owner.store.read_page(&command.session_id, &after, Some(&receipt.last), 10_000)?;
                         after.sequence = page.events.last().map_or(after.sequence, |event| event.sequence);
                         recorded.extend(page.events);
                         if !page.has_more { break; }
@@ -541,7 +541,7 @@ impl SessionCoordinator {
             )
             .map_err(AppendError::from)?;
             let mut accepted = SessionEvent::typed(
-                command.stream_id.clone(),
+                command.session_id.clone(),
                 EventData::TurnAccepted {
                     input_ref: StoredPayloadRef::from(&content),
                     ingress_ref: command.ingress_ref.clone(),
@@ -554,7 +554,7 @@ impl SessionCoordinator {
             accepted.turn_id = Some(command.turn_id.clone());
             let accepted_id = accepted.event_id.clone();
             let mut recorded = SessionEvent::typed(
-                command.stream_id.clone(),
+                command.session_id.clone(),
                 EventData::UserContentRecorded {
                     accepted_event_id: accepted_id.clone(),
                     content_ref: StoredPayloadRef::from(&content),
@@ -573,7 +573,7 @@ impl SessionCoordinator {
                     _=>return Err(SessionError::StaleTarget("execution binding unavailable".into())),
                 },
             };
-            if let Some(mut revision)=owner.authority_observation(&command.stream_id,&command.branch_id,&actor,&binding)? {
+            if let Some(mut revision)=owner.authority_observation(&command.session_id,&command.branch_id,&actor,&binding)? {
                 revision.causation_id=Some(accepted_id.clone());events.push(revision);
             }
             let guard_command = command.clone();
@@ -583,10 +583,10 @@ impl SessionCoordinator {
             let mut registered=std::collections::HashSet::new();
             if !files.is_empty() {
                 let wanted:std::collections::HashSet<_>=files.iter().map(|(_,file)|file.file_id.clone()).collect();
-                let mut through=owner.store.head(&command.stream_id)?;
+                let mut through=owner.store.head(&command.session_id)?;
                 while through.sequence>0 && !wanted.is_subset(&registered) {
-                    let after=EventCursor {stream_id:command.stream_id.clone(),sequence:through.sequence.saturating_sub(256)};
-                    let page=owner.store.read_page(&command.stream_id,&after,Some(&through),256)?;
+                    let after=EventCursor {session_id:command.session_id.clone(),sequence:through.sequence.saturating_sub(256)};
+                    let page=owner.store.read_page(&command.session_id,&after,Some(&through),256)?;
                     for event in page.events {
                         if let EventData::FileRegistered {file_id,..}=event.body.data {registered.insert(file_id);}
                     }
@@ -613,7 +613,7 @@ impl SessionCoordinator {
                     EventData::FileUsed {file_id:file.file_id,operation:"ingress_representation_captured".into(),representation_ref:StoredPayloadRef::from(&file.representation),policy_evidence_ref:StoredPayloadRef::from(&policy)},
                 ]);
                 for data in data {
-                    let mut event=SessionEvent::typed(command.stream_id.clone(),data,actor.clone()).map_err(AppendError::from)?;
+                    let mut event=SessionEvent::typed(command.session_id.clone(),data,actor.clone()).map_err(AppendError::from)?;
                     event.branch_id=recorded.branch_id.clone();event.turn_id=recorded.turn_id.clone();event.causation_id=Some(recorded.event_id.clone());
                     events.push(event);
                 }
@@ -629,14 +629,14 @@ impl SessionCoordinator {
             let mut payloads: Vec<_> = unique.into_values().collect();
             payloads.sort_by(|left, right| left.payload_id.as_str().cmp(right.payload_id.as_str()));
             owner.store.append_batch(AppendRequest {
-                stream_id: command.stream_id.clone(),
-                expected_head: owner.store.head(&command.stream_id)?,
+                session_id: command.session_id.clone(),
+                expected_head: owner.store.head(&command.session_id)?,
                 idempotency_key: command.ingress_key.clone(),
                 events,
                 payloads,
                 erasure_reference_commitment: None,
             })?;
-            let _ = owner.wakeups.send(command.stream_id.clone());
+            let _ = owner.wakeups.send(command.session_id.clone());
             // Ownership travels with the worker result. If the async caller
             // was dropped during the commit, dropping this result settles it.
             Ok(QueuedTurnGuard {
@@ -651,7 +651,7 @@ impl SessionCoordinator {
 
     async fn append_current(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
         key: String,
         events: Vec<SessionEvent>,
         payloads: Vec<PayloadRecord>,
@@ -665,7 +665,7 @@ impl SessionCoordinator {
             let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let head = owner.store.head(&stream)?;
             let receipt = owner.store.append_batch(AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: head,
                 idempotency_key: key,
                 events,
@@ -689,12 +689,12 @@ impl SessionCoordinator {
         self.blocking(move || {
             // Host settlement records an already admitted execution. Revoking
             // effect permission must not suppress its terminal observations.
-            let lock = owner.lock_for(&command.stream_id);
+            let lock = owner.lock_for(&command.session_id);
             let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let head = owner.store.head(&command.stream_id)?;
-            let input_receipt=owner.store.lookup_receipt(&command.stream_id,&command.ingress_key)?
+            let head = owner.store.head(&command.session_id)?;
+            let input_receipt=owner.store.lookup_receipt(&command.session_id,&command.ingress_key)?
                 .ok_or_else(||SessionError::StoreUnhealthy("accepted input receipt missing at settlement".into()))?;
-            let mut projection = HistoryProjection::empty(command.stream_id.clone());
+            let mut projection = HistoryProjection::empty(command.session_id.clone());
             projection.source_cursor.sequence=input_receipt.first.sequence.checked_sub(1)
                 .ok_or_else(||SessionError::StoreUnhealthy("accepted input receipt sequence invalid".into()))?;
             let mut last_provider_result = None;
@@ -704,7 +704,7 @@ impl SessionCoordinator {
             let mut cancellation_history = Vec::new();
             loop {
                 let page = owner.store.read_page(
-                    &command.stream_id,
+                    &command.session_id,
                     &projection.source_cursor,
                     Some(&head),
                     256)?;
@@ -778,7 +778,7 @@ impl SessionCoordinator {
                     && !events.iter().any(|event| event.invocation_id.as_ref() == Some(id)
                         && event.body.kind() == EventKind::InvocationOutcomeUnknown)
                 {
-                    let mut unknown = SessionEvent::typed(command.stream_id.clone(),
+                    let mut unknown = SessionEvent::typed(command.session_id.clone(),
                         EventData::InvocationOutcomeUnknown {
                             last_observed_event_id:state.last_event_id.clone(),reason_key:"engine_returned_without_effect_settlement".into(),
                             observed_partial_ref:None,error_ref:error_ref.clone(),
@@ -790,7 +790,7 @@ impl SessionCoordinator {
             // Finishing a turn releases its ephemeral preparation scope. A
             // pending reply or unused confirmation cannot authorize later work.
             for (request_id, requested) in approvals.into_requests() {
-                let mut invalidated = SessionEvent::typed(command.stream_id.clone(),
+                let mut invalidated = SessionEvent::typed(command.session_id.clone(),
                     EventData::ApprovalInvalidated {
                         request_id, confirmation_id: None,
                         reason_key: "approval_turn_execution_finished".into(), evidence_ref: None,
@@ -805,7 +805,7 @@ impl SessionCoordinator {
                     "state": if cancelled { "cancelled" } else { "interrupted" },
                     "reason_key": "elicitation_turn_execution_finished",
                 })).map_err(AppendError::from)?;
-                let mut resolved = SessionEvent::typed(command.stream_id.clone(),
+                let mut resolved = SessionEvent::typed(command.session_id.clone(),
                     EventData::ElicitationResolved {
                         request_id, resolution_ref: StoredPayloadRef::from(&resolution),
                     }, actor.clone()).map_err(AppendError::from)?;
@@ -831,14 +831,14 @@ impl SessionCoordinator {
                 match result {
                     Ok(text) => {
                         let mut existing = None;
-                        if let Some(context) = owner.branch_context(&command.stream_id, &command.branch_id)?
+                        if let Some(context) = owner.branch_context(&command.session_id, &command.branch_id)?
                             && context.turn_id.as_ref() == Some(&command.turn_id)
                             && let Some(item) = super::context_messages::context_refs(owner.store.as_ref(), &context)?.last()
                             && let ContextMessageSource::Content { content_event_id, .. } = &item.source
                         {
                                         let source = owner.store.read_event(content_event_id)?.ok_or_else(|| SessionError::StaleTarget("terminal content missing".into()))?;
                                         if source.turn_id.as_ref() == Some(&command.turn_id)
-                                            && super::context_messages::resolve_message(owner.store.as_ref(), &command.stream_id, item)?.is_some_and(|message| matches!(message, zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.role == "assistant" && chat.content == text)) {
+                                            && super::context_messages::resolve_message(owner.store.as_ref(), &command.session_id, item)?.is_some_and(|message| matches!(message, zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.role == "assistant" && chat.content == text)) {
                                             existing = Some(content_event_id.clone());
                                         }
                         }
@@ -882,7 +882,7 @@ impl SessionCoordinator {
                         )
                         .map_err(AppendError::from)?;
                         let mut recorded = SessionEvent::typed(
-                            command.stream_id.clone(),
+                            command.session_id.clone(),
                             EventData::AssistantContentRecorded {
                                 content_ref: StoredPayloadRef::from(&content),
                                 provenance_refs,
@@ -921,20 +921,20 @@ impl SessionCoordinator {
                     },
                 }
             };
-            let mut terminal = SessionEvent::typed(command.stream_id.clone(), data, actor)
+            let mut terminal = SessionEvent::typed(command.session_id.clone(), data, actor)
                 .map_err(AppendError::from)?;
             terminal.branch_id = Some(command.branch_id);
             terminal.turn_id = Some(command.turn_id.clone());
             events.push(terminal);
             let receipt = owner.store.append_batch(AppendRequest {
-                stream_id: command.stream_id.clone(),
+                session_id: command.session_id.clone(),
                 expected_head: head,
                 idempotency_key: format!("turn-outcome:{}", command.turn_id),
                 events,
                 payloads,
                 erasure_reference_commitment: None,
             })?;
-            let _ = owner.wakeups.send(command.stream_id);
+            let _ = owner.wakeups.send(command.session_id);
             Ok(receipt)
         })
         .await

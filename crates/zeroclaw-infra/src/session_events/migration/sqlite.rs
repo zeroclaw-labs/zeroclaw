@@ -3,13 +3,13 @@ use super::*;
 impl SqliteEventStore {
     pub(in crate::session_events) fn export_native(
         &self,
-        root: Option<&SessionStreamId>,
+        root: Option<&SessionId>,
     ) -> Result<NativeImage, AppendError> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction().map_err(map_sqlite)?;
         let mut batches = Vec::new();
         {
-            let mut statement=tx.prepare("SELECT stream_id,idempotency_key,request_commitment,first_seq,last_seq FROM session_append_receipts ORDER BY stream_id,first_seq").map_err(map_sqlite)?;
+            let mut statement=tx.prepare("SELECT session_id,idempotency_key,request_commitment,first_seq,last_seq FROM session_append_receipts ORDER BY session_id,first_seq").map_err(map_sqlite)?;
             let rows = statement
                 .query_map([], |row| {
                     Ok((
@@ -23,10 +23,10 @@ impl SqliteEventStore {
                 .map_err(map_sqlite)?;
             for row in rows {
                 let (stream, key, commitment, first, last) = row.map_err(map_sqlite)?;
-                let stream = SessionStreamId::parse(stream)?;
+                let stream = SessionId::parse(stream)?;
                 Self::receipt_range(&tx, &stream, first, last)
                     .map_err(|error| AppendError::Corrupt(error.to_string()))?;
-                let mut events=tx.prepare("SELECT event_json FROM session_events WHERE stream_id=?1 AND sequence BETWEEN ?2 AND ?3 ORDER BY sequence").map_err(map_sqlite)?;
+                let mut events=tx.prepare("SELECT event_json FROM session_events WHERE session_id=?1 AND sequence BETWEEN ?2 AND ?3 ORDER BY sequence").map_err(map_sqlite)?;
                 let raw = events
                     .query_map(params![stream.as_str(), first, last], |row| {
                         row.get::<_, Vec<u8>>(0)
@@ -94,7 +94,7 @@ impl SqliteEventStore {
             for raw in &batch.raw {
                 let event =
                     parse_event(raw).map_err(|error| AppendError::Corrupt(error.to_string()))?;
-                tails.insert(event.stream_id, event.sequence);
+                tails.insert(event.session_id, event.sequence);
             }
         }
         for (stream, tail) in tails {
@@ -125,8 +125,8 @@ impl SqliteEventStore {
                     parse_event(raw).map_err(|error| AppendError::Corrupt(error.to_string()))?;
                 let existing: Option<Vec<u8>> = tx
                     .query_row(
-                        "SELECT event_json FROM session_events WHERE stream_id=?1 AND sequence=?2",
-                        params![event.stream_id.as_str(), event.sequence],
+                        "SELECT event_json FROM session_events WHERE session_id=?1 AND sequence=?2",
+                        params![event.session_id.as_str(), event.sequence],
                         |row| row.get(0),
                     )
                     .optional()
@@ -138,9 +138,9 @@ impl SqliteEventStore {
                         ));
                     }
                 } else {
-                    tx.execute("INSERT INTO session_events(stream_id,sequence,event_id,event_json) VALUES(?1,?2,?3,?4)",params![event.stream_id.as_str(),event.sequence,event.event_id.as_str(),raw]).map_err(map_sqlite)?;
+                    tx.execute("INSERT INTO session_events(session_id,sequence,event_id,event_json) VALUES(?1,?2,?3,?4)",params![event.session_id.as_str(),event.sequence,event.event_id.as_str(),raw]).map_err(map_sqlite)?;
                 }
-                heads.insert(event.stream_id.clone(), event.sequence);
+                heads.insert(event.session_id.clone(), event.sequence);
             }
             let first = parse_event(
                 batch
@@ -158,7 +158,7 @@ impl SqliteEventStore {
             )
             .map_err(|error| AppendError::Corrupt(error.to_string()))?
             .sequence;
-            let existing:Option<(String,u64,u64)>=tx.query_row("SELECT request_commitment,first_seq,last_seq FROM session_append_receipts WHERE stream_id=?1 AND idempotency_key=?2",params![batch.stream.as_str(),batch.key],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(map_sqlite)?;
+            let existing:Option<(String,u64,u64)>=tx.query_row("SELECT request_commitment,first_seq,last_seq FROM session_append_receipts WHERE session_id=?1 AND idempotency_key=?2",params![batch.stream.as_str(),batch.key],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(map_sqlite)?;
             if let Some(existing) = existing {
                 if existing != (batch.commitment.as_str().to_owned(), first, last) {
                     return Err(AppendError::Corrupt(
@@ -166,7 +166,7 @@ impl SqliteEventStore {
                     ));
                 }
             } else {
-                tx.execute("INSERT INTO session_append_receipts(stream_id,idempotency_key,request_commitment,first_seq,last_seq) VALUES(?1,?2,?3,?4,?5)",params![batch.stream.as_str(),batch.key,batch.commitment.as_str(),first,last]).map_err(map_sqlite)?;
+                tx.execute("INSERT INTO session_append_receipts(session_id,idempotency_key,request_commitment,first_seq,last_seq) VALUES(?1,?2,?3,?4,?5)",params![batch.stream.as_str(),batch.key,batch.commitment.as_str(),first,last]).map_err(map_sqlite)?;
             }
         }
         for payload in &image.payloads {
@@ -196,7 +196,7 @@ impl SqliteEventStore {
         for (stream, sequence) in heads {
             let tail: u64 = tx
                 .query_row(
-                    "SELECT MAX(sequence) FROM session_events WHERE stream_id=?1",
+                    "SELECT MAX(sequence) FROM session_events WHERE session_id=?1",
                     params![stream.as_str()],
                     |row| row.get(0),
                 )

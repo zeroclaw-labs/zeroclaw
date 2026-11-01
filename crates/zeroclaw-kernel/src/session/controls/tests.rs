@@ -11,7 +11,7 @@ impl SessionAccessPolicy for Authority {
     fn authorize_actor(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         if matches!(actor,EventActor::System {component} if component=="fixture_system")
@@ -31,7 +31,7 @@ impl SessionAccessPolicy for Authority {
     fn authorize(
         &self,
         _: &PrincipalId,
-        _: &SessionStreamId,
+        _: &SessionId,
         _: SessionAccess,
     ) -> Result<(), SessionError> {
         if self.0.load(Ordering::SeqCst) {
@@ -46,15 +46,11 @@ impl PermissionResolver for Authority {
         SessionAccessPolicy::authorize(
             self,
             &PrincipalId::shared_operator(),
-            &intent.stream_id,
+            &intent.session_id,
             SessionAccess::Write,
         )
     }
-    fn authorize_context(
-        &self,
-        stream: &SessionStreamId,
-        _: &BranchId,
-    ) -> Result<(), SessionError> {
+    fn authorize_context(&self, stream: &SessionId, _: &BranchId) -> Result<(), SessionError> {
         SessionAccessPolicy::authorize(
             self,
             &PrincipalId::shared_operator(),
@@ -65,7 +61,7 @@ impl PermissionResolver for Authority {
     fn child_authority(
         &self,
         target: &str,
-        _: &SessionStreamId,
+        _: &SessionId,
     ) -> Result<Arc<dyn EngineSessionAuthority>, SessionError> {
         if target == "denied-fixture" {
             return Err(SessionError::PermissionDenied(
@@ -105,12 +101,11 @@ fn session(directory: &std::path::Path, backend: &str) -> (EngineSession, Arc<Au
     let owner = Arc::new(SessionCoordinator::new(store).with_search(Arc::new(
         zeroclaw_infra::session_events::search::FullTextSearch,
     )));
-    let stream = SessionStreamId::new();
+    let stream = SessionId::new();
     let branch = BranchId::new();
     let mut root = SessionEvent::typed(
         stream.clone(),
         EventData::SessionStarted {
-            session_id: SessionId::new(),
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
         },
@@ -141,7 +136,7 @@ fn session(directory: &std::path::Path, backend: &str) -> (EngineSession, Arc<Au
     projection.branch_id = Some(branch.clone());
     owner
         .append(AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: EventCursor::beginning(stream.clone()),
             idempotency_key: "root".into(),
             events: vec![root, projection],
@@ -709,7 +704,7 @@ async fn turn_model_selection_keeps_session_mode_across_turns_branches_and_reope
                     .owner
                     .store
                     .append_batch(AppendRequest {
-                        stream_id: bound.stream.clone(),
+                        session_id: bound.stream.clone(),
                         expected_head: head.clone(),
                         idempotency_key: format!("invalid-previous:{}", invalid.event_id),
                         events: vec![control, invalid],
@@ -744,7 +739,7 @@ async fn turn_model_selection_keeps_session_mode_across_turns_branches_and_reope
                     port.owner
                         .store
                         .append_batch(AppendRequest {
-                            stream_id: port.stream.clone(),
+                            session_id: port.stream.clone(),
                             expected_head: head.clone(),
                             idempotency_key: format!("invalid-model:{}", invalid.event_id),
                             events: vec![invalid],
@@ -1364,7 +1359,7 @@ async fn child_session_close_cannot_be_reported_as_execution_completion() {
             .iter()
             .find(|event| event.body.kind() == EventKind::ChildInvocationRequested)
             .expect("request");
-        let child = SessionStreamId::parse(format!(
+        let child = SessionId::parse(format!(
             "child-{}",
             request.invocation_id.as_ref().expect("invocation")
         ))
@@ -1387,7 +1382,7 @@ async fn child_session_close_cannot_be_reported_as_execution_completion() {
             .owner
             .store
             .append_batch(AppendRequest {
-                stream_id: child.clone(),
+                session_id: child.clone(),
                 expected_head: session.owner.store.head(&child).expect("child head"),
                 idempotency_key: "fixture-child-close".into(),
                 events: vec![close],
@@ -1414,7 +1409,7 @@ async fn child_session_close_cannot_be_reported_as_execution_completion() {
                 .owner
                 .store
                 .append_batch(AppendRequest {
-                    stream_id: session.stream.clone(),
+                    session_id: session.stream.clone(),
                     expected_head: head.clone(),
                     idempotency_key: "fixture-false-child-completion".into(),
                     events: vec![completed],
@@ -1732,19 +1727,19 @@ impl SessionEventStore for ContextWriteFailureStore {
     }
     fn read_page(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
     ) -> Result<EventPage, ReadError> {
         self.inner.read_page(stream, after, through, max_events)
     }
-    fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
+    fn head(&self, stream: &SessionId) -> Result<EventCursor, ReadError> {
         self.inner.head(stream)
     }
     fn lookup_receipt(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError> {
         self.inner.lookup_receipt(stream, key)
@@ -1755,7 +1750,7 @@ impl SessionEventStore for ContextWriteFailureStore {
     fn erasure_scope(
         &self,
         targets: &[StoredPayloadRef],
-    ) -> Result<(Vec<SessionStreamId>, Digest), AppendError> {
+    ) -> Result<(Vec<SessionId>, Digest), AppendError> {
         self.inner.erasure_scope(targets)
     }
 }
@@ -2297,7 +2292,7 @@ async fn elicitation_admission_uses_committed_turn_and_stream_lifecycle() {
                     started.turn_id = Some(command.turn_id.clone());
                     port.owner
                         .append(AppendRequest {
-                            stream_id: port.stream.clone(),
+                            session_id: port.stream.clone(),
                             expected_head: port.owner.store.head(&port.stream).expect("head"),
                             idempotency_key: format!("turn-start:{}", command.turn_id),
                             events: vec![started],
@@ -2348,7 +2343,7 @@ async fn elicitation_admission_uses_committed_turn_and_stream_lifecycle() {
                         terminal.turn_id = Some(command.turn_id.clone());
                         port.owner
                             .append(AppendRequest {
-                                stream_id: port.stream.clone(),
+                                session_id: port.stream.clone(),
                                 expected_head: port.owner.store.head(&port.stream).expect("head"),
                                 idempotency_key: "fixture-cancelled".into(),
                                 events: vec![terminal],
@@ -2617,7 +2612,7 @@ struct ElicitationOwnerLost;
 impl super::super::recovery::StreamExecutionLossVerifier for ElicitationOwnerLost {
     fn verify_stream_loss(
         &self,
-        _: &SessionStreamId,
+        _: &SessionId,
         through: &EventCursor,
     ) -> Result<PayloadRecord, SessionError> {
         Ok(PayloadRecord::json(
@@ -3118,7 +3113,7 @@ async fn message_pages_freeze_selection_preserve_ids_and_recheck_authority() {
         assert_eq!(prior.messages[0].message_id, a);
         assert!(prior.next_cursor.is_none());
         let mut foreign = cursor.clone();
-        foreign.through.stream_id = SessionStreamId::new();
+        foreign.through.session_id = SessionId::new();
         assert!(
             session
                 .query()
@@ -3218,7 +3213,7 @@ async fn native_search_uses_visible_messages_and_current_authority_and_erasure()
                 PrincipalId::shared_operator(),
                 authority.clone(),
                 AppendRequest {
-                    stream_id: session.stream.clone(),
+                    session_id: session.stream.clone(),
                     expected_head: page.through,
                     idempotency_key: "erase-search-leaf".into(),
                     events: vec![intent],
@@ -3277,7 +3272,7 @@ async fn native_search_uses_visible_messages_and_current_authority_and_erasure()
         session
             .owner
             .append(AppendRequest {
-                stream_id: session.stream.clone(),
+                session_id: session.stream.clone(),
                 expected_head: session.owner.store.head(&session.stream).expect("head"),
                 idempotency_key: "confirm-search-erasure".into(),
                 events: vec![
@@ -3543,7 +3538,7 @@ async fn context_sources_keep_ids_unknown_positions_and_validate_references() {
                 .owner
                 .store
                 .append_batch(AppendRequest {
-                    stream_id: session.stream.clone(),
+                    session_id: session.stream.clone(),
                     expected_head: session.owner.head(&session.stream).expect("head"),
                     idempotency_key: "invalid-context".into(),
                     events: vec![event],
@@ -3614,7 +3609,7 @@ async fn child_rejection_and_interrupted_initialization_are_durable_without_disp
             let invocation=InvocationId::new();
             let mut request=SessionEvent::typed(active.stream.clone(),EventData::ChildInvocationRequested {relation:"delegate".into(),execution_mode:ChildExecutionMode::Sync,target_agent_ref:StoredPayloadRef::from(&target),input_projection_ref:StoredPayloadRef::from(&seed),policy_evidence_ref:StoredPayloadRef::from(&evidence),task_id:None},EventActor::System {component:"child_executor".into()})?;
             request.branch_id=Some(active.branch.clone());request.turn_id=Some(turn);request.invocation_id=Some(invocation.clone());
-            active.owner.store.append_batch(AppendRequest {stream_id:active.stream.clone(),expected_head:active.owner.head(&active.stream)?,idempotency_key:"fixture-child-boundary".into(),events:vec![request.clone()],payloads:vec![target,seed,evidence],erasure_reference_commitment:None})?;
+            active.owner.store.append_batch(AppendRequest {session_id:active.stream.clone(),expected_head:active.owner.head(&active.stream)?,idempotency_key:"fixture-child-boundary".into(),events:vec![request.clone()],payloads:vec![target,seed,evidence],erasure_reference_commitment:None})?;
             let request=active.owner.store.read_event(&request.event_id)?.expect("committed request");
             let child=active.owner.recover_requested_child(request.clone(),Arc::new(ElicitationOwnerLost)).await?;
             let head=active.owner.head(&child)?;
@@ -3767,7 +3762,7 @@ async fn reopened_queued_inputs_preserve_order_parts_and_current_authorization()
                     port.owner
                         .store
                         .append_batch(AppendRequest {
-                            stream_id: port.stream.clone(),
+                            session_id: port.stream.clone(),
                             expected_head: port.owner.store.head(&port.stream).expect("head"),
                             idempotency_key: format!("turn-start:{}", command.turn_id),
                             events: vec![started],
@@ -3867,7 +3862,7 @@ async fn reopened_queued_inputs_preserve_order_parts_and_current_authorization()
                 .owner
                 .store
                 .append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: head.clone(),
                     idempotency_key: "invalid-queued-transform".into(),
                     events: vec![early_transform],
@@ -3899,7 +3894,7 @@ async fn reopened_queued_inputs_preserve_order_parts_and_current_authorization()
                     EventData::RecoveryObserved {
                         prior_execution_ref: None,
                         through_cursor: EventCursor {
-                            stream_id: stream.clone(),
+                            session_id: stream.clone(),
                             sequence: requeued.sequence,
                         },
                         disposition: RecoveryDisposition::Rescheduled {
@@ -3917,7 +3912,7 @@ async fn reopened_queued_inputs_preserve_order_parts_and_current_authorization()
                     .owner
                     .store
                     .append_batch(AppendRequest {
-                        stream_id: stream.clone(),
+                        session_id: stream.clone(),
                         expected_head: head.clone(),
                         idempotency_key: "invalid-first-reschedule".into(),
                         events: vec![rescheduled],
@@ -4041,7 +4036,7 @@ async fn recovered_queued_input_resolves_the_current_canonical_agent_alias() {
         port.owner
             .store
             .append_batch(AppendRequest {
-                stream_id: port.stream.clone(),
+                session_id: port.stream.clone(),
                 expected_head: port.owner.store.head(&port.stream).unwrap(),
                 idempotency_key: "agent-rename".into(),
                 events: vec![event],
@@ -4351,7 +4346,7 @@ async fn child_initialization_failure_settles_parent_without_a_child_handle() {
 
         fn read_page(
             &self,
-            stream: &SessionStreamId,
+            stream: &SessionId,
             after: &EventCursor,
             through: Option<&EventCursor>,
             max_events: usize,
@@ -4359,13 +4354,13 @@ async fn child_initialization_failure_settles_parent_without_a_child_handle() {
             self.inner.read_page(stream, after, through, max_events)
         }
 
-        fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
+        fn head(&self, stream: &SessionId) -> Result<EventCursor, ReadError> {
             self.inner.head(stream)
         }
 
         fn lookup_receipt(
             &self,
-            stream: &SessionStreamId,
+            stream: &SessionId,
             key: &str,
         ) -> Result<Option<AppendReceipt>, ReadError> {
             self.inner.lookup_receipt(stream, key)
@@ -4378,7 +4373,7 @@ async fn child_initialization_failure_settles_parent_without_a_child_handle() {
         fn erasure_scope(
             &self,
             targets: &[StoredPayloadRef],
-        ) -> Result<(Vec<SessionStreamId>, Digest), AppendError> {
+        ) -> Result<(Vec<SessionId>, Digest), AppendError> {
             self.inner.erasure_scope(targets)
         }
     }
@@ -4470,7 +4465,7 @@ async fn child_initialization_failure_settles_parent_without_a_child_handle() {
                             .contains("fixture child initialization write failed")
                     );
                 }
-                let child_stream = SessionStreamId::parse(format!(
+                let child_stream = SessionId::parse(format!(
                     "child-{}",
                     request.invocation_id.as_ref().expect("invocation")
                 ))
@@ -4571,7 +4566,7 @@ async fn unadmitted_child_interruption_closes_stream_without_inventing_a_turn() 
                 .iter()
                 .find(|event| event.body.kind() == EventKind::ChildInvocationRequested)
                 .expect("request");
-            let child_stream = SessionStreamId::parse(format!(
+            let child_stream = SessionId::parse(format!(
                 "child-{}",
                 request.invocation_id.as_ref().expect("invocation")
             ))
@@ -4642,7 +4637,7 @@ async fn unadmitted_child_interruption_closes_stream_without_inventing_a_turn() 
                 let cursor: EventCursor =
                     serde_json::from_value(evidence["child_closed_cursor"].clone())
                         .expect("closed cursor");
-                assert_eq!(cursor.stream_id, child_stream);
+                assert_eq!(cursor.session_id, child_stream);
                 assert_eq!(
                     cursor.sequence,
                     child_history.last().expect("closed").sequence
@@ -4700,7 +4695,7 @@ async fn stopped_child_without_effect_is_cancelled_and_settles_parent() {
             .expect("child settled");
         let child = port
             .owner
-            .stream_history(&terminal.stream_id)
+            .stream_history(&terminal.session_id)
             .expect("child history");
         assert!(child.iter().any(|event| matches!(&event.body.data, EventData::TurnCancelled {reason_key, ..} if reason_key == "child_execution_owner_lost_before_effect")));
         assert!(!child.iter().any(|event| matches!(
@@ -4799,7 +4794,7 @@ async fn legally_erased_recovered_inputs_are_cancelled_without_blocking_later_wo
                         PrincipalId::shared_operator(),
                         authority.clone(),
                         AppendRequest {
-                            stream_id: port.stream.clone(),
+                            session_id: port.stream.clone(),
                             expected_head: port.owner.store.head(&port.stream).expect("head"),
                             idempotency_key: "erase-queued-input".into(),
                             events: vec![intent],
@@ -4812,7 +4807,7 @@ async fn legally_erased_recovered_inputs_are_cancelled_without_blocking_later_wo
                 if confirm {
                     port.owner
                         .append(AppendRequest {
-                            stream_id: port.stream.clone(),
+                            session_id: port.stream.clone(),
                             expected_head: port.owner.store.head(&port.stream).expect("head"),
                             idempotency_key: "confirm-erased-queued-input".into(),
                             events: vec![
@@ -4866,7 +4861,7 @@ async fn dropped_admission_waiter_settles_a_later_worker_commit() {
         fn authorize(
             &self,
             _: &PrincipalId,
-            _: &SessionStreamId,
+            _: &SessionId,
             _: SessionAccess,
         ) -> Result<(), SessionError> {
             self.entered.notify_one();

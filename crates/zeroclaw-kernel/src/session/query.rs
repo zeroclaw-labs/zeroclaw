@@ -23,7 +23,7 @@ pub trait SessionAccessPolicy: Send + Sync {
     fn authorize_reasoning(
         &self,
         _actor: &EventActor,
-        _stream: &SessionStreamId,
+        _stream: &SessionId,
     ) -> Result<(), SessionError> {
         Err(SessionError::PermissionDenied(
             "reasoning disclosure denied".into(),
@@ -34,7 +34,7 @@ pub trait SessionAccessPolicy: Send + Sync {
     fn authorize_actor(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         match actor {
@@ -49,7 +49,7 @@ pub trait SessionAccessPolicy: Send + Sync {
     fn authorize(
         &self,
         principal: &PrincipalId,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError>;
 }
@@ -118,7 +118,7 @@ impl SessionCoordinator {
         mut request: AppendRequest,
         finish: bool,
     ) -> Result<AppendReceipt, SessionError> {
-        policy.authorize(&principal, &request.stream_id, SessionAccess::Erase)?;
+        policy.authorize(&principal, &request.session_id, SessionAccess::Erase)?;
         if request.events.iter().any(|event| {
             !matches!(&event.body.data, EventData::PayloadErasureRequested { .. })
                 || event.actor
@@ -146,7 +146,7 @@ impl SessionCoordinator {
         }
         let owner = Arc::clone(self);
         self.blocking(move || {
-            let lock = owner.lock_for(&request.stream_id);
+            let lock = owner.lock_for(&request.session_id);
             let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let (scopes, commitment) = owner.store.erasure_scope(&targets)?;
             if scopes.is_empty() {
@@ -154,13 +154,13 @@ impl SessionCoordinator {
                     "erasure target has no authorized event reference".into(),
                 ));
             }
-            policy.authorize(&principal, &request.stream_id, SessionAccess::Erase)?;
+            policy.authorize(&principal, &request.session_id, SessionAccess::Erase)?;
             for stream in scopes {
                 policy.authorize(&principal, &stream, SessionAccess::Erase)?;
             }
             request.erasure_reference_commitment = Some(commitment);
             // Backend rechecks the graph while holding the publication lock.
-            let stream = request.stream_id.clone();
+            let stream = request.session_id.clone();
             let receipt = owner.store.append_batch(request)?;
             let _ = owner.wakeups.send(stream.clone());
             if finish {
@@ -183,7 +183,7 @@ impl SessionQuery {
     /// page; concurrent appends cannot move this projection's frontier.
     pub async fn project_history(
         &self,
-        stream: SessionStreamId,
+        stream: SessionId,
     ) -> Result<zeroclaw_api::session_events::projection::HistoryProjection, SessionError> {
         let mut projection =
             zeroclaw_api::session_events::projection::HistoryProjection::empty(stream.clone());
@@ -214,9 +214,9 @@ impl SessionQuery {
                                 TurnCompletion, projection::InvocationStatus,
                             };
                             let page = owner.store.read_page(
-                                &terminal.stream_id,
+                                &terminal.session_id,
                                 &EventCursor {
-                                    stream_id: terminal.stream_id.clone(),
+                                    session_id: terminal.session_id.clone(),
                                     sequence: terminal.sequence - 1,
                                 },
                                 Some(&terminal),
@@ -275,7 +275,7 @@ impl SessionQuery {
     /// returned independently; transports must not infer files from markers.
     pub async fn messages(
         &self,
-        stream: SessionStreamId,
+        stream: SessionId,
     ) -> Result<Vec<HistoricalMessage>, SessionError> {
         Ok(self
             .message_window(stream, None, None, None)
@@ -285,7 +285,7 @@ impl SessionQuery {
 
     pub async fn search_messages(
         &self,
-        stream: SessionStreamId,
+        stream: SessionId,
         keyword: &str,
         limit: usize,
     ) -> Result<Vec<HistoricalMessage>, SessionError> {
@@ -342,7 +342,7 @@ impl SessionQuery {
     /// erasure afresh. Only page-selected native content leaves are loaded.
     pub async fn message_page(
         &self,
-        stream: SessionStreamId,
+        stream: SessionId,
         cursor: Option<MessageCursor>,
         limit: usize,
     ) -> Result<HistoricalMessagePage, SessionError> {
@@ -352,7 +352,7 @@ impl SessionQuery {
             ));
         }
         if cursor.as_ref().is_some_and(|cursor| {
-            cursor.through.stream_id != stream || cursor.branch != self.branch
+            cursor.through.session_id != stream || cursor.branch != self.branch
         }) {
             return Err(SessionError::InvalidAdmission(
                 "message cursor belongs to another stream".into(),
@@ -366,7 +366,7 @@ impl SessionQuery {
     }
     async fn message_window(
         &self,
-        stream: SessionStreamId,
+        stream: SessionId,
         frozen: Option<EventCursor>,
         before: Option<usize>,
         limit: Option<usize>,
@@ -568,7 +568,7 @@ impl SessionQuery {
     /// metadata. Never load raw file bytes merely to build a history row.
     async fn ingress_attachment(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         event: &SessionEvent,
     ) -> Result<Option<zeroclaw_api::media::AttachmentReference>, SessionError> {
         let EventData::FileUsed {
@@ -640,7 +640,7 @@ impl SessionQuery {
     /// context, reasoning continuation or opaque tool extensions to a viewer.
     async fn seed_messages_at(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         event: &SessionEvent,
     ) -> Result<Vec<HistoricalMessage>, SessionError> {
         self.policy
@@ -767,7 +767,7 @@ impl SessionQuery {
 
     async fn message_at(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         sequence: u64,
         path: Vec<usize>,
         role: &str,
@@ -873,7 +873,7 @@ impl SessionQuery {
     }
     pub async fn latest_event(
         &self,
-        stream: SessionStreamId,
+        stream: SessionId,
         branch: BranchId,
         turn: Option<TurnId>,
         kind: EventKind,
@@ -892,7 +892,7 @@ impl SessionQuery {
     }
     pub async fn read_page(
         &self,
-        stream: SessionStreamId,
+        stream: SessionId,
         after: EventCursor,
         through: Option<EventCursor>,
         max_events: usize,
@@ -912,7 +912,7 @@ impl SessionQuery {
 
     pub async fn read_payload(
         &self,
-        stream: SessionStreamId,
+        stream: SessionId,
         selector: PayloadSelector,
     ) -> Result<PayloadRead, SessionError> {
         if selector.event_sequence == 0
@@ -931,11 +931,11 @@ impl SessionQuery {
             .coordinator
             .blocking(move || {
                 let cursor = EventCursor {
-                    stream_id: scope.clone(),
+                    session_id: scope.clone(),
                     sequence: selector.event_sequence,
                 };
                 let after = EventCursor {
-                    stream_id: scope.clone(),
+                    session_id: scope.clone(),
                     sequence: selector.event_sequence - 1,
                 };
                 let page = store.read_page(&scope, &after, Some(&cursor), 1)?;
@@ -1079,14 +1079,14 @@ pub struct SessionSubscription {
     query: SessionQuery,
     cursor: EventCursor,
     offered_through: Option<EventCursor>,
-    wakeups: broadcast::Receiver<SessionStreamId>,
+    wakeups: broadcast::Receiver<SessionId>,
 }
 
 impl SessionSubscription {
     pub async fn validate_cursor(&self) -> Result<(), SessionError> {
         self.query
             .read_page(
-                self.cursor.stream_id.clone(),
+                self.cursor.session_id.clone(),
                 self.cursor.clone(),
                 Some(self.cursor.clone()),
                 1,
@@ -1099,14 +1099,14 @@ impl SessionSubscription {
     pub fn authorize_current(&self) -> Result<(), SessionError> {
         self.query.policy.authorize_actor(
             &self.query.actor,
-            &self.cursor.stream_id,
+            &self.cursor.session_id,
             SessionAccess::Read,
         )
     }
     /// Advance only after the caller has accepted a page. Cancellation of a
     /// wait never loses history or implicitly acknowledges delivery.
     pub fn acknowledge(&mut self, cursor: EventCursor) -> Result<(), SessionError> {
-        if cursor.stream_id != self.cursor.stream_id
+        if cursor.session_id != self.cursor.session_id
             || cursor.sequence < self.cursor.sequence
             || cursor.sequence
                 > self
@@ -1127,7 +1127,7 @@ impl SessionSubscription {
             let page = match self
                 .query
                 .read_page(
-                    self.cursor.stream_id.clone(),
+                    self.cursor.session_id.clone(),
                     self.cursor.clone(),
                     None,
                     max_events,
@@ -1144,7 +1144,7 @@ impl SessionSubscription {
             };
             if !page.events.is_empty() {
                 self.offered_through = page.events.last().map(|event| EventCursor {
-                    stream_id: page.stream_id.clone(),
+                    session_id: page.session_id.clone(),
                     sequence: event.sequence,
                 });
                 return Ok(SubscriptionUpdate::Page(page));

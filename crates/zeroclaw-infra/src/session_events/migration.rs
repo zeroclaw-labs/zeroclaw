@@ -9,7 +9,7 @@ mod sqlite;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct NativeBatch {
-    pub stream: SessionStreamId,
+    pub stream: SessionId,
     pub key: String,
     pub commitment: Digest,
     pub raw: Vec<Vec<u8>>,
@@ -47,7 +47,7 @@ impl NativeImage {
             commitment: &'a Digest,
             key: &'a str,
             raw: &'a Vec<Vec<u8>>,
-            stream: &'a SessionStreamId,
+            stream: &'a SessionId,
         }
         #[derive(Serialize)]
         struct Image<'a> {
@@ -115,7 +115,7 @@ impl NativeImage {
             for raw in &batch.raw {
                 let event =
                     parse_event(raw).map_err(|error| AppendError::Corrupt(error.to_string()))?;
-                if event.stream_id != batch.stream || event.sequence != *head + 1 {
+                if event.session_id != batch.stream || event.sequence != *head + 1 {
                     return Err(AppendError::Corrupt("migration event chain differs".into()));
                 }
                 *head = event.sequence;
@@ -190,12 +190,12 @@ fn raw_payload_refs(
 // leaves and validate the complete image before exposing it.
 pub(super) fn select_family(
     mut image: NativeImage,
-    root: Option<&SessionStreamId>,
+    root: Option<&SessionId>,
 ) -> Result<NativeImage, AppendError> {
     let events = image.events()?;
     if root.is_some_and(|root| {
         !events.iter().any(|event| {
-            event.stream_id == *root
+            event.session_id == *root
                 && event.sequence == 1
                 && matches!(event.body.data, EventData::SessionStarted { .. })
         })
@@ -207,7 +207,12 @@ pub(super) fn select_family(
         .map(|event| (event.event_id.clone(), event))
         .collect();
     let mut streams: BTreeSet<_> = root.map_or_else(
-        || events.iter().map(|event| event.stream_id.clone()).collect(),
+        || {
+            events
+                .iter()
+                .map(|event| event.session_id.clone())
+                .collect()
+        },
         |root| BTreeSet::from([root.clone()]),
     );
     loop {
@@ -218,9 +223,9 @@ pub(super) fn select_family(
                     .causation_id
                     .as_ref()
                     .and_then(|id| by_id.get(id))
-                    .is_some_and(|parent| streams.contains(&parent.stream_id))
+                    .is_some_and(|parent| streams.contains(&parent.session_id))
             {
-                streams.insert(event.stream_id.clone());
+                streams.insert(event.session_id.clone());
             }
         }
         if streams.len() == before {
@@ -232,7 +237,7 @@ pub(super) fn select_family(
     // doing so would make the source family and the target family disagree on
     // the same payload identity.  Require the caller to migrate the complete
     // reference component instead.
-    let mut payload_streams: BTreeMap<PayloadId, BTreeSet<SessionStreamId>> = BTreeMap::new();
+    let mut payload_streams: BTreeMap<PayloadId, BTreeSet<SessionId>> = BTreeMap::new();
     for batch in &image.batches {
         for raw in &batch.raw {
             let value = serde_json::from_slice(raw)
@@ -319,7 +324,7 @@ pub(super) fn select_family(
         }
     }
     let mut dependencies = vec![BTreeSet::new(); image.batches.len()];
-    let mut stream_batches: BTreeMap<SessionStreamId, Vec<(u64, usize)>> = BTreeMap::new();
+    let mut stream_batches: BTreeMap<SessionId, Vec<(u64, usize)>> = BTreeMap::new();
     for (index, batch) in image.batches.iter().enumerate() {
         let first = batch
             .raw
@@ -391,7 +396,7 @@ pub(super) fn select_family(
             .causation_id
             .as_ref()
             .and_then(|id| by_id.get(id))
-            .is_some_and(|cause| !streams.contains(&cause.stream_id))
+            .is_some_and(|cause| !streams.contains(&cause.session_id))
         {
             return Err(AppendError::InvalidReference(
                 "migration references another family".into(),
@@ -439,7 +444,7 @@ pub(super) fn select_family(
 pub(super) fn export(
     data_dir: &Path,
     backend: NativeBackend,
-    root: Option<&SessionStreamId>,
+    root: Option<&SessionId>,
 ) -> Result<NativeImage, AppendError> {
     match backend {
         NativeBackend::Sqlite => SqliteEventStore::open(data_dir)?.export_native(root),
@@ -492,7 +497,7 @@ pub(super) fn migrate_locked(
         return installation.finish(target);
     }
     let image = export(data_dir, source, None)?;
-    let families = installation::session_keys(data_dir, source)?;
+    let families = installation::session_ids(data_dir, source)?;
     let _leases = families
         .keys()
         .map(|family| ownership::SessionExecutionLease::acquire(data_dir, family))

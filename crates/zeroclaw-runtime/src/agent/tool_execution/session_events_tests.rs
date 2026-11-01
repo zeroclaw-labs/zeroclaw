@@ -16,14 +16,14 @@ impl ToolObservationPort for CaptureFixture {
         payloads: Vec<PayloadRecord>,
     ) -> anyhow::Result<AppendReceipt> {
         self.0.lock().expect("observations").push((data, payloads));
-        let stream = SessionStreamId::from("fixture-stream");
+        let stream = SessionId::from("fixture-stream");
         Ok(AppendReceipt {
             first: EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence: 1,
             },
             last: EventCursor {
-                stream_id: stream,
+                session_id: stream,
                 sequence: 1,
             },
             event_ids: vec![EventId::new()],

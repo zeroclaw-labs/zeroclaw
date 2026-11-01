@@ -69,12 +69,7 @@ fn render_native_summary(summary: &zeroclaw_api::session_events::views::SessionS
     tool_msg_with_args(
         "tool-sessions-native-summary",
         &[
-            (
-                "session_id",
-                summary
-                    .session_key()
-                    .unwrap_or(summary.head.stream_id.as_str()),
-            ),
+            ("session_id", summary.head.session_id.as_str()),
             ("channel", summary.channel_id().unwrap_or("")),
             ("messages", &summary.message_count.to_string()),
             ("last_activity", &summary.last_activity.to_string()),
@@ -455,16 +450,14 @@ mod tests {
         async fn current(
             &self,
         ) -> anyhow::Result<zeroclaw_api::session_events::views::SessionSummary> {
-            use zeroclaw_api::session_events::{
-                EventCursor, SessionStreamId, views::SessionSummary,
-            };
+            use zeroclaw_api::session_events::{EventCursor, SessionId, views::SessionSummary};
             anyhow::ensure!(
                 self.0.load(std::sync::atomic::Ordering::SeqCst),
                 "native_read_revoked"
             );
             Ok(SessionSummary {
                 session_id: None,
-                head: EventCursor::beginning(SessionStreamId::new()),
+                head: EventCursor::beginning(SessionId::new()),
                 owning_agent: Some("fixture".into()),
                 fields: std::collections::BTreeMap::from([(
                     "session_key".into(),

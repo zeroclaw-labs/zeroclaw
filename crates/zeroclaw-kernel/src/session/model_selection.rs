@@ -92,7 +92,7 @@ impl SessionCoordinator {
     ) -> Result<(), SessionError> {
         let owner = self.clone();
         self.blocking(move || {
-            let stream = control.stream_id.clone();
+            let stream = control.session_id.clone();
             let branch = control
                 .branch_id
                 .clone()
@@ -155,7 +155,7 @@ impl SessionCoordinator {
                 events.push(revision);
             }
             let request = AppendRequest {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 expected_head: head,
                 idempotency_key: key,
                 events,

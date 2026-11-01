@@ -7,7 +7,7 @@ pub(super) struct RepositoryView<'a>(pub SessionCatalog, pub &'a str);
 
 impl RepositoryView<'_> {
     pub fn record(&self, id: &str) -> Result<Option<Session>> {
-        let stream = crate::session_events::upgrade::stream_id(&format!("{}{id}", self.1))?;
+        let stream = zeroclaw_api::session_events::SessionId::parse(format!("{}{id}", self.1))?;
         Ok(self
             .0
             .query()
@@ -16,7 +16,7 @@ impl RepositoryView<'_> {
     }
 
     pub fn detail(&self, id: &str) -> Result<Option<SessionDetail>> {
-        let stream = crate::session_events::upgrade::stream_id(&format!("{}{id}", self.1))?;
+        let stream = zeroclaw_api::session_events::SessionId::parse(format!("{}{id}", self.1))?;
         Ok(self
             .0
             .query()
@@ -37,7 +37,7 @@ impl RepositoryView<'_> {
         fields: Vec<(&str, serde_json::Value)>,
     ) -> Result<i64> {
         let family = format!("{}{id}", self.1);
-        let stream = crate::session_events::upgrade::stream_id(&family)?;
+        let stream = zeroclaw_api::session_events::SessionId::parse(family.clone())?;
         if let Some(record) = self.0.query().summary(&stream)? {
             anyhow::ensure!(
                 !record.closed && !record.deleted && !record.fields.contains_key("workspace_dir"),

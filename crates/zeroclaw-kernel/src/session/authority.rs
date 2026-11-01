@@ -5,7 +5,7 @@ use zeroclaw_api::session_events::*;
 impl SessionCoordinator {
     pub(super) fn authority_observation(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &BranchId,
         actor: &EventActor,
         binding: &PayloadRecord,
@@ -79,7 +79,7 @@ impl SessionCoordinator {
                 previous_observation_event_id: previous.map(|event| event.event_id),
                 change_record_ref: None,
                 affected_scope_ref: TargetRef::Session {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                 },
                 reason_key: "current_authority_revision_observed".into(),
             },
@@ -103,12 +103,11 @@ mod tests {
             let store = zeroclaw_infra::session_events::open_event_store(directory.path(), backend)
                 .expect("store");
             let owner = SessionCoordinator::new(store);
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             let branch = BranchId::new();
             let mut root = SessionEvent::typed(
                 stream.clone(),
                 EventData::SessionStarted {
-                    session_id: SessionId::new(),
                     owning_agent: "fixture".into(),
                     capture_mode: CaptureMode::Native,
                 },
@@ -118,7 +117,7 @@ mod tests {
             root.branch_id = Some(branch.clone());
             owner
                 .append(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: EventCursor::beginning(stream.clone()),
                     idempotency_key: "root".into(),
                     events: vec![root],
@@ -146,7 +145,7 @@ mod tests {
                     let EventData::AuthorityRevisionObserved {revision_evidence_ref, ..} = &event.body.data else {unreachable!()};
                     assert_eq!(*revision_evidence_ref, StoredPayloadRef::from(&binding));
                     owner.append(AppendRequest {
-                        stream_id:stream.clone(), expected_head:owner.store.head(&stream).expect("head"),
+                        session_id:stream.clone(), expected_head:owner.store.head(&stream).expect("head"),
                         idempotency_key:format!("revision-{index}"), events:vec![event],
                         payloads:vec![binding], erasure_reference_commitment:None,
                     }).expect("commit observation");

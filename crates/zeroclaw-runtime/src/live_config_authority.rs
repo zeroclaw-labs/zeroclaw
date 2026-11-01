@@ -1582,7 +1582,7 @@ impl AgentHistoryAdmission {
 pub struct AgentHistoryAuthority {
     pub admission: AgentHistoryAdmission,
     pub actor: zeroclaw_api::session_events::EventActor,
-    pub stream: zeroclaw_api::session_events::SessionStreamId,
+    pub stream: zeroclaw_api::session_events::SessionId,
     pub origin: zeroclaw_api::ingress::TurnOrigin,
     pub parent_alias: Option<String>,
 }
@@ -1629,7 +1629,7 @@ impl AgentHistoryAuthority {
     }
     fn check_stream(
         &self,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         if stream != &self.stream {
             return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
@@ -1643,7 +1643,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for AgentHistoryAuthor
     fn authorize_reasoning(
         &self,
         actor: &zeroclaw_api::session_events::EventActor,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         if !matches!(actor, zeroclaw_api::session_events::EventActor::Principal { principal_id } if *principal_id == zeroclaw_api::principal::PrincipalId::shared_operator().0)
         {
@@ -1660,7 +1660,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for AgentHistoryAuthor
     fn authorize(
         &self,
         principal: &zeroclaw_api::principal::PrincipalId,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
         access: zeroclaw_kernel::session::query::SessionAccess,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         self.authorize_actor(
@@ -1674,7 +1674,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for AgentHistoryAuthor
     fn authorize_actor(
         &self,
         actor: &zeroclaw_api::session_events::EventActor,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
         access: zeroclaw_kernel::session::query::SessionAccess,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         if actor != &self.actor
@@ -1693,7 +1693,7 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for AgentHistoryAuthor
 impl zeroclaw_kernel::session::PermissionResolver for AgentHistoryAuthority {
     fn tool_authority_evidence(
         &self,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
         name: &str,
     ) -> Result<serde_json::Value, zeroclaw_kernel::session::SessionError> {
         self.check_stream(stream)?;
@@ -1721,7 +1721,7 @@ impl zeroclaw_kernel::session::PermissionResolver for AgentHistoryAuthority {
 
     fn authorize_context(
         &self,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
         _branch: &zeroclaw_api::session_events::BranchId,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
         self.check_stream(stream)
@@ -1730,7 +1730,7 @@ impl zeroclaw_kernel::session::PermissionResolver for AgentHistoryAuthority {
         &self,
         intent: &zeroclaw_kernel::session::EffectIntent,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
-        self.check_stream(&intent.stream_id)
+        self.check_stream(&intent.session_id)
     }
     fn authorize_tool(
         &self,
@@ -1738,7 +1738,7 @@ impl zeroclaw_kernel::session::PermissionResolver for AgentHistoryAuthority {
         name: &str,
         _arguments: &serde_json::Value,
     ) -> Result<(), zeroclaw_kernel::session::SessionError> {
-        self.check_stream(&intent.stream_id)?;
+        self.check_stream(&intent.session_id)?;
         let handle = self.admission.capability().config_handle();
         let config = handle.read();
         let profile = config
@@ -1761,7 +1761,7 @@ impl zeroclaw_kernel::session::PermissionResolver for AgentHistoryAuthority {
     fn child_authority(
         &self,
         target: &str,
-        stream: &zeroclaw_api::session_events::SessionStreamId,
+        stream: &zeroclaw_api::session_events::SessionId,
     ) -> Result<
         std::sync::Arc<dyn zeroclaw_kernel::session::engine::EngineSessionAuthority>,
         zeroclaw_kernel::session::SessionError,
@@ -1879,7 +1879,7 @@ mod tests {
             actor: zeroclaw_api::session_events::EventActor::System {
                 component: "fixture".into(),
             },
-            stream: zeroclaw_api::session_events::SessionStreamId::new(),
+            stream: zeroclaw_api::session_events::SessionId::new(),
             origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
             parent_alias: None,
         };
@@ -1891,7 +1891,7 @@ mod tests {
         let child = zeroclaw_kernel::session::PermissionResolver::child_authority(
             &history,
             "child",
-            &zeroclaw_api::session_events::SessionStreamId::new(),
+            &zeroclaw_api::session_events::SessionId::new(),
         )
         .unwrap();
         let record = child.maintenance_binding().unwrap();

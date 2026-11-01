@@ -47,7 +47,7 @@ impl SessionAccessPolicy for PeerAuthority {
     fn authorize(
         &self,
         principal: &PrincipalId,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         self.current()?;
@@ -56,7 +56,7 @@ impl SessionAccessPolicy for PeerAuthority {
     fn authorize_actor(
         &self,
         actor: &EventActor,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         access: SessionAccess,
     ) -> Result<(), SessionError> {
         self.current()?;
@@ -66,7 +66,7 @@ impl SessionAccessPolicy for PeerAuthority {
 impl PermissionResolver for PeerAuthority {
     fn tool_authority_evidence(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         name: &str,
     ) -> Result<serde_json::Value, SessionError> {
         self.current()?;
@@ -76,11 +76,7 @@ impl PermissionResolver for PeerAuthority {
         self.current()?;
         PermissionResolver::authorize(self.base.as_ref(), intent)
     }
-    fn authorize_context(
-        &self,
-        stream: &SessionStreamId,
-        branch: &BranchId,
-    ) -> Result<(), SessionError> {
+    fn authorize_context(&self, stream: &SessionId, branch: &BranchId) -> Result<(), SessionError> {
         self.current()?;
         self.base.authorize_context(stream, branch)
     }
@@ -96,7 +92,7 @@ impl PermissionResolver for PeerAuthority {
     fn child_authority(
         &self,
         target: &str,
-        stream: &SessionStreamId,
+        stream: &SessionId,
     ) -> Result<Arc<dyn EngineSessionAuthority>, SessionError> {
         self.current()?;
         Ok(Arc::new(Self {
@@ -137,7 +133,7 @@ pub(super) async fn open(
         actor: EventActor::System {
             component: "peer_inbox".into(),
         },
-        stream: source.stream_id(&family).await?,
+        stream: source.session_id(&family).await?,
         origin: zeroclaw_api::ingress::TurnOrigin::AgentDirect,
         parent_alias: None,
     });
@@ -197,7 +193,7 @@ mod tests {
         );
         let live = crate::LiveConfigAuthority::new(config.clone());
         let capability = live.execution_capability();
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let peer = PeerAuthority {
             base: Arc::new(crate::live_config_authority::AgentHistoryAuthority {
                 admission: capability.admit("recipient").expect("admission").into(),
@@ -236,7 +232,7 @@ mod tests {
             serde_json::json!(["shell"])
         );
         assert!(
-            peer.tool_authority_evidence(&SessionStreamId::new(), "shell")
+            peer.tool_authority_evidence(&SessionId::new(), "shell")
                 .is_err()
         );
         config.peer_groups.clear();

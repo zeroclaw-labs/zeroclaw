@@ -21,7 +21,7 @@ struct Root {
 struct Commit {
     previous: Option<FileRef>,
     segment: FileRef,
-    stream_id: SessionStreamId,
+    session_id: SessionId,
     idempotency_key: String,
     commitment: Digest,
     first: u64,
@@ -72,17 +72,17 @@ pub struct JsonlEventStore {
     index: Mutex<Snapshot>,
 }
 impl JsonlEventStore {
-    pub(super) fn session_streams(&self) -> Result<Vec<SessionStreamId>, AppendError> {
+    pub(super) fn session_streams(&self) -> Result<Vec<SessionId>, AppendError> {
         let _guard = self.lock()?;
         let snapshot = self.snapshot()?;
         snapshot
             .rows
             .keys()
-            .map(|stream| SessionStreamId::parse(stream).map_err(AppendError::from))
+            .map(|stream| SessionId::parse(stream).map_err(AppendError::from))
             .collect()
     }
 
-    pub(super) fn root_streams(&self) -> Result<Vec<SessionStreamId>, AppendError> {
+    pub(super) fn root_sessions(&self) -> Result<Vec<SessionId>, AppendError> {
         let _guard = self.lock()?;
         let snapshot = self.snapshot()?;
         let mut result = Vec::new();
@@ -97,7 +97,7 @@ impl JsonlEventStore {
                     event.body.data,
                     zeroclaw_api::session_events::EventData::SessionStarted { .. }
                 ) {
-                    result.push(event.stream_id.clone());
+                    result.push(event.session_id.clone());
                 }
             }
         }
@@ -105,7 +105,7 @@ impl JsonlEventStore {
     }
     pub(super) fn export_native(
         &self,
-        root: Option<&SessionStreamId>,
+        root: Option<&SessionId>,
     ) -> Result<super::migration::NativeImage, AppendError> {
         use super::migration::*;
         let _guard = self.lock()?;
@@ -121,7 +121,7 @@ impl JsonlEventStore {
                 .map(<[u8]>::to_vec)
                 .collect();
             chain.push(NativeBatch {
-                stream: commit.stream_id,
+                stream: commit.session_id,
                 key: commit.idempotency_key,
                 commitment: commit.commitment,
                 raw,
@@ -286,7 +286,7 @@ impl JsonlEventStore {
             let commit = Commit {
                 previous: tip,
                 segment,
-                stream_id: batch.stream.clone(),
+                session_id: batch.stream.clone(),
                 idempotency_key: batch.key.clone(),
                 commitment: batch.commitment.clone(),
                 first: first.sequence,
@@ -459,7 +459,7 @@ impl JsonlEventStore {
             }
             let rows = snapshot
                 .rows
-                .entry(commit.stream_id.to_string())
+                .entry(commit.session_id.to_string())
                 .or_default();
             let expected = (rows.len() as u64)
                 .checked_add(1)
@@ -480,7 +480,7 @@ impl JsonlEventStore {
             {
                 let event =
                     parse_event(line).map_err(|error| AppendError::Corrupt(error.to_string()))?;
-                if event.stream_id != commit.stream_id
+                if event.session_id != commit.session_id
                     || event.sequence
                         != commit
                             .first
@@ -526,7 +526,7 @@ impl JsonlEventStore {
                 snapshot.positions.insert(
                     event.event_id.clone(),
                     (
-                        commit.stream_id.to_string(),
+                        commit.session_id.to_string(),
                         rows.len(),
                         commit.segment.clone(),
                         commit_reference.clone(),
@@ -550,11 +550,11 @@ impl JsonlEventStore {
             }
             let receipt = AppendReceipt {
                 first: EventCursor {
-                    stream_id: commit.stream_id.clone(),
+                    session_id: commit.session_id.clone(),
                     sequence: commit.first,
                 },
                 last: EventCursor {
-                    stream_id: commit.stream_id.clone(),
+                    session_id: commit.session_id.clone(),
                     sequence: commit.last,
                 },
                 event_ids,
@@ -562,7 +562,7 @@ impl JsonlEventStore {
             if snapshot
                 .receipts
                 .insert(
-                    (commit.stream_id.to_string(), commit.idempotency_key),
+                    (commit.session_id.to_string(), commit.idempotency_key),
                     (commit.commitment, receipt),
                 )
                 .is_some()
@@ -682,7 +682,7 @@ fn as_read(error: AppendError) -> ReadError {
 impl SessionEventStore for JsonlEventStore {
     fn read_latest_event(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &zeroclaw_api::session_events::BranchId,
         turn: Option<&zeroclaw_api::session_events::TurnId>,
         kind: &zeroclaw_api::session_events::EventKind,
@@ -720,7 +720,7 @@ impl SessionEventStore for JsonlEventStore {
         let snapshot = self.snapshot()?;
         let commitment = request.commitment()?;
         if let Some((old, receipt)) = snapshot.receipts.get(&(
-            request.stream_id.to_string(),
+            request.session_id.to_string(),
             request.idempotency_key.clone(),
         )) {
             if *old != commitment {
@@ -729,7 +729,7 @@ impl SessionEventStore for JsonlEventStore {
             self.verify_events(&snapshot, request.events.iter())?;
             return Ok(receipt.clone());
         }
-        let rows = snapshot.rows.get(request.stream_id.as_str());
+        let rows = snapshot.rows.get(request.session_id.as_str());
         self.verify_events(
             &snapshot,
             rows.and_then(|rows| rows.last())
@@ -809,7 +809,7 @@ impl SessionEventStore for JsonlEventStore {
         let commit = Commit {
             previous: snapshot.tip.clone(),
             segment,
-            stream_id: request.stream_id.clone(),
+            session_id: request.session_id.clone(),
             idempotency_key: request.idempotency_key,
             commitment,
             first,
@@ -838,11 +838,11 @@ impl SessionEventStore for JsonlEventStore {
         super::crash_tests::crash_boundary("jsonl_root_published");
         Ok(AppendReceipt {
             first: EventCursor {
-                stream_id: request.stream_id.clone(),
+                session_id: request.session_id.clone(),
                 sequence: first,
             },
             last: EventCursor {
-                stream_id: request.stream_id,
+                session_id: request.session_id,
                 sequence: last,
             },
             event_ids,
@@ -850,7 +850,7 @@ impl SessionEventStore for JsonlEventStore {
     }
     fn read_page(
         &self,
-        stream_id: &SessionStreamId,
+        session_id: &SessionId,
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
@@ -858,14 +858,14 @@ impl SessionEventStore for JsonlEventStore {
         validate_page_limits(max_events)?;
         let _guard = self.lock().map_err(as_read)?;
         let snapshot = self.snapshot().map_err(as_read)?;
-        let rows = snapshot.rows.get(stream_id.as_str());
+        let rows = snapshot.rows.get(session_id.as_str());
         let sequence = rows.map_or(0, |rows| rows.len() as u64);
         let through = through.cloned().unwrap_or(EventCursor {
-            stream_id: stream_id.clone(),
+            session_id: session_id.clone(),
             sequence,
         });
-        if after.stream_id != *stream_id
-            || through.stream_id != *stream_id
+        if after.session_id != *session_id
+            || through.session_id != *session_id
             || after.sequence > through.sequence
             || through.sequence > sequence
         {
@@ -920,7 +920,7 @@ impl SessionEventStore for JsonlEventStore {
             materialized.push((bytes, event));
         }
         event_page(
-            stream_id.clone(),
+            session_id.clone(),
             after.clone(),
             through,
             materialized,
@@ -928,29 +928,29 @@ impl SessionEventStore for JsonlEventStore {
             has_more,
         )
     }
-    fn head(&self, stream_id: &SessionStreamId) -> Result<EventCursor, ReadError> {
+    fn head(&self, session_id: &SessionId) -> Result<EventCursor, ReadError> {
         let _guard = self.lock().map_err(as_read)?;
         let snapshot = self.snapshot().map_err(as_read)?;
         self.verify_events(
             &snapshot,
             snapshot
                 .rows
-                .get(stream_id.as_str())
+                .get(session_id.as_str())
                 .and_then(|rows| rows.last())
                 .and_then(|(_, id)| snapshot.history.get_event(id)),
         )
         .map_err(as_read)?;
         Ok(EventCursor {
-            stream_id: stream_id.clone(),
+            session_id: session_id.clone(),
             sequence: snapshot
                 .rows
-                .get(stream_id.as_str())
+                .get(session_id.as_str())
                 .map_or(0, |rows| rows.len() as u64),
         })
     }
     fn lookup_receipt(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError> {
         let _guard = self.lock().map_err(as_read)?;
@@ -982,7 +982,7 @@ impl SessionEventStore for JsonlEventStore {
     fn erasure_scope(
         &self,
         targets: &[zeroclaw_api::session_events::StoredPayloadRef],
-    ) -> Result<(Vec<SessionStreamId>, Digest), AppendError> {
+    ) -> Result<(Vec<SessionId>, Digest), AppendError> {
         let _guard = self.lock()?;
         let snapshot = self.snapshot()?;
         let history: Vec<_> = snapshot

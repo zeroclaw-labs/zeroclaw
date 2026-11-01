@@ -44,7 +44,7 @@ impl EventStorePool {
         // A session key has one deterministic storage stream. The source
         // marker is metadata on the root event; it is never consulted for
         // routing or enumeration.
-        let root_stream = super::upgrade::stream_id(family)
+        let root_stream = SessionId::parse(family.to_owned())
             .map_err(|error| AppendError::InvalidReference(error.to_string()))?;
         let head = store.head(&root_stream).map_err(super::upgrade::storage)?;
         if head.sequence == 0 {
@@ -54,7 +54,7 @@ impl EventStorePool {
         }
         Ok(ScopedEventStore {
             directory,
-            session_key: family.into(),
+            session_id: family.into(),
             backend,
             generation,
             root_stream,
@@ -89,16 +89,16 @@ impl EventStorePool {
 
 pub struct ScopedEventStore {
     directory: PathBuf,
-    session_key: String,
+    session_id: String,
     backend: NativeBackend,
     generation: u64,
-    root_stream: SessionStreamId,
+    root_stream: SessionId,
     store: Arc<dyn SessionEventStore>,
     cli_state_lease: Option<Arc<super::cli_state::CliStateGuard>>,
     execution_lease: Option<Arc<super::ownership::SessionExecutionLease>>,
 }
 impl ScopedEventStore {
-    pub fn root_stream(&self) -> &SessionStreamId {
+    pub fn root_stream(&self) -> &SessionId {
         &self.root_stream
     }
     pub fn open(data_dir: &Path, family: &str) -> Result<Self, AppendError> {
@@ -131,7 +131,7 @@ impl ScopedEventStore {
         let binding = lease.binding().ok_or_else(|| {
             AppendError::InvalidReference("CLI path has no native binding".into())
         })?;
-        if binding.session_key != family || binding.data_dir != data_dir {
+        if binding.session_id != family || binding.data_dir != data_dir {
             return Err(AppendError::InvalidReference(
                 "CLI path lease belongs to another installation/source".into(),
             ));
@@ -142,11 +142,11 @@ impl ScopedEventStore {
         )?));
         Ok(store)
     }
-    fn root(&self, guard: &InstallationGuard) -> Result<SessionStreamId, AppendError> {
+    fn root(&self, guard: &InstallationGuard) -> Result<SessionId, AppendError> {
         if self.execution_lease.as_ref().is_some_and(|lease| {
             !lease.matches(
                 self.directory.parent().unwrap_or(&self.directory),
-                &self.session_key,
+                &self.session_id,
             )
         }) {
             return Err(AppendError::InvalidReference(
@@ -156,7 +156,7 @@ impl ScopedEventStore {
         if let Some(lease) = &self.cli_state_lease
             && lease
                 .binding()
-                .is_none_or(|binding| binding.session_key != self.session_key)
+                .is_none_or(|binding| binding.session_id != self.session_id)
         {
             return Err(AppendError::InvalidReference(
                 "CLI state ownership binding missing".into(),
@@ -170,12 +170,8 @@ impl ScopedEventStore {
         }
         Ok(self.root_stream.clone())
     }
-    fn require_member(
-        &self,
-        root: &SessionStreamId,
-        request: &AppendRequest,
-    ) -> Result<(), AppendError> {
-        let mut stream = request.stream_id.clone();
+    fn require_member(&self, root: &SessionId, request: &AppendRequest) -> Result<(), AppendError> {
+        let mut stream = request.session_id.clone();
         let mut seen = HashSet::new();
         for _ in 0..64 {
             if stream == *root {
@@ -196,7 +192,7 @@ impl ScopedEventStore {
                         .events
                         .iter()
                         .find(|event| {
-                            event.stream_id == stream
+                            event.session_id == stream
                                 && event.body.kind() == EventKind::DerivedSessionStarted
                         })
                         .cloned()
@@ -221,7 +217,7 @@ impl ScopedEventStore {
             if parent.body.kind() != EventKind::ChildInvocationRequested {
                 return Err(AppendError::InvalidReference("invalid child origin".into()));
             }
-            stream = parent.stream_id;
+            stream = parent.session_id;
         }
         Err(AppendError::InvalidReference(
             "session source depth exceeded".into(),
@@ -231,7 +227,7 @@ impl ScopedEventStore {
 impl SessionEventStore for ScopedEventStore {
     fn read_latest_event(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &zeroclaw_api::session_events::BranchId,
         turn: Option<&zeroclaw_api::session_events::TurnId>,
         kind: &EventKind,
@@ -251,19 +247,19 @@ impl SessionEventStore for ScopedEventStore {
     }
     fn read_page(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         after: &EventCursor,
         through: Option<&EventCursor>,
         events: usize,
     ) -> Result<EventPage, ReadError> {
         self.store.read_page(stream, after, through, events)
     }
-    fn head(&self, stream: &SessionStreamId) -> Result<EventCursor, ReadError> {
+    fn head(&self, stream: &SessionId) -> Result<EventCursor, ReadError> {
         self.store.head(stream)
     }
     fn lookup_receipt(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError> {
         self.store.lookup_receipt(stream, key)
@@ -274,7 +270,7 @@ impl SessionEventStore for ScopedEventStore {
     fn erasure_scope(
         &self,
         targets: &[zeroclaw_api::session_events::StoredPayloadRef],
-    ) -> Result<(Vec<SessionStreamId>, Digest), AppendError> {
+    ) -> Result<(Vec<SessionId>, Digest), AppendError> {
         self.store.erasure_scope(targets)
     }
 }

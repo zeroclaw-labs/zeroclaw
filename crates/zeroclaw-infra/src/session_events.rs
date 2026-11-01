@@ -10,7 +10,7 @@ use std::sync::Arc;
 use zeroclaw_api::session_events::{
     AppendError, AppendReceipt, AppendRequest, ContractError, Digest, EventCursor, EventId,
     EventPage, MAX_BATCH_BYTES, PayloadId, PayloadRead, PayloadRecord, ReadError, SessionEvent,
-    SessionEventStore, SessionStreamId,
+    SessionEventStore, SessionId,
 };
 
 const MAX_PAGE_EVENTS: usize = 10_000;
@@ -100,7 +100,7 @@ fn checkpoint_erasure(conn: &Connection) -> Result<(), AppendError> {
 }
 
 fn event_page(
-    stream_id: SessionStreamId,
+    session_id: SessionId,
     after: EventCursor,
     through: EventCursor,
     rows: Vec<(Vec<u8>, SessionEvent)>,
@@ -112,7 +112,7 @@ fn event_page(
         .checked_add(1)
         .ok_or_else(|| ReadError::Gap("cursor overflow".to_owned()))?;
     for (_, event) in &rows {
-        if event.stream_id != stream_id || event.sequence != expected_sequence {
+        if event.session_id != session_id || event.sequence != expected_sequence {
             return Err(ReadError::Gap(format!(
                 "expected contiguous sequence {}, found {}",
                 expected_sequence, event.sequence
@@ -136,7 +136,7 @@ fn event_page(
         events.push(event);
     }
     Ok(EventPage {
-        stream_id,
+        session_id,
         after,
         through,
         events,
@@ -195,11 +195,11 @@ impl SqliteEventStore {
             conn.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE IF NOT EXISTS session_events(
-               stream_id TEXT NOT NULL,
+               session_id TEXT NOT NULL,
                sequence INTEGER NOT NULL CHECK(sequence > 0),
                event_id TEXT NOT NULL UNIQUE,
                event_json BLOB NOT NULL,
-               PRIMARY KEY(stream_id, sequence)
+               PRIMARY KEY(session_id, sequence)
              );
              CREATE TABLE IF NOT EXISTS event_payloads(
                payload_id TEXT PRIMARY KEY,
@@ -207,18 +207,18 @@ impl SqliteEventStore {
                body BLOB
              );
              CREATE TABLE IF NOT EXISTS session_append_receipts(
-               stream_id TEXT NOT NULL,
+               session_id TEXT NOT NULL,
                idempotency_key TEXT NOT NULL,
                request_commitment TEXT NOT NULL,
                first_seq INTEGER NOT NULL,
                last_seq INTEGER NOT NULL,
-               PRIMARY KEY(stream_id, idempotency_key)
+               PRIMARY KEY(session_id, idempotency_key)
              );
              DROP INDEX IF EXISTS session_events_stream_seq;
              CREATE INDEX IF NOT EXISTS session_events_latest_by_branch_kind
-               ON session_events(stream_id, json_extract(event_json, '$.branch_id'), json_extract(event_json, '$.kind'), sequence DESC);
+               ON session_events(session_id, json_extract(event_json, '$.branch_id'), json_extract(event_json, '$.kind'), sequence DESC);
              CREATE INDEX IF NOT EXISTS session_events_latest_by_turn_kind
-               ON session_events(stream_id, json_extract(event_json, '$.branch_id'), json_extract(event_json, '$.turn_id'), json_extract(event_json, '$.kind'), sequence DESC);
+               ON session_events(session_id, json_extract(event_json, '$.branch_id'), json_extract(event_json, '$.turn_id'), json_extract(event_json, '$.kind'), sequence DESC);
              PRAGMA user_version=1;
              COMMIT;",
         )
@@ -260,9 +260,9 @@ impl SqliteEventStore {
         })
     }
 
-    fn current_head(conn: &Connection, stream: &SessionStreamId) -> Result<u64, ReadError> {
+    fn current_head(conn: &Connection, stream: &SessionId) -> Result<u64, ReadError> {
         conn.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) FROM session_events WHERE stream_id=?1",
+            "SELECT COALESCE(MAX(sequence), 0) FROM session_events WHERE session_id=?1",
             params![stream.as_str()],
             |row| row.get(0),
         )
@@ -271,7 +271,7 @@ impl SqliteEventStore {
 
     fn receipt_range(
         conn: &Connection,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         first: u64,
         last: u64,
     ) -> Result<AppendReceipt, ReadError> {
@@ -282,7 +282,7 @@ impl SqliteEventStore {
         if last > head {
             return Err(ReadError::Corrupt("receipt beyond head".into()));
         }
-        let mut stmt = conn.prepare("SELECT sequence,event_id,event_json FROM session_events WHERE stream_id=?1 AND sequence>=?2 AND sequence<=?3 ORDER BY sequence").map_err(read_error)?;
+        let mut stmt = conn.prepare("SELECT sequence,event_id,event_json FROM session_events WHERE session_id=?1 AND sequence>=?2 AND sequence<=?3 ORDER BY sequence").map_err(read_error)?;
         let mut rows = stmt
             .query(params![stream.as_str(), first, last])
             .map_err(read_error)?;
@@ -296,7 +296,7 @@ impl SqliteEventStore {
             if sequence != expected
                 || event.sequence != sequence
                 || event.event_id.as_str() != id
-                || event.stream_id != *stream
+                || event.session_id != *stream
             {
                 return Err(ReadError::Corrupt("receipt event identity mismatch".into()));
             }
@@ -310,11 +310,11 @@ impl SqliteEventStore {
         }
         Ok(AppendReceipt {
             first: EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence: first,
             },
             last: EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence: last,
             },
             event_ids: ids,
@@ -327,8 +327,8 @@ impl SqliteEventStore {
     ) -> Result<Option<AppendReceipt>, AppendError> {
         let row: Option<(String, u64, u64)> = conn
             .query_row(
-                "SELECT request_commitment,first_seq,last_seq FROM session_append_receipts WHERE stream_id=?1 AND idempotency_key=?2",
-                params![request.stream_id.as_str(), request.idempotency_key.as_str()],
+                "SELECT request_commitment,first_seq,last_seq FROM session_append_receipts WHERE session_id=?1 AND idempotency_key=?2",
+                params![request.session_id.as_str(), request.idempotency_key.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -341,7 +341,7 @@ impl SqliteEventStore {
                 request.idempotency_key.clone(),
             ));
         }
-        Self::receipt_range(conn, &request.stream_id, first, last)
+        Self::receipt_range(conn, &request.session_id, first, last)
             .map(Some)
             .map_err(|error| AppendError::Corrupt(error.to_string()))
     }
@@ -350,7 +350,7 @@ impl SqliteEventStore {
 impl SessionEventStore for SqliteEventStore {
     fn read_latest_event(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         branch: &zeroclaw_api::session_events::BranchId,
         turn: Option<&zeroclaw_api::session_events::TurnId>,
         kind: &zeroclaw_api::session_events::EventKind,
@@ -363,7 +363,7 @@ impl SessionEventStore for SqliteEventStore {
         let id: Option<String> = {
             let conn = self.conn.lock();
 
-            let common = "SELECT event_id FROM session_events WHERE stream_id=?1 AND json_extract(event_json, '$.branch_id')=?2 AND json_extract(event_json, '$.kind')=?3 AND json_extract(event_json, '$.body.codec_version')=1";
+            let common = "SELECT event_id FROM session_events WHERE session_id=?1 AND json_extract(event_json, '$.branch_id')=?2 AND json_extract(event_json, '$.kind')=?3 AND json_extract(event_json, '$.body.codec_version')=1";
             if let Some(turn) = turn {
                 conn.query_row(&format!("{common} AND json_extract(event_json, '$.turn_id')=?4 ORDER BY sequence DESC LIMIT 1"), params![stream.as_str(),branch.as_str(),kind_tag,turn.as_str()], |row|row.get(0)).optional().map_err(read_error)?
             } else {
@@ -383,7 +383,7 @@ impl SessionEventStore for SqliteEventStore {
         let event = self
             .read_event(&id)?
             .ok_or_else(|| ReadError::Gap("latest event lookup missing".into()))?;
-        if event.stream_id != *stream
+        if event.session_id != *stream
             || event.branch_id.as_ref() != Some(branch)
             || turn.is_some_and(|turn| event.turn_id.as_ref() != Some(turn))
             || event.body.kind() != *kind
@@ -396,7 +396,7 @@ impl SessionEventStore for SqliteEventStore {
         let position: Option<(String, u64)> = {
             let conn = self.conn.lock();
             conn.query_row(
-                "SELECT stream_id,sequence FROM session_events WHERE event_id=?1",
+                "SELECT session_id,sequence FROM session_events WHERE event_id=?1",
                 params![event_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -406,18 +406,18 @@ impl SessionEventStore for SqliteEventStore {
         let Some((stream, sequence)) = position else {
             return Ok(None);
         };
-        let stream = SessionStreamId::parse(&stream)
-            .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+        let stream =
+            SessionId::parse(&stream).map_err(|error| ReadError::Corrupt(error.to_string()))?;
         let page = self.read_page(
             &stream,
             &EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence: sequence
                     .checked_sub(1)
                     .ok_or_else(|| ReadError::Corrupt("invalid event index sequence".into()))?,
             },
             Some(&EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence,
             }),
             1,
@@ -452,7 +452,7 @@ impl SessionEventStore for SqliteEventStore {
             }
             return Ok(receipt);
         }
-        let head_seq = Self::current_head(&tx, &request.stream_id)
+        let head_seq = Self::current_head(&tx, &request.session_id)
             .map_err(|e| AppendError::Corrupt(e.to_string()))?;
         if request.expected_head.sequence != head_seq {
             return Err(AppendError::HeadConflict {
@@ -545,10 +545,10 @@ impl SessionEventStore for SqliteEventStore {
             let raw = event.canonical_bytes()?;
             committed_bytes = committed_event_bytes(committed_bytes, raw.len())?;
             tx.execute(
-                "INSERT INTO session_events(stream_id, sequence, event_id, event_json)
+                "INSERT INTO session_events(session_id, sequence, event_id, event_json)
                  VALUES(?1, ?2, ?3, ?4)",
                 params![
-                    request.stream_id.as_str(),
+                    request.session_id.as_str(),
                     i64::try_from(event.sequence).map_err(|_| AppendError::Corrupt(
                         "sequence exceeds SQLite integer".to_owned()
                     ))?,
@@ -593,7 +593,7 @@ impl SessionEventStore for SqliteEventStore {
                     .map_err(|_| AppendError::Corrupt("sequence overflow".to_owned()))?,
             )
             .ok_or_else(|| AppendError::Corrupt("sequence overflow".into()))?;
-        tx.execute("INSERT INTO session_append_receipts(stream_id,idempotency_key,request_commitment,first_seq,last_seq) VALUES(?1,?2,?3,?4,?5)", params![request.stream_id.as_str(),request.idempotency_key,commitment.as_str(),i64::try_from(first_seq).map_err(|_|AppendError::Corrupt("sequence overflow".to_owned()))?,i64::try_from(last_seq).map_err(|_|AppendError::Corrupt("sequence overflow".to_owned()))?]).map_err(map_sqlite)?;
+        tx.execute("INSERT INTO session_append_receipts(session_id,idempotency_key,request_commitment,first_seq,last_seq) VALUES(?1,?2,?3,?4,?5)", params![request.session_id.as_str(),request.idempotency_key,commitment.as_str(),i64::try_from(first_seq).map_err(|_|AppendError::Corrupt("sequence overflow".to_owned()))?,i64::try_from(last_seq).map_err(|_|AppendError::Corrupt("sequence overflow".to_owned()))?]).map_err(map_sqlite)?;
         let erased = !deleting.is_empty();
         for id in deleting {
             tx.execute(
@@ -617,11 +617,11 @@ impl SessionEventStore for SqliteEventStore {
         crash_tests::crash_boundary("sqlite_after_commit");
         Ok(AppendReceipt {
             first: EventCursor {
-                stream_id: request.stream_id.clone(),
+                session_id: request.session_id.clone(),
                 sequence: first_seq,
             },
             last: EventCursor {
-                stream_id: request.stream_id,
+                session_id: request.session_id,
                 sequence: last_seq,
             },
             event_ids,
@@ -630,22 +630,22 @@ impl SessionEventStore for SqliteEventStore {
 
     fn read_page(
         &self,
-        stream_id: &SessionStreamId,
+        session_id: &SessionId,
         after: &EventCursor,
         through: Option<&EventCursor>,
         max_events: usize,
     ) -> Result<EventPage, ReadError> {
         validate_page_limits(max_events)?;
-        if &after.stream_id != stream_id {
+        if &after.session_id != session_id {
             return Err(ReadError::Gap(
                 "after cursor belongs to another stream".to_owned(),
             ));
         }
         let mut connection = self.conn.lock();
         let conn = connection.transaction().map_err(read_error)?;
-        let head = Self::current_head(&conn, stream_id)?;
+        let head = Self::current_head(&conn, session_id)?;
         let through_seq = through.map_or(head, |cursor| {
-            if &cursor.stream_id == stream_id {
+            if &cursor.session_id == session_id {
                 cursor.sequence
             } else {
                 u64::MAX
@@ -657,12 +657,12 @@ impl SessionEventStore for SqliteEventStore {
         let mut statement = conn
             .prepare(
                 "SELECT event_json,event_id,sequence FROM session_events
-             WHERE stream_id=?1 AND sequence>?2 AND sequence<=?3 ORDER BY sequence LIMIT ?4",
+             WHERE session_id=?1 AND sequence>?2 AND sequence<=?3 ORDER BY sequence LIMIT ?4",
             )
             .map_err(read_error)?;
         let mut mapped = statement
             .query(params![
-                stream_id.as_str(),
+                session_id.as_str(),
                 after.sequence,
                 through_seq,
                 max_events + 1
@@ -687,10 +687,10 @@ impl SessionEventStore for SqliteEventStore {
             rows.push((raw, event));
         }
         event_page(
-            stream_id.clone(),
+            session_id.clone(),
             after.clone(),
             EventCursor {
-                stream_id: stream_id.clone(),
+                session_id: session_id.clone(),
                 sequence: through_seq,
             },
             rows,
@@ -699,24 +699,24 @@ impl SessionEventStore for SqliteEventStore {
         )
     }
 
-    fn head(&self, stream_id: &SessionStreamId) -> Result<EventCursor, ReadError> {
+    fn head(&self, session_id: &SessionId) -> Result<EventCursor, ReadError> {
         let mut connection = self.conn.lock();
         let conn = connection.transaction().map_err(read_error)?;
-        let sequence = Self::current_head(&conn, stream_id)?;
+        let sequence = Self::current_head(&conn, session_id)?;
         Ok(EventCursor {
-            stream_id: stream_id.clone(),
+            session_id: session_id.clone(),
             sequence,
         })
     }
 
     fn lookup_receipt(
         &self,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         key: &str,
     ) -> Result<Option<AppendReceipt>, ReadError> {
         let mut connection = self.conn.lock();
         let conn = connection.transaction().map_err(read_error)?;
-        let range:Option<(i64,i64)>=conn.query_row("SELECT first_seq,last_seq FROM session_append_receipts WHERE stream_id=?1 AND idempotency_key=?2",params![stream.as_str(),key],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(read_error)?;
+        let range:Option<(i64,i64)>=conn.query_row("SELECT first_seq,last_seq FROM session_append_receipts WHERE session_id=?1 AND idempotency_key=?2",params![stream.as_str(),key],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(read_error)?;
         let Some((first, last)) = range else {
             return Ok(None);
         };
@@ -730,7 +730,7 @@ impl SessionEventStore for SqliteEventStore {
     fn erasure_scope(
         &self,
         targets: &[zeroclaw_api::session_events::StoredPayloadRef],
-    ) -> Result<(Vec<SessionStreamId>, Digest), AppendError> {
+    ) -> Result<(Vec<SessionId>, Digest), AppendError> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(map_sqlite)?;
         let history =
@@ -844,7 +844,7 @@ mod tests {
         use zeroclaw_api::session_events::*;
         let dir = TempDir::new().expect("dir");
         let store = SqliteEventStore::open(dir.path()).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let mut batch = request(&stream, "fixture", 0);
         let branch = batch.events[0].branch_id.clone().expect("branch");
         let title = PayloadRecord::new(
@@ -907,7 +907,7 @@ mod tests {
         }
     }
 
-    pub(super) fn request(stream: &SessionStreamId, key: &str, expected: u64) -> AppendRequest {
+    pub(super) fn request(stream: &SessionId, key: &str, expected: u64) -> AppendRequest {
         let mut event = SessionEvent::new(
             stream.clone(),
             EventKind::SessionStarted,
@@ -917,9 +917,9 @@ mod tests {
         .expect("event");
         event.branch_id = Some(zeroclaw_api::session_events::BranchId::new());
         AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence: expected,
             },
             idempotency_key: key.to_owned(),
@@ -930,7 +930,7 @@ mod tests {
     }
 
     fn exercise(store: &dyn SessionEventStore) {
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let first_request = request(&stream, "first", 0);
         let receipt = store
             .append_batch(first_request.clone())
@@ -965,7 +965,7 @@ mod tests {
         for backend in ["sqlite", "jsonl"] {
             let dir = TempDir::new().expect("temp");
             let store = open_event_store(dir.path(), backend).expect("store");
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             let root = request(&stream, "root", 0);
             let branch = root.events[0].branch_id.clone().expect("branch");
             store.append_batch(root).expect("root");
@@ -1000,7 +1000,7 @@ mod tests {
                 expected.push((turn, event.event_id.clone()));
                 store
                     .append_batch(AppendRequest {
-                        stream_id: stream.clone(),
+                        session_id: stream.clone(),
                         expected_head: store.head(&stream).expect("head"),
                         idempotency_key: format!("turn-{index}"),
                         events: vec![event],
@@ -1032,12 +1032,7 @@ mod tests {
             );
             assert!(
                 store
-                    .read_latest_event(
-                        &SessionStreamId::new(),
-                        &branch,
-                        None,
-                        &EventKind::TurnAccepted
-                    )
+                    .read_latest_event(&SessionId::new(), &branch, None, &EventKind::TurnAccepted)
                     .expect("foreign stream")
                     .is_none()
             );
@@ -1052,11 +1047,11 @@ mod tests {
                     .expect("connection");
                 for (sql, index_name) in [
                     (
-                        "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE stream_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
+                        "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE session_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
                         "session_events_latest_by_branch_kind",
                     ),
                     (
-                        "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE stream_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.turn_id')='turn' AND json_extract(event_json, '$.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
+                        "EXPLAIN QUERY PLAN SELECT event_id FROM session_events WHERE session_id='fixture' AND json_extract(event_json, '$.branch_id')='branch' AND json_extract(event_json, '$.turn_id')='turn' AND json_extract(event_json, '$.kind')='turn_accepted' ORDER BY sequence DESC LIMIT 1",
                         "session_events_latest_by_turn_kind",
                     ),
                 ] {
@@ -1077,11 +1072,10 @@ mod conformance {
     use zeroclaw_api::session_events::payloads::{StoredPayload, erasure_scope};
     use zeroclaw_api::session_events::*;
 
-    fn root(stream: &SessionStreamId) -> SessionEvent {
+    fn root(stream: &SessionId) -> SessionEvent {
         let mut event = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "fixture".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -1093,12 +1087,12 @@ mod conformance {
     }
     fn batch(
         store: &dyn SessionEventStore,
-        stream: &SessionStreamId,
+        stream: &SessionId,
         events: Vec<SessionEvent>,
         payloads: Vec<PayloadRecord>,
     ) -> AppendRequest {
         AppendRequest {
-            stream_id: stream.clone(),
+            session_id: stream.clone(),
             expected_head: store.head(stream).expect("head"),
             idempotency_key: EventId::new().to_string(),
             events,
@@ -1117,7 +1111,7 @@ mod conformance {
     #[test]
     fn payload_reads_have_no_byte_budget() {
         with_backends(|store, dir, backend| {
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             let payload = PayloadRecord::new(
                 PayloadId::new(),
                 "session.text/v1".into(),
@@ -1176,7 +1170,7 @@ mod conformance {
     fn sqlite_reads_edited_event_without_a_content_hash() {
         let dir = TempDir::new().expect("dir");
         let store = SqliteEventStore::open(dir.path()).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         store
             .append_batch(batch(&store, &stream, vec![root(&stream)], vec![]))
             .expect("append");
@@ -1204,7 +1198,7 @@ mod conformance {
     #[test]
     fn count_limited_pages_return_every_committed_event() {
         with_backends(|store, _, _| {
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             store
                 .append_batch(batch(store, &stream, vec![root(&stream)], vec![]))
                 .expect("root");
@@ -1288,7 +1282,7 @@ mod conformance {
             for (event_count, payload_bytes) in [(1, 0), (2, 0), (2, 1024)] {
                 let directory = TempDir::new().expect("directory");
                 let store = open_event_store(directory.path(), backend).expect("store");
-                let stream = SessionStreamId::new();
+                let stream = SessionId::new();
                 let mut events = vec![root(&stream)];
                 let payloads = if payload_bytes == 0 {
                     vec![]
@@ -1403,7 +1397,7 @@ mod conformance {
     #[test]
     fn erasure_freezes_reads_and_physically_removes_content_after_confirmation() {
         with_backends(|store, dir, backend| {
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             let payload = PayloadRecord::new(
                 PayloadId::new(),
                 "session.text/v1".into(),
@@ -1518,7 +1512,7 @@ mod conformance {
     fn sqlite_erasure_retry_purges_wal_after_pinned_reader_releases() {
         let dir = TempDir::new().expect("directory");
         let store = SqliteEventStore::open(dir.path()).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let payload = PayloadRecord::new(
             PayloadId::new(),
             "session.text/v1".into(),
@@ -1634,7 +1628,7 @@ mod conformance {
     #[test]
     fn changed_head_is_not_part_of_idempotency_identity() {
         with_backends(|store, _, _| {
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             let mut request = batch(store, &stream, vec![root(&stream)], vec![]);
             let receipt = store.append_batch(request.clone()).expect("append");
             request.expected_head.sequence = receipt.last.sequence;
@@ -1647,7 +1641,7 @@ mod conformance {
     #[test]
     fn malformed_references_leave_no_events_or_payloads_visible() {
         with_backends(|store, _, _| {
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             store
                 .append_batch(batch(store, &stream, vec![root(&stream)], vec![]))
                 .expect("root");
@@ -1683,7 +1677,7 @@ mod conformance {
     #[test]
     fn contiguous_pagination_keeps_a_fixed_head() {
         with_backends(|store, _, _| {
-            let stream = SessionStreamId::new();
+            let stream = SessionId::new();
             store
                 .append_batch(batch(store, &stream, vec![root(&stream)], vec![]))
                 .expect("root");
@@ -1724,7 +1718,7 @@ mod conformance {
                 .append_batch(batch(store, &stream, vec![closed], vec![]))
                 .expect("close");
             let mut after = EventCursor {
-                stream_id: stream.clone(),
+                session_id: stream.clone(),
                 sequence: 1,
             };
             let mut seen = vec![1];
@@ -1746,7 +1740,7 @@ mod conformance {
     fn jsonl_orphan_segments_are_invisible_but_committed_loss_is_corrupt() {
         let dir = TempDir::new().expect("dir");
         let store = JsonlEventStore::open(dir.path()).expect("store");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         store
             .append_batch(batch(&store, &stream, vec![root(&stream)], vec![]))
             .expect("root");
@@ -1764,7 +1758,7 @@ mod conformance {
     #[test]
     fn jsonl_independent_handles_serialize_same_head() {
         let dir = TempDir::new().expect("dir");
-        let stream = SessionStreamId::new();
+        let stream = SessionId::new();
         let first = JsonlEventStore::open(dir.path()).expect("first");
         let second = JsonlEventStore::open(dir.path()).expect("second");
         let one = batch(&first, &stream, vec![root(&stream)], vec![]);

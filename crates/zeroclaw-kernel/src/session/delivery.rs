@@ -59,7 +59,7 @@ impl EngineSession {
                 // Delivery reports already observed execution, including an
                 // uncertain result. It cannot restart a provider/tool effect.
                 owner.store.append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: owner.store.head(&stream)?,
                     idempotency_key: format!("delivery-start:{}", event.event_id),
                     events: vec![event],

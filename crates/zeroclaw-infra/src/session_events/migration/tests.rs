@@ -4,7 +4,7 @@ use zeroclaw_api::session_events::{BranchId, CaptureMode, EventActor, SessionId}
 fn seed(
     dir: &Path,
     backend: NativeBackend,
-) -> (SessionStreamId, AppendRequest, Arc<dyn SessionEventStore>) {
+) -> (SessionId, AppendRequest, Arc<dyn SessionEventStore>) {
     let name = match backend {
         NativeBackend::Sqlite => "sqlite",
         NativeBackend::Jsonl => "jsonl",
@@ -12,12 +12,11 @@ fn seed(
     super::super::upgrade::upgrade_installation(dir, backend, |_| "fixture".into())
         .expect("format");
     let store = open_event_store(dir, name).expect("store");
-    let stream = super::super::upgrade::stream_id("fixture").expect("stream");
+    let stream = super::super::upgrade::session_id("fixture").expect("stream");
     let branch = BranchId::new();
     let mut event = SessionEvent::typed(
         stream.clone(),
         EventData::SessionStarted {
-            session_id: SessionId::new(),
             owning_agent: "fixture".into(),
             capture_mode: CaptureMode::Native,
         },
@@ -27,14 +26,12 @@ fn seed(
     )
     .expect("event");
     event.branch_id = Some(branch);
-    let (identity, identity_payload) =
-        super::super::installation::session_key(stream.clone(), "fixture").expect("identity");
     let request = AppendRequest {
-        stream_id: stream.clone(),
+        session_id: stream.clone(),
         expected_head: EventCursor::beginning(stream.clone()),
         idempotency_key: "root".into(),
-        events: vec![event, identity],
-        payloads: vec![identity_payload],
+        events: vec![event],
+        payloads: vec![],
         erasure_reference_commitment: None,
     };
     store.append_batch(request.clone()).expect("root");
@@ -262,7 +259,7 @@ fn frozen_native_migration_rejects_a_changed_source_commitment() {
     .expect("event");
     store
         .append_batch(AppendRequest {
-            stream_id: root.clone(),
+            session_id: root.clone(),
             expected_head: store.head(&root).expect("head"),
             idempotency_key: "damage".into(),
             events: vec![event],
@@ -297,7 +294,15 @@ fn migration_preserves_future_event_bytes_and_its_explicit_payload_references() 
         EventActor::default(),
     )
     .expect("event");
-    event.sequence = 3;
+    event.sequence = image
+        .events()
+        .expect("source events")
+        .iter()
+        .filter(|event| event.session_id == root)
+        .map(|event| event.sequence)
+        .max()
+        .unwrap_or(0)
+        + 1;
     event.committed_at = now_millis();
     let mut value = serde_json::to_value(&event).expect("json");
     value["kind"] = serde_json::json!("future_observation");
@@ -328,7 +333,7 @@ fn migration_preserves_future_event_bytes_and_its_explicit_payload_references() 
     let page = store
         .read_page(&root, &EventCursor::beginning(root.clone()), None, 10)
         .expect("page");
-    assert_eq!(page.raw_events[2], raw);
+    assert_eq!(page.raw_events.last(), Some(&raw));
     assert_eq!(
         store.read_payload(&leaf.payload_id).expect("payload"),
         PayloadRead::Present(leaf)
@@ -340,11 +345,10 @@ fn installation_migration_preserves_shared_nested_content() {
     for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
         let dir = tempfile::TempDir::new().expect("dir");
         let (root, _, store) = seed(dir.path(), backend);
-        let other = SessionStreamId::new();
+        let other = SessionId::new();
         let mut start = SessionEvent::typed(
             other.clone(),
             EventData::SessionStarted {
-                session_id: SessionId::new(),
                 owning_agent: "other".into(),
                 capture_mode: CaptureMode::Native,
             },
@@ -354,7 +358,7 @@ fn installation_migration_preserves_shared_nested_content() {
         start.branch_id = Some(BranchId::new());
         store
             .append_batch(AppendRequest {
-                stream_id: other.clone(),
+                session_id: other.clone(),
                 expected_head: EventCursor::beginning(other.clone()),
                 idempotency_key: "other-root".into(),
                 events: vec![start],
@@ -389,7 +393,7 @@ fn installation_migration_preserves_shared_nested_content() {
             }
             store
                 .append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: store.head(stream).expect("head"),
                     idempotency_key: "shared".into(),
                     events: vec![event],
@@ -413,7 +417,7 @@ fn installation_migration_preserves_shared_nested_content() {
 fn migration_commitment_streams_identical_canonical_bytes_without_cloning_payloads() {
     let dir = tempfile::TempDir::new().expect("directory");
     let store = SqliteEventStore::open(dir.path()).expect("store");
-    let root = SessionStreamId::new();
+    let root = SessionId::new();
     store
         .append_batch(super::super::tests::request(&root, "fixture", 0))
         .expect("root");
@@ -479,7 +483,7 @@ fn migration_refuses_target_extra_tail_and_conflicting_receipt() {
                 .expect("event");
                 target_store
                     .append_batch(AppendRequest {
-                        stream_id: root.clone(),
+                        session_id: root.clone(),
                         expected_head: target_store.head(&root).expect("head"),
                         idempotency_key: "target-only".into(),
                         events: vec![event],
@@ -532,7 +536,7 @@ fn migration_retains_erasure_skeleton_and_never_restores_deleted_bytes() {
         .expect("event");
         store
             .append_batch(AppendRequest {
-                stream_id: root.clone(),
+                session_id: root.clone(),
                 expected_head: store.head(&root).expect("head"),
                 idempotency_key: "title".into(),
                 events: vec![title],
@@ -555,7 +559,7 @@ fn migration_retains_erasure_skeleton_and_never_restores_deleted_bytes() {
             .expect("scope");
         store
             .append_batch(AppendRequest {
-                stream_id: root.clone(),
+                session_id: root.clone(),
                 expected_head: store.head(&root).expect("head"),
                 idempotency_key: "erase-intent".into(),
                 events: vec![intent],
@@ -573,7 +577,7 @@ fn migration_retains_erasure_skeleton_and_never_restores_deleted_bytes() {
         .expect("confirm");
         store
             .append_batch(AppendRequest {
-                stream_id: root.clone(),
+                session_id: root.clone(),
                 expected_head: store.head(&root).expect("head"),
                 idempotency_key: "erase-confirm".into(),
                 events: vec![confirmed],

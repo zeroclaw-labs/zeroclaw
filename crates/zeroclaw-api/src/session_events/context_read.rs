@@ -20,7 +20,7 @@ pub fn present(
 
 pub fn resolve_message(
     store: &dyn SessionEventStore,
-    stream: &SessionStreamId,
+    stream: &SessionId,
     item: &MessageRef,
 ) -> Result<Option<ConversationMessage>, ReadError> {
     match &item.source {
@@ -43,7 +43,7 @@ pub fn resolve_message(
             let event = store
                 .read_event(content_event_id)?
                 .ok_or_else(|| ReadError::Gap("context content event absent".into()))?;
-            if event.stream_id != *stream {
+            if event.session_id != *stream {
                 return Err(ReadError::Corrupt(
                     "context reference outside stream".into(),
                 ));

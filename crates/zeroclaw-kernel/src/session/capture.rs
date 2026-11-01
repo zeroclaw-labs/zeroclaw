@@ -11,7 +11,7 @@ use zeroclaw_api::session_events::{
 /// capability snapshot or stored permission grant lives in this handle.
 pub(super) struct ProviderCaptureScope {
     pub(super) coordinator: Arc<SessionCoordinator>,
-    pub(super) stream: SessionStreamId,
+    pub(super) stream: SessionId,
     pub(super) branch: BranchId,
     pub(super) turn: Option<TurnId>,
     pub(super) context_event_id: EventId,
@@ -23,7 +23,7 @@ pub(super) struct ProviderCaptureScope {
 impl SessionCoordinator {
     pub fn provider_capture(
         self: &Arc<Self>,
-        stream: SessionStreamId,
+        stream: SessionId,
         branch: BranchId,
         turn: TurnId,
         context_event_id: EventId,
@@ -120,7 +120,7 @@ impl ProviderAdmissionPort for ProviderCaptureScope {
             let EventData::TurnAccepted {ingress_ref,..}=accepted.body.data else {return Err(SessionError::InvalidAdmission("model change ingress kind mismatch".into()));};
             let payload=PayloadRecord::json("session.control/v1",&serde_json::json!({"command":"model_override","selection":selection,"source":"admitted_engine"})).map_err(AppendError::from)?;
             let mut control=SessionEvent::typed(stream.clone(),EventData::ControlInputRecorded {
-                control_ref:StoredPayloadRef::from(&payload),expected_target_ref:TargetRef::Session {stream_id:stream},ingress_ref,
+                control_ref:StoredPayloadRef::from(&payload),expected_target_ref:TargetRef::Session {session_id:stream},ingress_ref,
             },EventActor::System {component:"model_selection".into()}).map_err(AppendError::from)?;
             control.branch_id=Some(branch);control.turn_id=Some(turn);
             Ok((control,payload))
@@ -259,7 +259,7 @@ impl ProviderAdmissionPort for ProviderCaptureScope {
                 }
                 let key = format!("provider-start:{}", started.event_id);
                 resolver.authorize(&EffectIntent {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: head.clone(),
                     idempotency_key: key.clone(),
                     event: started.clone(),
@@ -267,7 +267,7 @@ impl ProviderAdmissionPort for ProviderCaptureScope {
                 })?;
                 let started_event_id = started.event_id.clone();
                 coordinator.store.append_batch(AppendRequest {
-                    stream_id: stream.clone(),
+                    session_id: stream.clone(),
                     expected_head: head,
                     idempotency_key: key,
                     events: vec![prepared, started],
@@ -278,7 +278,7 @@ impl ProviderAdmissionPort for ProviderCaptureScope {
                 Ok(EffectObservationHandle {
                     started_event_id,
                     coordinator,
-                    stream_id: stream,
+                    session_id: stream,
                     branch_id: Some(branch),
                     turn_id: turn,
                     invocation_id: invocation,
@@ -312,7 +312,7 @@ impl ProviderObservationPort for EffectObservationHandle {
             .into());
         }
         let mut event = SessionEvent::typed(
-            self.stream_id.clone(),
+            self.session_id.clone(),
             data,
             EventActor::System {
                 component: "provider_capture".into(),
@@ -322,7 +322,7 @@ impl ProviderObservationPort for EffectObservationHandle {
         event.turn_id = self.turn_id.clone();
         event.invocation_id = Some(self.invocation_id.clone());
         let coordinator = Arc::clone(&self.coordinator);
-        let stream = self.stream_id.clone();
+        let stream = self.session_id.clone();
         let invocation = self.invocation_id.clone();
         Ok(self
             .coordinator
