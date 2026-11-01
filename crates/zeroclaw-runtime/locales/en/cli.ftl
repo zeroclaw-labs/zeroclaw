@@ -1718,6 +1718,10 @@ rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop 
 
 skill-http-request-timeout = HTTP request timed out
 
+turn-loop-detected = Repeated tool calls were stopped. Completed work is retained; unresolved actions remain pending.
+
+turn-loop-repeat-refused = Refused repeated tool { $tool } before execution after { $repeats } identical calls. Stop retrying and report completed, failed and pending work.
+
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.

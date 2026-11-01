@@ -1897,6 +1897,7 @@ async fn run_tool_call_loop_impl<'a>(
     // One `BudgetWarning` per turn at most (see `announce_budget_warning`).
     let mut budget_warning_sent = false;
 
+    let mut completion_limit = max_iter::CompletionLimit::LocalIterations(max_iterations);
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
         // Re-resolved every iteration, against the tools callable *right now*.
@@ -3286,6 +3287,7 @@ async fn run_tool_call_loop_impl<'a>(
         }
 
         let PreparedToolCalls {
+            preflight_loop_stopped,
             mut ordered_results,
             mut executable_indices,
             mut executable_calls,
@@ -3299,6 +3301,7 @@ async fn run_tool_call_loop_impl<'a>(
             &mut prompt_approval_tool_signatures,
             iteration,
             knobs.dedup_enabled,
+            Some(&loop_detector),
         )
         .await?;
 
@@ -3565,6 +3568,7 @@ async fn run_tool_call_loop_impl<'a>(
             individual_results,
             tool_results,
             detection_relevant_output,
+            loop_stopped,
         } = collect_tool_results(
             ordered_results,
             &tool_calls,
@@ -3578,7 +3582,9 @@ async fn run_tool_call_loop_impl<'a>(
             turn_id,
         )?;
 
-        if !cancelled_mid_batch && repetition_guard.is_none() {
+        let loop_stopped = preflight_loop_stopped || loop_stopped;
+
+        if !cancelled_mid_batch && !loop_stopped && repetition_guard.is_none() {
             check_identical_output_abort(
                 &detection_relevant_output,
                 loop_started_at,
@@ -3687,12 +3693,19 @@ async fn run_tool_call_loop_impl<'a>(
             turn_state.mark_all_synced();
         }
 
+        // A completed tool may have queued authorized SOP work in this batch.
+        // Settle that queue before closing, rather than orphaning a started run.
         pending_reported_usage = reported_input_tokens.map(|reported| ReportedRequestUsage {
             provider_name: served_provider.clone(),
             model: served_model_key.to_string(),
             reported_tokens: reported as usize,
             estimated_tokens: reported_population_estimated,
         });
+
+        if loop_stopped {
+            completion_limit = max_iter::CompletionLimit::LoopDetected;
+            break;
+        }
     }
 
     if let Some(budget) = shared_budget.as_ref() {
@@ -3713,7 +3726,7 @@ async fn run_tool_call_loop_impl<'a>(
         temperature,
         pacing,
         cancellation_token.as_ref(),
-        max_iter::CompletionLimit::LocalIterations(max_iterations),
+        completion_limit,
         accumulated_display_text,
         turn_id,
         knobs,
@@ -8422,7 +8435,7 @@ mod sop_step_reassembly_tests {
         start_single_step_with_capability(Some(step_agent), None)
     }
 
-    fn start_single_step_with_capability(
+    pub(super) fn start_single_step_with_capability(
         step_agent: Option<&str>,
         capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     ) -> (
@@ -9867,6 +9880,294 @@ mod tool_lifecycle_abandonment_tests {
             served_route_sink: None,
         })
         .await
+    }
+
+    async fn run_loop_review_scenario(
+        provider: &ScriptedProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        hooks: Option<&crate::hooks::HookRunner>,
+        history: &mut Vec<ChatMessage>,
+        knobs: &LoopKnobs,
+    ) -> anyhow::Result<String> {
+        run_loop_review_scenario_with_context_budget(
+            provider,
+            tools_registry,
+            hooks,
+            history,
+            knobs,
+            0,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn loop_closeout_preserves_reported_usage_before_summary_dispatch() {
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: (0..4)
+                    .map(|i| {
+                        tool_call(&format!("repeat-{i}"), "repeat", serde_json::json!({"n":1}))
+                    })
+                    .collect(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(100_000),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            }]),
+        };
+        let tools = registry_with(vec![Box::new(EchoTool {
+            name: "repeat".into(),
+        })]);
+        let mut history = vec![
+            ChatMessage::system("test"),
+            ChatMessage::user(format!("discard-at-summary {}", "old ".repeat(50))),
+            ChatMessage::assistant("earlier answer"),
+            ChatMessage::user("run"),
+        ];
+        let error = run_loop_review_scenario_with_context_budget(
+            &provider,
+            &tools,
+            None,
+            &mut history,
+            &LoopKnobs {
+                dedup_enabled: false,
+                ..Default::default()
+            },
+            2_000,
+        )
+        .await
+        .expect_err("Calibration must refuse a summary whose retained minimum cannot fit");
+        let exceeded = super::context_window_exceeded_from_error(&error)
+            .expect("Summary rejection must retain its typed context-capacity cause");
+        assert_eq!(exceeded.model_context_window, 2_000);
+        assert!(exceeded.estimated_tokens > 2_000);
+        assert!(
+            !history
+                .iter()
+                .any(|m| m.content.contains("discard-at-summary")),
+            "The tools-free summary must trim with the just-reported token calibration"
+        );
+    }
+
+    async fn run_loop_review_scenario_with_context_budget(
+        provider: &ScriptedProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        hooks: Option<&crate::hooks::HookRunner>,
+        history: &mut Vec<ChatMessage>,
+        knobs: &LoopKnobs,
+        context_token_budget: usize,
+    ) -> anyhow::Result<String> {
+        let observer = &NoopObserver;
+        let pacing = &zeroclaw_config::schema::PacingConfig::default();
+        let turn_id = "loop-review";
+        let parallel_tools = false;
+        let cancellation_token = None;
+        let image_cache = None;
+        let mut crumb_present = false;
+        let mut injected_preamble = None;
+        let mut context_limits =
+            zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(context_token_budget);
+        if context_token_budget > 0 {
+            context_limits.model_context_window = context_token_budget;
+            context_limits.model_context_window_source =
+                zeroclaw_config::schema::ModelContextWindowSource::Configured;
+        }
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    dispatch_model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry,
+                observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing,
+                strict_tool_parsing: false,
+                parallel_tools,
+                max_tool_result_chars: 0,
+                context_limits,
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs,
+                security: None,
+            },
+            history,
+            history_has_trim_breadcrumb: &mut crumb_present,
+            injected_memory_preamble: &mut injected_preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+            served_route_sink: None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn preflight_refusal_survives_hook_cancelled_result_before_it() {
+        let repeated = |id: &str| tool_call(id, "repeat", serde_json::json!({"n":1}));
+        let response = |tool_calls| ChatResponse {
+            text: None,
+            tool_calls,
+            usage: None,
+            reasoning_content: None,
+        };
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![
+                response(vec![repeated("a-0"), repeated("a-1"), repeated("a-2")]),
+                response(vec![
+                    tool_call("b", "cancelled", serde_json::json!({})),
+                    repeated("a-3"),
+                ]),
+            ]),
+        };
+        let tools = registry_with(vec![
+            Box::new(EchoTool {
+                name: "repeat".into(),
+            }),
+            Box::new(EchoTool {
+                name: "cancelled".into(),
+            }),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let hooks = lifecycle_runner(events, vec!["cancelled".into()]);
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("run")];
+        let output = run_loop_review_scenario(
+            &provider,
+            &tools,
+            Some(&hooks),
+            &mut history,
+            &LoopKnobs {
+                dedup_enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("closeout");
+        assert!(
+            output.contains(&crate::i18n::get_required_cli_string("turn-loop-detected")),
+            "a refused dispatch stays terminal after an unrelated cancelled result: {output}"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content.contains("Refused repeated tool"))
+        );
+    }
+
+    struct QueueSopForLoopReview {
+        engine: Arc<Mutex<crate::sop::SopEngine>>,
+        action: crate::sop::types::SopRunAction,
+    }
+    impl zeroclaw_api::attribution::Attributable for QueueSopForLoopReview {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "queue_sop"
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for QueueSopForLoopReview {
+        fn name(&self) -> &str {
+            "queue_sop"
+        }
+        fn description(&self) -> &str {
+            "queue a test SOP action"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            crate::sop::executor::enqueue_live_action(Arc::clone(&self.engine), None, &self.action);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "queued".into(),
+                error: None,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn loop_closeout_settles_sop_queued_by_a_completed_sibling_tool() {
+        let (engine, run_id, action) =
+            super::sop_step_reassembly_tests::start_single_step_with_capability(None, None);
+        let mut calls: Vec<_> = (0..4)
+            .map(|i| tool_call(&format!("repeat-{i}"), "repeat", serde_json::json!({"n":1})))
+            .collect();
+        calls.push(tool_call("sop", "queue_sop", serde_json::json!({})));
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: calls,
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let tools = registry_with(vec![
+            Box::new(EchoTool {
+                name: "repeat".into(),
+            }),
+            Box::new(QueueSopForLoopReview {
+                engine: Arc::clone(&engine),
+                action,
+            }),
+        ]);
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("run")];
+        let output = run_loop_review_scenario(
+            &provider,
+            &tools,
+            None,
+            &mut history,
+            &LoopKnobs {
+                dedup_enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("closeout");
+        assert!(output.contains(&crate::i18n::get_required_cli_string("turn-loop-detected")));
+        let engine = engine.lock().expect("engine lock");
+        let run = engine.get_run(&run_id).expect("retained run");
+        assert_eq!(run.status, crate::sop::types::SopRunStatus::Completed);
+        assert_eq!(
+            run.step_results.len(),
+            1,
+            "queued SOP step cannot disappear at closeout"
+        );
+        assert_eq!(
+            run.step_results[0].status,
+            crate::sop::types::SopStepStatus::Completed
+        );
     }
 
     fn registry_with(
