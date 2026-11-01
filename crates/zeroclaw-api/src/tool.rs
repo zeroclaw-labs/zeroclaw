@@ -1,5 +1,66 @@
+use crate::media::RenderedMarker;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+
+tokio::task_local! {
+    static TOOL_EXECUTION_CONTEXT: ToolExecutionContext;
+}
+
+/// Per-call execution inputs supplied by the turn owner.
+///
+/// The token is a handle to the owner's cancellation state. Spawned tasks do
+/// not inherit the task-local scope; capture the context or a child token
+/// before spawning work that should stop with the call.
+#[derive(Debug, Clone, Default)]
+pub struct ToolExecutionContext {
+    cancellation_token: Option<CancellationToken>,
+}
+
+/// The execution future was dropped because its owner cancelled the call.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("Tool execution cancelled")]
+pub struct ToolExecutionCancelled;
+
+impl ToolExecutionContext {
+    pub fn new(cancellation_token: Option<CancellationToken>) -> Self {
+        Self { cancellation_token }
+    }
+
+    pub fn cancellation_token(&self) -> Option<&CancellationToken> {
+        self.cancellation_token.as_ref()
+    }
+
+    /// Context for the future currently being polled, if it has a scope.
+    pub fn current() -> Option<Self> {
+        TOOL_EXECUTION_CONTEXT.try_with(Clone::clone).ok()
+    }
+
+    /// Scope the future and drop it when the token is cancelled.
+    ///
+    /// An empty context masks any outer token. Cancellation wins when both
+    /// branches are ready, and a pre-cancelled token never polls the future.
+    /// Dropping a future does not undo side effects or await child cleanup.
+    pub async fn run<T>(
+        &self,
+        future: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        TOOL_EXECUTION_CONTEXT
+            .scope(self.clone(), async {
+                match self.cancellation_token() {
+                    Some(token) => {
+                        tokio::select! {
+                            biased;
+                            () = token.cancelled() => Err(ToolExecutionCancelled.into()),
+                            result = future => result,
+                        }
+                    }
+                    None => future.await,
+                }
+            })
+            .await
+    }
+}
 
 #[macro_export]
 macro_rules! tool_attribution {
@@ -35,13 +96,19 @@ macro_rules! mock_tool_attribution {
 /// `str` keeps every text read site working on the rendered form.
 ///
 /// Wire format: serializes as a bare string when no structured value is
-/// attached (byte-identical to the legacy `output: String` field), and as
-/// `{"text", "data"}` when a tool declares structured output. Both shapes
-/// deserialize.
+/// attached (byte-identical to the legacy `output: String` field), and as an
+/// object with `text`, an optional `data` value, and — only when the tool
+/// declared attachments — an `attachments` array. Both shapes deserialize.
+///
+/// `attachments` is the attachment identity contract: a tool that produced a
+/// file the model should see as media records it here, and nothing in `text`
+/// is ever scanned for marker syntax to recover that fact. See
+/// `tool_carrier` for the carrier grammar this feeds on the history side.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolOutput {
     text: String,
     data: Option<serde_json::Value>,
+    attachments: Vec<RenderedMarker>,
 }
 
 impl ToolOutput {
@@ -50,6 +117,7 @@ impl ToolOutput {
         Self {
             text: text.into(),
             data: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -59,6 +127,7 @@ impl ToolOutput {
         Self {
             text,
             data: Some(data),
+            attachments: Vec::new(),
         }
     }
 
@@ -67,7 +136,34 @@ impl ToolOutput {
         Self {
             text: text.into(),
             data: Some(data),
+            attachments: Vec::new(),
         }
+    }
+
+    /// Declare one media attachment produced by this tool. The marker's
+    /// `target` is the exact path or URI the multimodal loader should resolve;
+    /// the attachment rides alongside the text and is never recovered by
+    /// scanning it.
+    pub fn with_attachment(mut self, marker: RenderedMarker) -> Self {
+        self.attachments.push(marker);
+        self
+    }
+
+    /// The attachments this tool declared, in declaration order.
+    pub fn attachments(&self) -> &[RenderedMarker] {
+        &self.attachments
+    }
+
+    /// Take the declared attachments, leaving the text and structured value.
+    pub fn take_attachments(&mut self) -> Vec<RenderedMarker> {
+        std::mem::take(&mut self.attachments)
+    }
+
+    /// Rewrite the display text in place, keeping the structured value and the
+    /// declared attachments. Use this instead of rebuilding the output from a
+    /// `String` (`.into()` goes through [`ToolOutput::text`], which drops both).
+    pub fn map_text(&mut self, f: impl FnOnce(&str) -> String) {
+        self.text = f(&self.text);
     }
 
     /// The structured value, when the tool declared one.
@@ -140,17 +236,41 @@ impl PartialEq<String> for ToolOutput {
 
 impl Serialize for ToolOutput {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match &self.data {
-            None => serializer.serialize_str(&self.text),
-            Some(data) => {
+        match (&self.data, self.attachments.is_empty()) {
+            (None, true) => serializer.serialize_str(&self.text),
+            _ => {
                 use serde::ser::SerializeStruct;
-                let mut s = serializer.serialize_struct("ToolOutput", 2)?;
+                // `data` is an optional field and `attachments` is written
+                // only when non-empty, so the object stays as close to the
+                // pre-attachment wire shape as the content allows.
+                let len = 1
+                    + usize::from(self.data.is_some())
+                    + usize::from(!self.attachments.is_empty());
+                let mut s = serializer.serialize_struct("ToolOutput", len)?;
                 s.serialize_field("text", &self.text)?;
-                s.serialize_field("data", data)?;
+                if let Some(data) = &self.data {
+                    s.serialize_field("data", data)?;
+                }
+                if !self.attachments.is_empty() {
+                    s.serialize_field("attachments", &self.attachments)?;
+                }
                 s.end()
             }
         }
     }
+}
+
+/// Deserialize a `data` field that is PRESENT: any value, `null` included,
+/// maps to `Some`, so an explicit structured null survives the round trip
+/// (a field that is absent stays `None` through `#[serde(default)]`).
+/// Without this, `Option`'s null-to-`None` rule collapsed
+/// `{"text":"x","data":null}` to text-only output, and reserialization
+/// changed the wire shape from an object to a bare string.
+fn deserialize_present_data<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(serde_json::Value::deserialize(deserializer)?))
 }
 
 impl<'de> Deserialize<'de> for ToolOutput {
@@ -161,12 +281,26 @@ impl<'de> Deserialize<'de> for ToolOutput {
             Text(String),
             Structured {
                 text: String,
-                data: serde_json::Value,
+                #[serde(default, deserialize_with = "deserialize_present_data")]
+                data: Option<serde_json::Value>,
+                #[serde(default)]
+                attachments: Option<Vec<RenderedMarker>>,
             },
         }
         Ok(match Repr::deserialize(deserializer)? {
             Repr::Text(text) => Self::text(text),
-            Repr::Structured { text, data } => Self::json_with_text(data, text),
+            Repr::Structured {
+                text,
+                data,
+                attachments,
+            } => {
+                let mut output = match data {
+                    Some(data) => Self::json_with_text(data, text),
+                    None => Self::text(text),
+                };
+                output.attachments = attachments.unwrap_or_default();
+                output
+            }
         })
     }
 }
@@ -187,6 +321,13 @@ impl ToolResult {
             output: output.into(),
             error: None,
         }
+    }
+
+    /// Attach one media reference to this result, marking it as a deliberate
+    /// attachment rather than text the model happens to be able to read.
+    pub fn with_attachment(mut self, marker: RenderedMarker) -> Self {
+        self.output = self.output.with_attachment(marker);
+        self
     }
 
     /// Failed result with no output.
@@ -426,6 +567,18 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Execute with turn-scoped cancellation while preserving legacy tools.
+    /// Tools that start child work can override this method to pass the
+    /// context or a child token explicitly, and use [`ToolExecutionContext::run`]
+    /// to scope and cancel their execution future.
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        context.run(self.execute(args)).await
+    }
+
     /// Assemble this tool's spec. The default recomposes it from
     /// `parameters_schema()` and allocates a fresh `Arc` per call, so tools
     /// with large stored schemas override it to hand out `Arc::clone`
@@ -451,6 +604,173 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tool_context_masks_and_restores_nested_scopes() {
+        assert!(ToolExecutionContext::current().is_none());
+        let token = CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+        let observed = context
+            .run(async {
+                assert!(
+                    ToolExecutionContext::current()
+                        .unwrap()
+                        .cancellation_token()
+                        .is_some()
+                );
+                let error = ToolExecutionContext::default()
+                    .run::<()>(async {
+                        assert!(
+                            ToolExecutionContext::current()
+                                .unwrap()
+                                .cancellation_token()
+                                .is_none()
+                        );
+                        let mut children = tokio::task::JoinSet::new();
+                        children.spawn(async { ToolExecutionContext::current() });
+                        assert!(children.join_next().await.unwrap().unwrap().is_none());
+                        anyhow::bail!("inner failure")
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.to_string(), "inner failure");
+                Ok(ToolExecutionContext::current()
+                    .unwrap()
+                    .cancellation_token()
+                    .unwrap()
+                    .clone())
+            })
+            .await
+            .unwrap();
+        assert!(ToolExecutionContext::current().is_none());
+        token.cancel();
+        assert!(observed.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn tool_context_scope_is_restored_when_future_is_dropped() {
+        let context = ToolExecutionContext::new(Some(CancellationToken::new()));
+        let mut call = Box::pin(context.run(async {
+            assert!(ToolExecutionContext::current().is_some());
+            std::future::pending::<anyhow::Result<()>>().await
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(call.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(ToolExecutionContext::current().is_none());
+        drop(call);
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_context_pre_cancelled_does_not_poll_ready_future() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let context = ToolExecutionContext::new(Some(token));
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let result = context
+            .run(std::future::poll_fn(|_| {
+                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::Ready(Ok(()))
+            }))
+            .await;
+        assert!(result.unwrap_err().is::<ToolExecutionCancelled>());
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_context_cancellation_drops_a_polled_future() {
+        struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut call = Box::pin(context.run(async {
+            let _guard = DropProbe(dropped.clone());
+            std::future::pending::<anyhow::Result<()>>().await
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(call.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        token.cancel();
+        assert!(call.await.unwrap_err().is::<ToolExecutionCancelled>());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_context_concurrent_futures_keep_independent_tokens() {
+        let first_token = CancellationToken::new();
+        let second_token = CancellationToken::new();
+        let first = ToolExecutionContext::new(Some(first_token.clone()));
+        let second = ToolExecutionContext::new(Some(second_token.clone()));
+        let barrier = tokio::sync::Barrier::new(2);
+        let capture = || async {
+            barrier.wait().await;
+            tokio::task::yield_now().await;
+            Ok(ToolExecutionContext::current()
+                .unwrap()
+                .cancellation_token()
+                .unwrap()
+                .clone())
+        };
+        let (first_seen, second_seen) = tokio::join!(first.run(capture()), second.run(capture()));
+        let first_seen = first_seen.unwrap();
+        let second_seen = second_seen.unwrap();
+        first_token.cancel();
+        assert!(first_seen.is_cancelled());
+        assert!(!second_seen.is_cancelled());
+        second_token.cancel();
+        assert!(second_seen.is_cancelled());
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    struct LegacyContextProbe;
+    crate::mock_tool_attribution!(LegacyContextProbe);
+
+    #[async_trait]
+    impl Tool for LegacyContextProbe {
+        fn name(&self) -> &str {
+            "legacy_context_probe"
+        }
+        fn description(&self) -> &str {
+            "Reads the scoped context through the legacy method"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            assert!(
+                ToolExecutionContext::current()
+                    .unwrap()
+                    .cancellation_token()
+                    .is_some()
+            );
+            Ok(ToolResult::ok("legacy completed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_context_default_bridge_scopes_legacy_execute() {
+        let context = ToolExecutionContext::new(Some(CancellationToken::new()));
+        let result = LegacyContextProbe
+            .execute_with_context(serde_json::json!({}), &context)
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(ToolExecutionContext::current().is_none());
+    }
 
     #[test]
     fn tool_spec_arc_parameters_serialize_transparently() {
@@ -584,10 +904,113 @@ mod tests {
     }
 
     #[test]
+    fn explicit_null_data_round_trips_as_structured_null() {
+        // `data: null` is presence, not absence: the round trip must keep
+        // the object shape instead of collapsing to text-only and then to a
+        // bare string on reserialization.
+        let output = ToolOutput::json_with_text(serde_json::Value::Null, "x");
+        assert_eq!(output.data(), Some(&serde_json::Value::Null));
+        let wire = serde_json::to_string(&output).expect("serializes");
+        assert_eq!(wire, "{\"text\":\"x\",\"data\":null}");
+        let back: ToolOutput = serde_json::from_str(&wire).expect("object deserializes");
+        assert_eq!(back, output);
+        assert_eq!(back.data(), Some(&serde_json::Value::Null));
+        assert_eq!(
+            serde_json::to_string(&back).expect("reserializes"),
+            wire,
+            "reserialization must be stable, not a bare string"
+        );
+    }
+
+    #[test]
+    fn text_only_object_canonicalizes_to_bare_string() {
+        // An object with `text` and neither `data` nor `attachments` reads as
+        // text-only output and serializes back as the legacy bare string.
+        let back: ToolOutput =
+            serde_json::from_str("{\"text\":\"read\"}").expect("text-only object deserializes");
+        assert_eq!(back.as_str(), "read");
+        assert!(back.data().is_none());
+        assert!(back.attachments().is_empty());
+        assert_eq!(
+            serde_json::to_string(&back).expect("reserializes"),
+            "\"read\"",
+            "text-only canonicalizes to the legacy wire shape"
+        );
+    }
+
+    #[test]
     fn deref_and_display_expose_rendered_text() {
         let out = ToolOutput::json(serde_json::json!({"a": 1}));
         assert!(out.contains("\"a\": 1"));
         assert_eq!(out.to_string(), out.as_str());
+    }
+
+    #[test]
+    fn plain_text_output_still_serializes_as_a_bare_string() {
+        let output = ToolOutput::text("plain result");
+        assert_eq!(
+            serde_json::to_string(&output).expect("serializes"),
+            "\"plain result\"",
+            "no data and no attachments must keep the legacy wire shape"
+        );
+        let back: ToolOutput =
+            serde_json::from_str("\"plain result\"").expect("bare string deserializes");
+        assert_eq!(back, output);
+        assert!(back.attachments().is_empty());
+    }
+
+    #[test]
+    fn structured_output_serializes_with_text_and_data_as_before() {
+        let output = ToolOutput::json(serde_json::json!({"a": 1}));
+        let wire = serde_json::to_string(&output).expect("serializes");
+        assert_eq!(
+            wire, "{\"text\":\"{\\n  \\\"a\\\": 1\\n}\",\"data\":{\"a\":1}}",
+            "structured output without attachments keeps the legacy object shape"
+        );
+        let back: ToolOutput = serde_json::from_str(&wire).expect("object deserializes");
+        assert_eq!(back, output);
+        assert!(back.attachments().is_empty());
+    }
+
+    #[test]
+    fn attachments_ride_the_object_only_when_present() {
+        let output = ToolOutput::text("image read").with_attachment(crate::media::RenderedMarker {
+            target: "/tmp/shot.png".to_string(),
+            kind: crate::media::MarkerKind::Image,
+        });
+        let wire = serde_json::to_string(&output).expect("serializes");
+        assert_eq!(
+            wire,
+            "{\"text\":\"image read\",\"attachments\":[{\"target\":\"/tmp/shot.png\",\"kind\":\"image\"}]}"
+        );
+        let back: ToolOutput = serde_json::from_str(&wire).expect("object deserializes");
+        assert_eq!(back, output);
+        assert_eq!(back.attachments().len(), 1);
+    }
+
+    #[test]
+    fn legacy_object_without_attachments_deserializes_to_none() {
+        let back: ToolOutput = serde_json::from_str("{\"text\":\"read\",\"data\":{\"a\":1}}")
+            .expect("legacy object deserializes");
+        assert_eq!(back.as_str(), "read");
+        assert_eq!(back.data(), Some(&serde_json::json!({"a": 1})));
+        assert!(back.attachments().is_empty());
+    }
+
+    #[test]
+    fn with_attachment_declares_without_touching_text() {
+        let result =
+            ToolResult::ok("File: /tmp/shot.png").with_attachment(crate::media::RenderedMarker {
+                target: "/tmp/shot.png".to_string(),
+                kind: crate::media::MarkerKind::Image,
+            });
+        assert_eq!(result.output.as_str(), "File: /tmp/shot.png");
+        assert_eq!(result.output.attachments().len(), 1);
+        let mut output = result.output;
+        let taken = output.take_attachments();
+        assert_eq!(taken.len(), 1);
+        assert!(output.attachments().is_empty());
+        assert_eq!(output.as_str(), "File: /tmp/shot.png");
     }
 
     #[test]
@@ -605,6 +1028,21 @@ mod tests {
             with_ephemeral_workspace_warning(""),
             EPHEMERAL_WORKSPACE_WARNING
         );
+    }
+
+    #[test]
+    fn map_text_keeps_data_and_attachments() {
+        let marker = crate::media::RenderedMarker {
+            target: "/ws/images/out.png".into(),
+            kind: crate::media::MarkerKind::Image,
+        };
+        let mut output = ToolOutput::json_with_text(serde_json::json!({"k": 1}), "body")
+            .with_attachment(marker.clone());
+        output.map_text(with_ephemeral_workspace_warning);
+        assert!(output.as_str().starts_with(EPHEMERAL_WORKSPACE_WARNING));
+        assert!(output.as_str().ends_with("\n\nbody"));
+        assert_eq!(output.data(), Some(&serde_json::json!({"k": 1})));
+        assert_eq!(output.attachments(), std::slice::from_ref(&marker));
     }
 
     #[test]

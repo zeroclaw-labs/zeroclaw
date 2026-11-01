@@ -424,7 +424,7 @@ impl OpenRouterModelProvider {
             return MessageContent::Text(content.to_string());
         }
 
-        let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
+        let (cleaned_text, image_refs) = multimodal::parse_user_message_image_refs(content);
         if image_refs.is_empty() {
             return MessageContent::Text(content.to_string());
         }

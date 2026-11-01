@@ -1205,6 +1205,9 @@ async fn run_agent_job(
                 error_attributes["error_kind"] = "context_window_exceeded".into();
                 error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
                 error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
+                error_attributes["system_tokens"] = exceeded.system_tokens.into();
+                error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
                 error_attributes["provider_attempted"] = false.into();
             } else {
                 error_attributes["error_kind"] = "agent_error".into();
@@ -2023,6 +2026,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cron_agent_default_excluded_tools_are_inventoried() {
+        let missing: Vec<&str> = CRON_AGENT_DEFAULT_EXCLUDED_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "CRON_AGENT_DEFAULT_EXCLUDED_TOOLS names tools missing from the built-in inventory: {missing:?}"
+        );
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn run_job_command_success() {
@@ -2528,6 +2544,9 @@ mod tests {
         let context = anyhow::Error::new(crate::agent::ContextWindowExceeded {
             estimated_tokens: 65_537,
             model_context_window: 65_536,
+            raw_estimated_tokens: 65_537,
+            system_tokens: 0,
+            tool_schema_tokens: 0,
         })
         .context("maximum context length; https://private.invalid/?key=secret");
         let provider =
@@ -2916,21 +2935,22 @@ mod tests {
             let (old_alias, mut delete) = {
                 let lifecycle = authority.agent_lifecycle();
                 let delete = lifecycle.begin_delete(TEST_AGENT).unwrap();
-                let old_alias = authority
-                    .config()
-                    .write()
-                    .agents
-                    .remove(TEST_AGENT)
-                    .unwrap();
+                let commit = authority.begin_config_commit().await.unwrap();
+                let mut published = commit.current_config();
+                let old_alias = published.agents.remove(TEST_AGENT).unwrap();
+                let revision = commit.next_revision().unwrap();
+                commit.publish(revision, published).unwrap();
                 (old_alias, delete)
             };
             delete.commit_destructive_mutation();
             drop(delete);
-            authority
-                .config()
-                .write()
-                .agents
-                .insert(TEST_AGENT.into(), old_alias);
+            {
+                let commit = authority.begin_config_commit().await.unwrap();
+                let mut published = commit.current_config();
+                published.agents.insert(TEST_AGENT.into(), old_alias);
+                let revision = commit.next_revision().unwrap();
+                commit.publish(revision, published).unwrap();
+            }
             let (tx, mut rx) = tokio::sync::broadcast::channel(4);
             let events = Some(tx);
 
@@ -2981,19 +3001,26 @@ mod tests {
         config.agents.insert("other".into(), Default::default());
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let selection = authority.execution_capability().capture_selection();
-        let selected_config = authority.config().read().clone();
+        let selected_config = authority.snapshot_config();
         let selected_job = cron::get_job(&selected_config, &job.id).unwrap();
         {
-            let handle = authority.config();
-            let mut live = handle.write();
-            // Disable the stored owner so the moved claim becomes effective.
-            live.agents.get_mut(TEST_AGENT).unwrap().cron_jobs.clear();
-            live.agents.get_mut(TEST_AGENT).unwrap().enabled = false;
-            live.agents
+            let mut published = authority.snapshot_config();
+            published
+                .agents
+                .get_mut(TEST_AGENT)
+                .unwrap()
+                .cron_jobs
+                .clear();
+            published.agents.get_mut(TEST_AGENT).unwrap().enabled = false;
+            published
+                .agents
                 .get_mut("other")
                 .unwrap()
                 .cron_jobs
                 .push(job.id.clone());
+            let commit = authority.begin_config_commit().await.unwrap();
+            let revision = commit.next_revision().unwrap();
+            commit.publish(revision, published).unwrap();
         }
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);
         let result = run_manual_job_with_selection(

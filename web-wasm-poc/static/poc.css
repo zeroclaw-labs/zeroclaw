@@ -1,7 +1,4 @@
-/* PoC stylesheet — tokens PORTED from the dashboard's RUNTIME palette
-   (web/src/themes.ts dark theme, as written by ThemeContext.applyVars —
-   dumped live from the real dashboard; index.css :root holds static
-   fallbacks that the theme system overrides). Keep in sync with themes.ts. */
+/* Mirror themes.ts dark runtime palette, not index.css fallbacks. */
 
 :root {
   color-scheme: dark;
@@ -45,6 +42,8 @@ body {
 }
 
 .page { padding: 24px; display: flex; flex-direction: column; gap: 24px; max-width: 1400px; margin: 0 auto; }
+.token-page { max-width: 540px; padding-top: 64px; }
+.token-form { display: flex; flex-direction: column; gap: 12px; }
 
 .header-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .header-controls { display: flex; align-items: center; gap: 12px; flex: 1; flex-wrap: wrap; }

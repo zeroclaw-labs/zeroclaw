@@ -105,6 +105,21 @@ pub fn release_freed_heap() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn release_freed_heap() {}
 
+/// Render `value` as one POSIX shell word. A value made only of ASCII
+/// alphanumerics and `-_./:=+` is returned as it is; anything else is
+/// single-quoted, with each `'` written as `'\''`.
+pub(crate) fn shell_escape(value: &std::ffi::OsStr) -> String {
+    let value = value.to_string_lossy();
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '+'))
+    {
+        value.into_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +293,27 @@ mod tests {
         let binding = result.unwrap();
         let arr = binding.as_array().unwrap();
         assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn shell_escape_leaves_safe_words_bare() {
+        assert_eq!(shell_escape(std::ffi::OsStr::new("codex")), "codex");
+        assert_eq!(
+            shell_escape(std::ffi::OsStr::new("/usr/bin/a-b_c.d:e=f+g")),
+            "/usr/bin/a-b_c.d:e=f+g"
+        );
+    }
+
+    #[test]
+    fn shell_escape_single_quotes_everything_else() {
+        assert_eq!(
+            shell_escape(std::ffi::OsStr::new("hello world")),
+            "'hello world'"
+        );
+        assert_eq!(
+            shell_escape(std::ffi::OsStr::new("it's safe; really")),
+            "'it'\\''s safe; really'"
+        );
+        assert_eq!(shell_escape(std::ffi::OsStr::new("~/data")), "'~/data'");
     }
 }

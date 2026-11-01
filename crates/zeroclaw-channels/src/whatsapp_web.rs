@@ -440,9 +440,10 @@ pub struct WhatsAppWebChannel {
     allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Optional pairing-persist authority for the canonical shared `Config`.
     /// `None` in tests; `Some` in the long-running daemon, wired via
-    /// `.with_persistence(config)`. Same contract as WeChat's authority: on
-    /// connect, the linked account is persisted into `peer_groups` through
-    /// `crate::identity_persist` (no channel-local allowlist cache).
+    /// `.with_persistence_authority(authority)`. Same contract as WeChat's
+    /// authority: on connect, the linked account is persisted into
+    /// `peer_groups` through `crate::identity_persist` (no channel-local
+    /// allowlist cache).
     persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     /// See [`ApprovalSendHook`]. `None` outside the tests that need to act
     /// between a token's registration and the cleanup that follows it.
@@ -592,19 +593,6 @@ impl WhatsAppWebChannel {
     /// channel handle is bound to.
     pub fn alias(&self) -> &str {
         &self.alias
-    }
-
-    /// Wire a config handle so a completed pairing can persist the linked
-    /// account into `peer_groups` and save. Standalone callers get a local
-    /// mutation witness; supervised callers use
-    /// [`Self::with_persistence_authority`] to share the daemon witness.
-    #[cfg(feature = "whatsapp-web")]
-    pub fn with_persistence(
-        mut self,
-        config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
-    ) -> Self {
-        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
-        self
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -4905,11 +4893,8 @@ mod tests {
         .with_persistence_authority(authority.clone());
         let stored = channel.persist.as_ref().expect("authority is stored");
 
-        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
-        assert!(Arc::ptr_eq(
-            &authority.config_write_lock(),
-            &stored.config_write_lock()
-        ));
+        assert!(authority.live_handle().same_storage(&stored.live_handle()));
+        assert_eq!(authority.config_epoch(), stored.config_epoch());
     }
 
     #[test]

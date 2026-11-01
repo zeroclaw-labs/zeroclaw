@@ -83,17 +83,74 @@ pub struct AgentSkillsResponse {
 }
 
 pub fn api_origin() -> String {
-    let window = web_sys::window().expect("no global window");
+    origin_from_window(web_sys::window())
+}
+
+fn origin_from_window(window: Option<web_sys::Window>) -> String {
+    let Some(window) = window else {
+        return String::new();
+    };
     let value = js_sys::Reflect::get(&window, &ORIGIN_KEY.into())
         .ok()
         .unwrap_or(wasm_bindgen::JsValue::UNDEFINED);
     value.as_string().unwrap_or_default()
 }
 
-fn auth_token() -> Option<String> {
+pub fn auth_token() -> Option<String> {
     let window = web_sys::window()?;
     let storage = window.local_storage().ok().flatten()?;
     storage.get_item(TOKEN_KEY).ok().flatten()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum AuthError {
+    Empty,
+    Rejected,
+    Unavailable,
+    Storage,
+}
+
+fn token_storage() -> Result<web_sys::Storage, AuthError> {
+    web_sys::window()
+        .ok_or(AuthError::Storage)?
+        .local_storage()
+        .map_err(|_| AuthError::Storage)?
+        .ok_or(AuthError::Storage)
+}
+
+pub fn store_token(token: &str) -> Result<(), AuthError> {
+    token_storage()?
+        .set_item(TOKEN_KEY, token)
+        .map_err(|_| AuthError::Storage)
+}
+
+pub fn clear_token() -> Result<(), AuthError> {
+    token_storage()?
+        .remove_item(TOKEN_KEY)
+        .map_err(|_| AuthError::Storage)
+}
+
+pub async fn validate_token(token: &str) -> Result<(), AuthError> {
+    if token.trim().is_empty() {
+        return Err(AuthError::Empty);
+    }
+    let response =
+        gloo_net::http::Request::get(&format!("{}/api/config/agent-options", api_origin()))
+            .header("Authorization", &format!("Bearer {token}"))
+            .send()
+            .await
+            .map_err(|_| AuthError::Unavailable)?;
+    if response.status() == 401 || response.status() == 403 {
+        return Err(AuthError::Rejected);
+    }
+    if !response.ok() {
+        return Err(AuthError::Unavailable);
+    }
+    response
+        .json::<AgentOptionsResponse>()
+        .await
+        .map(|_| ())
+        .map_err(|_| AuthError::Unavailable)
 }
 
 pub async fn get<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, String> {
@@ -138,4 +195,12 @@ pub fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn missing_window_uses_same_origin_without_panicking() {
+        assert_eq!(super::origin_from_window(None), "");
+    }
 }

@@ -1005,3 +1005,274 @@ test('session switch disconnects both the effect-owned and replacement sockets',
     message.content === 'stale replacement'), false);
   await unmount(mounted.renderer);
 });
+
+test('F5 while a detached turn is still running keeps the prompt the browser already showed', async () => {
+  // First page load: conversation A is empty on the server.
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+
+  await act(async () => { first.context().sendMessage('long task'); });
+  await act(async () => {
+    runtime1.sockets[0]!.emitMessage({ type: 'chunk', content: 'partial' });
+  });
+  assert.ok(
+    first.context().messages.some((m) => m.content === 'long task' && m.local === true),
+    'the optimistic prompt is on screen before F5',
+  );
+  await settle();
+
+  // F5: the React tree dies, localStorage survives, nothing is sent to the server.
+  await unmount(first.renderer);
+  assert.ok(
+    storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'),
+    'the mirror effect saved the prompt before the reload',
+  );
+
+  // Second page load: the gateway is still running the turn, so its transcript
+  // has not committed the prompt yet (ws.rs persists only when the turn ends).
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+
+  assert.equal(second.context().hydrated, true);
+  assert.ok(
+    second.context().messages.some((m) => m.content === 'long task'),
+    'hydration must not drop a locally-sent prompt the server has not committed yet',
+  );
+  assert.ok(
+    storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'),
+    'the browser copy must not be overwritten by the stale snapshot',
+  );
+  await unmount(second.renderer);
+});
+
+test('F5 after the detached turn committed shows the prompt once, with its answer', async () => {
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('long task'); });
+  await settle();
+  await unmount(first.renderer);
+
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve({
+    session_id: 'A',
+    session_persistence: true,
+    messages: [
+      {
+        role: 'user',
+        content: '[CURRENT DATE & TIME: 2026-10-01 10:00:00 UTC]\n\nlong task',
+        created_at: null,
+      },
+      { role: 'assistant', content: 'finished', created_at: null },
+    ],
+  }));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+
+  const contents = second.context().messages.map((m) => m.content);
+  assert.equal(
+    contents.filter((c) => c.endsWith('long task')).length,
+    1,
+    `the committed prompt must appear once: ${JSON.stringify(contents)}`,
+  );
+  // `Array.prototype.at` is ES2022; web/tsconfig.app.json:6 has lib ES2020.
+  assert.equal(contents[contents.length - 1], 'finished');
+  await unmount(second.renderer);
+});
+
+test('an uncommitted prompt does not follow the operator into another conversation', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true, ['from B'])));
+  // The turn in A is still running when the operator comes back: same snapshot.
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const mounted = await mountChat(runtime, false);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().sendMessage('long task'); });
+  await settle();
+  assert.ok(storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'));
+
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await openSocket(runtime, 1);
+  await settle();
+
+  assert.equal(mounted.context().sessionId, 'B');
+  assert.deepEqual(mounted.context().messages.map((m) => m.content), ['from B']);
+  assert.equal(
+    storage.getItem('zeroclaw_chat_history_v1:B')?.includes('long task') ?? false,
+    false,
+    'conversation B must not inherit the prompt of conversation A',
+  );
+
+  // Back in A the turn is still uncommitted, so its prompt is still ours.
+  assert.equal(await goToSession(mounted, 'A'), true);
+  await openSocket(runtime, 2);
+  await settle();
+  assert.equal(mounted.context().sessionId, 'A');
+  assert.ok(
+    mounted.context().messages.some((m) => m.content === 'long task'),
+    'returning to A must not drop its uncommitted prompt',
+  );
+  assert.ok(
+    storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'),
+    'the browser copy of A must survive the round trip',
+  );
+  assert.equal(
+    mounted.context().messages.some((m) => m.content === 'from B'),
+    false,
+    'A must not inherit the transcript of B',
+  );
+  await unmount(mounted.renderer);
+});
+
+test('returning to a conversation whose turn committed meanwhile shows the prompt once', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueMessages('B', () => Promise.resolve(messagesResponse('B', true, ['from B'])));
+  runtime.queueMessages('A', () => Promise.resolve({
+    session_id: 'A',
+    session_persistence: true,
+    messages: [
+      {
+        role: 'user',
+        content: '[CURRENT DATE & TIME: 2026-10-01 10:00:00 UTC]\n\nlong task',
+        created_at: null,
+      },
+      { role: 'assistant', content: 'finished', created_at: null },
+    ],
+  }));
+  const mounted = await mountChat(runtime, false);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().sendMessage('long task'); });
+  await settle();
+
+  assert.equal(await goToSession(mounted, 'B'), true);
+  await openSocket(runtime, 1);
+  await settle();
+  assert.equal(await goToSession(mounted, 'A'), true);
+  await openSocket(runtime, 2);
+  await settle();
+
+  const contents = mounted.context().messages.map((m) => m.content);
+  assert.equal(
+    contents.filter((c) => c.endsWith('long task')).length,
+    1,
+    `the committed prompt must appear once: ${JSON.stringify(contents)}`,
+  );
+  assert.equal(contents[contents.length - 1], 'finished');
+  await unmount(mounted.renderer);
+});
+
+test('reloading twice while the same detached turn is still running keeps the prompt each time', async () => {
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('long task'); });
+  await settle();
+  await unmount(first.renderer);
+
+  // Two reloads in a row; the gateway has committed nothing in between.
+  for (const reload of [1, 2]) {
+    const runtime = new FakeSessionRuntime();
+    runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+    const mounted = await mountChat(runtime, false);
+    await openSocket(runtime, 0);
+    await settle();
+
+    const kept = mounted.context().messages.filter((m) => m.content === 'long task');
+    assert.equal(kept.length, 1, `reload ${reload}: the prompt must appear once`);
+    assert.equal(kept[0]!.local, true, `reload ${reload}: it must still count as locally composed`);
+    assert.ok(
+      storage.getItem('zeroclaw_chat_history_v1:A')?.includes('long task'),
+      `reload ${reload}: the browser copy must survive`,
+    );
+    await unmount(mounted.renderer);
+  }
+});
+
+test('a second prompt queued behind a running turn does not displace the first one on the next reload', async () => {
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('first'); });
+  await settle();
+  await unmount(first.renderer);
+
+  // After the reload the composer is usable, so a follow-up can be sent while the
+  // first turn is still running; the gateway queues it behind that turn.
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+  await act(async () => { second.context().sendMessage('second'); });
+  await settle();
+  await unmount(second.renderer);
+
+  // Neither prompt is committed yet when the page is reloaded again.
+  const runtime3 = new FakeSessionRuntime();
+  runtime3.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const third = await mountChat(runtime3, false);
+  await openSocket(runtime3, 0);
+  await settle();
+
+  assert.deepEqual(third.context().messages.map((m) => m.content), ['first', 'second']);
+  assert.ok(
+    storage.getItem('zeroclaw_chat_history_v1:A')?.includes('first'),
+    'the browser copy must keep the first prompt too',
+  );
+  await unmount(third.renderer);
+});
+
+test('known limit: a conversation deleted elsewhere keeps its last exchange in this browser', async () => {
+  // The gateway answers 200 with no messages both for a turn it has not committed
+  // yet and for a session that no longer exists, so the client cannot tell them
+  // apart (`GET /state` can, but this path does not consult it). Only the last
+  // exchange comes back, never the whole cached chat. Pinned so it is not changed
+  // by accident.
+  const runtime1 = new FakeSessionRuntime();
+  runtime1.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const first = await mountChat(runtime1, false);
+  await openSocket(runtime1, 0);
+  await settle();
+  await act(async () => { first.context().sendMessage('one'); });
+  await settle();
+  await act(async () => {
+    runtime1.sockets[0]!.emitMessage({ type: 'done', full_response: 'answer one' });
+  });
+  await settle();
+  await act(async () => { first.context().sendMessage('two'); });
+  await settle();
+  await act(async () => {
+    runtime1.sockets[0]!.emitMessage({ type: 'done', full_response: 'answer two' });
+  });
+  await settle();
+  assert.deepEqual(
+    first.context().messages.map((m) => m.content),
+    ['one', 'answer one', 'two', 'answer two'],
+  );
+  await unmount(first.renderer);
+
+  const runtime2 = new FakeSessionRuntime();
+  runtime2.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  const second = await mountChat(runtime2, false);
+  await openSocket(runtime2, 0);
+  await settle();
+  assert.deepEqual(second.context().messages.map((m) => m.content), ['two', 'answer two']);
+  await unmount(second.renderer);
+});

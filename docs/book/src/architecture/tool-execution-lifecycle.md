@@ -159,6 +159,16 @@ fills slots for cancelled, denied, replaced, or deduplicated calls; execution
 fills the remaining slots. This preserves provider history ordering even when
 some calls never execute or when parallel calls finish out of order.
 
+### Cooperative execution context
+
+`Tool::execute_with_context(args, &ToolExecutionContext)` is the cancellation-aware Rust entrypoint. Its default implementation runs the existing `execute(args)` inside the context, so existing tool implementations remain compatible. The runtime supplies the current turn's optional cancellation token and preserves interrupted-result ownership. A cancelled context returns `ToolExecutionCancelled`, which runtime dispatch converts to its normal turn-cancellation outcome. A context without a token does not inherit another call's cancellation signal.
+
+A tool may override the context-aware method when it needs explicit execution inputs. Transparent wrappers forward that method while retaining their approval, path, rate-limit, audit, and locked-argument behavior. Legacy implementations can read `ToolExecutionContext::current()` while their future runs. Tools that spawn work must capture the context or derive a child token before spawning; Tokio task-local values do not automatically follow a new task. Sequential and parallel pipeline steps forward the same context to their children.
+
+Cancellation can drop the tool future promptly. Resources owned by that future need drop guards; work that outlives it must observe the captured token. The built-in shell retains its existing child and Unix process-group guards, and HTTP cancellation drops its local request future. Cancellation does not undo an HTTP action already received by a server, await asynchronous cleanup, or add cancellation messages to MCP, WASM, or remote-node protocols. Separately implemented shell-like tools do not acquire the built-in shell's process-tree guarantees from the context alone.
+
+In-turn parallel and agentic delegates derive child tokens from this context. Explicit background delegates keep their separate tool-owned cancellation token and remain cancellable through `cancel_task`.
+
 ## Results, receipts, and history
 
 Successful tool executions normalize empty output to `(no output)`. When

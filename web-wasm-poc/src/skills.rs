@@ -142,6 +142,8 @@ pub fn SkillsPage() -> Element {
                     input {
                         class: "input-electric search-input",
                         "type": "text",
+                        "aria-label": t("skills.search"),
+                        title: t("skills.search"),
                         value: "{search}",
                         placeholder: t("skills.search"),
                         oninput: move |e| search.set(e.value()),

@@ -153,6 +153,12 @@ presents the token on every connection and reconnect.
    The response carries a `zc_...` token. Use the gateway's pairing code here,
    not the enrollment code you gave zerocode above.
 
+   A daemon built without the gateway (the CLI-only build from
+   `install.sh --cli-only`) has no `/pair` and no Pairing page, so it cannot
+   issue this token. Connect with an OIDC token instead (below), or run
+   zerocode on the server itself (`ssh -t <remote-host> zerocode`): a zerocode
+   on the daemon host talks to the local socket and needs no bearer token.
+
 2. **Give zerocode the token.** The environment variable is the recommended
    way because it keeps the secret out of the config file:
 

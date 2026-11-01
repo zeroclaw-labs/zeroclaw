@@ -2,11 +2,16 @@
 
 Skills are reusable instructions and optional tool definitions that ZeroClaw can load into an agent session. Use them for repeatable workflows such as code review checklists, deployment runbooks, support playbooks, or domain-specific tool wrappers.
 
-Skills live in one of three locations:
+Skills can come from four sources:
 
+- Built-in skills embedded in the current ZeroClaw binary. These are read-only, loaded for every agent, and updated with the binary.
 - Per-agent workspace skills under `<install>/agents/<alias>/workspace/skills/<name>/`.
 - Shared skill bundles under `<install>/shared/skills/<bundle>/<name>/`. Agents load these when their config lists the bundle in `agents.<alias>.skill_bundles`.
 - The global skill directory under `<install>/data/skills/<name>/`. The CLI can install there as a fallback, but agents do not load global skills automatically.
+
+Built-in skills have the lowest precedence. A workspace, community, or assigned-bundle skill with the same name intentionally overrides the built-in skill for that agent. Plugin skills use qualified names and do not shadow the built-in name. Built-ins are served directly from the running binary; ZeroClaw does not copy them into agent workspaces.
+
+The built-in `zeroclaw-docs` skill uses progressive disclosure: every agent receives its name and description, while `read_skill` loads the full instructions only when they are relevant. This applies even when the effective prompt-injection mode is `full`; when `read_skill` is unavailable, the instructions are inline instead. Other skills keep the configured behavior. An operator-provided skill named `zeroclaw-docs` overrides the built-in and follows the configured mode like any other operator skill.
 
 Use bundles for skills an agent should load during runtime. A bundle is configured under `[skill_bundles.<alias>]`; when its `directory` is omitted, ZeroClaw resolves it to `<install>/shared/skills/<alias>/`.
 
@@ -16,7 +21,7 @@ Use bundles for skills an agent should load during runtime. A bundle is configur
 
 For hand-authored local skills, use `SKILL.md` or `SKILL.toml`. Use `SKILL.md` for instructions plus simple metadata. Use `SKILL.toml` when the skill needs structured prompts or tool definitions. ZeroClaw also understands `manifest.toml` for registry-style skill packages, but `SKILL.md` and `SKILL.toml` are the recommended local authoring formats.
 
-To distribute a set of skills as a signed, versioned, installable package, see [Skill bundles](./skill-bundles.md). Note that those ride the plugin system, which prebuilt release binaries do not include; on a stock binary, the shared bundles on this page are the supported mechanism.
+To distribute a set of skills as a signed, versioned, installable package, see [Skill bundles](./skill-bundles.md). Note that those ride the plugin system, which the 64-bit desktop and server release archives carry (every release executes a plugin from each of them) and the 32-bit ARM archives, the experimental Android archive, and default source builds do not; the [per-artifact table](../developing/plugin-protocol.md#plugin-support-per-release-artifact) lists every artifact. Where the plugin host is absent, the shared bundles on this page are the supported mechanism.
 
 ## Create a Markdown skill
 
@@ -86,6 +91,8 @@ Never exfiltrate secrets, never disable audit logging, and always ask for approv
 A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, `prompts`, and `always` are optional (`always` defaults to `false`; see above). Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
 
 HTTP skill tools use only `http` and `https` URLs. Arguments are percent-encoded before insertion, redirects and ambient proxies are disabled, and the resolved destination must pass ZeroClaw's public-network egress policy. Private or metadata destinations are rejected, and response bodies larger than one megabyte are truncated before they can expand runtime memory.
+
+Each HTTP skill call shares one 30-second timeout across destination validation, DNS lookup, request dispatch, and response-body reading. A timeout returns a failed tool result without including the URL or argument values. This bounds the call's wait; a platform DNS lookup already running on a blocking worker may continue until the operating system's resolver timeout.
 
 ### Slash command options and localizations
 

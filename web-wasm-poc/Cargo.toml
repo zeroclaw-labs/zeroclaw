@@ -1,6 +1,4 @@
-# Standalone PoC workspace — deliberately NOT a member of the zeroclaw
-# workspace so the default build is untouched. Tracked in the web UI
-# evaluation issue.
+# Isolate the PoC from default workspace builds.
 
 [workspace]
 

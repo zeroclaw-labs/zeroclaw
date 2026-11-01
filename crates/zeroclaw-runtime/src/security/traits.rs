@@ -22,6 +22,11 @@ pub trait Sandbox: Send + Sync {
         self.wrap_command(cmd)
     }
 
+    /// Report a retained construction failure without probing backend availability.
+    fn check_initialization(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn is_available(&self) -> bool;
 
     /// Return the human-readable name of this sandbox backend.
@@ -79,6 +84,7 @@ mod tests {
     #[test]
     fn noop_sandbox_is_always_available() {
         assert!(NoopSandbox.is_available());
+        assert!(NoopSandbox.check_initialization().is_ok());
     }
 
     #[test]
