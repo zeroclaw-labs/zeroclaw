@@ -588,10 +588,12 @@ impl ModelProvider for RouterModelProvider {
             let tools: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
                 request.tools.map(<[zeroclaw_api::tool::ToolSpec]>::to_vec);
             let thinking = request.thinking;
+            let thinking_level = request.thinking_level;
             return stream::once(async move {
                 let request = ChatRequest {
                     messages: &messages,
                     tools: tools.as_deref(),
+                    thinking_level,
                     thinking,
                 };
                 // The synthesized call is still a routed dispatch: the
@@ -867,6 +869,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "hint:fast",
@@ -1212,6 +1215,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[],
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         assert!(router.supports_exact_request_replay(request, "hint:safe"));
@@ -1863,6 +1867,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "hint:route",
@@ -1943,6 +1948,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let events: Vec<_> = router
@@ -2074,6 +2080,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let events: Vec<_> = router
@@ -2122,6 +2129,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -2200,6 +2208,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -2275,6 +2284,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let events: Vec<_> = router
@@ -2440,6 +2450,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking_level: None,
                 thinking: None,
             },
             "hint:reasoning",

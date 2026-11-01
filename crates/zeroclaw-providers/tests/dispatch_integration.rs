@@ -172,6 +172,7 @@ async fn every_dispatcher_method_attributes() {
     let req = ChatRequest {
         messages: &[],
         tools: None,
+        thinking_level: None,
         thinking: None,
     };
 

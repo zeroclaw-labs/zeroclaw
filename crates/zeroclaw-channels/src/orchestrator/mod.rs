@@ -10545,8 +10545,10 @@ async fn process_channel_message_body(
             // which share one SendViaTool, never read each other's routes.
             let tool_loop =
                 tools::TURN_ROUTING.scope(Some(std::sync::Arc::clone(&turn_routing)), tool_loop);
-            let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                .scope(thinking.params.native_thinking, tool_loop);
+            let tool_loop = zeroclaw_runtime::agent::thinking::scope_native_thinking(
+                &thinking.params,
+                tool_loop,
+            );
             let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                 .scope(receipt_scope.clone(), tool_loop);
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -46253,6 +46255,221 @@ BTC is currently around $65,000 based on latest tool output."#
                 "too many arguments".into()
             ))
         );
+    }
+
+    type NativeThinkingCapture = (String, Option<ThinkingLevel>, Option<u32>);
+
+    #[derive(Default)]
+    struct NativeThinkingCaptureModelProvider {
+        requests: std::sync::Mutex<Vec<NativeThinkingCapture>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NativeThinkingCaptureModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("channel turns must preserve the explicit request")
+        }
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let user = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .unwrap()
+                .content
+                .clone();
+            self.requests.lock().unwrap().push((
+                user,
+                request.thinking_level,
+                request.thinking.map(|thinking| thinking.budget_tokens),
+            ));
+            tokio::task::yield_now().await;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("native channel complete".into()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl zeroclaw_api::attribution::Attributable for NativeThinkingCaptureModelProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "native-thinking-capture"
+        }
+    }
+
+    fn native_thinking_channel_context(
+        dir: &std::path::Path,
+        level: ThinkingLevel,
+        native: bool,
+        provider: Arc<NativeThinkingCaptureModelProvider>,
+        channel: Arc<dyn Channel>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: dir.join("data"),
+            config_path: dir.join("config.toml"),
+            ..Default::default()
+        };
+        config.runtime_profiles.insert(
+            "native".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                thinking: ThinkingConfig {
+                    default_level: level,
+                    native_thinking: native,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "test-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: "native".into(),
+                model_provider: "custom.native".into(),
+                ..Default::default()
+            },
+        );
+        let agent = config.resolved_agent_config("test-agent").unwrap();
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            config,
+            agent,
+            "custom.native",
+            None,
+        );
+        Arc::get_mut(&mut ctx).unwrap().workspace_dir = Arc::new(dir.to_path_buf());
+        ctx
+    }
+
+    #[tokio::test]
+    async fn channel_native_thinking_profiles_remain_isolated_on_concurrent_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(NativeThinkingCaptureModelProvider::default());
+        let channel: Arc<dyn Channel> = Arc::new(SendMessageRecordingChannel {
+            channel_name: "discord",
+            ..Default::default()
+        });
+        let low = native_thinking_channel_context(
+            temp.path(),
+            ThinkingLevel::Low,
+            true,
+            Arc::clone(&provider),
+            Arc::clone(&channel),
+        );
+        let high = native_thinking_channel_context(
+            temp.path(),
+            ThinkingLevel::High,
+            true,
+            Arc::clone(&provider),
+            channel,
+        );
+        let mut fast = scope_test_msg("sender-fast", "room", None);
+        fast.content = "fast-profile".into();
+        fast.id = "native-fast".into();
+        let mut deep = scope_test_msg("sender-deep", "room", None);
+        deep.content = "deep-profile".into();
+        deep.id = "native-deep".into();
+        tokio::join!(
+            process_channel_message(low, fast, CancellationToken::new()),
+            process_channel_message(high, deep, CancellationToken::new()),
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (message, level, budget) in requests.iter() {
+            if message.contains("fast-profile") {
+                assert_eq!((*level, *budget), (Some(ThinkingLevel::Low), None));
+            } else {
+                assert!(message.contains("deep-profile"));
+                assert_eq!((*level, *budget), (Some(ThinkingLevel::High), Some(10_000)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_native_thinking_precedence_and_session_resets_reach_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(NativeThinkingCaptureModelProvider::default());
+        let channel: Arc<dyn Channel> = Arc::new(SendMessageRecordingChannel {
+            channel_name: "discord",
+            ..Default::default()
+        });
+        let ctx = native_thinking_channel_context(
+            temp.path(),
+            ThinkingLevel::High,
+            true,
+            Arc::clone(&provider),
+            Arc::clone(&channel),
+        );
+        for (index, content) in [
+            "/thinking max",
+            "/think:low inline-native",
+            "session-native",
+            "/new",
+            "new-native",
+            "/thinking minimal",
+            "minimal-native",
+            "/thinking reset",
+            "reset-native",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut msg = scope_test_msg("sender", "room", None);
+            msg.id = format!("native-{index}");
+            msg.content = content.into();
+            if content.starts_with('/') && !content.starts_with("/think:") {
+                assert!(handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await);
+            } else {
+                process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
+            }
+        }
+        assert_eq!(
+            provider
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.1)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(ThinkingLevel::Low),
+                Some(ThinkingLevel::Max),
+                Some(ThinkingLevel::High),
+                Some(ThinkingLevel::Minimal),
+                Some(ThinkingLevel::High)
+            ]
+        );
+        let opted_out = native_thinking_channel_context(
+            temp.path(),
+            ThinkingLevel::High,
+            false,
+            Arc::clone(&provider),
+            channel,
+        );
+        let mut msg = scope_test_msg("sender", "room", None);
+        msg.id = "native-opt-out".into();
+        msg.content = "/think:max opt-out-native".into();
+        process_channel_message(opted_out, msg, CancellationToken::new()).await;
+        assert_eq!(provider.requests.lock().unwrap().last().unwrap().1, None);
     }
 
     #[test]

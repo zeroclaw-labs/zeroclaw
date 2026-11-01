@@ -44477,7 +44477,12 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_description(&a2a, ".public_base_url", "operator-supplied base URL");
 
         let thinking = crate::scattered_types::ThinkingConfig::default().prop_fields();
-        assert_description(&thinking, ".native_thinking", "selected level has a budget");
+        assert_description(&thinking, ".native_thinking", "retain their token budgets");
+        assert_description(
+            &thinking,
+            ".native_thinking",
+            "OpenAI models receive reasoning effort for every level",
+        );
 
         let compression = crate::scattered_types::ContextCompressionConfig::default().prop_fields();
         assert_description(&compression, ".summary_provider", "<type>.<alias>");

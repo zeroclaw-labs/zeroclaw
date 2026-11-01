@@ -1805,6 +1805,11 @@ impl Agent {
         )
     }
 
+    fn native_thinking_level(&self) -> Option<zeroclaw_api::model_provider::ThinkingLevel> {
+        let thinking = &self.config.resolved.thinking;
+        thinking.native_thinking.then_some(thinking.default_level)
+    }
+
     fn response_cache_key_for_messages(
         &self,
         messages: &[ChatMessage],
@@ -1816,6 +1821,7 @@ impl Agent {
         if self.temperature != Some(0.0)
             || self.response_cache.is_none()
             || self.memory_injection_active()
+            || self.native_thinking_level().is_some()
             || zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .try_with(Option::is_some)
                 .unwrap_or(false)
@@ -4124,6 +4130,7 @@ impl Agent {
         let agent_alias_for_loop = self.observer_agent_alias();
         let execution_tree_budget =
             ExecutionTreeBudget::from_limit(self.config.resolved.max_execution_tree_iterations);
+        let native_level = self.native_thinking_level();
         let turn_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
             Some(cost_context.clone()),
             crate::agent::tool_receipts::scope_receipts(
@@ -4231,6 +4238,7 @@ impl Agent {
         // entering either task-local scope: boxing inside a nested async block
         // still captures the large turn-loop future on the worker stack.
         let turn_loop = Box::pin(turn_loop);
+        let turn_loop = zeroclaw_api::NATIVE_THINKING_LEVEL.scope(native_level, turn_loop);
         let (
             loop_result,
             turn_provider_recovery,
@@ -4693,6 +4701,8 @@ impl Agent {
         let execution_tree_budget =
             ExecutionTreeBudget::from_limit(self.config.resolved.max_execution_tree_iterations);
 
+        let native_level = self.native_thinking_level();
+
         // ── Round loop: one tool-call-loop run per steering round ──────────
         // Sink the loop writes the final serving route into each round, so the
         // terminal `StreamedTurnSuccess` carries the route/limits that actually
@@ -4882,6 +4892,7 @@ impl Agent {
             // the nested task-locals do not capture the full round future on
             // the worker stack in debug builds.
             let round_loop = Box::pin(round_loop);
+            let round_loop = zeroclaw_api::NATIVE_THINKING_LEVEL.scope(native_level, round_loop);
             let (loop_result, round_fallback, round_context_truncated, round_safeguard) =
                 zeroclaw_providers::scope_safeguard_fallback(async {
                     let (result, fallback, context_truncated) =
@@ -14888,6 +14899,203 @@ mod tests {
         );
         assert_eq!(seen_c.lock().len(), 1);
         assert_eq!(seen_d.lock().len(), 1);
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct NativeThinkingObservation {
+        level: Option<zeroclaw_api::model_provider::ThinkingLevel>,
+        budget: Option<u32>,
+        streaming: bool,
+    }
+
+    struct NativeThinkingProbeProvider {
+        seen: Arc<Mutex<Vec<NativeThinkingObservation>>>,
+    }
+
+    impl NativeThinkingProbeProvider {
+        fn record(&self, request: ChatRequest<'_>, streaming: bool) {
+            self.seen.lock().push(NativeThinkingObservation {
+                level: request.thinking_level,
+                budget: request.thinking.map(|thinking| thinking.budget_tokens),
+                streaming,
+            });
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for NativeThinkingProbeProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "native-thinking-probe"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for NativeThinkingProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("Agent must use the explicit request path")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.record(request, false);
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("native context complete".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            self.record(request, true);
+            Box::pin(futures_util::stream::iter([
+                Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk::delta("native context complete"),
+                )),
+                Ok(zeroclaw_providers::traits::StreamEvent::Final),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn native_thinking_agent_defaults_and_opt_out_reach_chat_and_stream() {
+        use zeroclaw_api::model_provider::ThinkingLevel;
+        for native in [true, false] {
+            for level in [ThinkingLevel::Minimal, ThinkingLevel::Low] {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let mut agent = blank_input_agent(Box::new(NativeThinkingProbeProvider {
+                    seen: Arc::clone(&seen),
+                }));
+                agent.config.resolved.thinking.native_thinking = native;
+                agent.config.resolved.thinking.default_level = level;
+                zeroclaw_api::NATIVE_THINKING_LEVEL
+                    .scope(Some(ThinkingLevel::High), async {
+                        assert_eq!(
+                            agent.turn("inspect").await.unwrap(),
+                            "native context complete"
+                        );
+                        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+                        assert_eq!(
+                            agent
+                                .turn_streamed("inspect again", tx, None)
+                                .await
+                                .unwrap()
+                                .0,
+                            "native context complete"
+                        );
+                        assert_eq!(
+                            zeroclaw_api::current_native_thinking_level(),
+                            Some(ThinkingLevel::High)
+                        );
+                    })
+                    .await;
+                let expected = native.then_some(level);
+                assert_eq!(
+                    *seen.lock(),
+                    vec![
+                        NativeThinkingObservation {
+                            level: expected,
+                            budget: None,
+                            streaming: false
+                        },
+                        NativeThinkingObservation {
+                            level: expected,
+                            budget: None,
+                            streaming: true
+                        },
+                    ]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_every_native_profile_level_and_retains_opt_out_hits() {
+        use zeroclaw_api::model_provider::ThinkingLevel;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100).unwrap(),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let build = |level, native| {
+            let mut agent = blank_input_agent(Box::new(NativeThinkingProbeProvider {
+                seen: Arc::clone(&seen),
+            }));
+            agent.config.resolved.thinking.native_thinking = native;
+            agent.config.resolved.thinking.default_level = level;
+            agent.response_cache = Some(Arc::clone(&cache));
+            agent.temperature = Some(0.0);
+            agent.turn_datetime = Some(Arc::new(fixed_response_cache_turn_datetime));
+            agent
+        };
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ] {
+            let before = seen.lock().len();
+            for _ in 0..2 {
+                let mut agent = build(level, true);
+                assert_eq!(
+                    agent.turn("same request").await.unwrap(),
+                    "native context complete"
+                );
+            }
+            assert_eq!(
+                seen.lock().len(),
+                before + 2,
+                "native level {level:?} must bypass the shared cache"
+            );
+        }
+        let before = seen.lock().len();
+        for _ in 0..2 {
+            let mut agent = build(ThinkingLevel::Low, false);
+            assert_eq!(
+                agent.turn("same request").await.unwrap(),
+                "native context complete"
+            );
+        }
+        assert_eq!(
+            seen.lock().len(),
+            before + 1,
+            "opt-out must preserve ordinary response-cache hits"
+        );
     }
 
     #[tokio::test]

@@ -2353,9 +2353,8 @@ pub async fn run(
                         runtime.shell_profile().as_ref(),
                     )?;
                 }
-                match zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .scope(
-                        thinking_params.native_thinking,
+                match crate::agent::thinking::scope_native_thinking(
+                        &thinking_params,
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
@@ -3023,9 +3022,8 @@ pub async fn run(
                             runtime.shell_profile().as_ref(),
                         )?;
                     }
-                    match zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                        .scope(
-                            thinking_params.native_thinking,
+                    match crate::agent::thinking::scope_native_thinking(
+                        &thinking_params,
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
                                 run_tool_call_loop(ToolLoop {
@@ -4201,70 +4199,69 @@ async fn process_message_inner(
             .as_ref()
             .map(|c| c as &dyn zeroclaw_api::channel::Channel);
 
-        zeroclaw_api::NATIVE_THINKING_OVERRIDE
-            .scope(
-                thinking_params.native_thinking,
-                agent_turn_with_sop_reassembly(
-                    Some(&config),
-                    model_provider.as_ref(),
-                    &mut history,
-                    &mut history_has_trim_breadcrumb,
-                    &mut None,
-                    &tools_registry,
-                    observer.as_ref(),
-                    &model_provider_ref,
-                    &model_name,
-                    effective_temperature,
-                    true,
-                    "daemon",
-                    None,
-                    &config.multimodal,
-                    agent.resolved.max_tool_iterations,
-                    Some(&approval_manager),
-                    // The same policy Arc that assembled this turn's scoped
-                    // tools, so the no-vision image-marker gate reads the
-                    // exact ledger the file tools enforce.
-                    Some(&security),
-                    effort_provider_refs.clone(),
-                    &excluded_tools,
-                    &agent.resolved.tool_call_dedup_exempt,
-                    activated_handle_pm.as_ref(),
-                    None,
-                    agent.resolved.strict_tool_parsing,
-                    agent.resolved.parallel_tools,
-                    agent.resolved.max_tool_result_chars,
-                    config
-                        .resolved_context_limits_for_route(
-                            agent_alias,
-                            &model_provider_ref,
-                            &model_name,
-                        )
-                        .context_token_budget,
-                    // Cross-channel HITL: a route-only approval bridge when the
-                    // profile sets `approval_route` and channels are live, else
-                    // `None` (today's channel-less auto-deny). See above.
-                    routed_approval_channel_ref,
-                    origin,
-                    internal_principal,
-                    Some(crate::agent::memory_inject::TurnMemory {
-                        handle: mem.as_ref(),
-                        query: effective_message.clone(),
-                        sessions: vec![session_id.map(str::to_string)],
-                        suppress: false,
-                        cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                            &config.memory,
-                            crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                        ),
-                    }),
-                    Some(agent_alias),
-                    Some(&turn_id),
-                    Some(SopStepReassembly {
-                        config: &config,
-                        live_config,
-                    }),
-                ),
-            )
-            .await
+        crate::agent::thinking::scope_native_thinking(
+            &thinking_params,
+            agent_turn_with_sop_reassembly(
+                Some(&config),
+                model_provider.as_ref(),
+                &mut history,
+                &mut history_has_trim_breadcrumb,
+                &mut None,
+                &tools_registry,
+                observer.as_ref(),
+                &model_provider_ref,
+                &model_name,
+                effective_temperature,
+                true,
+                "daemon",
+                None,
+                &config.multimodal,
+                agent.resolved.max_tool_iterations,
+                Some(&approval_manager),
+                // The same policy Arc that assembled this turn's scoped
+                // tools, so the no-vision image-marker gate reads the
+                // exact ledger the file tools enforce.
+                Some(&security),
+                effort_provider_refs.clone(),
+                &excluded_tools,
+                &agent.resolved.tool_call_dedup_exempt,
+                activated_handle_pm.as_ref(),
+                None,
+                agent.resolved.strict_tool_parsing,
+                agent.resolved.parallel_tools,
+                agent.resolved.max_tool_result_chars,
+                config
+                    .resolved_context_limits_for_route(
+                        agent_alias,
+                        &model_provider_ref,
+                        &model_name,
+                    )
+                    .context_token_budget,
+                // Cross-channel HITL: a route-only approval bridge when the
+                // profile sets `approval_route` and channels are live, else
+                // `None` (today's channel-less auto-deny). See above.
+                routed_approval_channel_ref,
+                origin,
+                internal_principal,
+                Some(crate::agent::memory_inject::TurnMemory {
+                    handle: mem.as_ref(),
+                    query: effective_message.clone(),
+                    sessions: vec![session_id.map(str::to_string)],
+                    suppress: false,
+                    cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                        &config.memory,
+                        crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                    ),
+                }),
+                Some(agent_alias),
+                Some(&turn_id),
+                Some(SopStepReassembly {
+                    config: &config,
+                    live_config,
+                }),
+            ),
+        )
+        .await
     };
     __zc_body
         .instrument(__zc_scope_span)
@@ -5861,6 +5858,7 @@ mod tests {
 
     struct StreamingNativeToolEventModelProvider {
         turns: Arc<Mutex<VecDeque<NativeStreamTurn>>>,
+        native_levels: Arc<Mutex<Vec<Option<zeroclaw_api::model_provider::ThinkingLevel>>>>,
         stream_calls: Arc<AtomicUsize>,
         stream_tool_requests: Arc<AtomicUsize>,
         chat_calls: Arc<AtomicUsize>,
@@ -5870,6 +5868,7 @@ mod tests {
         fn with_turns(turns: Vec<NativeStreamTurn>) -> Self {
             Self {
                 turns: Arc::new(Mutex::new(turns.into())),
+                native_levels: Arc::new(Mutex::new(Vec::new())),
                 stream_calls: Arc::new(AtomicUsize::new(0)),
                 stream_tool_requests: Arc::new(AtomicUsize::new(0)),
                 chat_calls: Arc::new(AtomicUsize::new(0)),
@@ -5930,6 +5929,10 @@ mod tests {
         > {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
             if request.tools.is_some_and(|tools| !tools.is_empty()) {
+                self.native_levels
+                    .lock()
+                    .unwrap()
+                    .push(request.thinking_level);
                 self.stream_tool_requests.fetch_add(1, Ordering::SeqCst);
             }
             if !options.enabled {
@@ -14813,64 +14816,68 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
-        let result = run_tool_call_loop(ToolLoop {
-            parent_agent_alias: None,
-            served_route_sink: None,
-            sop_reassembly: None,
-            exec: ResolvedAgentExecution {
-                model_access: ResolvedModelAccess {
-                    model_provider: &model_provider,
-                    provider_name: "mock-provider",
-                    model: "mock-model",
-                    dispatch_model: "mock-model",
-                    temperature: Some(0.0),
-                },
-                tools_registry: &tools_registry,
-                observer: &observer,
-                silent: true,
-                approval: None,
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
-                max_tool_iterations: 5,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
-                parallel_tools: false,
-                max_tool_result_chars: 0,
-                context_limits: test_context_limits(0),
-                context_limits_resolver: None,
-                receipt_generator: None,
-                knobs: &LoopKnobs::default(),
-                security: None,
-            },
-            history: &mut history,
-            // Test transcripts start fresh: no prior trim, no crumb.
-            history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
-            channel_name: "telegram",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: Some(tx),
-            shared_budget: None,
-            channel: None,
-            collected_receipts: None,
-            event_tx: None,
-            steering: None,
-            new_messages_out: None,
-            image_cache: None,
-            // Phase 1: stamp Internal/Trusted until per-transport
-            // stamping lands.
-            memory: None,
-            ingress: IngressContext::sub_turn(),
-            agent_alias: None,
-            turn_id: &turn_id,
-        })
-        .await
-        .expect("native streaming events should preserve tool loop semantics");
+        let result = zeroclaw_api::NATIVE_THINKING_LEVEL
+            .scope(
+                Some(zeroclaw_api::model_provider::ThinkingLevel::Low),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    served_route_sink: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &model_provider,
+                            provider_name: "mock-provider",
+                            model: "mock-model",
+                            dispatch_model: "mock-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &tools_registry,
+                        observer: &observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 5,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                        security: None,
+                    },
+                    history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
+                    channel_name: "telegram",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: Some(tx),
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    // Phase 1: stamp Internal/Trusted until per-transport
+                    // stamping lands.
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: None,
+                    turn_id: &turn_id,
+                }),
+            )
+            .await
+            .expect("native streaming events should preserve tool loop semantics");
 
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
@@ -14892,6 +14899,10 @@ This is an example, not an invocation."#;
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert_eq!(model_provider.stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *model_provider.native_levels.lock().unwrap(),
+            vec![Some(zeroclaw_api::model_provider::ThinkingLevel::Low); 2]
+        );
         assert_eq!(
             model_provider.stream_tool_requests.load(Ordering::SeqCst),
             2
@@ -23383,6 +23394,136 @@ Let me check the result."#;
             ..Config::default()
         };
         (tmp, config)
+    }
+
+    #[tokio::test]
+    async fn native_thinking_cli_profiles_override_global_effort_on_the_shared_endpoint() {
+        use axum::{Json, Router, routing::post};
+        use zeroclaw_api::model_provider::ThinkingLevel;
+        use zeroclaw_config::scattered_types::ThinkingConfig;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig,
+            RuntimeProfileConfig, WireApi,
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = Arc::clone(&requests);
+        let app = Router::new().route("/responses", post(move |Json(body): Json<serde_json::Value>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured.lock().unwrap().push(body);
+                Json(serde_json::json!({
+                    "id": "response_fixture", "status": "completed",
+                    "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}],
+                    "usage": {"input_tokens": 3, "output_tokens": 1}
+                }))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        struct StopServer(tokio::task::JoinHandle<()>);
+        impl Drop for StopServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = StopServer(zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let (_temp, mut config) = isolated_run_test_config();
+        config.runtime.reasoning_effort = Some("medium".into());
+        config.providers.models.openai.insert(
+            "shared".into(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-5.4".into()),
+                    uri: Some(uri),
+                    api_key: Some("fixture-key".into()),
+                    wire_api: Some(WireApi::Responses),
+                    timeout_secs: Some(5),
+                    ..Default::default()
+                },
+            },
+        );
+        config
+            .risk_profiles
+            .insert("native-test".into(), RiskProfileConfig::default());
+        for (name, level) in [("fast", ThinkingLevel::Low), ("deep", ThinkingLevel::High)] {
+            config.runtime_profiles.insert(
+                name.into(),
+                RuntimeProfileConfig {
+                    thinking: ThinkingConfig {
+                        native_thinking: true,
+                        default_level: level,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            let mut agent = AliasedAgentConfig {
+                model_provider: "openai.shared".into(),
+                risk_profile: "native-test".into(),
+                runtime_profile: name.into(),
+                ..Default::default()
+            };
+            agent.memory.backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+            config.agents.insert(name.into(), agent);
+        }
+        let invoke = |config: Config, alias: &'static str, message: &'static str| {
+            Box::pin(async move {
+                Box::pin(super::run(
+                    config,
+                    alias,
+                    Some(message.into()),
+                    None,
+                    None,
+                    Some(0.7),
+                    Vec::new(),
+                    false,
+                    None,
+                    Some(Vec::new()),
+                    TurnOrigin::Interactive,
+                    super::AgentRunOverrides::default(),
+                ))
+                .await
+                .unwrap()
+            })
+        };
+        let (fast, deep) = tokio::join!(
+            invoke(config.clone(), "fast", "fast-native-marker"),
+            invoke(config.clone(), "deep", "deep-native-marker")
+        );
+        assert_eq!(fast, "done");
+        assert_eq!(deep, "done");
+        assert_eq!(
+            invoke(config.clone(), "deep", "/think:off inline-native-marker").await,
+            "done"
+        );
+        config
+            .runtime_profiles
+            .get_mut("deep")
+            .unwrap()
+            .thinking
+            .native_thinking = false;
+        assert_eq!(
+            invoke(config, "deep", "opt-out-native-marker").await,
+            "done"
+        );
+        let bodies = requests.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        for body in bodies.iter() {
+            let input = body["input"].to_string();
+            let expected = if input.contains("fast-native-marker") {
+                "low"
+            } else if input.contains("deep-native-marker") {
+                "high"
+            } else if input.contains("inline-native-marker") {
+                "none"
+            } else {
+                assert!(input.contains("opt-out-native-marker"));
+                "medium"
+            };
+            assert_eq!(body["reasoning"]["effort"], expected);
+        }
     }
 
     #[tokio::test]

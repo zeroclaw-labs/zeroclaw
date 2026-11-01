@@ -23,6 +23,7 @@ pub mod ollama;
 mod ollama_wire;
 pub mod openai;
 pub mod openai_codex;
+mod openai_reasoning;
 pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
@@ -1603,9 +1604,10 @@ fn create_model_provider_inner(
     // construction here.
     if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
         return Ok(apply_factory_leaf_metadata(
-            Box::new(openai_codex::OpenAiCodexModelProvider::new(
-                alias, options, api_key,
-            )?),
+            Box::new(
+                openai_codex::OpenAiCodexModelProvider::new(alias, options, api_key)?
+                    .with_reasoning_surface(openai_reasoning::ReasoningSurface::Subscription),
+            ),
             options.vision,
         ));
     }
@@ -3532,6 +3534,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -3621,6 +3624,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -3658,6 +3662,7 @@ mod tests {
         let bare_request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -4122,6 +4127,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test-model",

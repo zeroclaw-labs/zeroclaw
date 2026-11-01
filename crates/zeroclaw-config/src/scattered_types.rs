@@ -9,49 +9,20 @@ use zeroclaw_macros::Configurable;
 
 // ── Agent config types ──────────────────────────────────────────
 
-/// How deeply the model should reason for a given message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum ThinkingLevel {
-    Off,
-    Minimal,
-    Low,
-    #[default]
-    Medium,
-    High,
-    Max,
-}
+pub use zeroclaw_api::model_provider::ThinkingLevel;
 
 impl HasPropKind for ThinkingLevel {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
 
-impl ThinkingLevel {
-    pub fn from_str_insensitive(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "off" | "none" => Some(Self::Off),
-            "minimal" | "min" => Some(Self::Minimal),
-            "low" => Some(Self::Low),
-            "medium" | "med" | "default" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            "max" | "maximum" => Some(Self::Max),
-            _ => None,
-        }
-    }
+/// Configuration-owned token-budget policy for a neutral thinking level.
+pub trait ThinkingLevelBudget {
+    /// Default native token budget, when the level has a budget policy.
+    fn default_budget_tokens(&self) -> Option<u32>;
+}
 
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Max => "max",
-        }
-    }
-
-    pub fn default_budget_tokens(&self) -> Option<u32> {
+impl ThinkingLevelBudget for ThinkingLevel {
+    fn default_budget_tokens(&self) -> Option<u32> {
         match self {
             Self::Off | Self::Minimal | Self::Low | Self::Medium => None,
             Self::High => Some(10_000),
@@ -103,7 +74,8 @@ impl ThinkingDisplayMode {
 pub struct ThinkingConfig {
     #[serde(default)]
     pub default_level: ThinkingLevel,
-    /// Enables provider-native thinking parameters when the selected level has a budget.
+    /// Enables provider-native thinking. Budgeted levels retain their token
+    /// budgets; supported OpenAI models receive reasoning effort for every level.
     #[serde(default)]
     pub native_thinking: bool,
     #[serde(default)]
@@ -127,7 +99,7 @@ impl Default for ThinkingConfig {
 
 impl ThinkingConfig {
     pub fn budget_tokens_for(&self, level: ThinkingLevel) -> Option<u32> {
-        // Guard: only levels that have a built-in budget can use native thinking.
+        // Only budgeted levels can use the token-budget payload.
         let default = level.default_budget_tokens()?;
         Some(
             self.budget_tokens
@@ -1000,5 +972,56 @@ mod tests {
     #[test]
     fn thinking_level_default_is_medium() {
         assert_eq!(ThinkingLevel::default(), ThinkingLevel::Medium);
+    }
+
+    #[test]
+    fn thinking_profiles_save_and_reload_every_native_level_without_changing_budgets() {
+        use crate::schema::{Config, RuntimeProfileConfig};
+        let mut config = Config::default();
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ] {
+            config.runtime_profiles.insert(
+                level.as_str().into(),
+                RuntimeProfileConfig {
+                    thinking: ThinkingConfig {
+                        default_level: level,
+                        native_thinking: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let reloaded: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for (name, profile) in config.runtime_profiles {
+            let actual = &reloaded.runtime_profiles[&name].thinking;
+            assert_eq!(actual.default_level, profile.thinking.default_level);
+            assert_eq!(actual.native_thinking, profile.thinking.native_thinking);
+            assert_eq!(
+                actual.budget_tokens_for(actual.default_level),
+                profile
+                    .thinking
+                    .budget_tokens_for(profile.thinking.default_level)
+            );
+        }
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn thinking_level_schema_variants_retain_the_existing_values() {
+        assert_eq!(
+            crate::helpers::enum_variants::<ThinkingLevel>(),
+            "off, minimal, low, medium, high, max"
+        );
+        let _: zeroclaw_api::model_provider::ThinkingLevel = ThinkingLevel::Low;
     }
 }
