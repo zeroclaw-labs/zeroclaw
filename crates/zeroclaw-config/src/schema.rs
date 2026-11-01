@@ -23889,43 +23889,14 @@ impl Config {
         for (alias, profile) in &self.runtime_profiles {
             let cc = &profile.context_compression;
 
-            // `enabled = true` gets its own message: it is the master switch
-            // users flip expecting compression to happen at all.
-            if cc.enabled {
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "context_compression_unsupported",
-                    format!(
-                        "runtime_profiles.{alias}.context_compression.enabled is set but context \
-                         compression is not currently implemented in the runtime (the compressor \
-                         was removed in #8196); this setting has no effect."
-                    ),
-                    format!("runtime_profiles.{alias}.context_compression.enabled"),
-                ));
-            }
-
-            // Every other knob: flag any value that differs from the default.
+            // `enabled`, `threshold_ratio`, `protect_first_n`, `protect_last_n`,
+            // `max_passes`, `summary_max_chars`, `source_max_chars`,
+            // `timeout_secs` and `identifier_policy` are honored by
+            // `agent::context_compaction` (automatic compaction and the manual
+            // `/compact` command), plus `identifier_policy`, which shapes the
+            // summarizer prompt. Only the summarizer-routing and tool-result
+            // knobs below still have no runtime consumer.
             let mut inert: Vec<&'static str> = Vec::new();
-            if (cc.threshold_ratio - defaults.threshold_ratio).abs() > f64::EPSILON {
-                inert.push("threshold_ratio");
-            }
-            if cc.protect_first_n != defaults.protect_first_n {
-                inert.push("protect_first_n");
-            }
-            if cc.protect_last_n != defaults.protect_last_n {
-                inert.push("protect_last_n");
-            }
-            if cc.max_passes != defaults.max_passes {
-                inert.push("max_passes");
-            }
-            if cc.summary_max_chars != defaults.summary_max_chars {
-                inert.push("summary_max_chars");
-            }
-            if cc.source_max_chars != defaults.source_max_chars {
-                inert.push("source_max_chars");
-            }
-            if cc.timeout_secs != defaults.timeout_secs {
-                inert.push("timeout_secs");
-            }
             if cc.summary_provider != defaults.summary_provider {
                 inert.push("summary_provider");
             }
@@ -23948,9 +23919,6 @@ impl Config {
                     inert.push("summary_model");
                 }
             }
-            if cc.identifier_policy != defaults.identifier_policy {
-                inert.push("identifier_policy");
-            }
             if cc.tool_result_retrim_chars != defaults.tool_result_retrim_chars {
                 inert.push("tool_result_retrim_chars");
             }
@@ -23963,9 +23931,9 @@ impl Config {
                     "context_compression_unsupported",
                     format!(
                         "runtime_profiles.{alias}.context_compression.{field} is set to a \
-                         non-default value but context compression is not currently implemented \
-                         in the runtime (the compressor was removed in #8196); this setting has \
-                         no effect."
+                         non-default value but has no runtime consumer: context compaction \
+                         summarizes with the agent's own provider and never re-trims recorded \
+                         tool results; this setting has no effect."
                     ),
                     format!("runtime_profiles.{alias}.context_compression.{field}"),
                 ));
@@ -49359,12 +49327,10 @@ allowed_users = []
         );
     }
 
-    // The runtime context compressor was removed; nothing reads
-    // `context_compression` at runtime anymore, so an explicit
-    // `enabled = true` on a named runtime profile is inert and must be
-    // flagged.
+    // `enabled = true` on a named runtime profile turns on automatic context
+    // compaction, which is implemented: it must not be reported as inert.
     #[tokio::test]
-    async fn collect_warnings_flags_context_compression_enabled_on_runtime_profile() {
+    async fn collect_warnings_accepts_context_compression_enabled_on_runtime_profile() {
         let toml = r#"
             [risk_profiles.default]
             level = "supervised"
@@ -49379,25 +49345,21 @@ allowed_users = []
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         let warnings = cfg.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "context_compression_unsupported")
-            .expect("expected context_compression_unsupported warning");
-        assert_eq!(w.path, "runtime_profiles.fast.context_compression.enabled");
         assert!(
-            w.message.contains("not currently implemented"),
-            "message explains the flag is inert: {}",
-            w.message
+            !warnings
+                .iter()
+                .any(|w| w.path == "runtime_profiles.fast.context_compression.enabled"),
+            "an enabled compaction is honored and must not be flagged: {warnings:?}"
         );
     }
 
     // The legacy pre-V3 `[agent.context_compression]` top-level table is
     // folded into `[runtime_profiles.default]` by the V1/V2→V3 migration
-    // (see `schema/v2.rs`), so it must surface the same diagnostic once
-    // migrated — this is the historical form of the surface commonly
-    // called "agent-level" configuration.
+    // (see `schema/v2.rs`), so an enabled compaction must be honored there
+    // too — this is the historical form of the surface commonly called
+    // "agent-level" configuration.
     #[::core::prelude::v1::test]
-    fn collect_warnings_flags_context_compression_enabled_via_legacy_agent_table() {
+    fn collect_warnings_accepts_context_compression_enabled_via_legacy_agent_table() {
         let raw = r#"
             default_temperature = 0.7
 
@@ -49406,13 +49368,11 @@ allowed_users = []
         "#;
         let parsed = crate::migration::migrate_to_current(raw).expect("migration succeeds");
         let warnings = parsed.collect_warnings();
-        let w = warnings
-            .iter()
-            .find(|w| w.code == "context_compression_unsupported")
-            .expect("expected context_compression_unsupported warning after migration");
-        assert_eq!(
-            w.path,
-            "runtime_profiles.default.context_compression.enabled"
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.path == "runtime_profiles.default.context_compression.enabled"),
+            "migrated enabled compaction is honored and must not be flagged: {warnings:?}"
         );
     }
 
@@ -49439,12 +49399,12 @@ allowed_users = []
         );
     }
 
-    // Every `context_compression` knob is inert, not just `enabled` — tuning
-    // fields set to non-default values must each surface their own warning
-    // with a per-field path, even with `enabled` left off, since the whole
-    // struct is covered.
+    // Only the knobs with no runtime consumer are flagged. The compaction
+    // thresholds and turn protections are honored, so tuning them must stay
+    // silent; the summarizer-routing and tool-result knobs still have no
+    // consumer and must each surface their own warning with a per-field path.
     #[tokio::test]
-    async fn collect_warnings_flags_context_compression_tuning_fields() {
+    async fn collect_warnings_flags_only_unconsumed_context_compression_fields() {
         let toml = r#"
             [risk_profiles.default]
             level = "supervised"
@@ -49452,6 +49412,8 @@ allowed_users = []
             [runtime_profiles.fast.context_compression]
             threshold_ratio = 0.9
             protect_first_n = 500
+            summary_provider = "custom.summarizer"
+            tool_result_retrim_chars = 900
 
             [agents.alpha]
             enabled = true
@@ -49466,22 +49428,24 @@ allowed_users = []
             .map(|w| w.path.as_str())
             .collect();
         assert!(
-            paths.contains(&"runtime_profiles.fast.context_compression.threshold_ratio"),
-            "threshold_ratio must be flagged: {paths:?}"
+            paths.contains(&"runtime_profiles.fast.context_compression.summary_provider"),
+            "summary_provider has no consumer and must be flagged: {paths:?}"
         );
         assert!(
-            paths.contains(&"runtime_profiles.fast.context_compression.protect_first_n"),
-            "protect_first_n must be flagged: {paths:?}"
+            paths.contains(&"runtime_profiles.fast.context_compression.tool_result_retrim_chars"),
+            "tool_result_retrim_chars has no consumer and must be flagged: {paths:?}"
         );
-        // `enabled` was not set (defaults to false) — no warning for it.
-        assert!(
-            !paths.contains(&"runtime_profiles.fast.context_compression.enabled"),
-            "unset enabled must not be flagged: {paths:?}"
-        );
+        for honored in ["threshold_ratio", "protect_first_n", "enabled"] {
+            let path = format!("runtime_profiles.fast.context_compression.{honored}");
+            assert!(
+                !paths.contains(&path.as_str()),
+                "{honored} is honored by context compaction and must not be flagged: {paths:?}"
+            );
+        }
         let w = warnings
             .iter()
-            .find(|w| w.path == "runtime_profiles.fast.context_compression.threshold_ratio")
-            .expect("threshold_ratio warning present");
+            .find(|w| w.path == "runtime_profiles.fast.context_compression.summary_provider")
+            .expect("summary_provider warning present");
         assert!(
             w.message.contains("non-default value"),
             "message says the value is non-default: {}",

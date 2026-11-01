@@ -2,6 +2,7 @@
 
 pub(crate) mod approval_gate;
 pub(crate) mod call_prep;
+pub(crate) mod compaction;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
@@ -28,6 +29,7 @@ pub(crate) mod tool_specs;
 pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
+pub(crate) use compaction::{CompactionRequest, compact_and_announce};
 pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{
     ContextRecovery, record_llm_failure, try_recover_context_overflow,
@@ -1719,6 +1721,42 @@ async fn run_tool_call_loop_impl<'a>(
 
     turn_state.sync_pending();
 
+    // A bare `/compact` is a runtime command, not a model prompt: it compacts
+    // the session's history into a summary and answers with the outcome. It is
+    // handled here because this is the only place that holds both the
+    // provider-facing history and the provider that can summarize it — the
+    // same reason the automatic compaction lives at the turn boundary.
+    if compaction::is_manual_compaction_request(turn_state.history) {
+        let outcome = compaction::compact_and_announce(compaction::CompactionRequest {
+            history: turn_state.history,
+            crumb_present: &mut turn_state.crumb_present,
+            injected_memory_preamble,
+            provider: model_provider,
+            model,
+            temperature,
+            config,
+            agent_alias,
+            context_limits,
+            observer,
+            event_tx: event_tx.as_ref(),
+            on_delta: on_delta.as_ref(),
+            turn_id,
+            trigger_tokens: 0,
+            forced: true,
+        })
+        .await;
+        let notice = compaction::manual_outcome_notice(&outcome);
+        turn_state.push_dual(ChatMessage::assistant(notice.clone()));
+        *history_has_trim_breadcrumb = turn_state.crumb_present;
+        events::emit_posthoc_turn_chunk(event_tx.as_ref(), &notice).await;
+        if let Some(tx) = on_delta.as_ref()
+            && !notice.is_empty()
+        {
+            events::stream_text_posthoc_chunks(tx, &notice, cancellation_token.as_ref()).await?;
+        }
+        return Ok(notice);
+    }
+
     let ingress_policy_cfg = IngressPolicy::default();
 
     // Stamp the initiating internal principal into the turn trace, keyed by
@@ -3205,6 +3243,41 @@ async fn run_tool_call_loop_impl<'a>(
             let msg = ChatMessage::assistant(response_text.clone());
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
+                // Compaction first: a model-written summary keeps the
+                // conversation's meaning while shrinking the request, which is
+                // strictly better than dropping the oldest turns outright.
+                // It runs here because the provider-reported count of the last
+                // request is the number the client's context meter shows, and
+                // no provider request is in flight to desynchronize.
+                let mut reported_tokens = reported as usize;
+                let compaction = compact_and_announce(CompactionRequest {
+                    history: turn_state.history,
+                    crumb_present: &mut turn_state.crumb_present,
+                    injected_memory_preamble,
+                    provider: active_model_provider,
+                    model: active_model,
+                    temperature,
+                    config,
+                    agent_alias,
+                    context_limits: ctx.context_limits,
+                    observer,
+                    event_tx: event_tx.as_ref(),
+                    on_delta: on_delta.as_ref(),
+                    turn_id,
+                    trigger_tokens: reported_tokens,
+                    forced: false,
+                })
+                .await;
+                if compaction.compacted {
+                    // The reported count described the pre-compaction request.
+                    // Re-anchoring both numbers on the retained history keeps
+                    // the budget enforcement below from trimming a history the
+                    // summary just made small.
+                    reported_population_estimated =
+                        crate::agent::history::estimate_history_tokens(turn_state.history)
+                            + tool_schema_tokens;
+                    reported_tokens = reported_population_estimated;
+                }
                 // Terminal response: no next request will be dispatched, so no
                 // hook reserve is carried — enforcement never executes a
                 // modifying `before_llm_call` hook merely to estimate a request
@@ -3212,7 +3285,7 @@ async fn run_tool_call_loop_impl<'a>(
                 Box::pin(enforce_reported_budget(
                     injected_memory_preamble,
                     turn_state.history,
-                    reported as usize,
+                    reported_tokens,
                     reported_population_estimated,
                     tool_schema_tokens,
                     ctx.context_limits.context_token_budget,
