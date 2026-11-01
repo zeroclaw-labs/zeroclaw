@@ -1376,7 +1376,7 @@ impl Channel for MinimalChannel {
 }
 
 #[tokio::test]
-async fn minimal_channel_all_defaults_succeed() {
+async fn minimal_channel_core_defaults_succeed_and_reactions_fail_loudly() {
     let ch: Box<dyn Channel> = Box::new(MinimalChannel);
 
     assert_eq!(ch.name(), "minimal");
@@ -1393,8 +1393,10 @@ async fn minimal_channel_all_defaults_succeed() {
     assert!(ch.update_draft("u", "m", "t").await.is_ok());
     assert!(ch.finalize_draft("u", "m", "t", false).await.is_ok());
     assert!(ch.cancel_draft("u", "m").await.is_ok());
-    assert!(ch.add_reaction("c", "m", "\u{1F440}").await.is_ok());
-    assert!(ch.remove_reaction("c", "m", "\u{1F440}").await.is_ok());
+    // Reaction defaults fail loudly so the reaction tool never surfaces a
+    // fabricated success for channels that do not implement them.
+    assert!(ch.add_reaction("c", "m", "\u{1F440}").await.is_err());
+    assert!(ch.remove_reaction("c", "m", "\u{1F440}").await.is_err());
     assert!(ch.pin_message("c", "m").await.is_ok());
     assert!(ch.unpin_message("c", "m").await.is_ok());
     assert!(

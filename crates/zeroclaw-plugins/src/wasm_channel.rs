@@ -1462,7 +1462,9 @@ impl Channel for WasmChannel {
             .capabilities
             .contains(ChannelCapabilities::ADD_REACTION)
         {
-            return Ok(());
+            // Fail closed like the trait default: reporting success here
+            // would tell the agent a reaction landed when nothing was sent.
+            return Err(zeroclaw_api::channel::ReactionsUnsupported.into());
         }
         let (channel_id, message_id, emoji) = (
             channel_id.to_string(),
@@ -1487,7 +1489,9 @@ impl Channel for WasmChannel {
             .capabilities
             .contains(ChannelCapabilities::REMOVE_REACTION)
         {
-            return Ok(());
+            // Fail closed like the trait default: reporting success here
+            // would tell the agent a reaction landed when nothing was sent.
+            return Err(zeroclaw_api::channel::ReactionsUnsupported.into());
         }
         let (channel_id, message_id, emoji) = (
             channel_id.to_string(),

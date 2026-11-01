@@ -173,9 +173,13 @@ impl Tool for ReactionTool {
         };
 
         let result = if action == "add" {
-            channel.add_reaction(channel_id, message_id, emoji).await
+            channel
+                .set_explicit_reaction(channel_id, message_id, emoji, true)
+                .await
         } else {
-            channel.remove_reaction(channel_id, message_id, emoji).await
+            channel
+                .set_explicit_reaction(channel_id, message_id, emoji, false)
+                .await
         };
 
         let past_tense = if action == "remove" {
@@ -192,6 +196,14 @@ impl Tool for ReactionTool {
                 )
                 .into(),
                 error: None,
+            }),
+            Err(e) if e.is::<zeroclaw_api::channel::ReactionsUnsupported>() => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_tool_string_with_args(
+                    "tool-reaction-error-unsupported",
+                    &[("channel", channel_name)],
+                )),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
@@ -526,6 +538,58 @@ mod tests {
             Some("123456789"),
             "add_reaction must receive channel_id, not channel name"
         );
+    }
+
+    /// A channel without reaction support must fail with the localized
+    /// unsupported message, not a success and not raw error text.
+    #[tokio::test]
+    async fn unsupported_channel_reports_localized_error() {
+        struct NoReactions;
+        impl ::zeroclaw_api::attribution::Attributable for NoReactions {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::Webhook,
+                )
+            }
+            fn alias(&self) -> &str {
+                "test"
+            }
+        }
+        #[async_trait]
+        impl Channel for NoReactions {
+            fn name(&self) -> &str {
+                "plain"
+            }
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tool = make_tool_with_channels(vec![("plain", Arc::new(NoReactions))]);
+        for action in ["add", "remove"] {
+            let result = tool
+                .execute(json!({
+                    "channel": "plain",
+                    "channel_id": "c1",
+                    "message_id": "m1",
+                    "emoji": "\u{2705}",
+                    "action": action
+                }))
+                .await
+                .unwrap();
+            assert!(!result.success, "{action} must not report success");
+            assert_eq!(
+                result.error.as_deref(),
+                Some("Reactions are not supported on the plain channel."),
+                "{action}"
+            );
+        }
     }
 
     #[tokio::test]
