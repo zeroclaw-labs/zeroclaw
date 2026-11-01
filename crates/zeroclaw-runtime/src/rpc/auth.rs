@@ -161,7 +161,11 @@ pub struct AcceptedAuthState {
 /// The parts of a configuration an accepted authorization state is compiled
 /// from: the OIDC, roster, and permission-profile sections and the daemon-uid
 /// trust posture. The pairing authority is shared live state, not config.
-fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
+///
+/// Public so a surface that edits configuration outside the daemon can tell
+/// whether its edit changes the policy a running daemon enforces, by the same
+/// comparison [`RpcInboundAuth::publish_accepted`] makes.
+pub fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::Value::Array(vec![
         serde_json::to_value(&config.oidc)?,
         serde_json::to_value(&config.users)?,
