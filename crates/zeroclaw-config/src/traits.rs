@@ -35,6 +35,7 @@ pub enum AliasSource {
     SkillBundles,
     KnowledgeBundles,
     McpBundles,
+    McpServers,
 }
 
 impl AliasSource {
@@ -51,6 +52,7 @@ impl AliasSource {
             Self::SkillBundles => "skill_bundles",
             Self::KnowledgeBundles => "knowledge_bundles",
             Self::McpBundles => "mcp_bundles",
+            Self::McpServers => "mcp.servers",
         }
     }
 
@@ -408,7 +410,7 @@ pub struct PropFieldInfo {
     /// Tab grouping for this field. `ConfigTab::None` when the field has
     /// no tab annotation (flat display, no tab bar).
     pub tab: ConfigTab,
-    /// Alias namespace for `PropKind::AliasRef` fields; `None` otherwise.
+    /// Alias namespace for reference scalars and arrays; `None` for ordinary values.
     pub alias_source: Option<AliasSource>,
     /// Whether this field is marked `#[multiline]`, a hint that surfaces
     /// should render a multi-line text area (e.g. a PEM key body) rather
@@ -1233,5 +1235,121 @@ mod resource_key_tests {
                  resource id, so it must not be marked #[resource_key]"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod alias_metadata_tests {
+    use super::{AliasSource, PropKind};
+    use crate::schema::{Config, McpServerConfig};
+
+    fn config_with_aliases() -> Config {
+        let mut config = Config::default();
+        for (section, alias) in [
+            ("providers.models.openai", "primary"),
+            ("channels.telegram", "work"),
+            ("agents", "assistant"),
+            ("peer_groups", "team"),
+            ("skill_bundles", "skills"),
+            ("knowledge_bundles", "knowledge"),
+            ("mcp_bundles", "tools"),
+        ] {
+            config
+                .create_map_key(section, alias)
+                .expect("fixture alias should be created");
+        }
+        config.mcp.servers.push(McpServerConfig {
+            name: "docs".to_string(),
+            ..McpServerConfig::default()
+        });
+        config
+    }
+
+    #[test]
+    fn config_reference_arrays_declare_canonical_sources() {
+        let fields = config_with_aliases().prop_fields();
+        for (name, source) in [
+            ("agents.assistant.skill_bundles", AliasSource::SkillBundles),
+            (
+                "agents.assistant.knowledge_bundles",
+                AliasSource::KnowledgeBundles,
+            ),
+            ("agents.assistant.mcp_bundles", AliasSource::McpBundles),
+            ("mcp_bundles.tools.servers", AliasSource::McpServers),
+            ("mcp_bundles.tools.exclude", AliasSource::McpServers),
+        ] {
+            let field = fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing generated field {name}"));
+            assert_eq!(field.kind, PropKind::StringArray, "{name}");
+            assert_eq!(field.alias_source, Some(source), "{name}");
+            let entry = super::ConfigFieldEntry::from_prop_field(field.clone(), false);
+            assert_eq!(entry.alias_source, Some(source), "wire entry for {name}");
+        }
+    }
+
+    #[test]
+    fn unannotated_config_arrays_keep_the_text_editor() {
+        let fields = config_with_aliases().prop_fields();
+        for name in [
+            "providers.models.openai.primary.fallback",
+            "agents.assistant.channels",
+            "peer_groups.team.agents",
+            "providers.models.openai.primary.fallback_models",
+            "peer_groups.team.external_peers",
+            "peer_groups.team.ignore",
+            "mcp.servers.docs.args",
+            "mcp.servers.docs.pinned_resources",
+        ] {
+            let field = fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing generated field {name}"));
+            assert_eq!(field.kind, PropKind::StringArray, "{name}");
+            assert_eq!(field.alias_source, None, "{name}");
+        }
+    }
+
+    #[test]
+    fn alias_resolver_reads_live_reference_namespaces() {
+        let mut config = config_with_aliases();
+        for (source, expected) in [
+            (AliasSource::ModelProviders, "openai.primary"),
+            (AliasSource::Channels, "telegram.work"),
+            (AliasSource::Agents, "assistant"),
+            (AliasSource::SkillBundles, "skills"),
+            (AliasSource::KnowledgeBundles, "knowledge"),
+            (AliasSource::McpBundles, "tools"),
+            (AliasSource::McpServers, "docs"),
+        ] {
+            assert_eq!(
+                config.resolve_alias_source(source),
+                vec![expected.to_string()]
+            );
+        }
+        config.mcp.servers.push(McpServerConfig {
+            name: "a-search".to_string(),
+            ..McpServerConfig::default()
+        });
+        assert_eq!(
+            config.resolve_alias_source(AliasSource::McpServers),
+            ["a-search", "docs"]
+        );
+        config.mcp.servers[0].name = "z_docs".to_string();
+        assert_eq!(
+            config.resolve_alias_source(AliasSource::McpServers),
+            ["a-search", "z_docs"]
+        );
+        config.mcp.servers.clear();
+        assert!(
+            config
+                .resolve_alias_source(AliasSource::McpServers)
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::to_value(AliasSource::McpServers).unwrap(),
+            "mcp_servers"
+        );
     }
 }

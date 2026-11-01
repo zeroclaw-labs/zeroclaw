@@ -882,6 +882,10 @@ zc-config-application-awaiting = Awaiting acknowledgement
 zc-config-application-scope-unavailable = Change scope unavailable
 zc-config-application-retired = Target retired
 zc-config-application-whole-config = Whole configuration; individual changed paths are unavailable
+zc-config-array-not-configured = not configured
+zc-config-array-empty-selection = No entries selected; saving clears this list
+zc-config-action-toggle-selection = Toggle selection
+zc-config-help-mouse-toggle = Click, scroll, double-click to toggle selection
 
 # Config setup guidance. Requirements arrive from the daemon's typed schema.
 zc-config-setup-model-providers = A model profile stores connection and model settings. Authentication may use an API key, an external login, or a local server.
