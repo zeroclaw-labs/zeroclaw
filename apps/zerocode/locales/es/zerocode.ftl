@@ -622,7 +622,6 @@ zc-config-footer-action-back-to-files = volver a archivos
 zc-config-footer-action-back-to-skills = volver a habilidades
 zc-config-footer-action-help = ayuda
 zc-config-footer-action-new-line = nueva línea
-zc-config-field-edit-hint = { $keys } → presiona para editar
 zc-doctor-log-path = log: { $path }
 
 zc-oidc-enroll-visit = Para iniciar sesión, abre { $uri } e introduce el código { $code }
@@ -706,3 +705,14 @@ zc-config-section-peer-groups-help = Grupos con nombre que vinculan un canal, ag
 zc-config-section-cron-help = Tareas programadas que vinculan un horario con un prompt, un canal y un destino.
 zc-config-section-tunnel-help = Expón opcionalmente la puerta de enlace mediante Cloudflare o ngrok, o mantenla solo local.
 zc-config-section-onboard-state-help = Estado del ciclo de vida del inicio rápido y su registro heredado de finalización por sección.
+
+# Config field details use schema-owned descriptions and values.
+zc-config-footer-action-field-details = detalles del campo
+zc-config-field-path = Ruta: { $path }
+zc-config-field-current-value = Valor actual:
+zc-config-field-unset = <sin definir>
+zc-config-field-secret-set = Definido (oculto)
+zc-config-field-value-unavailable = No disponible
+zc-config-field-environment-override = Hay una anulación mediante una variable de entorno activa.
+zc-config-field-precheck-timeout-secs-label = Tiempo de espera de la comprobación previa (segundos)
+zc-config-field-max-cost-per-day-cents-label = Coste máximo por día (céntimos)

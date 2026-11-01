@@ -622,7 +622,6 @@ zc-config-footer-action-back-to-files = ファイルに戻る
 zc-config-footer-action-back-to-skills = スキルに戻る
 zc-config-footer-action-help = ヘルプ
 zc-config-footer-action-new-line = 改行
-zc-config-field-edit-hint = { $keys } → 押して編集
 zc-doctor-log-path = log: { $path }
 
 zc-oidc-enroll-visit = サインインするには { $uri } を開き、コード { $code } を入力してください
@@ -705,3 +704,14 @@ zc-config-section-peer-groups-help = チャンネル、参加エージェント�
 zc-config-section-cron-help = スケジュール、プロンプト、チャンネル、対象を結び付ける定期タスクを設定します。
 zc-config-section-tunnel-help = Cloudflare または ngrok でゲートウェイを公開するか、ローカル専用のままにします。
 zc-config-section-onboard-state-help = クイックスタートのライフサイクル状態と、互換性のために残されたセクション別完了記録です。
+
+# Config field details use schema-owned descriptions and values.
+zc-config-footer-action-field-details = フィールドの詳細
+zc-config-field-path = パス: { $path }
+zc-config-field-current-value = 現在の値:
+zc-config-field-unset = <未設定>
+zc-config-field-secret-set = 設定済み (非表示)
+zc-config-field-value-unavailable = 利用不可
+zc-config-field-environment-override = 環境変数による上書きが有効です。
+zc-config-field-precheck-timeout-secs-label = 事前チェックのタイムアウト (秒)
+zc-config-field-max-cost-per-day-cents-label = 1日あたりの最大コスト (セント)
