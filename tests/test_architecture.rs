@@ -35,3 +35,6 @@ mod pairing_state_load;
 
 #[path = "architecture/stream_error_terminal.rs"]
 mod stream_error_terminal;
+
+#[path = "architecture/gateway_feature_edges.rs"]
+mod gateway_feature_edges;

@@ -585,6 +585,27 @@ impl ScopedToolRegistry {
                 delegate_tool: _,
         } = built;
 
+        // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
+        //    real devices), so this is gated: execution surfaces pass
+        //    `connect_peripherals: true`; listing-only surfaces pass `false` and
+        //    enumerate without holding devices. They are loaded before guest
+        //    names are settled and registered after the guests.
+        let peripheral_tools = if connect_peripherals {
+            let peripheral_tools = load_peripheral_tools(config.peripherals.clone()).await;
+            if emit_assembly_logs && !peripheral_tools.is_empty() {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_attrs(::serde_json::json!({"count": peripheral_tools.len()})),
+                    "Peripheral tools added"
+                );
+            }
+            peripheral_tools
+        } else {
+            Vec::new()
+        };
+
         // Builtin declarations own their names independently of whether the
         // current selection constructed them. Prebuilt inputs also retain the
         // canonical deferred/context-withdrawn owners.
@@ -593,11 +614,33 @@ impl ScopedToolRegistry {
             .partition(|tool| is_guest(tool.as_ref()));
         host_tool_names.extend(tools_registry.iter().map(|tool| tool.name().to_string()));
         tools::reserve_deferred_host_names(config, &mut host_tool_names);
-        tools_registry.extend(
-            plugin_tools
-                .into_iter()
-                .filter(|tool| !host_tool_names.contains(tool.name())),
-        );
+        // Peripheral and skill tools register after the guests, so the plugin
+        // loader cannot see their names. A skill tool's composed name loses its
+        // `__` separator when it is shortened, so the MCP-namespace refusal does
+        // not always cover it.
+        host_tool_names.extend(peripheral_tools.iter().map(|tool| tool.name().to_string()));
+        host_tool_names.extend(skills.iter().flat_map(|skill| {
+            skill
+                .tools
+                .iter()
+                .map(|tool| tools::skill_tool::composed_tool_name(&skill.name, &tool.name))
+        }));
+        tools_registry.extend(plugin_tools.into_iter().filter(|tool| {
+            let taken = host_tool_names.contains(tool.name());
+            if taken && emit_assembly_logs {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "tool": tool.name(),
+                            "error_key": "plugin_tool_name_conflict",
+                        })),
+                    "Plugin tool conflicts with a host tool"
+                );
+            }
+            !taken
+        }));
         unfiltered_tool_arcs
             .retain(|tool| !is_guest(tool.as_ref()) || !host_tool_names.contains(tool.name()));
         if let Some(parent) = delegate_handle.as_ref() {
@@ -611,23 +654,8 @@ impl ScopedToolRegistry {
             .map(|tool| tool.name().to_string())
             .collect();
 
-        // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
-        //    real devices), so this is gated: execution surfaces pass
-        //    `connect_peripherals: true`; listing-only surfaces pass `false` and
-        //    enumerate without holding devices.
-        if connect_peripherals {
-            let peripheral_tools = load_peripheral_tools(config.peripherals.clone()).await;
-            if emit_assembly_logs && !peripheral_tools.is_empty() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
-                        .with_category(::zeroclaw_log::EventCategory::Tool)
-                        .with_attrs(::serde_json::json!({"count": peripheral_tools.len()})),
-                    "Peripheral tools added"
-                );
-            }
-            tools_registry.extend(peripheral_tools);
-        }
+        // Peripheral tools follow the guests and stay out of the views built above.
+        tools_registry.extend(peripheral_tools);
 
         let mut tools_registry = BuildRegistry {
             entries: tools_registry
