@@ -2297,12 +2297,12 @@ fn apply_schema_and_migrations(conn: &Connection, config: &Config) -> Result<()>
     // resurrect a removed job, so cron keeps the pre-WAL durability.
     // Set before recovery below so its write transactions are covered too;
     // contention that outlasts the busy window fails the open closed.
-    conn.execute_batch(
-        "PRAGMA busy_timeout = 5000;
-         PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = FULL;",
-    )
+    conn.execute_batch(&format!(
+        "PRAGMA busy_timeout = {CRON_BUSY_TIMEOUT_MS};
+         PRAGMA synchronous = FULL;"
+    ))
     .context("Failed to set cron DB connection pragmas")?;
+    enable_wal(conn)?;
 
     // Before anything references cron_runs: in the between-DROP-and-RENAME
     // state an interrupted (predecessor, non-atomic) rebuild leaves behind,
@@ -2437,6 +2437,31 @@ fn apply_schema_and_migrations(conn: &Connection, config: &Config) -> Result<()>
     super::outbox::initialize_schema(conn)?;
 
     Ok(())
+}
+
+/// How long a cron connection waits for a competing writer.
+const CRON_BUSY_TIMEOUT_MS: u64 = 5000;
+
+/// Switch the connection to WAL, waiting out contention like every other
+/// phase. While a new database file is still in rollback-journal mode, SQLite
+/// fails the switch at once if another connection holds a lock, without
+/// consulting the busy handler, so two connections opening a fresh file
+/// together refused one of them immediately. Once the file is in WAL mode
+/// the switch is a no-op and never contends.
+fn enable_wal(conn: &Connection) -> Result<()> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(CRON_BUSY_TIMEOUT_MS);
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(_) => return Ok(()),
+            Err(err) if is_lock_contention(&err) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => return Err(err).context("Failed to set cron DB journal mode"),
+        }
+    }
 }
 
 /// True when SQLite reports lock contention with another connection.
@@ -7410,5 +7435,63 @@ schedule = { kind = "every", every_ms = 300000 }
         // it for API/admin visibility, but execution won't pick it up).
         let job = get_job(&config, "orphan-decl").unwrap();
         assert_eq!(job.source, "declarative");
+    }
+
+    #[test]
+    fn opening_a_fresh_database_waits_for_a_competing_writer() {
+        // A brand-new file starts in rollback-journal mode. While another
+        // connection holds its write lock, the switch to WAL must wait for
+        // it like every other phase, not refuse the operation at once.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let path = cron_db(&config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch(
+                "CREATE TABLE warmup (x INTEGER); BEGIN IMMEDIATE; INSERT INTO warmup VALUES (1);",
+            )
+            .unwrap();
+        // Started before the release thread, so a slow spawn can only make
+        // the measured wait longer, never shorter than the writer's hold.
+        let started = std::time::Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok");
+        let waited = started.elapsed();
+        release.join().unwrap();
+        let job = job.expect("a fresh database must wait out a competing writer");
+        assert!(
+            waited >= std::time::Duration::from_millis(250),
+            "the open should have waited for the writer, returned after {waited:?}"
+        );
+        assert_eq!(get_job(&config, &job.id).unwrap().id, job.id);
+    }
+
+    #[test]
+    fn two_connections_opening_a_fresh_database_both_succeed() {
+        use std::sync::{Arc, Barrier};
+        for round in 0..40 {
+            let tmp = TempDir::new().unwrap();
+            let config = Arc::new(test_config(&tmp));
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|who| {
+                    let (config, barrier) = (config.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        add_job(&config, "test-agent", "*/5 * * * *", &format!("echo {who}"))
+                            .map(|_| ())
+                            .map_err(|e| format!("round {round}, opener {who}: {e:#}"))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        }
     }
 }
