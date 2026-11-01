@@ -5,6 +5,9 @@
 #
 # Literal { and } in values must be escaped as {"{"}  and  {"}"} respectively.
 
+# Keep the DISMISSED status marker literal when translating the surrounding text.
+tool-ask-user-result-dismissed = DISMISSED: the user closed the question without choosing.
+
 tool-backup = Create, list, verify, and restore shared data directory backups
 
 tool-browser = Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions.
