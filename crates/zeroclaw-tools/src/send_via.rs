@@ -5,7 +5,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::channel::{Channel, SendMessage};
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
 use zeroclaw_config::multi_agent::OutputModality;
 use zeroclaw_config::multi_agent::PeerGroupConfig;
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
@@ -42,6 +42,102 @@ pub struct TurnRoutingEntry {
 /// before each `run_tool_call_loop` call, scopes it into [`TURN_ROUTING`] for the
 /// duration of the loop, and reads it back after the loop completes.
 pub type TurnRoutingHandle = Arc<Mutex<Vec<TurnRoutingEntry>>>;
+
+/// Routing needs a live reply consumer. A registered channel alone is not
+/// evidence that the current task owns a channel turn.
+fn has_turn_routing() -> bool {
+    TURN_ROUTING
+        .try_with(|handle| handle.is_some())
+        .unwrap_or(false)
+}
+
+fn description_for_routing(routing_available: bool) -> &'static str {
+    if !routing_available {
+        return "Send a message immediately to a configured channel peer. Both `target` \
+                    and a non-empty `body` are required: this task has no active channel \
+                    reply to redirect. Sending starts or resumes the recipient's conversation; \
+                    no inbound message is required. The target must be a channel alias or \
+                    a peer group the active agent belongs to. `modality` defaults to the \
+                    peer group's output modality.";
+    }
+    "Control where and how this turn's reply is delivered, or send an extra message \
+         to another channel.\n\
+         \n\
+         WHEN TO USE: call this tool at the start of your response whenever the user requests \
+         a specific reply format or destination — e.g. \"reply by text\", \"send as voice\", \
+         \"text only\", \"send to my email\", \"redirect to Discord\". Do not wait for the user \
+         to name the tool; infer intent from natural language just as you would use a weather \
+         tool when asked for the weather.\n\
+         \n\
+         Without `body` (routing instruction — affects this turn's main reply):\n\
+         - `send_via(modality: \"text\")` — reply by text even on a voice-only peer\n\
+         - `send_via(modality: \"voice\")` — reply by voice even on a text-only peer\n\
+         - `send_via(target: \"discord.main\")` — redirect reply to another channel\n\
+         - `send_via(target: \"discord.main\", modality: \"voice\")` — redirect + force modality\n\
+         At least one of `target` or `modality` is required when `body` is absent.\n\
+         Modality applies to this turn's final reply. Progress already streamed \
+         earlier in the turn (e.g. Telegram multi_message narration) keeps its \
+         streamed modality and is not retracted.\n\
+         \n\
+         With `body` (immediate fanout — main reply still goes to originating channel):\n\
+         - `send_via(target: \"email.default\", body: \"...\")` — send separate content elsewhere\n\
+         `target` is required when `body` is present.\n\
+         \n\
+         `target` must be a channel alias (e.g. `telegram.default`) or a peer group name \
+         the active agent belongs to. `modality` defaults to the peer group's output_modality."
+}
+
+fn schema_for_routing(routing_available: bool) -> serde_json::Value {
+    let mut schema = json!({
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Channel alias (e.g. telegram.default) or peer group name. \
+                                Required when body is present. Optional otherwise (omit = same channel)."
+            },
+            "modality": {
+                "type": "string",
+                "enum": ["text", "voice"],
+                "description": "Delivery modality. Omit to inherit from the peer group's output_modality."
+            },
+            "body": {
+                "type": "string",
+                "description": "Message content for an immediate fanout send. \
+                                Omit to set a routing instruction for the current reply instead."
+            }
+        }
+    });
+    if !routing_available {
+        schema["required"] = json!(["target", "body"]);
+        schema["properties"]["target"]["description"] =
+            json!("Required destination: a configured channel alias or authorized peer group.");
+        schema["properties"]["body"]["description"] =
+            json!("Required non-empty message content to send immediately.");
+        schema["properties"]["body"]["minLength"] = json!(1);
+    }
+    schema
+}
+
+fn description_for_current_turn() -> &'static str {
+    description_for_routing(has_turn_routing())
+}
+
+fn schema_for_current_turn() -> serde_json::Value {
+    schema_for_routing(has_turn_routing())
+}
+
+/// Re-project deferred discovery at read time, without changing a catalog shared
+/// by concurrent turns. The send tool remains the owner of its metadata.
+pub(crate) fn contextual_discovery_spec(spec: &ToolSpec) -> Option<ToolSpec> {
+    if spec.name != "send_via" {
+        return None;
+    }
+    let mut current = spec.clone();
+    current.description = description_for_current_turn().to_string();
+    current.parameters = Arc::new(schema_for_current_turn());
+    Some(current)
+}
 
 /// Static routing/modality wording that suggests a `send_via` call. Each entry
 /// is a multiword phrase that, taken whole, requests a destination or delivery
@@ -89,6 +185,19 @@ pub struct SendViaTool {
 }
 
 impl SendViaTool {
+    /// Project static channel-prompt metadata. The channel owner knows that
+    /// its real turns install a reply consumer; this does not install a fake
+    /// TURN_ROUTING handle or change execution/discovery for headless tasks.
+    pub fn channel_prompt_spec(spec: &ToolSpec) -> Option<ToolSpec> {
+        if spec.name != "send_via" {
+            return None;
+        }
+        let mut projected = spec.clone();
+        projected.description = description_for_routing(true).to_string();
+        projected.parameters = Arc::new(schema_for_routing(true));
+        Some(projected)
+    }
+
     pub fn new(
         security: Arc<SecurityPolicy>,
         channel_map: PerToolChannelHandle,
@@ -205,31 +314,7 @@ impl Tool for SendViaTool {
     }
 
     fn description(&self) -> &str {
-        "Control where and how this turn's reply is delivered, or send an extra message \
-         to another channel.\n\
-         \n\
-         WHEN TO USE: call this tool at the start of your response whenever the user requests \
-         a specific reply format or destination — e.g. \"reply by text\", \"send as voice\", \
-         \"text only\", \"send to my email\", \"redirect to Discord\". Do not wait for the user \
-         to name the tool; infer intent from natural language just as you would use a weather \
-         tool when asked for the weather.\n\
-         \n\
-         Without `body` (routing instruction — affects this turn's main reply):\n\
-         - `send_via(modality: \"text\")` — reply by text even on a voice-only peer\n\
-         - `send_via(modality: \"voice\")` — reply by voice even on a text-only peer\n\
-         - `send_via(target: \"discord.main\")` — redirect reply to another channel\n\
-         - `send_via(target: \"discord.main\", modality: \"voice\")` — redirect + force modality\n\
-         At least one of `target` or `modality` is required when `body` is absent.\n\
-         Modality applies to this turn's final reply. Progress already streamed \
-         earlier in the turn (e.g. Telegram multi_message narration) keeps its \
-         streamed modality and is not retracted.\n\
-         \n\
-         With `body` (immediate fanout — main reply still goes to originating channel):\n\
-         - `send_via(target: \"email.default\", body: \"...\")` — send separate content elsewhere\n\
-         `target` is required when `body` is present.\n\
-         \n\
-         `target` must be a channel alias (e.g. `telegram.default`) or a peer group name \
-         the active agent belongs to. `modality` defaults to the peer group's output_modality."
+        description_for_current_turn()
     }
 
     fn invocation_triggers(&self) -> Vec<String> {
@@ -273,26 +358,7 @@ impl Tool for SendViaTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "target": {
-                    "type": "string",
-                    "description": "Channel alias (e.g. telegram.default) or peer group name. \
-                                    Required when body is present. Optional otherwise (omit = same channel)."
-                },
-                "modality": {
-                    "type": "string",
-                    "enum": ["text", "voice"],
-                    "description": "Delivery modality. Omit to inherit from the peer group's output_modality."
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Message content for an immediate fanout send. \
-                                    Omit to set a routing instruction for the current reply instead."
-                }
-            }
-        })
+        schema_for_current_turn()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -410,6 +476,16 @@ impl Tool for SendViaTool {
         }
 
         // ── Routing instruction mode (no body) ───────────────────────────────
+        if !has_turn_routing() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::json(json!({
+                    "status": "rejected",
+                    "reason": crate::i18n::get_required_tool_string("tool-send-via-error-no-active-reply")
+                })),
+                error: None,
+            });
+        }
         if target.is_none() && explicit_modality.is_none() {
             return Ok(ToolResult {
                 success: false,
@@ -621,6 +697,85 @@ mod tests {
             output_modality: OutputModality::Text,
             ..PeerGroupConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn background_schema_requires_content_but_channel_turn_keeps_routing() {
+        let (tool, routing) = make_tool(vec![], HashMap::new());
+        let assert_background = || {
+            assert_eq!(
+                tool.inner.parameters_schema()["required"],
+                json!(["target", "body"])
+            );
+            assert!(tool.inner.description().contains("non-empty `body`"));
+        };
+        assert_background();
+        TURN_ROUTING
+            .scope(None, async { assert_background() })
+            .await;
+        TURN_ROUTING
+            .scope(Some(routing), async {
+                assert!(tool.inner.parameters_schema().get("required").is_none());
+                assert!(tool.inner.description().contains("routing instruction"));
+            })
+            .await;
+        assert_background();
+    }
+
+    #[tokio::test]
+    async fn background_missing_content_is_rejected_without_sending() {
+        let ch = Arc::new(StubChannel::new("telegram"));
+        let sent = Arc::clone(&ch.sent);
+        let groups = HashMap::from([(
+            "notifications".into(),
+            pg_with_peers("telegram", &["operator"], &["@recipient"]),
+        )]);
+        let (tool, _) = make_tool(vec![("telegram.default", ch)], groups);
+        for body in [serde_json::Value::Null, json!(""), json!("   ")] {
+            let result = tool
+                .inner
+                .execute(json!({"target": "notifications", "body": body}))
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert!(result.output.contains("non-empty `body`"));
+            assert!(sent.read().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn background_send_starts_conversation_without_inbound_turn() {
+        let ch = Arc::new(StubChannel::new("telegram"));
+        let sent = Arc::clone(&ch.sent);
+        let groups = HashMap::from([(
+            "notifications".into(),
+            pg_with_peers("telegram", &["operator"], &["@recipient"]),
+        )]);
+        let (tool, _) = make_tool(vec![("telegram.default", ch)], groups);
+        // Bypass TestTool's channel-turn wrapper: no routing scope exists.
+        let result = tool
+            .inner
+            .execute(json!({
+                "target": "notifications", "body": "Scheduled notification"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["mode"], "immediate");
+        assert_eq!(output["status"], "ok");
+        assert_eq!(sent.read().len(), 1);
+        assert_eq!(sent.read()[0].recipient, "@recipient");
+
+        let denied = tool
+            .inner
+            .execute(json!({
+                "target": "unconfigured", "body": "Must not send"
+            }))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert_eq!(sent.read().len(), 1);
     }
 
     #[test]

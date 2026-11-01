@@ -1347,29 +1347,30 @@ pub fn build_tool_instructions_for_names(
 }
 
 fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn Tool>) -> String {
-    let tools: Vec<&dyn Tool> = tools.into_iter().collect();
-    if tools.is_empty() {
+    build_tool_instructions_from_specs(tools.into_iter().map(|tool| tool.spec()))
+}
+
+/// Render already-admitted tool metadata, including owner-projected channel
+/// contracts. The projection changes prompt text only, never execution scope.
+pub fn build_tool_instructions_from_specs(
+    specs: impl IntoIterator<Item = zeroclaw_api::tool::ToolSpec>,
+) -> String {
+    let mut specs = specs.into_iter().peekable();
+    if specs.peek().is_none() {
         return String::new();
     }
-
-    // The tool-call formatting guidance has one home: `agent::tool_call_format`.
-    // Do not re-type it here; layer builder-specific material (the tool
-    // listing below) around it instead.
     let mut instructions = String::from("\n");
     instructions.push_str(crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS);
     instructions.push_str("### Available Tools\n\n");
-
-    for tool in tools {
-        let desc = tool.description();
+    for spec in specs {
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
-            tool.name(),
-            desc,
-            tool.parameters_schema()
+            spec.name,
+            spec.description,
+            spec.parameters.as_ref()
         );
     }
-
     instructions
 }
 

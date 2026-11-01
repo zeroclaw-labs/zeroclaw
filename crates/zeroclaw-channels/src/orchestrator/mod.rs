@@ -129,7 +129,7 @@ use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
+    build_tool_instructions_from_specs, is_model_switch_requested, run_tool_call_loop,
     scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::agent::system_prompt::build_skills_prompt_with_effective_tools;
@@ -17004,6 +17004,23 @@ tokio::task_local! {
     static CHANNEL_STARTUP_PROBE: Arc<ChannelStartupProbe>;
 }
 
+fn channel_prompt_tool_spec(tool: &dyn Tool) -> zeroclaw_api::tool::ToolSpec {
+    let spec = tool.spec();
+    zeroclaw_runtime::tools::SendViaTool::channel_prompt_spec(&spec).unwrap_or(spec)
+}
+
+fn build_channel_text_tool_instructions(
+    tools: &[Box<dyn Tool>],
+    effective_tool_names: &HashSet<&str>,
+) -> String {
+    build_tool_instructions_from_specs(
+        tools
+            .iter()
+            .filter(|tool| effective_tool_names.contains(tool.name()))
+            .map(|tool| channel_prompt_tool_spec(tool.as_ref())),
+    )
+}
+
 /// Start supervised channels with the shared live-config authority and the
 /// daemon generation's plugin-webhook route registry.
 #[allow(clippy::too_many_lines)]
@@ -17229,7 +17246,10 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
 
         let tool_specs: Vec<(String, String)> = built_tools
             .iter()
-            .map(|t| (t.name().to_string(), t.description().to_string()))
+            .map(|t| {
+                let spec = channel_prompt_tool_spec(t.as_ref());
+                (spec.name, spec.description)
+            })
             .collect();
 
         let tools_registry = Arc::new(built_tools);
@@ -17383,7 +17403,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             runtime.shell_profile().as_ref(),
         );
         if expose_text_tool_protocol {
-            system_prompt.push_str(&build_tool_instructions_for_names(
+            system_prompt.push_str(&build_channel_text_tool_instructions(
                 tools_registry.as_ref(),
                 &effective_tool_names,
             ));
@@ -20291,6 +20311,82 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn non_native_channel_prompt_keeps_send_via_routing_without_faking_a_turn() {
+        let workspace = make_workspace();
+        let tool = zeroclaw_runtime::tools::SendViaTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(HashMap::new),
+        );
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let names: HashSet<&str> = tools.iter().map(|tool| tool.name()).collect();
+        let before = tools[0].parameters_schema();
+        assert_eq!(before["required"], serde_json::json!(["target", "body"]));
+        let owned: Vec<_> = tools
+            .iter()
+            .map(|tool| channel_prompt_tool_spec(tool.as_ref()))
+            .collect();
+        let mut descriptions: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec.description.as_str()))
+            .collect();
+        let mut deferred = String::new();
+        assert!(apply_text_tool_prompt_policy(
+            false,
+            false,
+            &mut descriptions,
+            &mut deferred
+        ));
+        let mut prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "fixture-model",
+            &descriptions,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            false,
+            false,
+            None,
+        );
+        prompt.push_str(&build_channel_text_tool_instructions(&tools, &names));
+        assert!(prompt.contains("Without `body`"));
+        assert!(prompt.contains("routing instruction"));
+        assert!(!prompt.contains("this task has no active channel"));
+        let parameters = prompt
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Parameters: `")
+                    .and_then(|s| s.strip_suffix('`'))
+            })
+            .expect("rendered parameters");
+        let schema: serde_json::Value = serde_json::from_str(parameters).expect("valid schema");
+        assert!(
+            schema.get("required").is_none(),
+            "channel routing can omit body"
+        );
+        // Static projection must not alter shared tool metadata or install a
+        // routing owner. Gateway WebSocket/background builders stay headless.
+        assert_eq!(tools[0].parameters_schema(), before);
+        let background =
+            zeroclaw_runtime::agent::loop_::build_tool_instructions_for_names(&tools, &names);
+        assert!(background.contains("this task has no active channel"));
+        assert_eq!(
+            tools[0].parameters_schema()["required"],
+            serde_json::json!(["target", "body"])
+        );
+        assert!(
+            !zeroclaw_runtime::tools::TURN_ROUTING
+                .try_with(|handle| handle.is_some())
+                .unwrap_or(false)
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
@@ -38721,7 +38817,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
             let effective_tool_names: HashSet<&str> =
                 tools_registry.iter().map(|tool| tool.name()).collect();
-            prompt.push_str(&build_tool_instructions_for_names(
+            prompt.push_str(&build_channel_text_tool_instructions(
                 &tools_registry,
                 &effective_tool_names,
             ));
