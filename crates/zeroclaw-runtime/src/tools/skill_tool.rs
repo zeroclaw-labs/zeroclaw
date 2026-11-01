@@ -439,6 +439,10 @@ impl Tool for SkillBuiltinTool {
         self.target_tool.requires_unrestricted_principal()
     }
 
+    fn wrapped_tool_name(&self) -> Option<&str> {
+        Some(self.target_tool.name())
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }
@@ -491,6 +495,22 @@ impl Tool for SkillBuiltinTool {
                 })),
             "skill-scoped elevated tool invoked"
         );
+        // A channel that excludes the target excludes it under a skill's name
+        // too. Dispatch checks this as well; checking here keeps the refusal
+        // from depending on every caller resolving wrappers.
+        if crate::security::channel_restriction::active_restriction_excludes(
+            self.target_tool.name(),
+        ) {
+            return Ok(ToolResult::err(
+                crate::i18n::get_required_cli_string_with_args(
+                    "skill-tool-target-excluded",
+                    &[
+                        ("tool", self.tool_name.as_str()),
+                        ("target", self.target_tool.name()),
+                    ],
+                ),
+            ));
+        }
         let merged = merge_locked_args(&self.locked_args, args);
         self.target_tool.execute_with_context(merged, context).await
     }
@@ -981,6 +1001,76 @@ mod tests {
             locked_args: HashMap::new(),
             timeout_secs: None,
         }
+    }
+
+    /// Counts the calls that reach it, so a test can show a refused call never ran.
+    struct CountedBuiltinTool {
+        inner: MockBuiltinTool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountedBuiltinTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            self.inner.role()
+        }
+        fn alias(&self) -> &str {
+            self.inner.alias()
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountedBuiltinTool {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn description(&self) -> &str {
+            self.inner.description()
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            self.inner.parameters_schema()
+        }
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.execute(args).await
+        }
+    }
+
+    fn counted_wrapper(target: &str) -> (SkillBuiltinTool, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target: Arc<dyn Tool> = Arc::new(CountedBuiltinTool {
+            inner: MockBuiltinTool::new(target),
+            calls: Arc::clone(&calls),
+        });
+        let wrapper =
+            SkillBuiltinTool::new("ops", &sample_builtin_skill_tool(), target, HashMap::new());
+        (wrapper, calls)
+    }
+
+    #[tokio::test]
+    async fn a_channel_exclusion_reaches_through_a_skill_wrapper() {
+        let (excluded, excluded_calls) = counted_wrapper("http_request");
+        let (permitted, permitted_calls) = counted_wrapper("file_read");
+        assert_eq!(excluded.wrapped_tool_name(), Some("http_request"));
+
+        let restriction: Arc<[String]> = vec!["http_request".to_string()].into();
+        let (refused, allowed) =
+            crate::security::channel_restriction::with_channel_tool_restriction(
+                restriction,
+                async {
+                    let args = serde_json::json!({ "input": "x" });
+                    (
+                        excluded.execute(args.clone()).await.unwrap(),
+                        permitted.execute(args).await.unwrap(),
+                    )
+                },
+            )
+            .await;
+
+        assert!(!refused.success);
+        assert!(refused.error.unwrap_or_default().contains("http_request"));
+        assert_eq!(excluded_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(allowed.success, "{allowed:?}");
+        assert_eq!(permitted_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

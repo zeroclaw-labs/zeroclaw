@@ -517,6 +517,14 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// The tool this one runs on the caller's behalf, when it is a wrapper
+    /// under another name, such as a skill's builtin tool. Excluding that
+    /// tool excludes the wrapper too. Delegating wrappers forward the inner
+    /// tool's value, as with `requires_unrestricted_principal`.
+    fn wrapped_tool_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Tool name (used in LLM function calling)
     fn name(&self) -> &str;
 
