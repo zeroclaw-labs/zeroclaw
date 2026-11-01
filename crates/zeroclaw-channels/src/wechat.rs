@@ -2781,7 +2781,11 @@ impl Channel for WeChatChannel {
             );
         }
 
-        let (text_without_markers, attachments) = parse_attachment_markers(&content);
+        let (text_without_markers, attachments) = if message.inline_attachments {
+            parse_attachment_markers(&content)
+        } else {
+            (content.clone(), Vec::new())
+        };
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
                 self.send_text(recipient, &text_without_markers, context_token.as_deref())
@@ -2795,7 +2799,9 @@ impl Channel for WeChatChannel {
             return Ok(());
         }
 
-        if let Some(attachment) = parse_path_only_attachment(&content) {
+        if message.inline_attachments
+            && let Some(attachment) = parse_path_only_attachment(&content)
+        {
             return self
                 .send_attachment(recipient, &attachment, context_token.as_deref())
                 .await;
@@ -3595,6 +3601,125 @@ mod tests {
             send_message_failure_disposition(&err),
             SendMessageFailureDisposition::Permanent,
             "an explicit iLink rejection cannot recover by replaying an identical response"
+        );
+    }
+
+    /// With inline attachments off, markers and a body that is only a path,
+    /// a `file://` path or a media URL go out as text and nothing is uploaded
+    /// or downloaded.
+    #[tokio::test]
+    async fn send_without_inline_attachments_sends_markers_and_paths_as_text() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempdir().unwrap();
+        let photo_path = workspace.path().join("photo.png");
+        std::fs::write(&photo_path, b"fake-png").unwrap();
+        let photo_path = photo_path.to_string_lossy().to_string();
+
+        let server = MockServer::start().await;
+        let remote_url = format!("{}/a.png", server.uri());
+        let cases = [
+            (
+                "see [IMAGE:https://example.com/a.png] and [FILE:/workspace/x.pdf]".to_string(),
+                "IMAGE:https://example.com/a.png".to_string(),
+            ),
+            (photo_path.clone(), photo_path.clone()),
+            (
+                format!("file://{photo_path}"),
+                format!("file://{photo_path}"),
+            ),
+            (remote_url.clone(), remote_url.clone()),
+            (
+                "<function_calls>x</function_calls>[IMAGE:https://example.com/a.png]".to_string(),
+                "IMAGE:https://example.com/a.png".to_string(),
+            ),
+        ];
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .expect(cases.len() as u64)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getuploadurl"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/a.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-png".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let state = tempdir().unwrap();
+        let channel = test_wechat_channel_for_api(server.uri(), state.path());
+        for (content, _) in &cases {
+            channel
+                .send(
+                    &SendMessage::new(content.as_str(), "recipient").with_inline_attachments(false),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("{content}: {err}"));
+        }
+
+        let texts: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .and_then(|body| {
+                        body["msg"]["item_list"][0]["text_item"]["text"]
+                            .as_str()
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(texts.len(), cases.len(), "{texts:?}");
+        for ((content, expected), text) in cases.iter().zip(&texts) {
+            assert!(text.contains(expected.as_str()), "{content}: {text}");
+        }
+    }
+
+    /// Control: by default a marker is still delivered as an upload.
+    #[tokio::test]
+    async fn send_with_inline_attachments_still_uploads_markers() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getuploadurl"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("photo.png"), b"fake-png").unwrap();
+        let state = tempdir().unwrap();
+        let channel = test_wechat_channel_for_api(server.uri(), state.path())
+            .with_workspace_dir(workspace.path().to_path_buf());
+        let _ = channel
+            .send(&SendMessage::new(
+                "[IMAGE:/workspace/photo.png]",
+                "recipient",
+            ))
+            .await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path() == "/ilink/bot/getuploadurl"),
+            "the marker must still reach the upload step"
         );
     }
 

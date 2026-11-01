@@ -28988,6 +28988,7 @@ mod tests {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+                ..zeroclaw_config::builtin_tools::BuiltinToolsConfig::default()
             },
             data_dir: workspace_dir,
             config_path: tmp.path().join("config.toml"),

@@ -33,7 +33,9 @@ pub const EXTERNAL_TOOL_NAMES: &[&str] = &[
     "email_search",
 ];
 
-/// Model-visible built-in selection (`[tools]`). Rebuild the registry after edits.
+/// Model-visible built-in selection (`[tools]`), plus per-tool limits in its
+/// subsections. Rebuild the registry after editing `optional`; the limits are
+/// read live on each call.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, deny_unknown_fields)]
@@ -43,6 +45,10 @@ pub struct BuiltinToolsConfig {
     /// core tools). Named entries add tools to minimal and are redundant
     /// alongside `"*"`.
     pub optional: Vec<String>,
+
+    /// Limits on files attached by the `send_via` tool (`[tools.send_via]`).
+    #[nested]
+    pub send_via: crate::schema::SendViaToolConfig,
 }
 
 impl Default for BuiltinToolsConfig {
@@ -50,6 +56,7 @@ impl Default for BuiltinToolsConfig {
     fn default() -> Self {
         Self {
             optional: vec!["*".to_string()],
+            send_via: crate::schema::SendViaToolConfig::default(),
         }
     }
 }
@@ -104,6 +111,7 @@ mod tests {
         assert!(config.is_enabled("cron_list"));
         let minimal = BuiltinToolsConfig {
             optional: Vec::new(),
+            ..BuiltinToolsConfig::default()
         };
         assert!(CORE_TOOL_NAMES.iter().all(|name| minimal.is_enabled(name)));
         assert!(!minimal.is_enabled("cron_list"));
