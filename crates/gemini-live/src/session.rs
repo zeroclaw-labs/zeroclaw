@@ -49,7 +49,10 @@ use crate::wire;
 const HANDLE_DROP_AFTER: u32 = 4;
 
 /// Bounded capacity of the outbound command channel (audio/client-text/tool
-/// responses). Mirrors the old uplink channel depth.
+/// responses). Mirrors the old uplink channel depth. Once this many commands
+/// are queued, `send_client_text` parks until the driver drains one — a wait
+/// that happens before any receipt exists to time out, so a caller's delivery
+/// budget has to start before the enqueue, not after it.
 const CMD_CAPACITY: usize = 64;
 
 /// Bounded capacity of the inbound event channel.
@@ -244,8 +247,12 @@ impl ControlReceipt {
 
     /// Wait for the driver's verdict. [`SessionError::Closed`] means the
     /// driver died without reporting one — treat it as undelivered.
-    pub async fn outcome(self) -> Result<ControlOutcome, SessionError> {
-        self.verdict.await.map_err(|_| SessionError::Closed)
+    ///
+    /// Takes the receipt by value but borrows the channel: moving the
+    /// receiver out would conflict with this type's `Drop`, and the drop is
+    /// what withdraws a control whose caller went away.
+    pub async fn outcome(mut self) -> Result<ControlOutcome, SessionError> {
+        self.wait().await
     }
 
     /// Wait for the verdict without consuming the receipt, for a loop that
@@ -288,6 +295,36 @@ impl ControlReceipt {
             Ok(outcome) => Expiry::Decided(outcome),
             Err(_) => Expiry::InFlight,
         }
+    }
+}
+
+/// Dropping a receipt withdraws its control, exactly as [`Self::expire`]
+/// does, only without a report: a receipt goes away when nobody is waiting
+/// for the outcome any more — a cancelled `send`, a task aborted during
+/// shutdown — and a control no caller is waiting for must not be spoken once
+/// the driver catches up. Without this, cancellation left the queued command
+/// claimable and the driver could write it after a reconnect, which is the
+/// one case [`Self::expire`] cannot cover: an expiring caller is still there
+/// to call it, a cancelled one is not.
+///
+/// A write already handed to the transport is past withdrawing and is left
+/// alone, so dropping a receipt never turns a possible delivery into a
+/// claimed loss. Observation is unaffected: the verdict channel is only read
+/// by the receipt's own methods.
+///
+/// One case takes the claim for a control that is no longer queued: a command
+/// discarded with a dead connection reports `Discarded` without claiming it,
+/// so a receipt read and then dropped still marks it withdrawn. That is
+/// harmless — the [`Ack`] went with the connection and nothing reads the
+/// claim again — and it keeps the drop free of a verdict-dependent branch.
+impl Drop for ControlReceipt {
+    fn drop(&mut self) {
+        let _ = self.state.compare_exchange(
+            CONTROL_PENDING,
+            CONTROL_EXPIRED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
