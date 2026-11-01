@@ -452,6 +452,11 @@ zc-chat-status-awaiting-input = esperando respuesta
 zc-chat-status-cancelling = cancelando
 zc-chat-session-close-error = No se pudo cerrar la sesión: { $error }
 zc-chat-elicitation-dropped = Se descartó una pregunta del agente antes de poder mostrarla (el cliente se retrasó). Es posible que la pregunta del agente siga esperando; inténtalo de nuevo.
+zc-chat-elicitation-answered = Respondiste: { $answer }
+zc-chat-elicitation-cancelled = Descartaste la pregunta sin responder.
+zc-chat-elicitation-withdrawn = La pregunta se cerró antes de que respondieras (la vista se recargó). Se le indicó al agente que se canceló.
+zc-chat-elicitation-expired = El agente dejó de esperar una respuesta a su pregunta.
+zc-chat-elicitation-outcome-note = { $outcome } (Pregunta: { $question })
 zc-chat-session-restarted = Nueva sesión iniciada.
 zc-chat-session-cap = Límite de sesiones de este panel alcanzado ({ $max }). Cierra antes una sesión desde la barra lateral.
 zc-chat-resume-dropped = No se pudieron reconectar { $count } sesión(es) anteriores y se conservaron para reintentarlo.
@@ -706,3 +711,5 @@ zc-config-section-peer-groups-help = Grupos con nombre que vinculan un canal, ag
 zc-config-section-cron-help = Tareas programadas que vinculan un horario con un prompt, un canal y un destino.
 zc-config-section-tunnel-help = Expón opcionalmente la puerta de enlace mediante Cloudflare o ngrok, o mantenla solo local.
 zc-config-section-onboard-state-help = Estado del ciclo de vida del inicio rápido y su registro heredado de finalización por sección.
+
+zc-chat-tool-question = pregunta
