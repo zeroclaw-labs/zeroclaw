@@ -1,6 +1,6 @@
 # Background work lifecycle
 
-ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, and runtime-spawned subagents share some execution machinery, but they do not share one lifecycle or one durable store. Goal mode defines a related target contract that is not yet wired end to end.
+ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, and runtime-spawned subagents share some execution machinery, but they do not share one lifecycle or one durable store. Goal foreground child work is a separate, synchronously owned path: it preserves the current Goal operation rather than creating detached background work.
 
 Use this page when a change adds scheduled or autonomous work, introduces a wait or approval state, changes cancellation or restart behavior, or connects child work to an owning task. The first design question is not "how does it run in the background?" but "which subsystem owns its lifecycle?"
 
@@ -59,9 +59,19 @@ Legacy delegate result files that contain status remain readable when no task ro
 
 ## Goal-mode target contract
 
-[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) accepts the task control plane as the future authority for goal lifecycle, ownership, route, principal, parent relation, and recovery eligibility. The repository contains goal storage and control-plane APIs, but production goal admission and execution are not yet wired end to end.
+[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) accepts the task control plane as the authority for goal lifecycle, ownership, route, principal, parent relation, and recovery eligibility. In the current Goal implementation candidate, Matrix is the first host wired to establish the foreground root context; this does not establish deployment readiness or successful live validation. The later IPC/WSS receiver must separately install the same trusted context and honor its cancellation, deadline, and drain obligations before that surface can claim Goal child support.
 
-A background path may participate in goal mode only after it preserves the owning goal relationship and reports terminal state and model usage back to it. Until then, that path is ordinary background work rather than goal-mode execution.
+Supervised Start/Resume retains exact process-local launch custody from the committed admission through projection, acknowledgement, and worker registration. Cancellation transfers an unlaunched epoch to the same supervisor before releasing admission guards. One tracked initial cleanup attempt, followed only by bounded explicit control or lifecycle retries, reconciles the canonical winner without executing or replaying the request. Storage failure retains the actual cause and cleanup duty, blocks retirement and restart reopening, and returns through the existing error boundary; it does not imply a successful pause. The restart coordinator retains these supervisors until retirement is proved. This custody is not durable recovery intent: process death still uses the existing conservative previous-boot recovery, with no automatic resume.
+
+Goal children invoked by `delegate` or `spawn_subagent` remain in the parent's foreground operation. They share its accountant and ledger and obey the cross-tool depth-one child limit. A Goal-spawned subagent requires an owner-bound task row linked to the Goal and settles that row before returning; synchronous delegation does not create an additional task row. Cancellation or deadline signals the child and awaits settlement and required row cleanup before the parent publishes its terminal outcome; dropping the caller's future is not a substitute for that cleanup. Existing authorization, approval, target, and ordinary spend policies still apply.
+
+The candidate's parent and verifier calls use the ordinary daily/monthly cost tracker as well as the Goal budget. The Goal accountant remains the only writer for their usage. An ordinary pre-call spend refusal can pause the Goal only after accounting and the actual tool phase are clean. Wait for the ordinary limit to reset or raise it, then explicitly resume; resumption checks the same ordinary gate again. Missing or invalid accounting, unresolved tool work, and genuine operation failures do not become resumable merely because a budget error is also present.
+
+A failed Goal subagent terminal-row write also prevents a new resumable budget pause, even when its model call was refused before admission and the parent tool result is paired. The original refusal and cleanup failure remain visible. A rolled-back write may leave the child row marked Running after its body has stopped; this path has no same-process cleanup retry queue. The existing generic reaper can mark a prior-owner row Lost only after its normal process-absence or process-reuse check, without replaying the child or claiming successful cleanup.
+
+When a Goal-owned live SOP driver stops on an owned refusal, accounting, child, or tool-phase error, it stops advancing the current and queued actions. The existing SOP settlement owner terminates the begun run and cancels unstarted queued work without executing retry, Goto, or compensation steps. Failed terminal writes remain owned by the existing maintenance queue and prevent a clean budget pause; maintenance settlement does not replay the SOP steps. Ordinary SOP retry and failure policy is unchanged.
+
+Detached/background delegate tasks do not become Goal children merely because a Goal initiated them. A background path may participate in Goal mode only after it preserves the owning Goal relationship and reports terminal state and model usage back to it; otherwise it remains ordinary background work.
 
 ## Change checklist
 

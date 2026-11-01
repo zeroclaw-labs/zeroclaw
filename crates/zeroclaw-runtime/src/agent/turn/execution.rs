@@ -8,6 +8,7 @@ use zeroclaw_providers::dispatch::{AccountedAttempt, with_exact_dispatch_route};
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{ContextLimitsResolver, LoopKnobs, ModelSwitchCallback};
+use crate::agent::cost::admit_goal_operation_if_scoped;
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
@@ -81,7 +82,15 @@ impl ResolvedModelAccess<'_> {
     ) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
-        crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
+        crate::agent::turn::provider_call::enforce_tool_loop_budget().map_err(|error| {
+            if crate::agent::cost::goal_operation_accounting_is_scoped() {
+                // This one-shot query has not begun any local tool batch or
+                // admitted a provider operation at this pre-dispatch boundary.
+                zeroclaw_goal::accounting::GoalOrdinarySpendRefusal::new(error, true).into()
+            } else {
+                error
+            }
+        })?;
         // This one-shot seam does not run the full multimodal preparation
         // (`prepare_messages_for_provider`): callers that want images in the
         // request normalize before calling, and the max-iteration graceful
@@ -104,9 +113,22 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
+        let foreground = crate::goal_accounting::GoalForegroundContext::current();
+        if foreground.as_ref().is_some_and(|context| {
+            context.token().is_cancelled() || tokio::time::Instant::now() >= context.deadline()
+        }) {
+            return Err(super::outcome::ToolLoopCancelled.into());
+        }
+        admit_goal_operation_if_scoped(self.provider_name, self.model).await?;
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
-        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
-        let result = scope
+        let scope = if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            zeroclaw_providers::dispatch::AccountedChatScope::new_with_string_usage()
+        } else {
+            zeroclaw_providers::dispatch::AccountedChatScope::new()
+        };
+        // The collector outlives cancellation of the physical request, so its
+        // immutable unknown/lower-bound report still reaches settlement below.
+        let request_future = scope
             // The route identity records the model that actually serves this
             // request, while the dispatch call keeps the provider-facing
             // selector: a routed provider may need `hint:<name>` even though
@@ -115,14 +137,23 @@ impl ResolvedModelAccess<'_> {
                 self.provider_name.to_string(),
                 self.model.to_string(),
                 dispatcher.chat(request, self.dispatch_model, self.temperature),
-            ))
-            .await;
+            ));
+        let result = if let Some(context) = &foreground {
+            tokio::select! {
+                biased;
+                () = context.token().cancelled() => Err(super::outcome::ToolLoopCancelled.into()),
+                result = request_future => result,
+            }
+        } else {
+            request_future.await
+        };
         if result.is_ok() {
             scope.mark_logical_success();
         }
         let accounting = scope.take();
 
         let attempts = accounting.attempts();
+        let goal_scoped = crate::agent::cost::goal_operation_accounting_is_scoped();
 
         let accepted_route = accounting.accepted_route().cloned();
         let (served_provider, served_model) = accepted_route
@@ -136,29 +167,53 @@ impl ResolvedModelAccess<'_> {
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal() {
-                    crate::agent::cost::settle_provider_attempts(attempts, None);
+                    let error = anyhow::Error::new(SemanticEmptyTerminalCompletion);
+                    let settlement =
+                        crate::agent::cost::settle_provider_attempts(attempts, None).await;
                     extend_rejected_summaries(settled_out, attempts);
-                    return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+                    return Err(match settlement {
+                        Ok(()) => error,
+                        Err(secondary) => zeroclaw_goal::accounting::GoalAccountingFailure::preserving_primary_error(error, secondary),
+                    });
+                }
+                let settlement = if goal_scoped {
+                    crate::agent::cost::settle_provider_attempts(
+                        attempts,
+                        Some(attempts.len().saturating_sub(1)),
+                    )
+                    .await
+                } else {
+                    crate::agent::cost::settle_provider_attempts(
+                        &attempts[..attempts.len().saturating_sub(1)],
+                        None,
+                    )
+                    .await
+                };
+                if let Err(error) = settlement {
+                    extend_rejected_summaries(settled_out, attempts);
+                    return Err(error);
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
-                crate::agent::cost::settle_provider_attempts(
-                    &attempts[..attempts.len().saturating_sub(1)],
-                    None,
-                );
                 extend_rejected_summaries(
                     settled_out,
                     &attempts[..attempts.len().saturating_sub(1)],
                 );
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
-                let accepted_cost_usd = response.usage.as_ref().and_then(|usage| {
-                    crate::agent::cost::record_tool_loop_cost_usage(
-                        &served_provider,
-                        &served_model,
-                        usage,
-                    )
-                    .map(|(_, cost_usd)| cost_usd)
-                });
+                let accepted_cost_usd = if goal_scoped {
+                    response.usage.as_ref().and_then(|usage| {
+                        crate::agent::cost::compute_cost_usd(&served_provider, &served_model, usage)
+                    })
+                } else {
+                    response.usage.as_ref().and_then(|usage| {
+                        crate::agent::cost::record_tool_loop_cost_usage(
+                            &served_provider,
+                            &served_model,
+                            usage,
+                        )
+                        .map(|(_, cost_usd)| cost_usd)
+                    })
+                };
                 // The accepted leaf is always projected (even usage-less, so
                 // terminal identity stays coherent); the caller emits it with
                 // `accepted: true`.
@@ -185,9 +240,16 @@ impl ResolvedModelAccess<'_> {
                 Ok(response)
             }
             Err(error) => {
-                crate::agent::cost::settle_provider_attempts(attempts, None);
+                let settlement = crate::agent::cost::settle_provider_attempts(attempts, None).await;
                 extend_rejected_summaries(settled_out, attempts);
-                Err(error)
+                Err(match settlement {
+                    Ok(()) => error,
+                    Err(secondary) => {
+                        zeroclaw_goal::accounting::GoalAccountingFailure::preserving_primary_error(
+                            error, secondary,
+                        )
+                    }
+                })
             }
         }
     }
@@ -607,6 +669,481 @@ mod run_model_query_tests {
         assert!(summaries[1].accepted);
         assert_eq!(summaries[1].input_tokens, Some(80));
         assert_eq!(summaries[1].output_tokens, Some(7));
+    }
+
+    struct CapturedGoalSettlement(
+        Arc<parking_lot::Mutex<Vec<zeroclaw_goal::accounting::GoalOperationSettlement>>>,
+    );
+
+    struct RefusedQueryAccounting {
+        admits: Arc<AtomicUsize>,
+        settlements: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for RefusedQueryAccounting {
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.admits.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("refused query unexpectedly reached admission")
+        }
+
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.settlements.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("refused query unexpectedly reached settlement")
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            anyhow::bail!("refused query unexpectedly queried pricing completeness")
+        }
+    }
+
+    #[tokio::test]
+    async fn run_model_query_qualifies_only_goal_pre_admission_spend_refusal() {
+        use zeroclaw_api::turn_stop::{TurnStopCode, turn_stop};
+        use zeroclaw_goal::accounting::{GOAL_OPERATION_ACCOUNTING, GoalOrdinarySpendRefusal};
+
+        for goal_scoped in [false, true] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: true,
+                        daily_limit_usd: 1.0,
+                        monthly_limit_usd: 100.0,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            );
+            tracker
+                .record_usage(crate::cost::types::TokenUsage::new(
+                    "seed", 1_000_000, 0, 0, 2.0, 0.0, 0.0,
+                ))
+                .unwrap();
+            let ledger_path = directory.path().join("state/costs.jsonl");
+            let before = std::fs::read(&ledger_path).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = SemanticEmptyThenTextProvider {
+                calls: Arc::clone(&calls),
+                persist_empty: false,
+            };
+            let admits = Arc::new(AtomicUsize::new(0));
+            let settlements = Arc::new(AtomicUsize::new(0));
+            let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+                Arc::new(RefusedQueryAccounting {
+                    admits: Arc::clone(&admits),
+                    settlements: Arc::clone(&settlements),
+                });
+            let context = ToolLoopCostTrackingContext::new(
+                tracker,
+                Arc::new(std::collections::HashMap::new()),
+            );
+            let messages = [ChatMessage::user("do not dispatch")];
+            let mut summaries = Vec::new();
+            let error = GOAL_OPERATION_ACCOUNTING
+                .scope(
+                    goal_scoped.then_some(accountant),
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context), async {
+                        ResolvedModelAccess {
+                            model_provider: &provider,
+                            provider_name: "custom",
+                            model: "test-model",
+                            dispatch_model: "test-model",
+                            temperature: None,
+                        }
+                        .run_model_query(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            &mut summaries,
+                        )
+                        .await
+                        .unwrap_err()
+                    }),
+                )
+                .await;
+
+            assert_eq!(
+                turn_stop(&error).unwrap().code,
+                TurnStopCode::BudgetExhausted
+            );
+            let marker = error.downcast_ref::<GoalOrdinarySpendRefusal>();
+            assert_eq!(marker.is_some(), goal_scoped);
+            if let Some(marker) = marker {
+                assert!(marker.clean_tool_phase());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(admits.load(Ordering::SeqCst), 0);
+            assert_eq!(settlements.load(Ordering::SeqCst), 0);
+            assert!(summaries.is_empty());
+            assert_eq!(std::fs::read(ledger_path).unwrap(), before);
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for CapturedGoalSettlement {
+        async fn admit(
+            &self,
+            _request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.0.lock().push(settlement);
+            Ok(())
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct FailingGoalSettlement;
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for FailingGoalSettlement {
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            Err(zeroclaw_goal::accounting::GoalAccountingFailure::settled(
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown,
+                &["secondary accounting detail".into()],
+            )
+            .into())
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_failure_preserves_semantic_empty_and_rejected_usage() {
+        let provider = DirectResponseProvider {
+            response: ChatResponse {
+                text: Some(" ".into()),
+                tool_calls: vec![],
+                usage: Some(TokenUsage {
+                    input_tokens: Some(8),
+                    output_tokens: Some(3),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            },
+        };
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingGoalSettlement);
+        let messages = [ChatMessage::user("hi")];
+        let mut summaries = Vec::new();
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                direct_access(&provider)
+                    .run_model_query(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &mut summaries,
+                    )
+                    .await
+                    .unwrap_err()
+            })
+            .await;
+        assert!(
+            error
+                .downcast_ref::<SemanticEmptyTerminalCompletion>()
+                .is_some()
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .unwrap()
+                .accounting_state(),
+            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(format!("{error:#}").contains("secondary accounting detail"));
+        assert_eq!(summaries.len(), 1);
+        assert!(!summaries[0].accepted);
+        assert_eq!(summaries[0].input_tokens, Some(8));
+        assert_eq!(summaries[0].output_tokens, Some(3));
+    }
+
+    #[tokio::test]
+    async fn settlement_failure_rejects_valid_response_summary() {
+        let provider = UsageProvider;
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingGoalSettlement);
+        let messages = [ChatMessage::user("hi")];
+        let mut summaries = Vec::new();
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                access(&provider)
+                    .run_model_query(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &mut summaries,
+                    )
+                    .await
+                    .unwrap_err()
+            })
+            .await;
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .is_some()
+        );
+        assert_eq!(summaries.len(), 1);
+        assert!(!summaries[0].accepted);
+        assert_eq!(summaries[0].input_tokens, Some(100));
+    }
+
+    #[tokio::test]
+    async fn settlement_failure_preserves_reliable_exhaustion_and_rejected_summary() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reliable = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_owned(),
+                Box::new(SemanticEmptyThenTextProvider {
+                    calls: Arc::clone(&calls),
+                    persist_empty: true,
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingGoalSettlement);
+        let messages = [ChatMessage::user("hi")];
+        let mut summaries = Vec::new();
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                ResolvedModelAccess {
+                    model_provider: &reliable,
+                    provider_name: "reliable",
+                    model: "test-model",
+                    dispatch_model: "test-model",
+                    temperature: None,
+                }
+                .run_model_query(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    &mut summaries,
+                )
+                .await
+                .unwrap_err()
+            })
+            .await;
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableRejectedCompletionUsage>())
+        );
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .is_some()
+        );
+        assert!(format!("{error:#}").contains("secondary accounting detail"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].provider_ref, "primary");
+        assert!(!summaries[0].accepted);
+        assert_eq!(
+            (summaries[0].input_tokens, summaries[0].output_tokens),
+            (Some(80), Some(5))
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_model_query_projects_usage_like_ordinary_without_ordinary_ledger() {
+        let ordinary_calls = Arc::new(AtomicUsize::new(0));
+        let ordinary = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_string(),
+                Box::new(SemanticEmptyThenTextProvider {
+                    calls: Arc::clone(&ordinary_calls),
+                    persist_empty: false,
+                }) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let goal_calls = Arc::new(AtomicUsize::new(0));
+        let goal = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_string(),
+                Box::new(SemanticEmptyThenTextProvider {
+                    calls: Arc::clone(&goal_calls),
+                    persist_empty: false,
+                }) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let messages = [ChatMessage::user("hi")];
+        let make_context = |root: &std::path::Path| {
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    root,
+                )
+                .expect("cost tracker"),
+            );
+            let pricing = Arc::new(std::collections::HashMap::from([(
+                "primary".to_string(),
+                std::collections::HashMap::from([
+                    ("test-model.input".to_string(), 1.0),
+                    ("test-model.output".to_string(), 2.0),
+                ]),
+            )]));
+            ToolLoopCostTrackingContext::new(tracker, pricing)
+        };
+        let ordinary_root = tempfile::TempDir::new().expect("ordinary temp dir");
+        let ordinary_context = make_context(ordinary_root.path());
+        let ordinary_usage = Arc::clone(&ordinary_context.turn_usage);
+        let mut ordinary_summaries = Vec::new();
+        let ordinary_response = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ordinary_context), async {
+                ResolvedModelAccess {
+                    model_provider: &ordinary,
+                    provider_name: "reliable",
+                    model: "test-model",
+                    dispatch_model: "test-model",
+                    temperature: None,
+                }
+                .run_model_query(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    &mut ordinary_summaries,
+                )
+                .await
+            })
+            .await
+            .expect("ordinary query succeeds");
+
+        let goal_root = tempfile::TempDir::new().expect("Goal temp dir");
+        let goal_context = make_context(goal_root.path());
+        let goal_usage = Arc::clone(&goal_context.turn_usage);
+        let settlements = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(CapturedGoalSettlement(Arc::clone(&settlements)));
+        let mut goal_summaries = Vec::new();
+        let goal_response = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(Some(goal_context), async {
+                        ResolvedModelAccess {
+                            model_provider: &goal,
+                            provider_name: "reliable",
+                            model: "test-model",
+                            dispatch_model: "test-model",
+                            temperature: None,
+                        }
+                        .run_model_query(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            &mut goal_summaries,
+                        )
+                        .await
+                    })
+                    .await
+            })
+            .await
+            .expect("Goal-scoped query succeeds");
+
+        assert_eq!(ordinary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(goal_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(ordinary_response.text, goal_response.text);
+        assert_eq!(ordinary_summaries.len(), 2);
+        assert_eq!(goal_summaries.len(), ordinary_summaries.len());
+        for (index, (goal, ordinary)) in goal_summaries.iter().zip(&ordinary_summaries).enumerate()
+        {
+            assert_eq!(goal.provider_ref, ordinary.provider_ref);
+            assert_eq!(goal.model, ordinary.model);
+            assert_eq!(goal.provider_ref, "primary");
+            assert_eq!(goal.model, "test-model");
+            assert_eq!(goal.input_tokens, ordinary.input_tokens);
+            assert_eq!(goal.cached_input_tokens, ordinary.cached_input_tokens);
+            assert_eq!(goal.output_tokens, ordinary.output_tokens);
+            assert_eq!(goal.cost_usd, ordinary.cost_usd);
+            assert_eq!(goal.accepted, ordinary.accepted);
+            assert_eq!(goal.accepted, index == 1);
+            assert_eq!(goal.input_tokens, Some(80));
+            assert_eq!(goal.output_tokens, Some(if index == 0 { 5 } else { 7 }));
+            assert!(goal.cost_usd.is_some_and(|cost| cost > 0.0));
+        }
+        // TurnUsage deliberately has no PartialEq; compare its owned facts.
+        let goal_usage = *goal_usage.lock();
+        let ordinary_usage = *ordinary_usage.lock();
+        assert_eq!(goal_usage.input_tokens, ordinary_usage.input_tokens);
+        assert_eq!(goal_usage.output_tokens, ordinary_usage.output_tokens);
+        assert_eq!(goal_usage.cost_usd, ordinary_usage.cost_usd);
+        assert_eq!(
+            goal_usage.last_input_tokens,
+            ordinary_usage.last_input_tokens
+        );
+        assert_eq!(goal_usage.input_tokens, 160);
+        assert_eq!(goal_usage.output_tokens, 12);
+        assert_eq!(goal_usage.last_input_tokens, 80);
+        let settlements = settlements.lock();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(
+            settlements[0].accounting_state,
+            zeroclaw_goal::task::GoalAccountingState::Complete
+        );
+        assert_eq!(settlements[0].events.len(), 2);
+        for (event, summary) in settlements[0].events.iter().zip(&goal_summaries) {
+            assert_eq!(event.provider_ref, summary.provider_ref);
+            assert_eq!(event.model, summary.model);
+            assert_eq!(event.usage.input_tokens, summary.input_tokens);
+            assert_eq!(event.usage.output_tokens, summary.output_tokens);
+            // The summary keeps the provider's absent cache count; the canonical
+            // Goal event records a valid absent cache partition as explicit zeros.
+            assert_eq!(summary.cached_input_tokens, None);
+            assert_eq!(event.usage.cached_input_tokens, Some(0));
+            assert_eq!(event.usage.cache_creation_input_tokens, Some(0));
+            assert!(event.priceable);
+        }
+        assert!(ordinary_root.path().join("state/costs.jsonl").exists());
+        assert!(!goal_root.path().join("state/costs.jsonl").exists());
     }
 
     #[tokio::test]

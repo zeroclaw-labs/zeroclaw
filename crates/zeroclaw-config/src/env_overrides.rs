@@ -397,6 +397,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walker_resolves_goal_channel_turn_context() {
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set("ZEROCLAW_goal__include_channel_turn_context", "false");
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert!(applied.paths.contains("goal.include_channel_turn_context"));
+        assert!(!config.goal.include_channel_turn_context);
+    }
+
+    #[tokio::test]
     async fn walker_rejects_unknown_path() {
         let _guard = super::env_test_lock().await;
         let _v = EnvVarGuard::set("ZEROCLAW_no__such__field", "x");

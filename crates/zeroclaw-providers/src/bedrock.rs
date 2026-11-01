@@ -20,6 +20,11 @@ const ENDPOINT_PREFIX: &str = "bedrock-runtime";
 const SIGNING_SERVICE: &str = "bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
 
+#[cfg(test)]
+tokio::task_local! {
+    static CONVERSE_TEST_ORIGIN: reqwest::Url;
+}
+
 // ── Authentication ──────────────────────────────────────────────
 
 /// Authentication method for Bedrock: either SigV4 (AKSK) or Bearer token.
@@ -870,7 +875,19 @@ impl BedrockModelProvider {
 
     /// Build the actual request URL. Uses raw model ID (reqwest sends colons as-is).
     fn endpoint_url(region: &str, model_id: &str) -> String {
-        format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/model/{model_id}/converse")
+        let url =
+            format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/model/{model_id}/converse");
+        #[cfg(test)]
+        if let Ok(origin) = CONVERSE_TEST_ORIGIN.try_with(Clone::clone) {
+            let mut rewritten = reqwest::Url::parse(&url).expect("canonical Bedrock URL");
+            rewritten
+                .set_scheme(origin.scheme())
+                .expect("fixture scheme");
+            rewritten.set_host(origin.host_str()).expect("fixture host");
+            rewritten.set_port(origin.port()).expect("fixture port");
+            return rewritten.into();
+        }
+        url
     }
 
     /// Build the canonical URI for SigV4 signing. Must URI-encode the path
@@ -1701,7 +1718,9 @@ impl ModelProvider for BedrockModelProvider {
 
         let response = self.send_converse_request(&auth, model, &request).await?;
 
-        Self::parse_converse_response(response).text.ok_or_else(|| {
+        let response = Self::parse_converse_response(response);
+        crate::dispatch::accounting::observe_string_usage(response.usage.clone());
+        response.text.ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1848,6 +1867,613 @@ mod tests {
     use super::*;
     use crate::test_util::{EnvGuard, env_lock};
     use crate::traits::ChatMessage;
+
+    // Loopback exercises the request and observation, not AWS TLS, service-side
+    // signature acceptance, model availability, or billing. In particular the
+    // signed AWS host intentionally differs from the loopback wire Host.
+    #[tokio::test]
+    async fn goal_string_usage_bedrock_actual_dispatch() {
+        use crate::dispatch::{
+            AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, ProviderDispatch,
+        };
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, Method, StatusCode, Uri},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use std::{collections::VecDeque, sync::Arc};
+        use tokio::sync::{Notify, mpsc};
+
+        struct Script {
+            status: StatusCode,
+            body: Value,
+            hold: bool,
+        }
+        struct Capture {
+            method: Method,
+            uri: Uri,
+            headers: HeaderMap,
+            body: Value,
+        }
+        async fn receive(rx: &mut mpsc::UnboundedReceiver<Capture>) -> Capture {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        fn origin(addr: std::net::SocketAddr) -> reqwest::Url {
+            let url = reqwest::Url::parse(&format!("http://{addr}/")).unwrap();
+            assert_eq!(url.scheme(), "http");
+            assert_eq!(url.host_str(), Some("127.0.0.1"));
+            assert_ne!(url.port().unwrap(), 0);
+            assert_eq!(url.path(), "/");
+            assert_eq!(url.username(), "");
+            assert!(url.password().is_none() && url.query().is_none() && url.fragment().is_none());
+            url
+        }
+        const MODEL: &str = "anthropic.claude-test:0";
+        const ALIAS: &str = "goal-bedrock";
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let local_origin = origin(addr);
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_origin = origin(second_listener.local_addr().unwrap());
+        let canonical = "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-test:0/converse";
+        assert_eq!(
+            BedrockModelProvider::endpoint_url("us-east-1", MODEL),
+            canonical
+        );
+        assert_eq!(
+            BedrockModelProvider::canonical_uri(MODEL),
+            "/model/anthropic.claude-test%3A0/converse"
+        );
+        let local_url = format!("http://{addr}/model/{MODEL}/converse");
+        let other_url = format!(
+            "http://{}/model/{MODEL}/converse",
+            second_listener.local_addr().unwrap()
+        );
+        CONVERSE_TEST_ORIGIN
+            .scope(local_origin.clone(), async {
+                assert_eq!(
+                    BedrockModelProvider::endpoint_url("us-east-1", MODEL),
+                    local_url
+                );
+                let nested: Result<(), ()> = CONVERSE_TEST_ORIGIN
+                    .scope(other_origin.clone(), async {
+                        assert_eq!(
+                            BedrockModelProvider::endpoint_url("us-east-1", MODEL),
+                            other_url
+                        );
+                        Err(())
+                    })
+                    .await;
+                assert!(nested.is_err());
+                assert_eq!(
+                    BedrockModelProvider::endpoint_url("us-east-1", MODEL),
+                    local_url
+                );
+                {
+                    let nested = CONVERSE_TEST_ORIGIN.scope(other_origin.clone(), async {
+                        assert_eq!(
+                            BedrockModelProvider::endpoint_url("us-east-1", MODEL),
+                            other_url
+                        );
+                        std::future::pending::<()>().await;
+                    });
+                    tokio::pin!(nested);
+                    assert!(
+                        std::future::poll_fn(|cx| {
+                            std::task::Poll::Ready(
+                                std::future::Future::poll(nested.as_mut(), cx).is_pending(),
+                            )
+                        })
+                        .await
+                    );
+                }
+                assert_eq!(
+                    BedrockModelProvider::endpoint_url("us-east-1", MODEL),
+                    local_url
+                );
+            })
+            .await;
+        assert_eq!(
+            BedrockModelProvider::endpoint_url("us-east-1", MODEL),
+            canonical
+        );
+        let (first, second) = tokio::join!(
+            CONVERSE_TEST_ORIGIN.scope(local_origin.clone(), async {
+                tokio::task::yield_now().await;
+                BedrockModelProvider::endpoint_url("us-east-1", MODEL)
+            }),
+            CONVERSE_TEST_ORIGIN.scope(other_origin, async {
+                tokio::task::yield_now().await;
+                BedrockModelProvider::endpoint_url("us-east-1", MODEL)
+            }),
+        );
+        assert_eq!(first, local_url);
+        assert_eq!(second, other_url);
+        assert_eq!(
+            BedrockModelProvider::endpoint_url("us-east-1", MODEL),
+            canonical
+        );
+        drop(second_listener);
+
+        let scripts = Arc::new(Mutex::new(VecDeque::<Script>::new()));
+        let (capture_tx, mut capture_rx) = mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/model/{model}/converse",
+            post({
+                let scripts = Arc::clone(&scripts);
+                let release = Arc::clone(&release);
+                move |method: Method, uri: Uri, headers: HeaderMap, Json(body): Json<Value>| {
+                    let scripts = Arc::clone(&scripts);
+                    let capture_tx = capture_tx.clone();
+                    let finished_tx = finished_tx.clone();
+                    let release = Arc::clone(&release);
+                    async move {
+                        let script = scripts
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .expect("unexpected Bedrock request");
+                        capture_tx
+                            .send(Capture {
+                                method,
+                                uri,
+                                headers,
+                                body,
+                            })
+                            .unwrap();
+                        if script.hold {
+                            let _finished = scopeguard::guard(finished_tx, |tx| {
+                                let _ = tx.send(());
+                            });
+                            release.notified().await;
+                        }
+                        (script.status, Json(script.body))
+                    }
+                }
+            }),
+        );
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut server = scopeguard::guard(server, |server| server.abort());
+        let _release_on_unwind =
+            scopeguard::guard(Arc::clone(&release), |release| release.notify_one());
+        let enqueue = |body: Value, status: StatusCode, hold: bool| {
+            scripts
+                .lock()
+                .unwrap()
+                .push_back(Script { status, body, hold })
+        };
+        let provider = BedrockModelProvider::builder(ALIAS)
+            .bearer_token("synthetic-bearer")
+            .max_tokens(123)
+            .build();
+        let dispatch = ProviderDispatch::from_ref(&provider);
+        let system = "system".repeat(600);
+        let valid = json!({"output":{"message":{"content":[{"text":"  first  "},{"text":"\nsecond\t"}]}},"usage":{"inputTokens":8,"outputTokens":3}});
+        let check_capture =
+            |capture: Capture, model: &str, temperature: Option<f64>, cache: bool, bearer: bool| {
+                assert_eq!(capture.method, Method::POST);
+                assert_eq!(
+                    capture.uri.path_and_query().unwrap().as_str(),
+                    format!("/model/{model}/converse")
+                );
+                assert_eq!(capture.headers["content-type"], "application/json");
+                if bearer {
+                    assert_eq!(capture.headers["authorization"], "Bearer synthetic-bearer");
+                }
+                assert_eq!(capture.body["system"][0]["text"], system);
+                assert_eq!(
+                    capture.body["system"].as_array().unwrap().len(),
+                    if cache { 2 } else { 1 }
+                );
+                if cache {
+                    assert_eq!(
+                        capture.body["system"][1],
+                        json!({"cachePoint":{"type":"default"}})
+                    );
+                }
+                assert_eq!(
+                    capture.body["messages"],
+                    json!([{"role":"user","content":[{"text":"user\nbytes"}]}])
+                );
+                assert_eq!(capture.body["inferenceConfig"]["maxTokens"], 123);
+                match temperature {
+                    Some(t) => assert_eq!(capture.body["inferenceConfig"]["temperature"], json!(t)),
+                    None => assert!(capture.body["inferenceConfig"].get("temperature").is_none()),
+                }
+                assert!(capture.body.get("toolConfig").is_none());
+                assert!(capture.body.get("additionalModelRequestFields").is_none());
+            };
+
+        enqueue(valid.clone(), StatusCode::OK, false);
+        let text = CONVERSE_TEST_ORIGIN
+            .scope(
+                local_origin.clone(),
+                dispatch.chat_with_system(Some(&system), "user\nbytes", MODEL, Some(0.25)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(text, "first\nsecond");
+        check_capture(
+            receive(&mut capture_rx).await,
+            MODEL,
+            Some(0.25),
+            true,
+            true,
+        );
+        enqueue(valid.clone(), StatusCode::OK, false);
+        let (text, report) = CONVERSE_TEST_ORIGIN
+            .scope(local_origin.clone(), async {
+                let scope = AccountedChatScope::new();
+                let text = scope
+                    .scope(dispatch.chat_with_system(
+                        Some(&system),
+                        "user\nbytes",
+                        MODEL,
+                        Some(0.25),
+                    ))
+                    .await
+                    .unwrap();
+                scope.mark_logical_success();
+                (text, scope.take())
+            })
+            .await;
+        assert_eq!(text, "first\nsecond");
+        assert_eq!(report.attempts().len(), 1);
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::Missing
+        ));
+        check_capture(
+            receive(&mut capture_rx).await,
+            MODEL,
+            Some(0.25),
+            true,
+            true,
+        );
+
+        enum Expected {
+            Missing,
+            Complete(Option<u64>, Option<u64>),
+            Invalid(InvalidUsageReason, Option<u64>, Option<u64>),
+            Unknown,
+        }
+        let cases = vec![
+            (None, Expected::Missing),
+            (Some(Value::Null), Expected::Missing),
+            (Some(json!({})), Expected::Missing),
+            (
+                Some(json!({"inputTokens":8})),
+                Expected::Invalid(InvalidUsageReason::MissingOutput, Some(8), None),
+            ),
+            (
+                Some(json!({"outputTokens":3})),
+                Expected::Invalid(InvalidUsageReason::MissingInput, None, Some(3)),
+            ),
+            (
+                Some(json!({"inputTokens":8,"outputTokens":3})),
+                Expected::Complete(Some(8), Some(3)),
+            ),
+            (
+                Some(json!({"inputTokens":0,"outputTokens":0})),
+                Expected::Complete(Some(0), Some(0)),
+            ),
+            (
+                Some(json!({"inputTokens":u64::MAX,"outputTokens":1})),
+                Expected::Invalid(InvalidUsageReason::TotalOverflow, Some(u64::MAX), Some(1)),
+            ),
+            (
+                Some(json!({"inputTokens":"8","outputTokens":3})),
+                Expected::Unknown,
+            ),
+            (
+                Some(json!({"inputTokens":-1,"outputTokens":3})),
+                Expected::Unknown,
+            ),
+            (
+                Some(json!({"inputTokens":1.8446744073709552e19,"outputTokens":3})),
+                Expected::Unknown,
+            ),
+        ];
+        for (usage, expected) in cases {
+            let mut body = json!({"output":{"message":{"content":[{"text":"  first  "},{"text":"\nsecond\t"}]}}});
+            if let Some(usage) = usage {
+                body["usage"] = usage;
+            }
+            enqueue(body, StatusCode::OK, false);
+            let (result, report) = CONVERSE_TEST_ORIGIN
+                .scope(local_origin.clone(), async {
+                    let scope = AccountedChatScope::new_with_string_usage();
+                    let result = scope
+                        .scope(dispatch.chat_with_system(
+                            Some(&system),
+                            "user\nbytes",
+                            MODEL,
+                            Some(0.25),
+                        ))
+                        .await;
+                    if result.is_ok() {
+                        scope.mark_logical_success();
+                    }
+                    (result, scope.take())
+                })
+                .await;
+            assert_eq!(report.attempts().len(), 1);
+            let attempt = &report.attempts()[0];
+            assert_eq!(attempt.provider_ref(), ALIAS);
+            assert_eq!(attempt.model(), MODEL);
+            if result.is_ok() {
+                let route = report.accepted_route().expect("successful route");
+                assert_eq!(route.provider_ref(), ALIAS);
+                assert_eq!(route.model(), MODEL);
+            } else {
+                assert!(report.accepted_route().is_none());
+            }
+            match (expected, attempt.outcome()) {
+                (Expected::Missing, AttemptUsageOutcome::Missing) => {
+                    assert_eq!(result.unwrap(), "first\nsecond")
+                }
+                (Expected::Complete(i, o), AttemptUsageOutcome::Complete(u)) => {
+                    assert_eq!(result.unwrap(), "first\nsecond");
+                    assert_eq!((u.input_tokens, u.output_tokens), (i, o));
+                }
+                (
+                    Expected::Invalid(reason, i, o),
+                    AttemptUsageOutcome::Invalid {
+                        observed,
+                        reason: actual,
+                    },
+                ) => {
+                    assert_eq!(result.unwrap(), "first\nsecond");
+                    assert_eq!(*actual, reason);
+                    assert_eq!((observed.input_tokens, observed.output_tokens), (i, o));
+                }
+                (Expected::Unknown, AttemptUsageOutcome::OutcomeUnknown { observed: None }) => {
+                    assert!(result.is_err())
+                }
+                (_, actual) => panic!("unexpected Bedrock outcome: {actual:?}"),
+            }
+            check_capture(
+                receive(&mut capture_rx).await,
+                MODEL,
+                Some(0.25),
+                true,
+                true,
+            );
+        }
+
+        let nova = "amazon.nova-2-test:0";
+        enqueue(valid.clone(), StatusCode::OK, false);
+        let (text, report) = CONVERSE_TEST_ORIGIN
+            .scope(local_origin.clone(), async {
+                let scope = AccountedChatScope::new_with_string_usage();
+                let text = scope
+                    .scope(dispatch.chat_with_system(Some(&system), "user\nbytes", nova, None))
+                    .await
+                    .unwrap();
+                scope.mark_logical_success();
+                (text, scope.take())
+            })
+            .await;
+        assert_eq!(text, "first\nsecond");
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::Complete(_)
+        ));
+        check_capture(receive(&mut capture_rx).await, nova, None, false, true);
+
+        let credentials = AwsCredentials {
+            access_key_id: "SYNTHETICACCESS".into(),
+            secret_access_key: "synthetic-secret".into(),
+            session_token: Some("synthetic-session".into()),
+            region: "us-east-1".into(),
+            expires_at: None,
+        };
+        assert_eq!(
+            credentials.host(),
+            "bedrock-runtime.us-east-1.amazonaws.com"
+        );
+        let signed = BedrockModelProvider {
+            alias: "signed-bedrock".into(),
+            auth: Some(BedrockAuth::SigV4(credentials.clone())),
+            max_tokens: 123,
+            cred_cache: Mutex::new(Some(credentials)),
+        };
+        enqueue(valid.clone(), StatusCode::OK, false);
+        let (text, report) = CONVERSE_TEST_ORIGIN
+            .scope(local_origin.clone(), async {
+                let scope = AccountedChatScope::new_with_string_usage();
+                let text = scope
+                    .scope(ProviderDispatch::from_ref(&signed).chat_with_system(
+                        Some(&system),
+                        "user\nbytes",
+                        MODEL,
+                        Some(0.25),
+                    ))
+                    .await
+                    .unwrap();
+                scope.mark_logical_success();
+                (text, scope.take())
+            })
+            .await;
+        assert_eq!(text, "first\nsecond");
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::Complete(_)
+        ));
+        let capture = receive(&mut capture_rx).await;
+        let auth = capture.headers["authorization"].to_str().unwrap();
+        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=SYNTHETICACCESS/"));
+        assert!(auth.contains("/us-east-1/bedrock/aws4_request"));
+        assert!(auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token"));
+        assert!(!capture.headers["x-amz-date"].is_empty());
+        assert_eq!(capture.headers["x-amz-security-token"], "synthetic-session");
+        assert_eq!(capture.headers["host"], addr.to_string());
+        check_capture(capture, MODEL, Some(0.25), true, false);
+
+        let mut opt_in_http_error = None;
+        for (body, status, lower_bound) in [
+            (
+                json!({"output":{"message":{"content":[{"reasoningContent":{"reasoningText":{"text":"thinking"}}}]}},"usage":{"inputTokens":8,"outputTokens":3}}),
+                StatusCode::OK,
+                true,
+            ),
+            (
+                json!({"output":{"message":{"content":[{"toolUse":{"toolUseId":"id","name":"tool","input":{}}}]}},"usage":{"inputTokens":8,"outputTokens":3}}),
+                StatusCode::OK,
+                true,
+            ),
+            (
+                json!({"message":"fixture rejection"}),
+                StatusCode::BAD_REQUEST,
+                false,
+            ),
+            (
+                json!({"output":{"message":{"content":"invalid"}}}),
+                StatusCode::OK,
+                false,
+            ),
+        ] {
+            enqueue(body, status, false);
+            let (error, report) = CONVERSE_TEST_ORIGIN
+                .scope(local_origin.clone(), async {
+                    let scope = AccountedChatScope::new_with_string_usage();
+                    let error = scope
+                        .scope(dispatch.chat_with_system(
+                            Some(&system),
+                            "user\nbytes",
+                            MODEL,
+                            Some(0.25),
+                        ))
+                        .await
+                        .unwrap_err();
+                    (error, scope.take())
+                })
+                .await;
+            if lower_bound {
+                assert!(error.to_string().contains("No response from Bedrock"));
+            }
+            if status == StatusCode::BAD_REQUEST {
+                opt_in_http_error = Some(error.to_string());
+            }
+            assert_eq!(report.attempts().len(), 1);
+            assert!(report.accepted_route().is_none());
+            match report.attempts()[0].outcome() {
+                AttemptUsageOutcome::OutcomeUnknown { observed: Some(u) } if lower_bound => {
+                    assert_eq!((u.input_tokens, u.output_tokens), (Some(8), Some(3)))
+                }
+                AttemptUsageOutcome::OutcomeUnknown { observed: None } if !lower_bound => (),
+                other => panic!("unexpected error outcome: {other:?}"),
+            }
+            check_capture(
+                receive(&mut capture_rx).await,
+                MODEL,
+                Some(0.25),
+                true,
+                true,
+            );
+        }
+
+        let error_body = json!({"message":"fixture rejection"});
+        enqueue(error_body.clone(), StatusCode::BAD_REQUEST, false);
+        let direct_error = CONVERSE_TEST_ORIGIN
+            .scope(
+                local_origin.clone(),
+                dispatch.chat_with_system(Some(&system), "user\nbytes", MODEL, Some(0.25)),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        check_capture(
+            receive(&mut capture_rx).await,
+            MODEL,
+            Some(0.25),
+            true,
+            true,
+        );
+        enqueue(error_body, StatusCode::BAD_REQUEST, false);
+        let (ordinary_error, report) = CONVERSE_TEST_ORIGIN
+            .scope(local_origin.clone(), async {
+                let scope = AccountedChatScope::new();
+                let error = scope
+                    .scope(dispatch.chat_with_system(
+                        Some(&system),
+                        "user\nbytes",
+                        MODEL,
+                        Some(0.25),
+                    ))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                (error, scope.take())
+            })
+            .await;
+        assert_eq!(direct_error, ordinary_error);
+        assert_eq!(opt_in_http_error.as_deref(), Some(direct_error.as_str()));
+        assert_eq!(report.attempts().len(), 1);
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+        check_capture(
+            receive(&mut capture_rx).await,
+            MODEL,
+            Some(0.25),
+            true,
+            true,
+        );
+
+        CONVERSE_TEST_ORIGIN
+            .scope(local_origin.clone(), async {
+                let scope = AccountedChatScope::new_with_string_usage();
+                let future = scope.scope(dispatch.chat_with_system(
+                    Some(&system),
+                    "user\nbytes",
+                    MODEL,
+                    Some(0.25),
+                ));
+                drop(future);
+                assert!(scope.take().attempts().is_empty());
+            })
+            .await;
+        assert!(capture_rx.try_recv().is_err());
+        enqueue(valid, StatusCode::OK, true);
+        CONVERSE_TEST_ORIGIN.scope(local_origin, async {
+            let scope = AccountedChatScope::new_with_string_usage();
+            {
+                let future = scope.scope(dispatch.chat_with_system(Some(&system), "user\nbytes", MODEL, Some(0.25)));
+                tokio::pin!(future);
+                tokio::select! {
+                    capture = receive(&mut capture_rx) => check_capture(capture, MODEL, Some(0.25), true, true),
+                    result = &mut future => panic!("held request completed early: {result:?}"),
+                }
+            }
+            let report = scope.take();
+            assert_eq!(report.attempts().len(), 1);
+            assert!(matches!(report.attempts()[0].outcome(), AttemptUsageOutcome::OutcomeUnknown { observed: None }));
+        }).await;
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(scripts.lock().unwrap().is_empty());
+        assert!(capture_rx.try_recv().is_err());
+        assert_eq!(
+            BedrockModelProvider::endpoint_url("us-east-1", MODEL),
+            canonical
+        );
+        server.abort();
+        let _ = (&mut *server).await;
+    }
 
     // ── SigV4 signing tests ─────────────────────────────────────
 

@@ -18,6 +18,11 @@ use std::sync::Arc;
 
 const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
 
+#[cfg(test)]
+tokio::task_local! {
+    static GENERATE_CONTENT_TEST_ORIGIN: reqwest::Url;
+}
+
 /// Gemini model_provider supporting multiple authentication methods.
 pub struct GeminiModelProvider {
     /// `[providers.models.gemini.<alias>]` config-key alias.
@@ -899,7 +904,7 @@ impl GeminiModelProvider {
     }
 
     fn build_generate_content_url(model: &str, auth: &GeminiAuth) -> String {
-        match auth {
+        let url = match auth {
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
                 // OAuth tokens are scoped for the internal Code Assist API.
                 // The model is passed in the request body, not the URL path.
@@ -909,7 +914,18 @@ impl GeminiModelProvider {
                 let model_name = Self::format_model_name(model);
                 format!("{BASE_URL}/{model_name}:generateContent")
             }
+        };
+        #[cfg(test)]
+        if let Ok(origin) = GENERATE_CONTENT_TEST_ORIGIN.try_with(Clone::clone) {
+            let mut rewritten = reqwest::Url::parse(&url).expect("canonical Gemini URL");
+            rewritten
+                .set_scheme(origin.scheme())
+                .expect("fixture scheme");
+            rewritten.set_host(origin.host_str()).expect("fixture host");
+            rewritten.set_port(origin.port()).expect("fixture port");
+            return rewritten.into();
         }
+        url
     }
 
     fn http_client(&self) -> Client {
@@ -1474,9 +1490,10 @@ impl ModelProvider for GeminiModelProvider {
             parts: build_parts(message),
         }];
 
-        let (text, _usage) = self
+        let (text, usage) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
+        crate::dispatch::accounting::observe_string_usage(usage);
         Ok(text)
     }
 
@@ -1610,6 +1627,784 @@ impl ::zeroclaw_api::attribution::Attributable for GeminiModelProvider {
 mod tests {
     use super::*;
     use reqwest::{StatusCode, header::AUTHORIZATION};
+
+    // This loopback fixture proves the real request/response and dispatch
+    // boundaries, not live TLS, Google authentication, model availability, or billing.
+    #[tokio::test]
+    async fn goal_string_usage_gemini_actual_dispatch() {
+        use crate::dispatch::{
+            AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, ProviderDispatch,
+        };
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, Method, Uri},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use std::{
+            collections::VecDeque,
+            sync::{Arc, Mutex},
+        };
+        use tokio::sync::{Notify, mpsc};
+
+        struct Script {
+            status: StatusCode,
+            body: Value,
+            hold: bool,
+        }
+        struct Capture {
+            method: Method,
+            uri: Uri,
+            headers: HeaderMap,
+            body: Value,
+        }
+        async fn receive(rx: &mut mpsc::UnboundedReceiver<Capture>) -> Capture {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        fn origin(addr: std::net::SocketAddr) -> reqwest::Url {
+            let url = reqwest::Url::parse(&format!("http://{addr}/")).unwrap();
+            assert_eq!(url.scheme(), "http");
+            assert_eq!(url.host_str(), Some("127.0.0.1"));
+            assert_ne!(url.port().unwrap(), 0);
+            assert_eq!(url.path(), "/");
+            assert_eq!(url.username(), "");
+            assert!(url.password().is_none() && url.query().is_none() && url.fragment().is_none());
+            url
+        }
+        const MODEL: &str = "models/gemini-test";
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let local = origin(addr);
+        let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_addr = other_listener.local_addr().unwrap();
+        let other = origin(other_addr);
+        let auth = GeminiAuth::ExplicitKey("synthetic-key".into());
+        let canonical =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent";
+        let local_url = format!("http://{addr}/v1beta/models/gemini-test:generateContent");
+        let other_url = format!("http://{other_addr}/v1beta/models/gemini-test:generateContent");
+        assert_eq!(
+            GeminiModelProvider::build_generate_content_url(MODEL, &auth),
+            canonical
+        );
+        assert_eq!(
+            GeminiModelProvider::build_generate_content_url("gemini-test", &auth),
+            canonical
+        );
+        assert_eq!(
+            GeminiModelProvider::build_generate_content_url(MODEL, &test_oauth_auth("synthetic")),
+            "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+        );
+        GENERATE_CONTENT_TEST_ORIGIN
+            .scope(local.clone(), async {
+                assert_eq!(
+                    GeminiModelProvider::build_generate_content_url(MODEL, &auth),
+                    local_url
+                );
+                let nested: Result<(), ()> = GENERATE_CONTENT_TEST_ORIGIN
+                    .scope(other.clone(), async {
+                        assert_eq!(
+                            GeminiModelProvider::build_generate_content_url(MODEL, &auth),
+                            other_url
+                        );
+                        Err(())
+                    })
+                    .await;
+                assert!(nested.is_err());
+                assert_eq!(
+                    GeminiModelProvider::build_generate_content_url(MODEL, &auth),
+                    local_url
+                );
+                {
+                    let nested = GENERATE_CONTENT_TEST_ORIGIN.scope(other.clone(), async {
+                        assert_eq!(
+                            GeminiModelProvider::build_generate_content_url(MODEL, &auth),
+                            other_url
+                        );
+                        std::future::pending::<()>().await;
+                    });
+                    tokio::pin!(nested);
+                    assert!(
+                        std::future::poll_fn(|cx| {
+                            std::task::Poll::Ready(
+                                std::future::Future::poll(nested.as_mut(), cx).is_pending(),
+                            )
+                        })
+                        .await
+                    );
+                }
+                assert_eq!(
+                    GeminiModelProvider::build_generate_content_url(MODEL, &auth),
+                    local_url
+                );
+            })
+            .await;
+        let (first, second) = tokio::join!(
+            GENERATE_CONTENT_TEST_ORIGIN.scope(local.clone(), async {
+                tokio::task::yield_now().await;
+                GeminiModelProvider::build_generate_content_url(MODEL, &auth)
+            }),
+            GENERATE_CONTENT_TEST_ORIGIN.scope(other, async {
+                tokio::task::yield_now().await;
+                GeminiModelProvider::build_generate_content_url(MODEL, &auth)
+            }),
+        );
+        assert_eq!(first, local_url);
+        assert_eq!(second, other_url);
+        assert_eq!(
+            GeminiModelProvider::build_generate_content_url(MODEL, &auth),
+            canonical
+        );
+        drop(other_listener);
+
+        let scripts = Arc::new(Mutex::new(VecDeque::<Script>::new()));
+        let (capture_tx, mut capture_rx) = mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/{*path}",
+            post({
+                let scripts = Arc::clone(&scripts);
+                let release = Arc::clone(&release);
+                move |method: Method, uri: Uri, headers: HeaderMap, Json(body): Json<Value>| {
+                    let scripts = Arc::clone(&scripts);
+                    let capture_tx = capture_tx.clone();
+                    let finished_tx = finished_tx.clone();
+                    let release = Arc::clone(&release);
+                    async move {
+                        let script = scripts
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .expect("unexpected Gemini request");
+                        capture_tx
+                            .send(Capture {
+                                method,
+                                uri,
+                                headers,
+                                body,
+                            })
+                            .unwrap();
+                        if script.hold {
+                            let _finished = scopeguard::guard(finished_tx, |tx| {
+                                let _ = tx.send(());
+                            });
+                            release.notified().await;
+                        }
+                        (script.status, Json(script.body))
+                    }
+                }
+            }),
+        );
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut server = scopeguard::guard(server, |server| server.abort());
+        let _release_on_unwind =
+            scopeguard::guard(Arc::clone(&release), |release| release.notify_one());
+        let enqueue = |body: Value, status: StatusCode, hold: bool| {
+            scripts
+                .lock()
+                .unwrap()
+                .push_back(Script { status, body, hold })
+        };
+        let provider = test_model_provider(Some(auth));
+        let dispatch = ProviderDispatch::from_ref(&provider);
+        let valid = json!({"candidates":[{"content":{"parts":[{"text":"first "},{"text":"ignore","thought":true},{"text":"second"}]}}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3}});
+        let check_api = |capture: Capture, temperature: Option<f64>| {
+            assert_eq!(capture.method, Method::POST);
+            assert_eq!(
+                capture.uri.path_and_query().unwrap().as_str(),
+                "/v1beta/models/gemini-test:generateContent"
+            );
+            assert_eq!(capture.headers["content-type"], "application/json");
+            assert_eq!(capture.headers[GOOGLE_API_KEY_HEADER], "synthetic-key");
+            assert!(capture.headers.get(AUTHORIZATION).is_none());
+            assert_eq!(
+                capture.body["systemInstruction"]["parts"],
+                json!([{"text":"system\nbytes"}])
+            );
+            assert_eq!(
+                capture.body["contents"],
+                json!([{"role":"user","parts":[{"text":"user\nbytes"}]}])
+            );
+            assert_eq!(capture.body["generationConfig"]["maxOutputTokens"], 8192);
+            match temperature {
+                Some(value) => assert_eq!(
+                    capture.body["generationConfig"]["temperature"],
+                    json!(value)
+                ),
+                None => assert!(
+                    capture.body["generationConfig"]
+                        .get("temperature")
+                        .is_none()
+                ),
+            }
+        };
+
+        enqueue(valid.clone(), StatusCode::OK, false);
+        let text = GENERATE_CONTENT_TEST_ORIGIN
+            .scope(
+                local.clone(),
+                dispatch.chat_with_system(Some("system\nbytes"), "user\nbytes", MODEL, Some(0.25)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(text, "first second");
+        check_api(receive(&mut capture_rx).await, Some(0.25));
+        enqueue(valid.clone(), StatusCode::OK, false);
+        let (text, report) = GENERATE_CONTENT_TEST_ORIGIN
+            .scope(local.clone(), async {
+                let scope = AccountedChatScope::new();
+                let text = scope
+                    .scope(dispatch.chat_with_system(
+                        Some("system\nbytes"),
+                        "user\nbytes",
+                        MODEL,
+                        Some(0.25),
+                    ))
+                    .await
+                    .unwrap();
+                scope.mark_logical_success();
+                (text, scope.take())
+            })
+            .await;
+        assert_eq!(text, "first second");
+        assert_eq!(report.attempts().len(), 1);
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::Missing
+        ));
+        check_api(receive(&mut capture_rx).await, Some(0.25));
+
+        enum Expected {
+            Missing,
+            Complete(u64, u64),
+            Invalid(InvalidUsageReason, Option<u64>, Option<u64>),
+            Unknown,
+        }
+        let cases = vec![
+            (None, Expected::Missing),
+            (Some(Value::Null), Expected::Missing),
+            (Some(json!({})), Expected::Missing),
+            (
+                Some(json!({"promptTokenCount":8})),
+                Expected::Invalid(InvalidUsageReason::MissingOutput, Some(8), None),
+            ),
+            (
+                Some(json!({"candidatesTokenCount":3})),
+                Expected::Invalid(InvalidUsageReason::MissingInput, None, Some(3)),
+            ),
+            (
+                Some(json!({"promptTokenCount":8,"candidatesTokenCount":3})),
+                Expected::Complete(8, 3),
+            ),
+            (
+                Some(json!({"promptTokenCount":0,"candidatesTokenCount":0})),
+                Expected::Complete(0, 0),
+            ),
+            (
+                Some(json!({"promptTokenCount":u64::MAX,"candidatesTokenCount":1})),
+                Expected::Invalid(InvalidUsageReason::TotalOverflow, Some(u64::MAX), Some(1)),
+            ),
+            (
+                Some(json!({"promptTokenCount":"8","candidatesTokenCount":3})),
+                Expected::Unknown,
+            ),
+            (
+                Some(json!({"promptTokenCount":-1,"candidatesTokenCount":3})),
+                Expected::Unknown,
+            ),
+            (
+                Some(json!({"promptTokenCount":1.8446744073709552e19,"candidatesTokenCount":3})),
+                Expected::Unknown,
+            ),
+        ];
+        for (usage, expected) in cases {
+            let mut body =
+                json!({"candidates":[{"content":{"parts":[{"text":"first "},{"text":"second"}]}}]});
+            if let Some(usage) = usage {
+                body["usageMetadata"] = usage;
+            }
+            enqueue(body, StatusCode::OK, false);
+            let (result, report) = GENERATE_CONTENT_TEST_ORIGIN
+                .scope(local.clone(), async {
+                    let scope = AccountedChatScope::new_with_string_usage();
+                    let result = scope
+                        .scope(dispatch.chat_with_system(
+                            Some("system\nbytes"),
+                            "user\nbytes",
+                            MODEL,
+                            Some(0.25),
+                        ))
+                        .await;
+                    if result.is_ok() {
+                        scope.mark_logical_success();
+                    }
+                    (result, scope.take())
+                })
+                .await;
+            assert_eq!(report.attempts().len(), 1);
+            let attempt = &report.attempts()[0];
+            assert_eq!(attempt.provider_ref(), "test");
+            assert_eq!(attempt.model(), MODEL);
+            if result.is_ok() {
+                let route = report.accepted_route().unwrap();
+                assert_eq!(route.provider_ref(), "test");
+                assert_eq!(route.model(), MODEL);
+            } else {
+                assert!(report.accepted_route().is_none());
+            }
+            match (expected, attempt.outcome()) {
+                (Expected::Missing, AttemptUsageOutcome::Missing) => {
+                    assert_eq!(result.unwrap(), "first second")
+                }
+                (Expected::Complete(i, o), AttemptUsageOutcome::Complete(u)) => {
+                    assert_eq!(result.unwrap(), "first second");
+                    assert_eq!((u.input_tokens, u.output_tokens), (Some(i), Some(o)));
+                }
+                (
+                    Expected::Invalid(reason, i, o),
+                    AttemptUsageOutcome::Invalid {
+                        observed,
+                        reason: actual,
+                    },
+                ) => {
+                    assert_eq!(result.unwrap(), "first second");
+                    assert_eq!(*actual, reason);
+                    assert_eq!((observed.input_tokens, observed.output_tokens), (i, o));
+                }
+                (Expected::Unknown, AttemptUsageOutcome::OutcomeUnknown { observed: None }) => {
+                    assert!(result.is_err())
+                }
+                (_, actual) => panic!("unexpected Gemini outcome: {actual:?}"),
+            }
+            check_api(receive(&mut capture_rx).await, Some(0.25));
+        }
+
+        enqueue(
+            json!({"candidates":[{"content":{"parts":[{"text":"first thought","thought":true},{"text":"later thought","thought":true}]}}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3}}),
+            StatusCode::OK,
+            false,
+        );
+        let (text, report) = GENERATE_CONTENT_TEST_ORIGIN
+            .scope(local.clone(), async {
+                let scope = AccountedChatScope::new_with_string_usage();
+                let text = scope
+                    .scope(dispatch.chat_with_system(
+                        Some("system\nbytes"),
+                        "user\nbytes",
+                        "gemini-test",
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+                scope.mark_logical_success();
+                (text, scope.take())
+            })
+            .await;
+        assert_eq!(text, "first thought");
+        assert!(
+            matches!(report.attempts()[0].outcome(), AttemptUsageOutcome::Complete(u) if u.input_tokens == Some(8) && u.output_tokens == Some(3))
+        );
+        check_api(receive(&mut capture_rx).await, None);
+
+        for (body, expected) in [
+            (
+                json!({"candidates":[{"content":{"parts":[]}}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3}}),
+                "No response from Gemini",
+            ),
+            (
+                json!({"error":{"message":"synthetic envelope error"},"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3}}),
+                "synthetic envelope error",
+            ),
+        ] {
+            let mut errors = Vec::new();
+            for mode in 0..3 {
+                enqueue(body.clone(), StatusCode::OK, false);
+                let (error, report) = GENERATE_CONTENT_TEST_ORIGIN
+                    .scope(local.clone(), async {
+                        if mode == 0 {
+                            (
+                                dispatch
+                                    .chat_with_system(
+                                        Some("system\nbytes"),
+                                        "user\nbytes",
+                                        MODEL,
+                                        Some(0.25),
+                                    )
+                                    .await
+                                    .unwrap_err(),
+                                None,
+                            )
+                        } else {
+                            let scope = if mode == 1 {
+                                AccountedChatScope::new()
+                            } else {
+                                AccountedChatScope::new_with_string_usage()
+                            };
+                            let error = scope
+                                .scope(dispatch.chat_with_system(
+                                    Some("system\nbytes"),
+                                    "user\nbytes",
+                                    MODEL,
+                                    Some(0.25),
+                                ))
+                                .await
+                                .unwrap_err();
+                            (error, Some(scope.take()))
+                        }
+                    })
+                    .await;
+                assert!(
+                    error.to_string().contains(expected),
+                    "unexpected original error: {error:#}"
+                );
+                errors.push(error.to_string());
+                if let Some(report) = report {
+                    assert_eq!(report.attempts().len(), 1);
+                    assert!(matches!(
+                        report.attempts()[0].outcome(),
+                        AttemptUsageOutcome::OutcomeUnknown { observed: None }
+                    ));
+                    assert!(report.accepted_route().is_none());
+                }
+                check_api(receive(&mut capture_rx).await, Some(0.25));
+            }
+            assert_eq!(errors[0], errors[1]);
+            assert_eq!(errors[1], errors[2]);
+        }
+        let bad = json!({"error":{"message":"Unknown name \"generationConfig\""}});
+        let mut errors = Vec::new();
+        for mode in 0..3 {
+            enqueue(bad.clone(), StatusCode::BAD_REQUEST, false);
+            let (error, report) = GENERATE_CONTENT_TEST_ORIGIN
+                .scope(local.clone(), async {
+                    if mode == 0 {
+                        (
+                            dispatch
+                                .chat_with_system(
+                                    Some("system\nbytes"),
+                                    "user\nbytes",
+                                    MODEL,
+                                    Some(0.25),
+                                )
+                                .await
+                                .unwrap_err()
+                                .to_string(),
+                            None,
+                        )
+                    } else {
+                        let scope = if mode == 1 {
+                            AccountedChatScope::new()
+                        } else {
+                            AccountedChatScope::new_with_string_usage()
+                        };
+                        let error = scope
+                            .scope(dispatch.chat_with_system(
+                                Some("system\nbytes"),
+                                "user\nbytes",
+                                MODEL,
+                                Some(0.25),
+                            ))
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        (error, Some(scope.take()))
+                    }
+                })
+                .await;
+            if let Some(report) = report {
+                assert_eq!(report.attempts().len(), 1);
+                assert!(matches!(
+                    report.attempts()[0].outcome(),
+                    AttemptUsageOutcome::OutcomeUnknown { observed: None }
+                ));
+            }
+            errors.push(error);
+            check_api(receive(&mut capture_rx).await, Some(0.25));
+            assert!(
+                capture_rx.try_recv().is_err(),
+                "API-key HTTP400 must not retry"
+            );
+        }
+        assert_eq!(errors[0], errors[1]);
+        assert_eq!(errors[1], errors[2]);
+
+        let malformed = json!({"candidates":[{"content":{"parts":[{"text":"unused"}]}}],"usageMetadata":{"promptTokenCount":"8","candidatesTokenCount":3}});
+        let mut malformed_errors = Vec::new();
+        for mode in 0..3 {
+            enqueue(malformed.clone(), StatusCode::OK, false);
+            let (error, report) = GENERATE_CONTENT_TEST_ORIGIN
+                .scope(local.clone(), async {
+                    if mode == 0 {
+                        (
+                            dispatch
+                                .chat_with_system(
+                                    Some("system\nbytes"),
+                                    "user\nbytes",
+                                    MODEL,
+                                    Some(0.25),
+                                )
+                                .await
+                                .unwrap_err()
+                                .to_string(),
+                            None,
+                        )
+                    } else {
+                        let scope = if mode == 1 {
+                            AccountedChatScope::new()
+                        } else {
+                            AccountedChatScope::new_with_string_usage()
+                        };
+                        let error = scope
+                            .scope(dispatch.chat_with_system(
+                                Some("system\nbytes"),
+                                "user\nbytes",
+                                MODEL,
+                                Some(0.25),
+                            ))
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        (error, Some(scope.take()))
+                    }
+                })
+                .await;
+            if let Some(report) = report {
+                assert_eq!(report.attempts().len(), 1);
+                assert!(matches!(
+                    report.attempts()[0].outcome(),
+                    AttemptUsageOutcome::OutcomeUnknown { observed: None }
+                ));
+            }
+            malformed_errors.push(error);
+            check_api(receive(&mut capture_rx).await, Some(0.25));
+        }
+        assert_eq!(malformed_errors[0], malformed_errors[1]);
+        assert_eq!(malformed_errors[1], malformed_errors[2]);
+
+        let oauth = test_model_provider(Some(GeminiAuth::OAuthToken(Arc::new(
+            tokio::sync::Mutex::new(OAuthTokenState {
+                access_token: "synthetic-oauth".into(),
+                refresh_token: None,
+                client_id: None,
+                client_secret: None,
+                expiry_millis: Some(i64::MAX),
+            }),
+        ))));
+        *oauth.oauth_project.lock().await = Some("goal-test-project".into());
+        let oauth_dispatch = ProviderDispatch::from_ref(&oauth);
+        let check_oauth = |capture: Capture, include_config: bool| {
+            assert_eq!(capture.method, Method::POST);
+            assert_eq!(
+                capture.uri.path_and_query().unwrap().as_str(),
+                "/v1internal:generateContent"
+            );
+            assert_eq!(capture.headers["content-type"], "application/json");
+            assert_eq!(capture.headers[AUTHORIZATION], "Bearer synthetic-oauth");
+            assert!(capture.headers.get(GOOGLE_API_KEY_HEADER).is_none());
+            assert_eq!(capture.body["model"], "gemini-test");
+            assert_eq!(capture.body["project"], "goal-test-project");
+            assert!(!capture.body["user_prompt_id"].as_str().unwrap().is_empty());
+            assert_eq!(
+                capture.body["request"]["systemInstruction"]["parts"],
+                json!([{"text":"system\nbytes"}])
+            );
+            assert_eq!(
+                capture.body["request"]["contents"],
+                json!([{"role":"user","parts":[{"text":"user\nbytes"}]}])
+            );
+            if include_config {
+                assert_eq!(
+                    capture.body["request"]["generationConfig"]["maxOutputTokens"],
+                    8192
+                );
+                assert_eq!(
+                    capture.body["request"]["generationConfig"]["temperature"],
+                    json!(0.25)
+                );
+            } else {
+                assert!(capture.body["request"].get("generationConfig").is_none());
+            }
+        };
+        let wrapped = json!({"response":{"candidates":[{"content":{"parts":[{"text":"oauth answer"}]}}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3}},"usageMetadata":{"promptTokenCount":99,"candidatesTokenCount":99}});
+        for mode in 0..3 {
+            enqueue(wrapped.clone(), StatusCode::OK, false);
+            let (text, report) = GENERATE_CONTENT_TEST_ORIGIN
+                .scope(local.clone(), async {
+                    if mode == 0 {
+                        (
+                            oauth_dispatch
+                                .chat_with_system(
+                                    Some("system\nbytes"),
+                                    "user\nbytes",
+                                    MODEL,
+                                    Some(0.25),
+                                )
+                                .await
+                                .unwrap(),
+                            None,
+                        )
+                    } else {
+                        let scope = if mode == 1 {
+                            AccountedChatScope::new()
+                        } else {
+                            AccountedChatScope::new_with_string_usage()
+                        };
+                        let text = scope
+                            .scope(oauth_dispatch.chat_with_system(
+                                Some("system\nbytes"),
+                                "user\nbytes",
+                                MODEL,
+                                Some(0.25),
+                            ))
+                            .await
+                            .unwrap();
+                        scope.mark_logical_success();
+                        (text, Some(scope.take()))
+                    }
+                })
+                .await;
+            assert_eq!(text, "oauth answer");
+            if let Some(report) = report {
+                assert_eq!(report.attempts().len(), 1);
+                if mode == 1 {
+                    assert!(matches!(
+                        report.attempts()[0].outcome(),
+                        AttemptUsageOutcome::Missing
+                    ));
+                } else {
+                    assert!(
+                        matches!(report.attempts()[0].outcome(), AttemptUsageOutcome::Complete(u) if u.input_tokens == Some(8) && u.output_tokens == Some(3))
+                    );
+                    assert!(report.accepted_route().is_some());
+                }
+            }
+            check_oauth(receive(&mut capture_rx).await, true);
+        }
+        let fallback = json!({"response":{"candidates":[{"content":{"parts":[{"text":"fallback usage"}]}}]},"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3}});
+        enqueue(fallback, StatusCode::OK, false);
+        let (text, report) = GENERATE_CONTENT_TEST_ORIGIN
+            .scope(local.clone(), async {
+                let scope = AccountedChatScope::new_with_string_usage();
+                let text = scope
+                    .scope(oauth_dispatch.chat_with_system(
+                        Some("system\nbytes"),
+                        "user\nbytes",
+                        MODEL,
+                        Some(0.25),
+                    ))
+                    .await
+                    .unwrap();
+                scope.mark_logical_success();
+                (text, scope.take())
+            })
+            .await;
+        assert_eq!(text, "fallback usage");
+        assert!(
+            matches!(report.attempts()[0].outcome(), AttemptUsageOutcome::Complete(u) if u.input_tokens == Some(8) && u.output_tokens == Some(3))
+        );
+        check_oauth(receive(&mut capture_rx).await, true);
+
+        enqueue(bad, StatusCode::BAD_REQUEST, false);
+        enqueue(wrapped, StatusCode::OK, false);
+        let (text, report) = GENERATE_CONTENT_TEST_ORIGIN
+            .scope(local.clone(), async {
+                let scope = AccountedChatScope::new_with_string_usage();
+                let text = scope
+                    .scope(oauth_dispatch.chat_with_system(
+                        Some("system\nbytes"),
+                        "user\nbytes",
+                        MODEL,
+                        Some(0.25),
+                    ))
+                    .await
+                    .unwrap();
+                scope.mark_logical_success();
+                (text, scope.take())
+            })
+            .await;
+        assert_eq!(text, "oauth answer");
+        assert_eq!(report.attempts().len(), 1);
+        assert!(
+            matches!(report.attempts()[0].outcome(), AttemptUsageOutcome::Complete(u) if u.input_tokens == Some(8) && u.output_tokens == Some(3))
+        );
+        assert!(report.accepted_route().is_some());
+        let first = receive(&mut capture_rx).await;
+        let second = receive(&mut capture_rx).await;
+        let mut first_body = first.body.clone();
+        let mut second_body = second.body.clone();
+        first_body.as_object_mut().unwrap().remove("user_prompt_id");
+        second_body
+            .as_object_mut()
+            .unwrap()
+            .remove("user_prompt_id");
+        first_body["request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generationConfig");
+        assert_eq!(
+            first_body, second_body,
+            "OAuth retry must change only generationConfig and generated prompt id"
+        );
+        check_oauth(first, true);
+        check_oauth(second, false);
+        assert!(
+            capture_rx.try_recv().is_err(),
+            "OAuth generationConfig retry must stop after two requests"
+        );
+
+        GENERATE_CONTENT_TEST_ORIGIN
+            .scope(local.clone(), async {
+                let scope = AccountedChatScope::new_with_string_usage();
+                let future = scope.scope(dispatch.chat_with_system(
+                    Some("system\nbytes"),
+                    "user\nbytes",
+                    MODEL,
+                    Some(0.25),
+                ));
+                drop(future);
+                assert!(scope.take().attempts().is_empty());
+            })
+            .await;
+        assert!(capture_rx.try_recv().is_err());
+        enqueue(valid, StatusCode::OK, true);
+        GENERATE_CONTENT_TEST_ORIGIN.scope(local, async {
+            let scope = AccountedChatScope::new_with_string_usage();
+            {
+                let future = scope.scope(dispatch.chat_with_system(Some("system\nbytes"), "user\nbytes", MODEL, Some(0.25)));
+                tokio::pin!(future);
+                tokio::select! {
+                    capture = receive(&mut capture_rx) => check_api(capture, Some(0.25)),
+                    result = &mut future => panic!("held Gemini request completed early: {result:?}"),
+                }
+            }
+            let report = scope.take();
+            assert_eq!(report.attempts().len(), 1);
+            assert!(matches!(report.attempts()[0].outcome(), AttemptUsageOutcome::OutcomeUnknown { observed: None }));
+        }).await;
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(scripts.lock().unwrap().is_empty());
+        assert!(capture_rx.try_recv().is_err());
+        assert_eq!(
+            GeminiModelProvider::build_generate_content_url(
+                MODEL,
+                &GeminiAuth::ExplicitKey("synthetic-key".into())
+            ),
+            canonical
+        );
+        server.abort();
+        let _ = (&mut *server).await;
+    }
 
     fn test_oauth_auth(token: &str) -> GeminiAuth {
         GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(OAuthTokenState {

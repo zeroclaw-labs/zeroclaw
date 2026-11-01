@@ -891,7 +891,14 @@ pub async fn run_with_authority(
     }
     // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
     // boot_id matches what producers stamp via `control_plane()`.
-    if crate::control_plane::control_plane().is_some() {
+    if let Some(control_plane) = crate::control_plane::control_plane() {
+        // A control-plane handle survives in-process reload. Reopen the
+        // process-local Goal admission gate only after the prior generation
+        // has fully returned from its shutdown path.
+        control_plane
+            .goal_execution_restart()
+            .reopen_for_generation()
+            .await;
         let _ = crate::control_plane::spawn_control_plane_reaper(
             crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
             channels_cancel.clone(),
@@ -1351,7 +1358,7 @@ pub async fn run_with_authority(
         Ok(None)
     };
 
-    let exit_result = match startup_result {
+    let mut exit_result = match startup_result {
         Err(error) => Err(error),
         Ok(Some(exit)) => Ok(exit),
         Ok(None) if startup_feedback_enabled => {
@@ -1388,6 +1395,20 @@ pub async fn run_with_authority(
             },
         ),
         Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
+    }
+
+    if matches!(exit_result, Ok(DaemonExit::Reload))
+        && let Some(control_plane) = crate::control_plane::control_plane()
+        && let Err(error) = control_plane
+            .goal_execution_restart()
+            .quiesce_for_restart()
+            .await
+    {
+        // Do not begin transport teardown until the Goal coordinator has
+        // either fenced and drained every registered worker or reported the
+        // durable failure that prevented it. Continuing as a reload could let
+        // a successor generation overlap an old Goal executor.
+        exit_result = Err(error.context("quiesce Goal execution before daemon reload"));
     }
 
     // Freeze admission before stopping ingress; detached final writes must

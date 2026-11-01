@@ -4,6 +4,10 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use zeroclaw_config::schema::Config;
+use zeroclaw_goal::accounting::{
+    GOAL_OPERATION_ACCOUNTING, GoalAccountingIssue, GoalOperationRequest, GoalOperationSettlement,
+    GoalUsageEvent, combine_accounting_state,
+};
 use zeroclaw_providers::pricing::ModelRates;
 
 // ── Cost tracking via task-local ──
@@ -198,7 +202,203 @@ tokio::task_local! {
     pub static TOOL_LOOP_TURN_USAGE: Option<Arc<Mutex<TurnUsage>>>;
 }
 
-fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
+/// Admit an operation only when the enclosing execution is Goal-scoped.
+/// Ordinary turns never enter this branch.
+pub(crate) async fn admit_goal_operation_if_scoped(
+    provider_ref: &str,
+    model: &str,
+) -> anyhow::Result<()> {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        anyhow::ensure!(
+            !provider_ref.trim().is_empty(),
+            "Goal operation provider reference must be nonblank"
+        );
+        anyhow::ensure!(
+            !model.trim().is_empty(),
+            "Goal operation model must be nonblank"
+        );
+        accounting
+            .admit(GoalOperationRequest::new(provider_ref, model))
+            .await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn goal_operation_accounting_is_scoped() -> bool {
+    GOAL_OPERATION_ACCOUNTING
+        .try_with(|accounting| accounting.is_some())
+        .unwrap_or(false)
+}
+
+fn goal_operation_settlement(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) -> GoalOperationSettlement {
+    use crate::control_plane::GoalAccountingState;
+    let mut accounting_state = GoalAccountingState::Complete;
+    let mut events = Vec::new();
+    let mut issues = Vec::new();
+
+    for attempt in attempts {
+        let (usage, state) = goal_usage_event_for_attempt(
+            attempt.provider_ref(),
+            attempt.model(),
+            attempt.outcome(),
+        );
+        accounting_state = combine_accounting_state(accounting_state, state);
+        if let Some(issue) = goal_accounting_issue_for_attempt(
+            attempt.provider_ref(),
+            attempt.model(),
+            attempt.outcome(),
+            state,
+            usage.is_some(),
+        ) {
+            accounting_state = combine_accounting_state(accounting_state, issue.accounting_state);
+            issues.push(issue);
+        }
+        if let Some(event) = usage {
+            events.push(event);
+        }
+    }
+
+    let mut settlement = GoalOperationSettlement {
+        accounting_state,
+        events,
+        issues,
+    };
+    settlement.normalize();
+    settlement
+}
+
+fn goal_accounting_issue_for_attempt(
+    provider_ref: &str,
+    model: &str,
+    outcome: &zeroclaw_providers::dispatch::AttemptUsageOutcome,
+    state: crate::control_plane::GoalAccountingState,
+    has_event: bool,
+) -> Option<GoalAccountingIssue> {
+    use crate::control_plane::GoalAccountingState;
+    use zeroclaw_providers::dispatch::AttemptUsageOutcome;
+
+    let reason = match outcome {
+        AttemptUsageOutcome::Missing => Some("missing usage".to_string()),
+        AttemptUsageOutcome::Invalid { reason, .. } => Some(format!("{reason:?}")),
+        AttemptUsageOutcome::OutcomeUnknown { .. } => Some("usage outcome unknown".to_string()),
+        AttemptUsageOutcome::Complete(observed) if !has_event => {
+            let cache = observed
+                .cached_input_tokens
+                .unwrap_or(0)
+                .checked_add(observed.cache_creation_input_tokens.unwrap_or(0));
+            let input = observed.input_tokens.unwrap_or(0).max(cache.unwrap_or(0));
+            Some(
+                if input
+                    .checked_add(observed.output_tokens.unwrap_or(0))
+                    .is_none()
+                {
+                    "usage total overflow".to_string()
+                } else {
+                    "all-zero usage".to_string()
+                },
+            )
+        }
+        AttemptUsageOutcome::Complete(_) => None,
+    }?;
+    let issue_state = if matches!(outcome, AttemptUsageOutcome::Complete(_)) {
+        GoalAccountingState::Invalid
+    } else {
+        state
+    };
+    Some(GoalAccountingIssue {
+        provider_ref: provider_ref.to_string(),
+        model: model.to_string(),
+        accounting_state: issue_state,
+        reason,
+    })
+}
+
+fn goal_usage_event_for_attempt(
+    provider_ref: &str,
+    model: &str,
+    outcome: &zeroclaw_providers::dispatch::AttemptUsageOutcome,
+) -> (
+    Option<GoalUsageEvent>,
+    crate::control_plane::GoalAccountingState,
+) {
+    use crate::control_plane::GoalAccountingState;
+    use zeroclaw_providers::dispatch::AttemptUsageOutcome;
+
+    match outcome {
+        AttemptUsageOutcome::Complete(usage) => (
+            lower_bound_usage_event(provider_ref, model, usage),
+            GoalAccountingState::Complete,
+        ),
+        AttemptUsageOutcome::Missing => (None, GoalAccountingState::Missing),
+        AttemptUsageOutcome::Invalid { observed, .. } => (
+            lower_bound_usage_event(provider_ref, model, observed),
+            GoalAccountingState::Invalid,
+        ),
+        AttemptUsageOutcome::OutcomeUnknown { observed } => (
+            observed
+                .as_ref()
+                .and_then(|usage| lower_bound_usage_event(provider_ref, model, usage)),
+            GoalAccountingState::OutcomeUnknown,
+        ),
+    }
+}
+
+/// Preserve representable observed token counts without manufacturing missing
+/// dimensions. Cache sub-counts can establish a lower bound for input tokens,
+/// but an inconsistent cache partition is not safe to price.
+fn lower_bound_usage_event(
+    provider_ref: &str,
+    model: &str,
+    observed: &zeroclaw_providers::traits::TokenUsage,
+) -> Option<GoalUsageEvent> {
+    let cached = observed.cached_input_tokens.unwrap_or(0);
+    let cache_write = observed.cache_creation_input_tokens.unwrap_or(0);
+    let cache_lower_bound = cached.checked_add(cache_write);
+    let reported_input = observed.input_tokens;
+    let input = observed
+        .input_tokens
+        .unwrap_or(0)
+        .max(cache_lower_bound.unwrap_or(0));
+    let output = observed.output_tokens.unwrap_or(0);
+    let total = input.checked_add(output)?;
+    if total == 0 {
+        return None;
+    }
+
+    let cache_partition_is_valid = cache_lower_bound.is_some()
+        && reported_input.is_some_and(|reported_input| {
+            cached <= reported_input && cache_write <= reported_input.saturating_sub(cached)
+        });
+    let (cached_input_tokens, cache_creation_input_tokens) = if cache_partition_is_valid {
+        (Some(cached), Some(cache_write))
+    } else {
+        (Some(0), Some(0))
+    };
+
+    Some(GoalUsageEvent {
+        provider_ref: provider_ref.to_string(),
+        model: model.to_string(),
+        usage: zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        },
+        priceable: cache_partition_is_valid,
+    })
+}
+
+/// Resolve the configured rate map for an immutable actual provider/model
+/// attribution. Goal execution consumes this same resolver when it persists
+/// actual-attempt usage, so configured model aliases cannot drift between
+/// ordinary and Goal-scoped accounting.
+pub(crate) fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
     let try_lookup = |key: &str| -> ModelRates {
         let input = pricing.get(&format!("{key}.input")).copied();
         let output = pricing.get(&format!("{key}.output")).copied();
@@ -386,65 +586,20 @@ fn price_usage(
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
-    let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
-    let config_rates = normalized_rates(
-        pricing
-            .map(|map| resolve_rates_opt(map, model))
-            .unwrap_or_default(),
-    );
-
-    // Live-price FALLBACK fills only the dimensions config left unset; never
-    // fetches on this path (reads a cached snapshot, empty unless a provider
-    // opted into `live_pricing`). Cache writes are optional for completeness
-    // because they fall back to the ordinary input rate, but a cached live
-    // write rate must still be allowed to fill that absent dimension.
-    let live = if let Some(live) = live_override {
-        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none()).then_some(live)
-    } else {
-        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
-            .then(|| live_pricing_for(model_provider_name, model))
-            .flatten()
-    };
-    let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
-
-    // The catalog is the final per-dimension fallback, not an all-or-nothing
-    // replacement. Preserve every configured/live value (including an
-    // explicit free 0.0) and fill only the dimensions still absent.
-    if let Some((cat_in, cat_out, cat_cached)) =
-        crate::agent::pricing_catalog::global_pricing_rates(model)
-    {
-        rates = rates.or(ModelRates {
-            input_per_mtok: (cat_in > 0.0).then_some(cat_in),
-            output_per_mtok: (cat_out > 0.0).then_some(cat_out),
-            cached_input_per_mtok: (cat_cached > 0.0).then_some(cat_cached),
-            cache_write_per_mtok: None,
-        });
-    }
-
-    rates = normalized_rates(rates);
     let cache_creation_input_tokens = usage
         .cache_creation_input_tokens
         .unwrap_or(0)
         .min(input_tokens.saturating_sub(cached_input_tokens));
-    let unpriced = unpriced_usage(
-        rates,
-        input_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        output_tokens,
-    );
-    let cost_usage = CostTokenUsage::new_with_cache_write(
+    Some(cost_usage_with_pricing_and_live(
+        &ctx.model_provider_pricing,
+        model_provider_name,
         model,
         input_tokens,
         cached_input_tokens,
         cache_creation_input_tokens,
         output_tokens,
-        rates.input_per_mtok.unwrap_or(0.0),
-        rates.cached_input_per_mtok.unwrap_or(0.0),
-        rates.cache_write_per_mtok.unwrap_or(0.0),
-        rates.output_per_mtok.unwrap_or(0.0),
-    );
-    Some((cost_usage, unpriced))
+        live_override,
+    ))
 }
 
 /// Settle the immutable physical-attempt report exactly once.  Only complete
@@ -483,10 +638,26 @@ pub(crate) fn billable_provider_attempts(
     })
 }
 
-pub(crate) fn settle_provider_attempts(
+pub(crate) async fn settle_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
     accepted_attempt: Option<usize>,
-) {
+) -> anyhow::Result<()> {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        for event in billable_provider_attempts(attempts) {
+            let _ = price_and_accumulate_tool_loop_cost_usage(
+                event.attempt.provider_ref(),
+                event.attempt.model(),
+                event.usage,
+                accepted_attempt == Some(event.index),
+                None,
+            );
+        }
+        return accounting.settle(goal_operation_settlement(attempts)).await;
+    }
     for event in billable_provider_attempts(attempts) {
         let updates_context_window_fill = accepted_attempt == Some(event.index);
         let _ = record_tool_loop_cost_usage_inner(
@@ -496,6 +667,7 @@ pub(crate) fn settle_provider_attempts(
             updates_context_window_fill,
         );
     }
+    Ok(())
 }
 
 fn record_tool_loop_cost_usage_inner(
@@ -520,6 +692,48 @@ fn record_tool_loop_cost_usage_inner_with_live(
     updates_context_window_fill: bool,
     live_override: Option<ModelRates>,
 ) -> Option<(u64, f64)> {
+    let (ctx, cost_usage, unpriced) = price_and_accumulate_tool_loop_cost_usage(
+        model_provider_name,
+        model,
+        usage,
+        updates_context_window_fill,
+        live_override,
+    )?;
+
+    if ctx.tracker.is_some() && unpriced.tokens > 0 {
+        warn_once_missing_pricing(model_provider_name, model, &unpriced.dimensions);
+    }
+
+    // The session key scoped around this turn is the chat conversation the
+    // spend belongs to; the tracker's own id is daemon-lifetime scoped.
+    let conversation_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    if let Some(tracker) = &ctx.tracker
+        && let Err(error) = tracker.record_usage_attributed(
+            cost_usage.clone(),
+            ctx.agent_alias.as_deref(),
+            None,
+            conversation_id,
+        )
+    {
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
+    }
+
+    Some((cost_usage.total_tokens, cost_usage.cost_usd))
+}
+
+/// Price one billable attempt and project it into the ordinary turn totals.
+/// Warning and persistence stay with the ordinary wrapper; Goal accounting
+/// calls this helper without acquiring a second ledger writer.
+fn price_and_accumulate_tool_loop_cost_usage(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+    updates_context_window_fill: bool,
+    live_override: Option<ModelRates>,
+) -> Option<(ToolLoopCostTrackingContext, CostTokenUsage, UnpricedUsage)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
     let (mut cost_usage, unpriced) = price_usage(model_provider_name, model, usage, live_override)?;
@@ -527,13 +741,8 @@ fn record_tool_loop_cost_usage_inner_with_live(
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
-
     cost_usage.unpriced_tokens = unpriced.tokens;
     cost_usage.pricing_available = unpriced.tokens == 0;
-
-    if ctx.tracker.is_some() && unpriced.tokens > 0 {
-        warn_once_missing_pricing(model_provider_name, model, &unpriced.dimensions);
-    }
 
     // Accumulate turn usage: prefer the caller-scoped TOOL_LOOP_TURN_USAGE
     // task-local (ws.rs gateway path), fall back to the context's own
@@ -568,24 +777,104 @@ fn record_tool_loop_cost_usage_inner_with_live(
         }
     }
 
-    // The session key scoped around this turn is the chat conversation the
-    // spend belongs to; the tracker's own id is daemon-lifetime scoped.
-    let conversation_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
-        .try_with(Clone::clone)
-        .ok()
-        .flatten();
-    if let Some(tracker) = &ctx.tracker
-        && let Err(error) = tracker.record_usage_attributed(
-            cost_usage.clone(),
-            ctx.agent_alias.as_deref(),
-            None,
-            conversation_id,
-        )
+    Some((ctx, cost_usage, unpriced))
+}
+
+/// Convert actual provider usage into the canonical cost record shape using
+/// the same configured, live, and catalog pricing fallbacks as ordinary turns.
+///
+/// The caller owns structural validation. In particular, Goal Mode rejects
+/// malformed cache bands instead of relying on [`CostTokenUsage`] to clamp
+/// them. This helper only centralizes rate resolution and pricing provenance.
+pub(crate) fn cost_usage_with_pricing(
+    pricing: &ModelProviderPricing,
+    model_provider_name: &str,
+    model: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    output_tokens: u64,
+) -> CostTokenUsage {
+    cost_usage_with_pricing_and_live(
+        pricing,
+        model_provider_name,
+        model,
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+        None,
+    )
+    .0
+}
+
+fn cost_usage_with_pricing_and_live(
+    pricing: &ModelProviderPricing,
+    model_provider_name: &str,
+    model: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    output_tokens: u64,
+    live_override: Option<ModelRates>,
+) -> (CostTokenUsage, UnpricedUsage) {
+    let config_rates = normalized_rates(
+        provider_pricing(pricing, model_provider_name)
+            .map(|map| resolve_rates_opt(map, model))
+            .unwrap_or_default(),
+    );
+
+    // Live-price FALLBACK fills only the dimensions config left unset; never
+    // fetches on this path (reads a cached snapshot, empty unless a provider
+    // opted into `live_pricing`).
+    let live = if let Some(live) = live_override {
+        // Cache writes are optional for completeness because they fall back
+        // to the ordinary input rate, but a cached live write rate must still
+        // be allowed to fill that absent dimension.
+        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none()).then_some(live)
+    } else {
+        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
+            .then(|| live_pricing_for(model_provider_name, model))
+            .flatten()
+    };
+    let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
+
+    // The catalog is the final per-dimension fallback, not an all-or-nothing
+    // replacement. Preserve every configured/live value (including an
+    // explicit free 0.0) and fill only the dimensions still absent.
+    if let Some((cat_in, cat_out, cat_cached)) =
+        crate::agent::pricing_catalog::global_pricing_rates(model)
     {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
+        rates = rates.or(ModelRates {
+            input_per_mtok: (cat_in > 0.0).then_some(cat_in),
+            output_per_mtok: (cat_out > 0.0).then_some(cat_out),
+            cached_input_per_mtok: (cat_cached > 0.0).then_some(cat_cached),
+            cache_write_per_mtok: None,
+        });
     }
 
-    Some((cost_usage.total_tokens, cost_usage.cost_usd))
+    rates = normalized_rates(rates);
+    let unpriced = unpriced_usage(
+        rates,
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+    );
+    let mut cost_usage = CostTokenUsage::new_with_cache_write(
+        model,
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+        rates.input_per_mtok.unwrap_or(0.0),
+        rates.cached_input_per_mtok.unwrap_or(0.0),
+        rates.cache_write_per_mtok.unwrap_or(0.0),
+        rates.output_per_mtok.unwrap_or(0.0),
+    );
+    cost_usage.unpriced_tokens = unpriced.tokens;
+    cost_usage.pricing_available = unpriced.tokens == 0;
+    (cost_usage, unpriced)
 }
 
 /// Insert `(model_provider, model)` into `seen`. Returns `true` on first sighting,
@@ -652,11 +941,17 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goal_accounting::ModelProviderGoalUsagePricer;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
+    use zeroclaw_api::model_provider::{
+        ChatMessage, ChatRequest, ChatResponse, ModelProvider, TokenUsage,
+    };
     use zeroclaw_config::schema::{Config, DeepseekModelProviderConfig, ModelProviderConfig};
+    use zeroclaw_goal::accounting::GoalUsagePricer;
     use zeroclaw_providers::ProviderDispatch;
-    use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
+    use zeroclaw_providers::dispatch::{
+        AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, with_exact_dispatch_route,
+    };
 
     struct ResetGlobalPricingCatalog;
 
@@ -666,6 +961,227 @@ mod tests {
                 crate::agent::pricing_catalog::GlobalPricingCatalog::default(),
             );
         }
+    }
+
+    fn assert_ordinary_and_goal_price(
+        pricing: ModelProviderPricing,
+        model: &str,
+        usage: &TokenUsage,
+        expected_cost: f64,
+        expected_unpriced: u64,
+    ) {
+        let pricing = Arc::new(pricing);
+        let context = ToolLoopCostTrackingContext {
+            model_provider_pricing: Arc::clone(&pricing),
+            ..ToolLoopCostTrackingContext::usage_only()
+        };
+        let pricer = ModelProviderGoalUsagePricer::new(pricing);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context.clone()), async {
+                    let ordinary = compute_cost_usd("pricing-parity", model, usage).unwrap();
+                    let goal = pricer.price("pricing-parity", model, usage).unwrap();
+                    let (_, unpriced) = price_usage("pricing-parity", model, usage, None).unwrap();
+                    assert!((ordinary - expected_cost).abs() < 1e-12);
+                    assert!((goal.cost_usd - ordinary).abs() < 1e-12);
+                    assert_eq!(goal.unpriced_tokens, expected_unpriced);
+                    assert_eq!(unpriced.tokens, expected_unpriced);
+                    assert_eq!(goal.pricing_available, expected_unpriced == 0);
+                }),
+            );
+        let turn_usage = context.snapshot_turn_usage();
+        assert_eq!(turn_usage.input_tokens, 0);
+        assert_eq!(turn_usage.output_tokens, 0);
+        assert_eq!(turn_usage.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn ordinary_and_goal_pricing_preserve_configured_free_and_unpriced_rates() {
+        let model = "configured-goal-pricing-parity";
+        let usage = TokenUsage {
+            input_tokens: Some(1_200),
+            output_tokens: Some(500),
+            cached_input_tokens: Some(200),
+            cache_creation_input_tokens: Some(300),
+        };
+        for (rates, expected_cost, expected_unpriced) in [
+            (
+                pricing_with_cache_write(model, 2.0, 0.5, 3.0, 5.0),
+                (700.0 * 2.0 + 200.0 * 0.5 + 300.0 * 3.0 + 500.0 * 5.0) / 1e6,
+                0,
+            ),
+            (pricing_with_cache_write(model, 0.0, 0.0, 0.0, 0.0), 0.0, 0),
+            (
+                pricing_with_cache_write(model, 2.0, 0.0, 0.0, 5.0),
+                (1_200.0 * 2.0 + 500.0 * 5.0) / 1e6,
+                0,
+            ),
+            (
+                HashMap::from([(format!("{model}.input"), 2.0)]),
+                1_200.0 * 2.0 / 1e6,
+                500,
+            ),
+            (HashMap::new(), 0.0, 1_700),
+        ] {
+            assert_ordinary_and_goal_price(
+                HashMap::from([("pricing-parity".to_owned(), rates)]),
+                model,
+                &usage,
+                expected_cost,
+                expected_unpriced,
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_and_goal_pricing_share_per_dimension_catalog_fallback() {
+        use crate::agent::pricing_catalog::{
+            GLOBAL_PRICING_CATALOG_TEST_LOCK, GlobalPricingCatalog, set_global_pricing_catalog,
+        };
+        let _catalog_lock = GLOBAL_PRICING_CATALOG_TEST_LOCK.lock();
+        let _catalog_reset = ResetGlobalPricingCatalog;
+        let catalog: GlobalPricingCatalog = serde_json::from_str(
+            r#"{"models":{"catalog-goal-pricing-parity":{"input_usd_per_mtok":1.0,"output_usd_per_mtok":5.0,"cache_read_usd_per_mtok":0.1}}}"#,
+        )
+        .unwrap();
+        set_global_pricing_catalog(catalog);
+        let model = "catalog-goal-pricing-parity";
+        let usage = TokenUsage {
+            input_tokens: Some(1_200),
+            output_tokens: Some(500),
+            cached_input_tokens: Some(200),
+            cache_creation_input_tokens: Some(300),
+        };
+        for (rates, input_rate) in [
+            (HashMap::new(), 1.0),
+            (HashMap::from([(format!("{model}.input"), 2.0)]), 2.0),
+            (HashMap::from([(format!("{model}.input"), 0.0)]), 0.0),
+        ] {
+            // Without a write premium, cache writes retain the input rate.
+            let expected = (1_000.0 * input_rate + 200.0 * 0.1 + 500.0 * 5.0) / 1e6;
+            assert_ordinary_and_goal_price(
+                HashMap::from([("pricing-parity".to_owned(), rates)]),
+                model,
+                &usage,
+                expected,
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_pricing_live_override_preserves_shared_fallback_precedence() {
+        use crate::agent::pricing_catalog::{
+            GLOBAL_PRICING_CATALOG_TEST_LOCK, GlobalPricingCatalog, set_global_pricing_catalog,
+        };
+        let _catalog_lock = GLOBAL_PRICING_CATALOG_TEST_LOCK.lock();
+        let _catalog_reset = ResetGlobalPricingCatalog;
+        let catalog: GlobalPricingCatalog = serde_json::from_str(
+            r#"{"models":{"live-goal-pricing-parity":{"input_usd_per_mtok":1.0,"output_usd_per_mtok":5.0,"cache_read_usd_per_mtok":0.1}}}"#,
+        )
+        .unwrap();
+        set_global_pricing_catalog(catalog);
+        let model = "live-goal-pricing-parity";
+        let pricing = Arc::new(HashMap::from([(
+            "pricing-parity".to_owned(),
+            HashMap::from([(format!("{model}.input"), 0.0)]),
+        )]));
+        let context = ToolLoopCostTrackingContext {
+            model_provider_pricing: Arc::clone(&pricing),
+            ..ToolLoopCostTrackingContext::usage_only()
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(1_200),
+            output_tokens: Some(500),
+            cached_input_tokens: Some(200),
+            cache_creation_input_tokens: Some(300),
+        };
+        // Use the existing owned override, not a provider snapshot mutation
+        // or network refresh: config wins input, live wins cache bands, and
+        // only the still-missing output dimension comes from the catalog.
+        let live = ModelRates {
+            input_per_mtok: Some(9.0),
+            output_per_mtok: None,
+            cached_input_per_mtok: Some(0.5),
+            cache_write_per_mtok: Some(3.0),
+        };
+        let (shared, shared_unpriced) = cost_usage_with_pricing_and_live(
+            &pricing,
+            "pricing-parity",
+            model,
+            1_200,
+            200,
+            300,
+            500,
+            Some(live),
+        );
+        let (ordinary, ordinary_unpriced) = tokio::runtime::Runtime::new().unwrap().block_on(
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context), async {
+                price_usage("pricing-parity", model, &usage, Some(live)).unwrap()
+            }),
+        );
+        let expected = (200.0 * 0.5 + 300.0 * 3.0 + 500.0 * 5.0) / 1e6;
+        assert!((ordinary.cost_usd - expected).abs() < 1e-12);
+        assert!((shared.cost_usd - ordinary.cost_usd).abs() < 1e-12);
+        assert_eq!(ordinary_unpriced, shared_unpriced);
+        assert_eq!(ordinary_unpriced.tokens, 0);
+        assert!(shared.pricing_available);
+        assert_eq!(shared.unpriced_tokens, 0);
+    }
+
+    #[test]
+    fn ordinary_pricing_preserves_context_zero_and_malformed_cache_guards() {
+        let model = "guard-goal-pricing-parity";
+        let usage = TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cached_input_tokens: Some(20),
+            cache_creation_input_tokens: Some(30),
+        };
+        assert!(compute_cost_usd("pricing-parity", model, &usage).is_none());
+        let pricing = Arc::new(HashMap::from([(
+            "pricing-parity".to_owned(),
+            pricing_with_cache_write(model, 2.0, 1.0, 3.0, 5.0),
+        )]));
+        let context = ToolLoopCostTrackingContext {
+            model_provider_pricing: Arc::clone(&pricing),
+            ..ToolLoopCostTrackingContext::usage_only()
+        };
+        let pricer = ModelProviderGoalUsagePricer::new(pricing);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context), async {
+                for empty in [
+                    TokenUsage::default(),
+                    TokenUsage {
+                        input_tokens: Some(0),
+                        output_tokens: Some(0),
+                        cached_input_tokens: Some(100),
+                        cache_creation_input_tokens: Some(100),
+                    },
+                ] {
+                    assert!(compute_cost_usd("pricing-parity", model, &empty).is_none());
+                }
+                for (cached, writes, expected_cached, expected_writes, expected_cost) in [
+                    (120, 60, 100, 0, 200.0 / 1e6),
+                    (20, 120, 20, 80, 360.0 / 1e6),
+                ] {
+                    let malformed = TokenUsage {
+                        cached_input_tokens: Some(cached),
+                        cache_creation_input_tokens: Some(writes),
+                        ..usage.clone()
+                    };
+                    let ordinary = compute_cost_usd("pricing-parity", model, &malformed).unwrap();
+                    let (priced, unpriced) =
+                        price_usage("pricing-parity", model, &malformed, None).unwrap();
+                    assert!((ordinary - expected_cost).abs() < 1e-12);
+                    assert_eq!(priced.cached_input_tokens, expected_cached);
+                    assert_eq!(priced.cache_creation_input_tokens, expected_writes);
+                    assert_eq!(unpriced.tokens, 0);
+                    assert!(pricer.price("pricing-parity", model, &malformed).is_err());
+                }
+            }));
     }
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
@@ -838,9 +1354,11 @@ mod tests {
         let context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
         let first = PricedLeaf {
             alias: "wrapper.first",
+            usage: reported_usage(1_000_000, 0),
         };
         let second = PricedLeaf {
             alias: "wrapper.second",
+            usage: reported_usage(1_000_000, 0),
         };
         let messages = vec![ChatMessage::user("hello")];
         let scope = AccountedChatScope::new();
@@ -886,7 +1404,9 @@ mod tests {
                     })
                     .await;
                 let report = scope.take();
-                settle_provider_attempts(report.attempts(), None);
+                settle_provider_attempts(report.attempts(), None)
+                    .await
+                    .unwrap();
             })
             .await;
 
@@ -976,7 +1496,21 @@ mod tests {
                     })
                     .await;
                 let report = scope.take();
-                settle_provider_attempts(report.attempts(), Some(1));
+                let goal_settlement = goal_operation_settlement(report.attempts());
+                assert_eq!(
+                    goal_settlement.accounting_state,
+                    crate::control_plane::GoalAccountingState::Missing
+                );
+                assert_eq!(goal_settlement.events.len(), 1);
+                assert_eq!(goal_settlement.events[0].provider_ref, "provider.first");
+                assert_eq!(goal_settlement.events[0].model, "model-a");
+                assert_eq!(
+                    goal_settlement.events[0].usage.input_tokens,
+                    Some(1_000_000)
+                );
+                settle_provider_attempts(report.attempts(), Some(1))
+                    .await
+                    .expect("provider attempt settlement");
             })
             .await;
 
@@ -993,8 +1527,491 @@ mod tests {
         assert_eq!(turn_usage.output_tokens, 0);
     }
 
+    struct CapturedGoalSettlement(Arc<Mutex<Vec<GoalOperationSettlement>>>);
+
+    #[async_trait::async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for CapturedGoalSettlement {
+        async fn admit(&self, _request: GoalOperationRequest) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+            self.0.lock().push(settlement);
+            Ok(())
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_attempts_do_not_enter_ordinary_recording_path() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "provider.first".to_string(),
+            HashMap::from([("model-a.input".to_string(), 1.0)]),
+        )]));
+        let context = ToolLoopCostTrackingContext::new(tracker, pricing);
+        let messages = vec![ChatMessage::user("hello")];
+        let attempts = AccountedChatScope::new();
+        let settlements = Arc::new(Mutex::new(Vec::new()));
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(CapturedGoalSettlement(Arc::clone(&settlements)));
+
+        GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(Some(context.clone()), async {
+                        attempts
+                            .scope(async {
+                                let failed = FailingWithUsageLeaf {
+                                    alias: "wrapper.first",
+                                };
+                                let _ = with_exact_dispatch_route(
+                                    "provider.first".to_string(),
+                                    "model-a".to_string(),
+                                    ProviderDispatch::from_ref(&failed).chat(
+                                        ChatRequest {
+                                            messages: &messages,
+                                            tools: None,
+                                            thinking: None,
+                                        },
+                                        "ignored",
+                                        None,
+                                    ),
+                                )
+                                .await;
+                                let fallback = NoUsageLeaf {
+                                    alias: "wrapper.second",
+                                };
+                                assert!(
+                                    with_exact_dispatch_route(
+                                        "provider.second".to_string(),
+                                        "model-b".to_string(),
+                                        ProviderDispatch::from_ref(&fallback).chat(
+                                            ChatRequest {
+                                                messages: &messages,
+                                                tools: None,
+                                                thinking: None,
+                                            },
+                                            "ignored",
+                                            None,
+                                        ),
+                                    )
+                                    .await
+                                    .is_ok()
+                                );
+                            })
+                            .await;
+                        let report = attempts.take();
+                        settle_provider_attempts(report.attempts(), Some(1))
+                            .await
+                            .expect("Goal-scoped physical attempts settle once");
+                    })
+                    .await;
+            })
+            .await;
+
+        let settlements = settlements.lock();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(
+            settlements[0].accounting_state,
+            crate::control_plane::GoalAccountingState::Missing
+        );
+        assert_eq!(settlements[0].events.len(), 1);
+        assert_eq!(settlements[0].events[0].provider_ref, "provider.first");
+        assert_eq!(settlements[0].events[0].model, "model-a");
+        assert_eq!(settlements[0].events[0].usage.input_tokens, Some(1_000_000));
+        assert_eq!(settlements[0].issues.len(), 1);
+        assert_eq!(settlements[0].issues[0].provider_ref, "provider.second");
+        assert_eq!(settlements[0].issues[0].model, "model-b");
+        assert_eq!(
+            settlements[0].issues[0].accounting_state,
+            crate::control_plane::GoalAccountingState::Missing
+        );
+        drop(settlements);
+
+        let projected = context.snapshot_turn_usage();
+        assert_eq!(projected.input_tokens, 1_000_000);
+        assert_eq!(projected.output_tokens, 0);
+        assert_eq!(projected.cost_usd, 1.0);
+        assert_eq!(projected.last_input_tokens, 0);
+
+        assert!(
+            !workspace.path().join("state/costs.jsonl").exists(),
+            "Goal settlement must own this recording path without a duplicate ordinary record"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_projection_retains_ordered_physical_attempt_issues_and_valid_siblings() {
+        use crate::control_plane::GoalAccountingState;
+        let scope = AccountedChatScope::new();
+        let messages = vec![ChatMessage::user("hello")];
+        let usages = [
+            TokenUsage {
+                input_tokens: None,
+                output_tokens: Some(3),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            },
+            TokenUsage {
+                input_tokens: Some(8),
+                output_tokens: None,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            },
+            TokenUsage {
+                input_tokens: Some(8),
+                output_tokens: Some(3),
+                cached_input_tokens: Some(9),
+                cache_creation_input_tokens: None,
+            },
+            reported_usage(u64::MAX, 1),
+            reported_usage(0, 0),
+        ];
+        scope
+            .scope(async {
+                for usage in usages {
+                    let leaf = PricedLeaf {
+                        alias: "wrapper",
+                        usage,
+                    };
+                    let _ = with_exact_dispatch_route(
+                        "provider.actual".to_string(),
+                        "model.actual".to_string(),
+                        ProviderDispatch::from_ref(&leaf).chat(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            "ignored",
+                            None,
+                        ),
+                    )
+                    .await;
+                }
+                let leaf = ErrorLeaf;
+                let _ = with_exact_dispatch_route(
+                    "provider.unknown".to_string(),
+                    "model.unknown".to_string(),
+                    ProviderDispatch::from_ref(&leaf).chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "ignored",
+                        None,
+                    ),
+                )
+                .await;
+                let leaf = PricedLeaf {
+                    alias: "wrapper",
+                    usage: reported_usage(8, 3),
+                };
+                let _ = with_exact_dispatch_route(
+                    "provider.fallback".to_string(),
+                    "model.fallback".to_string(),
+                    ProviderDispatch::from_ref(&leaf).chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "ignored",
+                        None,
+                    ),
+                )
+                .await;
+                let leaf = NoUsageLeaf { alias: "wrapper" };
+                let _ = with_exact_dispatch_route(
+                    "provider.missing".to_string(),
+                    "model.missing".to_string(),
+                    ProviderDispatch::from_ref(&leaf).chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "ignored",
+                        None,
+                    ),
+                )
+                .await;
+            })
+            .await;
+        let report = scope.take();
+        let settlement = goal_operation_settlement(report.attempts());
+        assert_eq!(
+            settlement.accounting_state,
+            GoalAccountingState::OutcomeUnknown
+        );
+        assert_eq!(
+            settlement
+                .issues
+                .iter()
+                .map(|issue| issue.reason.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "MissingInput",
+                "MissingOutput",
+                "CachedInputExceedsInput",
+                "TotalOverflow",
+                "all-zero usage",
+                "usage outcome unknown",
+                "missing usage"
+            ]
+        );
+        assert!(
+            settlement.issues[..5]
+                .iter()
+                .all(|issue| issue.provider_ref == "provider.actual"
+                    && issue.model == "model.actual")
+        );
+        assert_eq!(settlement.issues[5].provider_ref, "provider.unknown");
+        assert_eq!(settlement.issues[5].model, "model.unknown");
+        assert_eq!(settlement.issues[6].provider_ref, "provider.missing");
+        assert_eq!(settlement.issues[6].model, "model.missing");
+        assert_eq!(settlement.events.len(), 4);
+        assert_eq!(
+            settlement.events.last().unwrap().provider_ref,
+            "provider.fallback"
+        );
+        assert_eq!(
+            settlement.events.last().unwrap().usage.output_tokens,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn goal_projection_retains_unknown_and_unrepresentable_complete_diagnostics() {
+        use crate::control_plane::GoalAccountingState;
+        for observed in [None, Some(reported_usage(8, 3))] {
+            let outcome = AttemptUsageOutcome::OutcomeUnknown { observed };
+            let (event, state) = goal_usage_event_for_attempt("actual", "model", &outcome);
+            let issue = goal_accounting_issue_for_attempt(
+                "actual",
+                "model",
+                &outcome,
+                state,
+                event.is_some(),
+            )
+            .unwrap();
+            assert_eq!(issue.accounting_state, GoalAccountingState::OutcomeUnknown);
+            assert_eq!(
+                (issue.provider_ref.as_str(), issue.model.as_str()),
+                ("actual", "model")
+            );
+            assert_eq!(issue.reason, "usage outcome unknown");
+        }
+        let outcome = AttemptUsageOutcome::Complete(reported_usage(u64::MAX, 1));
+        let (event, state) = goal_usage_event_for_attempt("actual", "model", &outcome);
+        let issue =
+            goal_accounting_issue_for_attempt("actual", "model", &outcome, state, event.is_some())
+                .unwrap();
+        assert!(event.is_none());
+        assert_eq!(issue.accounting_state, GoalAccountingState::Invalid);
+        assert_eq!(issue.reason, "usage total overflow");
+    }
+
+    #[test]
+    fn goal_settlement_preserves_known_counts_from_invalid_usage() {
+        let (event, state) = goal_usage_event_for_attempt(
+            "provider.primary",
+            "model-a",
+            &AttemptUsageOutcome::Invalid {
+                observed: zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(41),
+                    output_tokens: None,
+                    cached_input_tokens: Some(12),
+                    cache_creation_input_tokens: Some(4),
+                },
+                reason: InvalidUsageReason::MissingOutput,
+            },
+        );
+
+        assert_eq!(state, crate::control_plane::GoalAccountingState::Invalid);
+        let event = event.expect("known usage must be retained as a lower bound");
+        assert_eq!(event.provider_ref, "provider.primary");
+        assert_eq!(event.model, "model-a");
+        assert_eq!(event.usage.input_tokens, Some(41));
+        assert_eq!(event.usage.output_tokens, Some(0));
+        assert_eq!(event.usage.cached_input_tokens, Some(12));
+        assert_eq!(event.usage.cache_creation_input_tokens, Some(4));
+        assert!(event.priceable);
+    }
+
+    #[test]
+    fn goal_settlement_keeps_fallback_and_partial_unknown_usage_with_actual_routes() {
+        let primary = goal_usage_event_for_attempt(
+            "openai.primary",
+            "model-a",
+            &AttemptUsageOutcome::OutcomeUnknown {
+                observed: Some(reported_usage(10, 2)),
+            },
+        );
+        let fallback = goal_usage_event_for_attempt(
+            "anthropic.fallback",
+            "model-b",
+            &AttemptUsageOutcome::Complete(reported_usage(15, 3)),
+        );
+        let events = [primary.0.clone(), fallback.0.clone()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            combine_accounting_state(primary.1, fallback.1),
+            crate::control_plane::GoalAccountingState::OutcomeUnknown
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].provider_ref, "openai.primary");
+        assert_eq!(events[0].model, "model-a");
+        assert_eq!(events[1].provider_ref, "anthropic.fallback");
+        assert_eq!(events[1].model, "model-b");
+        assert_eq!(events[0].usage.input_tokens, Some(10));
+        assert_eq!(events[1].usage.output_tokens, Some(3));
+    }
+
+    #[test]
+    fn goal_settlement_does_not_invent_a_total_for_overflowed_usage() {
+        let (event, state) = goal_usage_event_for_attempt(
+            "provider.primary",
+            "model-a",
+            &AttemptUsageOutcome::Invalid {
+                observed: zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(u64::MAX),
+                    output_tokens: Some(1),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                },
+                reason: InvalidUsageReason::TotalOverflow,
+            },
+        );
+
+        assert_eq!(state, crate::control_plane::GoalAccountingState::Invalid);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn goal_settlement_keeps_known_counts_when_cache_subcounts_overflow() {
+        let (event, state) = goal_usage_event_for_attempt(
+            "provider.primary",
+            "model-a",
+            &AttemptUsageOutcome::Invalid {
+                observed: zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(41),
+                    output_tokens: Some(2),
+                    cached_input_tokens: Some(u64::MAX),
+                    cache_creation_input_tokens: Some(1),
+                },
+                reason: InvalidUsageReason::CachedInputExceedsInput,
+            },
+        );
+
+        assert_eq!(state, crate::control_plane::GoalAccountingState::Invalid);
+        let event = event.expect("known input/output counts remain a safe lower bound");
+        assert_eq!(event.usage.input_tokens, Some(41));
+        assert_eq!(event.usage.output_tokens, Some(2));
+        assert_eq!(event.usage.cached_input_tokens, Some(0));
+        assert_eq!(event.usage.cache_creation_input_tokens, Some(0));
+        assert!(!event.priceable);
+    }
+
+    #[test]
+    fn goal_settlement_does_not_price_cache_counts_that_exceed_reported_input() {
+        let (event, state) = goal_usage_event_for_attempt(
+            "provider.primary",
+            "model-a",
+            &AttemptUsageOutcome::Invalid {
+                observed: zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(41),
+                    output_tokens: Some(2),
+                    cached_input_tokens: Some(50),
+                    cache_creation_input_tokens: Some(0),
+                },
+                reason: InvalidUsageReason::CachedInputExceedsInput,
+            },
+        );
+
+        assert_eq!(state, crate::control_plane::GoalAccountingState::Invalid);
+        let event = event.expect("cache lower bounds establish known input usage");
+        assert_eq!(event.usage.input_tokens, Some(50));
+        assert_eq!(event.usage.output_tokens, Some(2));
+        assert_eq!(event.usage.cached_input_tokens, Some(0));
+        assert_eq!(event.usage.cache_creation_input_tokens, Some(0));
+        assert!(!event.priceable);
+    }
+
+    #[tokio::test]
+    async fn unscoped_turns_do_not_run_goal_operation_validation() {
+        admit_goal_operation_if_scoped("", "")
+            .await
+            .expect("ordinary turns must not acquire Goal-only validation");
+    }
+
+    struct ErrorLeaf;
+
+    impl Attributable for ErrorLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "wrapper"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ErrorLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("scripted error")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("scripted error")
+        }
+    }
+
     struct PricedLeaf {
         alias: &'static str,
+        usage: zeroclaw_providers::traits::TokenUsage,
+    }
+
+    fn reported_usage(
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> zeroclaw_providers::traits::TokenUsage {
+        zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }
     }
 
     impl Attributable for PricedLeaf {
@@ -1028,12 +2045,7 @@ mod tests {
             Ok(ChatResponse {
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
-                usage: Some(zeroclaw_providers::traits::TokenUsage {
-                    input_tokens: Some(1_000_000),
-                    output_tokens: Some(0),
-                    cached_input_tokens: None,
-                    cache_creation_input_tokens: None,
-                }),
+                usage: Some(self.usage.clone()),
                 reasoning_content: None,
             })
         }

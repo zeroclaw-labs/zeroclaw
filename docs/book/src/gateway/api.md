@@ -114,11 +114,20 @@ cache admitted package state between requests.
 `PATCH /api/config` accepts a JSON Patch document (RFC 6902). The supported
 config operations are `add`, `replace`, `remove`, and `test`. ZeroClaw also
 accepts a `comment` extension for config annotations. Config operations run
-against an in-memory copy; once every operation has applied,
-`Config::validate()` runs once on the result. If validation passes, the new
-state is persisted and swapped in. If any operation or final validation fails,
-on-disk and in-memory state are unchanged. Comment annotations are applied
-after the save on a non-fatal, best-effort basis.
+against an in-memory copy; once every operation has applied, validation compares
+the candidate with the pre-edit configuration. The same edit-aware validation
+applies to per-property `PUT`, `DELETE`, and section initialization.
+
+Errors in edited fields, newly introduced errors, and errors that cannot be
+safely attributed reject the write. A pre-existing unrelated error may be
+retained only when validation can safely continue past it without skipping a
+related check; otherwise the write is rejected. Retained diagnostics use the
+`pre_existing_validation_error` warning code in responses that carry warnings.
+Secret and initialization responses keep their documented response shapes.
+
+Accepted state is persisted and swapped in. If any operation or validation
+fails, on-disk and in-memory state are unchanged. Comment annotations are
+applied after the save on a non-fatal, best-effort basis.
 
 `move` and `copy` return `400 op_not_supported` because safe reference-graph
 rewriting is not part of this surface. `test` against a `#[secret]` path is
@@ -131,7 +140,9 @@ server normalises.
 
 The CLI counterpart is `zeroclaw config patch <file-or-stdin>`, which applies
 the same op set against the local Config and returns the same structured
-response shape (`--json` for scripts).
+response shape (`--json` for scripts). Unlike the HTTP editor, it uses strict
+`Config::validate()` and rejects any validation error, including pre-existing
+errors unrelated to the edit.
 
 ## Secrets: write-only over HTTP
 

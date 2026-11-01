@@ -7,26 +7,73 @@ use anyhow::Result;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::goal_task::GoalTaskRegistry;
 use super::reaper;
 use super::task_registry::TaskRegistry;
 use super::task_store_sqlite::SqliteTaskStore;
+use zeroclaw_goal::control::GoalExecutionRestartCoordinator;
 
 /// The live control-plane, shared (cheaply, via `Arc`/clone) across producers and
 /// the reaper.
 #[derive(Clone)]
 pub struct ControlPlaneHandle {
     pub store: Arc<dyn TaskRegistry>,
+    /// Goal-capable view of the same canonical task store.
+    ///
+    /// `TaskRegistry` intentionally stays generic, so erasing the SQLite
+    /// store to that trait alone would make the Goal extension unavailable to
+    /// a trusted ingress adapter.  This is a second trait-object handle to
+    /// the same allocation, not a second database or source of truth.
+    goal_store: Option<Arc<dyn GoalTaskRegistry>>,
     pub boot_id: String,
+    /// Process-local Goal executor coordination for this daemon process.
+    ///
+    /// This retains weak executor owners only. It is deliberately separate
+    /// from the durable task store, which remains the sole authority for Goal
+    /// identity, lifecycle, and accounting.
+    pub(crate) goal_execution_restart: Arc<GoalExecutionRestartCoordinator>,
 }
 
 impl ControlPlaneHandle {
     /// Open the durable task store for producers and observers without gaining
     /// startup-recovery or reaper authority.
     pub fn open(data_dir: &Path) -> Result<Self> {
+        let sqlite_store = Arc::new(SqliteTaskStore::new(data_dir)?);
         Ok(Self {
-            store: Arc::new(SqliteTaskStore::new(data_dir)?),
+            store: sqlite_store.clone(),
+            goal_store: Some(sqlite_store),
             boot_id: process_identity().to_string(),
+            goal_execution_restart: Arc::new(GoalExecutionRestartCoordinator::new()),
         })
+    }
+
+    /// Shared process-local coordinator for all transport-owned Goal workers.
+    pub fn goal_execution_restart(&self) -> Arc<GoalExecutionRestartCoordinator> {
+        Arc::clone(&self.goal_execution_restart)
+    }
+
+    /// Return the Goal-capable view when this handle originated from the
+    /// canonical SQLite control-plane boot path.
+    ///
+    /// Test-only and legacy generic task producers may hold a task-only
+    /// handle. They are deliberately not eligible to execute Goal Mode.
+    pub fn goal_store(&self) -> Result<Arc<dyn GoalTaskRegistry>> {
+        self.goal_store
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg("control-plane handle has no Goal registry"))
+    }
+
+    /// Build a task-only handle for internal producers and test fixtures that
+    /// intentionally do not own Goal admission authority.
+    #[cfg(test)]
+    pub(crate) fn task_only(store: Arc<dyn TaskRegistry>, boot_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            goal_store: None,
+            boot_id: boot_id.into(),
+            goal_execution_restart: Arc::new(GoalExecutionRestartCoordinator::new()),
+        }
     }
 }
 
@@ -47,8 +94,21 @@ impl ControlPlaneRecoveryOwner {
     /// As [`Self::start`] but with a caller-supplied `boot_id` — lets `DaemonRegistry`
     /// reuse a process-stable run-id across reloads instead of a fresh UUID.
     pub(crate) async fn start_with_boot_id(data_dir: &Path, boot_id: String) -> Result<Self> {
-        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new(data_dir)?);
+        let sqlite_store = Arc::new(SqliteTaskStore::new(data_dir)?);
+        let reconciled_goals = sqlite_store.reconcile_goal_boot_state(&boot_id)?;
+        let store: Arc<dyn TaskRegistry> = sqlite_store.clone();
+        let goal_store: Arc<dyn GoalTaskRegistry> = sqlite_store;
         let reclaimed = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
+        if reconciled_goals > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({ "reconciled_goals": reconciled_goals, "boot_id": boot_id })
+                    ),
+                "control-plane: reconciled interrupted goals at startup"
+            );
+        }
         if reclaimed > 0 {
             ::zeroclaw_log::record!(
                 INFO,
@@ -60,7 +120,12 @@ impl ControlPlaneRecoveryOwner {
             );
         }
         Ok(Self {
-            handle: ControlPlaneHandle { store, boot_id },
+            handle: ControlPlaneHandle {
+                store,
+                goal_store: Some(goal_store),
+                boot_id,
+                goal_execution_restart: Arc::new(GoalExecutionRestartCoordinator::new()),
+            },
         })
     }
 
@@ -156,6 +221,8 @@ mod tests {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-06-18T00:00:00Z".into(),
                 finished_at: None,
             })
@@ -192,6 +259,8 @@ mod tests {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-06-18T00:00:00Z".into(),
                 finished_at: None,
             })
@@ -209,6 +278,15 @@ mod tests {
                 .unwrap()
                 .status,
             TaskStatus::Running
+        );
+        assert!(
+            observer
+                .goal_store()
+                .unwrap()
+                .current_goal_for_session("matrix_test_session")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -234,6 +312,8 @@ mod tests {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-06-18T00:00:00Z".into(),
                 finished_at: None,
             })
@@ -341,6 +421,8 @@ mod tests {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-06-18T00:00:00Z".into(),
                 finished_at: None,
             })

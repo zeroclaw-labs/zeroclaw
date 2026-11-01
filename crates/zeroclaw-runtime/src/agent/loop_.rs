@@ -1522,6 +1522,43 @@ fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error 
     anyhow::Error::msg(user_message)
 }
 
+fn goal_child_active() -> bool {
+    crate::goal_accounting::GoalForegroundContext::current()
+        .is_some_and(|context| context.depth() > 0)
+}
+
+fn goal_owned_terminal_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<zeroclaw_api::tool::GoalChildOperationError>()
+        .is_some()
+        || error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .is_some()
+        || error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalOperationFenced>()
+            .is_some()
+}
+
+fn check_goal_child_continuation() -> anyhow::Result<()> {
+    if let Some(context) = crate::goal_accounting::GoalForegroundContext::current()
+        && context.depth() > 0
+    {
+        if tokio::time::Instant::now() >= context.deadline() {
+            context.token().cancel();
+            return Err(anyhow::Error::new(ToolLoopCancelled).context(
+                zeroclaw_api::turn_stop::TurnStop::recoverable(
+                    zeroclaw_api::turn_stop::TurnStopCode::TurnTimeout,
+                    "Goal child deadline elapsed",
+                ),
+            ));
+        }
+        if context.token().is_cancelled() {
+            return Err(ToolLoopCancelled.into());
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     mut config: Config,
@@ -2446,7 +2483,8 @@ pub async fn run(
                         break;
                     }
                     Err(e) => {
-                        if let Some((new_model_provider, new_model)) = is_model_switch_requested(&e)
+                        if !goal_owned_terminal_error(&e)
+                            && let Some((new_model_provider, new_model)) = is_model_switch_requested(&e)
                         {
                             ::zeroclaw_log::record!(
                                 INFO,
@@ -2503,7 +2541,7 @@ pub async fn run(
                             continue;
                         }
                         // Cron owns its terminal projection and needs the typed cause.
-                        return Err(if origin == TurnOrigin::Cron {
+                        return Err(if origin == TurnOrigin::Cron || goal_child_active() || goal_owned_terminal_error(&e) {
                             e
                         } else {
                             project_cli_terminal_completion_error(e)
@@ -2516,6 +2554,7 @@ pub async fn run(
             if config.skills.skill_creation.enabled {
                 let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
                 if tool_calls.len() >= 2 {
+                    check_goal_child_continuation()?;
                     let creator = crate::skills::creator::SkillCreator::new(
                         config.data_dir.clone(),
                         config.skills.skill_creation.clone(),
@@ -2566,6 +2605,7 @@ pub async fn run(
                                 "Skill creation skipped (duplicate or disabled)"
                             );
                         }
+                        Err(e) if goal_child_active() => return Err(e),
                         Err(e) => ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -2589,6 +2629,7 @@ pub async fn run(
             observer.record_event(&ObserverEvent::TurnComplete);
 
             if config.skills.skill_improvement.enabled {
+                check_goal_child_continuation()?;
                 let review_workspace = config.agent_workspace_dir(agent_alias);
                 let review_config = config.skills.skill_improvement.clone();
                 let failed_slugs: Vec<String> =
@@ -2596,9 +2637,28 @@ pub async fn run(
                         .into_iter()
                         .filter_map(|(slug, ok)| if ok { None } else { Some(slug) })
                         .collect();
-                TOOL_LOOP_COST_TRACKING_CONTEXT
-                    .scope(
-                        cost_tracking_context.clone(),
+                let review = async {
+                    if goal_child_active() {
+                        crate::skills::review::try_run_skill_review(
+                            Some(&config),
+                            review_workspace,
+                            review_config,
+                            config.skills.allow_scripts,
+                            history.clone(),
+                            failed_slugs,
+                            model_provider.as_ref(),
+                            &provider_name,
+                            &model_name,
+                            observer.as_ref(),
+                            &config.multimodal,
+                            &config.pacing,
+                            agent.resolved.max_tool_result_chars,
+                            agent.resolved.effective_context_budget(),
+                            None,
+                            Some(agent_alias),
+                        )
+                        .await
+                    } else {
                         crate::skills::review::maybe_run_skill_review(
                             Some(&config),
                             review_workspace,
@@ -2614,11 +2674,16 @@ pub async fn run(
                             &config.pacing,
                             agent.resolved.max_tool_result_chars,
                             agent.resolved.effective_context_budget(),
-                            None, // cancellation_token — no parent token in single-shot run
+                            None,
                             Some(agent_alias),
-                        ),
-                    )
-                    .await;
+                        )
+                        .await;
+                        Ok(())
+                    }
+                };
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(cost_tracking_context.clone(), review)
+                    .await?;
             }
         } else {
             println!("🦀 ZeroClaw Interactive Mode");
@@ -3403,7 +3468,9 @@ pub async fn run(
 
         Ok(final_output)
     };
-    __zc_body
+    // Pin the body before by-value instrumentation, preserving same-task poll/drop.
+    // Concrete body construction can still use native temporaries.
+    Box::pin(__zc_body)
         .instrument(__zc_scope_span)
         .instrument(__zc_attribution_span)
         .await
@@ -5208,6 +5275,19 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[test]
+    fn child_boundary_does_not_turn_a_child_switch_into_a_parent_switch() {
+        let local = anyhow::Error::new(super::ModelSwitchRequested {
+            model_provider: "mock.target".into(),
+            model: "mock-model".into(),
+        });
+        assert!(super::is_model_switch_requested(&local).is_some());
+        assert!(!super::goal_owned_terminal_error(&local));
+        let child = local.context(zeroclaw_api::tool::GoalChildOperationError);
+        assert!(super::is_model_switch_requested(&child).is_some());
+        assert!(super::goal_owned_terminal_error(&child));
     }
 
     #[test]
@@ -19409,6 +19489,10 @@ Let me check the result."#;
         model_pricing.insert("mock-model.output".to_string(), 15.0);
         let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
         pricing.insert("mock-provider".to_string(), model_pricing);
+        pricing.insert(
+            "ollama.default".to_string(),
+            pricing["mock-provider"].clone(),
+        );
         pricing
     }
 
@@ -19423,6 +19507,754 @@ Let me check the result."#;
                 content: "ok".to_string(),
             },
         ]
+    }
+
+    async fn goal_child_continuation_fixture() -> (
+        tempfile::TempDir,
+        crate::goal_accounting::GoalForegroundContext,
+        Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        Arc<crate::cost::CostTracker>,
+    ) {
+        use zeroclaw_goal::accounting::GoalOperationAccountingFactory;
+        let directory = tempfile::TempDir::new().unwrap();
+        let handle = crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap();
+        let scope =
+            zeroclaw_goal::GoalExecutionScope::new("continuation-goal", "continuation-session", 1)
+                .unwrap();
+        let task = crate::control_plane::TaskRecord {
+            id: scope.task_id().into(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "main".into(),
+            status: crate::control_plane::TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: handle.boot_id.clone(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some(scope.session_id().into()),
+            execution_epoch: 1,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let registry = handle.goal_store().unwrap();
+        let goal = zeroclaw_goal::GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "fixture".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            registry
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            zeroclaw_goal::GoalTransitionResult::Applied
+        );
+        let tracker = Arc::new(
+            crate::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let pricer = Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+            Arc::new(review_test_pricing()),
+        ));
+        let factory = crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+            registry,
+            Arc::clone(&tracker),
+            "main",
+            pricer,
+        )
+        .unwrap();
+        let accountant = factory.for_scope(scope.clone());
+        let root = crate::goal_accounting::GoalForegroundContext::new_root(
+            scope,
+            handle,
+            tokio_util::sync::CancellationToken::new(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        (directory, root.child(), accountant, tracker)
+    }
+
+    fn goal_continuation_reply(text: &str) -> ChatResponse {
+        ChatResponse {
+            text: Some(text.into()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(8),
+                output_tokens: Some(3),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+            reasoning_content: None,
+        }
+    }
+
+    struct CancelAfterGoalSettlement {
+        inner: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        count: std::sync::atomic::AtomicUsize,
+        token: tokio_util::sync::CancellationToken,
+    }
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for CancelAfterGoalSettlement {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.inner.admit(request).await
+        }
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            let result = self.inner.settle(settlement).await;
+            if self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                self.token.cancel();
+            }
+            result
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            self.inner.pricing_complete().await
+        }
+    }
+
+    fn assert_no_goal_run_context() {
+        assert!(crate::goal_accounting::GoalForegroundContext::current().is_none());
+        assert!(zeroclaw_api::tool::ToolExecutionContext::current().is_none());
+        assert!(
+            !zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .try_with(Option::is_some)
+                .unwrap_or(false)
+        );
+    }
+
+    struct SingleShotRunScopeAccounting {
+        inner: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        child: crate::goal_accounting::GoalForegroundContext,
+        accountant: std::sync::OnceLock<
+            std::sync::Weak<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        >,
+        lifecycle: crate::live_config_authority::AgentLifecycleCoordinator,
+        task_id: Option<tokio::task::Id>,
+        calls: std::sync::atomic::AtomicUsize,
+        admissions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SingleShotRunScopeAccounting {
+        fn observe(&self) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(tokio::task::try_id(), self.task_id);
+            assert_eq!(self.lifecycle.active_turn_count("main"), 1);
+            let active = crate::goal_accounting::GoalForegroundContext::current_for_child()
+                .unwrap()
+                .unwrap();
+            let expected = self.child.scope_identity();
+            assert_eq!(active.scope_identity().task_id(), expected.task_id());
+            assert_eq!(active.scope_identity().session_id(), expected.session_id());
+            assert_eq!(
+                active.scope_identity().execution_epoch(),
+                expected.execution_epoch()
+            );
+            assert_eq!(active.depth(), self.child.depth());
+            assert_eq!(active.deadline(), self.child.deadline());
+            assert_eq!(
+                active.control_plane().boot_id,
+                self.child.control_plane().boot_id
+            );
+            assert!(Arc::ptr_eq(
+                &active.control_plane().store,
+                &self.child.control_plane().store
+            ));
+            let expected_accountant = self.accountant.get().unwrap().upgrade().unwrap();
+            let active_accountant = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .try_with(Clone::clone)
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&active_accountant, &expected_accountant));
+            let cancelled = self.child.token().is_cancelled();
+            assert_eq!(active.token().is_cancelled(), cancelled);
+            let api = zeroclaw_api::tool::ToolExecutionContext::current().unwrap();
+            assert!(api.is_goal_foreground());
+            assert_eq!(api.cancellation_token().unwrap().is_cancelled(), cancelled);
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for SingleShotRunScopeAccounting {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.observe();
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.admit(request).await
+        }
+
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.observe();
+            let result = self.inner.settle(settlement).await;
+            self.observe();
+            result
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            self.observe();
+            self.inner.pricing_complete().await
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum SingleShotSkillCase {
+        ReflectionSuccess,
+        ReviewSuccess,
+        ReflectionFailure,
+        NotTriggered,
+        CancelAfterTurn,
+    }
+
+    async fn actual_goal_single_shot_skill_case(case: SingleShotSkillCase) {
+        boxed_goal_single_shot_skill_case(case).await;
+    }
+
+    fn boxed_goal_single_shot_skill_case(
+        case: SingleShotSkillCase,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()>>> {
+        Box::pin(actual_goal_single_shot_skill_case_body(case))
+    }
+
+    fn single_shot_skill_config_and_authority(
+        directory: &std::path::Path,
+        workspace: std::path::PathBuf,
+        provider_uri: String,
+        case: SingleShotSkillCase,
+    ) -> (
+        Config,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        crate::live_config_authority::LiveConfigAuthority,
+    ) {
+        // Synchronous fixture setup returns before the real run is polled.
+        // This does not guarantee compiler stack elimination.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let mut config = Config {
+            data_dir: directory.join("runtime"),
+            config_path: directory.join("config.toml"),
+            ..Config::default()
+        };
+        config.memory.backend = "none".into();
+        config.memory.auto_save = false;
+        config.reliability.provider_retries = 0;
+        config.providers.models.ollama.insert(
+            "default".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".into()),
+                    uri: Some(provider_uri),
+                    native_tools: Some(matches!(case, SingleShotSkillCase::ReviewSuccess)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".into(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                allowed_tools: vec!["file_read".into()],
+                auto_approve: vec!["file_read".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "main".into(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.skills.skill_creation.enabled = true;
+        config.skills.skill_creation.reflection_enabled = true;
+        config.skills.skill_improvement.enabled = true;
+        config.skills.skill_improvement.nudge_interval_iterations = 1;
+        config.skills.skill_improvement.max_review_iterations = 2;
+        let artifact_dir = config.data_dir.join("skills").join("inspect-fixture-files");
+        let runtime_dir = config.data_dir.clone();
+        let authority =
+            crate::live_config_authority::LiveConfigAuthority::for_tests(config.clone());
+        (config, artifact_dir, runtime_dir, authority)
+    }
+
+    async fn actual_goal_single_shot_skill_case_body(case: SingleShotSkillCase) {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+
+        let (directory, child, accountant, tracker) = goal_child_continuation_fixture().await;
+        let server = MockServer::start().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorded = Arc::clone(&bodies);
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                recorded.lock().unwrap().push(serde_json::from_slice(&request.body).unwrap());
+                let usage = serde_json::json!({"prompt_tokens":8,"completion_tokens":3});
+                let message = if matches!(case, SingleShotSkillCase::NotTriggered) {
+                    serde_json::json!({"role":"assistant","content":"single answer"})
+                } else if index == 0 && matches!(case, SingleShotSkillCase::ReviewSuccess) {
+                    serde_json::json!({"role":"assistant","content":null,"tool_calls":[
+                        {"id":"one","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"one.txt\"}"}},
+                        {"id":"two","type":"function","function":{"name":"file_read","arguments":"{\"path\":\"two.txt\"}"}}
+                    ]})
+                } else if index == 0 {
+                    serde_json::json!({"role":"assistant","content":"<tool_call>{\"name\":\"file_read\",\"arguments\":{\"path\":\"one.txt\"}}</tool_call><tool_call>{\"name\":\"file_read\",\"arguments\":{\"path\":\"two.txt\"}}</tool_call>"})
+                } else if index == 1 {
+                    serde_json::json!({"role":"assistant","content":"task complete"})
+                } else if index == 2 {
+                    if matches!(case, SingleShotSkillCase::ReflectionFailure) {
+                        return ResponseTemplate::new(400).set_body_json(serde_json::json!({"error":{"message":"fixture reflection failure"}}));
+                    }
+                    if matches!(case, SingleShotSkillCase::ReviewSuccess) {
+                        serde_json::json!({"role":"assistant","content":"Nothing to save."})
+                    } else {
+                        serde_json::json!({"role":"assistant","content":"---\nname: fixture\ndescription: Inspect fixture files.\n---\n\n# Inspect\n\nRead the files."})
+                    }
+                } else {
+                    serde_json::json!({"role":"assistant","content":"Nothing to save."})
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"choices":[{"message":message}],"usage":usage}))
+            }).mount(&server).await;
+
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("one.txt"), "first fixture").unwrap();
+        std::fs::write(workspace.join("two.txt"), "second fixture").unwrap();
+        let (config, artifact_dir, runtime_dir, authority) =
+            single_shot_skill_config_and_authority(directory.path(), workspace, server.uri(), case);
+        let lifecycle = authority.agent_lifecycle();
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            if matches!(case, SingleShotSkillCase::CancelAfterTurn) {
+                Arc::new(CancelAfterGoalSettlement {
+                    inner: accountant,
+                    count: std::sync::atomic::AtomicUsize::new(0),
+                    token: child.token().clone(),
+                })
+            } else {
+                accountant
+            };
+        let observed = Arc::new(SingleShotRunScopeAccounting {
+            inner: accountant,
+            child: child.clone(),
+            accountant: std::sync::OnceLock::new(),
+            lifecycle: lifecycle.clone(),
+            task_id: tokio::task::try_id(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            admissions: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            observed.clone();
+        assert!(observed.accountant.set(Arc::downgrade(&accountant)).is_ok());
+        assert_no_goal_run_context();
+        assert_eq!(lifecycle.active_turn_count("main"), 0);
+        // Pin the unpolled run before by-value scopes so their carriers hold a handle.
+        let run_future = Box::pin(super::run(
+            config,
+            "main",
+            Some("Inspect fixture files".into()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides {
+                is_subagent: true,
+                suppress_memory_inject: true,
+                execution_capability: Some(authority.execution_capability()),
+                ..Default::default()
+            },
+        ));
+        // Construction must not start admission, accounting, provider or body work.
+        assert_no_goal_run_context();
+        assert_eq!(lifecycle.active_turn_count("main"), 0);
+        assert_eq!(observed.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(bodies.lock().unwrap().is_empty());
+        assert!(!runtime_dir.exists());
+        assert!(!artifact_dir.exists());
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("continuation-goal")
+                .unwrap()
+                .0,
+            0
+        );
+        let result = GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), child.scope(run_future))
+            .await;
+        assert_no_goal_run_context();
+        assert_eq!(lifecycle.active_turn_count("main"), 0);
+        let count = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            count
+        );
+        let goal = child
+            .control_plane()
+            .goal_store()
+            .unwrap()
+            .get_goal_task("continuation-goal")
+            .await
+            .unwrap()
+            .unwrap();
+        let tokens = tracker
+            .get_strict_usage_totals_for_task_with_pricing("continuation-goal")
+            .unwrap()
+            .0;
+        match case {
+            SingleShotSkillCase::ReflectionSuccess => {
+                assert_eq!(result.unwrap(), "task complete");
+                assert_eq!(count, 3);
+                assert_eq!(tokens, 33);
+                assert!(artifact_dir.join("SKILL.md").exists());
+                assert!(!artifact_dir.join("SKILL.toml").exists());
+                assert_eq!(
+                    goal.accounting_state,
+                    zeroclaw_goal::GoalAccountingState::Complete
+                );
+                assert!(goal.pending_call_id.is_none());
+                let requests = bodies.lock().unwrap();
+                assert!(
+                    requests[1].to_string().contains("first fixture")
+                        && requests[1].to_string().contains("second fixture")
+                );
+                assert!(requests[2].to_string().contains("Inspect fixture files"));
+            }
+            SingleShotSkillCase::ReviewSuccess => {
+                assert_eq!(result.unwrap(), "task complete");
+                assert_eq!(count, 3);
+                assert_eq!(tokens, 33);
+                assert!(!artifact_dir.exists());
+                assert_eq!(
+                    goal.accounting_state,
+                    zeroclaw_goal::GoalAccountingState::Complete
+                );
+                assert!(goal.pending_call_id.is_none());
+                let requests = bodies.lock().unwrap();
+                assert!(
+                    requests[1].to_string().contains("first fixture")
+                        && requests[1].to_string().contains("second fixture")
+                );
+                assert!(requests[2].to_string().contains("skill"));
+            }
+            SingleShotSkillCase::ReflectionFailure => {
+                let error = result.unwrap_err();
+                assert!(format!("{error:#}").contains("fixture reflection failure"));
+                assert!(
+                    error
+                        .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                        .is_some()
+                );
+                assert_eq!(count, 3);
+                assert_eq!(tokens, 22);
+                assert!(
+                    !artifact_dir.join("SKILL.md").exists()
+                        && !artifact_dir.join("SKILL.toml").exists()
+                );
+                assert_eq!(
+                    goal.accounting_state,
+                    zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+                );
+                assert!(goal.pending_call_id.is_none());
+            }
+            SingleShotSkillCase::NotTriggered => {
+                assert_eq!(result.unwrap(), "single answer");
+                assert_eq!(count, 1);
+                assert_eq!(tokens, 11);
+                assert!(!artifact_dir.exists());
+                assert_eq!(
+                    goal.accounting_state,
+                    zeroclaw_goal::GoalAccountingState::Complete
+                );
+                assert!(goal.pending_call_id.is_none());
+            }
+            SingleShotSkillCase::CancelAfterTurn => {
+                let error = result.unwrap_err();
+                assert!(error.downcast_ref::<super::ToolLoopCancelled>().is_some());
+                assert_eq!(count, 2);
+                assert_eq!(tokens, 22);
+                assert!(!artifact_dir.exists());
+                assert_eq!(
+                    goal.accounting_state,
+                    zeroclaw_goal::GoalAccountingState::Complete
+                );
+                assert!(goal.pending_call_id.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_child_single_shot_prompt_mode_runs_enabled_reflection() {
+        actual_goal_single_shot_skill_case(SingleShotSkillCase::ReflectionSuccess).await;
+    }
+    #[tokio::test]
+    async fn goal_child_single_shot_native_mode_runs_enabled_review() {
+        actual_goal_single_shot_skill_case(SingleShotSkillCase::ReviewSuccess).await;
+    }
+    #[tokio::test]
+    async fn goal_child_single_shot_reflection_failure_stops_review_and_artifact() {
+        actual_goal_single_shot_skill_case(SingleShotSkillCase::ReflectionFailure).await;
+    }
+    #[tokio::test]
+    async fn goal_child_single_shot_enabled_but_not_triggered_skips_continuations() {
+        actual_goal_single_shot_skill_case(SingleShotSkillCase::NotTriggered).await;
+    }
+    #[tokio::test]
+    async fn goal_child_single_shot_cancellation_stops_optional_continuations() {
+        actual_goal_single_shot_skill_case(SingleShotSkillCase::CancelAfterTurn).await;
+    }
+
+    #[tokio::test]
+    async fn goal_child_reflection_and_review_succeed_and_charge_same_accountant() {
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let (directory, child, accountant, tracker) = goal_child_continuation_fixture().await;
+        let provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                goal_continuation_reply(
+                    "---\nname: fixture\ndescription: Fixture task.\n---\n\n# Fixture\n\nPerform the task.",
+                ),
+                goal_continuation_reply("Nothing to save."),
+            ]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let creator = crate::skills::creator::SkillCreator::new(
+            directory.path().to_path_buf(),
+            zeroclaw_config::schema::SkillCreationConfig {
+                enabled: true,
+                reflection_enabled: true,
+                ..Default::default()
+            },
+        );
+        let calls = vec![
+            crate::skills::creator::ToolCallRecord {
+                name: "one".into(),
+                args: serde_json::json!({}),
+            },
+            crate::skills::creator::ToolCallRecord {
+                name: "two".into(),
+                args: serde_json::json!({}),
+            },
+        ];
+        GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accountant),
+                child.scope(async {
+                    let slug = creator
+                        .create_from_execution_reflected(
+                            "Fixture task",
+                            &calls,
+                            "done",
+                            None,
+                            "mock-provider",
+                            &provider,
+                            "mock-model",
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        directory
+                            .path()
+                            .join("skills")
+                            .join(slug)
+                            .join("SKILL.md")
+                            .exists()
+                    );
+                    crate::skills::review::try_run_skill_review(
+                        None,
+                        directory.path().to_path_buf(),
+                        zeroclaw_config::schema::SkillImprovementConfig {
+                            enabled: true,
+                            cooldown_secs: 0,
+                            nudge_interval_iterations: 1,
+                            max_review_iterations: 2,
+                        },
+                        false,
+                        review_test_history(),
+                        Vec::new(),
+                        &provider,
+                        "mock-provider",
+                        "mock-model",
+                        &crate::observability::noop::NoopObserver,
+                        &zeroclaw_config::schema::MultimodalConfig::default(),
+                        &zeroclaw_config::schema::PacingConfig::default(),
+                        0,
+                        0,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }),
+            )
+            .await;
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("continuation-goal")
+                .unwrap()
+                .0,
+            22
+        );
+        assert!(provider.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_child_reflection_failure_preserves_provider_and_skips_fallback() {
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let (directory, child, accountant, _tracker) = goal_child_continuation_fixture().await;
+        let provider = ScriptedModelProvider::from_text_responses(Vec::new());
+        let creator = crate::skills::creator::SkillCreator::new(
+            directory.path().to_path_buf(),
+            zeroclaw_config::schema::SkillCreationConfig {
+                enabled: true,
+                reflection_enabled: true,
+                ..Default::default()
+            },
+        );
+        let calls = vec![
+            crate::skills::creator::ToolCallRecord {
+                name: "one".into(),
+                args: serde_json::json!({}),
+            },
+            crate::skills::creator::ToolCallRecord {
+                name: "two".into(),
+                args: serde_json::json!({}),
+            },
+        ];
+        let error = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accountant),
+                child.scope(async {
+                    creator
+                        .create_from_execution_reflected(
+                            "Fixture task",
+                            &calls,
+                            "done",
+                            None,
+                            "mock-provider",
+                            &provider,
+                            "mock-model",
+                        )
+                        .await
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("scripted model_provider exhausted responses"));
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .is_some()
+        );
+        assert!(
+            !directory
+                .path()
+                .join("skills/fixture-task/SKILL.toml")
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join("skills/fixture-task/SKILL.md")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_child_review_failure_retains_original_provider_error() {
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let (directory, child, accountant, _tracker) = goal_child_continuation_fixture().await;
+        let provider = ScriptedModelProvider::from_text_responses(Vec::new());
+        let error = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accountant),
+                child.scope(async {
+                    crate::skills::review::try_run_skill_review(
+                        None,
+                        directory.path().to_path_buf(),
+                        zeroclaw_config::schema::SkillImprovementConfig {
+                            enabled: true,
+                            cooldown_secs: 0,
+                            nudge_interval_iterations: 1,
+                            max_review_iterations: 2,
+                        },
+                        false,
+                        review_test_history(),
+                        Vec::new(),
+                        &provider,
+                        "mock-provider",
+                        "mock-model",
+                        &crate::observability::noop::NoopObserver,
+                        &zeroclaw_config::schema::MultimodalConfig::default(),
+                        &zeroclaw_config::schema::PacingConfig::default(),
+                        0,
+                        0,
+                        None,
+                        None,
+                    )
+                    .await
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("scripted model_provider exhausted responses"));
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_goal_child_stops_before_optional_continuation() {
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let (_directory, child, accountant, _tracker) = goal_child_continuation_fixture().await;
+        child.token().cancel();
+        let error = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accountant),
+                child.scope(async { super::check_goal_child_continuation() }),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<super::ToolLoopCancelled>().is_some());
     }
 
     #[tokio::test]
@@ -23395,11 +24227,56 @@ Let me check the result."#;
 
         let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
 
+        struct OrdinaryRunScopeObserver {
+            inner: Arc<CapturingObserver>,
+            task_id: Option<tokio::task::Id>,
+            observed_start: std::sync::atomic::AtomicBool,
+        }
+
+        impl Observer for OrdinaryRunScopeObserver {
+            fn record_event(&self, event: &ObserverEvent) {
+                if matches!(
+                    event,
+                    ObserverEvent::AgentStart { agent_alias, .. }
+                        if agent_alias.as_deref() == Some("run-lifecycle-success-agent")
+                ) {
+                    assert_no_goal_run_context();
+                    assert_eq!(tokio::task::try_id(), self.task_id);
+                    self.observed_start
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.inner.record_event(event);
+            }
+            fn record_metric(&self, metric: &zeroclaw_api::observability_traits::ObserverMetric) {
+                self.inner.record_metric(metric);
+            }
+            fn name(&self) -> &str {
+                "ordinary-run-scope"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn flush(&self) {
+                self.inner.flush();
+            }
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test listener should bind");
         let addr = listener.local_addr().expect("listener should have address");
-        let app = Router::new().route("/v1/chat/completions", post(respond_with_done));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded_requests = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let requests = Arc::clone(&recorded_requests);
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    respond_with_done().await
+                }
+            }),
+        );
         let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app)
                 .await
@@ -23432,10 +24309,16 @@ Let me check the result."#;
             .insert("default".to_string(), RiskProfileConfig::default());
 
         let capturing = Arc::new(CapturingObserver::default());
-        let observer: Arc<dyn Observer> = capturing.clone();
+        let scope_observer = Arc::new(OrdinaryRunScopeObserver {
+            inner: Arc::clone(&capturing),
+            task_id: tokio::task::try_id(),
+            observed_start: std::sync::atomic::AtomicBool::new(false),
+        });
+        let observer: Arc<dyn Observer> = scope_observer.clone();
         let hook_guard = observability::set_scoped_broadcast_hook(observer);
 
-        let result = super::run(
+        assert_no_goal_run_context();
+        let run_future = super::run(
             config,
             "run-lifecycle-success-agent",
             Some("hello".to_string()),
@@ -23448,8 +24331,26 @@ Let me check the result."#;
             None,
             TurnOrigin::SubTurn,
             super::AgentRunOverrides::default(),
-        )
-        .await;
+        );
+        assert_no_goal_run_context();
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            !scope_observer
+                .observed_start
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(
+            lifecycle_events_for_alias(&capturing.events.lock(), "run-lifecycle-success-agent"),
+            (0, 0)
+        );
+        let result = run_future.await;
+        assert_no_goal_run_context();
+        assert!(
+            scope_observer
+                .observed_start
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         drop(hook_guard);
         server.abort();

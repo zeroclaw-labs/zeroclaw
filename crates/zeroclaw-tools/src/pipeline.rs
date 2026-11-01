@@ -3,7 +3,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolExecutionContext, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{
+    GoalChildOperationError, Tool, ToolExecutionCancelled, ToolExecutionContext, ToolOutput,
+    ToolResult,
+};
 use zeroclaw_config::schema::PipelineConfig;
 
 use crate::tool_search::ToolAccessPolicy;
@@ -23,6 +26,18 @@ pub enum PipelineError {
         tool: String,
         message: String,
     },
+}
+
+// Owned child errors must cross the composite without being flattened to text.
+enum PipelineAbort {
+    Step(PipelineError),
+    Owned(anyhow::Error),
+}
+
+impl From<PipelineError> for PipelineAbort {
+    fn from(error: PipelineError) -> Self {
+        Self::Step(error)
+    }
 }
 
 /// A single step in a pipeline.
@@ -154,11 +169,18 @@ impl PipelineTool {
     async fn execute_sequential(
         &self,
         steps: &[PipelineStep],
-    ) -> std::result::Result<Vec<StepResult>, PipelineError> {
+    ) -> std::result::Result<Vec<StepResult>, PipelineAbort> {
         let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
         let context = ToolExecutionContext::current().unwrap_or_default();
 
         for (i, step) in steps.iter().enumerate() {
+            if context.is_goal_foreground()
+                && context
+                    .cancellation_token()
+                    .is_some_and(|t| t.is_cancelled())
+            {
+                return Err(PipelineAbort::Owned(ToolExecutionCancelled.into()));
+            }
             let tool = self
                 .find_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
@@ -166,14 +188,31 @@ impl PipelineTool {
             // Interpolate previous step results into args.
             let interpolated_args = interpolate_args(&step.args, &results);
 
-            let tool_result = tool
-                .execute_with_context(interpolated_args, &context)
-                .await
-                .map_err(|e| PipelineError::StepFailed {
-                    index: i,
-                    tool: step.tool.clone(),
-                    message: e.to_string(),
-                })?;
+            let possible_child =
+                context.is_goal_foreground() && tool.may_invoke_agent_child(&interpolated_args);
+            let call = tool.execute_with_context(interpolated_args, &context);
+            let result = if possible_child {
+                context.scope_only(call).await
+            } else if context.is_goal_foreground() {
+                context.run(call).await
+            } else {
+                call.await
+            };
+            let tool_result = result.map_err(|e| {
+                if context.is_goal_foreground()
+                    && (e.is::<GoalChildOperationError>() || e.is::<ToolExecutionCancelled>())
+                {
+                    PipelineAbort::Owned(
+                        e.context(format!("Pipeline step {i} ({}) failed", step.tool)),
+                    )
+                } else {
+                    PipelineAbort::Step(PipelineError::StepFailed {
+                        index: i,
+                        tool: step.tool.clone(),
+                        message: e.to_string(),
+                    })
+                }
+            })?;
 
             if !tool_result.success {
                 return Err(PipelineError::StepFailed {
@@ -182,7 +221,8 @@ impl PipelineTool {
                     message: tool_result
                         .error
                         .unwrap_or_else(|| tool_result.output.clone().into_string()),
-                });
+                }
+                .into());
             }
 
             results.push(StepResult {
@@ -193,6 +233,83 @@ impl PipelineTool {
             });
         }
 
+        Ok(results)
+    }
+
+    /// Poll child-free Goal steps in the owning task so task-local accounting survives.
+    async fn execute_goal_parallel(
+        &self,
+        steps: &[PipelineStep],
+    ) -> std::result::Result<Vec<StepResult>, PipelineAbort> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+        use std::future::Future;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let context = ToolExecutionContext::current().unwrap_or_default();
+        let mut pending = FuturesUnordered::new();
+        for (index, step) in steps.iter().enumerate() {
+            let tool = self
+                .find_tool(&step.tool)
+                .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
+            let context = context.clone();
+            pending.push(async move {
+                let future = context.run(tool.execute_with_context(step.args.clone(), &context));
+                let mut future = std::pin::pin!(future);
+                let result = std::future::poll_fn(|cx| {
+                    match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+                        Ok(poll) => poll.map(Some),
+                        Err(_) => std::task::Poll::Ready(None),
+                    }
+                })
+                .await;
+                (index, step, result)
+            });
+        }
+        let mut results = Vec::with_capacity(steps.len());
+        while let Some((index, step, result)) = pending.next().await {
+            let result = match result {
+                None => {
+                    return Err(PipelineError::StepFailed {
+                        index,
+                        tool: step.tool.clone(),
+                        message: "Pipeline step panicked".into(),
+                    }
+                    .into());
+                }
+                Some(Err(error))
+                    if error.is::<GoalChildOperationError>()
+                        || error.is::<ToolExecutionCancelled>() =>
+                {
+                    return Err(PipelineAbort::Owned(error));
+                }
+                Some(Err(error)) => {
+                    return Err(PipelineError::StepFailed {
+                        index,
+                        tool: step.tool.clone(),
+                        message: error.to_string(),
+                    }
+                    .into());
+                }
+                Some(Ok(result)) => result,
+            };
+            if !result.success {
+                return Err(PipelineError::StepFailed {
+                    index,
+                    tool: step.tool.clone(),
+                    message: result
+                        .error
+                        .unwrap_or_else(|| result.output.clone().into_string()),
+                }
+                .into());
+            }
+            results.push(StepResult {
+                index,
+                tool: step.tool.clone(),
+                success: true,
+                output: result.output.into_string(),
+            });
+        }
+        results.sort_by_key(|result| result.index);
         Ok(results)
     }
 
@@ -269,6 +386,16 @@ impl PipelineTool {
 
 #[async_trait]
 impl Tool for PipelineTool {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        let Ok(request) = serde_json::from_value::<PipelineRequest>(args.clone()) else {
+            return true;
+        };
+        request.steps.iter().any(|step| {
+            self.find_tool(&step.tool)
+                .is_none_or(|tool| tool.may_invoke_agent_child(&step.args))
+        })
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         true
     }
@@ -324,6 +451,14 @@ impl Tool for PipelineTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let context = ToolExecutionContext::current().unwrap_or_default();
+        if context.is_goal_foreground()
+            && context
+                .cancellation_token()
+                .is_some_and(|t| t.is_cancelled())
+        {
+            return Err(ToolExecutionCancelled.into());
+        }
         let request: PipelineRequest = serde_json::from_value(args).map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -344,8 +479,30 @@ impl Tool for PipelineTool {
             });
         }
 
-        let results = if request.parallel {
-            self.execute_parallel(&request.steps).await
+        if context.is_goal_foreground() && request.parallel {
+            for (index, step) in request.steps.iter().enumerate() {
+                if self
+                    .find_tool(&step.tool)
+                    .is_none_or(|tool| tool.may_invoke_agent_child(&step.args))
+                {
+                    let error = PipelineError::StepFailed {
+                        index,
+                        tool: step.tool.clone(),
+                        message: crate::i18n::get_required_tool_string(
+                            "tool-pipeline-error-goal-parallel-child",
+                        ),
+                    };
+                    return Ok(ToolResult::err(error.to_string()));
+                }
+            }
+        }
+
+        let results = if request.parallel && context.is_goal_foreground() {
+            self.execute_goal_parallel(&request.steps).await
+        } else if request.parallel {
+            self.execute_parallel(&request.steps)
+                .await
+                .map_err(PipelineAbort::Step)
         } else {
             self.execute_sequential(&request.steps).await
         };
@@ -366,11 +523,26 @@ impl Tool for PipelineTool {
                     error: None,
                 })
             }
-            Err(e) => Ok(ToolResult {
+            Err(PipelineAbort::Owned(error)) => Err(error),
+            Err(PipelineAbort::Step(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
+        }
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolResult> {
+        if context.is_goal_foreground()
+            || ToolExecutionContext::current().is_some_and(|outer| outer.is_goal_foreground())
+        {
+            context.scope_only(self.execute(args)).await
+        } else {
+            context.run(self.execute(args)).await
         }
     }
 }
@@ -461,6 +633,257 @@ fn resolve_template(template: &str, prior_results: &[StepResult]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    tokio::task_local! { static PIPELINE_TEST_SCOPE: usize; }
+
+    struct GoalProbe {
+        name: &'static str,
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    }
+    zeroclaw_api::mock_tool_attribution!(GoalProbe);
+
+    #[async_trait]
+    impl Tool for GoalProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Goal pipeline probe"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args.get("child").and_then(|v| v.as_bool()).unwrap_or(false)
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+            assert!(
+                ToolExecutionContext::current()
+                    .unwrap()
+                    .is_goal_foreground()
+            );
+            if self.barrier.is_some() {
+                assert_eq!(PIPELINE_TEST_SCOPE.get(), 7);
+            }
+            self.effects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+                assert_eq!(PIPELINE_TEST_SCOPE.get(), 7);
+                assert!(
+                    ToolExecutionContext::current()
+                        .unwrap()
+                        .is_goal_foreground()
+                );
+            }
+            if args.get("panic").and_then(|v| v.as_bool()) == Some(true) {
+                panic!("private payload");
+            }
+            if args.get("error").and_then(|v| v.as_bool()) == Some(true) {
+                return Err(
+                    anyhow::Error::msg("original child cause").context(GoalChildOperationError)
+                );
+            }
+            Ok(ToolResult::ok(args.to_string()))
+        }
+    }
+
+    fn goal_probe_pipeline(
+        effects: Arc<std::sync::atomic::AtomicUsize>,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    ) -> PipelineTool {
+        PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 5,
+                allowed_tools: vec!["probe".into()],
+            },
+            vec![Arc::new(GoalProbe {
+                name: "probe",
+                effects,
+                barrier,
+            })],
+        )
+    }
+
+    #[tokio::test]
+    async fn goal_parallel_child_rejected_before_any_step_and_after_validation() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = goal_probe_pipeline(effects.clone(), None);
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let result = pipeline
+            .execute_with_context(
+                serde_json::json!({"parallel":true,"steps":[
+                    {"tool":"probe","args":{}},{"tool":"probe","args":{"child":true}}
+                ]}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Step 1"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let invalid = pipeline
+            .execute_with_context(
+                serde_json::json!({"parallel":true,"steps":[
+                    {"tool":"probe","args":{"child":true}},{"tool":"missing","args":{}}
+                ]}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(invalid.error.unwrap().contains("Unknown tool"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn goal_parallel_child_free_steps_overlap_in_original_task() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let pipeline = goal_probe_pipeline(effects.clone(), Some(barrier));
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let result = PIPELINE_TEST_SCOPE
+            .scope(7, async {
+                pipeline
+                    .execute_with_context(
+                        serde_json::json!({"parallel":true,"steps":[
+                            {"tool":"probe","args":{}},{"tool":"probe","args":{}}
+                        ]}),
+                        &context,
+                    )
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(result.success);
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn goal_sequential_child_error_retains_marker_and_stops_tail() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = goal_probe_pipeline(effects.clone(), None);
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let error = pipeline
+            .execute_with_context(
+                serde_json::json!({"result":"last","steps":[
+                    {"tool":"probe","args":{"child":true,"error":true}},{"tool":"probe","args":{}}
+                ]}),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is::<GoalChildOperationError>());
+        assert!(format!("{error:#}").contains("original child cause"));
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn goal_parallel_panic_is_safe_step_failure() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = goal_probe_pipeline(effects, None);
+        let result = pipeline
+            .execute_with_context(
+                serde_json::json!({"parallel":true,"steps":[
+                    {"tool":"probe","args":{"panic":true}}
+                ]}),
+                &ToolExecutionContext::default().with_goal_foreground(),
+            )
+            .await
+            .unwrap();
+        let error = result.error.unwrap();
+        assert!(error.contains("Step 0"));
+        assert!(!error.contains("private payload"));
+    }
+
+    struct DrainingChild {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    zeroclaw_api::mock_tool_attribution!(DrainingChild);
+    #[async_trait]
+    impl Tool for DrainingChild {
+        fn name(&self) -> &str {
+            "child"
+        }
+        fn description(&self) -> &str {
+            "cooperatively drains on cancellation"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, _: &serde_json::Value) -> bool {
+            true
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<ToolResult> {
+            let context = ToolExecutionContext::current().unwrap();
+            self.entered.notify_one();
+            context.cancellation_token().unwrap().cancelled().await;
+            self.release.notified().await;
+            Err(anyhow::Error::new(ToolExecutionCancelled).context(GoalChildOperationError))
+        }
+        async fn execute_with_context(
+            &self,
+            args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> Result<ToolResult> {
+            context.scope_only(self.execute(args)).await
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_pipeline_awaits_child_cleanup_after_cancellation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let pipeline = PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 1,
+                allowed_tools: vec!["child".into()],
+            },
+            vec![Arc::new(DrainingChild {
+                entered: entered.clone(),
+                release: release.clone(),
+            })],
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone())).with_goal_foreground();
+        let mut call = Box::pin(pipeline.execute_with_context(
+            serde_json::json!({"steps":[{"tool":"child","args":{}}]}),
+            &context,
+        ));
+        tokio::select! {
+            () = entered.notified() => {},
+            result = &mut call => panic!("child returned before cancellation: {result:?}"),
+        }
+        token.cancel();
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(call.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.notify_one();
+        let error = call.await.unwrap_err();
+        assert!(error.is::<GoalChildOperationError>());
+        assert!(error.is::<ToolExecutionCancelled>());
+    }
+
+    #[tokio::test]
+    async fn goal_pipeline_pre_cancelled_starts_no_step() {
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = goal_probe_pipeline(effects.clone(), None);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let error = pipeline
+            .execute_with_context(
+                serde_json::json!({"steps":[{"tool":"probe","args":{}}]}),
+                &ToolExecutionContext::new(Some(token)).with_goal_foreground(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is::<ToolExecutionCancelled>());
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 
     struct ContextAwareStep {
         tokens: Arc<std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>>,

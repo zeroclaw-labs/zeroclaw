@@ -10,7 +10,7 @@ use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
-use zeroclaw_api::tool::{ToolExecutionCancelled, ToolExecutionContext};
+use zeroclaw_api::tool::{GoalChildOperationError, ToolExecutionCancelled, ToolExecutionContext};
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
@@ -168,6 +168,7 @@ fn unavailable_tool_outcome(
         output: reason.clone(),
         success: false,
         error_reason: Some(reason),
+        terminal_error: None,
         duration,
         receipt: None,
         output_data: None,
@@ -198,6 +199,8 @@ pub struct ToolExecutionOutcome {
     /// post-execution log line, CLI progress) and, unlike this field, on the
     /// model-visible `output`.
     pub error_reason: Option<String>,
+    /// Original Goal child boundary failure, retained only for in-process control flow.
+    pub terminal_error: Option<anyhow::Error>,
     pub duration: Duration,
     /// Cryptographic HMAC receipt proving this tool actually executed.
     /// Present only when tool receipts are enabled in config.
@@ -207,6 +210,8 @@ pub struct ToolExecutionOutcome {
 // ── Single tool execution ────────────────────────────────────────────────
 
 pub(crate) struct CompletedToolExecution {
+    /// Original result, including any native Goal terminal cause independent
+    /// from the completed call's canonical dispatch evidence.
     pub(crate) outcome: ToolExecutionOutcome,
     /// Created by the executor only after `Tool::execute` completes. An
     /// unavailable name returns an outcome without dispatch evidence.
@@ -300,6 +305,7 @@ async fn execute_one_tool_with_provenance(
                     output: reason.clone(),
                     success: false,
                     error_reason: Some(reason),
+                    terminal_error: None,
                     duration,
                     receipt: None,
                     output_data: None,
@@ -352,19 +358,32 @@ async fn execute_one_tool_with_provenance(
             .await;
     }
 
+    let participating = crate::goal_accounting::GoalForegroundContext::is_participating();
     let context = ToolExecutionContext::new(cancellation_token.cloned());
-    let execute = context
-        .run(tool.execute_with_context(call_arguments.clone(), &context))
-        .instrument(tool_span.clone());
+    let context = if participating {
+        context.with_goal_foreground()
+    } else {
+        context
+    };
+    let possible_child = participating && tool.may_invoke_agent_child(&call_arguments);
+    let execute = async {
+        let call = tool.execute_with_context(call_arguments.clone(), &context);
+        if possible_child {
+            context.scope_only(call).await
+        } else {
+            context.run(call).await
+        }
+    }
+    .instrument(tool_span.clone());
     let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
     } else {
         execute.await
     };
-    if tool_result
-        .as_ref()
-        .is_err_and(|error| error.is::<ToolExecutionCancelled>())
-    {
+    if tool_result.as_ref().is_err_and(|error| {
+        !(participating && error.is::<GoalChildOperationError>())
+            && error.is::<ToolExecutionCancelled>()
+    }) {
         return Err(ToolLoopCancelled.into());
     }
 
@@ -435,6 +454,7 @@ async fn execute_one_tool_with_provenance(
                         output_data: r.output.into_data(),
                         success: true,
                         error_reason: None,
+                        terminal_error: None,
                         duration,
                         receipt,
                     })
@@ -484,6 +504,7 @@ async fn execute_one_tool_with_provenance(
                         output: format!("Error: {model_visible}"),
                         success: false,
                         error_reason: Some(reason),
+                        terminal_error: None,
                         duration,
                         receipt: None,
                         attachments,
@@ -492,6 +513,7 @@ async fn execute_one_tool_with_provenance(
                 }
             }
             Err(e) => {
+                let is_goal_child_error = participating && e.is::<GoalChildOperationError>();
                 let duration = start.elapsed();
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -530,6 +552,7 @@ async fn execute_one_tool_with_provenance(
                     output: model_visible,
                     success: false,
                     error_reason: Some(reason),
+                    terminal_error: if is_goal_child_error { Some(e) } else { None },
                     duration,
                     receipt: None,
                     output_data: None,
@@ -630,6 +653,20 @@ pub(crate) async fn execute_tools_parallel(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<Vec<Option<CompletedToolExecution>>> {
+    if crate::goal_accounting::GoalForegroundContext::is_participating()
+        || ToolExecutionContext::current().is_some_and(|context| context.is_goal_foreground())
+    {
+        return execute_tools_sequential(
+            tool_calls,
+            dispatch,
+            meta,
+            observer,
+            cancellation_token,
+            receipt_generator,
+            event_tx,
+        )
+        .await;
+    }
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|call| {
@@ -719,7 +756,11 @@ pub(crate) async fn execute_tools_sequential(
             Err(e) if is_tool_loop_cancelled(&e) => break,
             Err(e) => return Err(e),
         };
+        let fatal = outcome.outcome.terminal_error.is_some();
         slots.push(Some(outcome));
+        if fatal {
+            break;
+        }
     }
 
     slots.resize_with(tool_calls.len(), || None);
@@ -2392,6 +2433,197 @@ mod tests {
             arguments: serde_json::json!({}),
             tool_call_id: None,
         }
+    }
+
+    struct GoalDispatchProbe {
+        calls: Arc<AtomicUsize>,
+    }
+    zeroclaw_api::mock_tool_attribution!(GoalDispatchProbe);
+
+    #[async_trait]
+    impl Tool for GoalDispatchProbe {
+        fn name(&self) -> &str {
+            "goal_dispatch_probe"
+        }
+        fn description(&self) -> &str {
+            "records Goal dispatch and returns a marked failure"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args.get("child").and_then(|v| v.as_bool()).unwrap_or(false)
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<zeroclaw_api::tool::ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                ToolExecutionContext::current()
+                    .unwrap()
+                    .is_goal_foreground()
+            );
+            if args.get("fail").and_then(|v| v.as_bool()) == Some(true) {
+                return Err(
+                    anyhow::Error::new(zeroclaw_api::tool::ToolExecutionCancelled)
+                        .context(zeroclaw_api::tool::GoalChildOperationError),
+                );
+            }
+            Ok(zeroclaw_api::tool::ToolResult::ok("done"))
+        }
+        async fn execute_with_context(
+            &self,
+            args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> Result<zeroclaw_api::tool::ToolResult> {
+            context.scope_only(self.execute(args)).await
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_parallel_dispatch_preserves_marked_failure_and_stops_tail() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(GoalDispatchProbe {
+            calls: calls.clone(),
+        })];
+        let mut batch = vec![
+            parsed_tool_call("goal_dispatch_probe"),
+            parsed_tool_call("goal_dispatch_probe"),
+            parsed_tool_call("goal_dispatch_probe"),
+        ];
+        batch[1].arguments = serde_json::json!({"child": true, "fail": true});
+        let meta = TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "goal-dispatch",
+            channel_name: "test",
+        };
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let outcomes = context
+            .scope_only(super::execute_tools_parallel(
+                &batch,
+                dispatch,
+                &meta,
+                &NoopObserver,
+                None,
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let prefix = outcomes[0].as_ref().unwrap();
+        assert_eq!(
+            prefix.executed_tool_name.as_deref(),
+            Some("goal_dispatch_probe")
+        );
+        assert!(prefix.outcome.success);
+        let failed = outcomes[1].as_ref().unwrap();
+        assert_eq!(
+            failed.executed_tool_name.as_deref(),
+            Some("goal_dispatch_probe")
+        );
+        assert!(!failed.outcome.success);
+        let error = failed.outcome.terminal_error.as_ref().unwrap();
+        assert!(error.is::<zeroclaw_api::tool::GoalChildOperationError>());
+        assert!(error.is::<zeroclaw_api::tool::ToolExecutionCancelled>());
+        assert!(outcomes[2].is_none());
+    }
+
+    struct GoalDrainProbe {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    zeroclaw_api::mock_tool_attribution!(GoalDrainProbe);
+    #[async_trait]
+    impl Tool for GoalDrainProbe {
+        fn name(&self) -> &str {
+            "goal_drain_probe"
+        }
+        fn description(&self) -> &str {
+            "awaits cleanup after cancellation"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args["child"] == true
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<zeroclaw_api::tool::ToolResult> {
+            let context = ToolExecutionContext::current().unwrap();
+            self.entered.notify_one();
+            context.cancellation_token().unwrap().cancelled().await;
+            self.release.notified().await;
+            Err(
+                anyhow::Error::new(zeroclaw_api::tool::ToolExecutionCancelled)
+                    .context(zeroclaw_api::tool::GoalChildOperationError),
+            )
+        }
+        async fn execute_with_context(
+            &self,
+            args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> Result<zeroclaw_api::tool::ToolResult> {
+            context.scope_only(self.execute(args)).await
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_dispatch_awaits_child_cleanup_before_terminal_outcome() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(GoalDrainProbe {
+            entered: entered.clone(),
+            release: release.clone(),
+        })];
+        let token = CancellationToken::new();
+        let meta = TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "goal-drain",
+            channel_name: "test",
+        };
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+        let context = ToolExecutionContext::default().with_goal_foreground();
+        let future = context.scope_only(execute_one_tool(
+            "goal_drain_probe",
+            serde_json::json!({"child": true}),
+            None,
+            dispatch,
+            &meta,
+            &NoopObserver,
+            Some(&token),
+            None,
+            None,
+        ));
+        let mut call = Box::pin(future);
+        tokio::select! {
+            () = entered.notified() => {},
+            result = &mut call => panic!("child completed before cancellation: {}", result.is_ok()),
+        }
+        token.cancel();
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(call.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.notify_one();
+        let outcome = call.await.unwrap();
+        assert!(
+            outcome
+                .terminal_error
+                .unwrap()
+                .is::<zeroclaw_api::tool::GoalChildOperationError>()
+        );
     }
 
     fn supervised_risk_profile() -> RiskProfileConfig {

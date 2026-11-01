@@ -204,6 +204,14 @@ pub enum OrphanedRunSettlement {
     /// Execution authority rejected the next step before its target ran.
     /// Settled `Cancelled`: the driver stopped without executing that step.
     ExecutionRejected,
+    /// The owning Goal stopped and will not advance this live action. This is
+    /// an additive Rust enum variant: exhaustive downstream matches must handle
+    /// it. The exact admitted step/revision remain bound across maintenance.
+    GoalOperationStopped {
+        step_started: bool,
+        expected_step: u32,
+        expected_revision: u64,
+    },
 }
 
 /// Canonical pending terminal writes, retained across daemon generations.
@@ -3912,6 +3920,9 @@ impl SopEngine {
                 (true, OrphanedRunSettlement::ExecutionRejected) => {
                     self.settle_run_for_rejected_execution(run_id)
                 }
+                (true, OrphanedRunSettlement::GoalOperationStopped { step_started, .. }) => {
+                    self.settle_run_for_stopped_goal(run_id, step_started)
+                }
             });
         match &result {
             Ok(_) => {
@@ -3942,11 +3953,48 @@ impl SopEngine {
                 self.adopt_terminal_record(run_id, stored.run);
                 return Ok(false);
             } else {
+                if let OrphanedRunSettlement::GoalOperationStopped {
+                    step_started,
+                    expected_step,
+                    expected_revision,
+                } = kind
+                {
+                    // A parked winner has its own operator/maintenance owner.
+                    // Never bind an old driver ticket to a successor revision.
+                    if matches!(
+                        stored.run.status,
+                        SopRunStatus::WaitingApproval | SopRunStatus::PausedCheckpoint
+                    ) {
+                        self.note_run_revision(run_id, stored.revision);
+                        self.active_runs.insert(run_id.to_string(), stored.run);
+                        return Ok(false);
+                    }
+                    if stored.run.current_step != expected_step
+                        || stored.revision != expected_revision
+                    {
+                        bail!(
+                            "Goal SOP cleanup conflict for {run_id}: expected step {expected_step} revision {expected_revision}, stored step {} revision {}",
+                            stored.run.current_step,
+                            stored.revision
+                        );
+                    }
+                    if step_started && stored.run.status == SopRunStatus::Pending {
+                        bail!(
+                            "Goal SOP cleanup integrity failure for {run_id}: begun step is Pending"
+                        );
+                    }
+                }
                 let needs_settlement = matches!(
                     stored.run.status,
                     SopRunStatus::Running | SopRunStatus::CancelRequested
-                ) || (kind == OrphanedRunSettlement::DrainedBeforeAdmission
-                    && stored.run.status == SopRunStatus::Pending);
+                ) || (matches!(
+                    kind,
+                    OrphanedRunSettlement::DrainedBeforeAdmission
+                        | OrphanedRunSettlement::GoalOperationStopped {
+                            step_started: false,
+                            ..
+                        }
+                ) && stored.run.status == SopRunStatus::Pending);
                 if needs_settlement || self.active_runs.contains_key(run_id) {
                     self.note_run_revision(run_id, stored.revision);
                     self.active_runs.insert(run_id.to_string(), stored.run);
@@ -3954,7 +4002,112 @@ impl SopEngine {
                 return Ok(needs_settlement);
             }
         }
+        if matches!(kind, OrphanedRunSettlement::GoalOperationStopped { .. }) {
+            bail!("Goal SOP cleanup cannot load the bound durable run {run_id}");
+        }
         Ok(self.active_runs.contains_key(run_id))
+    }
+
+    /// Bind a live Goal driver's exact held action before its step I/O. This
+    /// creates a cleanup ticket, not a pending maintenance entry while it runs.
+    pub(crate) fn goal_operation_stop_settlement(
+        &self,
+        run_id: &str,
+        expected_step: u32,
+        step_started: bool,
+    ) -> Result<OrphanedRunSettlement> {
+        let run = self.active_runs.get(run_id).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "goal_sop_cleanup_missing_active_run",
+                        "run_id": run_id,
+                    })),
+                "SOP engine: Goal cleanup could not bind a missing active run"
+            );
+            anyhow::Error::msg(format!(
+                "Goal SOP cleanup cannot bind missing active run {run_id}"
+            ))
+        })?;
+        if run.current_step != expected_step {
+            bail!(
+                "Goal SOP cleanup cannot bind {run_id}: action step {expected_step}, held step {}",
+                run.current_step
+            );
+        }
+        let expected_revision =
+            self.run_revisions
+                .lock()
+                .get(run_id)
+                .copied()
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "goal_sop_cleanup_missing_revision",
+                                "run_id": run_id,
+                            })),
+                        "SOP engine: Goal cleanup could not bind a missing run revision"
+                    );
+                    anyhow::Error::msg(format!(
+                        "Goal SOP cleanup cannot bind missing revision for {run_id}"
+                    ))
+                })?;
+        Ok(OrphanedRunSettlement::GoalOperationStopped {
+            step_started,
+            expected_step,
+            expected_revision,
+        })
+    }
+
+    /// Check the authoritative copy before Goal-owned step I/O, retaining the
+    /// already-bound ticket if a concurrent writer or read failure rejects it.
+    pub(crate) fn validate_goal_live_step(&mut self, run_id: &str) -> Result<()> {
+        if let Some(stale) = self.adopt_if_stale(run_id)? {
+            return Err(self.refused(stale));
+        }
+        Ok(())
+    }
+
+    fn settle_run_for_stopped_goal(
+        &mut self,
+        run_id: &str,
+        step_started: bool,
+    ) -> Result<Option<SopRunStatus>> {
+        let Some(run) = self.active_runs.get(run_id) else {
+            return Ok(None);
+        };
+        let prior = run.status;
+        let status = match (step_started, prior) {
+            (true, SopRunStatus::Running) => SopRunStatus::Failed,
+            (_, SopRunStatus::CancelRequested)
+            | (false, SopRunStatus::Pending | SopRunStatus::Running) => SopRunStatus::Cancelled,
+            (true, SopRunStatus::Pending) => {
+                bail!("Goal SOP cleanup integrity failure for {run_id}: begun step is Pending")
+            }
+            _ => return Ok(None),
+        };
+        let reason = "The owning Goal operation stopped; no live SOP driver will advance this run."
+            .to_string();
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "run_goal_operation_stopped".to_string(),
+            actor: None,
+            reason: Some(reason.clone()),
+            payload: ::serde_json::json!({
+                "step": run.current_step,
+                "step_started": step_started,
+                "prior_status": prior.to_string(),
+            }),
+        };
+        self.finish_run_with_gate_event(run_id, status, Some(reason), &event)?;
+        Ok(Some(prior))
     }
 
     /// Hand this engine the retry for runs a previous engine could not settle.
@@ -7503,7 +7656,7 @@ fn parse_iso8601_secs(input: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::store::ProposalKind;
     use super::*;
     use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
@@ -7589,6 +7742,187 @@ mod tests {
 
     fn engine_with_sops(sops: Vec<Sop>) -> SopEngine {
         engine_with_config_sops(SopConfig::default(), sops)
+    }
+
+    #[test]
+    fn goal_settlement_stopped_live_actions_release_claims_and_keep_truthful_events() {
+        for (started, prior, terminal) in [
+            (true, SopRunStatus::Running, SopRunStatus::Failed),
+            (true, SopRunStatus::CancelRequested, SopRunStatus::Cancelled),
+            (false, SopRunStatus::Running, SopRunStatus::Cancelled),
+            (false, SopRunStatus::Pending, SopRunStatus::Cancelled),
+            (
+                false,
+                SopRunStatus::CancelRequested,
+                SopRunStatus::Cancelled,
+            ),
+        ] {
+            let mut engine = engine_with_sops(vec![test_sop(
+                "goal-stop",
+                SopExecutionMode::Auto,
+                SopPriority::Normal,
+            )]);
+            let action = engine.start_run("goal-stop", manual_event()).unwrap();
+            let id = extract_run_id(&action).to_string();
+            if prior != SopRunStatus::Running {
+                let mut run = engine.active_runs.get(&id).unwrap().clone();
+                run.status = prior;
+                engine.store.save_run(&engine.persisted_run(&run)).unwrap();
+                let stored = engine.store.load_run(&id).unwrap().unwrap();
+                engine.note_run_revision(&id, stored.revision);
+                engine.active_runs.insert(id.clone(), run);
+            }
+            let ticket = engine
+                .goal_operation_stop_settlement(&id, 1, started)
+                .unwrap();
+            assert_eq!(
+                engine.settle_orphaned_run(&id, ticket).unwrap(),
+                Some(prior)
+            );
+            let stored = engine.store.load_run(&id).unwrap().unwrap();
+            assert_eq!(stored.run.status, terminal);
+            assert_eq!(engine.store.claim_counts("goal-stop").unwrap(), (0, 0));
+            assert!(
+                stored.run.step_results.is_empty(),
+                "unrun work is not fabricated as a step result"
+            );
+            let events = engine.store.list_events(&id).unwrap();
+            let stopped: Vec<_> = events
+                .iter()
+                .filter(|event| event.kind == "run_goal_operation_stopped")
+                .collect();
+            assert_eq!(stopped.len(), 1);
+            assert_eq!(
+                stopped[0].reason.as_deref(),
+                Some(
+                    "The owning Goal operation stopped; no live SOP driver will advance this run."
+                )
+            );
+            assert_eq!(stopped[0].payload["step_started"], started);
+            assert_eq!(stopped[0].payload["step"], 1);
+            assert_eq!(stopped[0].payload["prior_status"], prior.to_string());
+            assert_eq!(engine.settle_orphaned_run(&id, ticket).unwrap(), None);
+            assert_eq!(engine.store.list_events(&id).unwrap().len(), events.len());
+        }
+    }
+
+    #[test]
+    fn goal_settlement_failed_terminal_write_remains_maintenance_owned() {
+        let store = Arc::new(FailFirstFinishStore::new());
+        let mut engine = engine_with_sops(vec![test_sop(
+            "goal-stop",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        let action = engine.start_run("goal-stop", manual_event()).unwrap();
+        let id = extract_run_id(&action).to_string();
+        let ticket = engine.goal_operation_stop_settlement(&id, 1, true).unwrap();
+        let error = engine.settle_orphaned_run(&id, ticket).unwrap_err();
+        assert!(format!("{error:#}").contains("injected first terminal persistence failure"));
+        assert!(engine.has_pending_orphan_settlement(&id));
+        assert_eq!(engine.get_run(&id).unwrap().status, SopRunStatus::Running);
+        assert_eq!(store.claim_counts("goal-stop").unwrap(), (1, 1));
+        assert!(
+            !store
+                .list_events(&id)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "run_goal_operation_stopped")
+        );
+        assert_eq!(engine.run_maintenance_tick().settled_orphaned_runs, 1);
+        assert_eq!(engine.get_run(&id).unwrap().status, SopRunStatus::Failed);
+        assert_eq!(store.claim_counts("goal-stop").unwrap(), (0, 0));
+        assert_eq!(
+            store
+                .list_events(&id)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "run_goal_operation_stopped")
+                .count(),
+            1
+        );
+        assert!(!engine.has_pending_orphan_settlement(&id));
+        assert!(engine.run_maintenance_tick().is_empty());
+    }
+
+    #[test]
+    fn goal_settlement_revision_conflict_retains_ticket_without_overwriting_successor() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "goal-stop",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("goal-stop", manual_event()).unwrap();
+        let id = extract_run_id(&action).to_string();
+        let ticket = engine.goal_operation_stop_settlement(&id, 1, true).unwrap();
+        let mut successor = engine.store.load_run(&id).unwrap().unwrap();
+        successor.revision += 1;
+        successor.run.current_step = 2;
+        engine.store.save_run(&successor).unwrap();
+        let error = engine.settle_orphaned_run(&id, ticket).unwrap_err();
+        assert!(error.to_string().contains("Goal SOP cleanup conflict"));
+        assert!(engine.has_pending_orphan_settlement(&id));
+        assert_eq!(
+            engine.pending_orphan_settlements.pending.lock().get(&id),
+            Some(&ticket)
+        );
+        assert_eq!(
+            engine
+                .store
+                .load_run(&id)
+                .unwrap()
+                .unwrap()
+                .run
+                .current_step,
+            2
+        );
+        assert_eq!(engine.run_maintenance_tick().settled_orphaned_runs, 0);
+        assert!(engine.has_pending_orphan_settlement(&id));
+        assert!(
+            !engine
+                .store
+                .list_events(&id)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "run_goal_operation_stopped")
+        );
+    }
+
+    #[test]
+    fn goal_settlement_terminal_and_gated_winners_are_never_rebound() {
+        for winner in [
+            SopRunStatus::Cancelled,
+            SopRunStatus::Completed,
+            SopRunStatus::WaitingApproval,
+            SopRunStatus::PausedCheckpoint,
+        ] {
+            let mut engine = engine_with_sops(vec![test_sop(
+                "goal-stop",
+                SopExecutionMode::Auto,
+                SopPriority::Normal,
+            )]);
+            let action = engine.start_run("goal-stop", manual_event()).unwrap();
+            let id = extract_run_id(&action).to_string();
+            let ticket = engine.goal_operation_stop_settlement(&id, 1, true).unwrap();
+            let mut stored = engine.store.load_run(&id).unwrap().unwrap();
+            stored.run.current_step = 2;
+            stored.run.status = winner;
+            stored.revision += 1;
+            engine.store.save_run(&stored).unwrap();
+            assert_eq!(engine.settle_orphaned_run(&id, ticket).unwrap(), None);
+            assert_eq!(engine.get_run(&id).unwrap().status, winner);
+            assert_eq!(engine.get_run(&id).unwrap().current_step, 2);
+            assert!(!engine.has_pending_orphan_settlement(&id));
+            assert!(
+                !engine
+                    .store
+                    .list_events(&id)
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.kind == "run_goal_operation_stopped")
+            );
+        }
     }
 
     fn engine_with_config_sops(config: SopConfig, sops: Vec<Sop>) -> SopEngine {
@@ -17066,13 +17400,13 @@ type = "manual"
         }
     }
 
-    struct FailFirstFinishStore {
+    pub(crate) struct FailFirstFinishStore {
         inner: InMemoryRunStore,
         fail_next_finish: std::sync::atomic::AtomicBool,
     }
 
     impl FailFirstFinishStore {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 inner: InMemoryRunStore::new(),
                 fail_next_finish: std::sync::atomic::AtomicBool::new(true),
