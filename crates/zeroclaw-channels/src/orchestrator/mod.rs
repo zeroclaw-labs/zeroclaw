@@ -15419,7 +15419,8 @@ fn collect_configured_channels_with_authority(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("email", &alias))
             };
-            let mut channel = EmailChannel::new(email_cfg.clone(), alias.clone(), peer_resolver);
+            let mut channel = EmailChannel::new(email_cfg.clone(), alias.clone(), peer_resolver)
+                .with_workspace_dir(config.channel_workspace_dir(&format!("email.{alias}")));
             if email_cfg.oauth2.is_some() {
                 channel = channel.with_auth_service(auth_service.clone());
             }
