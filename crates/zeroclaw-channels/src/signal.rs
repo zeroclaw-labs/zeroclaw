@@ -429,6 +429,35 @@ impl SignalChannel {
         }
     }
 
+    /// Send an already prepared message without interpreting its text as media.
+    /// Strict approval previews use this transport directly so a proposed marker
+    /// cannot change the displayed content or upload a workspace file.
+    async fn send_payload(
+        &self,
+        recipient: &str,
+        text: String,
+        attachments: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let mut params = match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": [number],
+                "message": text,
+                "account": &self.account,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "groupId": group_id,
+                "message": text,
+                "account": &self.account,
+            }),
+        };
+        if !attachments.is_empty() {
+            params["attachments"] = serde_json::Value::from(attachments);
+        }
+
+        self.rpc_request("send", params).await?;
+        Ok(())
+    }
+
     /// Send a JSON-RPC request to signal-cli daemon.
     async fn rpc_request(
         &self,
@@ -1176,24 +1205,8 @@ impl Channel for SignalChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let (text, attachments) = self.prepare_outbound(&message.content).await;
-        let mut params = match Self::parse_recipient_target(&message.recipient) {
-            RecipientTarget::Direct(number) => serde_json::json!({
-                "recipient": [number],
-                "message": text,
-                "account": &self.account,
-            }),
-            RecipientTarget::Group(group_id) => serde_json::json!({
-                "groupId": group_id,
-                "message": text,
-                "account": &self.account,
-            }),
-        };
-        if !attachments.is_empty() {
-            params["attachments"] = serde_json::Value::from(attachments);
-        }
-
-        self.rpc_request("send", params).await?;
-        Ok(())
+        self.send_payload(&message.recipient, text, attachments)
+            .await
     }
 
     async fn send_choice(
@@ -1528,11 +1541,14 @@ impl Channel for SignalChannel {
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
-        let text = crate::util::build_yesno_approval_prompt(
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
+        let text = crate::util::build_yesno_approval_prompt_with_policy(
             &token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            strict_session_prompt_approval,
         );
 
         let (tx, rx) = oneshot::channel();
@@ -1542,6 +1558,7 @@ impl Channel for SignalChannel {
                 sender: tx,
                 destination: Self::canonical_destination(recipient),
                 tool_name: request.tool_name.clone(),
+                strict_session_prompt_approval,
             },
         );
         let mut guard = crate::util::PendingApprovalGuard::new(
@@ -1549,7 +1566,12 @@ impl Channel for SignalChannel {
             token.clone(),
         );
 
-        if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
+        let delivery = if strict_session_prompt_approval {
+            self.send_payload(recipient, text, Vec::new()).await
+        } else {
+            self.send(&SendMessage::new(text, recipient)).await
+        };
+        if let Err(err) = delivery {
             guard.remove().await;
             return Err(err);
         }
@@ -1586,6 +1608,108 @@ mod tests {
     use super::*;
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn strict_approval_delivery_preserves_markers_without_attachments() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rpc"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(2)
+            .mount(&server)
+            .await;
+        // A resolvable marker must remain literal even when normal outbound
+        // messages can upload this file. Exercise both Signal target shapes.
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("report.txt"), b"synthetic file")
+            .expect("workspace file");
+        let channel = SignalChannel::new(
+            server.uri(),
+            "+1234567890".into(),
+            vec![],
+            false,
+            "strict-test",
+            Arc::new(Vec::new),
+            true,
+            true,
+        )
+        .with_approval_timeout_secs(0)
+        .with_workspace_dir(workspace.path().into());
+        let summary = "[FILE:report.txt] [IMAGE:report.txt] [image:https://example.invalid/x.png] **literal** <b>text</b>";
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: summary.into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        for recipient in ["+1234567891", "group:strict-test"] {
+            let response = channel
+                .request_approval_attributed(recipient, &request)
+                .await
+                .expect("literal delivery")
+                .expect("timeout decision");
+            assert_eq!(
+                response.source,
+                zeroclaw_api::channel::ApprovalSource::TimedOut
+            );
+            assert!(channel.pending_approvals.lock().await.is_empty());
+        }
+        let calls = server.received_requests().await.expect("HTTP requests");
+        assert_eq!(calls.len(), 2);
+        for (index, call) in calls.iter().enumerate() {
+            let body: serde_json::Value = call.body_json().expect("RPC request");
+            assert_eq!(body["method"], "send");
+            assert!(
+                body["params"]["message"]
+                    .as_str()
+                    .expect("message")
+                    .contains(summary)
+            );
+            assert!(body["params"].get("attachments").is_none());
+            assert_eq!(body["params"]["account"], "+1234567890");
+            if index == 0 {
+                assert_eq!(
+                    body["params"]["recipient"],
+                    serde_json::json!(["+1234567891"])
+                );
+                assert!(body["params"].get("groupId").is_none());
+            } else {
+                assert_eq!(body["params"]["groupId"], "strict-test");
+                assert!(body["params"].get("recipient").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_approval_send_failure_removes_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": "synthetic delivery failure"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = media_channel(&server.uri(), false).with_approval_timeout_secs(0);
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        // Failed literal delivery must retire its reply token before returning.
+        assert!(
+            channel
+                .request_approval_attributed("+1234567891", &request)
+                .await
+                .is_err()
+        );
+        assert!(channel.pending_approvals.lock().await.is_empty());
+    }
 
     fn make_envelope(source_number: Option<&str>, message: Option<&str>) -> Envelope {
         Envelope {
@@ -2581,6 +2705,7 @@ mod tests {
                 sender: tx,
                 destination: "+1111111111".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
         let resolution = crate::util::resolve_pending_approval(
@@ -2609,6 +2734,7 @@ mod tests {
                 sender: approval_tx,
                 destination: "group:other-group".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
         let msg = ch.process_envelope(&group_envelope).pop().unwrap();
@@ -2649,6 +2775,7 @@ mod tests {
                 sender: tx,
                 destination: "+1111111111".to_string(),
                 tool_name: "tool".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
         let envelope = make_envelope(Some("+1111111111"), Some("direct yes"));

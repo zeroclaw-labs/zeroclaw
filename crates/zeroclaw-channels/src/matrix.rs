@@ -5475,11 +5475,14 @@ impl Channel for MatrixChannel {
             .await?
             .to_string();
         let token = approval::generate_token_default();
-        let prompt = crate::util::build_approve_deny_approval_prompt(
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
+        let prompt = crate::util::build_approve_deny_approval_prompt_with_policy(
             &token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            strict_session_prompt_approval,
         );
 
         let (tx, rx) = oneshot::channel();
@@ -5489,6 +5492,7 @@ impl Channel for MatrixChannel {
                 sender: tx,
                 destination,
                 tool_name: request.tool_name.clone(),
+                strict_session_prompt_approval,
             },
         );
         let mut guard = crate::util::PendingApprovalGuard::new(
@@ -5496,8 +5500,28 @@ impl Channel for MatrixChannel {
             token.clone(),
         );
 
-        let send_msg = approval::build_prompt_message(prompt, recipient);
-        if let Err(e) = self.send(&send_msg).await {
+        let send_result = if strict_session_prompt_approval {
+            // The proposed text is approval data, not an outbound instruction:
+            // bypass marker expansion, Markdown rendering and body truncation.
+            async {
+                let room =
+                    outbound::resolve_joined_room(client, &self.alias_cache, recipient).await?;
+                let mut content =
+                    matrix_sdk::ruma::events::room::message::RoomMessageEventContent::text_plain(
+                        &prompt,
+                    );
+                // An explicit empty mention set also disables legacy push rules
+                // that could interpret proposed @room text as a notification.
+                content.mentions = Some(matrix_sdk::ruma::events::Mentions::new());
+                room.send(content).await?;
+                Ok(())
+            }
+            .await
+        } else {
+            let send_msg = approval::build_prompt_message(prompt, recipient);
+            self.send(&send_msg).await
+        };
+        if let Err(e) = send_result {
             guard.remove().await;
             return Err(e);
         }
@@ -5548,6 +5572,166 @@ fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKe
 // ─── tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    mod strict_approval_delivery {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use matrix_sdk::ruma::{event_id, room_id};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use zeroclaw_api::channel::{
+            ApprovalSource, Channel, ChannelApprovalRequest, ChannelApprovalResponse,
+        };
+        use zeroclaw_config::schema::MatrixConfig;
+
+        use super::super::MatrixChannel;
+
+        /// A refused SDK send releases the pending token rather than parking it.
+        #[tokio::test]
+        async fn strict_preview_send_failure_removes_pending() {
+            use wiremock::matchers::{method, path_regex};
+            use wiremock::{Mock, ResponseTemplate};
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.mock_room_state_encryption().plain().mount().await;
+            let room_id = room_id!("!approval:localhost");
+            matrix.sync_joined_room(&client, room_id).await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r"/send/m\.room\.message/"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(
+                    serde_json::json!({"errcode": "M_BAD_JSON", "error": "synthetic rejection"}),
+                ))
+                .expect(1)
+                .mount(matrix.server())
+                .await;
+            let workspace = tempfile::TempDir::new().expect("synthetic workspace");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: matrix.server().uri(),
+                    access_token: Some("test-token".into()),
+                    ..MatrixConfig::default()
+                },
+                "approval-test",
+                Arc::new(Vec::new),
+                workspace.path().to_path_buf(),
+            )
+            .expect("Matrix channel");
+            assert!(channel.client.set(client).is_ok());
+            let request = ChannelApprovalRequest {
+                tool_name: "session_prompt_set".into(),
+                arguments_summary: "[FILE:report.txt]".into(),
+                raw_arguments: None,
+                position: None,
+                strict_session_prompt_approval: true,
+            };
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    channel.request_approval_attributed(room_id.as_str(), &request),
+                )
+                .await
+                .expect("bounded delivery")
+                .is_err()
+            );
+            assert!(channel.pending_approvals.lock().await.is_empty());
+        }
+
+        /// Real SDK delivery must leave proposed file/media markers visible,
+        /// without uploading workspace data before the operator decides.
+        #[tokio::test]
+        async fn strict_preview_is_literal_and_never_expands_attachments() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.mock_room_state_encryption().plain().mount().await;
+            let room_id = room_id!("!approval:localhost");
+            matrix.sync_joined_room(&client, room_id).await;
+            matrix
+                .mock_room_send()
+                .ok(event_id!("$approval"))
+                .expect(1)
+                .mount()
+                .await;
+
+            let workspace = tempfile::TempDir::new().expect("synthetic workspace");
+            std::fs::write(workspace.path().join("report.txt"), "private-test-report")
+                .expect("synthetic attachment");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: matrix.server().uri(),
+                    access_token: Some("test-token".into()),
+                    approval_timeout_secs: 1,
+                    ..MatrixConfig::default()
+                },
+                "approval-test",
+                Arc::new(Vec::new),
+                workspace.path().to_path_buf(),
+            )
+            .expect("Matrix channel")
+            .with_workspace_dir(workspace.path().to_path_buf());
+            assert!(channel.client.set(client).is_ok());
+            let marker_host = wiremock::MockServer::start().await;
+            let summary = format!(
+                "content_escaped: \"[FILE:report.txt] [image:{}/x.png] **literal** @room <b>text</b>\"",
+                marker_host.uri()
+            );
+            let request = ChannelApprovalRequest {
+                tool_name: "session_prompt_set".into(),
+                arguments_summary: summary.clone(),
+                raw_arguments: None,
+                position: None,
+                strict_session_prompt_approval: true,
+            };
+
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                channel.request_approval_attributed(room_id.as_str(), &request),
+            )
+            .await
+            .expect("bounded approval delivery")
+            .expect("literal send")
+            .expect("timeout decision");
+            assert_eq!(response.response, ChannelApprovalResponse::Deny);
+            assert_eq!(response.source, ApprovalSource::TimedOut);
+            assert!(channel.pending_approvals.lock().await.is_empty());
+
+            let requests = matrix
+                .server()
+                .received_requests()
+                .await
+                .expect("HTTP requests");
+            let sends: Vec<_> = requests
+                .iter()
+                .filter(|request| request.url.path().contains("/send/m.room.message/"))
+                .collect();
+            assert_eq!(sends.len(), 1);
+            let body: serde_json::Value = sends[0].body_json().expect("message event");
+            assert_eq!(body["msgtype"], "m.text");
+            assert!(body["body"].as_str().expect("text body").contains(&summary));
+            assert!(body.get("formatted_body").is_none());
+            assert!(body.get("format").is_none());
+            assert_eq!(body["m.mentions"], serde_json::json!({}));
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !(request.url.path().contains("/media/")
+                        && request.url.path().contains("/upload"))),
+                "unexpected media upload endpoints: {:?}",
+                requests
+                    .iter()
+                    .map(|request| request.url.path())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                marker_host
+                    .received_requests()
+                    .await
+                    .expect("marker requests")
+                    .is_empty()
+            );
+            assert!(sends.iter().all(|request| request.method == "PUT"));
+        }
+    }
+
     /// Regression: Matrix
     /// streams paragraphs via `update_draft` and does NOT implement the
     /// `flush_draft_turn` narration contract, so it must NOT opt into the
@@ -7731,6 +7915,7 @@ mod tests {
                         sender: approved_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
+                        strict_session_prompt_approval: false,
                     },
                 );
                 approvals.insert(
@@ -7739,6 +7924,7 @@ mod tests {
                         sender: wrong_tx,
                         destination: "!other:localhost".into(),
                         tool_name: "tool".to_string(),
+                        strict_session_prompt_approval: false,
                     },
                 );
                 approvals.insert(
@@ -7747,6 +7933,7 @@ mod tests {
                         sender: unauthorized_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
+                        strict_session_prompt_approval: false,
                     },
                 );
             }
@@ -7909,6 +8096,7 @@ mod tests {
                     sender: tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
 
@@ -7973,6 +8161,7 @@ mod tests {
                     sender: approve_tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             assert_eq!(

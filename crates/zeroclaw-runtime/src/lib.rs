@@ -3,6 +3,7 @@
     clippy::useless_format,
     clippy::manual_inspect
 )]
+#![recursion_limit = "256"]
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
 pub mod cli_input;

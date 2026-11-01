@@ -15,13 +15,65 @@ use zeroclaw_api::channel::{
     ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 
+/// A parked approval and the policy marker needed when a response arrives.
+pub struct PendingApproval {
+    pub(crate) sender: oneshot::Sender<ChannelApprovalResponse>,
+    pub(crate) strict_session_prompt_approval: bool,
+}
+
 /// Shared map keyed by `request_id`. Consumed by the receive loop to resolve
 /// the oneshot when an `approval_response` frame arrives.
-pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>;
+pub type PendingApprovals = Arc<Mutex<HashMap<String, PendingApproval>>>;
 
 /// Construct an empty pending-approvals registry for a fresh connection.
 pub fn new_pending_approvals() -> PendingApprovals {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalResolution {
+    /// The request id is unknown or has already been retired.
+    Unknown,
+    /// A stale client requested the unsupported persistent action. The
+    /// one-shot request remains parked so the client can retry with `approve`.
+    RejectedPersistentAction,
+    /// The request was consumed and its response was delivered (or its
+    /// receiver had already gone away).
+    Resolved,
+}
+
+/// Resolve a WebSocket approval without consuming a strict session-prompt
+/// request when an old client submits the unsupported `always` action.
+pub(crate) fn resolve_pending_approval(
+    pending: &PendingApprovals,
+    request_id: &str,
+    response: ChannelApprovalResponse,
+) -> ApprovalResolution {
+    let mut map = pending.lock();
+    if map.get(request_id).is_some_and(|entry| {
+        entry.strict_session_prompt_approval
+            && matches!(response, ChannelApprovalResponse::AlwaysApprove)
+    }) {
+        return ApprovalResolution::RejectedPersistentAction;
+    }
+    let Some(entry) = map.remove(request_id) else {
+        return ApprovalResolution::Unknown;
+    };
+    let _ = entry.sender.send(response);
+    ApprovalResolution::Resolved
+}
+
+/// Whether the client may render the persistent `always` action for a parked
+/// request. The policy marker lives with the pending request, not with the
+/// tool name: `session_prompt_approval = "disabled"` deliberately keeps the
+/// ordinary approval affordance for the same tools. Missing registry state is
+/// fail-closed, because an approval frame without a binding must not invent a
+/// persistent action.
+pub(crate) fn allow_always(pending: &PendingApprovals, request_id: &str) -> bool {
+    pending
+        .lock()
+        .get(request_id)
+        .is_some_and(|entry| !entry.strict_session_prompt_approval)
 }
 
 /// `Channel` implementation that emits approval frames over a connection's
@@ -111,7 +163,15 @@ impl Channel for WsApprovalChannel {
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(request_id.clone(), tx);
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
+        self.pending.lock().insert(
+            request_id.clone(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval,
+            },
+        );
 
         let event = TurnEvent::ApprovalRequest {
             request_id: request_id.clone(),
@@ -178,7 +238,52 @@ mod tests {
             arguments_summary: "path=a.txt".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         }
+    }
+
+    #[test]
+    fn websocket_action_visibility_uses_parked_policy_not_tool_name() {
+        let pending = new_pending_approvals();
+        let (strict_tx, _strict_rx) = tokio::sync::oneshot::channel();
+        let (ordinary_tx, _ordinary_rx) = tokio::sync::oneshot::channel();
+        pending.lock().insert(
+            "strict".to_string(),
+            PendingApproval {
+                sender: strict_tx,
+                strict_session_prompt_approval: true,
+            },
+        );
+        pending.lock().insert(
+            "ordinary".to_string(),
+            PendingApproval {
+                sender: ordinary_tx,
+                strict_session_prompt_approval: false,
+            },
+        );
+
+        assert!(!allow_always(&pending, "strict"));
+        assert!(allow_always(&pending, "ordinary"));
+        assert!(!allow_always(&pending, "missing"));
+    }
+
+    #[test]
+    fn stale_always_is_rejected_without_consuming_strict_request() {
+        let pending = new_pending_approvals();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        pending.lock().insert(
+            "strict".to_string(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: true,
+            },
+        );
+
+        assert_eq!(
+            resolve_pending_approval(&pending, "strict", ChannelApprovalResponse::AlwaysApprove,),
+            ApprovalResolution::RejectedPersistentAction
+        );
+        assert!(pending.lock().contains_key("strict"));
     }
 
     /// The operator never taps anything and the prompt times out. The channel

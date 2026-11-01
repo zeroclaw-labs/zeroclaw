@@ -359,6 +359,7 @@ pub async fn handle_sections(State(state): State<AppState>) -> Response {
                     zeroclaw_config::sections::Section::Hardware
                         | zeroclaw_config::sections::Section::Mcp
                         | zeroclaw_config::sections::Section::Skills
+                        | zeroclaw_config::sections::Section::SessionPromptApproval
                 ),
                 None => section_has_picker_for_key(&key),
             };
@@ -517,9 +518,11 @@ fn picker_items_for(
         | Section::EmbeddingRoutes => {
             PickerDispatch::Items(one_tier_alias_map_picker(cfg, section.as_str()))
         }
-        Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState => {
-            PickerDispatch::DirectForm
-        }
+        Section::Hardware
+        | Section::Mcp
+        | Section::Skills
+        | Section::SessionPromptApproval
+        | Section::QuickstartState => PickerDispatch::DirectForm,
     }
 }
 
@@ -1112,7 +1115,11 @@ async fn select_section(
             };
             (prefix, selection_changed || defaults_changed)
         }
-        Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState => {
+        Section::Hardware
+        | Section::Mcp
+        | Section::Skills
+        | Section::SessionPromptApproval
+        | Section::QuickstartState => {
             return error_response(
                 ConfigApiError::new(
                     ConfigApiCode::PathNotFound,
@@ -1625,7 +1632,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
+                crate::GatewayCancellationRegistry::default(),
             )),
             pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
@@ -2495,8 +2502,13 @@ mod tests {
             Section::SkillBundles,
             Section::RiskProfiles,
             Section::RuntimeProfiles,
+            Section::SessionPromptApproval,
         ];
-        let direct_form = [Section::Hardware, Section::Mcp];
+        let direct_form = [
+            Section::Hardware,
+            Section::Mcp,
+            Section::SessionPromptApproval,
+        ];
         for section in all {
             match picker_items_for(*section, &cfg) {
                 PickerDispatch::Items(_items) => {
