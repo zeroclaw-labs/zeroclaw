@@ -48,6 +48,16 @@ A server is reached over one of three transports (the `transport` field):
 
 `env` (stdio) and `headers` (http/sse) are stored as secrets; `headers` commonly carries the `Authorization: Bearer …` token for the upstream server.
 
+For `sse`, advertised message endpoints and HTTP redirects must stay on the
+configured URL's origin: the same scheme, host and effective port. Relative
+endpoints and same-origin absolute endpoints are supported. Cross-origin
+endpoints, HTTPS downgrades and URLs containing credentials are refused before
+headers or request content reach that destination. Configure authentication in
+`headers`, not URL userinfo. If a server uses a separate origin for messages,
+serve that endpoint through the configured origin instead. This check binds a
+destination to the configured origin; it does not restrict the operator's
+initial URL or pin DNS addresses.
+
 Add a server through the gateway, zerocode, or `zeroclaw config set` (for example `zeroclaw config set mcp.servers.filesystem.command npx`). A stdio server needs `command` plus optional `args`/`env`; an http/sse server needs `url` plus optional `headers`. The per-field commands are in the field table below.
 
 ### Example: Parallel Search
