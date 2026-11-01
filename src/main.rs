@@ -10442,6 +10442,12 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 )
                             );
                             println!("     zeroclaw gateway start"); // i18n-exempt: literal command/identifier example
+                            // Surface the fetch failure to the process exit status so
+                            // scripts/automation can tell that no code was obtained.
+                            // Exit here (instead of `return Err(e)`) so anyhow does not
+                            // reprint the same error after the human-readable guidance.
+                            let _ = e;
+                            std::process::exit(1);
                         }
                     }
                     Ok(())
