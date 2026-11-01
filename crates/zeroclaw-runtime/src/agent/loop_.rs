@@ -4495,6 +4495,7 @@ mod tests {
     zeroclaw_api::mock_tool_attribution!(
         ActivatingTool,
         CountingTool,
+        ScopeProbe,
         CredentialOutputTool,
         EmptySuccessTool,
         RecordingArgsTool,
@@ -8825,6 +8826,17 @@ mod tests {
                     reasoning_content: None,
                 },
                 ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "step-probe".to_string(),
+                        name: "scope_probe".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
                     text: Some("step recovered".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -8874,9 +8886,13 @@ mod tests {
                     body: "Use only allowed tools".to_string(),
                     scope: Some(crate::sop::StepToolScope {
                         allow: Some(if allow_search {
-                            vec!["allowed_tool".to_string(), "tool_search".to_string()]
+                            vec![
+                                "allowed_tool".to_string(),
+                                "tool_search".to_string(),
+                                "scope_probe".to_string(),
+                            ]
                         } else {
-                            vec!["allowed_tool".to_string()]
+                            vec!["allowed_tool".to_string(), "scope_probe".to_string()]
                         }),
                         deny: Vec::new(),
                     }),
@@ -8900,6 +8916,7 @@ mod tests {
 
             let allowed_invocations = Arc::new(AtomicUsize::new(0));
             let denied_invocations = Arc::new(AtomicUsize::new(0));
+            let seen_scope = Arc::new(std::sync::Mutex::new(None));
             let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
                 Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
                 mock_tool("tool_search"),
@@ -8911,6 +8928,9 @@ mod tests {
                     "denied_tool",
                     Arc::clone(&denied_invocations),
                 )),
+                Box::new(ScopeProbe {
+                    seen: Arc::clone(&seen_scope),
+                }),
             ]);
             let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
             activated.lock().unwrap().set_deferred_builtin_specs(
@@ -9057,6 +9077,20 @@ mod tests {
                 "denied tool call must be rejected before execution: {history:?}"
             );
 
+            // Child-run tools must see the same step boundary on live and
+            // headless paths, including the restriction on model selection.
+            let seen = seen_scope
+                .lock()
+                .unwrap()
+                .take()
+                .expect("a tool inside a live step must see the step scope");
+            let excluded = seen.excluded(&["denied_tool".to_string(), "model_switch".to_string()]);
+            assert!(
+                excluded.iter().any(|t| t == "denied_tool")
+                    && excluded.iter().any(|t| t == "model_switch"),
+                "the visible scope must carry the step's exclusions, got {excluded:?}"
+            );
+
             let started = sop_started_run_id_from_history(&history)
                 .expect("sop_execute tool result should include a run id");
             let engine = engine.lock().unwrap();
@@ -9067,7 +9101,7 @@ mod tests {
             assert_eq!(run.step_results.len(), 1);
             assert_eq!(run.step_results[0].output, "step recovered");
             let requests = requests.lock().unwrap();
-            assert_eq!(requests.len(), 4);
+            assert_eq!(requests.len(), 5);
             let prompt = |index: usize| {
                 requests[index]
                     .iter()
@@ -9079,7 +9113,7 @@ mod tests {
             if cap == 0 || cap == 10_000 {
                 assert!(prompt(0).contains("<available-deferred-builtin-tools>"));
             }
-            for index in [1, 2] {
+            for index in [1, 2, 3] {
                 if cap > 0 {
                     assert!(prompt(index).chars().count() <= cap);
                     assert!(
@@ -9117,11 +9151,44 @@ mod tests {
             }
             assert_eq!(
                 prompt(0),
-                prompt(3),
+                prompt(4),
                 "step fallback must not mutate the parent prompt"
             );
-            assert_eq!(history[0].content, prompt(3));
+            assert_eq!(history[0].content, prompt(4));
             assert_eq!(activated.lock().unwrap().hidden_builtin_names().len(), 2);
+        }
+    }
+
+    /// Records the SOP step scope in force on the task when called.
+    struct ScopeProbe {
+        seen: Arc<std::sync::Mutex<Option<crate::sop::active_scope::HeadlessStepScope>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ScopeProbe {
+        fn name(&self) -> &str {
+            "scope_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records the active step scope"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.seen.lock().expect("probe lock") =
+                crate::sop::active_scope::active_headless_step_scope();
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "probed".into(),
+                error: None,
+            })
         }
     }
 
