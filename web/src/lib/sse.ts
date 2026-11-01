@@ -1,6 +1,6 @@
 import type { SSEEvent } from '../types/api';
 import { AUTH_EVENTS, getAuthMode, getToken, isReauthPending } from './auth';
-import { failureReason } from './authSession';
+import { routeSessionRefusal } from './authSession';
 import { apiOrigin, basePath } from './basePath';
 
 export type SSEEventHandler = (event: SSEEvent) => void;
@@ -182,19 +182,15 @@ export class SSEClient {
   // ---------------------------------------------------------------------------
 
   /**
-   * A signed-in session was refused: 401 asks for re-auth (expired) or signs
-   * out, 403 means this account can't read the stream. None of them is retried.
+   * A signed-in session was refused: 401 asks for re-auth (expired), or reads
+   * the session again and signs out only if there is none; 403 means this
+   * account can't read the stream. None of them is retried on a timer; a
+   * resumed session reconnects the stream.
    */
   private haltForAuth(status: number, body: string): void {
     this.haltedForAuth = true;
     if (status === 401) {
-      window.dispatchEvent(
-        new Event(
-          failureReason(body) === 'session_expired'
-            ? AUTH_EVENTS.reauth
-            : AUTH_EVENTS.unauthorized,
-        ),
-      );
+      void routeSessionRefusal(body);
     }
   }
 

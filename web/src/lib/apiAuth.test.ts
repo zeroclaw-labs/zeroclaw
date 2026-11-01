@@ -206,6 +206,64 @@ test("session_invalid, or a 401 without a reason, signs out", async () => {
   }
 });
 
+// Signing in again ends the session the browser held, so a request sent under
+// it can come back session_invalid while the browser already holds a new one.
+function staleThenLive(path: string, session_: OidcSession) {
+  let refused = false;
+  return (url: string): Response => {
+    if (url.endsWith("/api/auth/session")) return json(200, session_);
+    if (url.endsWith(path) && !refused) {
+      refused = true;
+      return json(401, { error: "gone", reason: "session_invalid" });
+    }
+    return json(200, { ok: true });
+  };
+}
+
+test("a session_invalid read under a replaced session re-reads the session and is sent once more", async () => {
+  auth.setOidcSession(session());
+  responder = staleThenLive("/api/x", session({ csrf_token: "csrf-2" }));
+  const events = countEvents();
+  assert.deepEqual(await api.apiFetch("/api/x"), { ok: true });
+  events.stop();
+  assert.equal(events.unauthorized, 0);
+  assert.equal(events.resumed, 1);
+  assert.equal(auth.getOidcSession()?.csrf_token, "csrf-2");
+  assert.equal(requests.filter((r) => r.url.endsWith("/api/x")).length, 2);
+});
+
+test("a session_invalid change under a replaced session fails without signing out and is not resent", async () => {
+  auth.setOidcSession(session());
+  responder = staleThenLive("/api/x", session({ csrf_token: "csrf-2" }));
+  const events = countEvents();
+  await assert.rejects(api.apiFetch("/api/x", { method: "POST", body: "{}" }), (err: unknown) => {
+    assert.ok(err instanceof api.UnauthorizedError);
+    assert.ok(!(err instanceof api.SessionExpiredError));
+    return true;
+  });
+  events.stop();
+  assert.equal(events.unauthorized, 0);
+  assert.equal(requests.filter((r) => r.method === "POST").length, 1);
+
+  requests = [];
+  responder = staleThenLive("/api/personality/SOUL.md", session({ csrf_token: "csrf-3" }));
+  const again = countEvents();
+  await assert.rejects(api.putPersonalityFile("SOUL.md", "x", null), api.UnauthorizedError);
+  again.stop();
+  assert.equal(again.unauthorized, 0);
+  assert.equal(requests.filter((r) => r.method === "PUT").length, 1);
+});
+
+test("a read refused again after its one retry is not sent a third time", async () => {
+  auth.setOidcSession(session());
+  responder = (url) =>
+    url.endsWith("/api/auth/session")
+      ? json(200, session({ csrf_token: "csrf-2" }))
+      : json(401, { error: "gone", reason: "session_invalid" });
+  await assert.rejects(api.apiFetch("/api/x"), api.UnauthorizedError);
+  assert.equal(requests.filter((r) => r.url.endsWith("/api/x")).length, 2);
+});
+
 test("403 operator_required is a typed error the pages show as not available", async () => {
   auth.setOidcSession(session({ admin: false }));
   responder = () => json(403, { error: "no", reason: "operator_required" });

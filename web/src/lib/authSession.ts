@@ -410,6 +410,29 @@ export async function refreshOidcSession(
   }
 }
 
+export type SessionRefusal = 'resumed' | 'reauth' | 'reloading' | 'signed-out';
+
+/**
+ * Route a signed-in request's 401. An expired session asks for re-auth and
+ * keeps the page. Any other refusal can come from a request sent under a
+ * session this browser has since replaced, because signing in again ends the
+ * session the browser held. So the session is read again first, as for a
+ * socket closed with 4401: the same account resumes and keeps the page,
+ * another account reloads it, and only a browser with no session signs out.
+ */
+export async function routeSessionRefusal(body: string): Promise<SessionRefusal> {
+  if (failureReason(body) !== 'session_expired') {
+    const outcome = await refreshOidcSession();
+    if (outcome === 'resumed' || outcome === 'reloading') return outcome;
+    if (outcome !== 'expired') {
+      window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
+      return 'signed-out';
+    }
+  }
+  window.dispatchEvent(new Event(AUTH_EVENTS.reauth));
+  return 'reauth';
+}
+
 // ---------------------------------------------------------------------------
 // Cross-tab channel
 // ---------------------------------------------------------------------------

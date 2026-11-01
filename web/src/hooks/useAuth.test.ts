@@ -89,6 +89,8 @@ let providers: string[] = [];
 let sessionResponse: () => Response = () => new Response("", { status: 401 });
 // Paths whose next request meets a gateway generation that is stopping for a reload.
 let restartingOnce = new Set<string>();
+// Other API paths a test answers itself.
+let routes = new Map<string, () => Response | Promise<Response>>();
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -115,12 +117,16 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.endsWith("/api/auth/session")) return sessionResponse();
   if (url.endsWith("/auth/sign-out")) return new Response(null, { status: 204 });
+  for (const [path, respond] of routes) {
+    if (url.endsWith(path)) return respond();
+  }
   return json(404, {});
 };
 
 const auth = await import("../lib/auth.ts");
 const { AuthProvider, useAuth } = await import("./useAuth.ts");
 const { WebSocketClient } = await import("../lib/ws.ts");
+const api = await import("../lib/api.ts");
 
 function session(overrides: Partial<OidcSession> = {}): OidcSession {
   return {
@@ -184,6 +190,7 @@ beforeEach(() => {
   providers = [];
   sessionResponse = () => new Response("", { status: 401 });
   restartingOnce = new Set();
+  routes = new Map();
   latest = null;
 });
 
@@ -379,6 +386,109 @@ test("lost access re-checks the session", async () => {
   await fire("accessLost");
   assert.equal(state().isAuthenticated, false);
   assert.deepEqual(state().signOutNotice, { kind: "session-ended" });
+});
+
+/**
+ * Signing in again ends the session the browser held. A request sent under it
+ * comes back 401 `session_invalid` once the browser holds `renewed`: after this
+ * tab adopted it (`announced`, as the re-auth window reports), or without this
+ * tab hearing of it (a full-page sign-in in another tab, #12108). A second
+ * send of the request succeeds.
+ */
+async function staleRequestAfterRenewal(
+  path: string,
+  method: string,
+  renewed: OidcSession,
+  announced: boolean,
+): Promise<unknown> {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let sent = 0;
+  routes.set(path, async () => {
+    sent += 1;
+    if (sent > 1) return json(200, { ok: true });
+    await gate;
+    return json(401, { error: "gone", reason: "session_invalid" });
+  });
+  const pending = api.apiFetch(path, method === "GET" ? {} : { method, body: "{}" });
+  sessionResponse = () => json(200, renewed);
+  if (announced) await broadcast({ type: "signed-in" });
+  let outcome: unknown;
+  await act(async () => {
+    release();
+    outcome = await pending.then(
+      (value) => value,
+      (err: unknown) => err,
+    );
+  });
+  await act(settle);
+  return outcome;
+}
+
+test("a read refused under the session this tab replaced keeps the page and is sent again", async () => {
+  await mountSignedIn();
+  for (const announced of [true, false]) {
+    requests = [];
+    const outcome = await staleRequestAfterRenewal(
+      "/api/status",
+      "GET",
+      session({ csrf_token: announced ? "csrf-2" : "csrf-3" }),
+      announced,
+    );
+    assert.equal(
+      state().isAuthenticated,
+      true,
+      `announced=${announced}: a stale request's 401 must not sign the page out`,
+    );
+    assert.equal(state().signOutNotice, null);
+    assert.equal(state().session?.csrf_token, announced ? "csrf-2" : "csrf-3");
+    assert.deepEqual(outcome, { ok: true });
+    assert.equal(requests.filter((r) => r.url.endsWith("/api/status")).length, 2);
+  }
+  assert.equal(reloads, 0);
+});
+
+test("a change refused under the session this tab replaced fails without signing out", async () => {
+  await mountSignedIn();
+  const outcome = await staleRequestAfterRenewal(
+    "/api/thing",
+    "POST",
+    session({ csrf_token: "csrf-2" }),
+    true,
+  );
+  assert.equal(state().isAuthenticated, true, "a stale request's 401 must not sign the page out");
+  assert.equal(state().signOutNotice, null);
+  assert.ok(outcome instanceof api.UnauthorizedError);
+  assert.ok(!(outcome instanceof api.SessionExpiredError));
+  // Not sent again: only a read is retried.
+  assert.equal(requests.filter((r) => r.url.endsWith("/api/thing")).length, 1);
+});
+
+test("a request refused after another account signed in on this browser reloads the page", async () => {
+  await mountSignedIn();
+  await staleRequestAfterRenewal(
+    "/api/status",
+    "GET",
+    session({ principal_id: "principal-b", csrf_token: "csrf-b" }),
+    false,
+  );
+  assert.equal(reloads, 1);
+  assert.equal(state().signOutNotice, null);
+});
+
+test("a request refused with no session left still signs out", async () => {
+  await mountSignedIn();
+  routes.set("/api/status", () => json(401, { error: "gone", reason: "session_invalid" }));
+  sessionResponse = () => json(401, { error: "gone", reason: "session_invalid" });
+  await act(async () => {
+    await api.apiFetch("/api/status").catch(() => undefined);
+  });
+  await act(settle);
+  assert.equal(state().isAuthenticated, false);
+  assert.deepEqual(state().signOutNotice, { kind: "session-ended" });
+  assert.equal(requests.filter((r) => r.url.endsWith("/api/status")).length, 1);
 });
 
 // ---------------------------------------------------------------------------

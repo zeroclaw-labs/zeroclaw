@@ -25,7 +25,12 @@ import {
   setToken,
   type AuthMode,
 } from "./auth";
-import { failureReason, fetchThroughRestart, refreshOidcSession } from "./authSession";
+import {
+  failureReason,
+  fetchThroughRestart,
+  refreshOidcSession,
+  routeSessionRefusal,
+} from "./authSession";
 import { apiOrigin, basePath } from "./basePath";
 
 // ---------------------------------------------------------------------------
@@ -149,17 +154,16 @@ function invalidateInFlightGet(path: string): void {
 
 /**
  * Route a 401. Pairing clears the token and signs out, as always. A signed-in
- * session asks for re-authentication when it expired (keeping the page) and
- * signs out otherwise.
+ * session asks for re-authentication when it expired (keeping the page);
+ * otherwise the session is read again before anything signs out (see
+ * `routeSessionRefusal`). Returns only when this tab still holds a session of
+ * the same account, so the refusal was for one it has since replaced.
  */
-function rejectUnauthorized(mode: AuthMode, body: string): never {
+async function routeUnauthorized(mode: AuthMode, body: string): Promise<void> {
   if (mode === "oidc") {
-    if (failureReason(body) === "session_expired") {
-      window.dispatchEvent(new Event(AUTH_EVENTS.reauth));
-      throw new SessionExpiredError();
-    }
-    window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
-    throw new UnauthorizedError();
+    const outcome = await routeSessionRefusal(body);
+    if (outcome === "resumed") return;
+    throw outcome === "reauth" ? new SessionExpiredError() : new UnauthorizedError();
   }
   clearToken();
   window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
@@ -187,10 +191,11 @@ export async function apiFetch<T = unknown>(
   return apiFetchOnce<T>(path, options, false);
 }
 
+/** `retried`: this is the one retry a request gets, after a CSRF refusal or a stale 401. */
 async function apiFetchOnce<T>(
   path: string,
   options: RequestInit,
-  csrfRetried: boolean,
+  retried: boolean,
 ): Promise<T> {
   const mode = getAuthMode();
   const token = getToken();
@@ -248,7 +253,14 @@ async function apiFetchOnce<T>(
   }
 
   if (result.status === 401) {
-    rejectUnauthorized(mode, result.text);
+    await routeUnauthorized(mode, result.text);
+    // Still signed in as the same account: the refusal was for a session this
+    // tab no longer holds. A read is sent once more on the current session;
+    // anything else fails as an action, without signing out.
+    if (method === "GET" && !retried) {
+      return apiFetchOnce<T>(path, options, true);
+    }
+    throw new UnauthorizedError();
   }
 
   if (result.status === 403 && mode === "oidc") {
@@ -256,7 +268,7 @@ async function apiFetchOnce<T>(
     if (reason === "operator_required") {
       throw new OperatorRequiredError();
     }
-    if (reason === "csrf" && !csrfRetried && (await recoverFromCsrfRefusal())) {
+    if (reason === "csrf" && !retried && (await recoverFromCsrfRefusal())) {
       return apiFetchOnce<T>(path, options, true);
     }
   }
@@ -852,7 +864,8 @@ export async function putPersonalityFile(
     }),
   });
   if (response.status === 401) {
-    rejectUnauthorized(mode, await response.text().catch(() => ""));
+    await routeUnauthorized(mode, await response.text().catch(() => ""));
+    throw new UnauthorizedError();
   }
   if (response.status === 409) {
     const body = (await response
