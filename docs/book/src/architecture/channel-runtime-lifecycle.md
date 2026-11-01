@@ -75,6 +75,21 @@ and tested.
 
 ## Runtime turn responsibilities
 
+Channel turns use the shared runtime's result-aware recovery policy. Recovery
+evidence belongs to one logical turn and survives an in-turn model switch;
+unchanged successful polling is advisory, while repeated identical completed
+failures receive a correction and one final retry. Tool approval and dispatch
+remain subject to the existing policy.
+
+On timeout or cancellation, the channel requests cooperative cancellation and
+allows at most five seconds for executor closeout. With tool-context retention
+enabled, the runtime's canonical current-turn messages are saved to the existing
+session backend before the interruption marker. Native tool pairs and paired
+prompt-mode results both survive a later session reload. This is a transcript
+checkpoint, not an automatic retry or crash-resumable job: an operation without
+a recorded result can have an uncertain outcome and must be checked before it
+is repeated. The processing deadline is not extended by a model switch.
+
 The shared lifecycle should own behavior that must be consistent across
 channels:
 
@@ -237,6 +252,19 @@ sign-off:
 - Which focused test or manual smoke proves the boundary that changed?
 
 ## Source pointers
+
+### Recovery with task-owned SSH and progress notices
+
+The recovery entrypoints return boxed `Send` futures, matching the task-owned
+SSH entrypoints. This explicit boundary also breaks recursive future-type
+inference through nested SOP execution. Preserve the SSH scope around the
+initial-ingress, guarded and low-level turn paths when combining the changes;
+the recovery handle remains the canonical owner of completed-dispatch evidence.
+
+The resume regressions observe the terminal notice emitted by the progress
+implementation (`channel-runtime-task-deadline`). Changing that expectation is
+a test integration adjustment: it does not change the processing deadline,
+retry an external operation or add a second notification path.
 
 Canonical docs:
 

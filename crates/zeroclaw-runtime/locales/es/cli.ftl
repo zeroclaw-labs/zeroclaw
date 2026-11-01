@@ -1360,3 +1360,7 @@ channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
 tool-git-operations-error-docker-runtime-write-unsupported = Los comandos de escritura de Git no están disponibles con el entorno de ejecución Docker porque no pueden confinarse a su contenedor.
+
+# Generated with the official Fluent fill workflow for channel turn progress.
+channel-runtime-task-deadline = ⚠️ La tarea alcanzó su plazo de procesamiento. Es posible que algunas acciones se hayan completado; verifica su estado antes de volver a intentarlo.
+channel-runtime-still-working = Todavía estoy trabajando en tu solicitud ({ $seconds } segundos transcurridos). Aún no hay un resultado final.
