@@ -47,6 +47,7 @@ enum SlashCommandId {
     ClearQueue,
     Browse,
     Help,
+    LoadSession,
     Model,
     ModelProvider,
     ReloadContext,
@@ -93,6 +94,11 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
     LocalCommandDescriptor {
         id: SlashCommandId::Detach,
         name: "detach",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::LoadSession,
+        name: "load-session",
         aliases: &[],
     },
     LocalCommandDescriptor {
@@ -204,9 +210,17 @@ impl SlashCommandRegistry {
             (SlashCommandId::ModelProvider, Some(name)) => SlashCommand::ModelProvider(name),
             (SlashCommandId::Model, None | Some("")) => SlashCommand::ModelPicker,
             (SlashCommandId::Model, Some(name)) => SlashCommand::Model(name),
+            (SlashCommandId::LoadSession, None | Some("")) => SlashCommand::LoadSessionPicker,
+            (SlashCommandId::LoadSession, Some(query)) => SlashCommand::LoadSession(query),
             _ => SlashCommand::NotACommand,
         }
     }
+}
+
+/// Commands whose completion fills `"<command> "` and waits for an argument
+/// instead of submitting.
+fn command_takes_argument(choice: &str) -> bool {
+    matches!(choice, "/model" | "/model-provider" | "/load-session")
 }
 
 fn shared_command_id(id: &str) -> Option<SlashCommandId> {
@@ -250,6 +264,10 @@ pub(crate) enum InputBarAction {
     /// and start a new session in the selected directory. Takes no argument:
     /// the root is always chosen interactively.
     ChangeDirectory,
+    /// `/load-session` with no argument — open the pane's session picker.
+    OpenSessionPicker,
+    /// `/load-session <query>` — resolve and resume a saved session.
+    LoadSession(String),
     /// User typed `/clear-queue [N]`. The input bar doesn't own the queue, so
     /// it hands removal up to the parent. None = clear all; Some(N) = the
     /// 1-based queue position (Some(0) is an invalid-index sentinel).
@@ -304,6 +322,10 @@ enum SlashCommand<'a> {
     ChangeDirectory,
     EnterBrowseMode,
     OpenHelp,
+    /// `/load-session <query>` — resume a saved session by name or id.
+    LoadSession(&'a str),
+    /// `/load-session` (no arg) — open the session picker.
+    LoadSessionPicker,
     NotACommand,
 }
 
@@ -1100,14 +1122,14 @@ impl InputBarState {
     }
 
     /// Apply a chosen popup entry to the input. A command choice replaces the
-    /// whole line (and, for the model commands, appends a space so argument
-    /// autocomplete kicks in immediately). An argument choice rewrites only the
-    /// value after the command prefix.
+    /// whole line (and, for commands that take an argument, appends a space so
+    /// argument autocomplete, where the command has any, kicks in immediately).
+    /// An argument choice rewrites only the value after the command prefix.
     fn apply_autocomplete_choice(&mut self, choice: &str) {
         self.edit(|state| {
             match state.autocomplete_target {
                 AutocompleteTarget::Command => {
-                    let takes_arg = choice == "/model" || choice == "/model-provider";
+                    let takes_arg = command_takes_argument(choice);
                     state.input = if takes_arg {
                         format!("{choice} ")
                     } else {
@@ -1179,8 +1201,7 @@ impl InputBarState {
         let target = self.autocomplete_target;
         self.apply_autocomplete_choice(&choice);
         self.dismiss_autocomplete();
-        let fills_only = target == AutocompleteTarget::Command
-            && (choice == "/model" || choice == "/model-provider");
+        let fills_only = target == AutocompleteTarget::Command && command_takes_argument(&choice);
         if fills_only {
             return InputBarAction::Consumed;
         }
@@ -2025,6 +2046,8 @@ impl InputBarState {
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
                 SlashCommand::ReloadContext => InputBarAction::ReloadContext,
                 SlashCommand::ChangeDirectory => InputBarAction::ChangeDirectory,
+                SlashCommand::LoadSession(query) => InputBarAction::LoadSession(query.to_string()),
+                SlashCommand::LoadSessionPicker => InputBarAction::OpenSessionPicker,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::EnterBrowseMode => InputBarAction::EnterBrowseMode,
                 SlashCommand::OpenHelp => InputBarAction::OpenHelp,
@@ -3916,7 +3939,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_slash_command_set_matches_expected_fourteen_entries() {
+    fn derived_slash_command_set_matches_expected_entries() {
         let expected: Vec<&str> = vec![
             "/attach",
             "/attachments",
@@ -3925,6 +3948,7 @@ mod tests {
             "/clear-queue",
             "/detach",
             "/help",
+            "/load-session",
             "/model",
             "/model-provider",
             "/new",
@@ -4129,6 +4153,69 @@ mod tests {
         // picker or submit.
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "/model ");
+    }
+
+    #[test]
+    fn parse_load_session_with_and_without_argument() {
+        assert!(matches!(
+            parse_slash_command("/load-session"),
+            SlashCommand::LoadSessionPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/load-session   "),
+            SlashCommand::LoadSessionPicker
+        ));
+        assert!(matches!(
+            parse_slash_command("/load-session 9f3a"),
+            SlashCommand::LoadSession("9f3a")
+        ));
+        assert!(matches!(
+            parse_slash_command("/load-session   my  session  "),
+            SlashCommand::LoadSession("my  session")
+        ));
+    }
+
+    #[test]
+    fn load_session_submit_maps_to_actions() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("/load-session release notes".into(), Vec::new());
+        bar.dismiss_autocomplete();
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::LoadSession(q) if q == "release notes"));
+
+        bar.load_for_edit("/load-session".into(), Vec::new());
+        bar.dismiss_autocomplete();
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::OpenSessionPicker));
+    }
+
+    #[test]
+    fn enter_on_load_session_completion_fills_without_submitting() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/load-s");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "/load-session ");
+        assert!(
+            !bar.autocomplete_active,
+            "/load-session has no argument completion"
+        );
+    }
+
+    #[test]
+    fn second_enter_after_load_session_completion_opens_the_picker() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/load-s");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::from(KeyCode::Enter)),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.input(), "/load-session ");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::from(KeyCode::Enter)),
+            InputBarAction::OpenSessionPicker
+        ));
     }
 
     #[test]
