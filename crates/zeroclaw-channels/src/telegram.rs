@@ -734,17 +734,51 @@ struct ReactionSlot {
     verified: bool,
 }
 
+type ReactionSlotHandle = Arc<tokio::sync::Mutex<Option<ReactionSlot>>>;
+
 /// Per-message reaction state. The outer LRU map is only locked briefly to
 /// find a message's slot; each slot carries its own async lock, held across
 /// that message's `setMessageReaction` request, so a stalled request delays
 /// only writes to the same message rather than every chat on the bot.
-type ReactionSlots =
-    Mutex<lru::LruCache<(String, i64), Arc<tokio::sync::Mutex<Option<ReactionSlot>>>>>;
+struct ReactionSlots {
+    capacity: usize,
+    slots: Mutex<lru::LruCache<(String, i64), ReactionSlotHandle>>,
+}
 
-fn new_reaction_slots(capacity: usize) -> Arc<ReactionSlots> {
-    Arc::new(Mutex::new(lru::LruCache::new(
-        std::num::NonZeroUsize::new(capacity).expect("reaction cache capacity is non-zero"),
-    )))
+impl ReactionSlots {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            slots: Mutex::new(lru::LruCache::unbounded()),
+        }
+    }
+
+    /// Return the message's slot, creating it if needed, then trim the map
+    /// back to capacity from the least recently used end. A slot that an
+    /// in-flight or waiting write still holds is never evicted: the next
+    /// write to that message would otherwise get a fresh slot and lock and
+    /// run beside the stalled one. Such slots are moved to the recent end
+    /// instead, so the map can briefly exceed capacity while writes stall.
+    fn slot(&self, key: (String, i64)) -> ReactionSlotHandle {
+        let mut slots = self.slots.lock();
+        let slot = Arc::clone(slots.get_or_insert(key, || Arc::new(tokio::sync::Mutex::new(None))));
+        let mut kept = 0;
+        while slots.len() > self.capacity && kept < slots.len() {
+            let Some((key, candidate)) = slots.pop_lru() else {
+                break;
+            };
+            if Arc::strong_count(&candidate) > 1 {
+                slots.push(key, candidate);
+                kept += 1;
+            }
+        }
+        slot
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.lock().len()
+    }
 }
 
 enum ReactionWrite {
@@ -757,9 +791,9 @@ enum ReactionWrite {
 /// and the tracked slot stays consistent with what Telegram last received.
 /// The request carries its own timeout, so a stalled call cannot hold the
 /// slot indefinitely. The slot map is a bounded LRU cache: the oldest-touched
-/// message state is evicted at capacity, and an evicted message is
-/// untracked — explicit removals on it fail loudly, the same as after a
-/// restart.
+/// idle message state is evicted at capacity (never one a write still
+/// holds), and an evicted message is untracked — explicit removals on it
+/// fail loudly, the same as after a restart.
 ///
 /// Telegram has no emoji-scoped removal: the `reaction` list we send replaces
 /// the bot's whole reaction, and bots hold a single slot. Removal therefore
@@ -792,11 +826,7 @@ async fn send_reaction_request(
     remove: bool,
 ) -> anyhow::Result<()> {
     let key = (chat_id.clone(), message_id);
-    let slot = Arc::clone(
-        slots
-            .lock()
-            .get_or_insert(key, || Arc::new(tokio::sync::Mutex::new(None))),
-    );
+    let slot = slots.slot(key);
     let mut tracked = slot.lock().await;
     let message_id_arg = message_id.to_string();
 
@@ -2876,7 +2906,7 @@ impl TelegramChannel {
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
-            reactions: new_reaction_slots(TELEGRAM_REACTION_CACHE_CAPACITY),
+            reactions: Arc::new(ReactionSlots::new(TELEGRAM_REACTION_CACHE_CAPACITY)),
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
@@ -2941,7 +2971,7 @@ impl TelegramChannel {
     /// — it exists to bound memory, not to be tuned.
     #[cfg(test)]
     fn with_reaction_slot_capacity(mut self, cap: usize) -> Self {
-        self.reactions = new_reaction_slots(cap);
+        self.reactions = Arc::new(ReactionSlots::new(cap));
         self
     }
 
@@ -3902,25 +3932,28 @@ impl TelegramChannel {
     /// unrelated message.
     fn parse_reaction_message_id(message_id: &str, chat_id: &str) -> anyhow::Result<i64> {
         let trimmed = message_id.trim();
-        let raw = match trimmed
+        let scoped = trimmed
             .strip_prefix("telegram_")
-            .and_then(|scoped| scoped.rsplit_once('_'))
-        {
-            Some((scoped_chat, _)) if scoped_chat != chat_id => {
-                return Err(reaction_error(
-                    "channel-telegram-reaction-chat-mismatch",
-                    &[("message_id", message_id), ("chat_id", chat_id)],
-                ));
-            }
-            Some((_, raw)) => raw,
-            None => trimmed,
-        };
-        raw.parse::<i64>().map_err(|_| {
+            .and_then(|scoped| scoped.rsplit_once('_'));
+        let raw = scoped.map_or(trimmed, |(_, raw)| raw);
+        // Parse before the chat check, so an id that is not a message id at
+        // all (e.g. a synthetic `telegram_model_picker_<uuid>`) reports as
+        // invalid rather than as belonging to another chat.
+        let parsed = raw.parse::<i64>().map_err(|_| {
             reaction_error(
                 "channel-telegram-reaction-invalid-message-id",
                 &[("message_id", message_id)],
             )
-        })
+        })?;
+        if let Some((scoped_chat, _)) = scoped
+            && scoped_chat != chat_id
+        {
+            return Err(reaction_error(
+                "channel-telegram-reaction-chat-mismatch",
+                &[("message_id", message_id), ("chat_id", chat_id)],
+            ));
+        }
+        Ok(parsed)
     }
 
     /// Apply one reaction write. `explicit` marks agent-driven (tool) writes,
@@ -9519,6 +9552,21 @@ mod tests {
     fn parse_reaction_message_id_rejects_scoped_id_for_another_chat() {
         assert!(
             TelegramChannel::parse_reaction_message_id("telegram_111_893", "8943231406").is_err()
+        );
+    }
+
+    /// A synthetic id that is not a message id at all must be reported as
+    /// invalid, not as belonging to another chat.
+    #[test]
+    fn parse_reaction_message_id_reports_non_numeric_scoped_id_as_invalid() {
+        let err = TelegramChannel::parse_reaction_message_id(
+            "telegram_model_picker_550e8400-e29b-41d4-a716-446655440000",
+            "8943231406",
+        )
+        .expect_err("a model-picker id is not a message id");
+        assert!(
+            err.to_string().contains("Invalid Telegram message id"),
+            "rendered: {err}"
         );
     }
 
@@ -25149,6 +25197,65 @@ mod tests {
     fn telegram_declines_orchestrator_ack_reactions() {
         let ch = reaction_channel("http://127.0.0.1:1".into());
         assert!(!ch.supports_orchestrator_ack_reactions());
+    }
+
+    /// A slot whose write is still in flight must survive cache pressure:
+    /// evicting it would hand the next write to that message a fresh lock,
+    /// letting it run beside the stalled request instead of after it.
+    #[tokio::test]
+    async fn in_flight_slot_is_not_evicted() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        // Only the first write to chat 111 stalls; later ones answer at once.
+        Mock::given(method("POST"))
+            .and(path("/bot123456:ABC-def_GHI/setMessageReaction"))
+            .and(body_partial_json(serde_json::json!({"chat_id": "111"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": true}))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_reaction_ok(&server).await;
+        let ch = Arc::new(reaction_channel(server.uri()).with_reaction_slot_capacity(1));
+
+        let stalled = {
+            let ch = Arc::clone(&ch);
+            zeroclaw_spawn::spawn!(async move {
+                ch.set_explicit_reaction("111", "1", "\u{1F44D}", true)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A write to another message pushes the cache past capacity.
+        ch.set_explicit_reaction("222", "1", "\u{1F44D}", true)
+            .await
+            .unwrap();
+        assert_eq!(ch.reactions.len(), 2, "the in-flight slot must be kept");
+
+        // A second write to the stalled message must queue behind it rather
+        // than reach Telegram on a fresh slot.
+        let second = tokio::time::timeout(
+            Duration::from_millis(300),
+            ch.set_explicit_reaction("111", "1", "\u{1F525}", true),
+        )
+        .await;
+        assert!(second.is_err(), "the second write must wait for the first");
+        let to_stalled_chat = reaction_request_bodies(&server)
+            .await
+            .iter()
+            .filter(|b| b["chat_id"] == "111")
+            .count();
+        assert_eq!(
+            to_stalled_chat, 1,
+            "only the stalled request may have been sent"
+        );
+        stalled.abort();
     }
 
     /// Telegram can answer HTTP 200 with `ok: false`. That is a refusal, not
