@@ -273,6 +273,22 @@ pub fn context_floor_remediation(system_floor: usize, budget: usize) -> String {
     )
 }
 
+/// True when the non-droppable request floor stays under the context budget,
+/// so whole-turn history trimming still has room to bring a request under
+/// it. The `system_floor` operand is the caller-measured floor: the system
+/// messages plus, when the request carries them, the native tool definitions
+/// serialized into the same request — no history trim can reduce either
+/// share. A zero budget disables proactive trimming and never hard-stops.
+/// When this is false, and the operator budget (not model capacity) is the
+/// binding constraint, the caller refuses the request before dispatch: the
+/// provider would receive a request the operator's budget already rejects.
+/// When the budget reaches model capacity the caller leaves the refusal to
+/// the capacity check, which reports the model-window remediation instead.
+#[must_use]
+pub fn system_floor_within_budget(system_floor: usize, context_token_budget: usize) -> bool {
+    context_token_budget == 0 || system_floor < context_token_budget
+}
+
 pub fn normalize_system_messages(history: &mut Vec<ChatMessage>) {
     let mut saw_system = false;
     let mut system_content = String::new();
@@ -722,6 +738,21 @@ mod tests {
             !msg.contains("agent.max_context_tokens"),
             "remediation must not reference the inert agent.max_context_tokens: {msg}"
         );
+    }
+
+    #[test]
+    fn prompt_budget_cap_floor_gate_refuses_only_when_floor_meets_budget() {
+        // Zero budget is the explicit proactive-trimming disable sentinel and
+        // must never hard-stop a turn.
+        assert!(system_floor_within_budget(0, 0));
+        assert!(system_floor_within_budget(1_000_000, 0));
+        // A floor under the budget always dispatches.
+        assert!(system_floor_within_budget(0, 40_000));
+        assert!(system_floor_within_budget(39_999, 40_000));
+        // The 2026-10-20 incident shape: 143,448-token floor against a
+        // 40,000-token budget must refuse before the provider call.
+        assert!(!system_floor_within_budget(143_448, 40_000));
+        assert!(!system_floor_within_budget(40_000, 40_000));
     }
 
     #[test]
