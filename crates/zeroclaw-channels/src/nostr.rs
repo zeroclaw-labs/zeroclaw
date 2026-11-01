@@ -69,6 +69,47 @@ impl NostrChannel {
     /// authorized. Matches on the bare hex form (Nostr canonical wire
     /// representation); npub-prefixed bech32 entries in config are
     /// normalized to hex before comparison.
+    /// The message an unwrapped NIP-17 rumor delivers to the agent, if any:
+    /// `(id, sender, content, timestamp)`.
+    fn nip17_message(
+        &self,
+        wrap_id: EventId,
+        rumor: &UnsignedEvent,
+        listen_start: Timestamp,
+    ) -> Option<(String, String, String, u64)> {
+        if rumor.created_at < listen_start {
+            return None;
+        }
+        let sender = rumor.pubkey;
+        if !self.is_pubkey_allowed(&sender) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "Nostr: ignoring NIP-17 message from unauthorized pubkey: {}",
+                    sender.to_hex()
+                )
+            );
+            return None;
+        }
+        // Clients gift-wrap reactions to the agent's replies; they are not messages.
+        if rumor.kind == Kind::Reaction {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Nostr: ignoring gift-wrapped NIP-25 reaction"
+            );
+            return None;
+        }
+        Some((
+            wrap_id.to_hex(),
+            sender.to_hex(),
+            rumor.content.clone(),
+            rumor.created_at.as_secs(),
+        ))
+    }
+
     fn is_pubkey_allowed(&self, pubkey: &PublicKey) -> bool {
         let peers: Vec<String> = (self.peer_resolver)()
             .into_iter()
@@ -262,35 +303,16 @@ impl Channel for NostrChannel {
                             match self.client.unwrap_gift_wrap(&event).await {
                                 Ok(unwrapped) => {
                                     let rumor = unwrapped.rumor;
-                                    if rumor.created_at < listen_start {
+                                    let Some(message) =
+                                        self.nip17_message(event.id, &rumor, listen_start)
+                                    else {
                                         continue;
-                                    }
-                                    let sender = rumor.pubkey;
-                                    if !self.is_pubkey_allowed(&sender) {
-                                        ::zeroclaw_log::record!(
-                                            WARN,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Note
-                                            )
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                            &format!(
-                                                "Nostr: ignoring NIP-17 message from unauthorized pubkey: {}",
-                                                sender.to_hex()
-                                            )
-                                        );
-                                        continue;
-                                    }
+                                    };
                                     sender_protocols
                                         .write()
                                         .await
-                                        .insert(sender, NostrProtocol::Nip17);
-                                    Some((
-                                        event.id.to_hex(),
-                                        sender.to_hex(),
-                                        rumor.content.clone(),
-                                        rumor.created_at.as_secs(),
-                                    ))
+                                        .insert(rumor.pubkey, NostrProtocol::Nip17);
+                                    Some(message)
                                 }
                                 Err(e) => {
                                     ::zeroclaw_log::record!(
@@ -377,6 +399,55 @@ impl Channel for NostrChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gift_wrapped_reactions_are_not_messages() {
+        let bot = Keys::generate();
+        let user = Keys::generate();
+        let user_hex = user.public_key().to_hex();
+        let ch = NostrChannel::new(
+            &bot.secret_key().to_secret_hex(),
+            vec![],
+            "nostr_test_alias",
+            Arc::new(move || vec![user_hex.clone()]),
+        )
+        .await
+        .unwrap();
+        let delivered = async |wrap: &Event| {
+            let rumor = UnwrappedGift::from_gift_wrap(&bot, wrap)
+                .await
+                .unwrap()
+                .rumor;
+            ch.nip17_message(wrap.id, &rumor, Timestamp::from(0))
+        };
+
+        let mut reply =
+            EventBuilder::private_msg_rumor(user.public_key(), "answer").build(bot.public_key());
+        let reaction = EventBuilder::reaction(
+            ReactionTarget {
+                event_id: reply.id(),
+                public_key: bot.public_key(),
+                coordinate: None,
+                kind: Some(Kind::PrivateDirectMessage),
+                relay_hint: None,
+            },
+            "+",
+        )
+        .build(user.public_key());
+        let reaction_wrap = EventBuilder::gift_wrap(&user, &bot.public_key(), reaction, [])
+            .await
+            .unwrap();
+        assert_eq!(delivered(&reaction_wrap).await, None);
+
+        let dm = EventBuilder::private_msg_rumor(bot.public_key(), "hi").build(user.public_key());
+        let dm_wrap = EventBuilder::gift_wrap(&user, &bot.public_key(), dm, [])
+            .await
+            .unwrap();
+        let (id, sender, content, _) = delivered(&dm_wrap).await.expect("DM is delivered");
+        assert_eq!(id, dm_wrap.id.to_hex());
+        assert_eq!(sender, user.public_key().to_hex());
+        assert_eq!(content, "hi");
+    }
 
     #[tokio::test]
     async fn empty_allowlist_denies_all() {
