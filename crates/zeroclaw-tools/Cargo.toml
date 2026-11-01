@@ -44,7 +44,7 @@ flate2 = "1.1"
 brotli = "8.0"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-sha2 = "0.10"
+sha2 = "0.11"
 sys-locale.workspace = true
 tempfile = "3.26"
 thiserror = "2.0"

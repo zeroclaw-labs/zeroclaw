@@ -67,7 +67,7 @@ directories = "6.0"
 
 # Crypto
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # Database (session queue)
