@@ -188,7 +188,7 @@ Native macOS sandbox (`sandbox-exec`). Profiles are SBPL: ZeroClaw bundles one f
 
 An "Operation not permitted" error means the active profile denied an operation; it does not establish that the CLI tool is incompatible with Seatbelt. Check the denied path and the effective risk profile before changing filesystem access.
 
-The profile permits tool-configuration reads under the resolved current account's hidden home paths, with credential-path and configured forbidden-path exclusions. It resolves HOME and forbidden aliases before building those exclusions. Workspace and explicitly configured read-write, read-only, and write-only roots retain their existing grants. A program's internal file opens are checked by Seatbelt even when its command line does not name those files.
+The profile permits reads of hidden files and directories under the resolved current account's home, with the existing credential exclusions and configured forbidden paths. It resolves HOME and the excluded paths before building these rules. Workspace and explicitly configured read-write, read-only, and write-only roots retain their existing grants. A program's internal file opens are checked by Seatbelt even when its command line does not name those files.
 
 ### `none`
 

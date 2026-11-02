@@ -96,11 +96,16 @@ impl SeatbeltSandbox {
         let read_write = resolve_roots(read_write)?;
         let read_only = resolve_roots(read_only)?;
         let write_only = resolve_roots(write_only)?;
-        let forbidden = resolve_roots(forbidden)?;
+        let mut forbidden = resolve_roots(forbidden)?;
         let home = home
             .filter(|home| home.is_absolute())
             .map(|home| resolve_policy_root(home, &mut symlinks))
             .transpose()?;
+        if let Some(home) = home.as_deref() {
+            for name in HOME_CREDENTIAL_PATHS {
+                forbidden.push(resolve_policy_root(&home.join(name), &mut symlinks)?);
+            }
+        }
         let mut policy = generate_policy_for_home(
             &workspace,
             &read_write,
@@ -349,7 +354,7 @@ fn home_dotfile_rules(home: Option<&Path>, forbidden: &[PathBuf]) -> String {
     for name in HOME_CREDENTIAL_PATHS {
         denied.insert(home.join(name));
     }
-    // Configured forbidden paths whose first home-relative component is a
+    // Resolved forbidden paths whose first home-relative component is a
     // dotfile/dir would otherwise ride the Seatbelt `HOME/.` string prefix.
     // Path::starts_with("/home/.") does not match "/home/.private" because
     // "." and ".private" are distinct components, so compare components.
@@ -1162,7 +1167,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::os::unix::fs::symlink(".private-secrets", home.join("vault-link")).unwrap();
-            // This target is created only after the production constructor resolves it.
+            std::fs::write(home.join(".cargo/private-netrc"), "fixture-secret").unwrap();
+            std::os::unix::fs::symlink(".cargo/private-netrc", home.join(".netrc")).unwrap();
+            std::os::unix::fs::symlink(
+                ".cargo/private-git-credentials",
+                home.join(".git-credentials"),
+            )
+            .unwrap();
+            // These targets are created only after the production constructor resolves them.
             std::os::unix::fs::symlink(".later-secrets", home.join("later-link")).unwrap();
             let process_home = if symlink_home {
                 let alias = root.join("home-alias");
@@ -1195,6 +1207,11 @@ mod tests {
             &[home.join("vault-link"), home.join("later-link/new")],
         )
         .unwrap();
+        std::fs::write(
+            home.join(".cargo/private-git-credentials"),
+            "fixture-secret",
+        )
+        .unwrap();
         std::fs::create_dir_all(home.join(".later-secrets/new")).unwrap();
         std::fs::write(home.join(".later-secrets/new/token"), "fixture-secret").unwrap();
         std::fs::write(home.join(".later-secrets/allowed.txt"), "tool-config-ok").unwrap();
@@ -1223,6 +1240,10 @@ mod tests {
             ".later-secrets/new/token",
             ".ssh/id_fixture",
             "../other-home/.cargo/config.toml",
+            ".netrc",
+            ".cargo/private-netrc",
+            ".git-credentials",
+            ".cargo/private-git-credentials",
         ]
         .iter()
         .enumerate()
@@ -1241,6 +1262,16 @@ mod tests {
                 "protected contents must not escape"
             );
         }
+        // Retain the textual denial if a protected alias becomes a regular file.
+        let netrc = home.join(".netrc");
+        std::fs::remove_file(&netrc).unwrap();
+        std::fs::write(&netrc, "fixture-secret").unwrap();
+        let output = sandboxed_sh(&sandbox, &workspace, r#"cat "$0""#, &netrc);
+        assert!(
+            !output.status.success(),
+            "replacement credential must stay denied"
+        );
+        assert!(output.stdout.is_empty());
         if symlink_home {
             std::fs::remove_file(&home).unwrap();
             std::os::unix::fs::symlink(root.join("other-home"), &home).unwrap();
@@ -1316,6 +1347,29 @@ mod tests {
             if expected_kind == std::io::ErrorKind::Other {
                 assert!(error.to_string().contains("symlink limit exceeded"));
             }
+        }
+        for (name, target, expected_kind) in [
+            (".netrc", ".netrc", std::io::ErrorKind::Other),
+            (
+                ".git-credentials",
+                "file/child",
+                std::io::ErrorKind::NotADirectory,
+            ),
+        ] {
+            let alias = fixture.path().join(name);
+            std::os::unix::fs::symlink(target, &alias).unwrap();
+            let error = SeatbeltSandbox::with_roots_for_home(
+                Some(fixture.path()),
+                &[],
+                &[],
+                &[],
+                &[],
+                Some(fixture.path()),
+            )
+            .err()
+            .expect("fixed credential resolution errors must reject construction");
+            assert_eq!(error.kind(), expected_kind);
+            std::fs::remove_file(alias).unwrap();
         }
     }
 
