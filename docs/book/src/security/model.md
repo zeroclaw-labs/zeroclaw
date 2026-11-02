@@ -27,11 +27,16 @@ The agent operates within a configured workspace directory. `file_read`, `file_w
 **Important:** the `cwd` parameter changes which directory on the **ZeroClaw host** the agent is sandboxed to, it does not affect which machine tools run on. Tool use (shell commands, file reads/writes) always executes on the machine running ZeroClaw. If you connect to a remote ZeroClaw instance over the gateway WebSocket, tool calls operate on the remote machine's filesystem, not on your local machine. For localhost-only deployments this distinction does not matter, but remote setups should account for it.
 
 Beyond the workspace, `forbidden_paths` defaults include `/etc`, `/sys`,
-`/boot`, `~/.ssh`, and other sensitive roots. Absolute allow and forbidden
-entries use component-prefix specificity: the most specific matching entry
-wins, with forbidden winning an equal-depth tie. This lets a nested forbidden
-subtree block part of the workspace or an allowed root without making broad
-defaults such as `/home` override a narrower operator-configured allow.
+`/boot`, `~/.ssh`, and other sensitive roots. On Windows the defaults resolve
+`SYSTEMROOT` / `ProgramFiles` / `ProgramData` from the environment (with
+English `C:\…` fallbacks) and cover the Windows homes of the same secret
+classes Unix protects with `~/.gnupg` and `~/.config`: `%APPDATA%\gnupg`,
+`%APPDATA%\GitHub CLI`, DPAPI / Credential Manager trees, and Chromium/Edge
+`User Data` under `%LOCALAPPDATA%`. Absolute allow and forbidden entries use
+component-prefix specificity: the most specific matching entry wins, with
+forbidden winning an equal-depth tie. This lets a nested forbidden subtree
+block part of the workspace or an allowed root without making broad defaults
+such as `/home` override a narrower operator-configured allow.
 
 ## Shell command policy
 
