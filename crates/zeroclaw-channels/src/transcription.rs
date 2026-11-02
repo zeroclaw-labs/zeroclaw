@@ -956,13 +956,18 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 /// Manages multiple transcription / STT providers and routes transcription
 /// requests. The manager is implicitly per-agent: the runtime-active
 /// agent's `transcription_provider` reference is the resolved alias for
-/// `transcribe()` calls. there is no global default-provider concept.
+/// `transcribe()` calls. When the agent has no such reference, `transcribe`
+/// falls back to the `[transcription].default_provider` alias when one is
+/// configured, and fails loud otherwise.
 pub struct TranscriptionManager {
     transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>>,
     max_audio_bytes: Option<usize>,
     /// Resolved alias for the agent that owns this manager. Empty when
     /// the agent has no transcription preference (opt-out).
     agent_transcription_provider: String,
+    /// Fallback alias from `[transcription].default_provider`, used when
+    /// the owning agent has no `transcription_provider` of its own.
+    default_provider: Option<String>,
 }
 
 impl TranscriptionManager {
@@ -974,21 +979,25 @@ impl TranscriptionManager {
             transcription_providers: HashMap::new(),
             max_audio_bytes: None,
             agent_transcription_provider: String::new(),
+            default_provider: None,
         }
     }
 
     /// Build a `TranscriptionManager` from a `TranscriptionConfig`. The
     /// resolved agent alias starts empty; orchestrators that wire the
     /// manager to a specific agent should call
-    /// `with_agent_transcription_provider` to set it.
-    pub fn new(config: &TranscriptionConfig) -> Result<Self> {
-        Self::from_sections(config, None, String::new())
+    /// `with_agent_transcription_provider` to set it. `default_provider` is
+    /// the fallback alias (from `[transcription].default_provider`) used
+    /// when the agent has no `transcription_provider` of its own.
+    pub fn new(config: &TranscriptionConfig, default_provider: Option<String>) -> Result<Self> {
+        Self::from_sections(config, None, String::new(), default_provider)
     }
 
     fn from_sections(
         config: &TranscriptionConfig,
         typed: Option<&TranscriptionProviders>,
         agent_transcription_provider: String,
+        default_provider: Option<String>,
     ) -> Result<Self> {
         if matches!(config.max_audio_bytes, Some(0)) {
             bail!("transcription.max_audio_bytes must be greater than zero");
@@ -1016,6 +1025,7 @@ impl TranscriptionManager {
             transcription_providers,
             max_audio_bytes: config.max_audio_bytes,
             agent_transcription_provider,
+            default_provider,
         })
     }
 
@@ -1026,20 +1036,29 @@ impl TranscriptionManager {
             .map(|a| a.transcription_provider.as_str().to_string())
             .unwrap_or_default();
 
-        Self::from_config_with_provider(config, agent_transcription_provider)
+        Self::from_config_with_provider(
+            config,
+            agent_transcription_provider,
+            config.transcription.default_provider.clone(),
+        )
     }
 
     /// Build from the canonical runtime config while binding an already
     /// resolved provider reference. Channel factories use this when routing
     /// has selected an owner separately from the runtime-default agent.
+    /// `default_provider` is the fallback alias (from
+    /// `[transcription].default_provider`) used when the bound agent has no
+    /// `transcription_provider` of its own.
     pub(crate) fn from_config_with_provider(
         config: &Config,
         agent_transcription_provider: String,
+        default_provider: Option<String>,
     ) -> Result<Self> {
         Self::from_sections(
             &config.transcription,
             Some(&config.providers.transcription),
             agent_transcription_provider,
+            default_provider,
         )
     }
 
@@ -1164,16 +1183,29 @@ impl TranscriptionManager {
         self
     }
 
+    /// The provider alias `transcribe` will dispatch to: the owning agent's
+    /// `transcription_provider` when non-empty, otherwise the configured
+    /// `[transcription].default_provider`, otherwise an empty string.
+    pub fn resolved_agent_alias(&self) -> &str {
+        if !self.agent_transcription_provider.is_empty() {
+            &self.agent_transcription_provider
+        } else {
+            self.default_provider.as_deref().unwrap_or("")
+        }
+    }
+
     /// Transcribe audio using the runtime-active agent's resolved
-    /// `transcription_provider`. Fails loud when the agent has no
-    /// transcription_provider configured — there is no global default.
+    /// `transcription_provider`, falling back to `[transcription].
+    /// default_provider` when the agent has none. Fails loud when neither
+    /// is configured.
     pub async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
-        let provider_alias = self.agent_transcription_provider.as_str();
+        let provider_alias = self.resolved_agent_alias();
         if provider_alias.is_empty() {
             bail!(
-                "Agent has no transcription_provider configured. Set \
-                 `agent.<alias>.transcription_provider = \"<type>.<alias>\"` \
-                 referencing a configured transcription provider."
+                "Agent has no transcription_provider configured and no transcription \
+                 default_provider is set. Set `agent.<alias>.transcription_provider = \
+                 \"<type>.<alias>\"` referencing a configured transcription provider, or \
+                 set `[transcription].default_provider` to give every agent a default."
             );
         }
         self.transcribe_with_provider(audio_data, file_name, provider_alias)
@@ -1325,8 +1357,11 @@ pub(crate) fn build_channel_transcription_manager(
     config: &Config,
     agent_provider: &str,
 ) -> Result<TranscriptionManager> {
-    let manager =
-        TranscriptionManager::from_config_with_provider(config, agent_provider.to_string())?;
+    let manager = TranscriptionManager::from_config_with_provider(
+        config,
+        agent_provider.to_string(),
+        config.transcription.default_provider.clone(),
+    )?;
     Ok(bind_channel_provider(manager, agent_provider))
 }
 
@@ -1356,7 +1391,7 @@ pub(crate) fn manager_from_snapshot(
     if !config.enabled {
         return None;
     }
-    match TranscriptionManager::new(config) {
+    match TranscriptionManager::new(config, config.default_provider.clone()) {
         Ok(manager) => Some(std::sync::Arc::new(bind_channel_provider(manager, ""))),
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -1504,6 +1539,7 @@ mod tests {
                 transcription_providers,
                 max_audio_bytes,
                 agent_transcription_provider: String::new(),
+                default_provider: None,
             },
             calls,
         )
@@ -1649,11 +1685,12 @@ mod tests {
         unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let config = TranscriptionConfig::default();
-        let manager = TranscriptionManager::new(&config).unwrap();
+        let manager = TranscriptionManager::new(&config, None).unwrap();
         // the manager's agent_transcription_provider starts empty
         // until an orchestrator wires it via `with_agent_transcription_provider`.
-        // No global default-provider concept.
+        // No agent binding and no default_provider.
         assert!(manager.agent_transcription_provider.is_empty());
+        assert!(manager.default_provider.is_none());
         // Groq won't be registered without a key.
         assert!(manager.transcription_providers.is_empty());
     }
@@ -1668,7 +1705,7 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(&config).unwrap();
+        let manager = TranscriptionManager::new(&config, None).unwrap();
         assert!(manager.transcription_providers.contains_key("groq"));
         assert_eq!(manager.transcription_providers["groq"].name(), "groq");
     }
@@ -1691,7 +1728,7 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(&config).unwrap();
+        let manager = TranscriptionManager::new(&config, None).unwrap();
         assert!(manager.transcription_providers.contains_key("groq"));
         assert!(manager.transcription_providers.contains_key("openai"));
         assert!(manager.transcription_providers.contains_key("deepgram"));
@@ -1708,7 +1745,7 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(&config).unwrap();
+        let manager = TranscriptionManager::new(&config, None).unwrap();
         let err = manager
             .transcribe_with_provider(&[0u8; 100], "test.ogg", "nonexistent")
             .await
@@ -1732,10 +1769,63 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(&config)
+        let manager = TranscriptionManager::new(&config, None)
             .unwrap()
             .with_agent_transcription_provider("openai");
         assert_eq!(manager.agent_transcription_provider, "openai");
+    }
+
+    #[test]
+    fn resolved_agent_alias_prefers_agent_then_default_then_empty() {
+        let (manager, _) = manager_with_static_provider(None);
+        // Neither an agent binding nor a default: nothing to resolve to.
+        assert_eq!(manager.resolved_agent_alias(), "");
+
+        // A configured default fills the gap left by an unbound agent.
+        let mut manager = manager;
+        manager.default_provider = Some("static".to_string());
+        assert_eq!(manager.resolved_agent_alias(), "static");
+
+        // An explicit agent preference always wins over the default.
+        let manager = manager.with_agent_transcription_provider("other");
+        assert_eq!(manager.resolved_agent_alias(), "other");
+    }
+
+    #[tokio::test]
+    async fn transcribe_dispatches_to_agent_alias_when_set() {
+        let (manager, calls) = manager_with_static_provider(None);
+        let manager = manager.with_agent_transcription_provider("static");
+
+        let result = manager.transcribe(b"audio", "voice.ogg").await.unwrap();
+
+        assert_eq!(result, "under cap");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transcribe_falls_back_to_default_provider_when_agent_unbound() {
+        let (mut manager, calls) = manager_with_static_provider(None);
+        manager.default_provider = Some("static".to_string());
+
+        assert_eq!(manager.resolved_agent_alias(), "static");
+        let result = manager.transcribe(b"audio", "voice.ogg").await.unwrap();
+
+        assert_eq!(result, "under cap");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transcribe_fails_loud_when_agent_unbound_and_no_default_provider() {
+        let (manager, calls) = manager_with_static_provider(None);
+
+        let err = manager.transcribe(b"audio", "voice.ogg").await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("no transcription_provider configured"),
+            "expected fail-loud error, got: {err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2097,7 +2187,7 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let err = match TranscriptionManager::new(&config) {
+        let err = match TranscriptionManager::new(&config, None) {
             Ok(_) => panic!("expected zero max_audio_bytes to fail manager construction"),
             Err(err) => err,
         };
@@ -2187,8 +2277,10 @@ mod tests {
         assert!(config.api_key.is_none());
         assert!(config.api_url.contains("groq.com"));
         assert_eq!(config.model, "whisper-large-v3-turbo");
-        // TranscriptionConfig has no global default-provider field;
-        // per-agent `transcription_provider` is the only selector.
+        // No default_provider out of the box; it is opt-in and defaults to
+        // None so fail-loud stays the default for agents without their own
+        // `transcription_provider`.
+        assert!(config.default_provider.is_none());
         assert!(config.openai.is_none());
         assert!(config.deepgram.is_none());
         assert!(config.assemblyai.is_none());
@@ -2606,7 +2698,7 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(&config).unwrap();
+        let manager = TranscriptionManager::new(&config, None).unwrap();
         assert!(
             manager.available_providers().contains(&"local_whisper"),
             "expected local_whisper in {:?}",
@@ -2635,7 +2727,7 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let err = TranscriptionManager::new(&config).err().unwrap();
+        let err = TranscriptionManager::new(&config, None).err().unwrap();
         assert!(
             err.to_string()
                 .contains("no transcription provider registered"),
@@ -2657,7 +2749,7 @@ mod tests {
             ..TranscriptionConfig::default()
         };
 
-        let manager = TranscriptionManager::new(&config)
+        let manager = TranscriptionManager::new(&config, None)
             .expect("blank bearer_token must not prevent provider registration");
         assert!(
             manager.available_providers().contains(&"local_whisper"),
@@ -2883,6 +2975,7 @@ mod tests {
             transcription_providers: std::collections::HashMap::new(),
             max_audio_bytes: None,
             agent_transcription_provider: String::new(),
+            default_provider: None,
         }
         .with_typed_providers(&typed);
 
