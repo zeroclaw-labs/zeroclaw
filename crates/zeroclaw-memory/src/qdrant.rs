@@ -1291,7 +1291,9 @@ impl Memory for QdrantMemory {
             timestamp,
             session_id: session_id.map(str::to_string),
             agent_id: Some(resolved_agent_id.clone()),
-            importance,
+            // Same default as the SQLite backend: an unscored write ranks as
+            // middling, not as zero importance.
+            importance: Some(importance.unwrap_or(0.5)),
         };
 
         self.delete_points_matching(&[("key", key), ("agent_id", resolved_agent_id.as_str())])
