@@ -966,6 +966,10 @@ const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 /// Default minimum interval between Telegram draft edits.
 const TELEGRAM_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
+/// Character cap for the reasoning shown in a partial draft. Bounds the
+/// blockquote so the in-progress answer always keeps room in the message.
+const TELEGRAM_REASONING_DRAFT_MAX_CHARS: usize = 600;
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -2782,6 +2786,91 @@ impl TelegramChannel {
         self
     }
 
+    /// Truncate an HTML-escaped fragment to `budget` bytes without splitting a
+    /// UTF-8 character or leaving a half-written `&entity;` behind for the Bot
+    /// API HTML parser to reject.
+    fn truncate_escaped_html(escaped: &str, budget: usize) -> String {
+        if escaped.len() <= budget {
+            return escaped.to_string();
+        }
+        let mut end = 0;
+        for (idx, ch) in escaped.char_indices() {
+            let next = idx + ch.len_utf8();
+            if next > budget {
+                break;
+            }
+            end = next;
+        }
+        let mut out = escaped[..end].to_string();
+        if let Some(amp) = out.rfind('&')
+            && !out[amp..].contains(';')
+        {
+            out.truncate(amp);
+        }
+        out
+    }
+
+    /// Render the mid-stream reasoning blockquote above the in-progress answer
+    /// for a partial draft edit.
+    ///
+    /// Reasoning is draft-only chrome: `finalize_draft` rewrites the whole
+    /// message with the final answer, so it never survives into the delivered
+    /// reply. The answer is HTML-escaped rather than Markdown-converted, which
+    /// keeps the draft's literal-Markdown look identical to `update_draft`'s
+    /// plain-text edits. The reasoning is capped first, on the raw text, so
+    /// escaping can never split an entity and the closing tag always survives
+    /// the caller's whole-message truncation.
+    fn reasoning_draft_html(reasoning: &str, answer: &str) -> String {
+        const OPEN: &str = "<blockquote expandable>";
+        const CLOSE: &str = "</blockquote>";
+        let reasoning = Self::escape_html(&crate::util::truncate_with_ellipsis(
+            reasoning.trim_end(),
+            TELEGRAM_REASONING_DRAFT_MAX_CHARS,
+        ));
+        let answer = Self::escape_html(answer);
+        format!("{OPEN}{reasoning}{CLOSE}\n\n{answer}")
+    }
+
+    /// Render the draft's reasoning slot under the mode resolved for this edit.
+    ///
+    /// `full` keeps the raw reasoning blockquote. `status` publishes only the
+    /// liveness thinking line: the runtime's own tick when the turn already runs
+    /// in status mode, otherwise the canonical first-round line. The latter
+    /// matters for a live switch from `full` to `status` mid-turn — the runtime
+    /// keeps emitting raw reasoning deltas for the rest of the turn, so the
+    /// renderer is the boundary that must stop disclosing it.
+    fn reasoning_draft_html_for_mode(
+        mode: zeroclaw_config::schema::StreamReasoningMode,
+        reasoning: &str,
+        answer: &str,
+    ) -> String {
+        use zeroclaw_config::schema::StreamReasoningMode;
+        match mode {
+            StreamReasoningMode::Full => Self::reasoning_draft_html(reasoning, answer),
+            StreamReasoningMode::Status => {
+                let line = Self::reasoning_status_line(reasoning);
+                format!(
+                    "{}\n\n{}",
+                    Self::escape_html(&line),
+                    Self::escape_html(answer)
+                )
+            }
+            StreamReasoningMode::Off => Self::escape_html(answer),
+        }
+    }
+
+    /// Liveness-only line for `stream_reasoning = "status"`.
+    fn reasoning_status_line(reasoning: &str) -> String {
+        // The tick carries its trailing newline; the predicate requires it.
+        if zeroclaw_runtime::agent::loop_::is_thinking_status_text(reasoning) {
+            reasoning.trim_end().to_string()
+        } else {
+            zeroclaw_runtime::agent::loop_::thinking_status_text(0)
+                .trim_end()
+                .to_string()
+        }
+    }
+
     /// Canonical source: `[channels.telegram.<alias>].multi_message_delay_ms`.
     fn resolve_multi_message_delay_ms(&self) -> u64 {
         self.persist
@@ -2796,6 +2885,26 @@ impl TelegramChannel {
                     .map(|tg| tg.multi_message_delay_ms)
             })
             .unwrap_or(DEFAULT_MULTI_MESSAGE_DELAY_MS)
+    }
+
+    /// Canonical source: `[channels.telegram.<alias>].stream_reasoning`.
+    ///
+    /// Resolved live at use time rather than snapshotted into the handle, so a
+    /// published config change reaches the draft without a channel rebuild
+    /// (see AGENTS.md "Single Source Of Truth").
+    fn resolve_stream_reasoning(&self) -> zeroclaw_config::schema::StreamReasoningMode {
+        self.persist
+            .as_ref()
+            .and_then(|config| {
+                config
+                    .live_handle()
+                    .read()
+                    .channels
+                    .telegram
+                    .get(&self.alias)
+                    .map(|tg| tg.stream_reasoning)
+            })
+            .unwrap_or(zeroclaw_config::schema::StreamReasoningMode::Off)
     }
 
     fn new_multi_message_draft_id() -> String {
@@ -7958,6 +8067,82 @@ impl Channel for TelegramChannel {
         }
     }
 
+    /// Edit the partial draft with the in-progress answer plus the model's
+    /// reasoning as a collapsed HTML blockquote above it.
+    ///
+    /// A rejected HTML payload falls back to the plain-text edit so a draft is
+    /// never stranded. Both paths share the draft's per-chat edit pacing.
+    async fn update_draft_with_reasoning(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        answer: &str,
+        reasoning: &str,
+    ) -> anyhow::Result<()> {
+        let mode = self.resolve_stream_reasoning();
+        if self.stream_mode != StreamMode::Partial
+            || mode == zeroclaw_config::schema::StreamReasoningMode::Off
+            || reasoning.trim().is_empty()
+        {
+            return self.update_draft(recipient, message_id, answer).await;
+        }
+
+        let (chat_id, _) = Self::parse_reply_target(recipient);
+
+        // Same per-chat pacing as `update_draft`: the reasoning edit spends the
+        // draft's edit budget rather than bypassing it.
+        {
+            let last_edits = self.last_draft_edit.lock();
+            if let Some(last_time) = last_edits.get(&chat_id) {
+                let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed < self.draft_update_interval_ms {
+                    return Ok(());
+                }
+            }
+        }
+
+        let message_id_parsed = match message_id.parse::<i64>() {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+
+        let html = Self::truncate_escaped_html(
+            &Self::reasoning_draft_html_for_mode(mode, reasoning, answer),
+            TELEGRAM_MAX_MESSAGE_LENGTH,
+        );
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id_parsed,
+            "text": html,
+            "parse_mode": "HTML",
+        });
+
+        let resp = self
+            .http_client()
+            .post(self.api_url("editMessageText"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            self.last_draft_edit
+                .lock()
+                .insert(chat_id.clone(), std::time::Instant::now());
+            return Ok(());
+        }
+
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({"error": format!("{}", err), "status": status.to_string()})
+            ),
+            "editMessageText (reasoning draft) failed; falling back to plain text"
+        );
+        self.update_draft(recipient, message_id, answer).await
+    }
+
     async fn flush_draft_turn(
         &self,
         recipient: &str,
@@ -8162,21 +8347,34 @@ impl Channel for TelegramChannel {
             "parse_mode": "HTML",
         });
 
-        let resp = self
+        // A transport failure is as terminal as a rejected payload: both leave
+        // the reasoning quote on screen, so both must fall through to the
+        // delete+send fallback below rather than bail with `?`.
+        let html_edit = self
             .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
-            .await?;
+            .await;
 
-        match Self::classify_edit_message_response(resp).await {
-            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
-            EditMessageResult::Failed(status) => {
+        match html_edit {
+            Ok(resp) => match Self::classify_edit_message_response(resp).await {
+                EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
+                EditMessageResult::Failed(status) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                        "Telegram finalize_draft HTML edit failed; retrying without parse_mode"
+                    );
+                }
+            },
+            Err(err) => {
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"status": status.to_string()})),
-                    "Telegram finalize_draft HTML edit failed; retrying without parse_mode"
+                        .with_attrs(::serde_json::json!({"error": err.to_string()})),
+                    "Telegram finalize_draft HTML edit request failed; retrying without parse_mode"
                 );
             }
         }
@@ -8188,22 +8386,33 @@ impl Channel for TelegramChannel {
             "text": text,
         });
 
-        let resp = self
+        let plain_edit = self
             .http_client()
             .post(self.api_url("editMessageText"))
             .json(&plain_body)
             .send()
-            .await?;
+            .await;
 
-        match Self::classify_edit_message_response(resp).await {
-            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
-            EditMessageResult::Failed(status) => {
+        match plain_edit {
+            Ok(resp) => match Self::classify_edit_message_response(resp).await {
+                EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
+                EditMessageResult::Failed(status) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                        "Telegram finalize_draft plain edit failed; attempting delete+send fallback"
+                    );
+                }
+            },
+            Err(err) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"status": status.to_string()})),
-                    "Telegram finalize_draft plain edit failed; attempting delete+send fallback"
+                        .with_attrs(::serde_json::json!({"error": err.to_string()})),
+                    "Telegram finalize_draft plain edit request failed; attempting delete+send fallback"
                 );
             }
         }
@@ -9035,6 +9244,47 @@ mod tests {
         assert_eq!(ch.multi_message_delay_ms(), 0);
     }
 
+    #[test]
+    fn stream_reasoning_resolves_live_from_canonical_config() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let alias = "telegram_test_alias";
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                stream_mode: StreamMode::Partial,
+                stream_reasoning: StreamReasoningMode::Full,
+                ..TelegramConfig::default()
+            },
+        );
+        let authority = LiveConfigAuthority::new(config);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 750)
+        .with_persistence_authority(authority.clone());
+
+        assert_eq!(ch.resolve_stream_reasoning(), StreamReasoningMode::Full);
+        let mut updated = authority.snapshot_config();
+        updated
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias")
+            .stream_reasoning = StreamReasoningMode::Off;
+        authority.publish_for_test(updated);
+        assert_eq!(
+            ch.resolve_stream_reasoning(),
+            StreamReasoningMode::Off,
+            "the reasoning mode must be read from live config, not a startup copy"
+        );
+    }
+
     impl TelegramChannel {
         fn with_mock_api_base(mut self, api_base: String) -> Self {
             // Mock servers can be pooled across tests whose Tokio runtimes are not.
@@ -9050,6 +9300,69 @@ mod tests {
             );
             self.with_api_base(api_base)
         }
+    }
+
+    /// A failed final `editMessageText` must not leave the reasoning-bearing
+    /// draft on screen: finalization falls through to delete+send so the draft
+    /// is removed even when the edit request itself errors at the transport.
+    #[tokio::test]
+    async fn finalize_draft_deletes_the_draft_when_the_final_edit_request_fails() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path_regex(r"/bot[^/]+/editMessageText$"))
+                    .respond_with_err(|_: &Request| {
+                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")
+                    }),
+            )
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 99 }
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "main",
+            Arc::new(|| vec!["test_user".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 1000)
+        .with_mock_api_base(server.uri());
+
+        ch.finalize_draft("42", "77", "the final answer", true)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.url.path().ends_with("/deleteMessage")),
+            "a failed final edit must delete the reasoning-bearing draft",
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.url.path().ends_with("/sendMessage")),
+            "the answer must still be delivered after the failed edit",
+        );
     }
 
     #[test]
@@ -12614,6 +12927,168 @@ mod tests {
             ch.api_url("getMe"),
             "http://127.0.0.1:8081/bot123:ABC/getMe"
         );
+    }
+
+    #[test]
+    fn reasoning_draft_html_wraps_reasoning_in_a_collapsed_blockquote() {
+        assert_eq!(
+            TelegramChannel::reasoning_draft_html("step one\nstep two", "the answer"),
+            "<blockquote expandable>step one\nstep two</blockquote>\n\nthe answer"
+        );
+    }
+
+    #[test]
+    fn reasoning_draft_html_escapes_both_halves() {
+        assert_eq!(
+            TelegramChannel::reasoning_draft_html("<b>raw</b>", "a & b"),
+            "<blockquote expandable>&lt;b&gt;raw&lt;/b&gt;</blockquote>\n\na &amp; b"
+        );
+    }
+
+    #[test]
+    fn reasoning_draft_html_caps_the_reasoning_and_keeps_the_answer() {
+        let long = "x".repeat(TELEGRAM_REASONING_DRAFT_MAX_CHARS + 50);
+        let html = TelegramChannel::reasoning_draft_html(&long, "answer");
+        assert!(html.ends_with("</blockquote>\n\nanswer"), "{html}");
+        assert!(html.contains("...</blockquote>"), "{html}");
+    }
+
+    #[test]
+    fn reasoning_draft_html_for_mode_distinguishes_status_from_full() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let full = TelegramChannel::reasoning_draft_html_for_mode(
+            StreamReasoningMode::Full,
+            "the raw reasoning",
+            "the answer",
+        );
+        assert!(full.contains("the raw reasoning"), "{full}");
+
+        let status = TelegramChannel::reasoning_draft_html_for_mode(
+            StreamReasoningMode::Status,
+            "the raw reasoning",
+            "the answer",
+        );
+        assert!(status.contains("\u{1f914} Thinking..."), "{status}");
+        assert!(status.contains("the answer"), "{status}");
+        assert!(
+            !status.contains("the raw reasoning"),
+            "status must never render the supplied reasoning text: {status}"
+        );
+
+        let off = TelegramChannel::reasoning_draft_html_for_mode(
+            StreamReasoningMode::Off,
+            "the raw reasoning",
+            "the answer",
+        );
+        assert_eq!(off, "the answer");
+    }
+
+    #[test]
+    fn reasoning_draft_html_for_mode_keeps_the_runtime_status_line_verbatim() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let tick = zeroclaw_runtime::agent::loop_::thinking_status_text(2);
+        let html = TelegramChannel::reasoning_draft_html_for_mode(
+            StreamReasoningMode::Status,
+            &tick,
+            "the answer",
+        );
+        assert!(html.contains("Thinking (round 3)..."), "{html}");
+        assert!(html.ends_with("the answer"), "{html}");
+    }
+
+    /// Regression: a live `full` -> `status` switch kept publishing the raw
+    /// reasoning already buffered for the turn, because the renderer only
+    /// suppressed reasoning under `off`.
+    #[tokio::test]
+    async fn switching_to_status_stops_publishing_buffered_reasoning() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 77 },
+            })))
+            .mount(&server)
+            .await;
+
+        let alias = "telegram_status_switch";
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                stream_mode: StreamMode::Partial,
+                stream_reasoning: StreamReasoningMode::Full,
+                ..TelegramConfig::default()
+            },
+        );
+        let authority = LiveConfigAuthority::new(config);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 1)
+        .with_persistence_authority(authority.clone())
+        .with_mock_api_base(server.uri());
+
+        ch.update_draft_with_reasoning("42", "77", "the answer", "the raw reasoning")
+            .await
+            .unwrap();
+
+        let mut updated = authority.snapshot_config();
+        updated
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias")
+            .stream_reasoning = StreamReasoningMode::Status;
+        authority.publish_for_test(updated);
+        // Spend no wall-clock time on the per-chat edit pacing.
+        ch.last_draft_edit.lock().clear();
+        ch.update_draft_with_reasoning("42", "77", "the answer", "the raw reasoning")
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let edits: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("editMessageText"))
+            .collect();
+        assert_eq!(edits.len(), 2, "one edit per mode");
+        let first: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
+        assert!(
+            first["text"]
+                .as_str()
+                .unwrap()
+                .contains("the raw reasoning")
+        );
+        let second: serde_json::Value = serde_json::from_slice(&edits[1].body).unwrap();
+        let text = second["text"].as_str().unwrap();
+        assert!(text.contains("\u{1f914} Thinking..."), "{text}");
+        assert!(text.contains("the answer"), "{text}");
+        assert!(
+            !text.contains("the raw reasoning"),
+            "the edit after the switch must not republish reasoning: {text}"
+        );
+    }
+
+    #[test]
+    fn truncate_escaped_html_never_splits_a_character_or_an_entity() {
+        // `é` is two bytes, so a one-byte budget yields nothing.
+        assert_eq!(TelegramChannel::truncate_escaped_html("é", 1), "");
+        // A budget landing inside `&amp` drops the half-written entity.
+        assert_eq!(TelegramChannel::truncate_escaped_html("&amp;x", 4), "");
+        // A budget that keeps the whole entity keeps it verbatim.
+        assert_eq!(TelegramChannel::truncate_escaped_html("&amp;x", 5), "&amp;");
+        assert_eq!(TelegramChannel::truncate_escaped_html("abc", 10), "abc");
     }
 
     #[test]
