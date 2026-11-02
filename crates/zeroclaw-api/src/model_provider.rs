@@ -253,6 +253,14 @@ pub fn strip_think_tags(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Requested tool-call cadence for one provider response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolRoundPolicy {
+    #[default]
+    Batch,
+    Single,
+}
+
 /// Request payload for model_provider chat calls.
 #[derive(Debug, Clone, Copy)]
 pub struct ChatRequest<'a> {
@@ -537,6 +545,10 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
+    /// A provider returned a non-success HTTP response before streaming began.
+    #[error("ModelProvider HTTP {status}: {message}")]
+    HttpStatus { status: u16, message: String },
+
     #[error(transparent)]
     ModelRefusal(#[from] Box<ModelRefusalError>),
 
@@ -670,6 +682,14 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether this exact request shape can be replayed for `model` on the same
+    /// provider/model route without internal retries, fallback, or key
+    /// mutation. Runtime fails closed when this capability is absent.
+    #[doc(hidden)]
+    fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
+        false
+    }
+
     /// Query model_provider capabilities.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
@@ -688,6 +708,34 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         capabilities.native_tool_calling = self.supports_native_tools();
         capabilities.vision = self.supports_vision();
         capabilities
+    }
+
+    /// Whether every reachable route for this model honors a native one-call control.
+    /// Prompt guidance and provider-executed tools do not establish support.
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Explicit per-request policy. Unsupported adapters retain their batch path.
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat(request, model, temperature).await
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        _policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat(request, model, temperature, options)
     }
 
     /// Name the entry that forced `vision` to `false` on this provider's
@@ -971,8 +1019,45 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 /// boilerplate in test and production code.
 #[async_trait]
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        self.as_ref().supports_single_tool_rounds(model)
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        self.as_ref()
+            .chat_with_tool_round_policy(request, model, temperature, policy)
+            .await
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.as_ref().stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            policy,
+        )
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         self.as_ref().has_stable_request_identity(model)
+    }
+
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        self.as_ref().supports_exact_request_replay(request, model)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {

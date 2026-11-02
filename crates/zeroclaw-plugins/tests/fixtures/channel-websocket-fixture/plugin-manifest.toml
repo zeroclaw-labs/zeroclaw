@@ -1,0 +1,28 @@
+# Canonical on-disk manifest for the channel WebSocket component fixture.
+#
+# The channel WebSocket lifecycle end-to-end test installs this file verbatim as
+# a package's `manifest.toml` (and once more with `websocket_client` removed, to
+# prove the import is linked only for a granted instance). It doubles as a
+# worked example of the manifest a gateway-style channel plugin ships:
+# `websocket_client` links the host-mediated WebSocket import, `config_read`
+# lets the guest read the `url` it dials, and the operator's
+# `[[plugins.entries]].egress_hosts` grant (not this file) decides which
+# destinations that import may actually reach.
+name = "channel-websocket-fixture"
+version = "0.0.0"
+description = "Channel component fixture that holds one host-mediated WebSocket across polls, for the channel WebSocket lifecycle integration test."
+wasm_path = "channel-websocket-fixture.wasm"
+capabilities = ["channel"]
+permissions = ["config_read", "websocket_client"]
+
+# The guest dials the `url` it is configured with from `poll-message`, never
+# from `configure`, so the test can prove that reach is decided per connect by
+# the host-owned egress policy rather than at construction.
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+required = ["url"]
+additionalProperties = false
+
+[config_schema.properties.url]
+type = "string"

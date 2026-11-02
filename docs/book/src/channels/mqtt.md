@@ -16,6 +16,10 @@ Full field reference: [config reference](../reference/config.md#channels).
 
 Set `use_tls` to match the scheme of `broker_url`: `mqtts://` pairs with `use_tls = true`, `mqtt://` with `use_tls = false`. A mismatch is the most common connection failure.
 
+MQTT connections use MQTT 3.1.1. TLS connections verify the broker certificate and hostname against the system trust store. The maintained MQTT client uses the same patched Rustls certificate verifier as the rest of the TLS stack.
+
+`keep_alive_secs` must fit the MQTT protocol's 16-bit interval, from 0 to 65535 seconds. An out-of-range value fails listener startup instead of being truncated.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
