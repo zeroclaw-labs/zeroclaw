@@ -30,14 +30,48 @@ pub fn create_runtime_with_path(
             validate_shell(&shell)?;
             #[cfg(windows)]
             validate_shell_windows(&shell)?;
+            // A shell that is absent from the host is a missing capability (e.g.
+            // the shell-free distroless image), not a construction failure: the
+            // runtime reports no shell, so LLM-only turns still run and
+            // shell-dependent tools are not registered. Without an injected
+            // PATH the shell keeps being resolved at command build time; only
+            // its availability is checked here.
             #[cfg(unix)]
-            let shell_path = path
-                .map(|path| {
-                    let configured_shell = if zeroclaw_api::platform::is_android() {
-                        OsStr::new("/system/bin/sh")
-                    } else {
-                        OsStr::new(&shell)
-                    };
+            let shell_path = {
+                let configured_shell = if zeroclaw_api::platform::is_android() {
+                    OsStr::new("/system/bin/sh")
+                } else {
+                    OsStr::new(&shell)
+                };
+                let ambient_path = std::env::var_os("PATH").unwrap_or_default();
+                let search_path = path.unwrap_or(ambient_path.as_os_str());
+                // Only an absent shell is a missing capability. A shell that
+                // exists but is unusable (not executable, a directory) is a
+                // misconfiguration and keeps its earlier behavior: an error
+                // with an injected PATH, a failure at command build time
+                // otherwise.
+                if native::shell_is_absent(configured_shell, std::env::split_paths(search_path)) {
+                    // The factory runs for every status read and cron call;
+                    // announce the condition once per process.
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "shell": configured_shell.to_string_lossy(),
+                            })),
+                            "native runtime shell was not found; shell commands are unavailable"
+                        );
+                    }
+                    return Ok(Box::new(NativeRuntime::without_shell(shell)));
+                }
+                path.map(|path| {
                     resolve_executable_with_path(configured_shell, std::env::split_paths(path))
                         .map_err(|error| {
                             anyhow::Error::new(error).context(format!(
@@ -45,7 +79,8 @@ pub fn create_runtime_with_path(
                             ))
                         })
                 })
-                .transpose()?;
+                .transpose()?
+            };
             #[cfg(not(unix))]
             let shell_path = None;
             Ok(Box::new(NativeRuntime::with_shell_and_resolved_path(
@@ -210,6 +245,171 @@ mod tests {
             docker_command.as_std().get_program(),
             docker.canonicalize().unwrap().as_os_str()
         );
+    }
+
+    // ── Shell-free runtime (issue #9859) ─────────────────────
+
+    #[cfg(unix)]
+    fn assert_reports_no_shell(rt: &dyn RuntimeAdapter) {
+        use crate::platform::ShellDialect;
+
+        assert_eq!(rt.name(), "native");
+        assert!(!rt.has_shell_access());
+        assert_eq!(rt.shell_dialect(), ShellDialect::None);
+        assert_eq!(rt.shell_profile(), None);
+        assert_eq!(rt.shell_program(), None);
+        let dir = std::env::temp_dir();
+        let err = rt.build_shell_command("echo hi", &dir).unwrap_err();
+        assert!(
+            err.to_string().contains("no usable shell"),
+            "build_shell_command should fail closed, got: {err}"
+        );
+        let err = rt
+            .build_shell_command_with_effective_path(
+                "echo hi",
+                &dir,
+                Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no usable shell"),
+            "an effective PATH must not bypass the missing shell, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn factory_native_without_shell_on_ambient_path_reports_no_shell() {
+        for shell in [
+            "/nonexistent-zeroclaw-shell/bin/sh",
+            "zc-no-such-shell-on-path",
+        ] {
+            let rt = create_runtime(&RuntimeConfig {
+                kind: RuntimeKind::Native,
+                shell: Some(shell.into()),
+                ..RuntimeConfig::default()
+            })
+            .unwrap_or_else(|e| panic!("shell {shell:?} must not fail construction: {e}"));
+            assert_reports_no_shell(rt.as_ref());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn factory_native_without_shell_in_injected_path_reports_no_shell() {
+        let empty = tempfile::tempdir().unwrap();
+        let rt = create_runtime_with_path(
+            &RuntimeConfig {
+                kind: RuntimeKind::Native,
+                shell: Some("sh".into()),
+                ..RuntimeConfig::default()
+            },
+            Some(empty.path().as_os_str()),
+        )
+        .expect("an injected PATH without sh must not fail construction");
+        assert_reports_no_shell(rt.as_ref());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn factory_native_unusable_shell_is_not_reported_as_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-executable");
+        std::fs::write(&file, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let cfg = RuntimeConfig {
+            kind: RuntimeKind::Native,
+            shell: Some(file.to_string_lossy().into_owned()),
+            ..RuntimeConfig::default()
+        };
+
+        // Ambient PATH: unchanged, the failure surfaces when a command is built.
+        let rt = create_runtime(&cfg).unwrap();
+        assert!(rt.has_shell_access());
+        assert!(
+            rt.build_shell_command("echo hi", &std::env::temp_dir())
+                .is_err()
+        );
+        // Injected PATH: still a construction error, as before.
+        assert!(create_runtime_with_path(&cfg, Some(dir.path().as_os_str())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn factory_native_absent_shell_with_unusable_path_entries_reports_no_shell() {
+        // The resolver reports the error of an unusable entry (here a regular
+        // file used as a directory) instead of NotFound when the shell is
+        // nowhere to be found; that must still mean "absent", not "unusable".
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("file");
+        std::fs::write(&not_a_dir, "").unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths([not_a_dir.as_path(), empty.path()]).unwrap();
+
+        let rt = create_runtime_with_path(
+            &RuntimeConfig {
+                kind: RuntimeKind::Native,
+                shell: Some("sh".into()),
+                ..RuntimeConfig::default()
+            },
+            Some(path.as_os_str()),
+        )
+        .expect("an absent shell must not fail construction");
+        assert_reports_no_shell(rt.as_ref());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn factory_native_broken_symlink_shell_is_present_but_unusable() {
+        // A dangling symlink is a filesystem entry, so the shell is not
+        // "absent": it is a misconfiguration and keeps its earlier behavior.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("sh");
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), &link).unwrap();
+
+        // Absolute path, ambient PATH: construction succeeds and the failure
+        // surfaces when a command is built.
+        let cfg = RuntimeConfig {
+            kind: RuntimeKind::Native,
+            shell: Some(link.to_string_lossy().into_owned()),
+            ..RuntimeConfig::default()
+        };
+        let rt = create_runtime(&cfg).unwrap();
+        assert!(rt.has_shell_access());
+        let err = rt
+            .build_shell_command("echo hi", &std::env::temp_dir())
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("no usable shell"),
+            "a present-but-broken shell must report the resolver error, got: {err}"
+        );
+
+        // Bare name found only as a dangling symlink in an injected PATH:
+        // still a construction error, as before.
+        let bare = RuntimeConfig {
+            kind: RuntimeKind::Native,
+            shell: Some("sh".into()),
+            ..RuntimeConfig::default()
+        };
+        assert!(create_runtime_with_path(&bare, Some(dir.path().as_os_str())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn factory_native_still_rejects_malformed_shell() {
+        for bad in ["", "./sh"] {
+            assert!(
+                create_runtime(&RuntimeConfig {
+                    kind: RuntimeKind::Native,
+                    shell: Some(bad.into()),
+                    ..RuntimeConfig::default()
+                })
+                .is_err(),
+                "shell {bad:?} is misconfigured, not missing, and must stay an error"
+            );
+        }
     }
 
     #[test]
