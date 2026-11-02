@@ -12,6 +12,11 @@ homepage = "https://www.zeroclaw.com"
 rust-version = "1.96.0"
 
 [workspace.dependencies]
+# Keeps its own version rather than the workspace's: it is a standalone client
+# for someone else's API. The version requirement is what keeps
+# `zeroclaw-channels` packageable — cargo refuses a path-only dependency when
+# publishing, optional or not.
+gemini-live = { path = "crates/gemini-live", version = "0.1.0" }
 zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.7" }
 zeroclaw-buildinfo = { path = "crates/zeroclaw-buildinfo", version = "0.8.7" }
 zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.7" }
