@@ -1603,7 +1603,7 @@ fn format_telegram_text_chunk(chunk: &str, index: usize, total: usize) -> String
 /// splitter would drop or repeat text.
 fn delivery_chunks(message: &str, rich: bool) -> Vec<String> {
     if !rich {
-        return split_message_for_telegram(message);
+        return split_message_for_telegram_keeping_tables(message);
     }
     let prepared = prepare_rich_markdown(message);
     let budget = TELEGRAM_RICH_MAX_MESSAGE_LENGTH
@@ -12333,6 +12333,136 @@ mod tests {
             1,
             "the unsent HTML piece must be sent once: {bodies:?}"
         );
+    }
+
+    async fn assert_non_rich_table_resume(finalize: bool) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Repeated headers make the physical table sends outnumber plain chunks.
+        // Fail only after accepting more pieces than the old progress list held.
+        let mut narration = format!("| {} | Detail |\n| --- | --- |\n", "H".repeat(3_000));
+        for row in 0..12 {
+            narration.push_str(&format!("| ROW{row:03} | {} |\n", "v".repeat(480)));
+        }
+        let narration = narration.trim().to_string();
+        let chunks = split_message_for_telegram_keeping_tables(&narration);
+        let accepted = split_message_for_telegram(&narration).len() + 1;
+        assert!(
+            chunks.len() > accepted,
+            "fixture must retain an unsent table piece"
+        );
+
+        let fail_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(CountingSend {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_from: accepted,
+                fail_until: usize::MAX,
+            })
+            .mount(&fail_server)
+            .await;
+        let channel = multi_message_test_channel("telegram_test_alias", 0)
+            .with_mock_api_base(fail_server.uri());
+        assert!(
+            !channel.rich_messages_enabled(),
+            "default delivery remains HTML"
+        );
+        let recipient = "123:7";
+        let draft_id = seed_narration_draft(&channel, recipient, &narration);
+        channel.flush_unsent(recipient, &draft_id).await.unwrap();
+        {
+            let drafts = channel.multi_message_drafts.lock();
+            let draft = drafts
+                .get(&TelegramChannel::multi_draft_key(recipient, &draft_id))
+                .expect("partial flush retains the draft");
+            assert_eq!(draft.delivered_chunks, accepted);
+            assert_eq!(draft.delivery_rich, Some(false));
+            assert!(draft.sent_text.is_empty());
+        }
+        let failed_requests = fail_server.received_requests().await.unwrap();
+        assert_eq!(
+            failed_requests.len(),
+            accepted + 2,
+            "HTML and plain retries fail"
+        );
+
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 2 }
+            })))
+            .mount(&resume_server)
+            .await;
+        let channel = channel.with_mock_api_base(resume_server.uri());
+        let final_answer = "Final answer after table narration.";
+        if finalize {
+            channel
+                .finalize_multi_message_draft(recipient, &draft_id, final_answer, true)
+                .await
+                .unwrap();
+            assert!(channel.multi_message_drafts.lock().is_empty());
+        } else {
+            channel.flush_unsent(recipient, &draft_id).await.unwrap();
+            let drafts = channel.multi_message_drafts.lock();
+            let draft = drafts
+                .get(&TelegramChannel::multi_draft_key(recipient, &draft_id))
+                .expect("successful flush retains the draft");
+            assert_eq!(draft.sent_text, narration);
+            assert_eq!(draft.delivered_chunks, 0);
+            assert_eq!(draft.delivery_rich, None);
+        }
+        let resumed_requests = resume_server.received_requests().await.unwrap();
+        let successful_requests = failed_requests
+            .iter()
+            .take(accepted)
+            .chain(resumed_requests.iter());
+        let mut successful_texts = Vec::new();
+        for request in successful_requests {
+            assert!(request.url.path().ends_with("/sendMessage"));
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["chat_id"], "123");
+            assert_eq!(body["message_thread_id"], "7");
+            assert_eq!(body["parse_mode"], "HTML");
+            successful_texts.push(body["text"].as_str().unwrap().to_string());
+        }
+        for row in 0..12 {
+            assert_eq!(
+                successful_texts
+                    .iter()
+                    .filter(|text| text.contains(&format!("ROW{row:03}")))
+                    .count(),
+                1,
+                "each table row must be accepted once across the failed flush and resume"
+            );
+        }
+        let mut expected: Vec<String> = (0..chunks.len())
+            .map(|index| {
+                TelegramChannel::markdown_to_telegram_html(
+                    &telegram_chunk_payload(&chunks, index, false).unwrap(),
+                )
+            })
+            .collect();
+        if finalize {
+            expected.push(final_answer.to_string());
+        }
+        assert_eq!(
+            successful_texts, expected,
+            "resume preserves order and the final answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_unsent_resumes_non_rich_table_without_repeating_accepted_prefix() {
+        assert_non_rich_table_resume(false).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_multi_message_resumes_non_rich_table_without_repeating_accepted_prefix() {
+        assert_non_rich_table_resume(true).await;
     }
 
     fn rich_multi_message_channel_with_authority(
