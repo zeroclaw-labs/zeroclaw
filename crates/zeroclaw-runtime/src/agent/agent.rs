@@ -12474,7 +12474,8 @@ mod tests {
             Arc::clone(&pending),
             switch_tool.execute(serde_json::json!({
                 "action": "set",
-                "model_provider": "custom.gateway.renamed.renamed"
+                "model_provider": "custom.gateway.renamed",
+                "model": "updated-model"
             })),
         )
         .await
@@ -12482,10 +12483,7 @@ mod tests {
         assert!(switched.success, "{:?}", switched.error);
         assert_eq!(
             pending.lock().unwrap().as_ref(),
-            Some(&(
-                "custom.gateway.renamed.renamed".into(),
-                "updated-model".into()
-            ))
+            Some(&("custom.gateway.renamed".into(), "updated-model".into()))
         );
         let llm_task = agent
             .tools
