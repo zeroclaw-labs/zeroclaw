@@ -597,69 +597,55 @@ fn path_is_unc(path: &Path) -> bool {
     }
 }
 
-/// Map local Windows extended paths (`\\?\D:\…`, `//?/D:/…`) to the drive
-/// spelling used in `forbidden_paths` / `allowed_roots` (`D:\…`).
-///
-/// Cron and other string-only checkers compare the original command spelling
-/// against policy roots. Without this, `\\?\D:\secret` would miss a `D:\`
-/// forbidden entry after we stopped treating local extended paths as UNC.
-/// UNC long-form (`\\?\UNC\…`) is left unchanged so share refusal stays intact.
-fn strip_windows_local_extended_prefix(path: &Path) -> PathBuf {
-    let lossy = path.to_string_lossy();
-    let text = lossy.as_ref();
-    let rest = if let Some(r) = text.strip_prefix(r"\\?\") {
-        r
-    } else if let Some(r) = text.strip_prefix("//?/") {
-        r
-    } else if let Some(r) = text.strip_prefix(r"//?\") {
-        r
-    } else {
-        return path.to_path_buf();
-    };
-    // Leave `UNC\server\share` alone.
-    if rest.len() >= 3 && rest.as_bytes()[..3].eq_ignore_ascii_case(b"UNC") {
-        let b = rest.as_bytes();
-        if b.len() == 3 || b.get(3).is_some_and(|c| *c == b'\\' || *c == b'/') {
-            return path.to_path_buf();
+/// Normalize genuine Windows spellings into the same policy namespace on both
+/// sides of a comparison. Native Unix paths retain literal backslashes and case.
+/// Drive paths also occur in string-only checks on non-Windows hosts.
+fn windows_policy_path(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    let mut normalized = text.replace('/', "\\");
+    let mut extended = false;
+    if let Some(rest) = normalized.strip_prefix(r"\\?\") {
+        if has_windows_drive_prefix(rest) && !is_windows_drive_relative(rest) {
+            normalized = rest.to_owned();
+            extended = true;
+        } else if rest
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"UNC\"))
+        {
+            normalized = format!(r"\\{}", &rest[4..]);
+            extended = true;
         }
     }
-    // Drive-qualified local extended path: `D:\…` or `D:/…`
-    let rb = rest.as_bytes();
-    if rb.len() >= 2 && rb[1] == b':' && rb[0].is_ascii_alphabetic() {
-        return PathBuf::from(rest);
+    if cfg!(windows)
+        || extended
+        || has_windows_drive_prefix(text)
+        || (text.starts_with(r"\\") && path_text_is_unc(text))
+    {
+        Some(normalized.to_ascii_lowercase())
+    } else {
+        None
     }
-    path.to_path_buf()
 }
 
-/// Prefix match that understands Windows drive spellings on every host.
-///
-/// `Path::starts_with` only splits on the host separator, so on Unix a lexical
-/// `D:\Users\…` path is a single component and never matches a `D:\` forbidden
-/// root. Cron and cross-platform PowerShell still feed those spellings into
-/// [`SecurityPolicy::is_path_allowed`], so compare normalized drive strings too.
+/// Prefix matching and specificity must use the same path namespace. A single
+/// backslash in a Unix filename is not a separator or a reason to fold case.
 fn path_starts_with_policy_prefix(path: &Path, prefix: &Path) -> bool {
     if path.starts_with(prefix) {
         return true;
     }
-    let path_s = path.to_string_lossy();
-    let prefix_s = prefix.to_string_lossy();
-    if !(has_windows_drive_prefix(&path_s)
-        || has_windows_drive_prefix(&prefix_s)
-        || path_s.contains('\\')
-        || prefix_s.contains('\\'))
-    {
-        return false;
+    match (windows_policy_path(path), windows_policy_path(prefix)) {
+        (Some(path), Some(prefix)) => {
+            let prefix = prefix.trim_end_matches('\\');
+            if prefix.is_empty() {
+                return path == prefix;
+            }
+            path == prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('\\'))
+        }
+        _ => false,
     }
-    let norm = |s: &str| s.replace('/', "\\").to_ascii_lowercase();
-    let p = norm(&path_s);
-    let mut f = norm(&prefix_s);
-    while f.ends_with('\\') {
-        f.pop();
-    }
-    if f.is_empty() {
-        return false;
-    }
-    p == f || p.starts_with(&format!("{f}\\"))
 }
 
 fn roots_contain(roots: &[PathBuf], expanded: &Path) -> bool {
@@ -688,16 +674,29 @@ fn prefix_match_depth(prefix: &Path, target: &Path) -> Option<usize> {
     if !path_starts_with_policy_prefix(target, prefix) {
         return None;
     }
-    let native = prefix
-        .components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        .count();
-    if native > 0 {
-        Some(native)
-    } else {
-        // Drive-root style prefixes may have no Normal components on Unix.
-        Some(1)
+    if let Some(windows) = windows_policy_path(prefix) {
+        // Drive and UNC prefixes identify a namespace, not a child directory.
+        // Count Windows components even when reviewing lexical paths on Unix.
+        let (rest, skip) = if has_windows_drive_prefix(&windows) {
+            (&windows[2..], 0)
+        } else if let Some(rest) = windows.strip_prefix(r"\\") {
+            (rest, 2) // server and share form the UNC root
+        } else {
+            (windows.as_str(), 0)
+        };
+        return Some(
+            rest.split('\\')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .skip(skip)
+                .count(),
+        );
     }
+    Some(
+        prefix
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count(),
+    )
 }
 
 /// Namespace in which competing path-policy rules are compared.
@@ -5207,9 +5206,8 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Expand "~" for consistent matching with forbidden paths and allowlists.
-        // Strip local `\?\` prefixes so drive forbidden roots still match.
-        let expanded_path = strip_windows_local_extended_prefix(&expand_user_path(path));
+        // Expand "~"; the matcher normalizes Windows targets and roots together.
+        let expanded_path = expand_user_path(path);
 
         // The host null device is always permitted regardless of workspace or
         // forbidden-path config (`/dev/null` on Unix, `nul` on Windows); the
@@ -5218,7 +5216,12 @@ impl SecurityPolicy {
             return true;
         }
 
-        if expanded_path.is_absolute() {
+        let windows_path = windows_policy_path(&expanded_path);
+        let windows_absolute = windows_path.as_deref().is_some_and(|path| {
+            (has_windows_drive_prefix(path) && !is_windows_drive_relative(path))
+                || path_text_is_unc(path)
+        });
+        if expanded_path.is_absolute() || windows_absolute {
             let in_workspace = path_starts_with_policy_prefix(&expanded_path, &self.workspace_dir);
             let in_allowed_root = self
                 .allowed_roots
@@ -12549,6 +12552,165 @@ mod tests {
         assert_eq!(attached_short_option_value("--long"), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn policy_prefix_preserves_native_unix_components_and_case() {
+        assert!(!path_starts_with_policy_prefix(
+            Path::new(r"/srv/project\secret"),
+            Path::new("/srv/project"),
+        ));
+        assert!(!path_starts_with_policy_prefix(
+            Path::new(r"/srv/project\Root/file"),
+            Path::new(r"/srv/Project\Root"),
+        ));
+        assert!(path_starts_with_policy_prefix(
+            Path::new(r"/srv/Project\Root/file"),
+            Path::new(r"/srv/Project\Root"),
+        ));
+        // Leading double slashes do not turn a native Unix path into UNC.
+        assert!(!path_starts_with_policy_prefix(
+            Path::new("//srv/Project/file"),
+            Path::new("//srv/project"),
+        ));
+        assert_eq!(
+            prefix_match_depth(Path::new("/"), Path::new("/work/file")),
+            Some(0)
+        );
+        assert_eq!(
+            prefix_match_depth(Path::new("/work"), Path::new("/work/file")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn policy_prefix_counts_windows_components_on_every_host() {
+        for (root, target, depth) in [
+            (r"D:\", r"D:\work\file", 0),
+            (r"D:\work", r"D:\work\file", 1),
+            ("D:/work/nested", r"d:\WORK\nested\file", 2),
+            (r"\\?\D:\", r"D:\work\file", 0),
+            (r"\\?\D:\work", r"D:\work\file", 1),
+            (r"\\server\share", r"\\?\UNC\SERVER\share\file", 0),
+            (r"\\?\UNC\server\share\work", r"\\server\share\work\file", 1),
+        ] {
+            assert_eq!(
+                prefix_match_depth(Path::new(root), Path::new(target)),
+                Some(depth),
+                "{root} -> {target}"
+            );
+        }
+        assert_eq!(
+            prefix_match_depth(Path::new(r"D:\work"), Path::new(r"D:\workspace\file")),
+            None
+        );
+        assert_eq!(
+            prefix_match_depth(
+                Path::new(r"D:\work"),
+                Path::new(r"\\server\share\work\file")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_policy_roots_override_drive_denial_without_losing_equal_depth_denies() {
+        for root in [r"D:\work", r"\\?\D:\work", "//?/D:/work"] {
+            for workspace_grant in [true, false] {
+                let mut policy = SecurityPolicy {
+                    workspace_only: false,
+                    workspace_dir: PathBuf::from(r"C:\workspace"),
+                    ..SecurityPolicy::default()
+                };
+                // Windows keeps its actual defaults. Other hosts use the same
+                // drive deny to exercise the lexical Windows path namespace.
+                #[cfg(not(windows))]
+                policy.forbidden_paths.push(r"D:\".into());
+                assert!(policy.forbidden_paths.iter().any(|path| path == r"D:\"));
+                if workspace_grant {
+                    policy.workspace_dir = PathBuf::from(root);
+                } else {
+                    policy.allowed_roots.push(PathBuf::from(root));
+                }
+                for target in [
+                    r"D:\work\file",
+                    r"\\?\d:\WORK\file",
+                    "//?/D:/work/file",
+                    "d:/WORK/file",
+                ] {
+                    assert!(
+                        policy.is_path_allowed(target),
+                        "root {root}, target {target}, workspace {workspace_grant}"
+                    );
+                }
+                assert!(!policy.is_path_allowed(r"D:\elsewhere\file"));
+                assert!(!policy.is_path_allowed(r"D:\workspace\file"));
+                policy.forbidden_paths.push(r"\\?\D:\work\private".into());
+                assert!(!policy.is_path_allowed(r"D:\work\private\secret"));
+                policy.forbidden_paths.push(root.into());
+                assert!(
+                    !policy.is_path_allowed(r"D:\work\file"),
+                    "equal-depth deny must win"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_policy_refuses_unix_backslash_sibling_for_reads_and_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let child = workspace.join(r"literal\name");
+        let sibling = root.path().join(r"project\secret");
+        std::fs::write(&child, "inside").unwrap();
+        std::fs::write(&sibling, "outside").unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        };
+        let child = child.canonicalize().unwrap();
+        let sibling = sibling.canonicalize().unwrap();
+        assert!(policy.is_path_allowed(child.to_str().unwrap()));
+        assert!(policy.is_resolved_path_readable(&child));
+        assert!(policy.is_resolved_path_allowed(&child));
+        assert!(!policy.is_path_allowed(sibling.to_str().unwrap()));
+        assert!(!policy.is_resolved_path_readable(&sibling));
+        assert!(!policy.is_resolved_path_allowed(&sibling));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolved_windows_first_level_grants_beat_default_drive_denial() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("policy-control.txt");
+        std::fs::write(&file, "control").unwrap();
+        let file = file.canonicalize().unwrap();
+        let mut first_level = PathBuf::new();
+        for component in file.components() {
+            first_level.push(component.as_os_str());
+            if matches!(component, std::path::Component::Normal(_)) {
+                break;
+            }
+        }
+        for workspace_grant in [true, false] {
+            let mut policy = SecurityPolicy::default();
+            if workspace_grant {
+                policy.workspace_dir = first_level.clone();
+            } else {
+                policy.workspace_dir = temporary.path().join("unrelated");
+                policy.allowed_roots.push(first_level.clone());
+            }
+            assert!(policy.is_resolved_path_readable(&file));
+            assert!(policy.is_resolved_path_allowed(&file));
+            policy
+                .forbidden_paths
+                .push(first_level.to_str().unwrap().into());
+            assert!(!policy.is_resolved_path_readable(&file));
+            assert!(!policy.is_resolved_path_allowed(&file));
+        }
+    }
+
     #[test]
     fn local_extended_path_matches_drive_forbidden_roots() {
         // String-only check (cron): local extended paths must still hit drive forbidden roots.
@@ -12565,7 +12727,6 @@ mod tests {
         assert!(!p.is_path_allowed(r"//?/D:/secret.txt"));
         assert!(!p.is_path_allowed(r"D:\Users\alice\.ssh\id_rsa"));
         let mut allow = p.clone();
-        allow.forbidden_paths = vec![r"C:\Windows".into()];
         allow.allowed_roots = vec![PathBuf::from(r"D:\data")];
         assert!(allow.is_path_allowed(r"\\?\D:\data\report.txt"));
         // UNC long-form must stay classified as UNC (not stripped to a drive root).

@@ -18883,14 +18883,13 @@ const FILESYSTEM_BROAD_ROOTS: [&str; 8] = [
 /// WSL DrvFs mounts look like `/mnt/c`. Watching one is as broad as watching a
 /// Windows drive root; named bind mounts such as `/mnt/inbox` stay allowed.
 fn filesystem_path_is_drvfs_mnt_letter(path: &str) -> bool {
-    let trimmed = path.trim_end_matches('/');
-    let Some(rest) = trimmed.strip_prefix("/mnt/") else {
+    if !path.starts_with('/') {
         return false;
-    };
-    // Collapse `.` / empty segments so `/mnt/./c`, `/mnt//c`, and `/mnt/c/.`
-    // still count as the WSL drive root `/mnt/c`.
+    }
+    // Normalize the whole absolute spelling before recognizing /mnt/<drive>:
+    // dot/parent segments can appear before /mnt as well as after it.
     let mut parts: Vec<&str> = Vec::new();
-    for part in rest.split('/') {
+    for part in path.split('/') {
         match part {
             "" | "." => {}
             ".." => {
@@ -18901,7 +18900,7 @@ fn filesystem_path_is_drvfs_mnt_letter(path: &str) -> bool {
     }
     matches!(
         parts.as_slice(),
-        [letter]
+        ["mnt", letter]
             if letter.len() == 1 && letter.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
     )
 }
@@ -30800,7 +30799,18 @@ zeroclaw-operators = "operator"
 
     #[test]
     async fn filesystem_validate_rejects_drvfs_mnt_letter_by_default() {
-        for root in ["/mnt/c", "/mnt/C/", "/mnt/d"] {
+        for root in [
+            "/mnt/c",
+            "/mnt/C/",
+            "/mnt/d",
+            "/mnt/./c",
+            "/mnt//c",
+            "/mnt/c/.",
+            "/./mnt/c",
+            "/mnt/../mnt/c",
+            "/tmp/../mnt/c",
+            "/../../mnt/c",
+        ] {
             let cfg = FilesystemConfig {
                 enabled: true,
                 paths: vec![root.into()],
@@ -30818,14 +30828,18 @@ zeroclaw-operators = "operator"
     async fn filesystem_validate_allows_named_mnt_bind_and_drvfs_escape_hatch() {
         let named = FilesystemConfig {
             enabled: true,
-            paths: vec!["/mnt/inbox".into()],
+            paths: vec![
+                "/mnt/inbox".into(),
+                "/mnt/c/Users".into(),
+                "/./mnt/inbox".into(),
+            ],
             ..FilesystemConfig::default()
         };
         assert!(named.validate().is_ok());
 
         let escape = FilesystemConfig {
             enabled: true,
-            paths: vec!["/mnt/c".into()],
+            paths: vec!["/mnt/c".into(), "/./mnt/c".into(), "/mnt/../mnt/c".into()],
             allow_broad_roots: true,
             ..FilesystemConfig::default()
         };
