@@ -82,7 +82,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
 
   return (
     <>
-      <header className="h-14 flex items-center justify-between px-6 border-b animate-fade-in relative" style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', backdropFilter: 'blur(12px)', zIndex: 100 }}>
+      <header className="h-14 flex items-center justify-between px-3 sm:px-6 border-b animate-fade-in relative" style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', backdropFilter: 'blur(12px)', zIndex: 100 }}>
         <div className="flex items-center gap-3 min-w-0">
           {/* Hamburger — opens the mobile drawer; hidden on desktop where the
               slim rail is always present. */}
@@ -98,13 +98,13 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
           {/* Page title — the primary on-screen label for the current section
               now that the rail is icon-only. Truncates (rather than pushing the
               action cluster) so the right-side icons never get squeezed. */}
-          <h1 className="h-9 leading-9 text-lg font-semibold tracking-tight truncate min-w-0" style={{ color: 'var(--pc-text-primary)' }}>{pageTitle}</h1>
+          <h1 className="h-9 leading-9 text-base sm:text-lg font-semibold tracking-tight truncate min-w-0" style={{ color: 'var(--pc-text-primary)' }}>{pageTitle}</h1>
         </div>
 
         {/* Right-side controls. shrink-0 so the title yields first and these
             keep their size (icons here are flex items that would otherwise
             collapse in a tight row). */}
-        <div className="flex items-center gap-2 h-9 shrink-0">
+        <div className="flex items-center gap-1 sm:gap-2 h-9 shrink-0">
           {/* Command-palette trigger — styled like a search field. Opens the
               palette; the same action is bound globally to ⌘K / Ctrl+K, shown
               as a hint chip on the right. */}
@@ -148,12 +148,12 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
               onClick={() => setLangOpen(!langOpen)}
               aria-expanded={langOpen}
               aria-label={t('settings.language')}
-              className="h-9 px-3 text-xs font-semibold gap-1.5"
+              className="h-9 px-1.5 sm:px-3 text-xs font-semibold gap-1.5"
               style={{ background: 'var(--pc-bg-elevated)' }}
             >
               <Globe className="h-[20px] w-[20px] shrink-0" />
-              {locale.toUpperCase()}
-              <ChevronDown className="h-3 w-3 shrink-0" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
+              <span className="hidden sm:inline">{locale.toUpperCase()}</span>
+              <ChevronDown className="hidden sm:block h-3 w-3 shrink-0" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
             </Button>
 
             {langOpen && (
@@ -207,7 +207,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
           <Button
             variant="ghost"
             onClick={handleLogout}
-            className="h-9 px-3 text-xs gap-1.5 hover:text-status-error hover:border-status-error/25 hover:bg-status-error/10"
+            className="h-9 px-2 sm:px-3 text-xs gap-1.5 hover:text-status-error hover:border-status-error/25 hover:bg-status-error/10"
             aria-label={t('auth.logout')}
           >
             <LogOut className="h-[20px] w-[20px] shrink-0" />
