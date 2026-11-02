@@ -217,13 +217,25 @@ COPY --from=config-gen /rootfs/ /rootfs/
 # Copy web dashboard dist
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
 
+# The upstream StageX bundle still contains an incident root. Materialize only
+# the filtered bundle and aliases: copying its original per-root files would
+# let native consumers or update-ca-certificates restore the distrusted roots.
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS ca-bundle
+COPY --from=docker.io/stagex/core-ca-certificates@sha256:fe24a3809eba30972b64ddd8b611a6494bebea7631f805d795cec4241f5a11c6 /etc/ssl/certs/ca-certificates.crt /tmp/source-ca.crt
+COPY dev/ci/filter-emudhra-ca-bundle.sh /tmp/filter-emudhra-ca-bundle.sh
+RUN mkdir -p /rootfs/etc/ssl/certs /rootfs/etc/ssl1.1 \
+    && sh /tmp/filter-emudhra-ca-bundle.sh /tmp/source-ca.crt /rootfs/etc/ssl/certs/ca-certificates.crt \
+    && ln -s certs/ca-certificates.crt /rootfs/etc/ssl/cert.pem \
+    && ln -s ../ssl/cert.pem /rootfs/etc/ssl1.1/cert.pem \
+    && ln -s ../ssl/certs /rootfs/etc/ssl1.1/certs
+
 # ── Stage: package (minimal runtime) ─────────────────────────
 FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96ca181ea224df7bff40e1833c3db13 AS package
 
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build /rootfs/ /
 COPY --from=build --chown=65534:65534 /rootfs/zeroclaw-data /zeroclaw-data
-COPY --from=docker.io/stagex/core-ca-certificates@sha256:7773dae6630aa3bdcc82cfec6c9265c0c501aaf0af67cc73631b09e1cff1b094 / /
+COPY --from=ca-bundle /rootfs/ /
 
 ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
@@ -312,7 +324,7 @@ FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build-fat /rootfs/ /
 COPY --from=build-fat --chown=65534:65534 /rootfs/zeroclaw-data /zeroclaw-data
-COPY --from=docker.io/stagex/core-ca-certificates@sha256:7773dae6630aa3bdcc82cfec6c9265c0c501aaf0af67cc73631b09e1cff1b094 / /
+COPY --from=ca-bundle /rootfs/ /
 
 ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
