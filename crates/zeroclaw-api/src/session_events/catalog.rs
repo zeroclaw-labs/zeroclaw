@@ -39,7 +39,6 @@ pub struct SessionIndexRecord {
     pub category: Option<String>,
     pub project: Option<String>,
     pub parent_session_id: Option<SessionId>,
-    pub parent_thread_id: Option<SessionId>,
     pub parent_agent: Option<String>,
     pub owning_agent: Option<String>,
     pub closed: bool,
@@ -243,6 +242,30 @@ impl SessionReducer {
         Ok(())
     }
 
+    /// Apply a branch-scoped projection while still advancing over the full
+    /// event prefix. Branch filtering belongs to the projection boundary;
+    /// the underlying event sequence remains contiguous and is still checked.
+    pub fn apply_scoped(
+        &mut self,
+        event: &SessionEvent,
+        seed_count: Option<usize>,
+        include: bool,
+    ) -> Result<(), ReadError> {
+        if include {
+            return self.apply(event, seed_count);
+        }
+        if event.session_id != self.stream || self.sequence.checked_add(1) != Some(event.sequence) {
+            return Err(ReadError::Gap(
+                "session projection received noncontiguous event".into(),
+            ));
+        }
+        self.sequence = event.sequence;
+        if let Some(detail) = self.record.as_mut() {
+            detail.session.head.sequence = event.sequence;
+        }
+        Ok(())
+    }
+
     pub fn pending_metadata(&self) -> impl Iterator<Item = (&str, u64, &StoredPayloadRef)> {
         self.metadata
             .iter()
@@ -350,6 +373,16 @@ impl SessionReducer {
                     projection::TurnStatus::Queued | projection::TurnStatus::Running
                 )
             });
+            if detail.session.closed
+                && detail
+                    .session
+                    .fields
+                    .get("session_kind")
+                    .and_then(Value::as_str)
+                    == Some("temporary")
+            {
+                detail.session.deleted = true;
+            }
         }
         Ok(self.record)
     }

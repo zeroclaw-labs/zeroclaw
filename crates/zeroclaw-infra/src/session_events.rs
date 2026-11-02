@@ -145,9 +145,8 @@ fn event_page(
     })
 }
 
-/// SQLite event backend. The legacy `sessions` tables remain owned by the
-/// compatibility SessionBackend; this backend uses a separate database so it
-/// cannot accidentally double-write the old transcript.
+/// SQLite event backend. Legacy transcript databases are read only by the
+/// installation importer and renamed as backups after successful import.
 pub struct SqliteEventStore {
     conn: Mutex<Connection>,
     validation: Mutex<Option<ValidationSnapshot>>,
@@ -214,7 +213,6 @@ impl SqliteEventStore {
                last_seq INTEGER NOT NULL,
                PRIMARY KEY(session_id, idempotency_key)
              );
-             DROP INDEX IF EXISTS session_events_stream_seq;
              CREATE INDEX IF NOT EXISTS session_events_latest_by_branch_kind
                ON session_events(session_id, json_extract(event_json, '$.branch_id'), json_extract(event_json, '$.kind'), sequence DESC);
              CREATE INDEX IF NOT EXISTS session_events_latest_by_turn_kind
@@ -808,6 +806,7 @@ pub mod migration;
 pub mod ownership;
 pub mod scoped;
 mod sqlite_history;
+mod temporary;
 pub mod upgrade;
 pub use jsonl::JsonlEventStore;
 

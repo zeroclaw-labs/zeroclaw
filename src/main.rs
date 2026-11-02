@@ -10251,10 +10251,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 ));
                 source.sessions().await?;
                 let store = Some(std::sync::Arc::new(
-                    zeroclaw_infra::session_repository::SessionRepository::for_namespace(
-                        &config.data_dir,
-                        "acp_",
-                    )?,
+                    zeroclaw_infra::session_repository::SessionRepository::new(&config.data_dir)?,
                 ));
                 let server = channels::acp_server::AcpServer::new_stdio_with_authority(
                     &authority, acp_config, store,

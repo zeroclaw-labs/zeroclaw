@@ -4,10 +4,7 @@
 //! key-name redaction heuristic. Approval decisions bind to `request_id`; this
 //! transport forwards the summary without rebuilding it from raw arguments.
 
-use super::{
-    AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
-    remove_cancel_token_if_current,
-};
+use super::{AppState, gateway_cancel_key, register_cancel_token, remove_cancel_token_if_current};
 use crate::ws_approval::{
     PendingApprovals, WsApprovalChannel, new_pending_approvals, record_rejected_reply,
     resolve_approval_reply,
@@ -490,10 +487,8 @@ async fn handle_socket(
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    // Transcript identity keeps the raw display id (`gw_{session_id}`) so
-    // existing persisted histories and metadata rows stay resumable across
-    // reconnects.
-    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    // Persistence, execution and cancellation use one canonical session id.
+    let session_key = session_id.clone();
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
@@ -1205,7 +1200,7 @@ fn detach_mid_turn(session_key: &str, turn_id: &str, pending_approvals: &Pending
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
             ::serde_json::json!({
-                "session_key": session_key,
+                "session_id": session_key,
                 "trace_id": turn_id,
                 "parked_approvals": parked.len(),
             })
@@ -2156,7 +2151,7 @@ async fn process_chat_message(
                     "model_provider": &provider_label,
                     "model": cancel_model,
                     "provider_ref": cancel_provider_ref,
-                    "session_key": session_key,
+                    "session_id": session_key,
                     "reason": "interrupted by user",
                     "cancelled": true,
                     "trace_id": turn_id,
@@ -2331,7 +2326,7 @@ async fn process_chat_message(
                         "model_provider": &provider_label,
                         "model": effective_model,
                         "provider_ref": provider_ref_full,
-                        "session_key": session_key,
+                        "session_id": session_key,
                         "input_tokens": usage_fold.total_input_tokens,
                         "output_tokens": usage_fold.total_output_tokens,
                         "tokens_used": total_tokens,
@@ -2384,7 +2379,7 @@ async fn process_chat_message(
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_label,
                         "model": turn_model,
-                        "session_key": session_key,
+                        "session_id": session_key,
                         "error": zeroclaw_providers::sanitize_api_error(&e.error.to_string()),
                         "error_code": err["code"],
                         "trace_id": turn_id,
@@ -3146,7 +3141,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         for backend in ["sqlite", "jsonl"] {
             for malformed in [false, true] {
                 let session_id = "approval-audit-failure";
-                let key = format!("gw_{session_id}");
+                let key = session_id.to_owned();
                 let mut fixture = ParkedTurnFixture::spawn_with_native(Some((backend, &key))).await;
                 let (mut client, _) = fixture.connect(session_id).await;
                 fixture
@@ -3267,7 +3262,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     async fn native_websocket_terminal_write_inner() {
         for backend in ["sqlite", "jsonl"] {
             let session_id = "native-terminal";
-            let key = format!("gw_{session_id}");
+            let key = session_id.to_owned();
             let mut fixture = ParkedTurnFixture::spawn_with_native(Some((backend, &key))).await;
             let (mut client, _) = fixture.connect(session_id).await;
             fixture
@@ -3346,7 +3341,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     async fn native_websocket_disconnect_preserves_turn_and_reconnect_reuses_events_inner() {
         for backend in ["sqlite", "jsonl"] {
             let session_id = "native-disconnect";
-            let session_key = format!("gw_{session_id}");
+            let session_key = session_id.to_owned();
             let mut fixture =
                 ParkedTurnFixture::spawn_with_native(Some((backend, &session_key))).await;
             let (mut client, greeting) = fixture.connect(session_id).await;
@@ -3421,7 +3416,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         // on the same session resumes the completed transcript.
         let mut fixture = ParkedTurnFixture::spawn().await;
         let session_id = "detach-regression";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let session_key = session_id.to_owned();
         let (mut client, session_start) = fixture.connect(session_id).await;
         assert_eq!(session_start["resumed"], false);
 
@@ -3490,7 +3485,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         // run on the transcript the turn persisted, not on the stale snapshot.
         let mut fixture = ParkedTurnFixture::spawn().await;
         let session_id = "detach-reconnect";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let session_key = session_id.to_owned();
         let first_prompt = "start the long task";
         let follow_up = "now continue from where that left off";
 
@@ -3816,7 +3811,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         // Deletion closes execution and preserves the canonical audit history.
         let mut fixture = ParkedTurnFixture::spawn().await;
         let session_id = "delete-serialized";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let session_key = session_id.to_owned();
         let (mut client, _) = fixture.connect(session_id).await;
         fixture
             .start_parked_turn(&mut client, "work in progress")
@@ -3871,7 +3866,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         // turn neither hot-loops nor outlives an abort.
         let mut fixture = ParkedTurnFixture::spawn().await;
         let session_id = "detach-then-abort";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let session_key = session_id.to_owned();
         let (mut client, _) = fixture.connect(session_id).await;
         fixture
             .start_parked_turn(&mut client, "keep working until I say stop")
@@ -4773,7 +4768,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             },
         );
 
-        detach_mid_turn("gw_detached", "turn-1", &pending);
+        detach_mid_turn("detached", "turn-1", &pending);
 
         assert!(
             pending.lock().is_empty(),
@@ -4792,14 +4787,14 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
         assert_eq!(
             session_queue_ws_error_code(&SessionQueueError::QueueFull {
-                session_id: "gw_test".into(),
+                session_id: "test".into(),
                 depth: 2,
             }),
             "SESSION_QUEUE_FULL"
         );
         assert_eq!(
             session_queue_ws_error_code(&SessionQueueError::Timeout {
-                session_id: "gw_test".into(),
+                session_id: "test".into(),
             }),
             "SESSION_QUEUE_TIMEOUT"
         );

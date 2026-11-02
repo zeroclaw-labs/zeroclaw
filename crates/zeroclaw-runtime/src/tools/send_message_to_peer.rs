@@ -1840,7 +1840,7 @@ mod tests {
                 1,
                 "revocation never causes provider replay"
             );
-            let family = format!("peer-inbox:{task_id}");
+            let family = task_id.clone();
             let source = source.expect("native source");
             let stream = zeroclaw_kernel::session::engine::EngineSessionSource::session_id(
                 source.as_ref(),
@@ -1935,7 +1935,7 @@ mod tests {
         .expect("peer task should reach a terminal state");
         assert_eq!(terminal_snapshot.task.status, TaskStatus::Completed);
         if let Some(source) = &source {
-            let family = format!("peer-inbox:{task_id}");
+            let family = task_id.clone();
             let stream = zeroclaw_kernel::session::engine::EngineSessionSource::session_id(
                 source.as_ref(),
                 &family,

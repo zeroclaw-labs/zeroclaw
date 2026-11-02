@@ -1348,7 +1348,10 @@ async fn run_agent_job_for_occurrence(
             let Some(admission) = execution_admission.clone() else {
                 return Some((false, "cron_history_target_admission_missing".into()));
             };
-            let family = format!("cron:{agent_alias}:{}", session_path.display());
+            let family = match job.session_target {
+                SessionTarget::Main => format!("main-{agent_alias}"),
+                SessionTarget::Isolated => run_session_id.clone(),
+            };
             let opened = async {
                 let actor = zeroclaw_api::session_events::EventActor::System {
                     component: "cron_scheduler".into(),
@@ -3261,7 +3264,7 @@ mod tests {
                 _authority: Arc<dyn EngineSessionAuthority>,
                 _initial: ContextSnapshot,
             ) -> Result<Arc<dyn SessionExecutionPort>> {
-                assert_eq!(family, format!("cron:{TEST_AGENT}:main"));
+                assert_eq!(family, format!("main-{TEST_AGENT}"));
                 assert_eq!(creation_source, "cron");
                 assert_eq!(alias, TEST_AGENT);
                 assert_eq!(component, "cron_scheduler");
@@ -3489,7 +3492,7 @@ mod tests {
                 1,
                 "{backend}"
             );
-            let family = format!("cron:{TEST_AGENT}:main");
+            let family = format!("main-{TEST_AGENT}");
             let stream = source.session_id(&family).await.expect("stream");
             let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 &config.data_dir,

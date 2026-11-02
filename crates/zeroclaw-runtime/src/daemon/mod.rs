@@ -1047,10 +1047,7 @@ pub async fn run_with_authority(
         // source has already upgraded storage; no ACP database is created.
         let session_repository: Option<
             std::sync::Arc<zeroclaw_infra::session_repository::SessionRepository>,
-        > = match zeroclaw_infra::session_repository::SessionRepository::for_namespace(
-            &config.data_dir,
-            "acp_",
-        ) {
+        > = match zeroclaw_infra::session_repository::SessionRepository::new(&config.data_dir) {
             Ok(s) => Some(std::sync::Arc::new(s)),
             Err(e) => {
                 ::zeroclaw_log::record!(

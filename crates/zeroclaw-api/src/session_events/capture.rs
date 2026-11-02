@@ -571,13 +571,24 @@ pub trait SessionExecutionPort: Send + Sync {
     async fn reject_pending_input(&self, _turn_id: &str, _reason_key: &str) -> anyhow::Result<()> {
         anyhow::bail!("session_pending_rejection_unsupported")
     }
-    /// Register bytes under the identity already allocated by the file owner.
-    /// This observes an admitted rendition; it does not grant file access.
+    /// Create a new branch at a frozen point in this session.
     async fn fork_branch(
         &self,
         _branch: BranchId,
         _cursor: EventCursor,
     ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
+        anyhow::bail!("session_branch_control_unsupported")
+    }
+    /// Select an existing branch after opening its session. The branch origin
+    /// and current access are resolved from canonical events, including after
+    /// process restart. This does not create a new branch or copy its history.
+    async fn resume_branch(
+        &self,
+        _branch: BranchId,
+    ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
+        anyhow::bail!("session_branch_control_unsupported")
+    }
+    async fn branches(&self) -> anyhow::Result<Vec<BranchId>> {
         anyhow::bail!("session_branch_control_unsupported")
     }
     async fn hide_content(&self, _target: EventId, _reason_key: &str) -> anyhow::Result<()> {

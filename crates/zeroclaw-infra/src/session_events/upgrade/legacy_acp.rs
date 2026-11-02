@@ -3634,9 +3634,8 @@ mod tests {
                 .persist_retained_context_seed("fixture", std::slice::from_ref(&user), false)
                 .is_err()
         );
-        let store =
-            crate::session_repository::SessionRepository::for_namespace(directory.path(), "acp_")
-                .expect("standard repository");
+        let store = crate::session_repository::SessionRepository::new(directory.path())
+            .expect("standard repository");
         store.touch_session("fixture").expect("protocol activity");
         store.set_plan("fixture", &[]).expect("protocol plan");
         store

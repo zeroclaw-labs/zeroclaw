@@ -273,9 +273,8 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         let sessions = directory.path().join("sessions");
         assert!(!sessions.join("acp-sessions.db").exists());
         assert!(sessions.join("acp-sessions.db.backup").is_file());
-        assert!(!sessions.join("session-family-locator.json").exists());
         let backup = fs::read(sessions.join("acp-sessions.db.backup")).unwrap();
-        let current = SessionRepository::for_namespace(directory.path(), "acp_").unwrap();
+        let current = SessionRepository::new(directory.path()).unwrap();
         let after = current.load_session("live").unwrap().unwrap();
         assert_eq!(after.principal_id, before.principal_id);
         assert_eq!(after.workspace_dir, "/workspace");
@@ -302,7 +301,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
             SessionRestore::Killed
         ));
         assert_eq!(current.list_sessions().unwrap().len(), 1);
-        let stream = session_id("acp_live").unwrap();
+        let stream = session_id("live").unwrap();
         let store = open_event_store(directory.path(), target.name()).unwrap();
         let root = store
             .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
@@ -458,7 +457,6 @@ fn all_legacy_sessions_upgrade_in_bounded_batches_and_only_new_format_remains() 
                     })
                     .is_file()
             );
-            assert!(!sessions.join("session-family-locator.json").exists());
             assert!(
                 SqliteSessionBackend::new(directory.path()).is_err(),
                 "old constructors cannot recreate an archived database"
@@ -487,108 +485,7 @@ fn installation_upgrade_crash_worker() {
 }
 
 #[test]
-fn previous_catalog_upgrade_resumes_source_archival_after_identity_publication() {
-    use zeroclaw_api::session_events::{CaptureMode, EventActor};
-    for (source, target) in [
-        (NativeBackend::Sqlite, NativeBackend::Jsonl),
-        (NativeBackend::Jsonl, NativeBackend::Sqlite),
-    ] {
-        let directory = tempfile::tempdir().expect("directory");
-        let stream = SessionId::new();
-        let mut root = SessionEvent::typed(
-            stream.clone(),
-            EventData::SessionStarted {
-                owning_agent: "fixture".into(),
-                capture_mode: CaptureMode::Native,
-            },
-            EventActor::System {
-                component: "fixture".into(),
-            },
-        )
-        .expect("root");
-        root.branch_id = Some(BranchId::new());
-        let store = open_event_store(directory.path(), source.name()).expect("old store");
-        let receipt = store
-            .append_batch(AppendRequest {
-                session_id: stream.clone(),
-                expected_head: EventCursor::beginning(stream.clone()),
-                idempotency_key: "old-root".into(),
-                events: vec![root],
-                payloads: vec![],
-                erasure_reference_commitment: None,
-            })
-            .expect("old root");
-        drop(store);
-        let sessions = directory.path().join("sessions");
-        fs::write(
-            sessions.join("session-family-locator.json"),
-            zeroclaw_api::session_events::canonical_json(&serde_json::json!({
-                "version":1,"families":{"fixture":{
-                    "phase":"native","backend":source.name(),"root_stream":stream
-                }}
-            }))
-            .expect("old catalog bytes"),
-        )
-        .expect("old catalog");
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "session_events::upgrade::tests::installation_upgrade_crash_worker",
-                "--nocapture",
-            ])
-            .env("ZEROCLAW_UPGRADE_DIRECTORY", directory.path())
-            .env("ZEROCLAW_UPGRADE_TARGET", target.name())
-            .env(
-                "ZEROCLAW_SESSION_CRASH_POINT",
-                "installation_previous_identity",
-            )
-            .output()
-            .expect("interrupted upgrade");
-        assert_eq!(output.status.code(), Some(86), "{output:?}");
-        assert!(native_path(directory.path(), source).exists());
-        let locator = sessions.join("session-family-locator.json");
-        let original = fs::read(&locator).expect("original catalog");
-        let mut conflicting: serde_json::Value =
-            serde_json::from_slice(&original).expect("catalog");
-        conflicting["families"]["fixture"]["root_stream"] = serde_json::json!(SessionId::new());
-        fs::write(
-            &locator,
-            serde_json::to_vec(&conflicting).expect("conflicting bytes"),
-        )
-        .expect("conflicting catalog");
-        assert!(upgrade_installation(directory.path(), target, |_| "fixture".into()).is_err());
-        assert!(native_path(directory.path(), source).exists());
-        fs::write(&locator, original).expect("restore canonical catalog");
-        upgrade_installation(directory.path(), target, |_| "fixture".into())
-            .expect("resume archival");
-        assert!(!native_path(directory.path(), source).exists());
-        let mut backup = native_path(directory.path(), source).into_os_string();
-        backup.push(".backup-1");
-        assert!(Path::new(&backup).exists());
-        assert!(!sessions.join("session-family-locator.json").exists());
-        assert!(
-            sessions
-                .join("session-family-locator.json.backup")
-                .is_file()
-        );
-        assert_eq!(
-            installation::session_ids(directory.path(), target).expect("families")["fixture"],
-            stream
-        );
-        let store = open_event_store(directory.path(), target.name()).expect("current store");
-        assert_eq!(
-            store.lookup_receipt(&stream, "old-root").expect("receipt"),
-            Some(receipt)
-        );
-        assert_eq!(store.head(&stream).expect("head").sequence, 3);
-        drop(store);
-        upgrade_installation(directory.path(), target, |_| "fixture".into())
-            .expect("idempotent startup");
-    }
-}
-
-#[test]
-fn acp_upgrade_resumes_metadata_history_chunks_and_archived_source_without_locators() {
+fn acp_upgrade_resumes_metadata_history_chunks_and_archived_source() {
     use crate::session_repository::SessionRepository;
     use zeroclaw_api::model_provider::ConversationMessage;
     for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
@@ -624,7 +521,7 @@ fn acp_upgrade_resumes_metadata_history_chunks_and_archived_source_without_locat
             );
             assert!(old.append_turn("interrupted", &messages[..1]).is_err());
             upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
-            let restored = SessionRepository::for_namespace(directory.path(), "acp_")
+            let restored = SessionRepository::new(directory.path())
                 .unwrap()
                 .load_session("interrupted")
                 .unwrap()
@@ -642,13 +539,33 @@ fn acp_upgrade_resumes_metadata_history_chunks_and_archived_source_without_locat
                     .join("sessions/acp-sessions.db.backup")
                     .is_file()
             );
-            assert!(
-                !directory
-                    .path()
-                    .join("sessions/session-family-locator.json")
-                    .exists()
-            );
         }
+    }
+}
+
+#[test]
+fn colliding_acp_and_transcript_ids_leave_both_sources_available() {
+    use crate::session_repository::SessionRepository;
+    for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+        let directory = tempfile::tempdir().expect("directory");
+        let old = old_source(directory.path(), true, 1);
+        drop(old);
+        let acp = SessionRepository::legacy_fixture(directory.path()).expect("ACP source");
+        acp.create_session("gw_fixture", "acp", "fixture", "/workspace", None)
+            .expect("colliding source");
+        drop(acp);
+        assert!(matches!(
+            upgrade_installation(directory.path(), target, |_| "fixture".into()),
+            Err(AppendError::InvalidReference(message))
+                if message == "ACP session ID collides with another imported session"
+        ));
+        let sessions = directory.path().join("sessions");
+        assert!(sessions.join("sessions.db").is_file());
+        assert!(sessions.join("acp-sessions.db").is_file());
+        assert!(!sessions.join("sessions.db.backup").exists());
+        assert!(!sessions.join("acp-sessions.db.backup").exists());
+        let guard = InstallationGuard::acquire(&sessions).expect("installation");
+        assert!(matches!(guard.phase(), Some(FormatPhase::Upgrading { .. })));
     }
 }
 
@@ -659,7 +576,7 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
     for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
         let directory = tempfile::tempdir().unwrap();
         upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
-        let stream = session_id("acp_registration").unwrap();
+        let stream = session_id("registration").unwrap();
         let mut root = SessionEvent::typed(
             stream.clone(),
             EventData::SessionStarted {
@@ -683,7 +600,7 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
                 erasure_reference_commitment: None,
             })
             .unwrap();
-        let protocol = SessionRepository::for_namespace(directory.path(), "acp_").unwrap();
+        let protocol = SessionRepository::new(directory.path()).unwrap();
         let root = protocol.load_session("registration").unwrap().unwrap();
         assert_eq!(root.agent_alias, "fixture");
         assert_eq!(root.principal_id.as_deref(), Some("owner"));
@@ -724,208 +641,16 @@ fn acp_registration_completes_an_existing_native_root_with_exact_owner_once() {
         assert_eq!(data.principal_id.as_deref(), Some("owner"));
         assert_eq!(data.workspace_dir, "/workspace");
         assert_eq!(data.interaction_surface.as_deref(), Some("cli"));
-        assert!(
-            protocol
-                .create_session(
-                    "registration",
-                    "acp",
-                    "fixture",
-                    "/workspace",
-                    Some("owner"),
-                )
-                .is_err()
-        );
-        assert!(!directory.path().join("sessions/acp-sessions.db").exists());
-    }
-}
-
-#[test]
-fn earlier_native_acp_installation_merges_protocol_data_without_replacing_newer_context() {
-    use crate::session_repository::SessionRepository;
-    use zeroclaw_api::model_provider::ConversationMessage;
-    use zeroclaw_api::session_events::{CaptureMode, EventActor, context_read};
-    for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
-        let directory = tempfile::tempdir().unwrap();
-        let legacy = SessionRepository::legacy_fixture(directory.path()).unwrap();
-        legacy
+        protocol
             .create_session(
-                "existing",
+                "registration",
                 "acp",
                 "fixture",
-                "/old-workspace",
+                "/workspace",
                 Some("owner"),
             )
-            .unwrap();
-        let mut old_history = vec![ConversationMessage::Chat(ChatMessage::user(
-            "older message",
-        ))];
-        for _ in 0..11 {
-            old_history.push(ConversationMessage::Chat(ChatMessage::user(format!(
-                "repeated older message: {}",
-                "x".repeat(1024 * 1024)
-            ))));
-        }
-        legacy.append_turn("existing", &old_history).unwrap();
-        legacy.set_token_count("existing", 2).unwrap();
-        legacy
-            .persist_retained_context_seed("existing", &old_history[10..], false)
-            .unwrap();
-        let stream = session_id("acp_existing").unwrap();
-        let branch = BranchId::parse(format!("branch-{stream}")).unwrap();
-        let mut root = SessionEvent::typed(
-            stream.clone(),
-            EventData::SessionStarted {
-                owning_agent: "fixture".into(),
-                capture_mode: CaptureMode::Native,
-            },
-            EventActor::Principal {
-                principal_id: "owner".into(),
-            },
-        )
-        .unwrap();
-        root.branch_id = Some(branch.clone());
-        let messages = vec![ConversationMessage::Chat(ChatMessage::assistant(
-            "newer native context",
-        ))];
-        let conversation = PayloadRecord::json("session.conversation/v1", &messages).unwrap();
-        let context = PayloadRecord::json("session.context/v1",&serde_json::json!({"messages_ref":StoredPayloadRef::from(&conversation),"seed_messages":[]})).unwrap();
-        let mut projection = SessionEvent::typed(
-            stream.clone(),
-            EventData::ContextProjectionCreated {
-                source_ranges: vec![],
-                summary_ref: None,
-                budget: 0,
-                reason_key: "initial_context".into(),
-                algorithm_version: "native-entrance/v1".into(),
-                result_ref: StoredPayloadRef::from(&context),
-                summary_source_refs: vec![],
-                transform_started_event_id: None,
-            },
-            EventActor::default(),
-        )
-        .unwrap();
-        projection.branch_id = Some(branch);
-        let context_id = projection.event_id.clone();
-        let tokens =
-            super::super::catalog::metadata_payload("token_count", serde_json::json!(99)).unwrap();
-        let token_event = SessionEvent::typed(
-            stream.clone(),
-            EventData::SessionMetadataChanged {
-                field: "token_count".into(),
-                new_value_ref: StoredPayloadRef::from(&tokens),
-            },
-            EventActor::default(),
-        )
-        .unwrap();
-        let store = open_event_store(directory.path(), target.name()).unwrap();
-        store
-            .append_batch(AppendRequest {
-                session_id: stream.clone(),
-                expected_head: EventCursor::beginning(stream.clone()),
-                idempotency_key: "prior-native-root".into(),
-                events: vec![root, projection, token_event],
-                payloads: vec![conversation, context, tokens],
-                erasure_reference_commitment: None,
-            })
-            .unwrap();
-        {
-            let mut guard = InstallationGuard::acquire(&directory.path().join("sessions")).unwrap();
-            guard.begin(FormatPhase::Upgrading { target }).unwrap();
-            guard.finish(target).unwrap();
-        }
-        upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
-        let protocol = SessionRepository::for_namespace(directory.path(), "acp_").unwrap();
-        let data = protocol.load_session("existing").unwrap().unwrap();
-        assert_eq!(data.workspace_dir, "/old-workspace");
-        assert_eq!(
-            data.token_count, 99,
-            "native usage wins over imported observations"
-        );
-        assert_eq!(
-            serde_json::to_value(data.messages).unwrap(),
-            serde_json::to_value(&messages).unwrap()
-        );
-        let page = store
-            .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
-            .unwrap();
-        assert_eq!(
-            page.events
-                .iter()
-                .filter(|event| matches!(
-                    event.body.data,
-                    EventData::ContextProjectionCreated { .. }
-                ))
-                .count(),
-            1
-        );
-        assert!(page.events.iter().any(|event| event.event_id == context_id));
-        let mut recovered = 0;
-        let mut history_chunks = 0;
-        let mut identities = std::collections::HashSet::new();
-        let mut context_reused = false;
-        for event in &page.events {
-            if let EventData::LegacyHistoryImported {
-                source_kind,
-                import_receipt_ref,
-                ..
-            } = &event.body.data
-                && source_kind == "legacy-acp-observations"
-            {
-                let body: serde_json::Value = serde_json::from_slice(
-                    &context_read::present(store.as_ref(), import_receipt_ref)
-                        .unwrap()
-                        .body,
-                )
-                .unwrap();
-                if body["phase"] == "context" {
-                    assert_eq!(body["items"].as_array().unwrap().len(), 2);
-                    for item in body["items"].as_array().unwrap() {
-                        let reference: StoredPayloadRef =
-                            serde_json::from_value(item["conversation_ref"].clone()).unwrap();
-                        assert!(identities.contains(&(
-                            reference.payload_id,
-                            item["item_index"].as_u64().unwrap()
-                        )));
-                    }
-                    context_reused = true;
-                    continue;
-                }
-                assert_eq!(body["phase"], "history");
-                for item in body["items"].as_array().unwrap() {
-                    let reference: StoredPayloadRef =
-                        serde_json::from_value(item["conversation_ref"].clone()).unwrap();
-                    assert!(
-                        identities
-                            .insert((reference.payload_id, item["item_index"].as_u64().unwrap()))
-                    );
-                }
-                let reference: StoredPayloadRef =
-                    serde_json::from_value(body["items"][0]["conversation_ref"].clone()).unwrap();
-                let rows: Vec<ConversationMessage> = serde_json::from_slice(
-                    &context_read::present(store.as_ref(), &reference)
-                        .unwrap()
-                        .body,
-                )
-                .unwrap();
-                assert_eq!(
-                    serde_json::to_value(&rows).unwrap(),
-                    serde_json::to_value(&old_history[recovered..recovered + rows.len()]).unwrap()
-                );
-                recovered += rows.len();
-                history_chunks += 1;
-            }
-        }
-        assert_eq!(recovered, old_history.len());
-        assert_eq!(identities.len(), old_history.len());
-        assert!(history_chunks > 1);
-        assert!(context_reused);
+            .expect("idempotent reopen");
         assert!(!directory.path().join("sessions/acp-sessions.db").exists());
-        assert!(
-            directory
-                .path()
-                .join("sessions/acp-sessions.db.backup")
-                .is_file()
-        );
     }
 }
 
@@ -975,7 +700,7 @@ fn interrupted_upgrade_resumes_chunks_and_partial_backup_renames() {
 }
 
 #[test]
-fn native_sqlite_schema_zero_upgrades_without_rewriting_events_and_future_schema_is_refused() {
+fn native_sqlite_reopens_without_rewriting_events_and_future_schema_is_refused() {
     let directory = tempfile::tempdir().expect("directory");
     let store = SqliteEventStore::open(directory.path()).expect("store");
     let stream = SessionId::new();
@@ -988,10 +713,7 @@ fn native_sqlite_schema_zero_upgrades_without_rewriting_events_and_future_schema
         .raw_events;
     drop(store);
     let path = directory.path().join("sessions/session-events.db");
-    let conn = Connection::open(&path).expect("old database");
-    conn.execute_batch("PRAGMA user_version=0; CREATE INDEX session_events_stream_seq ON session_events(session_id,sequence);").expect("old schema");
-    drop(conn);
-    let store = SqliteEventStore::open(directory.path()).expect("automatic schema upgrade");
+    let store = SqliteEventStore::open(directory.path()).expect("reopened store");
     assert_eq!(
         before,
         store
@@ -1005,14 +727,6 @@ fn native_sqlite_schema_zero_upgrades_without_rewriting_events_and_future_schema
             .expect("version"),
         1
     );
-    let redundant: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='session_events_stream_seq')",
-            [],
-            |row| row.get(0),
-        )
-        .expect("index");
-    assert!(!redundant);
     conn.pragma_update(None, "user_version", 2)
         .expect("future version");
     drop(store);

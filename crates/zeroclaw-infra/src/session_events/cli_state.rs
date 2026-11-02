@@ -13,9 +13,7 @@ use zeroclaw_api::session_events::canonical_json;
 pub struct CliStateBinding {
     pub version: u32,
     pub data_dir: PathBuf,
-    /// Stable session key used to reopen the deterministic event stream.
-    /// `family` is accepted only when reading a pre-index binding.
-    #[serde(alias = "family")]
+    /// Session ID assigned by the master-format CLI state import.
     pub session_id: String,
 }
 

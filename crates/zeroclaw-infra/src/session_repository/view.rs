@@ -3,11 +3,11 @@ use super::*;
 use crate::session_events::catalog::{Session, SessionCatalog, SessionDetail};
 use zeroclaw_api::session_events::{EventData, context_read};
 
-pub(super) struct RepositoryView<'a>(pub SessionCatalog, pub &'a str);
+pub(super) struct RepositoryView(pub SessionCatalog);
 
-impl RepositoryView<'_> {
+impl RepositoryView {
     pub fn record(&self, id: &str) -> Result<Option<Session>> {
-        let stream = zeroclaw_api::session_events::SessionId::parse(format!("{}{id}", self.1))?;
+        let stream = zeroclaw_api::session_events::SessionId::parse(id)?;
         Ok(self
             .0
             .query()
@@ -16,7 +16,7 @@ impl RepositoryView<'_> {
     }
 
     pub fn detail(&self, id: &str) -> Result<Option<SessionDetail>> {
-        let stream = zeroclaw_api::session_events::SessionId::parse(format!("{}{id}", self.1))?;
+        let stream = zeroclaw_api::session_events::SessionId::parse(id)?;
         Ok(self
             .0
             .query()
@@ -36,13 +36,9 @@ impl RepositoryView<'_> {
         alias: &str,
         fields: Vec<(&str, serde_json::Value)>,
     ) -> Result<i64> {
-        let family = format!("{}{id}", self.1);
-        let stream = zeroclaw_api::session_events::SessionId::parse(family.clone())?;
+        let stream = zeroclaw_api::session_events::SessionId::parse(id)?;
         if let Some(record) = self.0.query().summary(&stream)? {
-            anyhow::ensure!(
-                !record.closed && !record.deleted && !record.fields.contains_key("workspace_dir"),
-                "session already exists"
-            );
+            anyhow::ensure!(!record.closed && !record.deleted, "session already exists");
             anyhow::ensure!(
                 record.owning_agent.as_deref() == Some(alias),
                 "session owning agent differs"
@@ -55,11 +51,17 @@ impl RepositoryView<'_> {
                 .transpose()?
                 .flatten();
             anyhow::ensure!(owner == expected, "session principal differs");
-            self.0.commands().change(&record, fields)?;
+            let changed = fields
+                .into_iter()
+                .filter(|(key, value)| record.fields.get(*key) != Some(value))
+                .collect::<Vec<_>>();
+            if !changed.is_empty() {
+                self.0.commands().change(&record, changed)?;
+            }
         } else {
             self.0
                 .commands()
-                .create(&family, creation_source, alias, fields)?;
+                .create(id, creation_source, alias, fields)?;
         }
         // The compatibility return value is the canonical root sequence,
         // rather than a new transport-specific row identifier.
@@ -80,12 +82,7 @@ impl RepositoryView<'_> {
             .query()
             .indexed_summaries()?
             .into_iter()
-            .filter_map(|(source, summary)| {
-                source
-                    .strip_prefix(self.1)
-                    .filter(|_| !summary.deleted)
-                    .map(|id| (id.to_owned(), summary))
-            })
+            .filter(|(_, summary)| !summary.deleted)
             .collect::<Vec<_>>();
         result.sort_by(|left, right| {
             right
@@ -100,10 +97,29 @@ impl RepositoryView<'_> {
     pub fn data(&self, id: &str, record: &SessionDetail) -> Result<SessionTranscript> {
         let mut messages = Vec::new();
         let mut trim_breadcrumb = false;
-        if let Some(context) = &record.context {
+        let mut context = record.context.clone();
+        let mut session_id = record.stream().clone();
+        let mut visited = std::collections::HashSet::from([session_id.clone()]);
+        while let Some(event) = context.as_ref() {
+            let EventData::ContextProjectionCreated { result_ref, .. } = &event.body.data else {
+                anyhow::bail!("context source kind mismatch");
+            };
+            let body: serde_json::Value =
+                serde_json::from_slice(&context_read::present(self.0.store(), result_ref)?.body)?;
+            let Some(source) = context_read::copy_source(&body)? else {
+                break;
+            };
+            anyhow::ensure!(
+                visited.insert(source.cursor.session_id.clone()),
+                "copy source cycle"
+            );
+            session_id = source.cursor.session_id.clone();
+            context = Some(context_read::projection_at(self.0.store(), &source)?);
+        }
+        if let Some(context) = &context {
             for item in context_read::context_refs(self.0.store(), context)? {
                 if let Some(message) =
-                    context_read::resolve_message(self.0.store(), record.stream(), &item)?
+                    context_read::resolve_message(self.0.store(), &session_id, &item)?
                 {
                     messages.push(message);
                 }

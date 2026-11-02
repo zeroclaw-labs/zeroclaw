@@ -3305,6 +3305,269 @@ async fn native_search_uses_visible_messages_and_current_authority_and_erasure()
     }
 }
 
+fn copied_session(source: &EngineSession) -> EngineSession {
+    let session_id = SessionId::new();
+    let branch = BranchId::new();
+    let cursor = source.owner.head(&source.stream).expect("source head");
+    let body = PayloadRecord::json(
+        "session.context/v1",
+        &serde_json::json!({
+            "copy_source_session_id":source.stream,
+            "copy_source_sequence":cursor.sequence,
+            "copy_source_branch_id":source.branch,
+            "history_has_trim_breadcrumb":false,
+        }),
+    )
+    .expect("copy seed");
+    let mut root = SessionEvent::typed(
+        session_id.clone(),
+        EventData::SessionStarted {
+            owning_agent: "fixture".into(),
+            capture_mode: CaptureMode::Native,
+        },
+        EventActor::default(),
+    )
+    .expect("root");
+    root.branch_id = Some(branch.clone());
+    let mut projection = SessionEvent::typed(
+        session_id.clone(),
+        EventData::ContextProjectionCreated {
+            source_ranges: vec![SourceRange {
+                session_id: source.stream.clone(),
+                from_seq: 1,
+                to_seq: cursor.sequence,
+                disposition: RangeDisposition::Included,
+            }],
+            summary_ref: None,
+            budget: 0,
+            reason_key: "copy_on_write_seed".into(),
+            algorithm_version: "session-copy/v1".into(),
+            result_ref: StoredPayloadRef::from(&body),
+            summary_source_refs: vec![],
+            transform_started_event_id: None,
+        },
+        EventActor::default(),
+    )
+    .expect("projection");
+    projection.branch_id = Some(branch.clone());
+    source
+        .owner
+        .append(AppendRequest {
+            session_id: session_id.clone(),
+            expected_head: EventCursor::beginning(session_id.clone()),
+            idempotency_key: format!("copy:{session_id}"),
+            events: vec![root, projection],
+            payloads: vec![body],
+            erasure_reference_commitment: None,
+        })
+        .expect("create copy");
+    EngineSession::new(
+        source.owner.clone(),
+        session_id,
+        branch,
+        PrincipalId::shared_operator(),
+        source.authority.clone(),
+    )
+}
+
+#[tokio::test]
+async fn copy_catalog_counts_only_the_frozen_branch_history() {
+    use zeroclaw_infra::session_events::{
+        catalog::SessionCatalog, installation::NativeBackend, scoped::EventStorePool,
+        upgrade::upgrade_installation,
+    };
+    for (backend, format) in [
+        ("sqlite", NativeBackend::Sqlite),
+        ("jsonl", NativeBackend::Jsonl),
+    ] {
+        let directory = tempfile::tempdir().expect("directory");
+        upgrade_installation(directory.path(), format, |_| "fixture".into()).expect("installation");
+        let (source, _) = session(directory.path(), backend);
+        source
+            .append_assistant("shared message")
+            .await
+            .expect("shared");
+        let branch = source
+            .fork(
+                BranchId::new(),
+                source.owner.head(&source.stream).expect("head"),
+            )
+            .await
+            .expect("fork");
+        source
+            .append_assistant("parent only")
+            .await
+            .expect("parent write");
+        let copy = copied_session(&branch);
+        assert_eq!(
+            copy.query()
+                .messages(copy.stream.clone())
+                .await
+                .expect("messages")
+                .len(),
+            1
+        );
+        let pool = EventStorePool::default();
+        let catalog = SessionCatalog::open(directory.path(), &pool)
+            .expect("catalog")
+            .expect("native");
+        let rows = catalog.query().index_records().expect("index");
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == copy.stream)
+            .expect("copy row");
+        assert_eq!(row.message_count, 1);
+    }
+}
+
+#[tokio::test]
+async fn nested_copies_restore_frozen_branched_context_across_pages_and_writes() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let (source, _) = session(directory.path(), backend);
+        source
+            .append_assistant("first source message")
+            .await
+            .expect("first");
+        let metadata = PayloadRecord::json("session.bytes/v1", &serde_json::json!("padding"))
+            .expect("metadata");
+        let events = (0..260)
+            .map(|_| {
+                SessionEvent::typed(
+                    source.stream.clone(),
+                    EventData::SessionMetadataChanged {
+                        field: "fixture".into(),
+                        new_value_ref: StoredPayloadRef::from(&metadata),
+                    },
+                    EventActor::default(),
+                )
+                .expect("padding event")
+            })
+            .collect();
+        source
+            .owner
+            .append(AppendRequest {
+                session_id: source.stream.clone(),
+                expected_head: source.owner.head(&source.stream).expect("head"),
+                idempotency_key: "padding".into(),
+                events,
+                payloads: vec![metadata],
+                erasure_reference_commitment: None,
+            })
+            .expect("padding page");
+        source
+            .append_assistant("frozen source message")
+            .await
+            .expect("frozen message");
+        let branch = source
+            .fork(
+                BranchId::new(),
+                source.owner.head(&source.stream).expect("cursor"),
+            )
+            .await
+            .expect("branch");
+        let frozen_model = ModelOverrideSelection::Set {
+            provider_ref: "fixture".into(),
+            model: "copied-model".into(),
+            thinking: None,
+            route_mode: ModelRouteMode::Manual,
+        };
+        branch
+            .observe_model_change(frozen_model.clone(), ModelChangeDisposition::Applied)
+            .await
+            .expect("source branch model");
+        let copy = copied_session(&branch);
+        let nested = copied_session(&copy);
+        branch
+            .observe_model_change(
+                ModelOverrideSelection::Clear,
+                ModelChangeDisposition::Applied,
+            )
+            .await
+            .expect("later source model");
+        let empty = copy
+            .fork(BranchId::new(), EventCursor::beginning(copy.stream.clone()))
+            .await
+            .expect("empty branch");
+        assert!(
+            empty
+                .query()
+                .messages(empty.stream.clone())
+                .await
+                .expect("empty history")
+                .is_empty()
+        );
+        source
+            .append_assistant("later source message")
+            .await
+            .expect("later message");
+        for current in [&copy, &nested] {
+            assert_eq!(
+                current
+                    .restore_model_override()
+                    .await
+                    .expect("copied model"),
+                Some(frozen_model.clone())
+            );
+            assert_eq!(
+                current
+                    .query()
+                    .summary(current.stream.clone())
+                    .await
+                    .expect("copy summary")
+                    .message_count,
+                2
+            );
+            let snapshot = current
+                .restore_context()
+                .await
+                .expect("restore")
+                .expect("context");
+            let texts: Vec<_> = snapshot
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    ConversationMessage::Chat(message) => Some(message.content.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(texts, ["first source message", "frozen source message"]);
+            let rows = current
+                .query()
+                .messages(current.stream.clone())
+                .await
+                .expect("history");
+            assert_eq!(
+                rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+                texts
+            );
+        }
+        nested
+            .append_assistant("local message")
+            .await
+            .expect("copy write");
+        let snapshot = nested
+            .restore_context()
+            .await
+            .expect("restore after write")
+            .expect("context");
+        assert_eq!(snapshot.messages.len(), 3);
+        let rows = nested
+            .query()
+            .messages(nested.stream.clone())
+            .await
+            .expect("history after write");
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            [
+                "first source message",
+                "frozen source message",
+                "local message"
+            ]
+        );
+    }
+}
+
 #[tokio::test]
 async fn frozen_branches_keep_parent_messages_ids_and_ignore_later_parent_edits() {
     for backend in ["sqlite", "jsonl"] {

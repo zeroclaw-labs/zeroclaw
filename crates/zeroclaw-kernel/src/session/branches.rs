@@ -46,6 +46,51 @@ impl SessionCoordinator {
     }
 }
 impl EngineSession {
+    pub(super) async fn existing_branches(&self) -> anyhow::Result<Vec<BranchId>> {
+        let owner = self.owner.clone();
+        let stream = self.stream.clone();
+        let authority = self.authority.clone();
+        let actor = self.actor.clone();
+        let branches = self
+            .owner
+            .blocking(move || {
+                SessionAccessPolicy::authorize_actor(
+                    authority.as_ref(),
+                    &actor,
+                    &stream,
+                    SessionAccess::Read,
+                )?;
+                let history = owner.stream_history(&stream)?;
+                let branches = history
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event.body.data,
+                            EventData::SessionStarted { .. }
+                                | EventData::DerivedSessionStarted { .. }
+                                | EventData::BranchCreated { .. }
+                        )
+                    })
+                    .filter_map(|event| event.branch_id);
+                let mut visible = Vec::new();
+                for branch in branches {
+                    match authority.authorize_context(&stream, &branch) {
+                        Ok(()) => visible.push(branch),
+                        Err(SessionError::PermissionDenied(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                SessionAccessPolicy::authorize_actor(
+                    authority.as_ref(),
+                    &actor,
+                    &stream,
+                    SessionAccess::Read,
+                )?;
+                Ok(visible)
+            })
+            .await?;
+        Ok(branches)
+    }
     pub async fn fork(&self, branch: BranchId, cursor: EventCursor) -> anyhow::Result<Self> {
         let owner = self.owner.clone();
         let authority = self.authority.clone();

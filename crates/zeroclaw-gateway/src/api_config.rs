@@ -2289,7 +2289,7 @@ async fn rename_residue_exists(
     // Standard sessions (live or closed) still owned by `from`.
     let owner = from.to_owned();
     let has_sessions = tokio::task::spawn_blocking(move || {
-        zeroclaw_session_host::open_repository(&cfg, "")?
+        zeroclaw_session_host::open_repository(&cfg)?
             .list_sessions_by_agent(&owner)
             .map(|sessions| !sessions.is_empty())
     })

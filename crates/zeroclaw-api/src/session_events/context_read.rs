@@ -3,6 +3,81 @@
 use super::*;
 use crate::model_provider::{ChatMessage, ConversationMessage};
 
+/// A copy shares only this frozen prefix. The coordinate is stored in its
+/// initial context payload; callers resolve and authorize it at read time.
+#[derive(Clone, Debug)]
+pub struct CopySource {
+    pub cursor: EventCursor,
+    pub branch_id: BranchId,
+}
+
+pub fn copy_source(body: &serde_json::Value) -> Result<Option<CopySource>, ReadError> {
+    let Some(id) = body.get("copy_source_session_id") else {
+        return Ok(None);
+    };
+    let corrupt = || ReadError::Corrupt("copy source coordinate missing or invalid".into());
+    let session_id = SessionId::parse(id.as_str().ok_or_else(corrupt)?.to_owned())
+        .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+    let sequence = body
+        .get("copy_source_sequence")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|sequence| *sequence > 0)
+        .ok_or_else(corrupt)?;
+    let branch_id = BranchId::parse(
+        body.get("copy_source_branch_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(corrupt)?
+            .to_owned(),
+    )
+    .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+    Ok(Some(CopySource {
+        cursor: EventCursor {
+            session_id,
+            sequence,
+        },
+        branch_id,
+    }))
+}
+
+/// Read the latest context visible at a copy's frozen branch coordinate.
+pub fn projection_at(
+    store: &dyn SessionEventStore,
+    source: &CopySource,
+) -> Result<SessionEvent, ReadError> {
+    let cursor = &source.cursor;
+    if cursor.sequence > store.head(&cursor.session_id)?.sequence {
+        return Err(ReadError::Gap("copy source prefix unavailable".into()));
+    }
+    let mut after = EventCursor::beginning(cursor.session_id.clone());
+    let mut history = Vec::new();
+    loop {
+        let page = store.read_page(&cursor.session_id, &after, Some(cursor), 256)?;
+        if let Some(last) = page.events.last() {
+            after.sequence = last.sequence;
+        } else if page.has_more {
+            return Err(ReadError::Gap("empty copy source page".into()));
+        }
+        history.extend(page.events);
+        if !page.has_more {
+            break;
+        }
+    }
+    let lineage = lineage::frozen_lineage(
+        &history,
+        &cursor.session_id,
+        &source.branch_id,
+        cursor.sequence,
+    )?;
+    history
+        .into_iter()
+        .rev()
+        .find(|event| {
+            event.body.kind() == EventKind::ContextProjectionCreated
+                && lineage::includes(&lineage, event)
+        })
+        .ok_or_else(|| ReadError::Gap("copy source context missing".into()))
+}
+
 pub fn present(
     store: &dyn SessionEventStore,
     reference: &StoredPayloadRef,
@@ -171,8 +246,9 @@ pub fn context_refs(
             })
             .collect();
     }
-    // Compatibility with the initial/legacy host context: identities derive
-    // from its immutable creation coordinate, rather than each later transform.
+    // Initial and imported host contexts reference one conversation payload.
+    // Identities derive from its immutable creation coordinate, rather than
+    // each later transform.
     let Some(reference) = body.get("messages_ref") else {
         return Ok(Vec::new());
     };

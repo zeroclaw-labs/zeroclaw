@@ -1,7 +1,6 @@
 //! Composition for native session sources. The installation manifest owns
 //! the active format; events own session identity and derivation.
 //! Live policies are supplied by the authenticated entrance, never cached here.
-use anyhow::Context;
 use std::{collections::HashMap, sync::Arc};
 use zeroclaw_api::{
     principal::PrincipalId,
@@ -81,10 +80,7 @@ impl NativeSessionHub {
         let check_directory = directory.clone();
         let ready = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let guard = InstallationGuard::acquire(&check_directory.join("sessions"))?;
-            Ok(guard.active().is_ok_and(|(active, _)| active == backend)
-                && !check_directory
-                    .join("sessions/acp-sessions.db")
-                    .try_exists()?)
+            Ok(guard.active().is_ok_and(|(active, _)| active == backend))
         })
         .await??;
         if !ready {
@@ -225,7 +221,8 @@ impl NativeSessionHub {
         ))
     }
     pub fn session_id(session_id: &str) -> Result<SessionId, ContractError> {
-        zeroclaw_infra::session_events::upgrade::session_id(session_id)
+        SessionId::parse(session_id.to_owned())
+            .map_err(|error| ContractError::InvalidRequest(error.to_string()))
     }
 
     async fn read_owner(
@@ -254,9 +251,8 @@ impl NativeSessionHub {
                     let stream = Self::session_id(&family)?;
                     catalog
                         .query()
-                        .index_records()?
-                        .into_iter()
-                        .any(|record| record.session_id == stream)
+                        .summary(&stream)?
+                        .is_some_and(|record| !record.deleted)
                 };
                 if !exists {
                     return Ok(None);
@@ -279,17 +275,13 @@ impl NativeSessionHub {
 /// serving entrances. The borrowed config is consumed only for this operation.
 pub fn open_repository(
     config: &zeroclaw_config::schema::Config,
-    namespace: &str,
 ) -> anyhow::Result<zeroclaw_infra::session_repository::SessionRepository> {
     zeroclaw_infra::session_events::upgrade::upgrade_installation(
         &config.data_dir,
         NativeBackend::parse(&config.channels.session_backend)?,
         |channel| legacy_session_owner(config, channel),
     )?;
-    zeroclaw_infra::session_repository::SessionRepository::for_namespace(
-        &config.data_dir,
-        namespace,
-    )
+    zeroclaw_infra::session_repository::SessionRepository::new(&config.data_dir)
 }
 #[async_trait::async_trait]
 impl EngineSessionSource for NativeSessionHub {
@@ -322,15 +314,29 @@ impl EngineSessionSource for NativeSessionHub {
         })
         .await?
     }
-    async fn archive_stale(&self, prefix: &str, before_millis: i64) -> anyhow::Result<usize> {
+    async fn archive_stale(
+        &self,
+        creation_source: &str,
+        before_millis: i64,
+    ) -> anyhow::Result<usize> {
         let (directory, _) = self.prepare().await?;
         let mut archived = 0;
-        for family in self
-            .sessions()
-            .await?
-            .into_iter()
-            .filter(|family| family.starts_with(prefix))
-        {
+        let stores = self.stores.clone();
+        let catalog_directory = directory.clone();
+        let creation_source = creation_source.to_owned();
+        let sessions = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+            let catalog = SessionCatalog::open(&catalog_directory, &stores)?
+                .ok_or_else(|| anyhow::Error::msg("native session storage is unavailable"))?;
+            Ok(catalog
+                .query()
+                .index_records()?
+                .into_iter()
+                .filter(|record| record.creation_source.as_deref() == Some(&creation_source))
+                .map(|record| record.session_id.to_string())
+                .collect())
+        })
+        .await??;
+        for family in sessions {
             {
                 let mut owners = self.owners.lock().await;
                 let key = (directory.clone(), family.clone());
@@ -357,7 +363,7 @@ impl EngineSessionSource for NativeSessionHub {
                 stores.open_session(&store_directory, &family, Some(Arc::new(lease)))
             })
             .await??;
-            let stream = store.root_stream().clone();
+            let stream = store.session_id().clone();
             let owner = Arc::new(SessionCoordinator::new(Arc::new(store)));
             let summary = owner
                 .query_actor(
@@ -412,11 +418,12 @@ impl EngineSessionSource for NativeSessionHub {
             .map(serde_json::from_value)
             .transpose()?
             .flatten();
+        let owning_agent = record
+            .owning_agent
+            .ok_or_else(|| anyhow::Error::msg("native source owning agent missing"))?;
         Ok(Some(zeroclaw_kernel::session::engine::SessionDescriptor {
             stream: record.head.session_id,
-            owning_agent: record
-                .owning_agent
-                .context("native source owning agent missing")?,
+            owning_agent,
             owner,
         }))
     }

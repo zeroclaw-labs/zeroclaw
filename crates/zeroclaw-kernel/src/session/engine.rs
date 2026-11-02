@@ -35,7 +35,11 @@ pub trait EngineSessionSource: Send + Sync {
     async fn sessions(&self) -> anyhow::Result<Vec<String>>;
     /// Trusted host retention command. Closing retains the append-only audit
     /// trail; it never erases payloads or expires a running execution.
-    async fn archive_stale(&self, _prefix: &str, _before_millis: i64) -> anyhow::Result<usize> {
+    async fn archive_stale(
+        &self,
+        _creation_source: &str,
+        _before_millis: i64,
+    ) -> anyhow::Result<usize> {
         anyhow::bail!("session_retention_unsupported")
     }
     /// `creation_source` records the initial entrance protocol when creating
@@ -94,10 +98,28 @@ impl views::SessionHistoryReadPort for EngineSession {
     async fn list(&self, limit: usize) -> anyhow::Result<Vec<views::SessionSummary>> {
         let current = self.query().summary(self.stream.clone()).await?;
         let current_id = self.stream.as_str().to_owned();
-        let mut summaries = vec![current];
+        let visible = if let Some(source) = &self.source {
+            Some(source.sessions().await?)
+        } else {
+            None
+        };
+        let current_visible = visible.as_ref().map_or_else(
+            || {
+                current
+                    .fields
+                    .get("session_kind")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("temporary")
+            },
+            |sessions| sessions.contains(&current_id),
+        );
+        let mut summaries = Vec::new();
+        if current_visible {
+            summaries.push(current);
+        }
         if let (Some(source), EventActor::Principal { principal_id }) = (&self.source, &self.actor)
         {
-            for family in source.sessions().await? {
+            for family in visible.into_iter().flatten() {
                 if family == current_id {
                     continue;
                 }
@@ -387,6 +409,26 @@ impl SessionExecutionPort for EngineSession {
         cursor: EventCursor,
     ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
         Ok(Arc::new(self.fork(branch, cursor).await?))
+    }
+    async fn branches(&self) -> anyhow::Result<Vec<BranchId>> {
+        self.existing_branches().await
+    }
+    async fn resume_branch(
+        &self,
+        branch: BranchId,
+    ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
+        let branches = self.existing_branches().await?;
+        anyhow::ensure!(branches.contains(&branch), "session_branch_not_found");
+        SessionAccessPolicy::authorize_actor(
+            self.authority.as_ref(),
+            &self.actor,
+            &self.stream,
+            SessionAccess::Write,
+        )?;
+        self.authority.authorize_context(&self.stream, &branch)?;
+        let mut session = self.clone();
+        session.branch = branch;
+        Ok(Arc::new(session))
     }
     async fn hide_content(&self, target: EventId, reason: &str) -> anyhow::Result<()> {
         EngineSession::hide_content(self, target, reason).await

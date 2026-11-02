@@ -160,7 +160,7 @@ impl NativeImage {
 
 // The migration codec keeps opaque event JSON. References keep their explicit
 // StoredPayloadRef shape even when the event tag is unknown to this version.
-fn raw_payload_refs(
+pub(super) fn raw_payload_refs(
     value: &serde_json::Value,
     out: &mut Vec<StoredPayloadRef>,
 ) -> Result<(), AppendError> {

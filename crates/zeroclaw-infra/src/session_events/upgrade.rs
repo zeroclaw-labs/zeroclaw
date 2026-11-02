@@ -1,7 +1,7 @@
 //! Installation-wide upgrade. All legacy writers share the publication fence;
 //! source files remain intact until every imported family has a final receipt.
 use super::import::{LegacyImport, LegacySnapshot, import_snapshot};
-use super::installation::{FormatPhase, InstallationGuard, NativeBackend, creation_source};
+use super::installation::{FormatPhase, InstallationGuard, NativeBackend};
 use super::*;
 use crate::session_backend::SessionBackend;
 use std::collections::BTreeSet;
@@ -23,22 +23,7 @@ pub fn upgrade_installation(
     }
     let directory = data_dir.join("sessions");
     let mut guard = InstallationGuard::acquire(&directory)?;
-    let mut upgrade_leases = Vec::new();
     let target = match guard.phase() {
-        Some(FormatPhase::Ready { backend })
-            if directory
-                .join("acp-sessions.db")
-                .try_exists()
-                .map_err(jsonl::storage)? =>
-        {
-            let backend = *backend;
-            upgrade_leases = installation::session_ids(data_dir, backend)?
-                .keys()
-                .map(|family| ownership::SessionExecutionLease::acquire(data_dir, family))
-                .collect::<Result<Vec<_>, _>>()?;
-            guard.begin(FormatPhase::Upgrading { target: backend })?;
-            backend
-        }
         Some(FormatPhase::Ready { .. } | FormatPhase::Switching { .. }) => {
             return migration::migrate_locked(data_dir, &mut guard, requested);
         }
@@ -49,7 +34,6 @@ pub fn upgrade_installation(
         }
     };
     let store = open_event_store(data_dir, target.name())?;
-    import_previous_catalog(data_dir, target, store.as_ref(), guard.generation())?;
     let mut existing = installation::session_ids(data_dir, target)?;
     let mut sqlite_keys = BTreeSet::new();
     if directory
@@ -66,7 +50,7 @@ pub fn upgrade_installation(
             .map_err(storage)?;
         for family in source.upgrade_keys().map_err(storage)? {
             sqlite_keys.insert(family.clone());
-            if existing.contains_key(&family) {
+            if existing.contains_key(&family) && !import_pending(store.as_ref(), &family)? {
                 continue;
             }
             let metadata = source.upgrade_metadata(&family).map_err(storage)?;
@@ -192,7 +176,7 @@ pub fn upgrade_installation(
                     "divergent SQLite and JSONL legacy history".into(),
                 ));
             }
-        } else if !existing.contains_key(family) {
+        } else if !existing.contains_key(family) || import_pending(store.as_ref(), family)? {
             import_one(
                 store.as_ref(),
                 family,
@@ -229,11 +213,9 @@ pub fn upgrade_installation(
     }
     archive_sqlite(&directory.join("sessions.db"), "backup")?;
     archive_sqlite(&directory.join("acp-sessions.db"), "backup")?;
-    archive_path(&directory.join("session-family-locator.json"), "backup")?;
     #[cfg(test)]
     super::crash_tests::crash_boundary("installation_archived");
     guard.finish(target)?;
-    drop(upgrade_leases);
     if target != requested {
         migration::migrate_locked(data_dir, &mut guard, requested)?;
     }
@@ -266,6 +248,18 @@ fn import_one(
     Ok(())
 }
 
+fn import_pending(store: &dyn SessionEventStore, family: &str) -> Result<bool, AppendError> {
+    let id = session_id(family)?;
+    Ok(store
+        .lookup_receipt(&id, &format!("legacy-import-root:{id}"))
+        .map_err(storage)?
+        .is_some()
+        && store
+            .lookup_receipt(&id, &format!("legacy-family-import:{id}"))
+            .map_err(storage)?
+            .is_none())
+}
+
 pub fn session_id(family: &str) -> Result<SessionId, ContractError> {
     // Old storage accepted keys outside the native ID grammar. Normal paths
     // parse their session ID directly; only import normalizes a legacy key.
@@ -277,104 +271,15 @@ pub fn session_id(family: &str) -> Result<SessionId, ContractError> {
     })
 }
 
-// Compatibility with the earlier worktree format is one upgrade step. Its
-// routing file is archived; normal operation never reads or updates it.
-fn import_previous_catalog(
-    data_dir: &Path,
-    target: NativeBackend,
-    store: &dyn SessionEventStore,
-    generation: u64,
-) -> Result<(), AppendError> {
-    let path = data_dir.join("sessions/session-family-locator.json");
-    let file = match filesystem::reader(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(jsonl::storage(error)),
-    };
-    let old: serde_json::Value = serde_json::from_reader(file).map_err(storage)?;
-    if old["version"] != 1 {
-        return Err(AppendError::UnsupportedSchema("old family catalog".into()));
-    }
-    let records = old["families"]
-        .as_object()
-        .ok_or_else(|| AppendError::Corrupt("old family catalog missing".into()))?;
-    let known = installation::session_ids(data_dir, target)?;
-    let mut archived = BTreeSet::new();
-    for (family, location) in records {
-        let phase = location["phase"]
-            .as_str()
-            .ok_or_else(|| AppendError::Corrupt("old cutover phase missing".into()))?;
-        if phase == "frozen" {
-            // No native publication took place. The immutable legacy source
-            // is imported by the installation pass below.
-            continue;
-        }
-        if phase != "native" && phase != "migrating" {
-            return Err(AppendError::UnsupportedSchema("old family phase".into()));
-        }
-        let source: NativeBackend = serde_json::from_value(
-            location[if phase == "native" {
-                "backend"
-            } else {
-                "source"
-            }]
-            .clone(),
-        )
-        .map_err(storage)?;
-        if source != target {
-            // Resume source archival even when its identity was published
-            // before the prior process exited.
-            archived.insert(source);
-        }
-        let root: SessionId =
-            serde_json::from_value(location["root_stream"].clone()).map_err(storage)?;
-        if let Some(existing) = known.get(family) {
-            if existing != &root {
-                return Err(AppendError::Corrupt(
-                    "old and current family identities differ".into(),
-                ));
-            }
-            continue;
-        }
-        let _lease = ownership::SessionExecutionLease::acquire(data_dir, family)?;
-        if source != target {
-            let image = migration::export(data_dir, source, Some(&root))?;
-            match target {
-                NativeBackend::Sqlite => SqliteEventStore::open(data_dir)?.import_native(&image)?,
-                NativeBackend::Jsonl => JsonlEventStore::open(data_dir)?.import_native(&image)?,
-            }
-        }
-        let key = format!("creation-source:{root}");
-        if store
-            .lookup_receipt(&root, &key)
-            .map_err(storage)?
-            .is_none()
-        {
-            let (source_event, source_payload) = creation_source(root.clone(), "legacy")?;
-            store.append_batch(AppendRequest {
-                session_id: root.clone(),
-                expected_head: store.head(&root).map_err(storage)?,
-                idempotency_key: key,
-                events: vec![source_event],
-                payloads: vec![source_payload],
-                erasure_reference_commitment: None,
-            })?;
-            #[cfg(test)]
-            super::crash_tests::crash_boundary("installation_previous_identity");
-        }
-    }
-    for source in archived {
-        archive_native(data_dir, source, generation)?;
-    }
-    Ok(())
-}
-
 pub(super) fn native_path(data_dir: &Path, backend: NativeBackend) -> std::path::PathBuf {
     data_dir.join(match backend {
         NativeBackend::Sqlite => "sessions/session-events.db",
         NativeBackend::Jsonl => "sessions/session-events-jsonl",
     })
 }
+
+/// Archive the previous native backend after a verified backend transfer.
+/// This is current-format backend switching, not legacy session import.
 pub(super) fn archive_native(
     data_dir: &Path,
     backend: NativeBackend,

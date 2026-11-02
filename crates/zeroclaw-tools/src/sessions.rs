@@ -456,13 +456,9 @@ mod tests {
                 "native_read_revoked"
             );
             Ok(SessionSummary {
-                session_id: None,
-                head: EventCursor::beginning(SessionId::new()),
+                head: EventCursor::beginning(SessionId::parse("native").expect("fixture id")),
                 owning_agent: Some("fixture".into()),
-                fields: std::collections::BTreeMap::from([(
-                    "session_key".into(),
-                    serde_json::json!("native"),
-                )]),
+                fields: std::collections::BTreeMap::new(),
                 created_at: 1,
                 last_activity: 2,
                 message_count: 1,

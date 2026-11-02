@@ -1,5 +1,5 @@
 //! A native store handle resolves the active format at each mutation. The
-//! immutable handle binds only its session key; installation format is the backend
+//! immutable handle binds only its session ID; installation format is the backend
 //! choice owner and events are the relationship owner.
 use super::installation::{InstallationGuard, NativeBackend};
 use super::*;
@@ -41,12 +41,12 @@ impl EventStorePool {
         let guard = InstallationGuard::acquire(&directory)?;
         let (backend, generation) = guard.active()?;
         let store = self.open_installation(&guard)?;
-        // A session key has one deterministic storage stream. The source
+        // A session ID selects one deterministic event stream. The source
         // marker is metadata on the root event; it is never consulted for
         // routing or enumeration.
-        let root_stream = super::upgrade::session_id(family)
+        let session_id = SessionId::parse(family.to_owned())
             .map_err(|error| AppendError::InvalidReference(error.to_string()))?;
-        let head = store.head(&root_stream).map_err(super::upgrade::storage)?;
+        let head = store.head(&session_id).map_err(super::upgrade::storage)?;
         if head.sequence == 0 {
             return Err(AppendError::InvalidReference(
                 "native session missing".into(),
@@ -54,10 +54,9 @@ impl EventStorePool {
         }
         Ok(ScopedEventStore {
             directory,
-            session_id: family.into(),
+            session_id,
             backend,
             generation,
-            root_stream,
             store,
             cli_state_lease: None,
             execution_lease: lease,
@@ -89,17 +88,16 @@ impl EventStorePool {
 
 pub struct ScopedEventStore {
     directory: PathBuf,
-    session_id: String,
+    session_id: SessionId,
     backend: NativeBackend,
     generation: u64,
-    root_stream: SessionId,
     store: Arc<dyn SessionEventStore>,
     cli_state_lease: Option<Arc<super::cli_state::CliStateGuard>>,
     execution_lease: Option<Arc<super::ownership::SessionExecutionLease>>,
 }
 impl ScopedEventStore {
-    pub fn root_stream(&self) -> &SessionId {
-        &self.root_stream
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
     pub fn open(data_dir: &Path, family: &str) -> Result<Self, AppendError> {
         EventStorePool::default().open_session(data_dir, family, None)
@@ -146,7 +144,7 @@ impl ScopedEventStore {
         if self.execution_lease.as_ref().is_some_and(|lease| {
             !lease.matches(
                 self.directory.parent().unwrap_or(&self.directory),
-                &self.session_id,
+                self.session_id.as_str(),
             )
         }) {
             return Err(AppendError::InvalidReference(
@@ -156,7 +154,7 @@ impl ScopedEventStore {
         if let Some(lease) = &self.cli_state_lease
             && lease
                 .binding()
-                .is_none_or(|binding| binding.session_id != self.session_id)
+                .is_none_or(|binding| binding.session_id != self.session_id.as_str())
         {
             return Err(AppendError::InvalidReference(
                 "CLI state ownership binding missing".into(),
@@ -168,7 +166,7 @@ impl ScopedEventStore {
                 "native writer generation changed".into(),
             ));
         }
-        Ok(self.root_stream.clone())
+        Ok(self.session_id.clone())
     }
     fn require_member(&self, root: &SessionId, request: &AppendRequest) -> Result<(), AppendError> {
         let mut stream = request.session_id.clone();
@@ -238,9 +236,36 @@ impl SessionEventStore for ScopedEventStore {
         let guard = InstallationGuard::acquire(&self.directory)?;
         let root = self.root(&guard)?;
         self.require_member(&root, &request)?;
+        if self
+            .store
+            .head(&root)
+            .map_err(super::upgrade::storage)?
+            .sequence
+            == 0
+        {
+            return Err(AppendError::WriterFenced(
+                "session has been discarded".into(),
+            ));
+        }
+        let closed = request
+            .events
+            .iter()
+            .any(|event| matches!(event.body.data, EventData::SessionClosed { .. }));
+        let session_id = request.session_id.clone();
         // Hold the same cross-process publication lock through the commit,
         // so freeze cannot race an already-open native handle.
-        self.store.append_batch(request)
+        let receipt = self.store.append_batch(request)?;
+        if closed {
+            super::temporary::discard_if_closed(
+                self.directory.parent().ok_or_else(|| {
+                    AppendError::Corrupt("session directory parent missing".into())
+                })?,
+                self.backend,
+                self.store.as_ref(),
+                &session_id,
+            )?;
+        }
+        Ok(receipt)
     }
     fn read_event(&self, id: &EventId) -> Result<Option<SessionEvent>, ReadError> {
         self.store.read_event(id)

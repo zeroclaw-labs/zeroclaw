@@ -1,7 +1,7 @@
 //! REST API handlers for the web dashboard.
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
-use super::{AppState, gateway_cancel_key};
+use super::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -1791,27 +1791,9 @@ pub async fn handle_api_sessions_list(
     .into_response()
 }
 
-/// Resolve an API session id to a live process-local cancellation key.
-///
-/// Cancellation registration deliberately keeps the accepted display id raw,
-/// because sanitization would make `team.alpha` and `team_alpha` share a
-/// token. A full persisted key is checked first so callers can pass the
-/// `session_key` returned by `GET /api/sessions`; when the caller passes a
-/// display id, the raw gateway prefix is added exactly once. There is no
-/// sanitized fallback here: guessing from a lossy key could abort a different
-/// live session.
+/// Cancellation addresses the exact canonical session id.
 fn resolve_gateway_cancel_key(id: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
-    if exists(id) {
-        return Some(id.to_string());
-    }
-
-    let display_key = gateway_cancel_key(id);
-    exists(&display_key).then_some(display_key)
-}
-
-/// Display session id used by WebSocket `?session_id=` / event filters.
-fn gateway_display_session_id(session_key: &str) -> &str {
-    session_key.strip_prefix("gw_").unwrap_or(session_key)
+    exists(id).then(|| id.to_owned())
 }
 
 /// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
@@ -1827,8 +1809,7 @@ pub async fn handle_api_session_messages(
     if state.native_sessions.is_some() {
         return crate::session_history::response(async {
                 let subject = crate::session_history::header_subject(&state, &headers)?;
-                let family = crate::session_history::family(&state, &id).await?;
-                let native = crate::session_history::query(&state, &family, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
+                let native = crate::session_history::query(&state, &id, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
                 let messages = native.query.messages(native.stream.clone()).await?.into_iter().map(|message| serde_json::json!({"message_id":message.message_id,"role":message.role,"content":message.text,"created_at":message.created_at.and_then(chrono::DateTime::from_timestamp_millis).map(|time| time.to_rfc3339()),"files":message.files,"attachments":message.attachments,"unavailable_parts":message.unavailable_parts})).collect::<Vec<_>>();
                 Ok(serde_json::json!({"session_id":id,"messages":messages,"session_persistence":true}))
         }.await);
@@ -1864,10 +1845,9 @@ pub async fn handle_api_session_message_post(
     if state.native_sessions.is_some() {
         return crate::session_history::response(async {
                 let subject = crate::session_history::header_subject(&state, &headers)?;
-                let family = crate::session_history::family(&state, &id).await?;
-                let port = crate::session_history::command(&state, &family, subject.as_deref()).await?;
+                let port = crate::session_history::command(&state, &id, subject.as_deref()).await?;
                 let message_id = port.append_assistant(&body.content).await?;
-                let display_id = gateway_display_session_id(&family);
+                let display_id = &id;
                 let _ = state.event_tx.send(serde_json::json!({"type":"message","session_id":display_id,"role":"assistant","content":body.content,"source":"api"}));
                 Ok(serde_json::json!({"status":"ok","session_id":display_id,"message_id":message_id,"message":{"role":"assistant","content":body.content},"session_persistence":true}))
         }.await);
@@ -1894,10 +1874,8 @@ pub async fn handle_api_session_delete(
         return crate::session_history::response(
             async {
                 let subject = crate::session_history::header_subject(&state, &headers)?;
-                let family = crate::session_history::family(&state, &id).await?;
-                let port =
-                    crate::session_history::command(&state, &family, subject.as_deref()).await?;
-                port.request_cancellation(None, &family, "gateway_session_delete")
+                let port = crate::session_history::command(&state, &id, subject.as_deref()).await?;
+                port.request_cancellation(None, &id, "gateway_session_delete")
                     .await?;
                 let cancellation = {
                     let tokens = state
@@ -1947,8 +1925,7 @@ pub async fn handle_api_session_rename(
         return crate::session_history::response(
             async {
                 let subject = crate::session_history::header_subject(&state, &headers)?;
-                let family = crate::session_history::family(&state, &id).await?;
-                crate::session_history::command(&state, &family, subject.as_deref())
+                crate::session_history::command(&state, &id, subject.as_deref())
                     .await?
                     .rename(name)
                     .await?;
@@ -2005,8 +1982,7 @@ pub async fn handle_api_session_state(
         return crate::session_history::response(async {
                 use zeroclaw_api::session_events::projection::TurnStatus;
                 let subject = crate::session_history::header_subject(&state, &headers)?;
-                let family = crate::session_history::family(&state, &id).await?;
-                let native = crate::session_history::query(&state, &family, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
+                let native = crate::session_history::query(&state, &id, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
                 let history = native.query.project_history(native.stream).await?;
                 let active = history.turns.iter().find(|(_, turn)| matches!(turn.status, TurnStatus::Queued|TurnStatus::Running));
                 let unknown = history.turns.values().max_by_key(|turn| turn.accepted_sequence).is_some_and(|turn| turn.status == TurnStatus::Unknown);
@@ -2050,8 +2026,7 @@ pub async fn handle_api_session_abort(
         if state.native_sessions.is_some() {
             let recorded = async {
                 let subject = crate::session_history::header_subject(&state, &headers)?;
-                let family = crate::session_history::family(&state, &id).await?;
-                crate::session_history::command(&state, &family, subject.as_deref())
+                crate::session_history::command(&state, &id, subject.as_deref())
                     .await?
                     .request_cancellation(None, &cancel_key, "gateway_operator_abort")
                     .await
@@ -3346,44 +3321,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resolve_gateway_cancel_key_accepts_display_and_full_ids_without_collisions() {
-        let dotted = |key: &str| key == "gw_team.alpha";
+    fn resolve_gateway_cancel_key_preserves_exact_session_ids() {
+        let dotted = |key: &str| key == "team.alpha";
         assert_eq!(
             resolve_gateway_cancel_key("team.alpha", dotted),
-            Some("gw_team.alpha".to_string())
+            Some("team.alpha".to_string())
         );
-        assert_eq!(
-            resolve_gateway_cancel_key("gw_team.alpha", dotted),
-            Some("gw_team.alpha".to_string())
-        );
+        assert_eq!(resolve_gateway_cancel_key("gw_team.alpha", dotted), None);
 
-        let both = |key: &str| key == "gw_team.alpha" || key == "gw_team_alpha";
+        let both = |key: &str| key == "team.alpha" || key == "team_alpha";
         assert_eq!(
             resolve_gateway_cancel_key("team.alpha", both),
-            Some("gw_team.alpha".to_string()),
+            Some("team.alpha".to_string()),
             "dotted display ids must retain their raw cancellation identity"
         );
         assert_eq!(
             resolve_gateway_cancel_key("team_alpha", both),
-            Some("gw_team_alpha".to_string()),
+            Some("team_alpha".to_string()),
             "underscored display ids must not collide with dotted ids"
-        );
-    }
-
-    #[test]
-    fn gateway_display_session_id_strips_gw_prefix() {
-        assert_eq!(gateway_display_session_id("gw_operator-1"), "operator-1");
-        assert_eq!(gateway_display_session_id("gw_team_alpha"), "team_alpha");
-        assert_eq!(
-            gateway_display_session_id("discord.clamps_room"),
-            "discord.clamps_room"
         );
     }
 
     #[tokio::test]
     async fn session_abort_accepts_full_session_key_from_sessions_list() {
         let state = test_state(zeroclaw_config::schema::Config::default());
-        let session_key = "gw_operator-1".to_string();
+        let session_key = "operator-1".to_string();
         let token = tokio_util::sync::CancellationToken::new();
         state
             .cancel_tokens
@@ -3391,7 +3353,7 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(session_key.clone(), std::sync::Arc::new(token.clone()));
 
-        // Same id GET /api/sessions advertises as session_key for abort.
+        // Use the canonical id returned by GET /api/sessions.
         let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
             .await
             .into_response();
@@ -3400,7 +3362,7 @@ pub(crate) mod tests {
         let json = response_json(response).await;
         assert_eq!(
             json["status"], "aborted",
-            "full session_key must abort; doubled gw_ prefix yields no_active_response"
+            "the canonical session id must address its cancellation token"
         );
         assert!(token.is_cancelled());
     }
@@ -3413,10 +3375,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert(
-                "gw_operator-1".to_string(),
-                std::sync::Arc::new(token.clone()),
-            );
+            .insert("operator-1".to_string(), std::sync::Arc::new(token.clone()));
 
         let response = handle_api_session_abort(
             State(state),
@@ -3440,12 +3399,9 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert(
-                "gw_team_alpha".to_string(),
-                std::sync::Arc::new(token.clone()),
-            );
+            .insert("team_alpha".to_string(), std::sync::Arc::new(token.clone()));
 
-        // List contract: session_id=team_alpha, session_key=gw_team_alpha.
+        // The list and cancellation registry use the same canonical id.
         // Treating "_" as "already a full key" would miss this cancel token.
         let response = handle_api_session_abort(
             State(state),
@@ -3459,7 +3415,7 @@ pub(crate) mod tests {
         let json = response_json(response).await;
         assert_eq!(
             json["status"], "aborted",
-            "underscore display ids must resolve to gw_ + id, not the bare id"
+            "underscored ids must resolve without protocol decoration"
         );
         assert!(token.is_cancelled());
     }
@@ -3472,10 +3428,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert(
-                "gw_team.alpha".to_string(),
-                std::sync::Arc::new(token.clone()),
-            );
+            .insert("team.alpha".to_string(), std::sync::Arc::new(token.clone()));
 
         let response = handle_api_session_abort(
             State(state),
@@ -3499,15 +3452,12 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert(
-                "gw_team.alpha".to_string(),
-                std::sync::Arc::new(token.clone()),
-            );
+            .insert("team.alpha".to_string(), std::sync::Arc::new(token.clone()));
 
         let response = handle_api_session_abort(
             State(state),
             HeaderMap::new(),
-            Path("gw_team.alpha".to_string()),
+            Path("team.alpha".to_string()),
         )
         .await
         .into_response();
@@ -3528,7 +3478,7 @@ pub(crate) mod tests {
             .lock()
             .expect("cancel_tokens lock")
             .insert(
-                "gw_team.alpha".to_string(),
+                "team.alpha".to_string(),
                 std::sync::Arc::new(dotted_token.clone()),
             );
         state
@@ -3536,7 +3486,7 @@ pub(crate) mod tests {
             .lock()
             .expect("cancel_tokens lock")
             .insert(
-                "gw_team_alpha".to_string(),
+                "team_alpha".to_string(),
                 std::sync::Arc::new(underscored_token.clone()),
             );
 

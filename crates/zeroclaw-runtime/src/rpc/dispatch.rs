@@ -3041,17 +3041,11 @@ impl RpcDispatcher {
 
     /// Resolve a session id to the ONE stored resource it names.
     ///
-    /// The live incarnation, every chat-backend key the id can be stored
-    /// under (`rpc_`, `gw_`, raw), and the ACP row are all located, and their
-    /// owners compared. Records that disagree about their owner are refused
-    /// as ambiguous rather than letting a caller authorize against one and
-    /// then read or destroy another through a prefixed-id or ACP/chat
-    /// collision. Store failures are errors, never absence. A live session's
-    /// mode selects its durable domain; `session/new` may supply its selected
-    /// mode and an admitted operation may retain its captured mode. An
-    /// unqualified reaped ACP/chat collision is ambiguous even when both
-    /// rows have the same owner. Among chat keys the RPC-prefixed key wins,
-    /// then the gateway prefix, then the raw id.
+    /// Resolve the one canonical native row for an id and compare it with
+    /// live and test-only compatibility records. The caller's current protocol
+    /// selects its adapter; creation metadata never selects identity or routing.
+    /// Conflicting owners are refused rather than authorizing one record and
+    /// reading another. Store failures are errors, never absence.
     ///
     /// Returns `Ok(None)` when the id names nothing anywhere.
     async fn resolve_session_record_for_mode(
@@ -3071,25 +3065,29 @@ impl RpcDispatcher {
         }
         let mut chat_durable: Option<DurableSession> = None;
         let mut has_acp = false;
-        {
+        if let Some(source) = &self.ctx.native_sessions {
+            if let Some(meta) = source
+                .describe(session_id.to_owned())
+                .await
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+            {
+                owners.push(meta.owner);
+                if live.as_ref().map(|(_, _, mode)| mode).or(selected_mode) == Some(&ChatMode::Acp)
+                {
+                    has_acp = true;
+                } else {
+                    chat_durable = Some(DurableSession::Chat {
+                        key: session_id.to_owned(),
+                    });
+                }
+            }
+        } else {
+            #[cfg(test)]
             for key in [
                 format!("rpc_{session_id}"),
                 format!("gw_{session_id}"),
                 session_id.to_string(),
             ] {
-                if let Some(source) = &self.ctx.native_sessions
-                    && let Some(meta) = source
-                        .describe(key.clone())
-                        .await
-                        .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                {
-                    owners.push(meta.owner);
-                    if chat_durable.is_none() {
-                        chat_durable = Some(DurableSession::Chat { key });
-                    }
-                    continue;
-                }
-                #[cfg(test)]
                 if let Some(meta) = self
                     .ctx
                     .session_backend
@@ -3103,22 +3101,15 @@ impl RpcDispatcher {
                 }
             }
         }
-        if let Some(source) = &self.ctx.native_sessions
-            && let Some(meta) = source
-                .describe(format!("acp_{session_id}"))
-                .await
-                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-        {
-            owners.push(meta.owner);
-            has_acp = true;
-        }
         if let Some(store) = self.ctx.session_repository.as_ref() {
             let store = store.clone();
             let sid = session_id.to_string();
             match tokio::task::spawn_blocking(move || store.session_principal(&sid)).await {
                 Ok(Ok(Some(owner))) => {
                     owners.push(owner);
-                    has_acp = true;
+                    if self.ctx.native_sessions.is_none() {
+                        has_acp = true;
+                    }
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
@@ -3859,7 +3850,7 @@ impl RpcDispatcher {
         let session_config = config.clone();
         let session_owner = from.to_owned();
         if tokio::task::spawn_blocking(move || {
-            zeroclaw_session_host::open_repository(&session_config, "")?
+            zeroclaw_session_host::open_repository(&session_config)?
                 .list_sessions_by_agent(&session_owner)
                 .map(|sessions| !sessions.is_empty())
         })
@@ -5282,7 +5273,7 @@ impl RpcDispatcher {
                     let owner_for_reload = expected_owner.clone();
                     let native_owned = if let Some(source) = &self.ctx.native_sessions {
                         source
-                            .describe(format!("acp_{session_id}"))
+                            .describe(session_id.to_owned())
                             .await
                             .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
                             .is_some()
@@ -5513,13 +5504,10 @@ impl RpcDispatcher {
                 .as_ref()
                 .and_then(|record| match &record.durable {
                     Some(DurableSession::Chat { key }) => Some(key.clone()),
-                    Some(DurableSession::Acp) => Some(format!("acp_{session_id}")),
+                    Some(DurableSession::Acp) => Some(session_id.to_owned()),
                     _ => None,
                 })
-                .unwrap_or_else(|| match chat_mode {
-                    ChatMode::Acp => format!("acp_{session_id}"),
-                    ChatMode::Chat => format!("rpc_{session_id}"),
-                });
+                .unwrap_or_else(|| session_id.to_owned());
             let stream = source
                 .session_id(&family)
                 .await
@@ -6551,7 +6539,7 @@ impl RpcDispatcher {
 
         let native_owned = if let Some(source) = &self.ctx.native_sessions {
             source
-                .describe(format!("acp_{sid}"))
+                .describe(sid.to_owned())
                 .await
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
                 .is_some()
@@ -6782,7 +6770,7 @@ impl RpcDispatcher {
                         "Native session requires authenticated admission",
                     )
                 })?;
-            let family = format!("acp_{sid}");
+            let family = sid.to_owned();
             let authority = Arc::new(RpcHistoryAuthority {
                 admission: PromptAdmission {
                     dispatcher: self.spawn_handle(),
@@ -7609,12 +7597,15 @@ impl RpcDispatcher {
             .as_ref()
             .and_then(|record| match record.durable.as_ref() {
                 Some(DurableSession::Chat { key }) => Some(key.clone()),
-                Some(DurableSession::Acp) => Some(format!("acp_{sid}")),
+                Some(DurableSession::Acp) => Some(sid.to_owned()),
                 _ => None,
             })
-            .unwrap_or_else(|| match chat_mode {
-                ChatMode::Acp => format!("acp_{sid}"),
-                ChatMode::Chat => format!("rpc_{sid}"),
+            .unwrap_or_else(|| {
+                if self.ctx.native_sessions.is_some() {
+                    sid.to_owned()
+                } else {
+                    format!("rpc_{sid}")
+                }
             });
         let turn_id = uuid::Uuid::new_v4().to_string();
         let native_session = if let Some(source) = &self.ctx.native_sessions {
@@ -8490,10 +8481,10 @@ impl RpcDispatcher {
             .as_ref()
             .and_then(|record| match record.durable.as_ref() {
                 Some(DurableSession::Chat { key }) => Some(key.clone()),
-                Some(DurableSession::Acp) => Some(format!("acp_{}", req.session_id)),
+                Some(DurableSession::Acp) => Some(req.session_id.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| format!("rpc_{}", req.session_id));
+            .unwrap_or_else(|| req.session_id.clone());
         let native_control = self
             .native_session_command(
                 &req.session_id,
@@ -8718,7 +8709,7 @@ impl RpcDispatcher {
                 Some(DurableSession::Chat { key }) => Some(key.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| format!("rpc_{sid}"));
+            .unwrap_or_else(|| sid.to_owned());
         if let Some(native) = self
             .native_session_command(sid, &key, record, method)
             .await?
@@ -9117,11 +9108,22 @@ impl RpcDispatcher {
     ///   append can race a running turn there and be lost the same way;
     /// - an ACP session, whose store replays structured turns.
     fn rpc_chat_writer_key(
+        &self,
         session_id: &str,
         record: Option<crate::rpc::session::SessionRecord>,
     ) -> Result<String, JsonRpcError> {
         match record.and_then(|rec| rec.durable) {
-            Some(DurableSession::Chat { key }) if key == format!("rpc_{session_id}") => Ok(key),
+            Some(DurableSession::Chat { key })
+                if key == session_id && self.ctx.native_sessions.is_some() =>
+            {
+                Ok(key)
+            }
+            #[cfg(test)]
+            Some(DurableSession::Chat { key })
+                if self.ctx.native_sessions.is_none() && key == format!("rpc_{session_id}") =>
+            {
+                Ok(key)
+            }
             Some(DurableSession::Chat { .. }) => Err(rpc_err(
                 INVALID_PARAMS,
                 "session/append writes only RPC chat sessions addressed by their own session_id; \
@@ -9170,7 +9172,7 @@ impl RpcDispatcher {
         // ownership again.
         let grants = self.recheck_authority_after_admission(Method::SessionAppend)?;
         self.require_ownership_under(grants.as_ref(), admitted.as_ref())?;
-        let key = Self::rpc_chat_writer_key(sid, admitted.clone())?;
+        let key = self.rpc_chat_writer_key(sid, admitted.clone())?;
         if let Some(native) = self
             .native_session_command(sid, &key, admitted.as_ref(), Method::SessionAppend)
             .await?
@@ -9265,8 +9267,8 @@ impl RpcDispatcher {
         // Installing context additionally requires update, not only provider execution.
         self.recheck_authority_after_admission(Method::SessionAppend)?;
         let key = match admitted.as_ref().and_then(|record| record.durable.as_ref()) {
-            Some(DurableSession::Chat { key }) if key == &format!("rpc_{sid}") => key.clone(),
-            Some(DurableSession::Acp) => format!("acp_{sid}"),
+            Some(DurableSession::Chat { key }) if key == sid => key.clone(),
+            Some(DurableSession::Acp) => sid.to_owned(),
             _ => {
                 return Err(rpc_err(
                     INVALID_PARAMS,
@@ -9589,15 +9591,7 @@ impl RpcDispatcher {
         let scope = self.scoped_principal_id();
         let mut sessions: Vec<SessionEntry> = Vec::new();
         for family in native_families {
-            // ACP has its own protocol picker and identity namespace.
-            if family.starts_with("acp_") {
-                continue;
-            }
-            let session_id = family
-                .strip_prefix("rpc_")
-                .or_else(|| family.strip_prefix("gw_"))
-                .unwrap_or(&family)
-                .to_owned();
+            let session_id = family.to_owned();
             if visible_ids
                 .as_ref()
                 .is_some_and(|ids| !ids.contains(&session_id))
@@ -9632,11 +9626,12 @@ impl RpcDispatcher {
             {
                 continue;
             }
+            let durable = DurableSession::Chat {
+                key: family.clone(),
+            };
             let record = crate::rpc::session::SessionRecord {
                 live_generation: None,
-                durable: Some(DurableSession::Chat {
-                    key: family.clone(),
-                }),
+                durable: Some(durable),
                 owner: descriptor.owner,
             };
             let native = self
@@ -9736,7 +9731,7 @@ impl RpcDispatcher {
                 .await?;
             let native = self
                 .native_history_query(
-                    &format!("acp_{}", summary.session_uuid),
+                    &summary.session_uuid.clone(),
                     record.as_ref(),
                     Method::SessionListAcp,
                 )
@@ -9923,26 +9918,13 @@ impl RpcDispatcher {
         method: Method,
     ) -> Result<zeroclaw_kernel::session::engine::SessionReadHandle, JsonRpcError> {
         let record = self.authorize_session_owner(sid, method).await?;
-        let source = self
-            .ctx
-            .native_sessions
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Native session storage is unavailable"))?;
-        let key = if source
-            .describe(sid.into())
-            .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-            .is_some()
-        {
-            sid.into()
-        } else {
-            match record.as_ref().and_then(|record| record.durable.as_ref()) {
-                Some(DurableSession::Chat { key }) => key.clone(),
-                Some(DurableSession::Acp) => format!("acp_{sid}"),
-                None => format!("rpc_{sid}"),
-            }
-        };
-        self.native_history_query(&key, record.as_ref(), method)
+        if self.ctx.native_sessions.is_none() {
+            return Err(rpc_err(
+                INTERNAL_ERROR,
+                "Native session storage is unavailable",
+            ));
+        }
+        self.native_history_query(sid, record.as_ref(), method)
             .await?
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Native history not found"))
     }
@@ -10145,7 +10127,7 @@ impl RpcDispatcher {
             Some(DurableSession::Acp)
         ) && let Some(native) = self
             .native_history_query(
-                &format!("acp_{}", req.session_id),
+                &req.session_id,
                 authorized.as_ref(),
                 Method::SessionMessages,
             )
@@ -10510,7 +10492,7 @@ impl RpcDispatcher {
             .as_ref()
             .and_then(|record| match record.durable.as_ref() {
                 Some(DurableSession::Chat { key }) => Some(key.clone()),
-                Some(DurableSession::Acp) => Some(format!("acp_{}", req.session_id)),
+                Some(DurableSession::Acp) => Some(req.session_id.clone()),
                 None => None,
             });
         if let Some(key) = native_key
@@ -10711,7 +10693,7 @@ impl RpcDispatcher {
             .and_then(|record| record.durable.as_ref())
             .map(|durable| match durable {
                 DurableSession::Chat { key } => key.clone(),
-                DurableSession::Acp => format!("acp_{}", req.session_id),
+                DurableSession::Acp => req.session_id.clone(),
             });
         let native_deleted =
             if let (Some(source), Some(key)) = (&self.ctx.native_sessions, &native_key) {
@@ -10870,8 +10852,8 @@ impl RpcDispatcher {
         };
         let key = match record.as_ref().and_then(|record| record.durable.as_ref()) {
             Some(DurableSession::Chat { key }) => key.clone(),
-            Some(DurableSession::Acp) => format!("acp_{session_id}"),
-            None => format!("rpc_{session_id}"),
+            Some(DurableSession::Acp) => session_id.to_owned(),
+            None => session_id.to_owned(),
         };
         if source
             .describe(key.clone())
@@ -12932,7 +12914,7 @@ impl RpcDispatcher {
                 Some(store) => store
                     .count_live_sessions_by_agent(&alias)
                     .map_err(|error| error.to_string()),
-                None => zeroclaw_session_host::open_repository(&config, "acp_")
+                None => zeroclaw_session_host::open_repository(&config)
                     .and_then(|store| store.count_live_sessions_by_agent(&alias))
                     .map_err(|error| error.to_string()),
             };
@@ -12973,7 +12955,7 @@ impl RpcDispatcher {
             Some(store) => store
                 .count_live_sessions_by_agent(&preflight_alias)
                 .map_err(|error| error.to_string()),
-            None => zeroclaw_session_host::open_repository(&session_config, "acp_")
+            None => zeroclaw_session_host::open_repository(&session_config)
                 .and_then(|store| store.count_live_sessions_by_agent(&preflight_alias))
                 .map_err(|error| error.to_string()),
         })
@@ -14060,9 +14042,9 @@ impl RpcDispatcher {
                 .resolve_session_record_for_mode(&target.session_id, None)
                 .await?;
             let key = match record.as_ref().and_then(|record| record.durable.as_ref()) {
-                Some(DurableSession::Acp) => format!("acp_{}", target.session_id),
+                Some(DurableSession::Acp) => target.session_id.clone(),
                 Some(DurableSession::Chat { key }) => key.clone(),
-                None => format!("rpc_{}", target.session_id),
+                None => target.session_id.clone(),
             };
             if let Some(port) = self
                 .native_session_command(&target.session_id, &key, record.as_ref(), method)
@@ -32682,7 +32664,7 @@ mod tests {
                 let upload = response(&mut rx, 6).await;
                 assert!(upload.get("error").is_none(), "{upload}");
                 let file_id = upload["result"]["ref_id"].as_str().expect("file identity");
-                let family = format!("{}_{sid}", if mode == "acp" { "acp" } else { "rpc" });
+                let family = sid.to_owned();
                 let query = dispatcher
                     .session_event_reader(sid, Method::SessionEvents)
                     .await
@@ -32908,7 +32890,7 @@ mod tests {
                 .expect("unshared context")
                 .native_sessions = Some(source.clone());
             let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
-            let family = "rpc_wire-fixture";
+            let family = "wire-fixture";
             let capability = ctx.config_authority.execution_capability();
             let authority = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
                 admission: capability.admit("test-agent").expect("agent").into(),
@@ -42690,12 +42672,7 @@ mod tests {
                 .await
                 .expect("owner");
             let native = dispatcher
-                .native_session_command(
-                    sid,
-                    &format!("rpc_{sid}"),
-                    record.as_ref(),
-                    Method::SessionConfigure,
-                )
+                .native_session_command(sid, sid, record.as_ref(), Method::SessionConfigure)
                 .await
                 .expect("command")
                 .expect("native session");
@@ -42897,7 +42874,7 @@ mod tests {
                     .handle_session_new_for_test(&new_params)
                     .await
                     .expect("session");
-                let family = format!("{}_{sid}", if mode == "acp" { "acp" } else { "rpc" });
+                let family = sid.to_owned();
                 let record = dispatcher
                     .authorize_session_owner(&sid, Method::SessionConfigure)
                     .await

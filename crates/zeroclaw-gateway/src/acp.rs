@@ -75,23 +75,22 @@ async fn handle_socket(
         max_sessions: config.acp.max_sessions,
         session_timeout_secs: config.acp.session_timeout_secs,
     };
-    let store = tokio::task::spawn_blocking(move || {
-        zeroclaw_session_host::open_repository(&config, "acp_")
-    })
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|result| result)
-    .map(Arc::new)
-    .inspect_err(|e| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": e.to_string()})),
-            "Failed to open ACP session store"
-        );
-    })
-    .ok();
+    let store =
+        tokio::task::spawn_blocking(move || zeroclaw_session_host::open_repository(&config))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+            .map(Arc::new)
+            .inspect_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "Failed to open ACP session store"
+                );
+            })
+            .ok();
     let canvas_store = state.canvas_store.clone();
     let server = if let Some(store) = store {
         AcpServer::new_with_live_config_and_writer_and_store(

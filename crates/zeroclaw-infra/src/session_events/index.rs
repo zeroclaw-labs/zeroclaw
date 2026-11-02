@@ -14,7 +14,6 @@ use std::path::Path;
 use zeroclaw_api::session_events::catalog::SessionIndexRecord;
 
 const JSONL_INDEX_FILE: &str = "session-index.jsonl";
-
 pub(crate) fn ensure_sqlite_schema(connection: &Connection) -> Result<(), AppendError> {
     connection
         .execute_batch(
@@ -35,7 +34,6 @@ pub(crate) fn ensure_sqlite_schema(connection: &Connection) -> Result<(), Append
                category TEXT,
                project TEXT,
                parent_session_id TEXT,
-               parent_thread_id TEXT,
                parent_agent TEXT,
                owning_agent TEXT,
                closed INTEGER NOT NULL,
@@ -88,7 +86,14 @@ pub(crate) fn read_records(
         )?,
     }
     .into_values()
-    .filter(|record| !record.deleted)
+    .filter(|record| {
+        !record.deleted
+            && record
+                .metadata
+                .get("session_kind")
+                .and_then(serde_json::Value::as_str)
+                != Some("temporary")
+    })
     .collect::<Vec<_>>();
     records.sort_by(|left, right| {
         right
@@ -110,6 +115,7 @@ where
 {
     let native = SqliteEventStore::open(data_dir)?;
     let connection = native.conn.lock();
+    ensure_sqlite_schema(&connection)?;
     // The table is a disposable projection. If an individual row or its
     // derived metadata cannot be decoded, rebuild the projection from the
     // canonical event streams instead of making the session store unusable.
@@ -128,6 +134,11 @@ where
             continue;
         }
         let Some(record) = project(stream).map_err(append_read_error)? else {
+            tx.execute(
+                "DELETE FROM session_index WHERE session_id=?1",
+                params![stream.as_str()],
+            )
+            .map_err(map_sqlite)?;
             continue;
         };
         upsert_sqlite(&tx, &record)?;
@@ -207,9 +218,9 @@ fn upsert_sqlite(
         "INSERT INTO session_index (
             session_id,creation_source,title,created_at,last_activity,
             first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,
-            provider,model,category,project,parent_session_id,parent_thread_id,parent_agent,
+            provider,model,category,project,parent_session_id,parent_agent,
             owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
          ON CONFLICT(session_id) DO UPDATE SET
             creation_source=excluded.creation_source,title=excluded.title,
             created_at=excluded.created_at,last_activity=excluded.last_activity,
@@ -217,7 +228,7 @@ fn upsert_sqlite(
             cwd=excluded.cwd,git_remote=excluded.git_remote,git_branch=excluded.git_branch,
             git_commit=excluded.git_commit,provider=excluded.provider,model=excluded.model,
             category=excluded.category,project=excluded.project,parent_session_id=excluded.parent_session_id,
-            parent_thread_id=excluded.parent_thread_id,parent_agent=excluded.parent_agent,
+            parent_agent=excluded.parent_agent,
             owning_agent=excluded.owning_agent,closed=excluded.closed,deleted=excluded.deleted,
             head_sequence=excluded.head_sequence,message_count=excluded.message_count,
             running=excluded.running,metadata_json=excluded.metadata_json",
@@ -238,7 +249,6 @@ fn upsert_sqlite(
             record.category,
             record.project,
             record.parent_session_id.as_ref().map(ToString::to_string),
-            record.parent_thread_id.as_ref().map(ToString::to_string),
             record.parent_agent,
             record.owning_agent,
             record.closed,
@@ -267,17 +277,17 @@ fn load_sqlite_records(
         return Ok(BTreeMap::new());
     }
     let mut statement = connection
-        .prepare("SELECT session_id,creation_source,title,created_at,last_activity,first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,provider,model,category,project,parent_session_id,parent_thread_id,parent_agent,owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json FROM session_index")
+        .prepare("SELECT session_id,creation_source,title,created_at,last_activity,first_user_message_id,first_user_preview,cwd,git_remote,git_branch,git_commit,provider,model,category,project,parent_session_id,parent_agent,owning_agent,closed,deleted,head_sequence,message_count,running,metadata_json FROM session_index")
         .map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
-            let metadata: Vec<u8> = row.get(24)?;
-            let head: i64 = row.get(21)?;
-            let message_count: i64 = row.get(22)?;
+            let metadata: Vec<u8> = row.get(23)?;
+            let head: i64 = row.get(20)?;
+            let message_count: i64 = row.get(21)?;
             let head_sequence = u64::try_from(head)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(21, head))?;
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(20, head))?;
             let message_count = usize::try_from(message_count)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(22, message_count))?;
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(21, message_count))?;
             Ok(SessionIndexRecord {
                 session_id: zeroclaw_api::session_events::SessionId::parse(
                     row.get::<_, String>(0)?,
@@ -304,17 +314,16 @@ fn load_sqlite_records(
                 category: row.get(13)?,
                 project: row.get(14)?,
                 parent_session_id: parse_optional(row.get(15)?),
-                parent_thread_id: parse_optional(row.get(16)?),
-                parent_agent: row.get(17)?,
-                owning_agent: row.get(18)?,
-                closed: row.get(19)?,
-                deleted: row.get(20)?,
+                parent_agent: row.get(16)?,
+                owning_agent: row.get(17)?,
+                closed: row.get(18)?,
+                deleted: row.get(19)?,
                 head_sequence,
                 message_count,
-                running: row.get(23)?,
+                running: row.get(22)?,
                 metadata: serde_json::from_slice(&metadata).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        24,
+                        23,
                         rusqlite::types::Type::Blob,
                         Box::new(error),
                     )
@@ -416,28 +425,31 @@ mod tests {
                 vec![("cwd", json!("/workspace")), ("category", json!("project"))],
             )
             .expect("create");
-        let sources = catalog.query().sessions().expect("sources");
-        assert!(sources.contains_key("gw_indexed"));
+        let records = catalog.query().index_records().expect("sessions");
+        let indexed = records
+            .iter()
+            .find(|record| record.session_id.as_str() == "gw_indexed")
+            .expect("indexed session");
         let connection =
             Connection::open(directory.path().join("sessions/session-events.db")).expect("db");
         let row: (String, String, String) = connection
             .query_row(
                 "SELECT session_id,cwd,category FROM session_index WHERE session_id=?1",
-                params![sources["gw_indexed"].as_str()],
+                params![indexed.session_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("index row");
         assert_eq!(
             row,
             (
-                sources["gw_indexed"].to_string(),
+                indexed.session_id.to_string(),
                 "/workspace".into(),
                 "project".into()
             )
         );
         let session = catalog
             .query()
-            .summary(&sources["gw_indexed"])
+            .summary(&indexed.session_id)
             .expect("summary")
             .expect("session");
         catalog
@@ -492,8 +504,8 @@ mod tests {
                 vec![("project", json!("demo"))],
             )
             .expect("create");
-        let sources = catalog.query().sessions().expect("sources");
-        assert_eq!(sources.len(), 1);
+        let records = catalog.query().index_records().expect("sessions");
+        assert_eq!(records.len(), 1);
         let bytes = fs::read(
             directory
                 .path()

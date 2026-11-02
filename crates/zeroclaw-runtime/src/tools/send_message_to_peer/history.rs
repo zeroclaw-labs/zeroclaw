@@ -126,7 +126,7 @@ pub(super) async fn open(
     recipient: &str,
     channel: &str,
 ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
-    let family = format!("peer-inbox:{task}");
+    let family = task.to_owned();
     let capability = admission.capability();
     let base = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
         admission: admission.into(),

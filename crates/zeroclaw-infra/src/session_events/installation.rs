@@ -70,9 +70,9 @@ impl InstallationGuard {
 
     pub fn acquire(sessions_dir: &Path) -> Result<Self, AppendError> {
         filesystem::directory(sessions_dir)?;
-        // Keep the old lock name so an already-open legacy writer shares the
-        // same fence during the upgrade from the previous implementation.
-        let lock = filesystem::file(&sessions_dir.join("session-family.lock"), false)
+        // Native operations and legacy import readers use the same
+        // installation-wide publication fence.
+        let lock = filesystem::file(&sessions_dir.join("session-store.lock"), false)
             .map_err(jsonl::storage)?;
         lock.lock().map_err(jsonl::storage)?;
         let manifest = match filesystem::reader(&sessions_dir.join("session-format.json")) {
@@ -140,12 +140,7 @@ impl InstallationGuard {
     }
 
     pub fn require_legacy(&self) -> std::io::Result<()> {
-        if self.manifest.is_some()
-            || self
-                .directory
-                .join("session-family-locator.json")
-                .try_exists()?
-        {
+        if self.manifest.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "legacy session writer fenced by native format upgrade",

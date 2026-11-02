@@ -314,7 +314,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
         };
         let source = source.clone();
         let capability = capability.clone();
-        let family = format!("sop:{}", context.run_id);
+        let family = context.run_id.clone();
         let task = format!(
             "sop:{}:{}:step:{}",
             context.sop_name, context.run_id, context.step_number

@@ -89,28 +89,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Gateway session key prefix to avoid collisions with channel sessions.
-pub(crate) const GW_SESSION_PREFIX: &str = "gw_";
-
-/// Return the canonical persistence key for a gateway session.
-///
-/// Persistence backends apply the shared filesystem-safe normalization so
-/// their in-memory and on-disk keys remain consistent.
-pub(crate) fn gateway_session_key(session_id: &str) -> String {
-    format!(
-        "{GW_SESSION_PREFIX}{}",
-        zeroclaw_api::session_keys::sanitize_session_key(session_id)
-    )
-}
-
 /// Return the process-local cancellation key for a gateway session.
 ///
-/// Unlike persistence keys, cancellation keys must preserve the accepted
-/// session id verbatim: filesystem-safe normalization is lossy and would make
+/// Cancellation and persistence both preserve the accepted session id
+/// verbatim: filesystem-safe normalization is lossy and would make
 /// distinct live sessions such as `team.alpha` and `team_alpha` cancel one
 /// another.
 pub(crate) fn gateway_cancel_key(session_id: &str) -> String {
-    format!("{GW_SESSION_PREFIX}{session_id}")
+    session_id.to_owned()
 }
 
 /// Backoff after a transient `accept()` error so the serve loop does not
@@ -773,7 +759,7 @@ pub struct AppState {
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
     /// Per-session cancellation tokens for aborting in-flight agent responses.
-    /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
+    /// Key is the canonical session id, value is the token for the
     /// current turn. Entries are inserted before each turn and removed after
     /// completion (normal or cancelled). The outer `Arc` provides turn identity
     /// so late cleanup cannot remove a replacement turn's token.
@@ -2003,7 +1989,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         if config.gateway.session_ttl_hours > 0 {
             let cutoff = chrono::Utc::now().timestamp_millis()
                 - i64::from(config.gateway.session_ttl_hours) * 3_600_000;
-            let archived = source.archive_stale("gw_", cutoff).await?;
+            let archived = source.archive_stale("gateway", cutoff).await?;
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3452,11 +3438,19 @@ pub(crate) async fn run_gateway_chat_with_parts(
         return Err(err);
     }
     if state.native_sessions.is_some() {
-        let family = session_id
-            .map(gateway_session_key)
-            .unwrap_or_else(|| gateway_session_key(&uuid::Uuid::new_v4().to_string()));
-        return run_native_gateway_turn(state, message, agent_override, &family, None, None, parts)
-            .await;
+        let session_id = session_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        return run_native_gateway_turn(
+            state,
+            message,
+            agent_override,
+            &session_id,
+            None,
+            None,
+            parts,
+        )
+        .await;
     }
 
     // Tests exercise webhook infrastructure (idempotency, auth, autosave)
@@ -4176,13 +4170,13 @@ pub(crate) fn register_cancel_token(
             std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
         >,
     >,
-    session_key: &str,
+    session_id: &str,
     cancel_token: Arc<tokio_util::sync::CancellationToken>,
 ) {
     let previous_token = cancel_tokens
         .lock()
         .expect("cancel_tokens lock poisoned")
-        .insert(session_key.to_owned(), cancel_token);
+        .insert(session_id.to_owned(), cancel_token);
     if let Some(previous_token) = previous_token {
         previous_token.cancel();
     }
@@ -4197,15 +4191,15 @@ pub(crate) fn remove_cancel_token_if_current(
             std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
         >,
     >,
-    session_key: &str,
+    session_id: &str,
     cancel_token: &Arc<tokio_util::sync::CancellationToken>,
 ) {
     let mut tokens = cancel_tokens.lock().expect("cancel_tokens lock poisoned");
     if tokens
-        .get(session_key)
+        .get(session_id)
         .is_some_and(|current| Arc::ptr_eq(current, cancel_token))
     {
-        tokens.remove(session_key);
+        tokens.remove(session_id);
     }
 }
 
@@ -4272,7 +4266,7 @@ impl Drop for SseClientStream {
 /// Drives the turn with the same streamed agent API the `/ws/chat` path uses
 /// ([`zeroclaw_runtime::agent::Agent::turn_streamed`]), relaying cumulative
 /// `TurnEvent::Chunk` text as `event: token` frames. The turn's cancellation
-/// token is registered under the same `gw_{session}` key the abort endpoint
+/// token is registered under the same session id the abort endpoint
 /// uses, so an in-flight streamed turn is cancellable exactly like a
 /// WebSocket turn; a client disconnect cancels the token too.
 async fn run_gateway_chat_streaming_response(
@@ -4298,19 +4292,10 @@ async fn run_gateway_chat_streaming_response(
     // Register under the process-local cancellation key so the existing abort
     // endpoint (and the shared cancellation registry) can cancel the
     // in-flight turn without collapsing distinct display ids.
-    let (session_key, cancel_key) = match session_id {
-        Some(session_id) => (
-            gateway_session_key(session_id),
-            gateway_cancel_key(session_id),
-        ),
-        None => {
-            let generated_session_id = uuid::Uuid::new_v4().to_string();
-            (
-                gateway_session_key(&generated_session_id),
-                gateway_cancel_key(&generated_session_id),
-            )
-        }
-    };
+    let session_id = session_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let cancel_key = session_id.clone();
     register_cancel_token(&state.cancel_tokens, &cancel_key, Arc::clone(&cancel_token));
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<SseFrame>(16);
@@ -4319,9 +4304,9 @@ async fn run_gateway_chat_streaming_response(
 
     let state_for_turn = state.clone();
     let message_owned = message.to_string();
-    let session_for_turn = session_id.map(str::to_string);
+    let session_for_turn = Some(session_id.clone());
     let alias_for_turn = agent_override.map(str::to_string);
-    let session_key_for_turn = session_key.clone();
+    let session_id_for_turn = session_id.clone();
     let token_for_turn = Arc::clone(&cancel_token);
     let proof = if state.native_sessions.is_some() {
         match session_history::current_ingress() {
@@ -4341,7 +4326,7 @@ async fn run_gateway_chat_streaming_response(
             token_for_turn.as_ref(),
             session_for_turn.as_deref(),
             alias_for_turn.as_deref(),
-            &session_key_for_turn,
+            &session_id_for_turn,
         ));
         let outcome = if let Some(proof) = proof {
             session_history::scope_ingress(proof, turn).await
@@ -4351,7 +4336,7 @@ async fn run_gateway_chat_streaming_response(
         let _ = turn_tx.send(outcome);
     });
 
-    let session_key_for_frames = session_key.clone();
+    let session_id_for_frames = session_id.clone();
     let state_for_frames = state.clone();
     let cancel_key_for_frames = cancel_key.clone();
     let token_for_stream = Arc::clone(&cancel_token);
@@ -4407,7 +4392,7 @@ async fn run_gateway_chat_streaming_response(
                     let delivered = delivery
                         .observe(
                             "sse",
-                            &session_key_for_frames,
+                            &session_id_for_frames,
                             &final_response,
                             "sse_terminal_queue_acceptance",
                             async {
@@ -4493,7 +4478,7 @@ async fn run_gateway_chat_streaming_response(
                     let result = delivery
                         .observe(
                             "sse",
-                            &session_key_for_frames,
+                            &session_id_for_frames,
                             &message,
                             "sse_terminal_queue_acceptance",
                             async {
@@ -4548,7 +4533,7 @@ async fn dispatch_gateway_turn_streaming(
     cancel_token: &tokio_util::sync::CancellationToken,
     session_id: Option<&str>,
     agent_override: Option<&str>,
-    session_key: &str,
+    session_id_for_scope: &str,
 ) -> anyhow::Result<GatewayChatOutcome> {
     #[cfg(test)]
     {
@@ -4568,7 +4553,7 @@ async fn dispatch_gateway_turn_streaming(
                 cancel_token,
                 session_id,
                 agent_override,
-                session_key,
+                session_id_for_scope,
             )
             .await;
         }
@@ -4601,7 +4586,7 @@ async fn dispatch_gateway_turn_streaming(
             cancel_token,
             session_id,
             agent_override,
-            session_key,
+            session_id_for_scope,
         )
         .await
     }
@@ -4618,14 +4603,14 @@ async fn dispatch_gateway_turn_streaming_with_agent(
     cancel_token: &tokio_util::sync::CancellationToken,
     session_id: Option<&str>,
     agent_override: Option<&str>,
-    session_key: &str,
+    session_id_for_scope: &str,
 ) -> anyhow::Result<GatewayChatOutcome> {
     if state.native_sessions.is_some() {
         return run_native_gateway_turn(
             state,
             message,
             agent_override,
-            session_key,
+            session_id_for_scope,
             Some(event_tx),
             Some(cancel_token.clone()),
             None,
@@ -4668,7 +4653,7 @@ async fn dispatch_gateway_turn_streaming_with_agent(
         ))
     });
     let (response, _) = Box::pin(zeroclaw_runtime::agent::loop_::scope_session_key(
-        Some(session_key.to_owned()),
+        Some(session_id_for_scope.to_owned()),
         zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
             turn_usage,
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
@@ -4691,20 +4676,20 @@ async fn run_native_gateway_turn(
     state: &AppState,
     message: &str,
     agent_override: Option<&str>,
-    family: &str,
+    session_id: &str,
     events: Option<tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     cancellation: Option<tokio_util::sync::CancellationToken>,
     parts: Option<Vec<zeroclaw_api::session_events::capture::EngineInputPart>>,
 ) -> anyhow::Result<GatewayChatOutcome> {
     let proof = session_history::current_ingress()?;
-    let _guard = state.session_queue.acquire(family).await?;
+    let _guard = state.session_queue.acquire(session_id).await?;
     let config = state.config.read().clone();
     let alias = require_gateway_chat_agent_alias(&config, agent_override)?;
     let capability = zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
         state.config.clone(),
         state.agent_lifecycle.clone(),
     );
-    let port = session_history::open_ingress(state, family, &alias, proof.clone()).await?;
+    let port = session_history::open_ingress(state, session_id, &alias, proof.clone()).await?;
     // Agent construction carries provider and tool setup futures; keep their
     // storage out of the nested transport and native-session futures.
     let mut agent = Box::pin(
@@ -4730,11 +4715,11 @@ async fn run_native_gateway_turn(
     }
     session_history::restore(port.as_ref(), &mut agent).await?;
     agent.set_memory_session_id(Some(zeroclaw_api::session_keys::sanitize_session_key(
-        family,
+        session_id,
     )));
     session_history::recover_pending(
         state,
-        family,
+        session_id,
         &port,
         &mut agent,
         &proof,
@@ -4800,7 +4785,7 @@ async fn run_native_gateway_turn(
         turn: input.turn_id.clone(),
     };
     let response = zeroclaw_runtime::agent::loop_::scope_session_key(
-        Some(family.into()),
+        Some(session_id.into()),
         zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
             usage,
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
@@ -5895,8 +5880,8 @@ mod tests {
         let dotted = gateway_cancel_key("team.alpha");
         let underscored = gateway_cancel_key("team_alpha");
 
-        assert_eq!(dotted, "gw_team.alpha");
-        assert_eq!(underscored, "gw_team_alpha");
+        assert_eq!(dotted, "team.alpha");
+        assert_eq!(underscored, "team_alpha");
         assert_ne!(dotted, underscored);
     }
 
@@ -8926,7 +8911,12 @@ path = "{trigger_path}"
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
         // `run_gateway` binds the process-global pricing config handle.
         let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
-        let mut config = Config::default();
+        let directory = tempfile::tempdir().expect("isolated gateway installation");
+        let mut config = Config {
+            data_dir: directory.path().join("data"),
+            config_path: directory.path().join("config.toml"),
+            ..Config::default()
+        };
         config.providers.models.anthropic.insert(
             "default".to_string(),
             zeroclaw_config::schema::AnthropicModelProviderConfig {
@@ -10215,7 +10205,7 @@ path = "{trigger_path}"
 
     async fn wait_for_registry_token(
         state: &AppState,
-        session_key: &str,
+        session_id: &str,
     ) -> Arc<tokio_util::sync::CancellationToken> {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -10223,7 +10213,7 @@ path = "{trigger_path}"
                     .cancel_tokens
                     .lock()
                     .expect("cancel_tokens lock poisoned")
-                    .get(session_key)
+                    .get(session_id)
                     .cloned()
                 {
                     return token;
@@ -10237,7 +10227,7 @@ path = "{trigger_path}"
 
     async fn wait_for_registry_replacement(
         state: &AppState,
-        session_key: &str,
+        session_id: &str,
         previous: &Arc<tokio_util::sync::CancellationToken>,
     ) -> Arc<tokio_util::sync::CancellationToken> {
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -10246,7 +10236,7 @@ path = "{trigger_path}"
                     .cancel_tokens
                     .lock()
                     .expect("cancel_tokens lock poisoned")
-                    .get(session_key)
+                    .get(session_id)
                     .cloned()
                     && !Arc::ptr_eq(&token, previous)
                 {
@@ -10261,7 +10251,7 @@ path = "{trigger_path}"
 
     async fn wait_for_registry_owner(
         state: &AppState,
-        session_key: &str,
+        session_id: &str,
         expected: &Arc<tokio_util::sync::CancellationToken>,
     ) {
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -10270,7 +10260,7 @@ path = "{trigger_path}"
                     .cancel_tokens
                     .lock()
                     .expect("cancel_tokens lock poisoned")
-                    .get(session_key)
+                    .get(session_id)
                     .is_some_and(|current| Arc::ptr_eq(current, expected));
                 if matches {
                     return;
@@ -10282,14 +10272,14 @@ path = "{trigger_path}"
         .expect("replacement transport retains registry ownership");
     }
 
-    async fn wait_for_registry_empty(state: &AppState, session_key: &str) {
+    async fn wait_for_registry_empty(state: &AppState, session_id: &str) {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let empty = !state
                     .cancel_tokens
                     .lock()
                     .expect("cancel_tokens lock poisoned")
-                    .contains_key(session_key);
+                    .contains_key(session_id);
                 if empty {
                     return;
                 }
@@ -10570,7 +10560,7 @@ data: [DONE]\n\n";
         assert!(
             session_history::recover_pending(
                 &state,
-                "gw_recovery",
+                "recovery",
                 &port,
                 &mut agent,
                 &wrong_proof,
@@ -10580,7 +10570,7 @@ data: [DONE]\n\n";
             .is_err()
         );
         assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
-        session_history::recover_pending(&state, "gw_recovery", &port, &mut agent, &proof, None)
+        session_history::recover_pending(&state, "recovery", &port, &mut agent, &proof, None)
             .await
             .unwrap();
         assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
@@ -10614,7 +10604,7 @@ data: [DONE]\n\n";
                     state.native_sessions = Some(Arc::new(
                         zeroclaw_session_host::NativeSessionHub::new(state.config.clone()),
                     ));
-                    let family = "gw_cross-entry-recovery";
+                    let family = "cross-entry-recovery";
                     let paired = session_history::IngressProof::Paired { subject: None };
                     let http_proof = if webhook {
                         session_history::IngressProof::Webhook {
@@ -10770,7 +10760,7 @@ data: [DONE]\n\n";
             assert!(text.contains("event: done"), "{backend}: {text}");
             assert!(!text.contains("event: error"), "{backend}: {text}");
             assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
-            let native = session_history::query(&state, "gw_native-sse-fixture", None)
+            let native = session_history::query(&state, "native-sse-fixture", None)
                 .await
                 .expect("query")
                 .expect("family");
@@ -10851,7 +10841,7 @@ data: [DONE]\n\n";
             let context = body["result"]["task"]["contextId"]
                 .as_str()
                 .expect("context");
-            let family = gateway_session_key(context);
+            let family = context.to_owned();
             let native = session_history::query(&state, &family, None)
                 .await
                 .expect("query")
@@ -11185,7 +11175,7 @@ data: [DONE]\n\n";
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned")
-            .get("gw_sse-abort")
+            .get("sse-abort")
             .cloned();
         assert!(
             token.is_some(),
@@ -11283,7 +11273,7 @@ data: [DONE]\n\n";
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned")
-            .get("gw_sse-drop")
+            .get("sse-drop")
             .cloned()
             .expect("streamed turn must register its cancellation token");
 
@@ -11297,7 +11287,7 @@ data: [DONE]\n\n";
                 .cancel_tokens
                 .lock()
                 .expect("cancel_tokens lock poisoned")
-                .contains_key("gw_sse-drop"),
+                .contains_key("sse-drop"),
             "dropping the SSE body must remove its cancellation token"
         );
     }
@@ -11334,7 +11324,7 @@ data: [DONE]\n\n";
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned")
-            .get("gw_sse-replace")
+            .get("sse-replace")
             .cloned()
             .expect("first streamed turn must register its cancellation token");
 
@@ -11351,7 +11341,7 @@ data: [DONE]\n\n";
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned")
-            .get("gw_sse-replace")
+            .get("sse-replace")
             .cloned()
             .expect("replacement streamed turn must register its cancellation token");
 
@@ -11363,7 +11353,7 @@ data: [DONE]\n\n";
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned")
-            .get("gw_sse-replace")
+            .get("sse-replace")
             .cloned()
             .expect("old-turn cleanup must preserve the replacement token");
         assert!(Arc::ptr_eq(&current, &second_token));
@@ -11401,7 +11391,7 @@ data: [DONE]\n\n";
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
         let session_id = "transport.ws-to.sse";
-        let session_key = gateway_cancel_key(session_id);
+        let session_id = gateway_cancel_key(session_id);
 
         // This URL connects only to the test's loopback listener. Keep the
         // scheme split so the static insecure-transport rule does not flag a
@@ -11436,17 +11426,17 @@ data: [DONE]\n\n";
             .await
             .expect("WS chat frame");
 
-        let ws_token = wait_for_registry_token(&state, &session_key).await;
+        let ws_token = wait_for_registry_token(&state, &session_id).await;
         wait_for_fixture_requests(&fixture, 1).await;
 
-        let sse_response = start_test_sse(&state, session_id).await;
+        let sse_response = start_test_sse(&state, &session_id).await;
         assert_eq!(sse_response.status(), StatusCode::OK);
-        let sse_token = wait_for_registry_replacement(&state, &session_key, &ws_token).await;
+        let sse_token = wait_for_registry_replacement(&state, &session_id, &ws_token).await;
         wait_for_fixture_requests(&fixture, 2).await;
         tokio::time::timeout(Duration::from_secs(3), ws_token.cancelled())
             .await
             .expect("SSE registration cancels the replaced WS turn");
-        wait_for_registry_owner(&state, &session_key, &sse_token).await;
+        wait_for_registry_owner(&state, &session_id, &sse_token).await;
 
         // The dotted display id must resolve to the canonical key and cancel
         // the replacement SSE turn, not the original WebSocket turn.
@@ -11472,7 +11462,7 @@ data: [DONE]\n\n";
             !sse_text.contains("event: done"),
             "cancelled SSE must not complete: {sse_text}"
         );
-        wait_for_registry_empty(&state, &session_key).await;
+        wait_for_registry_empty(&state, &session_id).await;
 
         drop(websocket);
         gateway_server.abort();
@@ -11503,11 +11493,11 @@ data: [DONE]\n\n";
         let tmp = tempfile::tempdir().expect("transport test temp dir");
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
         let session_id = "transport-sse-to-ws";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let session_id = session_id.to_owned();
 
-        let sse_response = start_test_sse(&state, session_id).await;
+        let sse_response = start_test_sse(&state, &session_id).await;
         assert_eq!(sse_response.status(), StatusCode::OK);
-        let sse_token = wait_for_registry_token(&state, &session_key).await;
+        let sse_token = wait_for_registry_token(&state, &session_id).await;
         wait_for_fixture_requests(&fixture, 1).await;
 
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
@@ -11544,12 +11534,12 @@ data: [DONE]\n\n";
             .await
             .expect("WS chat frame");
 
-        let ws_token = wait_for_registry_replacement(&state, &session_key, &sse_token).await;
+        let ws_token = wait_for_registry_replacement(&state, &session_id, &sse_token).await;
         wait_for_fixture_requests(&fixture, 2).await;
         tokio::time::timeout(Duration::from_secs(3), sse_token.cancelled())
             .await
             .expect("WS registration cancels the replaced SSE turn");
-        wait_for_registry_owner(&state, &session_key, &ws_token).await;
+        wait_for_registry_owner(&state, &session_id, &ws_token).await;
 
         let sse_text = collect_cancelled_sse(sse_response).await;
         assert!(
@@ -11564,7 +11554,7 @@ data: [DONE]\n\n";
         // Cancel the replacement WS turn and verify that its cleanup removes
         // only its own registry entry after the old SSE cleanup has completed.
         ws_token.cancel();
-        wait_for_registry_empty(&state, &session_key).await;
+        wait_for_registry_empty(&state, &session_id).await;
 
         drop(websocket);
         gateway_server.abort();
@@ -11605,7 +11595,7 @@ data: [DONE]\n\n";
         // Seed the transcript under the legacy raw gateway key: dot-bearing
         // display ids persisted this exact key before cancellation keys were
         // normalized, so a reconnect must resume it unchanged.
-        let legacy_key = format!("{GW_SESSION_PREFIX}{}", "transport.legacy-resume");
+        let legacy_key = "transport.legacy-resume".to_owned();
         backend
             .append(
                 &legacy_key,
@@ -11804,15 +11794,15 @@ data: [DONE]\n\n";
         let ws_token = Arc::new(tokio_util::sync::CancellationToken::new());
         let sse_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
-        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&ws_token));
-        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&sse_token));
-        remove_cancel_token_if_current(&registry, "gw_cross_direction", &ws_token);
+        register_cancel_token(&registry, "cross_direction", Arc::clone(&ws_token));
+        register_cancel_token(&registry, "cross_direction", Arc::clone(&sse_token));
+        remove_cancel_token_if_current(&registry, "cross_direction", &ws_token);
 
         assert!(ws_token.is_cancelled());
         let current = registry
             .lock()
             .expect("cancel registry lock")
-            .get("gw_cross_direction")
+            .get("cross_direction")
             .cloned()
             .expect("replacement SSE token remains registered");
         assert!(Arc::ptr_eq(&current, &sse_token));
@@ -11825,15 +11815,15 @@ data: [DONE]\n\n";
         let sse_token = Arc::new(tokio_util::sync::CancellationToken::new());
         let ws_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
-        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&sse_token));
-        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&ws_token));
-        remove_cancel_token_if_current(&registry, "gw_cross_direction", &sse_token);
+        register_cancel_token(&registry, "cross_direction", Arc::clone(&sse_token));
+        register_cancel_token(&registry, "cross_direction", Arc::clone(&ws_token));
+        remove_cancel_token_if_current(&registry, "cross_direction", &sse_token);
 
         assert!(sse_token.is_cancelled());
         let current = registry
             .lock()
             .expect("cancel registry lock")
-            .get("gw_cross_direction")
+            .get("cross_direction")
             .cloned()
             .expect("replacement WS token remains registered");
         assert!(Arc::ptr_eq(&current, &ws_token));

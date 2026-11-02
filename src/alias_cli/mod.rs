@@ -1154,7 +1154,7 @@ mod tests {
             ..Config::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        zeroclaw_session_host::open_repository(&config, "acp_")
+        zeroclaw_session_host::open_repository(&config)
             .unwrap()
             .create_session("live-session", "test", "busy", "/ws/busy", None)
             .unwrap();
@@ -1180,7 +1180,7 @@ mod tests {
             zeroclaw_config::schema::AliasedAgentConfig::default(),
         );
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        let store = zeroclaw_session_host::open_repository(&config, "acp_").unwrap();
+        let store = zeroclaw_session_host::open_repository(&config).unwrap();
         store
             .create_session("ended-session", "test", "victim", "/ws/victim", None)
             .unwrap();

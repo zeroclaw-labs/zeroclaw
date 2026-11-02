@@ -372,6 +372,27 @@ impl SessionQuery {
         before: Option<usize>,
         limit: Option<usize>,
     ) -> Result<HistoricalMessagePage, SessionError> {
+        self.message_window_inner(
+            stream,
+            frozen,
+            before,
+            limit,
+            &mut std::collections::HashSet::new(),
+        )
+        .await
+    }
+
+    async fn message_window_inner(
+        &self,
+        stream: SessionId,
+        frozen: Option<EventCursor>,
+        before: Option<usize>,
+        limit: Option<usize>,
+        visited: &mut std::collections::HashSet<SessionId>,
+    ) -> Result<HistoricalMessagePage, SessionError> {
+        if !visited.insert(stream.clone()) {
+            return Err(SessionError::InvalidAdmission("copy source cycle".into()));
+        }
         let mut history = Vec::new();
         let mut after = EventCursor::beginning(stream.clone());
         let mut through = frozen;
@@ -388,9 +409,32 @@ impl SessionQuery {
                 break;
             }
         }
+        let branch = self.branch.clone().or_else(|| {
+            history
+                .iter()
+                .find(|event| {
+                    matches!(
+                        event.body.kind(),
+                        EventKind::SessionStarted | EventKind::DerivedSessionStarted
+                    )
+                })
+                .and_then(|event| event.branch_id.clone())
+        });
+        let lineage = branch
+            .map(|branch| {
+                zeroclaw_api::session_events::lineage::frozen_lineage(
+                    &history,
+                    &stream,
+                    &branch,
+                    after.sequence,
+                )
+            })
+            .transpose()?;
         let mut seeds = Vec::new();
         if let Some(copy) = history.iter().find(|event| {
-            matches!(
+            lineage.as_ref().is_none_or(|lineage| {
+                zeroclaw_api::session_events::lineage::includes(lineage, event)
+            }) && matches!(
                 &event.body.data,
                 EventData::ContextProjectionCreated { reason_key, .. }
                     if reason_key == "copy_on_write_seed"
@@ -418,9 +462,6 @@ impl SessionQuery {
                     .to_owned(),
             )
             .map_err(|error| ReadError::Corrupt(error.to_string()))?;
-            if source == stream {
-                return Err(SessionError::InvalidAdmission("copy source cycle".into()));
-            }
             let sequence = value
                 .get("copy_source_sequence")
                 .and_then(serde_json::Value::as_u64)
@@ -437,37 +478,17 @@ impl SessionQuery {
             };
             let mut source_query = self.clone();
             source_query.branch = source_branch;
-            let inherited = std::pin::Pin::from(Box::new(source_query.message_window(
+            let inherited = std::pin::Pin::from(Box::new(source_query.message_window_inner(
                 source,
                 Some(source_cursor),
                 None,
                 None,
+                visited,
             )))
             .await?
             .messages;
             seeds.extend(inherited);
         }
-        let branch = self.branch.clone().or_else(|| {
-            history
-                .iter()
-                .find(|e| {
-                    matches!(
-                        e.body.kind(),
-                        EventKind::SessionStarted | EventKind::DerivedSessionStarted
-                    )
-                })
-                .and_then(|e| e.branch_id.clone())
-        });
-        let lineage = branch
-            .map(|branch| {
-                zeroclaw_api::session_events::lineage::frozen_lineage(
-                    &history,
-                    &stream,
-                    &branch,
-                    after.sequence,
-                )
-            })
-            .transpose()?;
         let mut imported = Vec::new();
         let mut messages = Vec::new();
         for event in &history {

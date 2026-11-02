@@ -7,6 +7,272 @@ use zeroclaw_kernel::session::{EffectIntent, PermissionResolver, SessionError};
 struct Authority(AtomicBool);
 
 #[tokio::test]
+async fn temporary_copy_restores_shared_context_hides_children_and_disappears_on_close() {
+    use zeroclaw_api::session_events::capture::{
+        ChildDispatchIntent, EngineInputPart, EngineTurnInput, current_provider_admission,
+    };
+    use zeroclaw_api::session_events::{ChildExecutionMode, context_read::CopySource};
+    use zeroclaw_infra::session_events::catalog::SessionCopy;
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: directory.path().into(),
+            ..Default::default()
+        };
+        config.channels.session_backend = backend.into();
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        let hub = NativeSessionHub::new(live.handle());
+        let source_port = hub
+            .open(
+                "source".into(),
+                "rpc",
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority.clone(),
+                ContextSnapshot {
+                    messages: vec![ConversationMessage::Chat(ChatMessage::user(
+                        "shared source history",
+                    ))],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+            )
+            .await
+            .expect("source");
+        let source = CopySource {
+            cursor: source_port
+                .history_reader()
+                .expect("reader")
+                .current()
+                .await
+                .expect("summary")
+                .head,
+            branch_id: BranchId::parse("branch-source").expect("branch"),
+        };
+        let id = SessionId::parse("temporary").expect("id");
+        {
+            let catalog = SessionCatalog::open(directory.path(), &hub.stores)
+                .expect("catalog")
+                .expect("native");
+            catalog
+                .commands()
+                .create_temporary(SessionCopy {
+                    session_id: &id,
+                    source: &source,
+                    creation_source: "rpc",
+                    owning_agent: "fixture",
+                })
+                .expect("temporary copy");
+        }
+        let port = hub
+            .open(
+                id.to_string(),
+                "rpc",
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority,
+                ContextSnapshot {
+                    messages: vec![],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+            )
+            .await
+            .expect("open temporary");
+        let context = port
+            .restore_context()
+            .await
+            .expect("restore")
+            .expect("context");
+        assert!(
+            matches!(&context.messages[0], ConversationMessage::Chat(chat) if chat.content == "shared source history")
+        );
+        port.execute(
+            EngineTurnInput {
+                execution_workspace: None,
+                turn_id: TurnId::new().to_string(),
+                agent_alias: Some("fixture".into()),
+                ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                reply_route: None,
+                parts: vec![EngineInputPart::Text("temporary prompt".into())],
+                provider_ref: "fixture".into(),
+                model: "fixture".into(),
+            },
+            Box::pin(async {
+                let child = current_provider_admission()
+                    .expect("admission")
+                    .begin_child(ChildDispatchIntent {
+                        relation: "delegate".into(),
+                        target_agent: "child".into(),
+                        prompt: "private child".into(),
+                        execution_mode: ChildExecutionMode::Sync,
+                        task_id: None,
+                    })
+                    .await?;
+                child
+                    .execute(Box::pin(async {
+                        let visible =
+                            zeroclaw_api::session_events::capture::current_session_execution()
+                                .expect("child execution")
+                                .history_reader()
+                                .expect("child history reader")
+                                .list(20)
+                                .await?;
+                        assert_eq!(visible.len(), 1);
+                        assert_eq!(visible[0].head.session_id.as_str(), "source");
+                        Ok("temporary child result".into())
+                    }))
+                    .await?;
+                Ok("temporary output".into())
+            }),
+        )
+        .await
+        .expect("temporary turn");
+        assert_eq!(hub.sessions().await.expect("visible sessions"), ["source"]);
+        let visible = port
+            .history_reader()
+            .expect("temporary history reader")
+            .list(20)
+            .await
+            .expect("visible history sessions");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].head.session_id.as_str(), "source");
+        let catalog = SessionCatalog::open(directory.path(), &hub.stores)
+            .expect("catalog")
+            .expect("native");
+        let events = catalog
+            .store()
+            .read_page(&id, &EventCursor::beginning(id.clone()), None, 256)
+            .expect("history")
+            .events;
+        let child = events
+            .iter()
+            .find_map(|event| match &event.body.data {
+                EventData::ChildInvocationCompleted {
+                    child_terminal_cursor,
+                    ..
+                } => Some(child_terminal_cursor.session_id.clone()),
+                _ => None,
+            })
+            .expect("child");
+        drop(catalog);
+        port.close("temporary_closed").await.expect("close");
+        assert!(port.append_assistant("late output").await.is_err());
+        let catalog = SessionCatalog::open(directory.path(), &hub.stores)
+            .expect("catalog")
+            .expect("native");
+        for id in [&id, &child] {
+            assert_eq!(catalog.store().head(id).expect("head").sequence, 0);
+        }
+        drop(catalog);
+        assert!(
+            hub.describe(id.to_string())
+                .await
+                .expect("describe")
+                .is_none()
+        );
+        let context = source_port
+            .restore_context()
+            .await
+            .expect("source retained")
+            .expect("source context");
+        assert!(
+            matches!(&context.messages[0], ConversationMessage::Chat(chat) if chat.content == "shared source history")
+        );
+    }
+}
+
+#[tokio::test]
+async fn existing_fork_resumes_after_host_restart_without_copying_history() {
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().expect("directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: directory.path().into(),
+            ..Default::default()
+        };
+        config.channels.session_backend = backend.into();
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        let hub = NativeSessionHub::new(live.handle());
+        let port = hub
+            .open(
+                "branch-session".into(),
+                "rpc",
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority.clone(),
+                ContextSnapshot {
+                    messages: vec![ConversationMessage::Chat(ChatMessage::user("shared input"))],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+            )
+            .await
+            .expect("create");
+        let cursor = port
+            .history_reader()
+            .expect("reader")
+            .current()
+            .await
+            .expect("summary")
+            .head;
+        let branch_id = BranchId::new();
+        let branch = port
+            .fork_branch(branch_id.clone(), cursor)
+            .await
+            .expect("fork");
+        branch
+            .append_assistant("fork output")
+            .await
+            .expect("branch output");
+        port.append_assistant("default output")
+            .await
+            .expect("default output");
+        drop(branch);
+        drop(port);
+        drop(hub);
+        let hub = NativeSessionHub::new(live.handle());
+        let port = hub
+            .open(
+                "branch-session".into(),
+                "rpc",
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority.clone(),
+                ContextSnapshot {
+                    messages: vec![],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+            )
+            .await
+            .expect("reopen");
+        assert!(
+            port.branches()
+                .await
+                .expect("branches")
+                .contains(&branch_id)
+        );
+        let fork = port.resume_branch(branch_id).await.expect("resume fork");
+        let restored = fork
+            .restore_context()
+            .await
+            .expect("restore")
+            .expect("context");
+        let text = restored
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(chat) => Some(chat.content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text, ["shared input", "fork output"]);
+        assert!(port.resume_branch(BranchId::new()).await.is_err());
+        authority.0.store(false, Ordering::SeqCst);
+        assert!(port.branches().await.is_err());
+        assert!(fork.restore_context().await.is_err());
+    }
+}
+
+#[tokio::test]
 async fn creation_source_is_preserved_on_reopen() {
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
@@ -17,7 +283,7 @@ async fn creation_source_is_preserved_on_reopen() {
         config.channels.session_backend = backend.into();
         let live = zeroclaw_config::live::LiveConfig::new(config);
         let authority = Arc::new(Authority(AtomicBool::new(true)));
-        let key = "project-discussion";
+        let key = "project-discussion-会话-Алиса";
         let initial = ContextSnapshot {
             messages: vec![ConversationMessage::Chat(ChatMessage::user(
                 "retained context",
@@ -127,7 +393,10 @@ async fn ttl_expiry_reopens_same_family_with_history() {
             .await
             .expect("old session");
         drop(port);
-        assert_eq!(hub.archive_stale("gw_", i64::MAX).await.expect("expire"), 1);
+        assert_eq!(
+            hub.archive_stale("test", i64::MAX).await.expect("expire"),
+            1
+        );
         let resumed = hub
             .open(
                 "gw_expired".into(),
@@ -231,60 +500,6 @@ fn historical_owner_resolution_uses_routing_and_preserves_ambiguity() {
         legacy_session_owner(&config, Some("matrix.fixture")),
         "alpha"
     );
-}
-
-#[tokio::test]
-async fn native_ready_history_queries_finish_pending_acp_migration() {
-    use zeroclaw_infra::session_repository::SessionRepository;
-    for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
-        let directory = tempfile::tempdir().expect("directory");
-        let source = SessionRepository::legacy_fixture(directory.path()).expect("legacy ACP");
-        source
-            .create_session("pending", "test", "fixture", "/workspace", Some("owner"))
-            .expect("legacy session");
-        source
-            .append_turn(
-                "pending",
-                &[ConversationMessage::Chat(ChatMessage::user("legacy input"))],
-            )
-            .expect("legacy history");
-        drop(source);
-        open_event_store(directory.path(), backend.name()).expect("earlier native store");
-        // Earlier native installations marked ready while retaining ACP's DB.
-        std::fs::write(
-            directory.path().join("sessions/session-format.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "version":1,"generation":1,"phase":"ready","backend":backend.name()
-            }))
-            .expect("earlier manifest bytes"),
-        )
-        .expect("earlier ready installation");
-        let mut config = zeroclaw_config::schema::Config {
-            data_dir: directory.path().into(),
-            ..Default::default()
-        };
-        config.channels.session_backend = backend.name().into();
-        let live = zeroclaw_config::live::LiveConfig::new(config);
-        let hub = NativeSessionHub::new(live.handle());
-        assert_eq!(
-            hub.sessions().await.expect("cold history query"),
-            vec!["acp_pending".to_owned()]
-        );
-        let descriptor = hub
-            .describe("acp_pending".into())
-            .await
-            .expect("descriptor")
-            .expect("migrated family");
-        assert_eq!(descriptor.owning_agent, "fixture");
-        assert_eq!(descriptor.owner.as_deref(), Some("owner"));
-        assert!(!directory.path().join("sessions/acp-sessions.db").exists());
-        assert!(
-            directory
-                .path()
-                .join("sessions/acp-sessions.db.backup")
-                .is_file()
-        );
-    }
 }
 
 #[tokio::test]
@@ -432,7 +647,7 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
             original.last_activity.timestamp_millis()
         );
         assert_eq!(
-            hub.archive_stale("gw_", summary.last_activity + 1)
+            hub.archive_stale("legacy", summary.last_activity + 1)
                 .await
                 .expect("retention"),
             1
@@ -512,14 +727,14 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
             .await
             .expect("active owner");
         assert_eq!(
-            hub.archive_stale("gw_active", i64::MAX)
+            hub.archive_stale("test", i64::MAX)
                 .await
                 .expect("active owner skipped"),
             0
         );
         drop(port);
         assert_eq!(
-            hub.archive_stale("gw_active", i64::MAX)
+            hub.archive_stale("test", i64::MAX)
                 .await
                 .expect("idle owner released"),
             1
@@ -750,6 +965,21 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
             .lookup_receipt(&stream, &format!("native-family-create:{stream}"))
             .expect("receipt");
         let child_start = child.events.first().expect("derived start");
+        let hub = NativeSessionHub::new(live.handle());
+        let descriptor = hub
+            .describe(terminal.session_id.to_string())
+            .await
+            .expect("describe derived session")
+            .expect("child descriptor");
+        assert_eq!(descriptor.owning_agent, "fixture");
+        assert_eq!(descriptor.owner, Some(PrincipalId::shared_operator().0));
+        assert!(
+            hub.sessions()
+                .await
+                .expect("session list")
+                .contains(&terminal.session_id.to_string())
+        );
+        drop(hub);
         assert_eq!(child_start.body.kind(), EventKind::DerivedSessionStarted);
         assert!(
             parent

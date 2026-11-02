@@ -513,8 +513,8 @@ lock. Resume uses the canonical context and committed model selection; history
 queries cannot promote old checkpoints.
 Standalone ACP prepares this standard store before binding its repository
 and propagates initialization failures. A fresh installation creates no legacy
-ACP database. Existing native installations also finish pending ACP imports
-before serving history enumeration.
+ACP database. An interrupted installation import finishes before serving history
+enumeration; completed installations do not reopen archived protocol stores.
 
 During execution, RPC and standalone ACP submit accepted context-usage and
 plan observations through the bound coordinator. These restricted metadata
@@ -537,9 +537,9 @@ they cannot override a value already recorded by native execution. Detail reads 
 reference without duplicating metadata. Session discovery also maintains a
 rebuildable `session_index` projection: SQLite stores it as a table beside the
 event rows, while JSONL stores the same logical rows in `session-index.jsonl`.
-It contains stream/session identity, title, creation and activity times, first
+It contains session identity, title, creation and activity times, first
 user message identity and bounded preview, workspace and Git fields, provider
-and model, category/project, parent thread/agent, lifecycle flags, message
+and model, category/project, parent session/agent, lifecycle flags, message
 count and the projected event head. The event stream remains canonical; the
 index is refreshed when the catalog opens or is queried, and a missing or
 stale row is rebuilt from committed events. Full message bodies are resolved
@@ -676,7 +676,12 @@ parent child request. A same-session fork keeps the `session_id` and creates a
 new `branch_id` with a frozen parent cursor. A copied session gets a new
 `session_id` and stores a `copy_on_write_seed` pointing to the source session
 and immutable sequence; history is resolved from that prefix until the copy
-writes its own events. A temporary session also gets a new `session_id`, is
-marked `session_kind=temporary`, and may record its parent in the index
-metadata. All four forms are independently enumerable and use the ordinary
-permission, recovery, close and retention paths.
+writes its own events. A temporary session also gets a new `session_id`, reuses a
+frozen context through the same copy-on-write seed, and is marked
+`session_kind=temporary`. It is hidden from the session list. Closing it removes
+its event stream and payloads that are no longer shared; startup cleanup removes
+temporary sessions left by a dead process. Durable sessions cannot use a
+temporary session as their source. Copies and child-agent sessions have ordinary
+session-list rows; forks are branches within one session, selected by `branch_id`.
+Existing branches can be enumerated and resumed after restart using
+`branches` and `resume_branch`, with current authorization checked on use.

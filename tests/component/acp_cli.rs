@@ -129,7 +129,7 @@ runtime_profile = "default"
         "ACP should exit cleanly after stdin closes"
     );
 
-    let store = SessionRepository::for_namespace(&config_dir.path().join("data"), "acp_")
+    let store = SessionRepository::new(&config_dir.path().join("data"))
         .expect("open persisted ACP sessions");
     let session = store
         .load_session(session_id)

@@ -935,8 +935,8 @@ fn validate_id(value: &str) -> Result<(), ContractError> {
     if value.is_empty()
         || value.len() > 256
         || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_' | '.'))
         || matches!(value, "." | "..")
     {
         return Err(ContractError::InvalidRequest(

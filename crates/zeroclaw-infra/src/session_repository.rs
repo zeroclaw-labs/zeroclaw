@@ -1,5 +1,6 @@
 //! Standard session repository used by protocol entrances. Event storage and
-//! projections are shared; namespaces select session keys, never a database.
+//! projections are shared; the protocol is metadata on a session, never part
+//! of its identity.
 use crate::session_events::{catalog::SessionCatalog, scoped::EventStorePool};
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -26,23 +27,17 @@ mod legacy_fixture;
 
 pub struct SessionRepository {
     data_dir: PathBuf,
-    namespace: String,
     stores: EventStorePool,
     #[cfg(any(test, feature = "test-util"))]
     legacy_fixture: Option<crate::session_events::upgrade::legacy_acp::LegacyAcpStore>,
 }
 
 impl SessionRepository {
-    /// Binds a session key namespace to the installation's configured native format.
-    /// Migration remains owned by installation startup, never this handle.
-    pub fn for_namespace(data_dir: &Path, namespace: &str) -> Result<Self> {
-        anyhow::ensure!(
-            !namespace.contains('/') && !namespace.contains('\\'),
-            "invalid session namespace"
-        );
+    /// Bind the installation's canonical session store. Creation protocol is
+    /// supplied separately as metadata when a session is created.
+    pub fn new(data_dir: &Path) -> Result<Self> {
         Ok(Self {
             data_dir: data_dir.into(),
-            namespace: namespace.into(),
             stores: Default::default(),
             #[cfg(any(test, feature = "test-util"))]
             legacy_fixture: None,
@@ -58,7 +53,7 @@ impl SessionRepository {
 
     #[cfg(any(test, feature = "test-util"))]
     pub fn legacy_fixture(data_dir: &Path) -> Result<Self> {
-        let mut repository = Self::for_namespace(data_dir, "acp_")?;
+        let mut repository = Self::new(data_dir)?;
         if !data_dir.join("sessions/session-format.json").try_exists()? {
             repository.legacy_fixture =
                 Some(crate::session_events::upgrade::legacy_acp::LegacyAcpStore::new(data_dir)?);
@@ -83,9 +78,9 @@ impl SessionRepository {
         )
     }
 
-    fn view(&self) -> Result<view::RepositoryView<'_>> {
+    fn view(&self) -> Result<view::RepositoryView> {
         let catalog = self.catalog()?;
-        Ok(view::RepositoryView(catalog, &self.namespace))
+        Ok(view::RepositoryView(catalog))
     }
     pub fn create_session(
         &self,
@@ -551,34 +546,134 @@ mod tests {
     use crate::session_events::{installation::NativeBackend, upgrade::upgrade_installation};
 
     #[test]
-    fn protocol_namespaces_share_the_standard_session_model_and_never_create_acp_database() {
+    fn protocol_entries_share_one_canonical_session_without_changing_owner_or_creation_source() {
         for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
             let directory = tempfile::tempdir().expect("directory");
             upgrade_installation(directory.path(), backend, |_| "unattributed".into())
                 .expect("ready");
-            let acp = SessionRepository::for_namespace(directory.path(), "acp_").expect("acp");
-            let rpc = SessionRepository::for_namespace(directory.path(), "rpc_").expect("rpc");
-            acp.create_session("same", "test", "agent", "/workspace", Some("owner"))
+            let acp = SessionRepository::new(directory.path()).expect("repository");
+            let rpc = SessionRepository::new(directory.path()).expect("repository");
+            acp.create_session("same", "acp", "agent", "/workspace", Some("owner"))
                 .expect("create ACP");
-            rpc.create_session("same", "test", "agent", "/workspace", Some("owner"))
-                .expect("create RPC");
-            assert_eq!(acp.list_sessions().expect("ACP list").len(), 1);
-            assert_eq!(rpc.list_sessions().expect("RPC list").len(), 1);
+            rpc.create_session("same", "rpc", "agent", "/workspace", Some("owner"))
+                .expect("reopen through RPC");
+            assert!(
+                rpc.create_session("same", "rpc", "agent", "/workspace", Some("other"))
+                    .is_err()
+            );
+            assert_eq!(acp.list_session_ids().expect("ACP list"), vec!["same"]);
+            assert_eq!(rpc.list_session_ids().expect("RPC list"), vec!["same"]);
             let catalog = acp.catalog().expect("catalog");
-            let families = catalog.query().sessions().expect("families");
-            let acp: zeroclaw_api::session_events::catalog::Session = catalog
+            let id = zeroclaw_api::session_events::SessionId::parse("same").expect("id");
+            let record = catalog
                 .query()
-                .summary(&families["acp_same"])
+                .summary(&id)
                 .expect("summary")
-                .expect("ACP session");
-            let rpc: zeroclaw_api::session_events::catalog::Session = catalog
-                .query()
-                .summary(&families["rpc_same"])
-                .expect("summary")
-                .expect("RPC session");
-            assert_eq!(acp.owning_agent, rpc.owning_agent);
-            assert_ne!(acp.stream(), rpc.stream());
+                .expect("session");
+            assert_eq!(record.stream(), &id);
+            assert_eq!(record.creation_source(), Some("acp"));
             assert!(!directory.path().join("sessions/acp-sessions.db").exists());
+        }
+    }
+
+    #[test]
+    fn nested_copies_restore_frozen_history_and_inherit_ownership_and_index_preview() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        use zeroclaw_api::session_events::*;
+        for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().expect("directory");
+            let legacy =
+                SessionRepository::legacy_fixture(directory.path()).expect("legacy fixture");
+            legacy
+                .create_session("original", "acp", "agent", "/workspace", Some("owner"))
+                .expect("source");
+            let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+                "original input",
+            ))];
+            legacy.append_turn("original", &messages).expect("history");
+            upgrade_installation(directory.path(), backend, |_| "agent".into()).expect("upgrade");
+            let repository = SessionRepository::new(directory.path()).expect("repository");
+            let catalog = repository.catalog().expect("catalog");
+            let original = SessionId::parse("original").expect("id");
+            let copied = SessionId::parse("copied").expect("id");
+            let nested = SessionId::parse("nested").expect("id");
+            for (target, source) in [(&copied, &original), (&nested, &copied)] {
+                let row = catalog
+                    .query()
+                    .summary(source)
+                    .expect("summary")
+                    .expect("source");
+                catalog
+                    .commands()
+                    .create_copy(crate::session_events::catalog::SessionCopy {
+                        session_id: target,
+                        source: &context_read::CopySource {
+                            cursor: row.head,
+                            branch_id: BranchId::parse(format!("branch-{source}")).expect("branch"),
+                        },
+                        creation_source: "rpc",
+                        owning_agent: "agent",
+                    })
+                    .expect("copy");
+            }
+            let body = PayloadRecord::json(
+                "session.context/v1",
+                &serde_json::json!({"message_refs":[]}),
+            )
+            .expect("later empty context");
+            let mut context = SessionEvent::typed(
+                original.clone(),
+                EventData::ContextProjectionCreated {
+                    source_ranges: vec![],
+                    summary_ref: None,
+                    budget: 0,
+                    reason_key: "fixture_replacement".into(),
+                    algorithm_version: "fixture/v1".into(),
+                    result_ref: StoredPayloadRef::from(&body),
+                    summary_source_refs: vec![],
+                    transform_started_event_id: None,
+                },
+                EventActor::default(),
+            )
+            .expect("context");
+            context.branch_id = Some(BranchId::parse("branch-original").expect("branch"));
+            catalog
+                .store()
+                .append_batch(AppendRequest {
+                    session_id: original.clone(),
+                    expected_head: catalog.store().head(&original).expect("head"),
+                    idempotency_key: "later-source-context".into(),
+                    events: vec![context],
+                    payloads: vec![body],
+                    erasure_reference_commitment: None,
+                })
+                .expect("later source write");
+            drop(catalog);
+            assert!(
+                repository
+                    .load_session("original")
+                    .expect("source")
+                    .expect("source exists")
+                    .messages
+                    .is_empty()
+            );
+            for id in [&copied, &nested] {
+                let copy = repository
+                    .load_session(id.as_str())
+                    .expect("load copy")
+                    .expect("copy exists");
+                assert_eq!(copy.principal_id.as_deref(), Some("owner"));
+                assert_eq!(copy.workspace_dir, "/workspace");
+                assert_eq!(
+                    serde_json::to_value(copy.messages).expect("copy messages"),
+                    serde_json::to_value(&messages).expect("original messages")
+                );
+            }
+            let catalog = repository.catalog().expect("catalog");
+            for row in catalog.query().index_records().expect("index") {
+                assert_eq!(row.message_count, 1);
+                assert_eq!(row.first_user_preview.as_deref(), Some("original input"));
+            }
         }
     }
 }

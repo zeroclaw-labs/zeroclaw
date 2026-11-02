@@ -680,21 +680,6 @@ pub(crate) async fn restore(
     Ok(())
 }
 
-/// Resolve exact existing families before applying the display-id namespace.
-pub(crate) async fn family(state: &AppState, id: &str) -> anyhow::Result<String> {
-    let source = state
-        .native_sessions
-        .as_ref()
-        .ok_or_else(|| anyhow::Error::msg("native_session_source_missing"))?;
-    if source.describe(id.into()).await?.is_some() {
-        return Ok(id.into());
-    }
-    Ok(if id.starts_with("gw_") {
-        id.into()
-    } else {
-        format!("gw_{id}")
-    })
-}
 pub(crate) async fn command(
     state: &AppState,
     family: &str,
@@ -736,8 +721,8 @@ pub(crate) async fn list(
         .as_ref()
         .ok_or_else(|| anyhow::Error::msg("native_session_source_missing"))?;
     let mut sessions = Vec::new();
-    for family in source.sessions().await? {
-        let native = match query(state, &family, subject).await {
+    for session_id in source.sessions().await? {
+        let native = match query(state, &session_id, subject).await {
             Ok(Some(native)) => native,
             Ok(None) => continue,
             Err(error) if history_access_denied(&error) => continue,
@@ -749,7 +734,7 @@ pub(crate) async fn list(
         }
         let timestamp =
             |millis| chrono::DateTime::from_timestamp_millis(millis).map(|time| time.to_rfc3339());
-        sessions.push(serde_json::json!({"session_id":family.strip_prefix("gw_").unwrap_or(&family),"session_key":family,"name":summary.title().map(str::to_owned),"agent_alias":summary.owning_agent,"channel_id":summary.channel_id().map(str::to_owned),"message_count":summary.message_count,"created_at":timestamp(summary.created_at),"last_activity":timestamp(summary.last_activity),"source_cursor":summary.head}));
+        sessions.push(serde_json::json!({"session_id":session_id,"name":summary.title().map(str::to_owned),"agent_alias":summary.owning_agent,"channel_id":summary.channel_id().map(str::to_owned),"message_count":summary.message_count,"created_at":timestamp(summary.created_at),"last_activity":timestamp(summary.last_activity),"source_cursor":summary.head}));
     }
     verify_history_subject(&state.pairing, subject)?;
     Ok(serde_json::json!({"sessions":sessions}))
@@ -1076,9 +1061,9 @@ pub(crate) mod tests {
                 },
             );
             let mut state = crate::api::tests::test_state(config);
-            let source = Source::new(directory.path(), backend, "gw_native-fixture");
+            let source = Source::new(directory.path(), backend, "native-fixture");
             state.native_sessions = Some(source.clone());
-            let port = open(&state, "gw_native-fixture", "web", None)
+            let port = open(&state, "native-fixture", "web", None)
                 .await
                 .expect("open")
                 .expect("port");
@@ -1207,15 +1192,11 @@ pub(crate) mod tests {
                 .pairing
                 .authenticate_and_hash("fixture-bearer")
                 .expect("fixture authentication");
-            let bound = open(&state, "gw_native-fixture", "web", Some(&hash))
+            let bound = open(&state, "native-fixture", "web", Some(&hash))
                 .await
                 .expect("authenticated open")
                 .expect("port");
-            assert!(
-                open(&state, "gw_native-fixture", "web", None)
-                    .await
-                    .is_err()
-            );
+            assert!(open(&state, "native-fixture", "web", None).await.is_err());
             assert!(state.pairing.revoke_token_hash(&hash));
             assert!(bound.append_assistant("revoked action").await.is_err());
             assert!(bound.restore_context().await.is_err());
@@ -1257,7 +1238,7 @@ pub(crate) mod tests {
         };
         use tokio_util::sync::CancellationToken;
         for backend in ["sqlite", "jsonl"] {
-            for family in ["gw_team_alpha", "gw_team.alpha"] {
+            for family in ["team_alpha", "team.alpha"] {
                 let directory = tempfile::tempdir().expect("directory");
                 let mut config = zeroclaw_config::schema::Config {
                     data_dir: directory.path().into(),
@@ -1281,7 +1262,7 @@ pub(crate) mod tests {
                     .expect("open")
                     .expect("port");
                 port.append_assistant("original").await.expect("seed");
-                let display = family.strip_prefix("gw_").expect("display");
+                let display = family;
                 let mut rx = state.event_tx.subscribe();
                 for id in [display, family] {
                     let response = crate::api::handle_api_session_message_post(
@@ -1400,9 +1381,9 @@ pub(crate) mod tests {
                 },
             );
             let mut state = crate::api::tests::test_state(config);
-            let source = Source::new(directory.path(), backend, "gw_body-fixture");
+            let source = Source::new(directory.path(), backend, "body-fixture");
             state.native_sessions = Some(source.clone());
-            let port = open(&state, "gw_body-fixture", "web", None)
+            let port = open(&state, "body-fixture", "web", None)
                 .await
                 .expect("open")
                 .expect("port");

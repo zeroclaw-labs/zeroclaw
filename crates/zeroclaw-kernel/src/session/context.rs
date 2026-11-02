@@ -12,6 +12,81 @@ use zeroclaw_api::session_events::capture::{
 };
 use zeroclaw_api::session_events::*;
 
+impl EngineSession {
+    fn resolve_copy_context(
+        &self,
+        source: &SessionId,
+        sequence: u64,
+        branch: &BranchId,
+        visited: &mut std::collections::HashSet<SessionId>,
+    ) -> Result<ContextSnapshot, SessionError> {
+        if !visited.insert(source.clone()) {
+            return Err(SessionError::InvalidAdmission("copy source cycle".into()));
+        }
+        let owner = &self.owner;
+        self.authority
+            .authorize_actor(&self.actor, source, SessionAccess::Read)?;
+        self.authority.authorize_context(source, branch)?;
+        let projection = context_read::projection_at(
+            owner.store.as_ref(),
+            &context_read::CopySource {
+                cursor: EventCursor {
+                    session_id: source.clone(),
+                    sequence,
+                },
+                branch_id: branch.clone(),
+            },
+        )?;
+        let EventData::ContextProjectionCreated { result_ref, .. } = &projection.body.data else {
+            return Err(SessionError::Read(ReadError::Corrupt(
+                "copy source context kind mismatch".into(),
+            )));
+        };
+        let body: serde_json::Value = serde_json::from_slice(
+            &zeroclaw_api::session_events::context_read::present(owner.store.as_ref(), result_ref)?
+                .body,
+        )
+        .map_err(|error| ReadError::Corrupt(error.to_string()))?;
+        if let Some(nested) = context_read::copy_source(&body)? {
+            let snapshot = self.resolve_copy_context(
+                &nested.cursor.session_id,
+                nested.cursor.sequence,
+                &nested.branch_id,
+                visited,
+            )?;
+            self.authority
+                .authorize_actor(&self.actor, source, SessionAccess::Read)?;
+            self.authority.authorize_context(source, branch)?;
+            return Ok(snapshot);
+        }
+        let refs = zeroclaw_api::session_events::context_read::context_refs(
+            owner.store.as_ref(),
+            &projection,
+        )?;
+        let messages = refs
+            .iter()
+            .map(|item| {
+                zeroclaw_api::session_events::context_read::resolve_message(
+                    owner.store.as_ref(),
+                    source,
+                    item,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|items| items.into_iter().flatten().collect())
+            .map_err(SessionError::from)?;
+        self.authority
+            .authorize_actor(&self.actor, source, SessionAccess::Read)?;
+        self.authority.authorize_context(source, branch)?;
+        Ok(ContextSnapshot {
+            messages,
+            history_has_trim_breadcrumb: body
+                .get("history_has_trim_breadcrumb")
+                .and_then(serde_json::Value::as_bool),
+        })
+    }
+}
+
 struct Transform {
     owner: Arc<SessionCoordinator>,
     stream: SessionId,
@@ -547,63 +622,22 @@ impl EngineSession {
             let source_branch = value
                 .get("copy_source_branch_id")
                 .and_then(serde_json::Value::as_str)
-                .map(|value| BranchId::parse(value.to_owned()))
-                .transpose()?;
+                .ok_or_else(|| ReadError::Corrupt("copy source branch missing".into()))?;
+            let source_branch = BranchId::parse(source_branch.to_owned())?;
             let owner = self.owner.clone();
-            let messages = owner
+            let session = self.clone();
+            let snapshot = owner
                 .clone()
                 .blocking(move || {
-                    let head = owner.store.head(&source)?;
-                    let through = EventCursor {
-                        session_id: source.clone(),
-                        sequence: sequence.min(head.sequence),
-                    };
-                    let mut after = EventCursor::beginning(source.clone());
-                    let mut latest = None;
-                    loop {
-                        let page = owner
-                            .store
-                            .read_page(&source, &after, Some(&through), 256)?;
-                        for candidate in &page.events {
-                            if candidate.body.kind() == EventKind::ContextProjectionCreated
-                                && source_branch.as_ref().is_none_or(|branch| {
-                                    candidate.branch_id.as_ref() == Some(branch)
-                                })
-                            {
-                                latest = Some(candidate.clone());
-                            }
-                        }
-                        if !page.has_more {
-                            break;
-                        }
-                        after = page.through;
-                    }
-                    let projection = latest.ok_or_else(|| {
-                        SessionError::StaleTarget("copy source context missing".into())
-                    })?;
-                    let refs = zeroclaw_api::session_events::context_read::context_refs(
-                        owner.store.as_ref(),
-                        &projection,
-                    )?;
-                    refs.iter()
-                        .map(|item| {
-                            zeroclaw_api::session_events::context_read::resolve_message(
-                                owner.store.as_ref(),
-                                &source,
-                                item,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .map(|items| items.into_iter().flatten().collect())
-                        .map_err(SessionError::from)
+                    session.resolve_copy_context(
+                        &source,
+                        sequence,
+                        &source_branch,
+                        &mut std::collections::HashSet::new(),
+                    )
                 })
                 .await?;
-            return Ok(Some(ContextSnapshot {
-                messages,
-                history_has_trim_breadcrumb: value
-                    .get("history_has_trim_breadcrumb")
-                    .and_then(serde_json::Value::as_bool),
-            }));
+            return Ok(Some(snapshot));
         }
         let messages = if let Some(items) = value.get("message_refs") {
             let refs: Vec<MessageRef> = serde_json::from_value(items.clone())?;

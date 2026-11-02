@@ -342,7 +342,7 @@ impl AcpServer {
 
     async fn record_history_cancellation(&self, session_id: &str, reason: &str) -> RpcResult {
         if let Some((source, factory)) = &self.native_history {
-            let family = format!("acp_{session_id}");
+            let family = session_id.to_owned();
             let command = async {
                 let Some(descriptor) = source.describe(family.clone()).await? else {
                     return Ok::<_, anyhow::Error>(());
@@ -386,7 +386,7 @@ impl AcpServer {
         let Some((source, factory)) = &self.native_history else {
             return Ok(None);
         };
-        let family = format!("acp_{session_id}");
+        let family = session_id.to_owned();
         let Some(descriptor) = source.describe(family.clone()).await? else {
             return Ok(None);
         };
@@ -2104,7 +2104,7 @@ impl AcpServer {
         }
 
         let native = if let Some((source, factory)) = &self.native_history {
-            let family = format!("acp_{session_id}");
+            let family = session_id.to_owned();
             let initial = {
                 let session = session_arc.lock().await;
                 zeroclaw_api::session_events::capture::ContextSnapshot {
@@ -7626,7 +7626,7 @@ mod tests {
             ]}}).to_string()).await;
             let result = response(&mut rx, 2).await;
             assert!(result.get("error").is_none(), "{backend}: {result}");
-            let family = format!("acp_{sid}");
+            let family = sid.to_owned();
             let stream = source.session_id(&family).await.expect("stream");
             let native = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 directory.path(),

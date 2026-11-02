@@ -102,7 +102,7 @@ pub fn plan_agent_delete_with_acp_count(
 }
 
 pub fn live_acp_session_count(config: &Config, alias: &str) -> anyhow::Result<usize> {
-    let store = zeroclaw_session_host::open_repository(config, "acp_")
+    let store = zeroclaw_session_host::open_repository(config)
         .context("open ACP session store to verify live sessions")?;
     store
         .count_live_sessions_by_agent(alias)
@@ -258,7 +258,7 @@ pub async fn cascade_owned_state(
     let session_config = config.clone();
     let acp_alias = alias.to_string();
     let acp_export = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let store = zeroclaw_session_host::open_repository(&session_config, "acp_")?;
+        let store = zeroclaw_session_host::open_repository(&session_config)?;
         let sessions = store.list_sessions_by_agent(&acp_alias)?;
         let json = sessions
             .iter()
@@ -290,31 +290,11 @@ pub async fn cascade_owned_state(
             warnings.push(format!("acp export task failed: {error}"));
         }
     }
-    let session_config = config.clone();
-    let acp_alias = alias.to_string();
-    let acp_removed = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        zeroclaw_session_host::open_repository(&session_config, "acp_")?
-            .delete_sessions_by_agent(&acp_alias)
-    })
-    .await
-    {
-        Ok(Ok(count)) => count,
-        Ok(Err(error)) => {
-            warnings.push(format!("acp delete: {error}"));
-            0
-        }
-        Err(error) => {
-            warnings.push(format!("acp delete task failed: {error}"));
-            0
-        }
-    };
-
-    // ACP families above are already closed and excluded from this query.
-    // Close the remaining standard sessions without touching archived stores.
+    // All protocols share the same repository; close each session once.
     let session_config = config.clone();
     let session_alias = alias.to_string();
     let sessions_cleared = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        zeroclaw_session_host::open_repository(&session_config, "")?
+        zeroclaw_session_host::open_repository(&session_config)?
             .delete_sessions_by_agent(&session_alias)
     })
     .await
@@ -367,7 +347,8 @@ pub async fn cascade_owned_state(
     let report = OwnedStateReport {
         memory_purged,
         cron_removed,
-        acp_removed,
+        // Compatibility report field: no separate ACP storage remains.
+        acp_removed: 0,
         sessions_cleared,
         control_plane_tasks_removed,
         archived_to: Some(archive_dir.display().to_string()),
@@ -423,13 +404,11 @@ pub async fn cascade_rename_agent(
                     0
                 });
         // Installation upgrade fences every legacy writer. Rename every
-        // family through the same standard repository, including chat.
+        // session through the same standard repository once.
         let sessions = (|| -> anyhow::Result<_> {
-            let acp = zeroclaw_session_host::open_repository(&blocking_config, "acp_")?;
-            let acp_count = acp.rename_sessions_by_agent(&blocking_from, &blocking_to)?;
-            let store = zeroclaw_session_host::open_repository(&blocking_config, "")?;
-            let remaining = store.rename_sessions_by_agent(&blocking_from, &blocking_to)?;
-            Ok((acp_count, remaining))
+            let store = zeroclaw_session_host::open_repository(&blocking_config)?;
+            let changed = store.rename_sessions_by_agent(&blocking_from, &blocking_to)?;
+            Ok((0, changed))
         })();
         let (acp_sessions, sessions_repointed) = sessions.unwrap_or_else(|error| {
             warnings.push(format!("session rename: {error}"));
@@ -599,7 +578,7 @@ mod tests {
                 ..Config::default()
             };
             config.channels.session_backend = backend.into();
-            let repository = zeroclaw_session_host::open_repository(&config, "").unwrap();
+            let repository = zeroclaw_session_host::open_repository(&config).unwrap();
             for (id, owner) in [
                 ("acp_fixture", "from"),
                 ("chat_fixture", "from"),
@@ -612,7 +591,7 @@ mod tests {
 
             let renamed = cascade_rename_agent(&config, None, "from", "to").await;
             assert!(renamed.warnings.is_empty(), "{:?}", renamed.warnings);
-            assert_eq!((renamed.acp_sessions, renamed.sessions_repointed), (1, 1));
+            assert_eq!((renamed.acp_sessions, renamed.sessions_repointed), (0, 2));
             assert!(
                 repository
                     .list_sessions_by_agent("from")
@@ -632,7 +611,7 @@ mod tests {
                 "{:?}",
                 deleted.warnings
             );
-            assert_eq!((deleted.acp_removed, deleted.sessions_cleared), (1, 1));
+            assert_eq!((deleted.acp_removed, deleted.sessions_cleared), (0, 2));
             assert!(repository.list_sessions_by_agent("to").unwrap().is_empty());
             assert_eq!(repository.list_sessions_by_agent("other").unwrap().len(), 1);
             assert!(!config.data_dir.join("acp-sessions.db").exists());

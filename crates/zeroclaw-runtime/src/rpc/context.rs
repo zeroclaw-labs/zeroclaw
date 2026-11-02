@@ -441,9 +441,7 @@ impl RpcContext {
             .ok()
             .map(Arc::new);
         #[cfg(not(any(test, feature = "test-util")))]
-        let session_repository = SessionRepository::for_namespace(&data_dir, "acp_")
-            .ok()
-            .map(Arc::new);
+        let session_repository = SessionRepository::new(&data_dir).ok().map(Arc::new);
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {

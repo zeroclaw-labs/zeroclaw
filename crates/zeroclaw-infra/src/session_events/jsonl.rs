@@ -72,6 +72,94 @@ pub struct JsonlEventStore {
     index: Mutex<Snapshot>,
 }
 impl JsonlEventStore {
+    pub(super) fn temporary_sessions(&self) -> Result<Vec<SessionId>, AppendError> {
+        let _guard = self.lock()?;
+        let snapshot = self.snapshot()?;
+        let mut sessions = std::collections::BTreeSet::new();
+        for (_, id) in snapshot.rows.values().flatten() {
+            let event = snapshot
+                .history
+                .get_event(id)
+                .ok_or_else(|| AppendError::Corrupt("event index missing".into()))?;
+            if let zeroclaw_api::session_events::EventData::SessionMetadataChanged {
+                field,
+                new_value_ref,
+            } = &event.body.data
+                && field == "session_kind"
+            {
+                let value: serde_json::Value = serde_json::from_slice(
+                    &filesystem::read(&self.payload_path(&new_value_ref.payload_id)?)
+                        .map_err(storage)?,
+                )
+                .map_err(|error| AppendError::Corrupt(error.to_string()))?;
+                if value.as_str() == Some("temporary") {
+                    sessions.insert(event.session_id.clone());
+                }
+            }
+        }
+        Ok(sessions.into_iter().collect())
+    }
+    /// Publish a compacted history without temporary sessions. Existing event
+    /// bytes and receipts stay unchanged; publication replaces the root atomically.
+    pub(super) fn replace_native(
+        &self,
+        image: &super::migration::NativeImage,
+    ) -> Result<(), AppendError> {
+        image.validate()?;
+        let _guard = self.lock()?;
+        let mut tip = None;
+        let mut payloads = image
+            .payloads
+            .iter()
+            .map(|payload| PayloadMeta {
+                payload_id: payload.reference.payload_id.clone(),
+                codec: payload.reference.codec.clone(),
+            })
+            .collect::<Vec<_>>();
+        for batch in &image.batches {
+            let mut raw = Vec::new();
+            for event in &batch.raw {
+                raw.extend(event);
+                raw.push(b'\n');
+            }
+            let first = parse_event(
+                batch
+                    .raw
+                    .first()
+                    .ok_or_else(|| AppendError::Corrupt("empty retained batch".into()))?,
+            )
+            .map_err(super::upgrade::storage)?
+            .sequence;
+            let last = parse_event(
+                batch
+                    .raw
+                    .last()
+                    .ok_or_else(|| AppendError::Corrupt("empty retained batch".into()))?,
+            )
+            .map_err(super::upgrade::storage)?
+            .sequence;
+            let segment = self.write_file("segments", "jsonl", &raw)?;
+            let commit = Commit {
+                previous: tip,
+                segment,
+                session_id: batch.stream.clone(),
+                idempotency_key: batch.key.clone(),
+                commitment: batch.commitment.clone(),
+                first,
+                last,
+                payloads: std::mem::take(&mut payloads),
+            };
+            let reference = self.write_file("commits", "json", &canonical_json(&commit)?)?;
+            tip = Some(reference);
+        }
+        self.publish_root(&Root { version: 1, tip })?;
+        *self.index.lock() = Snapshot::default();
+        // Root publication precedes reclamation. If cleanup is interrupted,
+        // an open can safely retry removal of unreachable files.
+        let snapshot = self.snapshot()?;
+        self.reclaim_unreachable(&snapshot)?;
+        Ok(())
+    }
     pub(super) fn session_streams(&self) -> Result<Vec<SessionId>, AppendError> {
         let _guard = self.lock()?;
         let snapshot = self.snapshot()?;
@@ -352,8 +440,35 @@ impl JsonlEventStore {
                 tip: None,
             })?;
         }
-        drop(store.snapshot()?);
+        let snapshot = store.snapshot()?;
+        store.reclaim_unreachable(&snapshot)?;
+        drop(snapshot);
         Ok(store)
+    }
+
+    fn reclaim_unreachable(&self, snapshot: &Snapshot) -> Result<(), AppendError> {
+        let mut retained = HashSet::new();
+        for (_, _, segment, commit) in snapshot.positions.values() {
+            retained.insert(self.path("segments", &segment.id, "jsonl")?);
+            retained.insert(self.path("commits", &commit.id, "json")?);
+        }
+        for payload in snapshot.payloads.values() {
+            retained.insert(self.payload_path(&payload.payload_id)?);
+        }
+        for directory in ["commits", "segments", "payloads", "staging"] {
+            let mut changed = false;
+            for entry in fs::read_dir(self.root.join(directory)).map_err(storage)? {
+                let path = entry.map_err(storage)?.path();
+                if !retained.contains(&path) {
+                    fs::remove_file(path).map_err(storage)?;
+                    changed = true;
+                }
+            }
+            if changed {
+                sync_directory(&self.root.join(directory))?;
+            }
+        }
+        Ok(())
     }
     fn root_path(&self) -> PathBuf {
         self.root.join("commit-manifest.json")
@@ -446,9 +561,11 @@ impl JsonlEventStore {
             commits.push((reference, commit));
         }
         if snapshot.initialized && next != snapshot.tip {
-            return Err(AppendError::Corrupt(
-                "commit manifest regressed or changed lineage".into(),
-            ));
+            // Temporary-session reclamation publishes a replacement commit
+            // root. Rebuild the disposable coordinates from that canonical
+            // root rather than treating a valid compaction as corruption.
+            *snapshot = Snapshot::default();
+            return self.refresh_snapshot(snapshot);
         }
         for (commit_reference, commit) in commits.into_iter().rev() {
             let raw = self.read_file("segments", &commit.segment, "jsonl")?;

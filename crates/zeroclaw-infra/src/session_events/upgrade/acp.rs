@@ -16,7 +16,7 @@ pub(super) fn import_all(
     }
     let source = super::legacy_acp::LegacyAcpStore::open_import(guard).map_err(storage)?;
     for id in source.list_session_ids().map_err(storage)? {
-        let family = format!("acp_{id}");
+        let family = id.clone();
         let stream = session_id(&family)?;
         let key = format!("legacy-acp-complete:{stream}");
         if store
@@ -26,11 +26,16 @@ pub(super) fn import_all(
         {
             continue;
         }
-        let existing_native = store.head(&stream).map_err(storage)?.sequence > 0
+        if store.head(&stream).map_err(storage)?.sequence > 0
             && store
                 .lookup_receipt(&stream, &format!("legacy-acp-root:{stream}"))
                 .map_err(storage)?
-                .is_none();
+                .is_none()
+        {
+            return Err(AppendError::InvalidReference(
+                "ACP session ID collides with another imported session".into(),
+            ));
+        }
         let mut data = source
             .load_session(&id)
             .map_err(storage)?
@@ -52,11 +57,7 @@ pub(super) fn import_all(
             closed,
             metadata,
         };
-        if existing_native {
-            import_existing(store, &stream, imported)?;
-        } else {
-            import_one(store, &family, imported)?;
-        }
+        import_one(store, &family, imported)?;
     }
     Ok(())
 }
@@ -72,240 +73,6 @@ fn upgrade_actor() -> EventActor {
     EventActor::System {
         component: "session_upgrade".into(),
     }
-}
-
-// An earlier native stream keeps its current context and all newer facts.
-// Reuse its canonical messages and preserve only missing legacy observations.
-fn import_existing(
-    store: &dyn SessionEventStore,
-    stream: &SessionId,
-    imported: AcpImport,
-) -> Result<(), AppendError> {
-    use std::collections::{HashMap, HashSet, VecDeque};
-    use zeroclaw_api::session_events::context_read;
-    let head = store.head(stream).map_err(storage)?;
-    let mut after = EventCursor::beginning(stream.clone());
-    let mut known = HashMap::<String, VecDeque<serde_json::Value>>::new();
-    let mut seen = HashSet::new();
-    let mut owner = None;
-    let mut principal = None;
-    let mut closed = false;
-    loop {
-        let page = store
-            .read_page(stream, &after, Some(&head), 256)
-            .map_err(storage)?;
-        for event in &page.events {
-            match &event.body.data {
-                EventData::SessionStarted { owning_agent, .. } => {
-                    owner = Some(owning_agent.clone());
-                    if let EventActor::Principal { principal_id } = &event.actor {
-                        principal = Some(principal_id.clone());
-                    }
-                }
-                EventData::SessionMetadataChanged {
-                    field,
-                    new_value_ref,
-                } if field == "principal_id" || field == "owning_agent" => {
-                    let body = context_read::present(store, new_value_ref).map_err(storage)?;
-                    if field == "principal_id" {
-                        principal = serde_json::from_slice(&body.body).map_err(storage)?;
-                    } else {
-                        owner = Some(serde_json::from_slice(&body.body).map_err(storage)?);
-                    }
-                }
-                EventData::ContextProjectionCreated { .. } => {
-                    for item in context_read::context_refs(store, event).map_err(storage)? {
-                        if seen.insert(item.message_id.clone())
-                            && let Some(message) =
-                                context_read::resolve_message(store, stream, &item)
-                                    .map_err(storage)?
-                        {
-                            let digest = Digest::from_bytes(&canonical_json(&message)?);
-                            known
-                                .entry(digest.as_str().to_owned())
-                                .or_default()
-                                .push_back(serde_json::json!({"message_ref":item}));
-                        }
-                    }
-                }
-                EventData::SessionClosed { reason_key } if reason_key != "session_ttl_expired" => {
-                    closed = true
-                }
-                _ => {}
-            }
-        }
-        if !page.has_more {
-            break;
-        }
-        after.sequence = page
-            .events
-            .last()
-            .ok_or_else(|| AppendError::Corrupt("empty ACP overlap page".into()))?
-            .sequence;
-    }
-    if owner.as_deref() != Some(&imported.data.agent_alias)
-        || principal != imported.data.principal_id
-    {
-        return Err(AppendError::InvalidReference(
-            "ACP native and legacy ownership differs".into(),
-        ));
-    }
-    let evidence = PayloadRecord::new(
-        PayloadId::parse(format!("legacy-acp-overlap-evidence-{stream}"))?,
-        "session.evidence/v1".into(),
-        canonical_json(
-            &serde_json::json!({"source_digest":Digest::from_bytes(&canonical_json(&(serde_json::json!({
-            "messages":imported.data.messages,"context":imported.data.retained_context,"checkpoint":imported.checkpoint,"metadata":imported.metadata,"closed":imported.closed
-        })))?)}),
-        )?,
-    )?;
-    let start = format!("legacy-acp-overlap-start:{stream}");
-    if store
-        .lookup_receipt(stream, &start)
-        .map_err(storage)?
-        .is_some()
-    {
-        let PayloadRead::Present(frozen) =
-            store.read_payload(&evidence.payload_id).map_err(storage)?
-        else {
-            return Err(AppendError::Corrupt("ACP overlap evidence missing".into()));
-        };
-        if frozen != evidence {
-            return Err(AppendError::Corrupt(
-                "frozen ACP overlap source changed".into(),
-            ));
-        }
-    } else {
-        let event = legacy_evidence(stream, &evidence, "legacy-acp-existing-native")?;
-        append(store, stream, start, vec![event], vec![evidence])?;
-    }
-    import_metadata(store, stream, &imported.metadata)?;
-    let mut phases = vec![("history", imported.data.messages)];
-    if let Some(context) = imported.data.retained_context {
-        phases.push(("context", context));
-    }
-    if let Some(checkpoint) = imported.checkpoint {
-        let fragments = serde_json::from_value(checkpoint["fragments"].clone()).map_err(storage)?;
-        phases.push(("checkpoint", fragments));
-        let mut metadata = checkpoint;
-        metadata
-            .as_object_mut()
-            .ok_or_else(|| AppendError::Corrupt("ACP checkpoint is not an object".into()))?
-            .remove("fragments");
-        let body = PayloadRecord::json("session.evidence/v1", &metadata)?;
-        let key = format!("legacy-acp-overlap-checkpoint:{stream}");
-        if store
-            .lookup_receipt(stream, &key)
-            .map_err(storage)?
-            .is_none()
-        {
-            let event = legacy_evidence(stream, &body, "legacy-acp-checkpoint-identity")?;
-            append(store, stream, key, vec![event], vec![body])?;
-        }
-    }
-    for (phase, rows) in phases {
-        // Consume each existing occurrence once per source view. Newly
-        // imported rows become reusable only by the next view, not a later
-        // batch of the same history containing an identical message.
-        let mut available = known.clone();
-        let mut offset = 0;
-        let mut chunk = 0;
-        while offset < rows.len() {
-            let end = chunk_end(&rows, offset)?;
-            let rows = &rows[offset..end];
-            let mut items = Vec::new();
-            let mut missing = Vec::new();
-            for message in rows {
-                let message = message.clone();
-                let digest = Digest::from_bytes(&canonical_json(&message)?);
-                if let Some(item) = available
-                    .get_mut(digest.as_str())
-                    .and_then(VecDeque::pop_front)
-                {
-                    items.push(item);
-                } else {
-                    items.push(serde_json::json!({"item_index":missing.len()}));
-                    missing.push(message);
-                }
-            }
-            let key = format!("legacy-acp-overlap-{phase}:{stream}:{chunk}");
-            let mut payloads = Vec::new();
-            if !missing.is_empty() {
-                let body = PayloadRecord::new(
-                    PayloadId::parse(format!("legacy-acp-overlap-rows-{stream}-{phase}-{chunk}"))?,
-                    "session.conversation/v1".into(),
-                    canonical_json(&missing)?,
-                )?;
-                for item in &mut items {
-                    if item.get("item_index").is_some() {
-                        item["conversation_ref"] = serde_json::json!(StoredPayloadRef::from(&body));
-                    }
-                }
-                for (index, message) in missing.iter().enumerate() {
-                    let digest = Digest::from_bytes(&canonical_json(message)?);
-                    known.entry(digest.as_str().to_owned()).or_default().push_back(serde_json::json!({"conversation_ref":StoredPayloadRef::from(&body),"item_index":index}));
-                }
-                payloads.push(body);
-            }
-            if store
-                .lookup_receipt(stream, &key)
-                .map_err(storage)?
-                .is_some()
-            {
-                offset = end;
-                chunk += 1;
-                continue;
-            }
-            let body = PayloadRecord::json(
-                "session.evidence/v1",
-                &serde_json::json!({"phase":phase,"source_offset":offset,"items":items}),
-            )?;
-            let event = legacy_evidence(stream, &body, "legacy-acp-observations")?;
-            payloads.push(body);
-            append(store, stream, key, vec![event], payloads)?;
-            offset = end;
-            chunk += 1;
-        }
-    }
-    let mut events = Vec::new();
-    if imported.closed && !closed {
-        events.push(SessionEvent::typed(
-            stream.clone(),
-            EventData::SessionClosed {
-                reason_key: "legacy_acp_session_killed".into(),
-            },
-            upgrade_actor(),
-        )?);
-    }
-    let body = PayloadRecord::json(
-        "session.evidence/v1",
-        &serde_json::json!({"source_kind":"legacy-acp","active_context":"preserved_native"}),
-    )?;
-    events.push(legacy_evidence(stream, &body, "legacy-acp-completed")?);
-    append(
-        store,
-        stream,
-        format!("legacy-acp-complete:{stream}"),
-        events,
-        vec![body],
-    )
-}
-
-fn legacy_evidence(
-    stream: &SessionId,
-    body: &PayloadRecord,
-    kind: &str,
-) -> Result<SessionEvent, AppendError> {
-    Ok(SessionEvent::typed(
-        stream.clone(),
-        EventData::LegacyHistoryImported {
-            source_kind: kind.into(),
-            import_receipt_ref: StoredPayloadRef::from(body),
-            completeness: "typed_legacy_observation".into(),
-            known_gaps: vec!["prior_execution_not_observed".into()],
-        },
-        upgrade_actor(),
-    )?)
 }
 
 fn import_one(
