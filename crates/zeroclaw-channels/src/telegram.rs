@@ -1005,6 +1005,10 @@ pub struct TelegramChannel {
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
+    /// Cache of local file paths for voice/audio messages that were downloaded
+    /// on-demand so reply context can reference them even when the original
+    /// message was dropped by the mention-only gate.
+    voice_file_paths: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
@@ -2617,6 +2621,7 @@ impl TelegramChannel {
             transcription: None,
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
+            voice_file_paths: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
             tts_manager: None,
@@ -5806,6 +5811,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             })
             .unwrap_or("unknown");
 
+        let caption = reply
+            .get("caption")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
             text.to_string()
         } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
@@ -5814,21 +5825,45 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .get("chat")
                 .and_then(|c| c.get("id"))
                 .and_then(serde_json::Value::as_i64);
-            if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
-                self.voice_transcriptions
-                    .lock()
-                    .get(&format!("{cid}:{mid}"))
-                    .map(|t| format!("[Voice] {t}"))
-                    .unwrap_or_else(|| "[Voice message]".to_string())
+            let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
+                let key = format!("{cid}:{mid}");
+                if let Some(text) = self.voice_transcriptions.lock().get(&key) {
+                    format!("[Voice] {text}")
+                } else if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("audio.ogg");
+                    format!("[Document: {file_name}] {path}")
+                } else {
+                    "[Voice message]".to_string()
+                }
             } else {
                 "[Voice message]".to_string()
+            };
+            if let Some(caption) = caption {
+                format!("{body}\n\n{caption}")
+            } else {
+                body
             }
         } else if reply.get("photo").is_some() {
-            "[Photo]".to_string()
+            if let Some(caption) = caption {
+                format!("[Photo] {caption}")
+            } else {
+                "[Photo]".to_string()
+            }
         } else if reply.get("document").is_some() {
-            "[Document]".to_string()
+            if let Some(caption) = caption {
+                format!("[Document] {caption}")
+            } else {
+                "[Document]".to_string()
+            }
         } else if reply.get("video").is_some() {
-            "[Video]".to_string()
+            if let Some(caption) = caption {
+                format!("[Video] {caption}")
+            } else {
+                "[Video]".to_string()
+            }
         } else if reply.get("sticker").is_some() {
             "[Sticker]".to_string()
         } else {
@@ -5843,6 +5878,122 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .join("\n");
 
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
+    }
+
+    /// Pre-download a replied-to voice/audio message so `extract_reply_context`
+    /// can reference it even when the original message was dropped by the
+    /// mention-only gate. If built-in transcription is enabled, the audio is
+    /// also transcribed and cached; otherwise only the local file path is kept
+    /// so the agent can call `transcriber__transcribe_audio` itself.
+    async fn prepopulate_voice_reply_context(&self, update: &serde_json::Value) {
+        let Some(message) = update.get("message") else {
+            return;
+        };
+        let Some(reply) = message.get("reply_to_message") else {
+            return;
+        };
+        if reply.get("voice").is_none() && reply.get("audio").is_none() {
+            return;
+        }
+
+        let (username, sender_id, _) = Self::extract_sender_info(message);
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return;
+        }
+
+        let reply_mid = match reply.get("message_id").and_then(serde_json::Value::as_i64) {
+            Some(m) => m,
+            None => return,
+        };
+        let chat_id = match message
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            Some(c) => c,
+            None => return,
+        };
+        let key = format!("{chat_id}:{reply_mid}");
+        {
+            let paths = self.voice_file_paths.lock();
+            let texts = self.voice_transcriptions.lock();
+            if paths.contains_key(&key) || texts.contains_key(&key) {
+                return;
+            }
+        }
+
+        let workspace = match self.workspace_dir.as_ref() {
+            Some(w) => w,
+            None => return,
+        };
+        let save_dir = workspace.join("telegram_files");
+        if tokio::fs::create_dir_all(&save_dir).await.is_err() {
+            return;
+        }
+
+        let (file_id, duration) = match Self::parse_voice_metadata(reply) {
+            Some(v) => v,
+            None => return,
+        };
+
+        let tg_file_path = match self.get_file_path(&file_id).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let audio_data = match self.download_file(&tg_file_path).await {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let local_filename = if reply.get("voice").is_some() {
+            let ext = tg_file_path.rsplit('.').next().unwrap_or("ogg");
+            format!("voice_{chat_id}_{reply_mid}.{ext}")
+        } else {
+            let ext = tg_file_path.rsplit('.').next().unwrap_or("mp3");
+            format!("audio_{chat_id}_{reply_mid}.{ext}")
+        };
+        let local_path = save_dir.join(&local_filename);
+        if tokio::fs::write(&local_path, &audio_data).await.is_err() {
+            return;
+        }
+        let path_str = local_path.to_string_lossy().into_owned();
+
+        // Prefer built-in transcription when configured.
+        if let (Some(config), Some(manager)) = (
+            self.transcription.as_ref(),
+            self.transcription_manager.as_deref(),
+        ) && duration <= config.max_duration_secs
+        {
+            let file_name = tg_file_path
+                .rsplit('/')
+                .next()
+                .unwrap_or("voice.ogg")
+                .to_string();
+            if let Ok(text) = manager.transcribe(&audio_data, &file_name).await
+                && !text.trim().is_empty()
+            {
+                let mut cache = self.voice_transcriptions.lock();
+                if cache.len() >= 100 {
+                    cache.clear();
+                }
+                cache.insert(key, text);
+                return;
+            }
+        }
+
+        // Fall back to caching the local path so the agent can transcribe itself.
+        {
+            let mut cache = self.voice_file_paths.lock();
+            if cache.len() >= 100 {
+                cache.clear();
+            }
+            cache.insert(key, path_str);
+        }
     }
 
     /// Forum-topic thread id for history keying and reply routing, if this
@@ -7249,6 +7400,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // transient failure must abort this update's processing entirely
         // (not fall through to the next parser) so the offset stays put and
         // the next poll retries it.
+        // Download and cache the replied-to voice/audio file before
+        // parsing, so reply context can reference it even when the
+        // original message was dropped by the mention-only gate.
+        self.prepopulate_voice_reply_context(update).await;
+
         let disposition = if let Some(m) = self.parse_update_message(update) {
             UpdateDisposition::Parsed(Box::new(m))
         } else {
@@ -18322,6 +18478,55 @@ mod tests {
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
         assert_eq!(ctx, "> @bob:\n> [Voice] Hello from voice");
+    }
+
+    #[test]
+    fn extract_reply_context_photo_includes_caption() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "username": "alice" },
+                "photo": [{ "file_id": "photo_id", "file_size": 1024 }],
+                "caption": "sunny day"
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @alice:\n> [Photo] sunny day");
+    }
+
+    #[test]
+    fn extract_reply_context_voice_with_cached_file_path() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        // Pre-populate the local-path cache (no transcription available).
+        let path = "/workspace/telegram_files/voice_100_42.ogg";
+        ch.voice_file_paths
+            .lock()
+            .insert("100:42".to_string(), path.to_string());
+        let msg = serde_json::json!({
+            "chat": { "id": 100 },
+            "reply_to_message": {
+                "message_id": 42,
+                "from": { "username": "bob" },
+                "voice": { "file_id": "abc", "duration": 5 }
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(
+            ctx,
+            format!("> @bob:\n> [Document: voice_100_42.ogg] {path}")
+        );
     }
 
     #[test]
