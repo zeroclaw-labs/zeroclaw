@@ -299,6 +299,8 @@ rmdir /s /q "%USERPROFILE%\.zeroclaw"
   - "Stop if the computer switches to battery power": unchecked
   - "Start the task only if the computer is idle for…": unchecked
 
+- **Killing the daemon frees its port at once.** A `zeroclaw daemon` or `zeroclaw gateway start` process places itself in a Windows job object that terminates every process it spawned (browser sessions, MCP servers, shell commands) when the daemon itself ends, however it ends. Those processes used to survive a Task Manager or `taskkill /F` kill and keep the gateway port bound until they exited by themselves. The post-upgrade self-respawn opts out of the job, so it still outlives the daemon. On a host that refuses the job, the daemon logs a warning and runs unconfined, as before.
+
 - **OpenSSH password auth.** If you're driving Windows over SSH and pubkey isn't accepted, drop your key into `C:\Users\<user>\.ssh\authorized_keys` (regular user) or `C:\ProgramData\ssh\administrators_authorized_keys` (when logged in as a member of `Administrators`).
 
 ## Next

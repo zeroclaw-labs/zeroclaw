@@ -1,5 +1,6 @@
 pub mod docker;
 pub mod executable;
+pub mod job_object;
 pub mod native;
 
 pub use docker::DockerRuntime;

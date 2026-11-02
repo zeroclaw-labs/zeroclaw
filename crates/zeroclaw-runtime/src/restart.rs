@@ -175,33 +175,7 @@ pub fn respawn_if_requested() -> Option<u32> {
     let mut command = std::process::Command::new(&cmd.exe);
     command.args(&cmd.args);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: `pre_exec` runs in the forked child before exec; `setsid` is
-        // async-signal-safe and only detaches us into a new session/process
-        // group so the child outlives this process and any terminal hangup.
-        unsafe {
-            command.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS: no inherited console, so the child survives the
-        // launching console closing. CREATE_NEW_PROCESS_GROUP: a Ctrl+C/Break to
-        // the old group doesn't reach it. (Inherited file-handle stdio — e.g.
-        // the daemon wrapper's log redirects — stays valid.)
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    match command.spawn() {
+    match spawn_detached(&mut command) {
         Ok(child) => {
             let pid = child.id();
             ::zeroclaw_log::record!(
@@ -225,9 +199,68 @@ pub fn respawn_if_requested() -> Option<u32> {
     }
 }
 
+/// Spawn `command` so that the child outlives this process.
+#[cfg(unix)]
+fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `pre_exec` runs in the forked child before exec; `setsid` is
+    // async-signal-safe and only detaches us into a new session/process
+    // group so the child outlives this process and any terminal hangup.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
+/// Spawn `command` so that the child outlives this process.
+#[cfg(windows)]
+fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    // DETACHED_PROCESS: no inherited console, so the child survives the
+    // launching console closing. CREATE_NEW_PROCESS_GROUP: a Ctrl+C/Break to
+    // the old group doesn't reach it. (Inherited file-handle stdio — e.g.
+    // the daemon wrapper's log redirects — stays valid.)
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    // CREATE_BREAKAWAY_FROM_JOB: the daemon owns its process tree through a
+    // kill-on-close job object, which would otherwise take the child down
+    // with the exiting daemon. The child leaves that job and stays in any
+    // enclosing job that forbids breakaway, such as the service runner's.
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const DETACHED: u32 = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    match command
+        .creation_flags(DETACHED | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()
+    {
+        // A daemon that never got its own job sits directly in an enclosing
+        // job, and one that forbids breakaway refuses the flag outright. The
+        // child then stays in that job, as it always did.
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            command.creation_flags(DETACHED).spawn()
+        }
+        spawned => spawned,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_detached_child_spawns_whether_or_not_this_process_is_in_a_job() {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "exit 0"]);
+        let status = spawn_detached(&mut command)
+            .expect("spawn a detached child")
+            .wait()
+            .expect("reap the detached child");
+        assert!(status.success());
+    }
 
     #[test]
     fn unresolved_launch_keeps_respawn_fallback_but_not_remediation_path() {

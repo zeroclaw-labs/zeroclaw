@@ -392,6 +392,7 @@ run(["crates/zeroclaw-runtime/Cargo.toml"], (True, False, True, True))
 run(["crates/zeroclaw-spawn/src/lib.rs"], (True, False, False, True))
 for path in ("crates/zeroclaw-runtime/src/control_plane/authority.rs", "crates/zeroclaw-runtime/src/control_plane/task_registry.rs"):
     run([path], (True, False, True, False))
+run(["crates/zeroclaw-config/src/platform/job_object.rs"], (True, True, True, True))
 for path in ("crates/zeroclaw-runtime/src/service/mod.rs", "crates/zeroclaw-runtime/examples/windows_service_smoke_fixture.rs"):
     run([path], (True, False, False, True))
 run(["crates/zeroclaw-runtime/src/lib.rs"], (True, False, True, True))
