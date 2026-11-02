@@ -204,6 +204,20 @@ struct Cli {
     enroll_port: Option<u16>,
 }
 
+impl Cli {
+    fn initial_reconnect_state(&self) -> app::SharedReconnectState {
+        // Shared state that survives a reconnect. Quickstart's Stage 2 writes
+        // the new agent's alias here so the recovering app loop drops the user
+        // into Chat. The startup flag uses the same Immediate handoff.
+        Arc::new(std::sync::Mutex::new(app::CrossReconnectState {
+            pending_quickstart_chat: self
+                .agent
+                .clone()
+                .map(app::PendingQuickstartChat::Immediate),
+        }))
+    }
+}
+
 /// Map an empty path string to `None`.
 fn opt_path(s: &str) -> Option<String> {
     let s = s.trim();
@@ -1217,7 +1231,7 @@ async fn run() -> anyhow::Result<()> {
         &local_config_dir,
         owned_daemon_pid,
         initial_leg,
-        cli.agent.clone(),
+        cli.initial_reconnect_state(),
         #[cfg(unix)]
         shutdown_signals
             .as_mut()
@@ -1241,18 +1255,9 @@ async fn run_until_exit(
     config_dir: &std::path::Path,
     owned_daemon_pid: Option<u32>,
     initial_leg: ActiveLeg,
-    initial_agent: Option<String>,
+    reconnect_state: app::SharedReconnectState,
     #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
 ) -> anyhow::Result<()> {
-    // Shared state that survives a reconnect. Quickstart's Stage 2 writes
-    // the new agent's alias here so the recovering `app::run` loop drops
-    // the user into Chat once the daemon is back up. `--agent` / `-a` seeds
-    // the same Immediate handoff so startup lands on Chat for that alias.
-    let reconnect_state: app::SharedReconnectState =
-        Arc::new(std::sync::Mutex::new(app::CrossReconnectState {
-            pending_quickstart_chat: initial_agent.map(app::PendingQuickstartChat::Immediate),
-        }));
-
     let label = target.label();
     let insecure_tls = target.insecure_tls();
 
