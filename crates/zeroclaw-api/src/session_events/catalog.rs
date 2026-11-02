@@ -554,8 +554,13 @@ mod tests {
         reducer.apply(&root(&stream, false), None).expect("root");
         let mut values = BTreeMap::new();
         for (sequence, field, value, imported) in [
-            (2, "token_count", serde_json::json!(99), false),
-            (3, "token_count", serde_json::json!(2), true),
+            (
+                2,
+                "latest_context_input_tokens",
+                serde_json::json!(99),
+                false,
+            ),
+            (3, "latest_context_input_tokens", serde_json::json!(2), true),
             (4, "workspace_dir", serde_json::json!("/old"), true),
             (5, "workspace_dir", serde_json::json!("/new"), false),
             (6, "workspace_dir", serde_json::json!("/old"), true),
@@ -571,7 +576,12 @@ mod tests {
             values.insert(sequence, value);
         }
         let summary = finish(reducer, values);
-        assert_eq!(summary.field("token_count", 0u64).expect("tokens"), 99);
+        assert_eq!(
+            summary
+                .field("latest_context_input_tokens", 0u64)
+                .expect("tokens"),
+            99
+        );
         assert_eq!(
             summary
                 .field("workspace_dir", String::new())

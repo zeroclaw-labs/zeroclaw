@@ -250,7 +250,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         let retained = history[128..].to_vec();
         old.persist_retained_context_seed("live", &retained, true)
             .unwrap();
-        old.set_token_count("live", 123).unwrap();
+        old.set_latest_context_input_tokens("live", 123).unwrap();
         let plan: Vec<zeroclaw_api::plan::PlanEntry> =
             serde_json::from_value(serde_json::json!([{"content":"audit","status":"in_progress"}]))
                 .unwrap();
@@ -279,7 +279,7 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         assert_eq!(after.principal_id, before.principal_id);
         assert_eq!(after.workspace_dir, "/workspace");
         assert_eq!(after.interaction_surface.as_deref(), Some("cli"));
-        assert_eq!(after.token_count, 123);
+        assert_eq!(after.latest_context_input_tokens, 123);
         assert_eq!(
             after.created_at.timestamp_millis(),
             before.created_at.timestamp_millis()
@@ -370,9 +370,13 @@ fn acp_sessions_migrate_metadata_typed_history_context_and_checkpoints_to_standa
         upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
         assert_eq!(store.head(&stream).unwrap(), head);
         old.touch_session("live").unwrap();
-        old.set_token_count("live", 456).unwrap();
+        old.set_latest_context_input_tokens("live", 456).unwrap();
         assert_eq!(
-            current.load_session("live").unwrap().unwrap().token_count,
+            current
+                .load_session("live")
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             456
         );
         assert!(old.append_turn("live", &[pending]).is_err());

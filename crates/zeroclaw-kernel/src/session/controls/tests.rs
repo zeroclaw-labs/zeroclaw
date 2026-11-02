@@ -234,7 +234,7 @@ async fn execution_metadata_serializes_with_commands_and_rechecks_live_authority
                 else {
                     panic!("metadata unavailable");
                 };
-                if field == "token_count" {
+                if field == "latest_context_input_tokens" {
                     counts.push(serde_json::from_slice::<u64>(&value.body).expect("count"));
                 } else if field == "plan" {
                     plan = Some(String::from_utf8(value.body).expect("plan bytes"));

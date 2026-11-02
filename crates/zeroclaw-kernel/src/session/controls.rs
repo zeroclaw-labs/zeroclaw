@@ -548,7 +548,7 @@ impl EngineSession {
     ) -> anyhow::Result<()> {
         let (field, codec, value) = match value {
             SessionMetadataObservation::ContextUsage { input_tokens } => (
-                "token_count",
+                "latest_context_input_tokens",
                 "session.authority/v1",
                 serde_json::json!(input_tokens.unwrap_or(0)),
             ),

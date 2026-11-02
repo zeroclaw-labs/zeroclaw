@@ -840,7 +840,7 @@ pub(crate) fn metadata_payload(
             | "created_at"
             | "last_activity"
             | "owning_agent"
-            | "token_count"
+            | "latest_context_input_tokens"
             | "interaction_surface"
             | "session_kind"
             | "temporary_owner_id"
@@ -961,7 +961,7 @@ impl SessionCommand<'_> {
                         | "model"
                         | "category"
                         | "project"
-                        | "token_count"
+                        | "latest_context_input_tokens"
                 )
             })
             .map(|(key, value)| (key.as_str(), value.clone()))

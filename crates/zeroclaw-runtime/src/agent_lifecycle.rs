@@ -267,7 +267,7 @@ pub async fn cascade_owned_state(
                     "session_uuid": session.session_uuid,
                     "agent_alias": session.agent_alias,
                     "workspace_dir": session.workspace_dir,
-                    "token_count": session.token_count,
+                    "latest_context_input_tokens": session.latest_context_input_tokens,
                     "message_count": session.message_count,
                     "created_at": session.created_at.to_rfc3339(),
                     "last_activity": session.last_activity.to_rfc3339(),

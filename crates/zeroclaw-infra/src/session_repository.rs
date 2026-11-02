@@ -327,23 +327,36 @@ impl SessionRepository {
         Ok(native.record(session_uuid)?.is_some())
     }
 
-    pub fn set_token_count(&self, session_uuid: &str, token_count: u64) -> Result<()> {
-        legacy_fixture!(self, set_token_count(session_uuid, token_count));
+    pub fn set_latest_context_input_tokens(
+        &self,
+        session_uuid: &str,
+        latest_context_input_tokens: u64,
+    ) -> Result<()> {
+        legacy_fixture!(
+            self,
+            set_token_count(session_uuid, latest_context_input_tokens)
+        );
 
         let native = self.view()?;
 
         native.change(
             session_uuid,
-            vec![("token_count", serde_json::json!(token_count))],
+            vec![(
+                "latest_context_input_tokens",
+                serde_json::json!(latest_context_input_tokens),
+            )],
         )
     }
 
-    pub fn clear_token_count(&self, session_uuid: &str) -> Result<()> {
+    pub fn clear_latest_context_input_tokens(&self, session_uuid: &str) -> Result<()> {
         legacy_fixture!(self, clear_token_count(session_uuid));
 
         let native = self.view()?;
 
-        native.change(session_uuid, vec![("token_count", serde_json::json!(0))])
+        native.change(
+            session_uuid,
+            vec![("latest_context_input_tokens", serde_json::json!(0))],
+        )
     }
 
     pub fn persist_usage_snapshot(
@@ -361,8 +374,8 @@ impl SessionRepository {
             return Ok(());
         }
         match input_tokens {
-            Some(v) => self.set_token_count(session_uuid, v),
-            None => self.clear_token_count(session_uuid),
+            Some(v) => self.set_latest_context_input_tokens(session_uuid, v),
+            None => self.clear_latest_context_input_tokens(session_uuid),
         }
     }
 

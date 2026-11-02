@@ -143,7 +143,7 @@ impl RepositoryView {
                 .context("session owning agent missing")?,
             workspace_dir: Self::value(record, "workspace_dir", String::new())?,
             interaction_surface: Self::value(record, "interaction_surface", None)?,
-            token_count: Self::value(record, "token_count", 0)?,
+            latest_context_input_tokens: Self::value(record, "latest_context_input_tokens", 0)?,
             created_at: chrono::DateTime::from_timestamp_millis(record.created_at)
                 .context("invalid session created_at")?,
             last_activity: chrono::DateTime::from_timestamp_millis(record.last_activity)
@@ -158,7 +158,7 @@ impl RepositoryView {
         Ok(SessionListEntry {
             principal_id: Self::value(&record, "principal_id", None)?,
             workspace_dir: Self::value(&record, "workspace_dir", String::new())?,
-            token_count: Self::value(&record, "token_count", 0)?,
+            latest_context_input_tokens: Self::value(&record, "latest_context_input_tokens", 0)?,
             created_at: chrono::DateTime::from_timestamp_millis(record.created_at)
                 .context("invalid session created_at")?,
             last_activity: chrono::DateTime::from_timestamp_millis(record.last_activity)

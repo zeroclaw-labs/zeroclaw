@@ -4553,7 +4553,11 @@ mod tests {
         persist_acp_usage_snapshot_ordered(&store, session_id, None, true).await;
 
         assert_eq!(
-            store.load_session(session_id).unwrap().unwrap().token_count,
+            store
+                .load_session(session_id)
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             0,
             "accepted usage-less event must clear stale count immediately"
         );
@@ -4562,7 +4566,11 @@ mod tests {
         persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
         persist_acp_usage_snapshot_ordered(&store, session_id, Some(5000), false).await;
         assert_eq!(
-            store.load_session(session_id).unwrap().unwrap().token_count,
+            store
+                .load_session(session_id)
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             1000,
             "rejected usage is billing-only"
         );
@@ -4593,7 +4601,11 @@ mod tests {
         // Establish a real measured count first.
         persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
         assert_eq!(
-            store.load_session(session_id).unwrap().unwrap().token_count,
+            store
+                .load_session(session_id)
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             1000
         );
 
@@ -4634,7 +4646,11 @@ mod tests {
         persist_acp_usage_snapshot_ordered(&store, session_id, *input_tokens, *accepted).await;
 
         assert_eq!(
-            store.load_session(session_id).unwrap().unwrap().token_count,
+            store
+                .load_session(session_id)
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             0,
             "estimate must clear the stale measured count, never be persisted as one"
         );
@@ -7704,7 +7720,7 @@ mod tests {
                     .load_session(sid)
                     .expect("metadata")
                     .expect("session")
-                    .token_count,
+                    .latest_context_input_tokens,
                 2
             );
             assert!(

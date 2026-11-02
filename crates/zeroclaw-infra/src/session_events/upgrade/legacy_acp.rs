@@ -156,7 +156,7 @@ impl LegacyAcpStore {
             ("workspace_dir".into(), serde_json::json!(workspace)),
             ("interaction_surface".into(), serde_json::json!(surface)),
             (
-                "token_count".into(),
+                "latest_context_input_tokens".into(),
                 serde_json::json!(tokens.max(0) as u64),
             ),
             (
@@ -939,7 +939,7 @@ impl LegacyAcpStore {
             agent_alias,
             workspace_dir,
             interaction_surface,
-            token_count: token_count.max(0) as u64,
+            latest_context_input_tokens: token_count.max(0) as u64,
             created_at,
             last_activity,
             messages,
@@ -1204,7 +1204,7 @@ impl LegacyAcpStore {
             agent_alias: owner_alias,
             workspace_dir,
             interaction_surface,
-            token_count: token_count.max(0) as u64,
+            latest_context_input_tokens: token_count.max(0) as u64,
             created_at,
             last_activity,
             messages,
@@ -1336,7 +1336,7 @@ impl LegacyAcpStore {
             agent_alias,
             workspace_dir,
             interaction_surface,
-            token_count: token_count.max(0) as u64,
+            latest_context_input_tokens: token_count.max(0) as u64,
             created_at,
             last_activity,
             messages,
@@ -1406,7 +1406,7 @@ impl LegacyAcpStore {
                 principal_id,
                 agent_alias,
                 workspace_dir,
-                token_count: token_count.max(0) as u64,
+                latest_context_input_tokens: token_count.max(0) as u64,
                 message_count: msg_count.max(0) as usize,
             });
         }
@@ -1475,7 +1475,7 @@ impl LegacyAcpStore {
                 principal_id,
                 agent_alias: owner_alias,
                 workspace_dir,
-                token_count: token_count.max(0) as u64,
+                latest_context_input_tokens: token_count.max(0) as u64,
                 message_count: msg_count.max(0) as usize,
             });
         }
@@ -3034,7 +3034,7 @@ impl LegacyAcpStore {
                 principal_id,
                 agent_alias,
                 workspace_dir,
-                token_count: token_count.max(0) as u64,
+                latest_context_input_tokens: token_count.max(0) as u64,
                 message_count: msg_count.max(0) as usize,
             });
         }
@@ -4019,7 +4019,7 @@ mod tests {
         assert_eq!(data.agent_alias, "personal_code");
         assert_eq!(data.workspace_dir, "/home/user/project");
         assert_eq!(data.interaction_surface, None);
-        assert_eq!(data.token_count, 0);
+        assert_eq!(data.latest_context_input_tokens, 0);
         assert!(data.messages.is_empty());
     }
 
@@ -5944,13 +5944,21 @@ mod tests {
             .create_session("sess-tok", "alpha", "/tmp/proj", None)
             .unwrap();
         assert_eq!(
-            store.load_session("sess-tok").unwrap().unwrap().token_count,
+            store
+                .load_session("sess-tok")
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             0
         );
 
         store.set_token_count("sess-tok", 152_306).unwrap();
         assert_eq!(
-            store.load_session("sess-tok").unwrap().unwrap().token_count,
+            store
+                .load_session("sess-tok")
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             152_306,
             "ctx-bar value must round-trip through the store"
         );
@@ -5958,7 +5966,11 @@ mod tests {
         // Overwrite semantics (not cumulative).
         store.set_token_count("sess-tok", 42).unwrap();
         assert_eq!(
-            store.load_session("sess-tok").unwrap().unwrap().token_count,
+            store
+                .load_session("sess-tok")
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             42
         );
     }
@@ -5985,7 +5997,11 @@ mod tests {
         store.set_token_count("sess-clr", 152_306).unwrap();
         store.clear_token_count("sess-clr").unwrap();
         assert_eq!(
-            store.load_session("sess-clr").unwrap().unwrap().token_count,
+            store
+                .load_session("sess-clr")
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             0,
             "accepted usage-less call must clear the durable snapshot"
         );
@@ -6013,14 +6029,22 @@ mod tests {
             .persist_usage_snapshot("sess-seq", Some(1000), true)
             .unwrap();
         assert_eq!(
-            store.load_session("sess-seq").unwrap().unwrap().token_count,
+            store
+                .load_session("sess-seq")
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             1000
         );
         store
             .persist_usage_snapshot("sess-seq", None, true)
             .unwrap();
         assert_eq!(
-            store.load_session("sess-seq").unwrap().unwrap().token_count,
+            store
+                .load_session("sess-seq")
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             0,
             "accepted usage-less call must clear the durable snapshot"
         );
@@ -6042,7 +6066,11 @@ mod tests {
             .persist_usage_snapshot("sess-rej", None, false)
             .unwrap();
         assert_eq!(
-            store.load_session("sess-rej").unwrap().unwrap().token_count,
+            store
+                .load_session("sess-rej")
+                .unwrap()
+                .unwrap()
+                .latest_context_input_tokens,
             1000,
             "rejected billing telemetry is billing-only"
         );
@@ -6102,7 +6130,7 @@ mod tests {
         assert_eq!(list[0].agent_alias, "beta");
         assert_eq!(list[0].workspace_dir, "/tmp/b");
         assert_eq!(list[0].message_count, 1);
-        assert_eq!(list[0].token_count, 1234);
+        assert_eq!(list[0].latest_context_input_tokens, 1234);
         assert_eq!(list[1].session_uuid, "sess-old");
         assert_eq!(list[1].message_count, 0);
     }
