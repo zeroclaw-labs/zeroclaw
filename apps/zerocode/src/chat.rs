@@ -52,6 +52,7 @@ use context_menu::{
 };
 
 mod message_queue;
+mod session_lookup;
 mod transcript_layout;
 use message_queue::{AdmissionError, MessageQueue, QueuePauseReason};
 pub(crate) use message_queue::{QueueItemStatus, QueuedMessage};
@@ -4529,6 +4530,15 @@ impl Chat {
                     self.begin_change_directory();
                     return false;
                 }
+                InputBarAction::OpenSessionPicker => {
+                    // Same picker and listing as `Ctrl+S`.
+                    Self::open_pane_session_picker(&self.rpc, self.pane_kind, state).await;
+                    return false;
+                }
+                InputBarAction::LoadSession(query) => {
+                    self.load_session_by_query(&query).await;
+                    return false;
+                }
                 InputBarAction::ResumeQueue => {
                     state.clear_info_notice();
                     if state.resume_queue() {
@@ -4686,35 +4696,8 @@ impl Chat {
                 self.add_session_requested = true;
             }
             Some(ChatTabAction::SwitchSession) => {
-                // ACP and Chat live in separate stores and must not cross-pick:
-                //  • Chat → unified session_backend (filter out channel-backed
-                //    sessions; those are owned by the channels pane).
-                //  • ACP  → dedicated acp-sessions.db, listed by a separate RPC.
-                let picker_sessions = if self.pane_kind == PaneKind::Acp {
-                    self.rpc
-                        .acp_session_list()
-                        .await
-                        .map(|list| list.sessions)
-                        .unwrap_or_default()
-                } else {
-                    match self.rpc.session_list(None).await {
-                        Ok(list) => list
-                            .sessions
-                            .into_iter()
-                            .filter(|s| s.channel_id.is_none())
-                            .collect(),
-                        Err(_) => Vec::new(),
-                    }
-                };
-
-                let mut ls = ListState::default();
-                if !picker_sessions.is_empty() {
-                    ls.select(Some(0));
-                }
-                state.session_overlay = SessionOverlay::List {
-                    sessions: picker_sessions,
-                    list_state: ls,
-                };
+                // A listing failure shows an empty picker, as before.
+                Self::open_pane_session_picker(&self.rpc, self.pane_kind, state).await;
             }
             Some(ChatTabAction::ToggleThoughts)
                 if state.input_bar.input().is_empty()
@@ -4849,6 +4832,78 @@ impl Chat {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The persisted sessions this pane may load, from the pane's own store.
+    ///
+    /// ACP and Chat live in separate stores and must not cross-pick:
+    ///  • Chat → unified session_backend (filter out channel-backed
+    ///    sessions; those are owned by the channels pane).
+    ///  • ACP  → dedicated acp-sessions.db, listed by a separate RPC.
+    async fn list_pane_sessions(
+        rpc: &RpcClient,
+        pane_kind: PaneKind,
+    ) -> Result<Vec<SessionEntry>, String> {
+        if pane_kind == PaneKind::Acp {
+            rpc.acp_session_list()
+                .await
+                .map(|list| list.sessions)
+                .map_err(|e| e.to_string())
+        } else {
+            rpc.session_list(None)
+                .await
+                .map(|list| {
+                    list.sessions
+                        .into_iter()
+                        .filter(|s| s.channel_id.is_none())
+                        .collect()
+                })
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// Open the session picker over this pane's saved sessions (Ctrl+S and
+    /// bare `/load-session`). A listing failure shows an empty picker.
+    async fn open_pane_session_picker(rpc: &RpcClient, pane_kind: PaneKind, state: &mut ChatState) {
+        let sessions = Self::list_pane_sessions(rpc, pane_kind)
+            .await
+            .unwrap_or_default();
+        state.open_session_list(sessions);
+    }
+
+    /// `/load-session <query>`: resolve `query` against this pane's store and
+    /// resume the match. Never starts a new session; never closes the
+    /// previously focused one (it stays live in `background`).
+    async fn load_session_by_query(&mut self, query: &str) {
+        use session_lookup::{SessionMatch, resolve_session};
+
+        let rpc = Arc::clone(&self.rpc);
+        let listed = Self::list_pane_sessions(&rpc, self.pane_kind).await;
+        let ChatPhase::Active(state) = &mut self.phase else {
+            return;
+        };
+        let sessions = match listed {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-load-session-list-error",
+                    &[("error", &error)],
+                ));
+                return;
+            }
+        };
+        let active_sid = state.session_id.clone();
+        match resolve_session(&sessions, query) {
+            SessionMatch::One(entry) if entry.session_id == active_sid => {
+                state.set_info_notice(crate::i18n::t("zc-chat-load-session-already-active"));
+            }
+            SessionMatch::One(entry) => self.switch_to_session_entry(entry).await,
+            SessionMatch::Many(entries) => state.open_session_list(entries),
+            SessionMatch::NoMatch => state.set_info_notice(crate::i18n::t_args(
+                "zc-chat-load-session-not-found",
+                &[("query", query)],
+            )),
         }
     }
 
@@ -6202,6 +6257,7 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                 ];
                 pane_entries.extend(queue_sidebar_help_entries());
+                pane_entries.push(E::desc(crate::i18n::t("zc-chat-help-load-session")));
                 // Code owns a session root the user can re-select; Chat
                 // sessions keep the root they started with, so the hint is
                 // scoped to this pane.
@@ -12123,6 +12179,18 @@ impl ChatState {
         self.info_message = Some(crate::widgets::InfoMessage::note(msg));
     }
 
+    /// Open the session picker over `sessions`, selecting the first row.
+    fn open_session_list(&mut self, sessions: Vec<SessionEntry>) {
+        let mut list_state = ListState::default();
+        if !sessions.is_empty() {
+            list_state.select(Some(0));
+        }
+        self.session_overlay = SessionOverlay::List {
+            sessions,
+            list_state,
+        };
+    }
+
     fn surface_cleanup_report(&mut self, report: CleanupReport) {
         if let Some(message) = report.notice() {
             self.set_info_notice(message);
@@ -15975,23 +16043,10 @@ mod tests {
         serde_json::from_str(&line).expect("RPC request should be JSON")
     }
 
-    /// Answer every follow-up request a transition emits (session/close,
-    /// model identity refresh, history load) with a permissive empty result,
-    /// until the pane goes quiet. Keeps transition tests focused on the
-    /// behavior under test rather than on exact RPC choreography.
+    /// Answer every follow-up request permissively; see
+    /// [`drain_and_record_methods`] for the drain behavior.
     async fn drain_pending_requests(rx: &mut mpsc::Receiver<String>, rpc: &RpcOutbound) {
-        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-        {
-            let request: serde_json::Value =
-                serde_json::from_str(&line).expect("RPC request should be JSON");
-            if let Some(id) = request["id"].as_str() {
-                rpc.dispatch_response(
-                    id,
-                    Some(serde_json::json!({ "messages": [], "sessions": [] })),
-                    None,
-                );
-            }
-        }
+        drain_and_record_methods(rx, rpc).await;
     }
 
     fn respond_ok(rpc: &RpcOutbound, request: &serde_json::Value, result: serde_json::Value) {
@@ -21608,6 +21663,484 @@ mod tests {
         chat.session_order.push(session_id.to_string());
         chat.phase = ChatPhase::Active(Box::new(state));
         chat
+    }
+
+    fn listed_session(id: &str, name: Option<&str>, channel: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": id,
+            "session_key": id,
+            "created_at": "2026-10-27T00:00:00Z",
+            "last_activity": "2026-10-27T00:05:00Z",
+            "message_count": 2,
+            "agent_alias": "alpha",
+            "channel_id": channel,
+            "name": name,
+        })
+    }
+
+    #[tokio::test]
+    async fn list_pane_sessions_uses_the_acp_store_for_code_panes() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let task =
+            tokio::spawn(async move { Chat::list_pane_sessions(&client, PaneKind::Acp).await });
+        let request = next_rpc_request(&mut rx, "Code panes list the ACP store").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "sessions": [listed_session("acp-1", None, None)] }),
+        );
+        let ids: Vec<String> = task
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(ids, ["acp-1"]);
+    }
+
+    #[tokio::test]
+    async fn list_pane_sessions_hides_channel_sessions_in_chat_panes() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let task =
+            tokio::spawn(async move { Chat::list_pane_sessions(&client, PaneKind::Chat).await });
+        let request = next_rpc_request(&mut rx, "Chat panes list the unified store").await;
+        assert_eq!(request["method"], method::SESSION_LIST);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "sessions": [
+                listed_session("chan-1", None, Some("telegram")),
+                listed_session("web-1", None, None),
+            ] }),
+        );
+        let ids: Vec<String> = task
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(ids, ["web-1"]);
+    }
+
+    #[tokio::test]
+    async fn list_pane_sessions_reports_store_errors() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let task =
+            tokio::spawn(async move { Chat::list_pane_sessions(&client, PaneKind::Acp).await });
+        let request = next_rpc_request(&mut rx, "listing should reach the daemon").await;
+        respond_err(&rpc, &request, -32000, "store unavailable");
+        let error = task.await.unwrap().expect_err("an RPC error must surface");
+        assert!(error.contains("store unavailable"), "got: {error}");
+    }
+
+    #[test]
+    fn open_session_list_selects_the_first_row_or_none() {
+        let mut state = state_for("sess-1", "alpha");
+        state.open_session_list(Vec::new());
+        let SessionOverlay::List {
+            sessions,
+            list_state,
+        } = &state.session_overlay
+        else {
+            panic!("the picker must open even when empty");
+        };
+        assert!(sessions.is_empty());
+        assert_eq!(list_state.selected(), None);
+
+        let entries = vec![
+            serde_json::from_value::<crate::client::SessionEntry>(listed_session("a", None, None))
+                .unwrap(),
+            serde_json::from_value::<crate::client::SessionEntry>(listed_session("b", None, None))
+                .unwrap(),
+        ];
+        state.open_session_list(entries);
+        let SessionOverlay::List {
+            sessions,
+            list_state,
+        } = &state.session_overlay
+        else {
+            panic!("the picker must open with entries");
+        };
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(list_state.selected(), Some(0));
+    }
+
+    /// Answer every follow-up request a transition emits (session/close,
+    /// model identity refresh, history load) with a permissive empty result,
+    /// until the pane goes quiet, and return the methods seen in order. Keeps
+    /// transition tests focused on the behavior under test rather than on
+    /// exact RPC choreography, while still letting a test assert that a
+    /// given request (e.g. `session/new`) was never sent.
+    async fn drain_and_record_methods(
+        rx: &mut mpsc::Receiver<String>,
+        rpc: &RpcOutbound,
+    ) -> Vec<String> {
+        let mut methods = Vec::new();
+        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        {
+            let request: serde_json::Value =
+                serde_json::from_str(&line).expect("RPC request should be JSON");
+            methods.push(request["method"].as_str().unwrap_or_default().to_string());
+            if let Some(id) = request["id"].as_str() {
+                rpc.dispatch_response(
+                    id,
+                    Some(serde_json::json!({ "messages": [], "sessions": [] })),
+                    None,
+                );
+            }
+        }
+        methods
+    }
+
+    #[tokio::test]
+    async fn load_session_by_uuid_attaches_from_the_acp_store() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-target").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        assert_eq!(list["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [
+                listed_session("sess-other", None, None),
+                listed_session("sess-target", None, None),
+            ] }),
+        );
+        let attach = next_rpc_request(&mut rx, "a unique match should attach").await;
+        assert_eq!(attach["method"], method::SESSION_NEW);
+        assert_eq!(attach["params"]["session_id"], "sess-target");
+        respond_ok(
+            &rpc,
+            &attach,
+            serde_json::json!({ "session_id": "sess-target", "workspace_dir": "/w" }),
+        );
+        drain_pending_requests(&mut rx, &rpc).await;
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-target"));
+        assert!(
+            chat.background.iter().any(|s| s.session_id == "sess-old"),
+            "the previously focused session stays live in the background"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_session_by_name_in_a_chat_pane_ignores_channel_sessions() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.session_order.push("sess-1".to_string());
+        chat.phase = ChatPhase::Active(Box::new(state_for("sess-1", "alpha")));
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("release notes").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the chat store").await;
+        assert_eq!(list["method"], method::SESSION_LIST);
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [
+                listed_session("sess-chan", Some("Release notes"), Some("telegram")),
+                listed_session("sess-web", Some("Release notes"), None),
+            ] }),
+        );
+        let attach = next_rpc_request(&mut rx, "the single non-channel match should attach").await;
+        assert_eq!(attach["method"], method::SESSION_NEW);
+        assert_eq!(attach["params"]["session_id"], "sess-web");
+        respond_ok(
+            &rpc,
+            &attach,
+            serde_json::json!({ "session_id": "sess-web", "workspace_dir": null }),
+        );
+        drain_pending_requests(&mut rx, &rpc).await;
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-web"));
+    }
+
+    #[tokio::test]
+    async fn load_session_focuses_a_background_session_without_attaching() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-bg".to_string());
+        chat.background.push(state_for("sess-bg", "alpha"));
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-bg").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [
+                listed_session("sess-old", None, None),
+                listed_session("sess-bg", None, None),
+            ] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert_eq!(chat.current_session_id(), Some("sess-bg"));
+        assert!(
+            !methods.iter().any(|m| m == method::SESSION_NEW),
+            "a tracked session must not be attached twice: {methods:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_session_on_the_focused_session_shows_a_notice() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-old").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [listed_session("sess-old", None, None)] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(methods.is_empty(), "no RPC beyond the listing: {methods:?}");
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t("zc-chat-load-session-already-active")
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_load_session_opens_a_filtered_picker() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-dup").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [
+                listed_session("sess-dup-1", None, None),
+                listed_session("sess-other", None, None),
+                listed_session("sess-dup-2", None, None),
+            ] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(!methods.iter().any(|m| m == method::SESSION_NEW));
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        let SessionOverlay::List {
+            sessions,
+            list_state,
+        } = &active_state(&mut chat).session_overlay
+        else {
+            panic!("an ambiguous query must open the session picker");
+        };
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["sess-dup-1", "sess-dup-2"]);
+        assert_eq!(list_state.selected(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn load_session_with_no_match_shows_a_notice_and_starts_nothing() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("nope").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [listed_session("sess-old", None, None)] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(!methods.iter().any(|m| m == method::SESSION_NEW));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t_args("zc-chat-load-session-not-found", &[("query", "nope")])
+        );
+    }
+
+    #[tokio::test]
+    async fn load_session_listing_failure_shows_a_notice_and_starts_nothing() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-target").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_err(&rpc, &list, -32000, "store unavailable");
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(!methods.iter().any(|m| m == method::SESSION_NEW));
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        let notice = active_info_notice(&chat);
+        assert!(notice.contains("store unavailable"), "got: {notice}");
+    }
+
+    #[tokio::test]
+    async fn load_session_respects_the_session_cap() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        for idx in 2..=MAX_TRACKED_SESSIONS_PER_PANE {
+            let session_id = format!("sess-{idx}");
+            chat.session_order.push(session_id.clone());
+            chat.background.push(state_for(&session_id, "alpha"));
+        }
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-target").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [listed_session("sess-target", None, None)] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(!methods.iter().any(|m| m == method::SESSION_NEW));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t_args(
+                "zc-chat-session-cap",
+                &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn load_session_command_reaches_the_handler_mid_turn() {
+        use crossterm::event::KeyCode;
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.input_bar.insert_text("/load-session sess-target");
+
+        let task = tokio::spawn(async move {
+            let mut term = headless_term();
+            chat.handle_key(KeyEvent::from(KeyCode::Enter), &mut term)
+                .await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "Enter on /load-session should list the store").await;
+        assert_eq!(list["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [listed_session("sess-target", None, None)] }),
+        );
+        let attach = next_rpc_request(&mut rx, "a unique match should attach mid-turn").await;
+        assert_eq!(attach["method"], method::SESSION_NEW);
+        assert_eq!(attach["params"]["session_id"], "sess-target");
+        respond_ok(
+            &rpc,
+            &attach,
+            serde_json::json!({ "session_id": "sess-target", "workspace_dir": "/w" }),
+        );
+        drain_pending_requests(&mut rx, &rpc).await;
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-target"));
     }
 
     fn headless_term() -> crate::config_manager::Term {
