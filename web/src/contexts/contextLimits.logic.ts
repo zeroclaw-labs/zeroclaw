@@ -32,20 +32,19 @@ export interface DisplayedContextBudget {
 /**
  * Apply a history-trim frame to the displayed context budget.
  *
- * A trim is emitted after the usage sample that triggered it, and the web
- * meter otherwise refreshes only on the terminal `done` frame. When the trim
- * carries a post-trim count, that count replaces the displayed numerator and
- * the budget that governed the trim replaces the displayed trim budget.
- * Message-limit trims carry no token accounting and must leave the displayed
- * snapshot alone. Model capacity is not on this frame, so it is not touched.
+ * A real trim supplies a new retained-context estimate. Its token_budget can
+ * be an emergency dispatch threshold, not the canonical configured budget.
+ * Zero-drop floor notices and message-only trims leave the count alone; all
+ * budget/capacity updates remain owned by the accepted done-frame snapshot.
  */
 export function applyHistoryTrimToDisplayedBudget(
   current: DisplayedContextBudget,
-  frame: Pick<WsMessage, 'tokens_after' | 'token_budget'>,
+  frame: Pick<WsMessage, 'dropped_messages' | 'tokens_after'>,
 ): DisplayedContextBudget {
-  if (typeof frame.tokens_after !== 'number') return current;
+  if (!(typeof frame.dropped_messages === 'number' && frame.dropped_messages > 0)
+    || typeof frame.tokens_after !== 'number') return current;
   return {
     inputTokens: frame.tokens_after,
-    maxTokens: typeof frame.token_budget === 'number' ? frame.token_budget : current.maxTokens,
+    maxTokens: current.maxTokens,
   };
 }

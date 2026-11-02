@@ -3811,7 +3811,7 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
     );
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
 
@@ -5415,7 +5415,7 @@ mod tests {
     /// the final terminal cells a user sees. Reaches the outermost TUI
     /// boundary for the context meter, not a component snapshot.
     #[cfg(test)]
-    fn render_status_bar_cells(ctx: CtxBar, width: u16) -> String {
+    pub(crate) fn render_status_bar_cells(ctx: CtxBar, width: u16) -> String {
         use ratatui::{Terminal, backend::TestBackend};
 
         let backend = TestBackend::new(width, 1);

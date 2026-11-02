@@ -466,12 +466,16 @@ export function AgentProvider({
         // Extract context window info from "done" frame (sent by gateway).
         if (msg.type === 'done') {
           setContextLimits(contextLimitsFromDoneFrame(msg));
+          // A retained-context estimate is display-only and takes precedence
+          // over the measured prompt that preceded a terminal trim.
           // Prefer last_input_tokens (accurate per-turn prompt size) over
           // accumulated input_tokens for context-bar rendering.
           // When last_input_tokens is explicitly null, the accepted route has no
           // usage data; clear the input state and do NOT fall back to the
           // accumulated input_tokens (which would be stale from a previous route).
-          if (msg.last_input_tokens === null) {
+          if (typeof msg.context_input_tokens === 'number') {
+            setContextInputTokens(msg.context_input_tokens);
+          } else if (msg.last_input_tokens === null) {
             setContextInputTokens(null);
           } else if (typeof msg.last_input_tokens === 'number') {
             setContextInputTokens(msg.last_input_tokens);
@@ -599,9 +603,6 @@ export function AgentProvider({
         );
         if (trimmedBudget.inputTokens !== contextInputTokensRef.current) {
           setContextInputTokens(trimmedBudget.inputTokens);
-        }
-        if (trimmedBudget.maxTokens !== contextLimitsRef.current.maxTokens) {
-          setContextLimits((prev) => ({ ...prev, maxTokens: trimmedBudget.maxTokens }));
         }
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
