@@ -2,7 +2,9 @@ import { createContext, useContext, useEffect, useRef, useState, useCallback } f
 import type {
   ApprovalDecision,
   PendingApproval,
+  SessionMessageRow,
   SessionMessagesResponse,
+  SessionStateResponse,
   WsMessage,
 } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
@@ -18,6 +20,7 @@ import {
   listProps,
   getStatus,
   getSessionMessages,
+  getSessionState,
   abortSession,
   deleteSession,
   renameSession,
@@ -34,6 +37,11 @@ import {
 } from '@/contexts/turnStream.logic';
 import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
 import { uncommittedLocalTail } from '@/contexts/chatHydration.logic';
+import {
+  clearInflightTurn,
+  loadInflightTurn,
+  saveInflightTurn,
+} from '@/lib/inflightTurn';
 import {
   EMPTY_CONTEXT_LIMITS,
   contextLimitsFromDoneFrame,
@@ -198,6 +206,8 @@ export interface SessionSocket {
 export interface AgentSessionRuntime {
   createSocket(options: { agentAlias: string; sessionId: string }): SessionSocket;
   getMessages(sessionId: string): Promise<SessionMessagesResponse>;
+  /** Live turn state; absent on test runtimes that do not model it. */
+  getState?: (sessionId: string) => Promise<SessionStateResponse>;
   delete(sessionId: string): Promise<{ deleted: boolean }>;
   rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
   mintId(): string;
@@ -206,6 +216,7 @@ export interface AgentSessionRuntime {
 const defaultSessionRuntime: AgentSessionRuntime = {
   createSocket: (options) => new WebSocketClient(options),
   getMessages: getSessionMessages,
+  getState: getSessionState,
   delete: deleteSession,
   rename: renameSession,
   mintId: newSessionId,
@@ -245,6 +256,15 @@ export function AgentProvider({
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
+  // True when the visible turn belongs to a detached server-side run that this
+  // page reattached to after a reload. The socket opened after the turn began,
+  // so it will never receive that turn's deltas; poll the session state until
+  // the turn ends, then rehydrate the committed transcript.
+  const [awaitingDetachedTurn, setAwaitingDetachedTurn] = useState(false);
+  // Bumped when a detached turn finishes: the socket that was open during the
+  // turn seeded its Agent from an empty transcript, so it must be rebuilt to
+  // pick up the now-persisted history.
+  const [socketEpoch, setSocketEpoch] = useState(0);
   const [streamingContent, setStreamingContent] = useState('');
   const [streamingThinking, setStreamingThinking] = useState('');
   const [currentModel, setCurrentModel] = useState<string | null>(null);
@@ -283,6 +303,9 @@ export function AgentProvider({
   const sessionPersistenceRef = useRef(sessionPersistence);
   const typingRef = useRef(typing);
   const sessionRuntimeRef = useRef(sessionRuntime);
+  // Latest streamed text, for the pagehide snapshot without re-arming a timer
+  // on every delta.
+  const inflightSnapshotRef = useRef({ content: '', thinking: '' });
   activeSessionIdRef.current = sessionId;
   sessionPersistenceRef.current = sessionPersistence;
   typingRef.current = typing;
@@ -312,8 +335,10 @@ export function AgentProvider({
     // the transition actions.
     setSessionPersistence(null);
     setHydratedSessionId(null);
+    setAwaitingDetachedTurn(false);
 
     (async () => {
+      let restoredDetachedTurn = false;
       try {
         const res = await sessionRuntime.getMessages(sid);
         if (cancelled) return;
@@ -325,9 +350,8 @@ export function AgentProvider({
               .map((row) => row.content);
             const hydrated = persistedToUiMessages(mapServerMessagesToPersisted(res.messages));
             // The gateway commits a turn's prompt only when the turn ends, so a
-            // reload or a round trip to another conversation mid-turn fetches a
-            // snapshot that predates the prompt this browser already showed.
-            // Keep that uncommitted tail instead of replacing it.
+            // reload mid-turn fetches a snapshot that predates the prompt this
+            // browser already showed. Keep that uncommitted tail on screen.
             setMessages([...hydrated, ...uncommittedLocalTail(snapshotUsers, browserCopy)]);
           }
         } else if (!res.session_persistence) {
@@ -336,6 +360,37 @@ export function AgentProvider({
             const ls = loadChatHistory(sid);
             return ls.length ? persistedToUiMessages(ls) : prev;
           });
+        }
+
+        // A reload disconnects the socket but does not cancel the turn: the
+        // gateway keeps running it and persists only at the end. If the
+        // session is still running, put the browser's last partial answer back
+        // and let the polling effect below wait for the committed transcript.
+        if (res.session_persistence && sessionRuntime.getState) {
+          try {
+            const live = await sessionRuntime.getState(sid);
+            if (cancelled) return;
+            const startedMs = live.turn_started_at
+              ? Date.parse(live.turn_started_at)
+              : Number.NaN;
+            // The agentic timeout is 30 minutes; a "running" flag older than
+            // that survived a daemon crash and is not a live turn.
+            const stale = Number.isFinite(startedMs)
+              && Date.now() - startedMs > 35 * 60 * 1000;
+            if (live.state === 'running' && !stale) {
+              const inflight = loadInflightTurn(sid);
+              setStreamingContent(inflight?.content ?? '');
+              setStreamingThinking(inflight?.thinking ?? '');
+              restoredDetachedTurn = true;
+              setTyping(true);
+              setAwaitingDetachedTurn(true);
+            } else {
+              clearInflightTurn(sid);
+            }
+          } catch {
+            // State is optional: older gateways may not expose it. Hydration
+            // still works; the transcript simply reflects the last commit.
+          }
         }
       } catch {
         if (!cancelled) {
@@ -347,7 +402,10 @@ export function AgentProvider({
           });
         }
       } finally {
-        if (!cancelled) setHydratedSessionId(sid);
+        if (!cancelled) {
+          setHydratedSessionId(sid);
+          if (!restoredDetachedTurn) clearInflightTurn(sid);
+        }
       }
     })();
 
@@ -361,6 +419,123 @@ export function AgentProvider({
     if (hydratedSessionId !== sessionId) return;
     saveChatHistory(sessionId, uiMessagesToPersisted(messages));
   }, [messages, hydratedSessionId, sessionId]);
+
+  // Keep the latest live answer where a reload can find it. The gateway only
+  // commits a turn when it ends, so these deltas exist nowhere else until then.
+  useEffect(() => {
+    inflightSnapshotRef.current = { content: streamingContent, thinking: streamingThinking };
+    if (!typing) {
+      // Do not delete the snapshot on the first render after a reload: the
+      // hydration effect has not yet read it to decide whether the server turn
+      // is still running. Only clear once this conversation is known to be
+      // idle (or its turn has just ended).
+      if (hydratedSessionId === sessionId) clearInflightTurn(sessionId);
+      return;
+    }
+    // Coalesce deltas: a long model response can emit hundreds per second, and
+    // localStorage writes are synchronous. The last delta before a pause (or
+    // pagehide) is the one that matters.
+    const id = setTimeout(() => {
+      if (!typingRef.current) return;
+      saveInflightTurn(sessionId, {
+        ...inflightSnapshotRef.current,
+        updatedAt: Date.now(),
+      });
+    }, 400);
+    return () => clearTimeout(id);
+  }, [typing, streamingContent, streamingThinking, sessionId, hydratedSessionId]);
+
+  // A refresh fires pagehide before the debounce above gets a chance to write.
+  // Snapshot synchronously so the restored page has the latest partial answer.
+  useEffect(() => {
+    const capture = () => {
+      if (!typingRef.current) return;
+      saveInflightTurn(activeSessionIdRef.current, {
+        ...inflightSnapshotRef.current,
+        updatedAt: Date.now(),
+      });
+    };
+    // The headless lifecycle suite mounts this provider with a minimal window
+    // stub that has no event listeners. Browser builds always enter the branch.
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
+    window.addEventListener('pagehide', capture);
+    return () => window.removeEventListener('pagehide', capture);
+  }, []);
+
+  // Wait out a turn that kept running on the gateway after this page reloaded.
+  // The restored socket opened after the turn began, so it never receives its
+  // deltas; poll the session state and rehydrate the committed transcript when
+  // the turn ends. A socket rebuild follows because the live Agent for this
+  // connection seeded from the pre-turn (empty) transcript.
+  useEffect(() => {
+    if (!awaitingDetachedTurn) return;
+    const getState = sessionRuntime.getState;
+    if (!getState) return;
+    const sid = sessionId;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const startedAt = Date.now();
+
+    const tick = async () => {
+      if (cancelled) return;
+      let live: SessionStateResponse | null = null;
+      try {
+        live = await getState(sid);
+      } catch {
+        // Transient network errors keep the indicator; keep polling.
+      }
+      if (cancelled) return;
+
+      if (live && live.state !== 'running') {
+        clearInflightTurn(sid);
+        // The gateway flips the state to idle after committing the turn, but
+        // SQLite and the HTTP read are separate steps; a fetch can still race
+        // the commit. Wait for the terminal assistant row instead of stopping
+        // at a snapshot that only holds the prompt.
+        let finalRows: SessionMessageRow[] | null = null;
+        for (let attempt = 0; attempt < 6 && !cancelled; attempt += 1) {
+          try {
+            const res = await sessionRuntime.getMessages(sid);
+            finalRows = res.messages;
+            const last = res.messages[res.messages.length - 1];
+            if (res.messages.length === 0 || last?.role === 'assistant') break;
+          } catch {
+            // Retry; a transient read error must not strand the indicator.
+          }
+          await new Promise((resolve) => setTimeout(resolve, 400));
+        }
+        if (cancelled || activeSessionIdRef.current !== sid) return;
+        setAwaitingDetachedTurn(false);
+        setTyping(false);
+        setStreamingContent('');
+        setStreamingThinking('');
+        if (finalRows) {
+          setMessages(persistedToUiMessages(mapServerMessagesToPersisted(finalRows)));
+          setHydratedSessionId(sid);
+          // The live Agent for this socket was built before the transcript was
+          // committed. Reconnect so the next turn carries the restored history.
+          setSocketEpoch((v) => v + 1);
+        }
+        return;
+      }
+
+      // Do not poll forever if the gateway died with a turn marked running.
+      if (Date.now() - startedAt > 45 * 60 * 1000) {
+        setAwaitingDetachedTurn(false);
+        setTyping(false);
+        return;
+      }
+      timer = setTimeout(tick, 2000);
+    };
+
+    timer = setTimeout(tick, 1500);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [awaitingDetachedTurn, sessionId, sessionRuntime]);
 
   // Auto-clear a pending approval when its timeout elapses on the backend.
   // The gateway auto-denies after `timeout_secs`; without this effect the
@@ -802,7 +977,7 @@ export function AgentProvider({
         wsRef.current.disconnect();
       }
     };
-  }, [attachSocketCallbacks, agentAlias, sessionId, sessionRuntime]);
+  }, [attachSocketCallbacks, agentAlias, sessionId, sessionRuntime, socketEpoch]);
 
   // Fetch current model and available models from config.
   useEffect(() => {
@@ -1268,7 +1443,23 @@ export function AgentProvider({
       // to round-trip; the user clicked Stop and expects the UI to follow.
       setPendingApproval(null);
       try {
-        await abortSession(sessionId);
+        const result = await abortSession(sessionId);
+        if (result.status === 'no_active_response') {
+          // The gateway has no turn for this session: the metadata's
+          // "running" flag is stale (a daemon restart leaves it behind).
+          // Drop the restored indicator instead of polling forever.
+          setAwaitingDetachedTurn(false);
+          setTyping(false);
+          setStreamingContent('');
+          setStreamingThinking('');
+          clearInflightTurn(sessionId);
+          try {
+            const res = await sessionRuntimeRef.current.getMessages(sessionId);
+            setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+          } catch {
+            // Keep the local transcript if the read also fails.
+          }
+        }
       } catch {
         // Best-effort abort
       }

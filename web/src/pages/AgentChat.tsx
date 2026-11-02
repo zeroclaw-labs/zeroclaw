@@ -860,7 +860,7 @@ export function AgentChatInner({
 // don't try — we just strip the prefix for display and copy; the bubble shows
 // its own wall-clock caption separately. Anchored to the start so a bracketed
 // datetime appearing mid-message (a log line, an error report) is left intact.
-const SERVER_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
+const SERVER_TIMESTAMP_RE = /^\s*(?:\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]|\[CURRENT DATE & TIME: [^\]]*\])\s*/;
 
 function stripServerTimestamp(content: string): string {
   return content.replace(SERVER_TIMESTAMP_RE, '');

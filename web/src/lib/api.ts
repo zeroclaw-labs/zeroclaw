@@ -12,6 +12,7 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  SessionStateResponse,
   TuiEntry,
 } from "../types/api";
 import type { components } from "./api-generated";
@@ -2155,6 +2156,20 @@ export function getSessionMessages(
 ): Promise<SessionMessagesResponse> {
   return apiFetch<SessionMessagesResponse>(
     `/api/sessions/${encodeURIComponent(id)}/messages`,
+  );
+}
+
+/**
+ * Live turn state for a gateway chat session.
+ *
+ * A dashboard reload disconnects the WebSocket but does not cancel the turn:
+ * the gateway keeps running it and only writes the transcript when it ends.
+ * The restored page uses this endpoint to tell a detached in-flight turn
+ * (state 'running') from a finished one, and to know when to rehydrate.
+ */
+export function getSessionState(id: string): Promise<SessionStateResponse> {
+  return apiFetch<SessionStateResponse>(
+    `/api/sessions/${encodeURIComponent(id)}/state`,
   );
 }
 

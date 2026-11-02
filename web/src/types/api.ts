@@ -321,6 +321,15 @@ export interface SessionMessagesResponse {
   session_persistence: boolean;
 }
 
+/** Live turn state reported by GET /api/sessions/{id}/state. */
+export interface SessionStateResponse {
+  session_id: string;
+  /** 'running' while the gateway is executing a turn for this session. */
+  state: string;
+  turn_id?: string;
+  turn_started_at?: string;
+}
+
 export interface TuiEntry {
   tui_id: string;
   connected_at: string;
