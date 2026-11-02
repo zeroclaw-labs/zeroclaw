@@ -4696,7 +4696,11 @@ async fn drive_live_sop_actions(
                                         .expect("owned implies a reassembly handle")
                                         .config,
                                 ),
-                                step_alias.expect("needs_reassembly implies a step agent alias"),
+                                // A step that names no agent but runs under a
+                                // foreign owner is re-assembled as this loop's
+                                // agent, so the alias it ran as is the
+                                // re-assembly alias, not the step's own.
+                                reassembly_alias.expect("a re-assembled step has an agent alias"),
                                 &sop_excluded_tools,
                             ) {
                                 Ok(prompt) => {
@@ -4849,7 +4853,7 @@ async fn drive_live_sop_actions(
                                     // sub-loop, with the delegating agent kept
                                     // alongside as the parent correlation.
                                     agent_alias: if owned.is_some() {
-                                        step_alias
+                                        reassembly_alias
                                     } else {
                                         agent_alias
                                     },
@@ -4904,7 +4908,7 @@ async fn drive_live_sop_actions(
                     // assembly — the record names who SHOULD have run it),
                     // otherwise this loop's own agent.
                     let effective_agent = if needs_reassembly {
-                        step_alias.map(str::to_string)
+                        reassembly_alias.map(str::to_string)
                     } else {
                         agent_alias.map(str::to_string)
                     };
@@ -9384,6 +9388,58 @@ mod sop_step_reassembly_tests {
                     .as_deref()
                     .is_some_and(|e| e.contains("principal-scoped")),
             "{stored:?}"
+        );
+    }
+
+    /// The same for a step that names no agent: an unowned session approving
+    /// alice's run re-assembles its own agent under alice for that step, and
+    /// the step's prompt and attribution name the agent it ran as instead of
+    /// assuming the step named one.
+    #[tokio::test]
+    async fn another_sessions_driver_runs_an_owned_runs_unnamed_step_as_its_own_agent() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config = memory_step_config(&tmp);
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("stepper".to_string()));
+        let (engine, run_id, action) = start_single_step_for(None, None, Some(owner));
+        let handle = SopStepReassembly {
+            config: &config,
+            capabilities: None,
+            live_config: None,
+            memory_owner: None,
+        };
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let mut exec_cache = std::collections::HashMap::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("stepper"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await
+        .expect("the driver settles");
+        assert!(
+            !exec_cache.contains_key("stepper") && exec_cache.len() == 1,
+            "the step agent is re-assembled under the run's owner, apart from the session's own"
+        );
+        let result = step1_result(&engine, &run_id);
+        assert_eq!(
+            result.effective_agent.as_deref(),
+            Some("stepper"),
+            "the step is attributed to the agent it ran as: {result:?}"
         );
     }
 
