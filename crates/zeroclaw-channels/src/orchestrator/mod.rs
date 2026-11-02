@@ -47917,7 +47917,7 @@ BTC is currently around $65,000 based on latest tool output."#
         ));
 
         for (label, tail) in [("at the cap", tail_at_cap), ("over the cap", tail_over_cap)] {
-            let prompt = "z".repeat(101) + &tail;
+            let prompt = "z".repeat(101) + tail.as_str();
             let capped = cap_channel_system_prompt(prompt, PROMPT_CAP, "test-agent");
             assert!(
                 capped.ends_with(&tail),
