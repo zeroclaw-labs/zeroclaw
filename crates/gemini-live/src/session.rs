@@ -1,0 +1,1674 @@
+//! The reconnect/resumption session driver and the crate's public API.
+//!
+//! [`Session`] owns exactly one thing: the *connection lifecycle*. It connects,
+//! sends `setup`, drives the transport, parses server frames into [`Event`]s,
+//! remembers the session-resumption handle, and — on a resumable close —
+//! reconnects with backoff and transparently resumes.
+//!
+//! The lifecycle runs in an **internal `tokio::spawn`ed task** that owns the
+//! transport and the reconnect/backoff loop. The public API is therefore
+//! *cancel-safe*: [`Session::recv_event`] is a plain `mpsc` receive (the
+//! reconnect loop lives in the task, never in the caller's `select!`, so a
+//! caller that races `recv_event` against other futures can never cancel a
+//! reconnect mid-flight), and the `send_*` methods enqueue a command to the task
+//! over a channel (they take `&self`). This is the fix for the reconnect
+//! *starvation* that a caller-driven `next_event` racing a ~20 ms audio arm
+//! would cause: every audio frame used to cancel the backoff sleep so the
+//! reconnect never completed. Now the task drains (and discards) audio commands
+//! while it is reconnecting, and the backoff runs to completion regardless of
+//! caller traffic.
+//!
+//! It deliberately does **not** own call semantics: the greeting timer, energy
+//! VAD, audio-forwarding decisions, RESUME_CUE/GREET_CUE wording, the uplink
+//! drain, or `end_call` handling. Those live in the caller (kutsu), built on
+//! top of this API — the caller reacts to `SessionOpened { is_reconnect, resumed }`
+//! and decides what to send via [`Session::send_audio`] /
+//! [`Session::send_client_text`] / [`Session::send_tool_response`].
+//!
+//! The reconnect/backoff policy is ported from kutsu's original `gemini_live`:
+//! backoff 0.3s → ×2 → max 5s; the stored resumption handle is dropped as stale
+//! after `HANDLE_DROP_AFTER` consecutive failed connects; and the *initial*
+//! connect applies the same bounded backoff+retry so a transient blip during the
+//! SIP ring never kills the call.
+
+use std::future::Future;
+use std::ops::ControlFlow;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{mpsc, oneshot};
+
+use crate::transport::{ProxyConfig, Transport, TransportError, WsTransport};
+use crate::types::{AffectLabel, CloseReason, Model, Role, ServerEvent, SetupConfig};
+use crate::wire;
+
+/// Drop the stored resumption handle after this many consecutive failed
+/// connects (kutsu's `ReconnectState::new(4)`).
+const HANDLE_DROP_AFTER: u32 = 4;
+
+/// Bounded capacity of the outbound command channel (audio/client-text/tool
+/// responses). Mirrors the old uplink channel depth. Once this many commands
+/// are queued, `send_client_text` parks until the driver drains one — a wait
+/// that happens before any receipt exists to time out, so a caller's delivery
+/// budget has to start before the enqueue, not after it.
+const CMD_CAPACITY: usize = 64;
+
+/// Bounded capacity of the inbound event channel.
+const EVENT_CAPACITY: usize = 256;
+
+/// A produced-on-demand transport factory: each call establishes a *fresh*
+/// connection (a new [`WsTransport`] in production; a scripted double in
+/// tests). Used by the reconnect loop; the initial connection is established
+/// eagerly by [`Session::connect`].
+pub type Reconnector<T> =
+    Box<dyn FnMut() -> Pin<Box<dyn Future<Output = Result<T, SessionError>> + Send>> + Send>;
+
+/// Everything the crate needs to open (and reopen) one Gemini Live session.
+/// `setup` is assembled by the caller (kutsu builds the prompt/scenario); the
+/// crate only serializes and sends it.
+pub struct ClientConfig {
+    pub model: Model,
+    pub api_key: String,
+    pub proxy: Option<ProxyConfig>,
+    /// The caller-assembled setup. Its `resume_handle` seeds the first connect;
+    /// thereafter the crate replaces it with the latest server-issued handle.
+    pub setup: SetupConfig,
+    /// Give up (terminal [`Event::SessionClosed`], or an `Err` from
+    /// [`Session::connect`] on the *initial* connect) after this many
+    /// consecutive *non-progressing* attempts (a failed connect, or a connect
+    /// that closes before `setupComplete`). `None` (the default and the match
+    /// for kutsu) is unbounded: the crate reconnects forever, bounded only by
+    /// the caller's own call-level hangup/time-cap. This is safe from
+    /// busy-looping because the backoff caps at 5s.
+    pub max_reconnect_attempts: Option<u32>,
+}
+
+/// One event on the unified session stream. `SessionOpened`/`SessionClosed`
+/// bracket the lifecycle; the rest mirror parsed server activity. The
+/// resumption handle is intentionally absent — it is managed internally and
+/// never surfaced.
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// A connection is open and `setup` has been sent. `is_reconnect` is
+    /// `false` for the very first open, `true` for every transparent resume —
+    /// the caller's cue to drain stale uplink / send a resume cue. `resumed`
+    /// says whether that reopen re-sent `setup` carrying a stored resumption
+    /// handle: `true` means context was preserved server-side (the model can
+    /// restore it itself), `false` means the reopen was fresh and context was
+    /// lost. The first open is always `is_reconnect: false, resumed: false`.
+    SessionOpened {
+        is_reconnect: bool,
+        resumed: bool,
+    },
+    /// Terminal: reconnection was exhausted or the close is unrecoverable. The
+    /// stream ends after this (`recv_event` returns `None` thereafter).
+    SessionClosed {
+        reason: CloseReason,
+    },
+    /// 24 kHz PCM16 output audio.
+    OutputAudio(Vec<i16>),
+    Transcript {
+        role: Role,
+        text: String,
+        final_: bool,
+    },
+    Affect {
+        role: Role,
+        label: AffectLabel,
+    },
+    Interrupted,
+    TurnComplete,
+    /// A tool/function call. The crate does not special-case `end_call`; the
+    /// caller decides its semantics and acks via [`Session::send_tool_response`].
+    ToolCall {
+        name: String,
+        id: String,
+        args: serde_json::Value,
+    },
+}
+
+/// An error from establishing or driving a [`Session`].
+#[derive(Debug)]
+pub enum SessionError {
+    Transport(TransportError),
+    /// The session's driver task has terminated (a terminal close, or the
+    /// session was dropped); a `send_*` after that point returns this.
+    Closed,
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::Transport(e) => write!(f, "transport: {e}"),
+            SessionError::Closed => write!(f, "session closed"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+impl From<TransportError> for SessionError {
+    fn from(e: TransportError) -> Self {
+        SessionError::Transport(e)
+    }
+}
+
+/// What the driver did with one non-audio control after taking it off the
+/// queue. Audio has no outcome: it is stale within milliseconds and is lossy
+/// by design.
+///
+/// Enqueuing says nothing about delivery — the driver may still be
+/// reconnecting, and the command it holds can be written, dropped with the
+/// dead connection, or refused by the transport. Reporting which of the three
+/// happened is what lets a caller tell a delivered reply from a lost one
+/// instead of assuming the queue spoke for the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlOutcome {
+    /// Handed to the transport, which accepted it.
+    Written,
+    /// Dropped without a write: the connection died while it was queued.
+    /// The control never reached the model; retrying it is the caller's call.
+    Discarded,
+    /// The transport refused the write. Carries the transport's own message.
+    Failed(String),
+}
+
+/// What [`ControlReceipt::expire`] found when the caller stopped waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expiry {
+    /// The driver had not started the write and now never will: the control
+    /// is definitely undelivered, and a later reconnect cannot revive it.
+    Unwritten,
+    /// The transport write had already begun. Whether it lands is up to the
+    /// socket and no longer observable through this receipt: the outcome is
+    /// unknown, not a confirmed loss.
+    InFlight,
+    /// The driver decided between the caller's last look and this call.
+    Decided(ControlOutcome),
+}
+
+/// Who reached an enqueued control first: the driver (it started the write)
+/// or the caller (it stopped waiting). Shared between the queued [`Command`]
+/// and its [`ControlReceipt`], so a receipt the caller expires is never
+/// written afterwards and a write the driver started is never reported as
+/// skipped.
+const CONTROL_PENDING: u8 = 0;
+const CONTROL_WRITING: u8 = 1;
+const CONTROL_EXPIRED: u8 = 2;
+
+/// The driver's half of one control's receipt: where the verdict goes, and
+/// the claim it must win before writing.
+struct Ack {
+    verdict: oneshot::Sender<ControlOutcome>,
+    state: Arc<AtomicU8>,
+}
+
+impl Ack {
+    /// Claim the control for writing. `false` means the caller expired it
+    /// first; the driver must not write it.
+    fn begin_write(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CONTROL_PENDING,
+                CONTROL_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// The outcome channel for one enqueued control.
+///
+/// Enqueue and outcome are separate so an event loop can keep pumping while a
+/// control is in flight: block on [`Self::outcome`] where blocking is safe,
+/// poll [`Self::try_outcome`] from inside a `select!` loop, and
+/// [`Self::expire`] what the caller will no longer wait for, so a control
+/// given up on is never written behind the caller's back.
+pub struct ControlReceipt {
+    verdict: oneshot::Receiver<ControlOutcome>,
+    state: Arc<AtomicU8>,
+}
+
+impl ControlReceipt {
+    fn pair() -> (Ack, Self) {
+        let (tx, rx) = oneshot::channel();
+        let state = Arc::new(AtomicU8::new(CONTROL_PENDING));
+        (
+            Ack {
+                verdict: tx,
+                state: Arc::clone(&state),
+            },
+            Self { verdict: rx, state },
+        )
+    }
+
+    /// Wait for the driver's verdict. [`SessionError::Closed`] means the
+    /// driver died without reporting one — treat it as undelivered.
+    ///
+    /// Takes the receipt by value but borrows the channel: moving the
+    /// receiver out would conflict with this type's `Drop`, and the drop is
+    /// what withdraws a control whose caller went away.
+    pub async fn outcome(mut self) -> Result<ControlOutcome, SessionError> {
+        self.wait().await
+    }
+
+    /// Wait for the verdict without consuming the receipt, for a loop that
+    /// holds several receipts and wants to wake on the oldest one. The value
+    /// is delivered once: after this resolves, [`Self::try_outcome`] reports
+    /// the receiver as closed.
+    pub async fn wait(&mut self) -> Result<ControlOutcome, SessionError> {
+        (&mut self.verdict).await.map_err(|_| SessionError::Closed)
+    }
+
+    /// Non-blocking peek for callers that cannot await here. `None` means the
+    /// driver has not decided yet.
+    pub fn try_outcome(&mut self) -> Option<Result<ControlOutcome, SessionError>> {
+        match self.verdict.try_recv() {
+            Ok(outcome) => Some(Ok(outcome)),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(SessionError::Closed)),
+        }
+    }
+
+    /// Stop waiting. A control the driver has not started writing is
+    /// withdrawn: it stays in the queue but the driver skips it, so a reply
+    /// the caller has already replaced cannot be delivered later. A write
+    /// already in flight cannot be withdrawn; the caller learns that it is
+    /// in flight rather than being told it failed.
+    pub fn expire(mut self) -> Expiry {
+        if self
+            .state
+            .compare_exchange(
+                CONTROL_PENDING,
+                CONTROL_EXPIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Expiry::Unwritten;
+        }
+        match self.verdict.try_recv() {
+            Ok(outcome) => Expiry::Decided(outcome),
+            Err(_) => Expiry::InFlight,
+        }
+    }
+}
+
+/// Dropping a receipt withdraws its control, exactly as [`Self::expire`]
+/// does, only without a report: a receipt goes away when nobody is waiting
+/// for the outcome any more — a cancelled `send`, a task aborted during
+/// shutdown — and a control no caller is waiting for must not be spoken once
+/// the driver catches up. Without this, cancellation left the queued command
+/// claimable and the driver could write it after a reconnect, which is the
+/// one case [`Self::expire`] cannot cover: an expiring caller is still there
+/// to call it, a cancelled one is not.
+///
+/// A write already handed to the transport is past withdrawing and is left
+/// alone, so dropping a receipt never turns a possible delivery into a
+/// claimed loss. Observation is unaffected: the verdict channel is only read
+/// by the receipt's own methods.
+///
+/// One case takes the claim for a control that is no longer queued: a command
+/// discarded with a dead connection reports `Discarded` without claiming it,
+/// so a receipt read and then dropped still marks it withdrawn. That is
+/// harmless — the [`Ack`] went with the connection and nothing reads the
+/// claim again — and it keeps the drop free of a verdict-dependent branch.
+impl Drop for ControlReceipt {
+    fn drop(&mut self) {
+        let _ = self.state.compare_exchange(
+            CONTROL_PENDING,
+            CONTROL_EXPIRED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+/// How the just-ended attempt terminated — drives the reconnect bookkeeping.
+/// `Resumable` (goAway / send / protocol error) is always a failure;
+/// `RemoteClose` (a clean WS close or a dropped stream) is a success only if the
+/// attempt made real progress.
+#[derive(Clone, Copy)]
+enum EndKind {
+    Resumable,
+    RemoteClose,
+}
+
+/// An outbound request from the caller to the driver task. The task performs the
+/// actual transport write (byte-identical to the old inline builders).
+enum Command {
+    Audio(Vec<i16>),
+    /// Non-audio controls carry the channel the driver reports their
+    /// [`ControlOutcome`] on, so "accepted into the queue" never passes for
+    /// "written to the wire".
+    ClientText(String, Ack),
+    ToolResponse(String, Ack),
+}
+
+/// Tell the enqueuing caller what became of one control. A dropped receiver
+/// (caller gone) is not an error here.
+fn report(outcome: ControlOutcome, ack: Ack) {
+    let _ = ack.verdict.send(outcome);
+}
+
+/// Report a control the driver is about to drop without writing it. Silence
+/// here is what let a settled reply vanish while `send()` had already told its
+/// caller the reply was accepted.
+fn discard(cmd: Command) {
+    match cmd {
+        Command::Audio(_) => {}
+        Command::ClientText(_, ack) | Command::ToolResponse(_, ack) => {
+            report(ControlOutcome::Discarded, ack);
+        }
+    }
+}
+
+/// The public session handle: a cancel-safe event stream + an enqueue-only
+/// command channel to the internal driver task. Dropping it closes both
+/// channels; the task then drains any already-queued commands (e.g. a final
+/// `end_call` ack) and exits on its own, dropping the transport (which closes
+/// the WS). It is intentionally NOT aborted on drop, so that last enqueued ack
+/// is still delivered before teardown.
+pub struct Session {
+    cmd_tx: mpsc::Sender<Command>,
+    events: mpsc::Receiver<Event>,
+}
+
+impl Session {
+    /// Connect (first open) with bounded backoff+retry, then spawn the driver
+    /// task. The first [`Session::recv_event`] yields
+    /// `SessionOpened { is_reconnect: false, resumed: false }`.
+    ///
+    /// The *initial* connect is retried with the same backoff as reconnects, so
+    /// a transient network blip (e.g. during the SIP ring) does not kill the
+    /// call. It only returns `Err` when `max_reconnect_attempts` is `Some(n)`
+    /// and that budget is exhausted; with `None` it retries until the socket
+    /// opens (the caller's own task/time-cap bounds it).
+    pub async fn connect(cfg: ClientConfig) -> Result<Self, SessionError> {
+        let model = cfg.model;
+        // The reconnect factory re-establishes a fresh WS each time, cloning the
+        // auth/proxy config (the endpoint + key are fixed for the session).
+        let reconnect: Reconnector<WsTransport> = {
+            let api_key = cfg.api_key.clone();
+            let proxy = cfg.proxy.clone();
+            Box::new(move || {
+                let api_key = api_key.clone();
+                let proxy = proxy.clone();
+                Box::pin(async move {
+                    WsTransport::connect(model, &api_key, proxy.as_ref())
+                        .await
+                        .map_err(SessionError::from)
+                })
+            })
+        };
+
+        let mut backoff = Backoff::new(300, 5000);
+        let mut rstate = ReconnectState::new(HANDLE_DROP_AFTER);
+        let mut handle = cfg.setup.resume_handle.clone();
+
+        // Initial connect with the same bounded backoff+retry as reconnects.
+        let transport = loop {
+            match WsTransport::connect(model, &cfg.api_key, cfg.proxy.as_ref()).await {
+                Ok(t) => break t,
+                Err(e) => {
+                    if note_failure(&mut rstate, &cfg, &mut handle) {
+                        return Err(SessionError::from(e));
+                    }
+                    tokio::time::sleep(backoff.next_delay()).await;
+                }
+            }
+        };
+
+        Ok(Self::spawn(
+            cfg, transport, reconnect, handle, backoff, rstate,
+        ))
+    }
+
+    /// Construct a session over an already-established transport plus a
+    /// reconnect factory. Public but hidden: production goes through
+    /// [`Session::connect`]; this exists so tests (and kutsu's tests) can
+    /// inject a scripted transport.
+    #[doc(hidden)]
+    pub async fn connect_with_transport<T: Transport + 'static>(
+        cfg: ClientConfig,
+        transport: T,
+        reconnect: Reconnector<T>,
+    ) -> Result<Self, SessionError> {
+        let handle = cfg.setup.resume_handle.clone();
+        let backoff = Backoff::new(300, 5000);
+        let rstate = ReconnectState::new(HANDLE_DROP_AFTER);
+        Ok(Self::spawn(
+            cfg, transport, reconnect, handle, backoff, rstate,
+        ))
+    }
+
+    /// Wire up the channels and spawn the driver task.
+    fn spawn<T: Transport + 'static>(
+        cfg: ClientConfig,
+        transport: T,
+        reconnect: Reconnector<T>,
+        handle: Option<String>,
+        backoff: Backoff,
+        rstate: ReconnectState,
+    ) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(CMD_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel::<Event>(EVENT_CAPACITY);
+        // Detached: the task self-terminates when the caller drops the Session
+        // (its `cmd_rx`/`events` close), after draining queued commands.
+        tokio::spawn(driver_task(
+            transport, cfg, reconnect, handle, backoff, rstate, cmd_rx, event_tx,
+        ));
+        Session {
+            cmd_tx,
+            events: event_rx,
+        }
+    }
+
+    /// The unified event stream across reconnects. Cancel-safe: it is a plain
+    /// `mpsc` receive, so racing it in a `select!` never disturbs the reconnect
+    /// loop (which runs in the driver task). Returns `None` once the task ends
+    /// (after a terminal [`Event::SessionClosed`], or once the session is
+    /// dropped).
+    pub async fn recv_event(&mut self) -> Option<Event> {
+        self.events.recv().await
+    }
+
+    /// Send one uplink audio frame (PCM16 @ 16 kHz). Enqueues to the driver task
+    /// (`&self`); the task writes the byte-identical `realtime_input` frame. If
+    /// the task is reconnecting the frame is dropped there (never blocks the
+    /// caller). Returns `Err(SessionError::Closed)` once the task has ended.
+    pub async fn send_audio(&self, pcm16_16k: &[i16]) -> Result<(), SessionError> {
+        self.cmd_tx
+            .send(Command::Audio(pcm16_16k.to_vec()))
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
+
+    /// Send a client text turn (kutsu uses this for GREET_CUE / RESUME_CUE).
+    ///
+    /// Returns once the control is queued; the returned [`ControlReceipt`]
+    /// says whether the driver later wrote, dropped, or failed it. An error
+    /// here means the queue itself is gone (the driver has ended).
+    pub async fn send_client_text(&self, text: &str) -> Result<ControlReceipt, SessionError> {
+        let (ack, receipt) = ControlReceipt::pair();
+        self.cmd_tx
+            .send(Command::ClientText(text.to_string(), ack))
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        Ok(receipt)
+    }
+
+    /// Acknowledge a tool call by id (kutsu owns the tool's semantics).
+    /// Carries the same delivery receipt as [`Self::send_client_text`]: an
+    /// acknowledgement the driver never writes is a model turn left waiting.
+    pub async fn send_tool_response(&self, call_id: &str) -> Result<ControlReceipt, SessionError> {
+        let (ack, receipt) = ControlReceipt::pair();
+        self.cmd_tx
+            .send(Command::ToolResponse(call_id.to_string(), ack))
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        Ok(receipt)
+    }
+
+    /// A cloneable, `&self`-only handle for enqueuing client-text turns,
+    /// detached from the event-receiving half of this session. `recv_event`
+    /// needs `&mut self` and is normally polled continuously by one owner
+    /// (e.g. a caller's event loop); this handle lets a *different* task push
+    /// text into the same live session concurrently, without contending for
+    /// `&mut Session` — it just clones the outbound command sender, which
+    /// `send_client_text` already only needed `&self` for.
+    pub fn text_sender(&self) -> ClientTextSender {
+        ClientTextSender {
+            cmd_tx: self.cmd_tx.clone(),
+        }
+    }
+}
+
+/// A cloneable handle for sending client-text turns into a live [`Session`],
+/// obtained via [`Session::text_sender`]. See that method's docs for why this
+/// exists (letting a `send()`-style caller reach the session without owning
+/// the `&mut self` used for `recv_event`).
+#[derive(Clone)]
+pub struct ClientTextSender {
+    cmd_tx: mpsc::Sender<Command>,
+}
+
+impl ClientTextSender {
+    /// Send a client text turn. Identical wire effect to
+    /// [`Session::send_client_text`], including its delivery receipt.
+    pub async fn send_client_text(&self, text: &str) -> Result<ControlReceipt, SessionError> {
+        let (ack, receipt) = ControlReceipt::pair();
+        self.cmd_tx
+            .send(Command::ClientText(text.to_string(), ack))
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        Ok(receipt)
+    }
+}
+
+/// The reconnect/resumption driver, run inside a spawned task. Owns the
+/// transport and the whole lifecycle; communicates with the caller only over
+/// `cmd_rx` (in) and `events` (out).
+#[allow(clippy::too_many_arguments)] // internal driver: params are the lifecycle wiring
+async fn driver_task<T: Transport>(
+    mut transport: T,
+    cfg: ClientConfig,
+    mut reconnect: Reconnector<T>,
+    mut handle: Option<String>,
+    mut backoff: Backoff,
+    mut rstate: ReconnectState,
+    mut cmd_rx: mpsc::Receiver<Command>,
+    events: mpsc::Sender<Event>,
+) {
+    let mut progressed = false;
+
+    // First open (is_reconnect: false, resumed: false).
+    if send_setup(&mut transport, &cfg, &handle).await.is_err() {
+        match reconnect_loop(
+            &mut reconnect,
+            &mut backoff,
+            &mut rstate,
+            &cfg,
+            &mut handle,
+            false,
+            EndKind::Resumable,
+            &mut cmd_rx,
+            &events,
+        )
+        .await
+        {
+            Ok(t) => {
+                transport = t;
+                progressed = false;
+            }
+            Err(()) => {
+                let _ = events
+                    .send(Event::SessionClosed {
+                        reason: synth_reason("setup failed"),
+                    })
+                    .await;
+                return;
+            }
+        }
+    } else if events
+        .send(Event::SessionOpened {
+            is_reconnect: false,
+            resumed: false,
+        })
+        .await
+        .is_err()
+    {
+        return; // caller gone
+    }
+
+    'outer: loop {
+        // --- LIVE phase: pump commands out, server frames in. ---
+        let (end, reason) = loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(c) => {
+                        if write_cmd(&mut transport, c).await.is_err() {
+                            break (EndKind::Resumable, synth_reason("send error"));
+                        }
+                    }
+                    None => return, // all command senders dropped -> caller gone
+                },
+                msg = transport.recv() => match msg {
+                    Some(Ok(bytes)) => {
+                        // DIAG (gated on KUTSU_GEMINI_DIAG=1): compact summary of
+                        // every inbound server message, to see what Gemini does
+                        // during the silence windows where it stops replying.
+                        if std::env::var("KUTSU_GEMINI_DIAG").as_deref() == Ok("1") {
+                            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                let keys: Vec<String> = v.as_object()
+                                    .map(|o| o.keys().cloned().collect())
+                                    .unwrap_or_default();
+                                let sc = &v["serverContent"];
+                                tracing::info!(
+                                    target: "gemini_diag",
+                                    ?keys,
+                                    model_turn = !sc["modelTurn"].is_null(),
+                                    turn_complete = !sc["turnComplete"].is_null(),
+                                    generation_complete = !sc["generationComplete"].is_null(),
+                                    interrupted = !sc["interrupted"].is_null(),
+                                    input_tx = !sc["inputTranscription"].is_null(),
+                                    output_tx = !sc["outputTranscription"].is_null(),
+                                    "server msg"
+                                );
+                            }
+                        }
+                        // Malformed frames are skipped (never fatal).
+                        if let Ok(evs) = wire::parse_server_message(&bytes) {
+                            let mut goaway = false;
+                            for se in evs {
+                                match absorb(se, &mut handle, &mut progressed) {
+                                    Absorbed::Emit(ev) => {
+                                        if events.send(ev).await.is_err() {
+                                            return; // caller gone
+                                        }
+                                    }
+                                    Absorbed::GoAway => goaway = true,
+                                    Absorbed::Ignore => {}
+                                }
+                            }
+                            if goaway {
+                                break (EndKind::Resumable, synth_reason("goAway"));
+                            }
+                        }
+                    }
+                    Some(Err(TransportError::Closed(r))) => break (EndKind::RemoteClose, r),
+                    Some(Err(_)) => break (EndKind::Resumable, synth_reason("transport error")),
+                    None => break (EndKind::RemoteClose, synth_reason("stream ended")),
+                },
+            }
+        };
+
+        // A no-progress close whose code says the request itself is invalid
+        // (not a transient/server condition) can never succeed on retry: the
+        // reconnect would re-send the identical, still-invalid setup. Terminate
+        // instead of storming it forever. This is the WS-1007 class (a malformed
+        // setup schema). Only fatal before any progress — a permanent-coded drop
+        // on a session that already reached setupComplete stays retryable.
+        if !progressed && is_permanent_close(reason.code) {
+            let _ = events.send(Event::SessionClosed { reason }).await;
+            return;
+        }
+
+        // --- RECONNECT phase (transparent). ---
+        match reconnect_loop(
+            &mut reconnect,
+            &mut backoff,
+            &mut rstate,
+            &cfg,
+            &mut handle,
+            progressed,
+            end,
+            &mut cmd_rx,
+            &events,
+        )
+        .await
+        {
+            Ok(t) => {
+                transport = t;
+                progressed = false;
+                continue 'outer;
+            }
+            Err(()) => {
+                let _ = events.send(Event::SessionClosed { reason }).await;
+                return;
+            }
+        }
+    }
+}
+
+/// What one parsed server event maps to.
+enum Absorbed {
+    Emit(Event),
+    GoAway,
+    Ignore,
+}
+
+/// Map one parsed server event onto internal state or a surfaced [`Event`].
+/// The resumption handle is stored (never surfaced); `setupComplete` is internal
+/// progress; `goAway` schedules a transparent reconnect.
+fn absorb(se: ServerEvent, handle: &mut Option<String>, progressed: &mut bool) -> Absorbed {
+    match se {
+        ServerEvent::SetupComplete => {
+            *progressed = true;
+            Absorbed::Ignore
+        }
+        ServerEvent::OutputAudio(pcm) => Absorbed::Emit(Event::OutputAudio(pcm)),
+        ServerEvent::Transcript { role, text, final_ } => {
+            Absorbed::Emit(Event::Transcript { role, text, final_ })
+        }
+        ServerEvent::Affect { role, label } => Absorbed::Emit(Event::Affect { role, label }),
+        ServerEvent::Interrupted => Absorbed::Emit(Event::Interrupted),
+        ServerEvent::TurnComplete => Absorbed::Emit(Event::TurnComplete),
+        ServerEvent::ToolCall { name, id, args } => {
+            Absorbed::Emit(Event::ToolCall { name, id, args })
+        }
+        ServerEvent::ResumptionUpdate {
+            new_handle,
+            resumable,
+        } => {
+            // Per Google's session-management guidance, handle retention is
+            // conditioned on BOTH fields: `resumable: false` means the stored
+            // handle is stale and must be cleared (a reconnect must never
+            // replay it), regardless of whether a `newHandle` accompanies it.
+            // Only when the session is still resumable does a fresh handle
+            // (when present) replace the stored one.
+            if !resumable {
+                *handle = None;
+            } else if let Some(h) = new_handle {
+                *handle = Some(h);
+            }
+            *progressed = true;
+            Absorbed::Ignore
+        }
+        ServerEvent::GoAway => Absorbed::GoAway,
+    }
+}
+
+/// Send `setup` (carrying the latest stored handle) on `transport`.
+async fn send_setup<T: Transport>(
+    transport: &mut T,
+    cfg: &ClientConfig,
+    handle: &Option<String>,
+) -> Result<(), TransportError> {
+    let mut setup = cfg.setup.clone();
+    setup.resume_handle = handle.clone();
+    transport
+        .send_text(wire::build_setup(&setup).to_string())
+        .await
+}
+
+/// Perform the byte-identical transport write for one outbound command.
+async fn write_cmd<T: Transport>(transport: &mut T, cmd: Command) -> Result<(), TransportError> {
+    match cmd {
+        Command::Audio(pcm) => {
+            // DIAG (KUTSU_GEMINI_DIAG=1): a per-frame WS write should be near-
+            // instant (~50 frames/s). If it takes long the socket is
+            // backpressuring — uplink audio isn't leaving fast enough, pointing
+            // at a throttled/DPI'd network path rather than Gemini's own VAD.
+            let msg = wire::build_realtime_input(&pcm);
+            let t0 = std::time::Instant::now();
+            let r = transport.send_text(msg).await;
+            let ms = t0.elapsed().as_millis();
+            if ms > 40 && std::env::var("KUTSU_GEMINI_DIAG").as_deref() == Ok("1") {
+                tracing::warn!(target: "gemini_diag", send_ms = ms as u64, "uplink WS send backpressure (network/DPI?)");
+            }
+            r
+        }
+        // A control the caller has expired is skipped, not written: the
+        // caller was told it is undelivered and may already have replaced it.
+        Command::ClientText(t, ack) => {
+            if !ack.begin_write() {
+                return Ok(());
+            }
+            let r = transport.send_text(wire::build_client_content(&t)).await;
+            report(outcome_of(&r), ack);
+            r
+        }
+        Command::ToolResponse(id, ack) => {
+            if !ack.begin_write() {
+                return Ok(());
+            }
+            let r = transport.send_text(wire::build_tool_response(&id)).await;
+            report(outcome_of(&r), ack);
+            r
+        }
+    }
+}
+
+/// The write's verdict, in the shape the enqueuing caller is waiting for.
+fn outcome_of(r: &Result<(), TransportError>) -> ControlOutcome {
+    match r {
+        Ok(()) => ControlOutcome::Written,
+        Err(e) => ControlOutcome::Failed(e.to_string()),
+    }
+}
+
+/// Record one non-progressing reconnect attempt: advance the consecutive-failure
+/// count, drop the stale handle at the threshold, and report whether the
+/// configured attempt budget is now exhausted (→ terminal).
+fn note_failure(
+    rstate: &mut ReconnectState,
+    cfg: &ClientConfig,
+    handle: &mut Option<String>,
+) -> bool {
+    if rstate.on_failure() {
+        *handle = None; // stale handle after N consecutive failures
+    }
+    matches!(cfg.max_reconnect_attempts, Some(max) if rstate.fails() >= max)
+}
+
+/// Reconnect for a just-ended attempt: apply the bookkeeping, then back off and
+/// (re)connect — retrying with escalating backoff and stale-handle drop — until
+/// a fresh transport is open + `setup` re-sent (emitting
+/// `SessionOpened { is_reconnect: true, resumed }`), or the attempt budget is
+/// exhausted (terminal → `Err`).
+///
+/// Crucially, throughout the backoff it **drains and discards** inbound commands
+/// (`drain_backoff`): audio queued during the outage is stale, and draining it
+/// keeps the caller's bounded command channel from blocking — this is what
+/// prevents caller audio traffic from starving the reconnect. The backoff sleep
+/// itself runs to completion regardless of how many commands arrive.
+///
+/// Recovery of any control message (a settled agent reply, a provider ack) that
+/// the caller enqueues during the outage is deliberately NOT done here: the
+/// crate does not own call semantics. `SessionOpened { is_reconnect: true, .. }`
+/// is the caller's signal to react (drain stale uplink, send a resume cue) —
+/// mirroring kutsu, which keeps this decision in the caller rather than blindly
+/// replaying queued commands (a replay would race the server's own turn-resume
+/// on a warm reconnect).
+#[allow(clippy::too_many_arguments)] // internal driver: params are the lifecycle wiring
+async fn reconnect_loop<T: Transport>(
+    reconnect: &mut Reconnector<T>,
+    backoff: &mut Backoff,
+    rstate: &mut ReconnectState,
+    cfg: &ClientConfig,
+    handle: &mut Option<String>,
+    progressed: bool,
+    end: EndKind,
+    cmd_rx: &mut mpsc::Receiver<Command>,
+    events: &mpsc::Sender<Event>,
+) -> Result<T, ()> {
+    // Bookkeeping for the attempt that just ended: Resumable is always a
+    // failure; RemoteClose is success iff progress was made.
+    let success = matches!(end, EndKind::RemoteClose) && progressed;
+    if success {
+        rstate.on_success();
+        backoff.reset();
+    } else if note_failure(rstate, cfg, handle) {
+        return Err(());
+    }
+
+    loop {
+        // Back off before (re)connecting, draining stale commands meanwhile.
+        if let ControlFlow::Break(()) = drain_backoff(cmd_rx, backoff.next_delay()).await {
+            return Err(()); // caller gone
+        }
+
+        if let Ok(mut t) = reconnect().await {
+            if send_setup(&mut t, cfg, handle).await.is_ok() {
+                // A reopen "resumed" iff it re-sent setup carrying a stored handle.
+                let resumed = handle.is_some();
+                if events
+                    .send(Event::SessionOpened {
+                        is_reconnect: true,
+                        resumed,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    return Ok(t);
+                }
+                return Err(()); // caller gone
+            }
+            // setup send failed on the fresh transport: treat as a failed attempt.
+        }
+        if note_failure(rstate, cfg, handle) {
+            return Err(());
+        }
+    }
+}
+
+/// Sleep `delay` while draining (discarding) inbound commands, so the caller's
+/// bounded command channel never blocks during an outage. The `sleep` is pinned
+/// so draining commands does not restart the backoff. Returns `Break` if the
+/// command channel closed (caller gone).
+async fn drain_backoff(cmd_rx: &mut mpsc::Receiver<Command>, delay: Duration) -> ControlFlow<()> {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return ControlFlow::Continue(()),
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    None => return ControlFlow::Break(()),
+                    // Drop the stale command and say so, so its sender can
+                    // tell a reply that reached the model from one that died
+                    // with the connection; keep waiting out the backoff.
+                    Some(c) => discard(c),
+                }
+            }
+        }
+    }
+}
+
+/// A synthetic close reason for ends that carry no server close frame.
+/// WS close codes that mean the request we sent is itself invalid, so
+/// reconnecting and re-sending the identical setup can never succeed: 1002
+/// (protocol error), 1003 (unsupported data), 1007 (invalid payload — Gemini
+/// Live uses it for setup/schema validation failures). Transient/server codes
+/// (1006 abnormal, 1011 server error, 1012/1013 restart/overloaded) stay
+/// retryable.
+fn is_permanent_close(code: u16) -> bool {
+    matches!(code, 1002 | 1003 | 1007)
+}
+
+fn synth_reason(reason: &str) -> CloseReason {
+    CloseReason {
+        code: 0,
+        reason: reason.to_string(),
+    }
+}
+
+// --- Pure reconnect policy (ported from kutsu's `src/reconnect.rs`). ---------
+
+/// Exponential backoff: `base` → ×2 → capped at `max`.
+struct Backoff {
+    current_ms: u64,
+    base_ms: u64,
+    max_ms: u64,
+}
+
+impl Backoff {
+    fn new(base_ms: u64, max_ms: u64) -> Self {
+        Backoff {
+            current_ms: base_ms,
+            base_ms,
+            max_ms,
+        }
+    }
+
+    fn next_delay(&mut self) -> std::time::Duration {
+        let d = std::time::Duration::from_millis(self.current_ms);
+        self.current_ms = (self.current_ms * 2).min(self.max_ms);
+        d
+    }
+
+    fn reset(&mut self) {
+        self.current_ms = self.base_ms;
+    }
+}
+
+/// Consecutive-failure counter that signals when the (likely stale) resumption
+/// handle should be dropped.
+struct ReconnectState {
+    fails: u32,
+    reset_handle_after: u32,
+}
+
+impl ReconnectState {
+    fn new(reset_handle_after: u32) -> Self {
+        ReconnectState {
+            fails: 0,
+            reset_handle_after,
+        }
+    }
+
+    fn on_success(&mut self) {
+        self.fails = 0;
+    }
+
+    /// Record a failure; returns true when the caller should drop the handle.
+    fn on_failure(&mut self) -> bool {
+        self.fails += 1;
+        self.reset_handle_after != 0 && self.fails >= self.reset_handle_after
+    }
+
+    /// The current consecutive-failure count (drives the terminal attempt bound).
+    fn fails(&self) -> u32 {
+        self.fails
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::FakeTransport;
+
+    fn cfg() -> ClientConfig {
+        ClientConfig {
+            model: Model::HalfCascade,
+            api_key: "K".into(),
+            proxy: None,
+            setup: SetupConfig {
+                model: Model::HalfCascade,
+                model_id_override: None,
+                voice: "Autonoe".into(),
+                language: Some("en-US".into()),
+                system_instruction: "Be nice.".into(),
+                temperature: 0.8,
+                functions: Vec::new(),
+                resume_handle: None,
+            },
+            // Matches kutsu: unbounded reconnect (backoff caps at 5s). Tests
+            // that need deterministic termination override with `Some(n)`.
+            max_reconnect_attempts: None,
+        }
+    }
+
+    /// A reconnector that always fails.
+    fn no_reconnect() -> Reconnector<FakeTransport> {
+        Box::new(|| {
+            Box::pin(async {
+                Err(SessionError::Transport(TransportError::Connect(
+                    "no reconnect".into(),
+                )))
+            })
+        })
+    }
+
+    /// A reconnector that hands back `next` exactly once, then fails.
+    fn once(next: FakeTransport) -> Reconnector<FakeTransport> {
+        let mut slot = Some(next);
+        Box::new(move || {
+            let t = slot.take();
+            Box::pin(async move {
+                t.ok_or(SessionError::Transport(TransportError::Connect(
+                    "drained".into(),
+                )))
+            })
+        })
+    }
+
+    /// A reconnector that yields `n` accept-then-close transports (each accepts
+    /// `setup`, then closes before any `setupComplete` — i.e. no progress),
+    /// then fails.
+    fn accept_then_close(n: usize) -> Reconnector<FakeTransport> {
+        let mut queue: std::collections::VecDeque<FakeTransport> = (0..n)
+            .map(|_| {
+                let mut t = FakeTransport::new(false);
+                t.push_close(1013, "overloaded");
+                t
+            })
+            .collect();
+        Box::new(move || {
+            let t = queue.pop_front();
+            Box::pin(async move {
+                t.ok_or(SessionError::Transport(TransportError::Connect(
+                    "drained".into(),
+                )))
+            })
+        })
+    }
+
+    /// Poll `sent` until it has at least `n` frames (the driver task writes
+    /// asynchronously), or panic after a bounded number of yields.
+    async fn wait_for_sent(sent: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, n: usize) {
+        for _ in 0..1000 {
+            if sent.lock().unwrap().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!(
+            "timed out waiting for {n} sent frames (have {})",
+            sent.lock().unwrap().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn first_open_emits_session_opened_and_sends_setup() {
+        let fake = FakeTransport::new(true);
+        let sent = fake.sent.clone();
+        let mut s = Session::connect_with_transport(cfg(), fake, no_reconnect())
+            .await
+            .unwrap();
+
+        let ev = s.recv_event().await;
+        assert!(matches!(
+            ev,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+        // setup was captured on the fake as the first outgoing frame.
+        assert!(sent.lock().unwrap()[0].contains("\"setup\""));
+    }
+
+    #[tokio::test]
+    async fn events_surface_in_order_from_scripted_frames() {
+        // base64 "AAABAAIAAwA=" -> i16 LE [0,1,2,3].
+        let mut fake = FakeTransport::new(true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        fake.push_data(
+            br#"{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"data":"AAABAAIAAwA="}}]}}}"#
+                .to_vec(),
+        );
+        fake.push_data(
+            br#"{"serverContent":{"outputTranscription":{"text":"Hi","finished":true}}}"#.to_vec(),
+        );
+        fake.push_data(
+            br#"{"toolCall":{"functionCalls":[{"name":"end_call","id":"c1","args":{"d":"x"}}]}}"#
+                .to_vec(),
+        );
+        fake.push_data(br#"{"serverContent":{"turnComplete":true}}"#.to_vec());
+        fake.push_data(br#"{"serverContent":{"interrupted":true}}"#.to_vec());
+
+        let mut s = Session::connect_with_transport(cfg(), fake, no_reconnect())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+        assert!(
+            matches!(s.recv_event().await, Some(Event::OutputAudio(a)) if a == vec![0, 1, 2, 3])
+        );
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::Transcript { role: Role::Model, text, final_: true }) if text == "Hi"
+        ));
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::ToolCall { name, id, .. }) if name == "end_call" && id == "c1"
+        ));
+        assert!(matches!(s.recv_event().await, Some(Event::TurnComplete)));
+        assert!(matches!(s.recv_event().await, Some(Event::Interrupted)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumption_handle_stored_not_surfaced_then_replayed_on_reconnect() {
+        let mut first = FakeTransport::new(false);
+        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        first.push_data(br#"{"sessionResumptionUpdate":{"newHandle":"H1"}}"#.to_vec());
+        first.push_close(1011, "server restart");
+
+        let second = FakeTransport::new(true);
+        let second_sent = second.sent.clone();
+
+        let mut s = Session::connect_with_transport(cfg(), first, once(second))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+        // The handle update surfaces nothing; the next event is the transparent
+        // reopen. It re-sent setup carrying "H1", so `resumed` is true.
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: true,
+                resumed: true
+            })
+        ));
+
+        let setup = &second_sent.lock().unwrap()[0];
+        assert!(setup.contains("\"setup\""));
+        assert!(
+            setup.contains("H1"),
+            "reopened setup must carry the stored handle: {setup}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumable_false_clears_stored_handle_before_reconnect() {
+        // Defect A regression: a `sessionResumptionUpdate` with
+        // `resumable:false` (no `newHandle`) must clear a previously-stored
+        // handle, so the next reconnect does NOT replay a stale handle.
+        let mut first = FakeTransport::new(false);
+        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        first.push_data(
+            br#"{"sessionResumptionUpdate":{"newHandle":"H1","resumable":true}}"#.to_vec(),
+        );
+        first.push_data(br#"{"sessionResumptionUpdate":{"resumable":false}}"#.to_vec());
+        first.push_close(1011, "server restart");
+
+        let second = FakeTransport::new(true);
+        let second_sent = second.sent.clone();
+
+        let mut s = Session::connect_with_transport(cfg(), first, once(second))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+        // The handle was stored then cleared before the close, so the reopen
+        // is fresh (no stored handle to resume with).
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: true,
+                resumed: false
+            })
+        ));
+
+        let setup = &second_sent.lock().unwrap()[0];
+        assert!(setup.contains("\"setup\""));
+        assert!(
+            !setup.contains("H1"),
+            "stale handle must be dropped after resumable:false, got: {setup}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_commands_queued_during_backoff_are_dropped_signal_is_observable() {
+        // Deliberate design (mirrors kutsu): the crate does NOT replay commands
+        // queued during an outage. Control messages (ClientText/ToolResponse)
+        // are dropped along with stale audio; recovery is the caller's job,
+        // driven by the observable `SessionOpened { is_reconnect: true }`
+        // signal. This guards against a regression back to in-crate replay,
+        // which would race the server's own turn-resume on a warm reconnect and
+        // duplicate a reply the caller already heard.
+        let mut first = FakeTransport::new(false);
+        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        first.push_close(1011, "server restart");
+
+        let second = FakeTransport::new(true);
+        let second_sent = second.sent.clone();
+
+        let mut s = Session::connect_with_transport(cfg(), first, once(second))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+
+        // Enqueued while the transport is down (backoff).
+        let text = s.send_client_text("settled reply").await.unwrap();
+        let ack = s.send_tool_response("call-1").await.unwrap();
+
+        // The reconnect is observable — this is the caller's recovery hook.
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: true,
+                ..
+            })
+        ));
+
+        // Dropping them is only half the contract: each sender must be told,
+        // so a caller can tell a reply that reached the model from one that
+        // died with the connection instead of assuming the queue spoke for
+        // the wire.
+        assert_eq!(
+            text.outcome().await.unwrap(),
+            ControlOutcome::Discarded,
+            "a reply dropped during backoff must report Discarded"
+        );
+        assert_eq!(
+            ack.outcome().await.unwrap(),
+            ControlOutcome::Discarded,
+            "a tool acknowledgement dropped during backoff must report Discarded"
+        );
+
+        // Only the re-sent setup reached the reopened transport; the queued
+        // control commands were dropped, NOT replayed.
+        let sent = second_sent.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            1,
+            "only setup replayed on reopen; control commands dropped: {sent:?}"
+        );
+        assert!(sent[0].contains("\"setup\""));
+    }
+
+    #[tokio::test]
+    async fn a_written_control_reports_written_and_a_refused_one_reports_failed() {
+        // The other two thirds of the outcome contract. A transport that
+        // always accepts the frame cannot establish the failure half, which is
+        // why `FakeTransport::failing_writes` exists.
+        let ok = FakeTransport::new(true);
+        let s = Session::connect_with_transport(cfg(), ok, no_reconnect())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.send_client_text("delivered")
+                .await
+                .unwrap()
+                .outcome()
+                .await
+                .unwrap(),
+            ControlOutcome::Written
+        );
+
+        let bad = FakeTransport::failing_writes_after(0, true);
+        let bad_sent = bad.sent.clone();
+        // Setup itself fails on this transport, and with no reconnector the
+        // driver ends; a control enqueued before that either reports the
+        // refused write or finds the driver already gone. Both are explicit
+        // failures — what must never happen is a silent success.
+        let s = Session::connect_with_transport(cfg(), bad, no_reconnect()).await;
+        if let Ok(s) = s {
+            match s.send_client_text("refused").await {
+                Ok(receipt) => match receipt.outcome().await {
+                    Ok(ControlOutcome::Failed(reason)) => {
+                        assert!(reason.contains("refused"), "carries the cause: {reason}")
+                    }
+                    Ok(ControlOutcome::Discarded) | Err(SessionError::Closed) => {}
+                    other => panic!("a refused write must not report success: {other:?}"),
+                },
+                Err(SessionError::Closed) => {}
+                Err(e) => panic!("unexpected enqueue error: {e}"),
+            }
+        }
+        // The attempt is recorded either way: "tried and failed" is not the
+        // same as "never tried".
+        assert!(
+            !bad_sent.lock().unwrap().is_empty(),
+            "the failing transport must still record the attempted write"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_control_is_never_written_and_an_in_flight_one_says_so() {
+        // Setup is accepted; the next write parks on the stall, so the first
+        // text is in flight on the transport and the second is queued behind
+        // it. Expiring them must tell the two apart, and the expired queued
+        // one must be skipped when the driver gets to it.
+        let mut fake = FakeTransport::stalling_writes_after(1, true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        let sent = fake.sent.clone();
+        let stall = Arc::clone(&fake.stall);
+        let s = Session::connect_with_transport(cfg(), fake, no_reconnect())
+            .await
+            .unwrap();
+
+        let first = s.send_client_text("first").await.unwrap();
+        let second = s.send_client_text("second").await.unwrap();
+        // The stalled write has been handed to the transport (setup + first).
+        wait_for_sent(&sent, 2).await;
+
+        assert_eq!(
+            second.expire(),
+            Expiry::Unwritten,
+            "a control the driver has not reached is withdrawn outright"
+        );
+        assert_eq!(
+            first.expire(),
+            Expiry::InFlight,
+            "a control already on the transport cannot be withdrawn"
+        );
+
+        // Release the stalled write; the driver then reaches the expired
+        // control and must skip it, so the next live one lands right after.
+        // Every write past setup parks, so the next one needs its permit too.
+        stall.add_permits(2);
+        s.send_client_text("third")
+            .await
+            .unwrap()
+            .outcome()
+            .await
+            .unwrap();
+        let sent = sent.lock().unwrap();
+        assert!(
+            !sent.iter().any(|f| f.contains("second")),
+            "an expired control must never be written, got {sent:?}"
+        );
+        assert!(sent.last().unwrap().contains("third"));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_receipt_withdraws_a_queued_control_but_not_a_started_write() {
+        // Dropping a receipt is how a cancelled caller gives up: the future
+        // holding it is destroyed without reaching `expire`. A control the
+        // driver has not started must be withdrawn all the same, or the reply
+        // nobody is waiting for any more gets spoken once the driver catches
+        // up. A write already handed to the transport is past withdrawing and
+        // must still go out.
+        let mut fake = FakeTransport::stalling_writes_after(1, true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        let sent = fake.sent.clone();
+        let stall = Arc::clone(&fake.stall);
+        let s = Session::connect_with_transport(cfg(), fake, no_reconnect())
+            .await
+            .unwrap();
+
+        let in_flight = s.send_client_text("already writing").await.unwrap();
+        let queued = s.send_client_text("abandoned").await.unwrap();
+        // Setup plus the first text are on the transport; the second is
+        // queued behind the stalled write.
+        wait_for_sent(&sent, 2).await;
+
+        drop(queued);
+        drop(in_flight);
+
+        // Three permits, not two: without the withdrawal the abandoned write
+        // takes one of them, and a budget of two would leave this test hanging
+        // on `live` instead of failing on the assertion below.
+        stall.add_permits(3);
+        s.send_client_text("live")
+            .await
+            .unwrap()
+            .outcome()
+            .await
+            .unwrap();
+        let sent = sent.lock().unwrap();
+        assert!(
+            !sent.iter().any(|f| f.contains("abandoned")),
+            "a dropped receipt withdraws its queued control, got {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|f| f.contains("already writing")),
+            "dropping a receipt cannot unsend a write already in progress, got {sent:?}"
+        );
+        assert!(sent.last().unwrap().contains("live"));
+    }
+
+    #[tokio::test]
+    async fn send_audio_is_byte_identical_to_kutsu() {
+        let fake = FakeTransport::new(true);
+        let sent = fake.sent.clone();
+        let mut s = Session::connect_with_transport(cfg(), fake, no_reconnect())
+            .await
+            .unwrap();
+        let _ = s.recv_event().await; // SessionOpened (setup already sent)
+
+        s.send_audio(&[0i16, 1i16]).await.unwrap();
+        // The driver task writes the enqueued command asynchronously.
+        wait_for_sent(&sent, 2).await;
+
+        assert_eq!(
+            sent.lock().unwrap().last().unwrap(),
+            r#"{"realtime_input":{"audio":{"data":"AAABAA==","mimeType":"audio/pcm;rate=16000"}}}"#
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_close_emits_session_closed_then_none() {
+        let mut fake = FakeTransport::new(false);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        fake.push_close(1011, "boom");
+
+        let mut c = cfg();
+        c.max_reconnect_attempts = Some(1);
+        let mut s = Session::connect_with_transport(c, fake, no_reconnect())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+        match s.recv_event().await {
+            Some(Event::SessionClosed { reason }) => assert_eq!(reason.code, 1011),
+            other => panic!("expected SessionClosed, got {other:?}"),
+        }
+        assert!(s.recv_event().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_setup_rejection_terminates_without_reconnect() {
+        // A no-progress close with a permanent code (1007 = invalid argument,
+        // e.g. a malformed setup schema) must terminate immediately — even with
+        // unbounded reconnect attempts (the production setting) and a reconnector
+        // that would happily keep accepting. Re-sending an identical invalid
+        // setup can never succeed; this is the WS-1007 reconnect-storm class.
+        let mut initial = FakeTransport::new(false);
+        initial.push_close(1007, "parameters.properties: only allowed for OBJECT type");
+
+        // cfg() has max_reconnect_attempts: None (unbounded). accept_then_close
+        // would let the driver reconnect forever if permanence were ignored.
+        let mut s = Session::connect_with_transport(cfg(), initial, accept_then_close(100))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+        match s.recv_event().await {
+            Some(Event::SessionClosed { reason }) => assert_eq!(reason.code, 1007),
+            other => panic!("expected terminal SessionClosed(1007), got {other:?}"),
+        }
+        assert!(s.recv_event().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_close_after_progress_still_reconnects() {
+        // Guard against over-classification: a permanent-coded close on an
+        // attempt that DID progress (reached setupComplete) is treated as a
+        // normal drop and still reconnects — only no-progress setup rejections
+        // are fatal.
+        let mut initial = FakeTransport::new(false);
+        initial.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        initial.push_close(1007, "mid-session");
+
+        let mut c = cfg();
+        c.max_reconnect_attempts = Some(1);
+        let mut s = Session::connect_with_transport(c, initial, accept_then_close(1))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+        // Progressed → the 1007 drop is retried, not fatal.
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: true,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_then_close_storm_backs_off_and_terminates_at_the_bound() {
+        let mut initial = FakeTransport::new(false);
+        initial.push_close(1013, "overloaded");
+
+        let mut c = cfg();
+        c.max_reconnect_attempts = Some(3);
+        let mut s = Session::connect_with_transport(c, initial, accept_then_close(2))
+            .await
+            .unwrap();
+
+        let start = tokio::time::Instant::now();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+        // Each reopen is a no-progress accept-then-close with no stored handle.
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: true,
+                resumed: false
+            })
+        ));
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: true,
+                resumed: false
+            })
+        ));
+        match s.recv_event().await {
+            Some(Event::SessionClosed { reason }) => assert_eq!(reason.code, 1013),
+            other => panic!("expected SessionClosed after the bound, got {other:?}"),
+        }
+        assert!(s.recv_event().await.is_none());
+
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(800),
+            "reconnects must back off with an advancing delay, elapsed = {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The regression the redesign fixes: while the session is reconnecting
+    /// (transport closed, backoff pending), the caller keeps sending audio AND
+    /// polling events. With the reconnect owned by the driver task, caller
+    /// traffic can no longer cancel/starve the backoff — the reopen completes
+    /// and `SessionOpened { is_reconnect: true }` is delivered. (Under the old
+    /// caller-driven `next_event`, the ~20 ms audio arm cancelled the backoff on
+    /// every frame and the reconnect never completed.)
+    #[tokio::test(start_paused = true)]
+    async fn continuous_audio_does_not_starve_reconnect() {
+        let mut first = FakeTransport::new(false);
+        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        first.push_close(1011, "server restart");
+        let second = FakeTransport::new(true); // stays open after reopen
+        let mut s = Session::connect_with_transport(cfg(), first, once(second))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+
+        // Simulate continuous ~20 ms uplink while awaiting the reopen: enqueue a
+        // frame, then poll for an event with a short timeout, repeatedly. The
+        // send + recv are sequential (mirrors kutsu's select! where the send runs
+        // in the audio-arm body after recv_event resolves), so no borrow clash.
+        let mut got_reopen = false;
+        for _ in 0..2000 {
+            let _ = s.send_audio(&[0i16; 160]).await;
+            match tokio::time::timeout(Duration::from_millis(20), s.recv_event()).await {
+                Ok(Some(Event::SessionOpened {
+                    is_reconnect: true, ..
+                })) => {
+                    got_reopen = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {} // timeout: keep sending audio, keep waiting
+            }
+        }
+        assert!(
+            got_reopen,
+            "reconnect must complete despite continuous audio traffic"
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps_then_resets() {
+        let mut b = Backoff::new(300, 5000);
+        assert_eq!(b.next_delay(), std::time::Duration::from_millis(300));
+        assert_eq!(b.next_delay(), std::time::Duration::from_millis(600));
+        assert_eq!(b.next_delay(), std::time::Duration::from_millis(1200));
+        assert_eq!(b.next_delay(), std::time::Duration::from_millis(2400));
+        assert_eq!(b.next_delay(), std::time::Duration::from_millis(4800));
+        assert_eq!(b.next_delay(), std::time::Duration::from_millis(5000)); // capped
+        b.reset();
+        assert_eq!(b.next_delay(), std::time::Duration::from_millis(300));
+    }
+
+    #[test]
+    fn reconnect_state_drops_handle_after_n_failures() {
+        let mut s = ReconnectState::new(HANDLE_DROP_AFTER);
+        assert!(!s.on_failure());
+        assert!(!s.on_failure());
+        assert!(!s.on_failure());
+        assert!(s.on_failure()); // 4th -> drop
+        s.on_success();
+        assert!(!s.on_failure()); // reset by success
+    }
+}
