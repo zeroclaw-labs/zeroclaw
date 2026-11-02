@@ -209,11 +209,12 @@ fn image_payload_for_vision(attachment: &MediaAttachment) -> Option<(String, Cow
                             "error": format!("{}", err),
                             "error_key": "media_pipeline_webp_to_png_failed",
                         })),
-                    "Media pipeline: dropping WebP image that failed to decode"
+                    "Media pipeline: dropping WebP image that failed to decode or exceeds the decode cap"
                 );
-                // The decoder has already proven these bytes are not a usable
-                // image. Forwarding them anyway earns a provider-side 400 that
-                // fails the entire turn, including the accompanying text.
+                // Either the decoder has proven these bytes are not a usable
+                // image, or the per-image cap refused them before decoding.
+                // Forwarding them anyway earns a provider-side 400 that fails
+                // the entire turn, including the accompanying text.
                 return None;
             }
         }
@@ -233,6 +234,13 @@ fn is_webp_attachment(attachment: &MediaAttachment, mime: &str) -> bool {
 
 #[cfg(feature = "image-normalization")]
 fn webp_to_png(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // Refuse from the header before `image` reserves the canvas: this runs at
+    // ingestion, ahead of the bounds `prepare_messages_for_provider` applies.
+    zeroclaw_providers::multimodal::ensure_decode_within_per_image_cap(
+        "inbound WebP attachment",
+        "image/webp",
+        data,
+    )?;
     let image = image::load_from_memory_with_format(data, image::ImageFormat::WebP)?;
     let mut cursor = std::io::Cursor::new(Vec::new());
     image.write_to(&mut cursor, image::ImageFormat::Png)?;
@@ -667,6 +675,81 @@ mod tests {
         assert!(result.contains("[IMAGE:data:image/png;base64,"));
         assert!(!result.contains("[IMAGE:data:image/webp;base64,"));
         assert!(result.contains("what is this?"));
+    }
+
+    #[cfg(feature = "image-normalization")]
+    fn solid_webp_attachment(side: u32) -> MediaAttachment {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            side,
+            side,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut cursor, image::ImageFormat::WebP)
+        .expect("test WebP should encode");
+        MediaAttachment {
+            file_name: "sticker.webp".to_string(),
+            data: cursor.into_inner(),
+            mime_type: Some("image/webp".to_string()),
+            marker: None,
+        }
+    }
+
+    #[cfg(feature = "image-normalization")]
+    #[test]
+    fn webp_canvas_over_the_per_image_cap_is_refused_before_decode() {
+        // A solid 3000x3000 RGBA WebP is a few KB, but the validator's model
+        // projects 3000*3000*(4 output + 5 scratch) = 81_000_000 bytes for it,
+        // above the 64 MiB per-image cap. Before the header gate this decoded
+        // and re-encoded to PNG; the refusal must come from the cap, not from
+        // a decoder error.
+        let sticker = solid_webp_attachment(3000);
+        assert!(
+            sticker.data.len() < 1024 * 1024,
+            "fixture must stay small so the declared canvas is what is refused"
+        );
+
+        let error = webp_to_png(&sticker.data).expect_err("an over-cap canvas must be refused");
+
+        assert!(
+            error.to_string().contains("per-image limit"),
+            "refusal must name the per-image cap: {error}"
+        );
+    }
+
+    #[cfg(feature = "image-normalization")]
+    #[tokio::test]
+    async fn oversized_webp_is_dropped_rather_than_inlined() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        let result = pipeline
+            .process("what is this?", &[solid_webp_attachment(3000)])
+            .await;
+
+        assert!(
+            !result.contains("[IMAGE:data:"),
+            "an over-cap WebP must not be inlined: {result}"
+        );
+        assert!(
+            result.contains("could not be read"),
+            "annotation must state the image was dropped: {result}"
+        );
+        assert!(
+            result.contains("what is this?"),
+            "user text must survive: {result}"
+        );
+    }
+
+    #[cfg(feature = "image-normalization")]
+    #[test]
+    fn webp_canvas_under_the_per_image_cap_still_converts() {
+        // 2000x2000 RGBA projects to 2000*2000*9 = 36_000_000 bytes, under the cap.
+        let sticker = solid_webp_attachment(2000);
+
+        let png = webp_to_png(&sticker.data).expect("an in-cap WebP must still convert");
+
+        assert!(png.starts_with(b"\x89PNG"), "output must be a PNG");
     }
 
     #[cfg(feature = "image-normalization")]

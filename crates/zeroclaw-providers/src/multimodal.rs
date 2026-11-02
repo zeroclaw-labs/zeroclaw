@@ -3832,6 +3832,34 @@ fn per_image_cap_refusal(
     })
 }
 
+/// Header-only per-image gate for callers that decode untrusted image bytes
+/// outside [`prepare_messages_for_provider`], such as channel ingestion.
+///
+/// Runs the same `projected_allocation` and `per_image_cap_refusal` pair the
+/// validator applies to the encoded bytes before it constructs a decoder, so
+/// an image gets the same verdict whether it is decoded here or reaches the
+/// validator unconverted. The projection is the decode peak (output plus the
+/// decoder's scratch). A caller that re-encodes the result hands the validator
+/// a different image, judged on its own smaller cost, so this can refuse an
+/// image whose re-encoding the validator would admit.
+/// `image::Limits` is not a substitute: `WebPDecoder` (image 0.25.10) does not
+/// enforce `max_alloc`, and neither `Limits` nor `ImageReader::decode` sees the
+/// decoder's scratch buffers. Nothing is decoded and no pixel buffer is allocated.
+///
+/// `mime` must be one of the supported image MIME types. A header that cannot
+/// be read is an error, as is a projection at or above the per-image cap.
+pub fn ensure_decode_within_per_image_cap(
+    source: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let projected = projected_allocation(source, mime, bytes)?;
+    match per_image_cap_refusal(source, mime, projected) {
+        Some(failure) => Err(failure.error),
+        None => Ok(()),
+    }
+}
+
 fn image_error_failure(
     source: &str,
     mime: &str,
@@ -8672,6 +8700,75 @@ mod tests {
                 "refusal must name the per-image cap (animated={animated}): {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ensure_decode_within_per_image_cap_flips_where_the_validator_does() {
+        // A still WebP projects to output + scratch per pixel: 3 + 5 without
+        // alpha (cap crossed between 2896 and 2897 px per side) and 4 + 5 with
+        // the VP8X alpha flag (between 2730 and 2731). The sanity asserts tie
+        // those sides to the constants, so a change to either fails here
+        // rather than silently moving the boundary under the cases below.
+        let projected = |side: u32, output_bytes_per_pixel: u64| {
+            u64::from(side)
+                * u64::from(side)
+                * (output_bytes_per_pixel + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL)
+        };
+        assert!(projected(2896, 3) < MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2897, 3) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2730, 4) < MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2731, 4) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
+
+        let cases = [
+            (1000, false, false),
+            (2896, false, false),
+            (2897, false, true),
+            (4000, false, true),
+            (2730, true, false),
+            (2731, true, true),
+        ];
+        for (side, alpha, over_cap) in cases {
+            let mut webp = webp_with_canvas(side, false);
+            if alpha {
+                // The VP8X flags byte follows the 12-byte RIFF header and the
+                // 8-byte chunk header; bit 4 is the alpha flag.
+                webp[20] |= 0x10;
+            }
+
+            let gate = ensure_decode_within_per_image_cap("canvas.webp", "image/webp", &webp);
+            let validator =
+                validate_image_content("canvas.webp", "image/webp", &webp, u64::MAX).await;
+            let validator_refused_on_cap = validator
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("per-image limit"));
+
+            assert_eq!(
+                gate.is_err(),
+                over_cap,
+                "gate at {side}px alpha={alpha}: {gate:?}"
+            );
+            assert_eq!(
+                validator_refused_on_cap, over_cap,
+                "validator at {side}px alpha={alpha}: {validator:?}"
+            );
+            if over_cap {
+                let error = gate.expect_err("checked above");
+                assert!(
+                    error.to_string().contains("per-image limit"),
+                    "refusal must name the per-image cap: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_decode_within_per_image_cap_refuses_unreadable_input() {
+        let readable = webp_with_canvas(1000, false);
+        ensure_decode_within_per_image_cap("junk.webp", "image/webp", b"RIFF\0\0\0\0WEBPjunk")
+            .expect_err("an unreadable header is refused, not admitted");
+        ensure_decode_within_per_image_cap("x.bin", "application/pdf", &readable)
+            .expect_err("an unsupported MIME is refused");
     }
 
     #[tokio::test]
