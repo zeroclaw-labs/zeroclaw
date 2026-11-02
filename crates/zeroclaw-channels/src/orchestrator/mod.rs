@@ -11170,24 +11170,52 @@ async fn process_channel_message_body(
                                 Err(e)
                             }
                             Err(e) => {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
+                                // Telegram flood-control exhaustion is not a
+                                // formatting failure: the token is inside an
+                                // active 429 window that already outlasted the
+                                // wait budget, so the fresh-send fallback would
+                                // only hit the same gate. Stop instead.
+                                #[cfg(feature = "channel-telegram")]
+                                let flood_limited = e
+                                    .downcast_ref::<crate::telegram_rate_limit::TelegramGateError>(
                                     )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Failed to finalize draft; sending as new message"
-                                );
-                                let mut fallback = SendMessage::reply_to(&msg, &delivered_response);
-                                if suppress {
-                                    fallback = fallback.suppress_voice();
+                                    .is_some();
+                                #[cfg(not(feature = "channel-telegram"))]
+                                let flood_limited = false;
+                                if flood_limited {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                        "Final answer held: Telegram flood-control window outlasted \
+                                         the wait budget; not falling back to a fresh send"
+                                    );
+                                    Err(e)
+                                } else {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                        "Failed to finalize draft; sending as new message"
+                                    );
+                                    let mut fallback =
+                                        SendMessage::reply_to(&msg, &delivered_response);
+                                    if suppress {
+                                        fallback = fallback.suppress_voice();
+                                    }
+                                    channel
+                                        .send_final(&fallback)
+                                        .await
+                                        .map(|()| ReplyDelivery::Complete)
                                 }
-                                channel
-                                    .send_final(&fallback)
-                                    .await
-                                    .map(|()| ReplyDelivery::Complete)
                             }
                         }
                     }
@@ -17944,9 +17972,17 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("telegram", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
+            // This one-off channel has no daemon persistence authority, so
+            // its live-config resolvers would fall back to built-in defaults.
+            // Attach an in-memory authority over the supplied config (the
+            // same move the one-shot factory makes) so operator settings like
+            // `rate_limit_max_wait_secs` apply to announcement sends too.
             let ch =
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
-                    .with_api_base(tg.api_base_url.clone());
+                    .with_api_base(tg.api_base_url.clone())
+                    .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(
+                        config.clone(),
+                    ));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -25776,6 +25812,10 @@ api_key = "anthropic-key"
         supports_multi_message_streaming: bool,
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
+        /// When true, `finalize_draft` fails with a Telegram flood-gate error
+        /// (budget exhausted), modeling the real Telegram adapter's terminal
+        /// flood stop so the orchestrator's no-resend branch can be exercised.
+        finalize_flood_limited: bool,
         final_send_calls: AtomicUsize,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
@@ -25831,6 +25871,7 @@ api_key = "anthropic-key"
                 supports_multi_message_streaming: false,
                 finalize_should_fail,
                 fallback_send_should_fail,
+                finalize_flood_limited: false,
                 final_send_calls: AtomicUsize::new(0),
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
@@ -26435,6 +26476,17 @@ api_key = "anthropic-key"
             text: &str,
             _suppress_voice: bool,
         ) -> anyhow::Result<()> {
+            if self.finalize_flood_limited {
+                #[cfg(feature = "channel-telegram")]
+                return Err(
+                    crate::telegram_rate_limit::TelegramGateError::BudgetExhausted {
+                        remaining: Duration::from_secs(30),
+                    }
+                    .into(),
+                );
+                #[cfg(not(feature = "channel-telegram"))]
+                anyhow::bail!("finalize flood-limited");
+            }
             if self.finalize_should_fail {
                 anyhow::bail!("finalize boom")
             }
@@ -28014,6 +28066,55 @@ api_key = "anthropic-key"
         assert!(channel_impl.finalized_messages.lock().await.is_empty());
         assert!(channel_impl.sent_messages.lock().await.is_empty());
         assert!(hook_events.lock().await.is_empty());
+    }
+
+    /// A terminal Telegram flood-gate error from `finalize_draft` must stop
+    /// the delivery outright: no fresh-send fallback, no message-sent hook,
+    /// and the reply is not reported as delivered.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn process_channel_message_stops_on_flood_gate_error_without_fallback_send_or_hook() {
+        let channel_impl = Arc::new(DraftRecordingChannel {
+            finalize_flood_limited: true,
+            ..DraftRecordingChannel::new(false, false)
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (hook_events, hook_runner) = recording_message_sent_runner();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(hook_runner),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.draft_messages.lock().await.as_slice(),
+            ["chat-42:..."]
+        );
+        assert!(channel_impl.finalized_messages.lock().await.is_empty());
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "a flood gate error must not fall back to a fresh send"
+        );
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            0,
+            "a flood gate error is terminal: no fallback send_final"
+        );
+        assert!(
+            hook_events.lock().await.is_empty(),
+            "nothing was delivered, so the message-sent hook must not fire"
+        );
     }
 
     struct SlowModelProvider {
@@ -53527,6 +53628,8 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                rate_limit_max_wait_secs: 60,
+                typing_refresh_interval_secs: 4,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
@@ -53560,6 +53663,8 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                rate_limit_max_wait_secs: 60,
+                typing_refresh_interval_secs: 4,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
@@ -57631,6 +57736,68 @@ Done."#;
                 "{channel} must report the real config table [channels.lark.default]; got: {msg}"
             );
         }
+    }
+
+    /// A one-off announcement channel shares the sendMessage flood policy: a
+    /// penalty past the 60s inline wait ceiling fails the announcement after
+    /// exactly one request - the ceiling is not waited out and no resend
+    /// fires into the window.
+    #[tokio::test]
+    #[cfg(feature = "channel-telegram")]
+    async fn deliver_announcement_telegram_stops_after_one_request_on_long_flood_penalty() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 536",
+                "parameters": { "retry_after": 536 }
+            })))
+            .expect(1)
+            .named("the flood-limited attempt is the only request")
+            .mount(&mock_server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "ann".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                bot_token: "fake-token".into(),
+                api_base_url: mock_server.uri(),
+                ..Default::default()
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let err = deliver_announcement(&config, "telegram.ann", "123", None, "hello")
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!("a penalty past the inline ceiling must fail the announcement")
+            });
+
+        assert!(
+            format!("{err:#}").contains("rate limited"),
+            "expected the rate-limited outcome, got: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "a penalty past the inline ceiling must not be waited out: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .len(),
+            1,
+            "no retry may fire into the penalty window"
+        );
     }
 
     #[tokio::test]
