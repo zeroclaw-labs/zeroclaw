@@ -4,6 +4,7 @@ import {
   Window,
   type Document as HappyDocument,
   type HTMLButtonElement as HappyHTMLButtonElement,
+  type HTMLInputElement as HappyHTMLInputElement,
 } from "happy-dom";
 import { createJiti } from "jiti";
 import * as React from "react";
@@ -269,16 +270,14 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
     assert.ok(listCalls >= 2, "expected Save all to refresh the field baseline");
     assert.ok(releasePendingList, "expected the baseline refresh to be pending");
     originalSwitch.focus();
-    assert.strictEqual(
+    assert.ok(
       domWindow.document.querySelector<HappyHTMLButtonElement>(
         'button[role="switch"]',
-      ),
-      originalSwitch,
+      ) === originalSwitch,
       "background refresh should keep the switch DOM node mounted",
     );
-    assert.strictEqual(
-      domWindow.document.activeElement,
-      originalSwitch,
+    assert.ok(
+      domWindow.document.activeElement === originalSwitch,
       "background refresh should preserve field focus while loading",
     );
     assert.doesNotMatch(
@@ -299,6 +298,24 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       /1 unsaved change/,
       "an edit matching the old baseline must remain staged until refresh completes",
     );
+    await act(async () => {
+      findButton(domWindow.document, "Add comment").click();
+    });
+    const commentSelector = 'input[placeholder="Optional comment (why?)"]';
+    const commentInput =
+      domWindow.document.querySelector<HappyHTMLInputElement>(commentSelector);
+    assert.ok(commentInput, "expected the comment input to render");
+    const setInputValue = Object.getOwnPropertyDescriptor(
+      domWindow.HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    assert.ok(setInputValue, "expected the native input value setter");
+    await act(async () => {
+      setInputValue.call(commentInput, "why");
+      commentInput.dispatchEvent(new domWindow.Event("input", { bubbles: true }));
+    });
+    assert.equal(commentInput.value, "why");
+    originalSwitch.focus();
     const finishFirstRefresh = releasePendingList;
     releasePendingList = undefined;
     assert.ok(finishFirstRefresh, "expected the delayed baseline request");
@@ -306,11 +323,10 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       finishFirstRefresh();
       await flushEffects();
     });
-    assert.strictEqual(
+    assert.ok(
       domWindow.document.querySelector<HappyHTMLButtonElement>(
         'button[role="switch"]',
-      ),
-      originalSwitch,
+      ) === originalSwitch,
       "refresh completion should keep the same switch DOM node mounted",
     );
     assert.equal(
@@ -319,15 +335,21 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
         ?.getAttribute("aria-checked"),
       "false",
     );
-    assert.strictEqual(
-      domWindow.document.activeElement,
-      originalSwitch,
+    assert.ok(
+      domWindow.document.activeElement === originalSwitch,
       "background refresh should preserve field focus through completion",
     );
     assert.match(
       domWindow.document.body.textContent ?? "",
       /1 unsaved change/,
       "the edit should be compared with the refreshed server value",
+    );
+
+    assert.equal(
+      domWindow.document.querySelector<HappyHTMLInputElement>(commentSelector)
+        ?.value,
+      "why",
+      "a comment typed during the background refresh should remain visible",
     );
 
     // Save the edit against the refreshed baseline before exercising the
@@ -338,6 +360,24 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
     });
     assert.equal(savedValue, false);
     assert.equal(patches.length, 2);
+    assert.deepEqual(
+      patches[1],
+      [
+        {
+          op: "replace",
+          path: "channels.show_tool_calls",
+          value: false,
+          comment: "why",
+        },
+      ],
+      "the next save should send the comment that remains visible",
+    );
+    assert.equal(
+      domWindow.document.querySelector<HappyHTMLInputElement>(commentSelector)
+        ?.value,
+      "",
+      "the submitted comment should clear after a successful save",
+    );
     assert.match(
       domWindow.document.body.textContent ?? "",
       /No unsaved changes/,

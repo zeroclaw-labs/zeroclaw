@@ -984,6 +984,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     const reloadSequence = useRef(0);
     const sharedDraftsRef = useRef(configDraft.drafts);
     sharedDraftsRef.current = configDraft.drafts;
+    const sharedCommentsRef = useRef(configDraft.comments);
+    sharedCommentsRef.current = configDraft.comments;
     const savingDraftsRef = useRef(configDraft.savingDrafts);
     savingDraftsRef.current = configDraft.savingDrafts;
     const refreshInFlightRef = useRef(false);
@@ -1069,7 +1071,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
             configDraft.clearDraftIfInput(e.path, staged.input);
           }
           seed[e.path] = staged?.input ?? savedInput;
-          const stagedComment = configDraft.comments[e.path];
+          const stagedComment = sharedCommentsRef.current[e.path];
           if (stagedComment) commentSeed[e.path] = stagedComment;
         }
         setDraft(seed);
