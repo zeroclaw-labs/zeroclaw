@@ -2180,7 +2180,7 @@ async fn run_quickstart_cli(
                     "{}",
                     t(
                         "cli-quickstart-cancelled",
-                        "Quickstart cancelled. No config written."
+                        "Quickstart cancelled. Nothing was configured."
                     )
                 );
                 return Ok(());
