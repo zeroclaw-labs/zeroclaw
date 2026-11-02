@@ -58,38 +58,26 @@ pub struct SendMessageToPeerTool {
 }
 
 impl SendMessageToPeerTool {
-    pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Self {
-        let sender_alias = sender_alias.into();
-        let security = Arc::new(
-            SecurityPolicy::for_agent(config.as_ref(), &sender_alias)
-                .unwrap_or_else(|_| SecurityPolicy::default()),
-        );
-        Self::new_with_live_config_security_and_capability(
-            config,
-            sender_alias,
-            None,
-            security,
-            None,
-        )
+    /// Derive the sender's policy, propagating profile and workspace errors.
+    pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Result<Self> {
+        Self::new_with_capability(config, sender_alias, None)
     }
 
+    /// Derive the sender's policy before binding recipient admission capability.
     pub fn new_with_capability(
         config: Arc<Config>,
         sender_alias: impl Into<String>,
         execution_capability: Option<AgentExecutionCapability>,
-    ) -> Self {
+    ) -> Result<Self> {
         let sender_alias = sender_alias.into();
-        let security = Arc::new(
-            SecurityPolicy::for_agent(config.as_ref(), &sender_alias)
-                .unwrap_or_else(|_| SecurityPolicy::default()),
-        );
-        Self::new_with_live_config_security_and_capability(
+        let security = Arc::new(SecurityPolicy::for_agent(config.as_ref(), &sender_alias)?);
+        Ok(Self::new_with_live_config_security_and_capability(
             config,
             sender_alias,
             None,
             security,
             execution_capability,
-        )
+        ))
     }
 
     pub fn new_with_security(
@@ -852,7 +840,38 @@ mod tests {
 
     use crate::control_plane::{SqliteTaskStore, TaskSnapshot};
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::schema::AliasedAgentConfig;
+    use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+    fn peer_policy_config(install: &std::path::Path) -> Config {
+        let mut config = Config {
+            data_dir: install.join("data"),
+            config_path: install.join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        for alias in ["sender", "recipient"] {
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    channels: vec!["telegram.prod".into()],
+                    risk_profile: "default".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.peer_groups.insert(
+            "ops".into(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                external_peers: vec![PeerUsername::new("operator")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+    }
 
     struct MockRegistry {
         create_error: bool,
@@ -1176,11 +1195,20 @@ mod tests {
 
     #[test]
     fn description_stays_channel_agnostic() {
-        let mut config = Config::default();
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let mut config = Config {
+            data_dir: install.path().join("data"),
+            config_path: install.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
         config.agents.insert(
             "aa".to_string(),
             AliasedAgentConfig {
                 channels: vec!["telegram.prod".into()],
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -1208,7 +1236,7 @@ mod tests {
             },
         );
 
-        let tool = SendMessageToPeerTool::new(Arc::new(config), "aa");
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "aa").expect("sender policy");
         assert!(crate::i18n::get_tool_description(tool.name()).is_none());
         let spec = tool.spec();
         let description = spec.description.as_str();
@@ -1684,6 +1712,7 @@ mod tests {
             "sender".to_string(),
             AliasedAgentConfig {
                 channels: vec!["telegram.prod".into()],
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -1718,6 +1747,7 @@ mod tests {
             "sender",
             Some(authority.execution_capability()),
         )
+        .expect("sender policy")
         .with_control_plane(control_plane);
         let result = tool
             .execute(json!({
@@ -1870,6 +1900,61 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn peer_constructors_propagate_missing_risk_profile() {
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let mut config = peer_policy_config(install.path());
+        config.agents.get_mut("sender").unwrap().risk_profile = "missing".into();
+        let config = Arc::new(config);
+
+        for with_capability in [false, true] {
+            let result = if with_capability {
+                SendMessageToPeerTool::new_with_capability(Arc::clone(&config), "sender", None)
+            } else {
+                SendMessageToPeerTool::new(Arc::clone(&config), "sender")
+            };
+            let error = result
+                .err()
+                .expect("invalid sender policy must refuse construction");
+            assert!(error.to_string().contains("no resolvable risk_profile"));
+            assert!(!config.agent_workspace_dir("sender").exists());
+            assert!(
+                !config.data_dir.exists(),
+                "construction must not create a task store"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_constructors_propagate_workspace_creation_failure() {
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let config = Arc::new(peer_policy_config(install.path()));
+        let workspace = config.agent_workspace_dir("sender");
+        std::fs::create_dir_all(workspace.parent().unwrap()).expect("workspace parent");
+        std::fs::write(&workspace, b"keep this file").expect("block workspace creation");
+
+        for with_capability in [false, true] {
+            let result = if with_capability {
+                SendMessageToPeerTool::new_with_capability(Arc::clone(&config), "sender", None)
+            } else {
+                SendMessageToPeerTool::new(Arc::clone(&config), "sender")
+            };
+            let error = result
+                .err()
+                .expect("workspace error must refuse construction");
+            assert!(
+                error
+                    .to_string()
+                    .contains("failed to create agent workspace dir")
+            );
+            assert_eq!(std::fs::read(&workspace).unwrap(), b"keep this file");
+            assert!(
+                !config.data_dir.exists(),
+                "construction must not create a task store"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn send_message_to_peer_denied_in_readonly_autonomy() {
         // Sibling contract of a2a_send_denied_in_readonly_autonomy:
@@ -1878,32 +1963,50 @@ mod tests {
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            max_actions_per_hour: 1,
             ..SecurityPolicy::default()
         });
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let config = peer_policy_config(install.path());
+        let control_plane = ControlPlaneHandle::open(&config.data_dir).expect("task store");
+        let task_store = Arc::clone(&control_plane.store);
         let tool = SendMessageToPeerTool::new_with_security(
-            Arc::new(Config::default()),
+            Arc::new(config),
             "sender",
-            security,
-        );
-        let result = tool
-            .execute(json!({
-                "channel": "telegram.prod",
-                "target": "recipient",
-                "message": "hola"
-            }))
-            .await
-            .expect("execute returns a ToolResult");
+            Arc::clone(&security),
+        )
+        .with_control_plane(control_plane);
+        for target in ["recipient", "@operator"] {
+            let result = tool
+                .execute(json!({
+                    "channel": "telegram.prod",
+                    "target": target,
+                    "message": "hola"
+                }))
+                .await
+                .expect("execute returns a ToolResult");
+            assert!(
+                !result.success,
+                "read-only sender must be refused; got {result:?}"
+            );
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("read-only")),
+                "error must mention read-only; got {result:?}"
+            );
+        }
         assert!(
-            !result.success,
-            "read-only sender must be refused; got {result:?}"
+            !security.is_rate_limited(),
+            "read-only refusals must not charge an action"
         );
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("read-only"),
-            "error must mention read-only; got {result:?}"
+            task_store
+                .list_by_agent("recipient")
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -1959,6 +2062,7 @@ mod tests {
             .expect("isolated control plane should initialize");
         let task_store = Arc::clone(&control_plane.store);
         let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
+            .expect("sender policy")
             .with_control_plane(control_plane);
 
         let result = tool
@@ -1982,26 +2086,73 @@ mod tests {
             "error must mention read-only; got {result:?}"
         );
 
-        let running = task_store.list_running().await.expect("list_running");
+        let tasks = task_store
+            .list_by_agent("recipient")
+            .await
+            .expect("recipient tasks");
         assert!(
-            running.is_empty(),
-            "readonly denial must not create a PeerInbox task; got {running:?}"
+            tasks.is_empty(),
+            "readonly denial must not create a PeerInbox task in any state; got {tasks:?}"
         );
     }
 
     #[tokio::test]
     async fn send_message_to_peer_consumes_action_budget() {
-        use crate::security::SecurityPolicy;
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
+        };
 
-        let security = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 1,
-            ..SecurityPolicy::default()
+        async fn respond(State(requests): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"choices": [{"message": {"content": "peer received"}}]}))
+        }
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/v1/chat/completions", post(respond))
+            .with_state(Arc::clone(&requests));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, router).await.expect("local provider");
         });
-        let tool = SendMessageToPeerTool::new_with_security(
-            Arc::new(Config::default()),
-            "sender",
-            Arc::clone(&security),
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let mut config = peer_policy_config(install.path());
+        config.agents.get_mut("sender").unwrap().runtime_profile = "one-action".into();
+        config.runtime_profiles.insert(
+            "one-action".into(),
+            RuntimeProfileConfig {
+                max_actions_per_hour: 1,
+                ..RuntimeProfileConfig::default()
+            },
         );
+        config.agents.get_mut("recipient").unwrap().model_provider = "ollama.test".into();
+        config.providers.models.ollama.insert(
+            "test".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".into()),
+                    uri: Some(format!("http://{address}")),
+                    timeout_secs: Some(5),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        let control_plane = ControlPlaneHandle::open(&config.data_dir).expect("task store");
+        let task_store = Arc::clone(&control_plane.store);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let config = Arc::new(config);
+        let tool = SendMessageToPeerTool::new_with_capability(
+            Arc::clone(&config),
+            "sender",
+            Some(authority.execution_capability()),
+        )
+        .expect("sender policy")
+        .with_control_plane(control_plane.clone());
+        let security = Arc::clone(&tool.security);
+        assert_eq!(security.max_actions_per_hour, 1);
+        assert!(!security.is_rate_limited());
         let args = json!({
             "channel": "telegram.prod",
             "target": "recipient",
@@ -2011,12 +2162,39 @@ mod tests {
             .execute(args.clone())
             .await
             .expect("first execute returns a ToolResult");
-        // First call may fail peer-set validation after consuming the Act slot.
         assert!(
-            security.is_rate_limited() || !first.success,
-            "first Act must consume the single slot; got {first:?}"
+            first.success,
+            "the admitted peer send must succeed: {first:?}"
         );
-        let second = tool
+        assert!(
+            security.is_rate_limited(),
+            "the successful Act must consume the slot"
+        );
+        let task_id = first
+            .output
+            .split_once("task_id=")
+            .unwrap()
+            .1
+            .trim_end_matches(')');
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = task_store.get_snapshot(task_id).await.unwrap().unwrap();
+                if snapshot.task.status.is_terminal() {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recipient completes through the local provider");
+        assert_eq!(terminal.task.status, TaskStatus::Completed);
+        assert_eq!(terminal.output.as_deref(), Some("peer received"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let second_tool =
+            SendMessageToPeerTool::new_with_security(config, "sender", Arc::clone(&security))
+                .with_control_plane(control_plane);
+        let second = second_tool
             .execute(args)
             .await
             .expect("second execute returns a ToolResult");
@@ -2024,10 +2202,19 @@ mod tests {
             !second.success,
             "second send must be refused; got {second:?}"
         );
-        let err = second.error.as_deref().unwrap_or_default();
-        assert!(
-            err.contains("rate") || err.contains("limit") || err.contains("action"),
-            "second error should reflect the exhausted action budget; got {second:?}"
+        assert_eq!(
+            second.error.as_deref(),
+            Some("Rate limit exceeded: action budget exhausted")
         );
+        assert_eq!(
+            task_store.list_by_agent("recipient").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "refused send must not reach the provider"
+        );
+        server.abort();
     }
 }

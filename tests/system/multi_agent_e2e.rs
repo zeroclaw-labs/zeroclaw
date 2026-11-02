@@ -238,7 +238,9 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
     let cfg = Arc::new(cfg);
     let control_plane_dir = TempDir::new().unwrap();
     let control_plane = ControlPlaneHandle::open(control_plane_dir.path()).unwrap();
-    let tool = SendMessageToPeerTool::new(cfg.clone(), "alpha").with_control_plane(control_plane);
+    let tool = SendMessageToPeerTool::new(cfg.clone(), "alpha")
+        .expect("sender policy")
+        .with_control_plane(control_plane);
 
     let to_gamma = tool
         .execute(json!({
@@ -322,6 +324,7 @@ async fn standalone_peer_send_registers_before_acceptance_and_rejects_an_unopena
 
     let args = json!({"channel": "telegram.prod", "target": "beta", "message": "hi"});
     let accepted = SendMessageToPeerTool::new(Arc::new(cfg.clone()), "alpha")
+        .expect("sender policy")
         .execute(args.clone())
         .await
         .expect("standalone tool result");
@@ -347,6 +350,7 @@ async fn standalone_peer_send_registers_before_acceptance_and_rejects_an_unopena
     std::fs::write(&blocked_path, b"occupied").expect("block the store directory");
     cfg.data_dir = blocked_path;
     let rejected = SendMessageToPeerTool::new(Arc::new(cfg), "alpha")
+        .expect("sender policy")
         .execute(args)
         .await
         .expect("store-open failure is a tool result");
@@ -405,7 +409,9 @@ async fn peer_group_dotted_channel_refs_remain_alias_scoped_for_dispatch() {
     let cfg = Arc::new(cfg);
     let control_plane_dir = TempDir::new().unwrap();
     let control_plane = ControlPlaneHandle::open(control_plane_dir.path()).unwrap();
-    let tool = SendMessageToPeerTool::new(cfg, "alpha").with_control_plane(control_plane);
+    let tool = SendMessageToPeerTool::new(cfg, "alpha")
+        .expect("sender policy")
+        .with_control_plane(control_plane);
     let prod = tool
         .execute(json!({
             "channel": "telegram.prod",

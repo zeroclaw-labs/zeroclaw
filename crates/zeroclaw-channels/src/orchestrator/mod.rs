@@ -47319,7 +47319,16 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
-        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        let install = tempfile::TempDir::new().expect("isolated peer-tool install");
+        let mut prompt_config = zeroclaw_config::schema::Config {
+            data_dir: install.path().join("data"),
+            config_path: install.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        prompt_config.risk_profiles.insert(
+            "default".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
         prompt_config.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -47327,6 +47336,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     "test-channel.default".into(),
                     "other-channel.default".into(),
                 ],
+                risk_profile: "default".into(),
                 ..zeroclaw_config::schema::AliasedAgentConfig::default()
             },
         );
@@ -47373,7 +47383,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::tools::SendMessageToPeerTool::new(
                     Arc::clone(&prompt_config),
                     "test-agent",
-                ),
+                )
+                .expect("sender policy"),
             )]),
         );
         let runtime_ctx = peer_prompt_test_context(
