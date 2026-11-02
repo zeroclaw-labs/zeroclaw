@@ -2443,7 +2443,7 @@ mod client {
 // ─── inbound ───────────────────────────────────────────────────────────────
 mod inbound {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -7352,7 +7352,7 @@ mod tests {
     // event parsing → media download/save → attach_media → transcript
     // insertion, with only the homeserver and STT provider mocked at HTTP.
     mod inbound_route {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashSet;
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
