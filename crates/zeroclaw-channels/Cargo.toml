@@ -174,7 +174,7 @@ jsonwebtoken = { version = "10", optional = true, default-features = false, feat
   "use_pem",
 ] }
 thiserror = { version = "2.0", optional = true }
-gemini-live = { path = "../gemini-live", optional = true }
+gemini-live = { workspace = true, optional = true }
 
 [features]
 default = ["default-channels"]
