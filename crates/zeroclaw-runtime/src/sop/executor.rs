@@ -638,12 +638,16 @@ pub fn spawn_and_register_sop_driver_with_capability(
         )
     });
     if !admitted {
-        settle_refused_run(&engine_for_refusal, &run_id);
+        settle_undriven_run(
+            &engine_for_refusal,
+            &run_id,
+            crate::sop::engine::OrphanedRunSettlement::DrainedBeforeAdmission,
+        );
     }
     admitted
 }
 
-/// Take the run a refused driver would have advanced to a terminal state.
+/// Settle the run when its driver is refused or stops at execution rejection.
 ///
 /// Refusing the driver is only half the boundary. The producers reach here with
 /// the run already started and persisted — an approval resume, for instance,
@@ -653,22 +657,23 @@ pub fn spawn_and_register_sop_driver_with_capability(
 /// and maintenance keeps renewing, so expiry never recovers it: the run holds
 /// concurrency capacity for as long as the daemon lives.
 ///
-/// Settling it here, at the single point every generation-owned producer funnels
-/// through, is what keeps that from depending on each caller remembering to.
+/// Both generation admission and execution rejection use the engine's retry
+/// owner so a failed terminal write cannot abandon the run.
 /// The engine lock is taken only after `admit_sop_driver` has released the
 /// registry lock, and no producer holds the engine lock across this call.
-fn settle_refused_run(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
+fn settle_undriven_run(
+    engine: &Arc<Mutex<SopEngine>>,
+    run_id: &str,
+    kind: crate::sop::engine::OrphanedRunSettlement,
+) {
     let mut guard = match engine.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     // Through the owning path: if this terminal write fails, the engine keeps
-    // the run for maintenance to settle again. No driver was admitted, so
-    // nothing else would ever make that write.
-    if let Err(e) = guard.settle_orphaned_run(
-        run_id,
-        crate::sop::engine::OrphanedRunSettlement::DrainedBeforeAdmission,
-    ) {
+    // the run for maintenance to settle again. No driver will advance the
+    // run, so nothing else would ever make that write.
+    if let Err(e) = guard.settle_orphaned_run(run_id, kind) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -677,7 +682,7 @@ fn settle_refused_run(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
                     "run_id": run_id,
                     "error": e.to_string(),
                 })),
-            "Could not settle a SOP run whose driver was refused; it stays active and SOP \
+            "Could not settle a SOP run no driver will advance; it stays active and SOP \
              maintenance retries the terminal write until it lands"
         );
     }
@@ -902,6 +907,11 @@ async fn drive_headless_run(
                             })),
                         "SOP headless driver: managed ExecuteStep witness validation failed"
                     );
+                    settle_undriven_run(
+                        &engine,
+                        &run_id,
+                        crate::sop::engine::OrphanedRunSettlement::ExecutionRejected,
+                    );
                     return;
                 }
                 // Read per action, not once per driver: the run is the durable
@@ -942,6 +952,11 @@ async fn drive_headless_run(
                                 "error": error.to_string(),
                             })),
                             "SOP headless driver: authority witness rejected before target execution"
+                        );
+                        settle_undriven_run(
+                            &engine,
+                            &run_id,
+                            crate::sop::engine::OrphanedRunSettlement::ExecutionRejected,
                         );
                         return;
                     }
@@ -1487,26 +1502,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_sop_rejects_stale_or_closed_action_without_advancing() {
-        for closed in [false, true] {
+    async fn headless_sop_settles_rejected_action_without_executing() {
+        for rejection in ["stale", "closed", "missing"] {
             let mut config = zeroclaw_config::schema::Config::default();
             config.agents.insert("alpha".into(), Default::default());
             let authority = LiveConfigAuthority::new(config.clone());
+            let store = Arc::new(InMemoryRunStore::new());
             let mut engine = SopEngine::new(SopConfig::default())
+                .with_store(store.clone())
                 .with_execution_capability(authority.execution_capability());
             let mut sop = test_sop("queued");
             sop.agent = Some("alpha".into());
             engine.set_sops_for_test(vec![sop]);
-            let action = engine.start_run("queued", manual_event()).unwrap();
+            let mut action = engine.start_run("queued", manual_event()).unwrap();
             let run_id = extract_run_id(&action);
-            if closed {
-                authority.close_agent_lifecycle();
-            } else {
-                let mut delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
-                delete.commit_destructive_mutation();
-                drop(delete);
+            match rejection {
+                "closed" => authority.close_agent_lifecycle(),
+                "stale" => {
+                    let mut delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+                    delete.commit_destructive_mutation();
+                    drop(delete);
+                }
+                "missing" => {
+                    if let SopRunAction::ExecuteStep {
+                        execution_witness, ..
+                    } = &mut action
+                    {
+                        *execution_witness = None;
+                    }
+                }
+                _ => unreachable!(),
             }
-            let before = serde_json::to_value(engine.get_run(&run_id).unwrap()).unwrap();
+            assert_eq!(store.claim_counts("queued").unwrap().0, 1);
             let engine = Arc::new(Mutex::new(engine));
             drive_headless_run(
                 config,
@@ -1518,11 +1545,118 @@ mod tests {
             )
             .await;
             let guard = engine.lock().unwrap();
+            let run = guard.get_run(&run_id).unwrap();
+            assert_eq!(run.status, SopRunStatus::Cancelled);
+            assert!(run.step_results.is_empty());
+            assert!(!guard.active_runs().contains_key(&run_id));
+            assert!(!guard.has_pending_orphan_settlement(&run_id));
             assert_eq!(
-                serde_json::to_value(guard.get_run(&run_id).unwrap()).unwrap(),
-                before
+                store.load_run(&run_id).unwrap().unwrap().run.status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(store.claim_counts("queued").unwrap().0, 0);
+            assert_eq!(
+                store
+                    .list_events(&run_id)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.kind == "run_execution_rejected")
+                    .count(),
+                1
             );
             assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_preflight_rejection_settles_and_retries_without_holding_capacity() {
+        use crate::sop::store::testing::FailFirstTerminalWrite;
+
+        for fail_write in [false, true] {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.agents.insert("alpha".into(), Default::default());
+            let authority = LiveConfigAuthority::new(config.clone());
+            let delete = authority.agent_lifecycle().begin_delete("alpha").unwrap();
+            let failing = Arc::new(FailFirstTerminalWrite::new(InMemoryRunStore::new()));
+            let store: Arc<dyn SopRunStore> = if fail_write {
+                failing.clone()
+            } else {
+                Arc::new(InMemoryRunStore::new())
+            };
+            let sop_name = "delete-preflight";
+            let mut engine = SopEngine::new(SopConfig::default())
+                .with_store(store.clone())
+                .with_execution_capability(authority.execution_capability());
+            let mut sop = test_sop(sop_name);
+            sop.agent = Some("alpha".into());
+            engine.set_sops_for_test(vec![sop]);
+            let action = engine.start_run(sop_name, manual_event()).unwrap();
+            let run_id = extract_run_id(&action);
+            assert_eq!(store.claim_counts(sop_name).unwrap().0, 1);
+            let engine = Arc::new(Mutex::new(engine));
+            let lease = lease_for_first_action(&engine, &action).unwrap();
+            drive_headless_run(
+                config,
+                engine.clone(),
+                None,
+                action,
+                lease,
+                Some(authority.execution_capability()),
+            )
+            .await;
+
+            // Preflight refused deletion; the alias remains usable, but this
+            // run has no driver and must not retain capacity indefinitely.
+            drop(delete);
+            assert!(authority.execution_capability().admit("alpha").is_ok());
+            assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 0);
+            let mut guard = engine.lock().unwrap();
+            if fail_write {
+                assert!(failing.fired());
+                assert_eq!(
+                    guard.get_run(&run_id).unwrap().status,
+                    SopRunStatus::Running
+                );
+                assert!(guard.has_pending_orphan_settlement(&run_id));
+                assert_eq!(
+                    store.load_run(&run_id).unwrap().unwrap().run.status,
+                    SopRunStatus::Running
+                );
+                assert_eq!(store.claim_counts(sop_name).unwrap().0, 1);
+                assert_eq!(guard.run_maintenance_tick().settled_orphaned_runs, 1);
+            }
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Cancelled
+            );
+            assert!(guard.get_run(&run_id).unwrap().step_results.is_empty());
+            assert!(!guard.active_runs().contains_key(&run_id));
+            assert!(!guard.has_pending_orphan_settlement(&run_id));
+            assert_eq!(
+                store.load_run(&run_id).unwrap().unwrap().run.status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(store.claim_counts(sop_name).unwrap().0, 0);
+            let events = store.list_events(&run_id).unwrap();
+            let rejected: Vec<_> = events
+                .iter()
+                .filter(|event| event.kind == "run_execution_rejected")
+                .collect();
+            assert_eq!(rejected.len(), 1);
+            assert!(
+                rejected[0]
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("before target execution")
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event.kind == "run_generation_drained")
+            );
+            assert_eq!(guard.run_maintenance_tick().settled_orphaned_runs, 0);
+            assert!(guard.start_run(sop_name, manual_event()).is_ok());
         }
     }
 

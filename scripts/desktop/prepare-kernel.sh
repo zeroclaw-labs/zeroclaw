@@ -18,6 +18,7 @@ set -euo pipefail
 #       # builds both mac arches and fuses them with lipo
 #   scripts/desktop/prepare-kernel.sh --target universal-apple-darwin \
 #       --features embedded-web
+#   scripts/desktop/prepare-kernel.sh --distribution dist-compat
 #
 # Environment:
 #   ZEROCLAW_KERNEL_PATH   Reuse an existing kernel binary instead of building
@@ -34,14 +35,21 @@ PROFILE="${CARGO_PROFILE:-release}"
 
 TARGET=""
 FEATURES=""
+DISTRIBUTION="dist"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="$2"; shift 2 ;;
     --features) FEATURES="$2"; shift 2 ;;
+    --distribution) DISTRIBUTION="$2"; shift 2 ;;
     -h|--help) sed -n '3,29p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+case "$DISTRIBUTION" in
+  dist|dist-compat) ;;
+  *) echo "unsupported distribution: $DISTRIBUTION" >&2; exit 2 ;;
+esac
 
 host_triple() {
   rustc -vV | sed -n 's/^host: //p'
@@ -77,13 +85,13 @@ build_kernel() {
     echo "$ZEROCLAW_KERNEL_PATH"
     return
   fi
+  local resolved_features
+  resolved_features="$(cd "$REPO_ROOT" && cargo run --quiet --locked -p xtask --bin generate -- features --selection "$DISTRIBUTION" --target "$triple")"
   if [[ -n "$FEATURES" ]]; then
-    echo "prepare-kernel: cargo build --profile $PROFILE --bin zeroclaw --target $triple --features $FEATURES" >&2
-    (cd "$REPO_ROOT" && cargo build --profile "$PROFILE" --bin zeroclaw --target "$triple" --features "$FEATURES")
-  else
-    echo "prepare-kernel: cargo build --profile $PROFILE --bin zeroclaw --target $triple" >&2
-    (cd "$REPO_ROOT" && cargo build --profile "$PROFILE" --bin zeroclaw --target "$triple")
+    resolved_features="$resolved_features,$FEATURES"
   fi
+  echo "prepare-kernel: $DISTRIBUTION for $triple; features: $resolved_features" >&2
+  (cd "$REPO_ROOT" && cargo build --locked --profile "$PROFILE" --bin zeroclaw --target "$triple" --no-default-features --features "$resolved_features")
   local dir="release"
   [[ "$PROFILE" != "release" ]] && dir="$PROFILE"
   echo "$REPO_ROOT/target/$triple/$dir/zeroclaw$exe"
