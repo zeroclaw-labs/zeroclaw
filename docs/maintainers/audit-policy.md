@@ -37,19 +37,17 @@ tool blocks the PR. What actually fails each tool differs by category:
   advisories are reported as allowed warnings and exit 0.
 - **`cargo deny check advisories`**: vulnerability *and* unmaintained advisories for crates in the resolved graph are errors (exit 1). That is why the live unmaintained exceptions for `rustls-pemfile` and `anymap2` remain in `deny.toml`. A stale graph-ignore instead emits `advisory-not-detected`, which is a warning (exit 0); it is never triggered by removing an entry from `.cargo/audit.toml`.
 
-An audit-only ignore covers a crate `cargo deny`'s resolved graph does
-not pull in, so it affects only `cargo audit`: removing it while the
-crate stays locked re-reports the advisory as an allowed warning (exit
-0), not a CI failure. Keeping it is therefore accepted full-lock noise
-control, not a hard-gate bypass — but dropping it does not break the
-gate.
+An audit-only ignore is needed by `cargo audit` but not by `cargo deny`
+under its configured graph. That describes tool scope, not advisory
+severity. Removing an ignore for an affected vulnerability makes the
+configured `cargo audit` fail (exit 1). An unmaintained or informational
+finding is instead an allowed warning under the bare invocation.
 
-The difference between the tools is **scope**, not severity:
-`cargo audit` reports every advisory touching the lockfile, while
-`cargo deny` only reports advisories for crates in the resolved
-workspace graph. Use the narrower `cargo deny` result to confirm an
-advisory is not actually pulled in; keep the audit-only entry while
-the crate remains locked.
+The tools' graph scopes also do not prove runtime reachability. A crate
+outside the default graph can be included by another feature or target.
+Each vulnerability exception needs an explicit exposure rationale,
+tracking, and removal condition; a clean default-graph scan is not
+sufficient justification by itself.
 
 ---
 
@@ -92,8 +90,7 @@ files.
 These advisories are informational. The crate has no maintained
 successor on the dependency lines we use. They are
 **semi-permanent**; the entry stays until the underlying dependency
-is replaced (e.g. GTK3 → GTK4, rumqttc upgrade that pulls
-`rustls-webpki 0.103.x`).
+is replaced (e.g. GTK3 → GTK4).
 
 Live, deny+audit (both files):
 
@@ -111,6 +108,11 @@ Live, deny-only:
 
 - **`anymap2` (`RUSTSEC-2026-0319`)**: unmaintained; `matrix-sdk 0.19.1` still depends on it, with no replacement SDK release available. The advisory recommends `anymap3`. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. Remove the exception once the resolved dependency graph no longer includes an affected `anymap2`. Tracking #11429.
 
+### Audit-only inventory (scope, not severity)
+
+Tool scope does not determine advisory severity. This inventory includes
+informational unsoundness and maintenance notices.
+
 Live, audit-only (`cargo deny`'s resolved graph no longer pulls these
 in, but they remain in `Cargo.lock` and `cargo audit` reads the whole
 lockfile — remove from `audit.toml` only once the crate is either
@@ -118,9 +120,10 @@ dropped from `Cargo.lock` entirely, e.g. via `cargo update` or a
 dependency bump, or every locked version of it is patched/unaffected
 per the advisory):
 
-- **`rustls-webpki` (4 entries, `RUSTSEC-2026-0049`, `-0098`, `-0099`,
-  `-0104`)**: 0.102.x copy is in `Cargo.lock` but not in the resolved
-  dependency graph. `cargo deny` does not flag it; `cargo audit` does.
+- **`lru` (`RUSTSEC-2026-0253`)**: informational unsoundness in the
+  retained 0.16 Nostr cache dependency, outside the current default
+  cargo-deny graph. Track the dependency migration in #9602; remove
+  the ignore when the affected retained copy is repaired or removed.
 - **GTK3 stack (11 entries, `RUSTSEC-2024-0411..-0420`, `-0429`)**:
   `gdk`/`gtk`/`atk`-family gtk-rs bindings and `glib`. Present in
   `Cargo.lock` — `zeroclaw-desktop` (Tauri) was removed in PR #8544
@@ -166,10 +169,9 @@ unaffected by the advisory):
   `audit.toml` once the crate is either gone from `Cargo.lock`
   entirely or every locked version of it is patched/unaffected per the
   advisory. Removing an audit-only entry while a still-affected
-  version remains resolvable makes `cargo audit` report the advisory
-  again as an allowed warning (it does not fail CI — `cargo audit`
-  exits 0 on warnings under the configured invocation) — but it drops
-  the accepted full-lock noise control this document records. Always
+  version remains locked reports the finding again: vulnerability
+  advisories fail the audit, while maintenance/informational findings
+  remain allowed warnings under the configured bare invocation. Always
   check `Cargo.lock` and the advisory's patched-version range directly,
   not just `cargo deny`'s last result.
 
@@ -188,7 +190,7 @@ unaffected by the advisory):
   locked version (0.8.6, 0.9.4, 0.10.1) is patched per the advisory,
   not because the crate left `Cargo.lock`. Remaining deny+audit live
   ignore: `rustls-pemfile`. Remaining audit-only ignores:
-  `rustls-webpki` (4) plus the 19 lockfile-stale entries above.
+  `lru` (1, tracked in #9602) plus the 19 lockfile-stale entries above.
 - **#9899**: *Remove the `matrix-sdk -> imbl` advisory waivers.* Closed by
   the `matrix-sdk` 0.19 bump. The resolved graph and `Cargo.lock` no longer
   contain `bitmaps` or an affected `imbl-sized-chunks`, so
@@ -230,6 +232,10 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
+- 2026-10-21: Refreshed container CA stores and added compromised-issuer
+  regressions. After #11924 removed the legacy MQTT verifier and its
+  four ignores, removed its stale inventory here. Distinguished audit
+  tool scope from advisory severity.
 - 2026-09-23: Bumped `matrix-sdk` 0.18 to 0.19 (with `rusqlite` 0.37 to
   0.40 and the OpenTelemetry stack 0.32 to 0.33, both forced by that bump)
   and removed every waiver it clears: `RUSTSEC-2026-0247` (`bitmaps`),
