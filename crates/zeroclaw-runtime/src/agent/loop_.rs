@@ -3455,6 +3455,7 @@ pub(crate) async fn process_message_shared(
         origin,
         None,
         internal_principal,
+        false,
     )
     .await
 }
@@ -3570,6 +3571,7 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission_and_pr
         origin,
         execution_admission,
         internal_principal,
+        false,
     )
     .await
 }
@@ -3592,6 +3594,7 @@ pub async fn process_message_with_live_config(
         session_id,
         origin,
         None,
+        false,
     )
     .await
 }
@@ -3604,6 +3607,8 @@ pub async fn process_message_with_live_config_and_admission(
     session_id: Option<&str>,
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
+    // The caller owns the surface fact; TurnOrigin does not distinguish messaging.
+    is_messaging_channel_turn: bool,
 ) -> Result<String> {
     process_message_inner(
         Arc::new(config),
@@ -3614,6 +3619,7 @@ pub async fn process_message_with_live_config_and_admission(
         origin,
         execution_admission,
         None,
+        is_messaging_channel_turn,
     )
     .await
 }
@@ -3627,6 +3633,7 @@ async fn process_message_inner(
     origin: TurnOrigin,
     execution_admission: Option<AgentExecutionAdmission>,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+    is_messaging_channel_turn: bool,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
     if let Some(admission) = execution_admission.as_ref() {
@@ -4078,7 +4085,7 @@ async fn process_message_inner(
                 false,
                 config.channels.show_tool_calls,
                 runtime.shell_profile().as_ref(),
-                false,
+                is_messaging_channel_turn,
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -8966,6 +8973,7 @@ mod tests {
                 true,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -17000,6 +17008,7 @@ Let me check the result."#;
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap()
         };
@@ -20514,6 +20523,118 @@ Let me check the result."#;
             "run and process_message must both resolve runtime_profiles.*.max_tool_iterations \
              before provider setup; observed {seen:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn process_message_forwards_messaging_surface_to_provider_prompt() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "surface reply"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("workspace directory");
+        let provider = config.providers.models.ensure("custom", "default").unwrap();
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("surface-test-model".to_string());
+        provider.uri = Some(server.uri());
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("surface-test".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "surface-test".to_string(),
+            RuntimeProfileConfig {
+                compact_context: Some(false),
+                max_system_prompt_chars: Some(usize::MAX),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "surface-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.default".into(),
+                risk_profile: "surface-test".into(),
+                runtime_profile: "surface-test".into(),
+                ..Default::default()
+            },
+        );
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let capability = AgentExecutionCapability::from_parts(
+            authority.live_handle(),
+            authority.agent_lifecycle(),
+        );
+        for (message, is_messaging_channel_turn) in [
+            ("messaging surface", true),
+            ("generic gateway surface", false),
+        ] {
+            let admission = capability
+                .resolve_and_admit("surface-agent")
+                .expect("admit agent");
+            let response = super::process_message_with_live_config_and_admission(
+                config.clone(),
+                authority.live_handle(),
+                "surface-agent",
+                message,
+                None,
+                TurnOrigin::Interactive,
+                Some(admission),
+                is_messaging_channel_turn,
+            )
+            .await
+            .expect("admitted turn should complete");
+            assert_eq!(response, "surface reply");
+        }
+        let response = super::process_message(
+            config,
+            "surface-agent",
+            "ordinary direct surface",
+            None,
+            TurnOrigin::Interactive,
+            None,
+        )
+        .await
+        .expect("ordinary direct turn should complete");
+        assert_eq!(response, "surface reply");
+
+        let requests = server.received_requests().await.expect("provider requests");
+        assert_eq!(requests.len(), 3);
+        for (request, is_messaging_channel_turn) in requests.iter().zip([true, false, false]) {
+            let body: serde_json::Value = request.body_json().expect("provider JSON");
+            let prompt = body["messages"]
+                .as_array()
+                .expect("provider messages")
+                .iter()
+                .find(|message| message["role"] == "system")
+                .and_then(|message| message["content"].as_str())
+                .expect("runtime system prompt in actual provider request");
+            assert_eq!(
+                prompt.contains("## Channel Capabilities"),
+                is_messaging_channel_turn,
+                "runtime must forward the caller's messaging surface into the provider prompt"
+            );
+            assert_eq!(prompt.contains("messaging bot"), is_messaging_channel_turn);
+            assert!(prompt.contains("NEVER repeat, describe, or echo credentials"));
+            assert!(prompt.contains("If a tool output contains credentials"));
+        }
     }
 
     #[tokio::test]

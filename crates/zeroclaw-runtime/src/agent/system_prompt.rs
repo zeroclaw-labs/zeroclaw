@@ -116,7 +116,7 @@ fn append_project_context(
 ///
 /// This convenience wrapper (like [`build_system_prompt_with_tool_calls`] and
 /// [`build_system_prompt_with_mode`]) describes a messaging-channel surface, so
-/// existing channel callers keep their prompt unchanged. A caller that is not
+/// existing channel callers retain messaging guidance. A caller that is not
 /// a messaging channel should use [`build_system_prompt_with_mode_and_autonomy`]
 /// and pass `is_messaging_channel_turn: false`.
 ///
@@ -467,6 +467,8 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
             );
         }
     }
+    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
+    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
     prompt.push('\n');
 
     // ── 2b. Shell dialect ───────────────────────────────────────
@@ -574,8 +576,6 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
              - If there is no approval path for this channel or the runtime blocks an action, explain that restriction directly instead of simulating an approval flow.\n"
         }
     });
-        prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-        prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
         prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
         if !show_tool_calls {
             prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
@@ -1898,52 +1898,48 @@ mod tests {
         let ws = tempfile::tempdir().expect("tempdir");
         let tools: Vec<(&str, &str)> = vec![("file_edit", "edit files")];
 
-        let channel = build_system_prompt_with_mode_and_autonomy(
-            ws.path(),
-            "m",
-            &tools,
-            &[],
-            None,
-            None,
-            None,
-            true,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
-            false,
-            0,
-            true,
-            false,
-            None,
-            true,
-        );
-        let cli = build_system_prompt_with_mode_and_autonomy(
-            ws.path(),
-            "m",
-            &tools,
-            &[],
-            None,
-            None,
-            None,
-            true,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
-            false,
-            0,
-            true,
-            false,
-            None,
-            false,
-        );
+        for compact_context in [false, true] {
+            for is_messaging_channel_turn in [false, true] {
+                let prompt = build_system_prompt_with_mode_and_autonomy(
+                    ws.path(),
+                    "m",
+                    &tools,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    true,
+                    zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
+                    compact_context,
+                    0,
+                    true,
+                    false,
+                    None,
+                    is_messaging_channel_turn,
+                );
 
-        assert!(
-            channel.contains("Channel Capabilities"),
-            "chat surfaces must keep the channel section"
-        );
-        assert!(
-            !cli.contains("Channel Capabilities"),
-            "CLI surface must not receive the channel section"
-        );
-        assert!(
-            !cli.contains("messaging bot"),
-            "CLI surface must not be told it is a messaging bot"
-        );
+                assert_eq!(
+                    prompt.contains("## Channel Capabilities"),
+                    is_messaging_channel_turn && !compact_context,
+                    "channel guidance must follow the turn surface and compact mode"
+                );
+                if !is_messaging_channel_turn {
+                    assert!(
+                        !prompt.contains("messaging bot"),
+                        "direct surfaces must not be told they are messaging bots"
+                    );
+                }
+                for rule in [
+                    "NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.",
+                    "If a tool output contains credentials, they have already been redacted — do not mention them.",
+                ] {
+                    assert_eq!(
+                        prompt.matches(rule).count(),
+                        1,
+                        "credential guidance must appear once on every surface and in compact mode"
+                    );
+                }
+            }
+        }
     }
 }
