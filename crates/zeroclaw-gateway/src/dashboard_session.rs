@@ -54,14 +54,23 @@ pub(crate) const HOST_SESSION_COOKIE: &str = "__Host-zc_session";
 /// or over plain HTTP on a loopback host.
 pub(crate) const SESSION_COOKIE: &str = "zc_session";
 
-/// Browser marker on an HTTPS dashboard served at the root path.
-pub(crate) const HOST_BROWSER_COOKIE: &str = "__Host-zc_browser";
+/// Name stem of the browser markers on an HTTPS dashboard served at the
+/// root path.
+pub(crate) const HOST_BROWSER_COOKIE_STEM: &str = "__Host-zc_browser_";
 
-/// Browser marker everywhere `__Host-` cannot apply. A random value that
-/// tells this browser's sessions apart from other browsers' and authorizes
-/// nothing: a sign-in that succeeds ends the other sessions carrying the same
-/// marker, and sign-out ends all of them.
-pub(crate) const BROWSER_COOKIE: &str = "zc_browser";
+/// Name stem of the browser markers everywhere `__Host-` cannot apply. A
+/// marker is a random value that tells this browser's sessions apart from
+/// other browsers' and authorizes nothing: a sign-in that succeeds ends the
+/// other sessions sharing a marker with it, and sign-out ends all of them.
+/// Each marker has a name of its own, so a start's answer that lands late
+/// adds a marker rather than replacing one an earlier session recorded.
+pub(crate) const BROWSER_COOKIE_STEM: &str = "zc_browser_";
+
+/// Browser markers read from one request, in the order the browser sends
+/// them, oldest first. Only a start that leaves while the browser holds none
+/// adds one, so a browser holds more than one only after starting several
+/// sign-ins at once.
+pub(crate) const MAX_BROWSER_MARKERS: usize = 8;
 
 /// Name stem of the short-lived cookie that binds a dashboard sign-in to
 /// the browser that started it, so a callback someone else started cannot
@@ -156,10 +165,10 @@ struct Session {
     /// Cancelled on sign-out, expiry or revocation, so long-lived sockets
     /// the session opened can close.
     ended: CancellationToken,
-    /// The browser marker the sign-in's callback carried, as the store keys
-    /// it. Never a credential: it only lets that browser's next sign-in, or
-    /// its sign-out, end this session.
-    browser: Option<[u8; 32]>,
+    /// The browser markers the sign-in's callback carried, as the store keys
+    /// them. Never a credential: they only let that browser's next sign-in,
+    /// or its sign-out, end this session.
+    browser: Vec<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Session {
@@ -197,7 +206,7 @@ struct NewSession {
     authority: Weak<RpcInboundAuth>,
     display_name: String,
     lifetime_secs: u64,
-    browser: Option<[u8; 32]>,
+    browser: Vec<[u8; 32]>,
 }
 
 /// How long the store remembers that a session expired, so a browser
@@ -299,7 +308,7 @@ impl DashboardSessions {
 
     /// Store a verified sign-in and return the cookie value that names it.
     ///
-    /// The sessions its browser marker already names end first, under the
+    /// The sessions that share a browser marker with it end first, under the
     /// same lock, so of two sign-ins one browser finishes at once the later
     /// one stands. A principal at its own cap gives up its oldest session.
     /// Nobody else's session is ever evicted: at the global cap the sign-in
@@ -317,9 +326,7 @@ impl DashboardSessions {
         } = new;
         let mut sessions = self.sessions.lock();
         self.sweep(&mut sessions, now);
-        if let Some(browser) = &browser {
-            Self::end_marked(&mut sessions, browser);
-        }
+        Self::end_marked(&mut sessions, &browser);
         let principal = auth.principal.id.clone();
         let mut own: Vec<([u8; 32], u64)> = sessions
             .iter()
@@ -390,11 +397,14 @@ impl DashboardSessions {
         });
     }
 
-    /// End every session the browser marker `browser` names.
-    fn end_marked(sessions: &mut HashMap<[u8; 32], Session>, browser: &[u8; 32]) -> usize {
+    /// End every session that shares a browser marker with `browser`.
+    fn end_marked(sessions: &mut HashMap<[u8; 32], Session>, browser: &[[u8; 32]]) -> usize {
         let before = sessions.len();
         sessions.retain(|_, session| {
-            let kept = session.browser.as_ref() != Some(browser);
+            let kept = !session
+                .browser
+                .iter()
+                .any(|marker| browser.contains(marker));
             if !kept {
                 session.ended.cancel();
             }
@@ -733,7 +743,7 @@ impl DashboardAuth {
         access_token: String,
         lifetime_secs: u64,
     ) -> Result<(String, Arc<SessionAuth>), SignInRefusal> {
-        self.sign_in_browser(alias, provider, access_token, lifetime_secs, None)
+        self.sign_in_browser(alias, provider, access_token, lifetime_secs, Vec::new())
             .await
     }
 
@@ -741,15 +751,15 @@ impl DashboardAuth {
     /// session. The token is verified by the configured provider exactly as
     /// RPC verifies a bearer; the resolved principal must be a human.
     /// `provider` is the alias's issuer and client as configured now, which
-    /// the session is pinned to. `browser` is the browser marker the callback
-    /// carried: the sessions it already names end as this one is stored.
+    /// the session is pinned to. `browser` holds the browser markers the
+    /// callback carried: the sessions sharing one end as this one is stored.
     pub(crate) async fn sign_in_browser(
         &self,
         alias: &str,
         provider: ProviderPin,
         access_token: String,
         lifetime_secs: u64,
-        browser: Option<[u8; 32]>,
+        browser: Vec<[u8; 32]>,
     ) -> Result<(String, Arc<SessionAuth>), SignInRefusal> {
         // Wiped on every path out, a refused sign-in included.
         let access_token = Zeroizing::new(access_token);
@@ -966,8 +976,9 @@ impl DashboardAuth {
         self.sessions.remove_key(key)
     }
 
-    /// End every session the browser marker `browser` names (sign-out).
-    pub(crate) fn end_browser(&self, browser: &[u8; 32]) -> usize {
+    /// End every session that shares a browser marker with `browser`
+    /// (sign-out).
+    pub(crate) fn end_browser(&self, browser: &[[u8; 32]]) -> usize {
         DashboardSessions::end_marked(&mut self.sessions.sessions.lock(), browser)
     }
 }
@@ -1028,26 +1039,49 @@ impl CookieScope<'_> {
         cookie_value(headers, self.session_name())
     }
 
-    fn browser_name(&self) -> &'static str {
+    fn browser_stem(&self) -> &'static str {
         if self.host_prefixed() {
-            HOST_BROWSER_COOKIE
+            HOST_BROWSER_COOKIE_STEM
         } else {
-            BROWSER_COOKIE
+            BROWSER_COOKIE_STEM
         }
     }
 
-    /// The browser marker the request carries, as the store keys it.
-    pub(crate) fn browser_key(&self, headers: &HeaderMap) -> Option<[u8; 32]> {
-        cookie_value(headers, self.browser_name()).map(|value| session_key(&value))
+    /// The browser markers the request carries, as the store keys them: at
+    /// most [`MAX_BROWSER_MARKERS`], in the order the browser sent them.
+    pub(crate) fn browser_keys(&self, headers: &HeaderMap) -> Vec<[u8; 32]> {
+        let stem = self.browser_stem();
+        let mut keys = Vec::new();
+        let markers = headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(';'))
+            .filter_map(|pair| pair.trim().split_once('='))
+            .filter(|(name, _)| name.strip_prefix(stem).is_some_and(|tag| !tag.is_empty()))
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty());
+        for value in markers {
+            let key = session_key(value);
+            if !keys.contains(&key) {
+                keys.push(key);
+                if keys.len() == MAX_BROWSER_MARKERS {
+                    break;
+                }
+            }
+        }
+        keys
     }
 
-    /// `Set-Cookie` for a new browser marker. `Lax`, so the callback, a
-    /// navigation from the identity provider's site, carries it; no
-    /// `Max-Age`, like the session cookie.
+    /// `Set-Cookie` for a new browser marker, under a name of its own so it
+    /// never replaces a marker the browser already holds. `Lax`, so the
+    /// callback, a navigation from the identity provider's site, carries it;
+    /// no `Max-Age`, like the session cookie.
     pub(crate) fn browser_cookie(&self, value: &str) -> HeaderValue {
+        let tag = hex::encode(rand::random::<[u8; 8]>());
         let header = format!(
-            "{}={value}; Path={}/; HttpOnly; SameSite=Lax{}",
-            self.browser_name(),
+            "{}{tag}={value}; Path={}/; HttpOnly; SameSite=Lax{}",
+            self.browser_stem(),
             self.path_prefix,
             self.secure()
         );
@@ -2682,7 +2716,7 @@ mod tests {
             authority: inbound.authority_ref(),
             display_name: "alice".into(),
             lifetime_secs: lifetime,
-            browser: None,
+            browser: Vec::new(),
         }
     }
 
@@ -3327,6 +3361,15 @@ mod tests {
                 .map(|(_, value, _, _)| value.clone())
         }
 
+        /// The browser markers the jar holds, as `(name, value)`, oldest first.
+        fn markers(&self) -> Vec<(String, String)> {
+            self.0
+                .iter()
+                .filter(|(name, _, _, _)| name.starts_with(BROWSER_COOKIE_STEM))
+                .map(|(name, value, _, _)| (name.clone(), value.clone()))
+                .collect()
+        }
+
         /// Put `value` back under `name`, as a late-arriving older answer would.
         fn set(&mut self, name: &str, value: &str) {
             for cookie in self.0.iter_mut().filter(|(n, _, _, _)| n == name) {
@@ -3374,6 +3417,28 @@ mod tests {
         .await;
         jar.take(&response);
         started_from(jar, &response)
+    }
+
+    /// Send a start from the browser behind `jar` and hold its answer: the
+    /// request carries what the jar holds now, and nothing the answer sets
+    /// lands until [`start_answer`].
+    async fn start_request(fixture: &Fixture, jar: &Jar) -> Response {
+        let cookie = jar.header("/auth/sign-in/corp", false);
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if !cookie.is_empty() {
+            headers.push(("cookie", cookie.as_str()));
+        }
+        send(
+            &fixture.router,
+            request("GET", "/auth/sign-in/corp", loopback(), &headers),
+        )
+        .await
+    }
+
+    /// A start's held answer lands in the browser behind `jar`.
+    fn start_answer(jar: &mut Jar, response: &Response) -> Started {
+        jar.take(response);
+        started_from(jar, response)
     }
 
     fn started_from(jar: &Jar, response: &Response) -> Started {
@@ -3532,22 +3597,25 @@ mod tests {
     }
 
     /// Two starts that race, each leaving before the other's answer arrives:
-    /// each carries no browser marker and each answer sets one, and the browser
-    /// keeps the last. Both callbacks then carry that one marker.
+    /// each carries no browser marker and each answer sets one under a name of
+    /// its own, so the browser keeps both. Both callbacks then carry both.
     #[tokio::test]
     async fn two_racing_starts_still_tie_both_sessions_to_one_browser() {
         let server = idp(&["admins"], "gw").await;
         let fixture = fixture(sign_in_config(&server.uri()));
         let mut browser = Jar::default();
         let a = start_in(&fixture, &mut browser).await;
-        let marker_a = browser
-            .value("zc_browser")
-            .expect("the start sets a browser marker");
+        assert_eq!(
+            browser.markers().len(),
+            1,
+            "the start sets a browser marker"
+        );
         let b = start_racing(&fixture, &mut browser).await;
-        let marker_b = browser
-            .value("zc_browser")
-            .expect("the start sets a browser marker");
-        assert_ne!(marker_a, marker_b, "each racing start set its own marker");
+        assert_eq!(
+            browser.markers().len(),
+            2,
+            "each racing start sets its own marker, and neither replaces the other"
+        );
         mount_token_for(&server, &a, "code-a", "at-alice").await;
         mount_token_for(&server, &b, "code-b", "at-alice").await;
         let response = finish_in(&fixture, &mut browser, &a, "code-a").await;
@@ -3556,7 +3624,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert!(
             first.ended.is_cancelled(),
-            "both sessions belong to the browser that kept the last marker"
+            "both sessions belong to the browser that kept both markers"
         );
     }
 
@@ -3571,14 +3639,15 @@ mod tests {
         mount_token_for(&server, &started, "code-a", "at-alice").await;
         let response = finish_in(&fixture, &mut browser, &started, "code-a").await;
         let signed_in = cookie_from(&response, SESSION_COOKIE).unwrap();
-        let marker = browser
-            .value("zc_browser")
+        let (name, marker) = browser
+            .markers()
+            .pop()
             .expect("the start sets a browser marker");
 
-        let (status, body) = probe(&fixture, &[("cookie", &format!("zc_browser={marker}"))]).await;
+        let (status, body) = probe(&fixture, &[("cookie", &format!("{name}={marker}"))]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(body.get("reason").is_none(), "the pairing denial: {body}");
-        let forged = format!("zc_browser={marker}; {SESSION_COOKIE}=forged");
+        let forged = format!("{name}={marker}; {SESSION_COOKIE}=forged");
         let (status, body) = probe(&fixture, &[("cookie", &forged)]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["reason"], "session_invalid");
@@ -3588,6 +3657,50 @@ mod tests {
                 .0,
             StatusCode::OK
         );
+    }
+
+    /// A request is read for at most eight browser markers, in the order it
+    /// sends them. A name that is only the stem or an empty value is no
+    /// marker, a value under two names counts once, and under `__Host-` only
+    /// `__Host-` names count.
+    #[test]
+    fn browser_markers_are_read_in_order_up_to_the_cap() {
+        let values: Vec<String> = (0..10).map(|i| format!("marker-{i}")).collect();
+        let mut pairs: Vec<String> = vec![
+            "zc_browser=old".into(),
+            "zc_browser_=stem-only".into(),
+            "zc_browser_e0=".into(),
+            format!("{SESSION_COOKIE}=session"),
+        ];
+        pairs.push(format!("zc_browser_r0={}", values[0]));
+        for (i, value) in values.iter().enumerate() {
+            pairs.push(format!("zc_browser_{i:02}={value}"));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, pairs.join("; ").parse().unwrap());
+        let plain = CookieScope {
+            https: false,
+            path_prefix: "",
+        };
+        let expected: Vec<[u8; 32]> = values
+            .iter()
+            .take(MAX_BROWSER_MARKERS)
+            .map(|value| session_key(value))
+            .collect();
+        assert_eq!(plain.browser_keys(&headers), expected);
+
+        let host = CookieScope {
+            https: true,
+            path_prefix: "",
+        };
+        assert!(host.browser_keys(&headers).is_empty());
+        headers.insert(
+            header::COOKIE,
+            "__Host-zc_browser_aa=one; zc_browser_bb=two"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(host.browser_keys(&headers), vec![session_key("one")]);
     }
 
     /// Sign-out ends every session the browser's marker names, also one the
@@ -3656,6 +3769,254 @@ mod tests {
             "sign-out with an ended session's cookie must still end the marked session"
         );
         assert_eq!(fixture.auth.sessions.len(), 0);
+    }
+
+    /// Two starts leave before either answer arrives. A's answer lands, A
+    /// finishes and a socket opens on its session; only then does B's delayed
+    /// answer land, with a marker of its own. B finishes through a provider on
+    /// another site, so its callback carries B's binding cookie and the
+    /// browser's markers but not the `SameSite=Strict` session cookie. Signing
+    /// out must still leave nothing of that browser signed in, and another
+    /// browser's session stays.
+    #[tokio::test]
+    async fn a_delayed_start_answer_still_leaves_nothing_after_sign_out() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let mut other = Jar::default();
+        let elsewhere = start_in(&fixture, &mut other).await;
+        mount_token_for(&server, &elsewhere, "code-other", "at-alice").await;
+        let response = finish_in(&fixture, &mut other, &elsewhere, "code-other").await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let other_session = cookie_from(&response, SESSION_COOKIE).expect("another browser");
+
+        let mut browser = Jar::default();
+        let answer_a = start_request(&fixture, &browser).await;
+        let answer_b = start_request(&fixture, &browser).await;
+        let a = start_answer(&mut browser, &answer_a);
+        mount_token_for(&server, &a, "code-a", "at-alice").await;
+        let response = finish_in(&fixture, &mut browser, &a, "code-a").await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let s1 = cookie_from(&response, SESSION_COOKIE).expect("A's session");
+        let first = session_for(&fixture, &s1).await;
+        let mut watch = Some(SessionWatch::new(
+            Arc::clone(&fixture.auth),
+            Arc::clone(&first),
+            true,
+            &fixture.state,
+        ));
+
+        let b = start_answer(&mut browser, &answer_b);
+        mount_token_for(&server, &b, "code-b", "at-alice").await;
+        let response = finish_in(&fixture, &mut browser, &b, "code-b").await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let s2 = cookie_from(&response, SESSION_COOKIE).expect("B's session");
+        let csrf = session_for(&fixture, &s2).await.csrf.clone();
+        let response = browse(
+            &fixture,
+            &mut browser,
+            "POST",
+            "/auth/sign-out",
+            false,
+            &[("origin", OWN_ORIGIN), (CSRF_HEADER, &csrf)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(
+            first.ended.is_cancelled(),
+            "a delayed start answer must not let the first session outlive sign-out"
+        );
+        let code = tokio::time::timeout(
+            Duration::from_secs(5),
+            session_lost(&mut watch, &fixture.state),
+        )
+        .await
+        .expect("the first session's socket closes");
+        assert_eq!(code, WS_CLOSE_SESSION_ENDED);
+        let (status, body) = probe(&fixture, &[("cookie", &cookie_for(&s1))]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["reason"], "session_invalid");
+        assert_eq!(
+            probe(&fixture, &[("cookie", &cookie_for(&other_session))])
+                .await
+                .0,
+            StatusCode::OK,
+            "another browser stays signed in"
+        );
+        assert_eq!(fixture.auth.sessions.len(), 1);
+    }
+
+    /// The same delayed answer, with B refused: A's session stays.
+    #[tokio::test]
+    async fn a_refused_sign_in_whose_start_answer_landed_late_keeps_the_session() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let mut browser = Jar::default();
+        let answer_a = start_request(&fixture, &browser).await;
+        let answer_b = start_request(&fixture, &browser).await;
+        let a = start_answer(&mut browser, &answer_a);
+        mount_token_for(&server, &a, "code-a", "at-alice").await;
+        let response = finish_in(&fixture, &mut browser, &a, "code-a").await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let s1 = cookie_from(&response, SESSION_COOKIE).expect("A's session");
+        let first = session_for(&fixture, &s1).await;
+
+        let b = start_answer(&mut browser, &answer_b);
+        mount_identity(&server, "at-nobody", "nobody", &["nobody"]).await;
+        mount_token_for(&server, &b, "code-b", "at-nobody").await;
+        let response = finish_in(&fixture, &mut browser, &b, "code-b").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !first.ended.is_cancelled(),
+            "a refused sign-in keeps the session its browser holds"
+        );
+        assert_eq!(
+            probe(&fixture, &[("cookie", &cookie_for(&s1))]).await.0,
+            StatusCode::OK
+        );
+    }
+
+    /// Every order in which two sign-ins' steps can reach one browser. Each
+    /// sign-in's start leaves, its answer lands and its callback comes back,
+    /// in that order, and the two sign-ins interleave in all twenty ways. The
+    /// browser then signs out holding either session's cookie, as callback
+    /// answers landing in either order can leave it. In every case the later
+    /// sign-in ends the earlier one's session, sign-out ends both, and another
+    /// browser stays signed in.
+    #[tokio::test]
+    async fn every_order_of_two_sign_ins_in_one_browser_leaves_nothing_after_sign_out() {
+        let server = idp(&["admins"], "gw").await;
+        // Which sign-in takes its next step: its start leaving, its answer
+        // landing, then its callback.
+        let orders: Vec<[usize; 6]> = (0u32..64)
+            .filter(|bits| bits.count_ones() == 3)
+            .map(|bits| std::array::from_fn(|step| ((bits >> step) & 1) as usize))
+            .collect();
+        let mut failures = Vec::new();
+        let mut cases = 0;
+        for order in &orders {
+            for signs_out in 0..2 {
+                cases += 1;
+                if let Err(failure) = two_sign_ins_in_order(&server, cases, order, signs_out).await
+                {
+                    let steps: String = order.iter().map(|&flow| ['A', 'B'][flow]).collect();
+                    failures.push(format!(
+                        "{steps}, signing out with {}'s cookie: {failure}",
+                        ['A', 'B'][signs_out]
+                    ));
+                }
+            }
+        }
+        assert_eq!(cases, 40);
+        assert!(
+            failures.is_empty(),
+            "{} of {cases} orders failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// One case of the test above: sign-ins 0 and 1 take their steps in
+    /// `order`, then the browser signs out holding the cookie of sign-in
+    /// `signs_out`.
+    async fn two_sign_ins_in_order(
+        server: &MockServer,
+        case: usize,
+        order: &[usize; 6],
+        signs_out: usize,
+    ) -> Result<(), String> {
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let mut other = Jar::default();
+        let elsewhere = start_in(&fixture, &mut other).await;
+        let code = format!("code-{case}-other");
+        mount_token_for(server, &elsewhere, &code, "at-alice").await;
+        let response = finish_in(&fixture, &mut other, &elsewhere, &code).await;
+        let other_session =
+            cookie_from(&response, SESSION_COOKIE).ok_or("another browser did not sign in")?;
+
+        let mut browser = Jar::default();
+        let mut answers: [Option<Response>; 2] = [None, None];
+        let mut started: [Option<Started>; 2] = [None, None];
+        let mut steps = [0usize; 2];
+        // The sessions in the order their callbacks stored them.
+        let mut stored: Vec<(usize, String, Arc<SessionAuth>)> = Vec::new();
+        for &flow in order {
+            match steps[flow] {
+                0 => answers[flow] = Some(start_request(&fixture, &browser).await),
+                1 => {
+                    let answer = answers[flow].take().expect("the start left");
+                    started[flow] = Some(start_answer(&mut browser, &answer));
+                }
+                _ => {
+                    let flow_started = started[flow].as_ref().expect("the answer landed");
+                    let code = format!("code-{case}-{flow}");
+                    mount_token_for(server, flow_started, &code, "at-alice").await;
+                    let response = finish_in(&fixture, &mut browser, flow_started, &code).await;
+                    if response.status() != StatusCode::SEE_OTHER {
+                        return Err(format!("sign-in {flow} answered {}", response.status()));
+                    }
+                    let cookie =
+                        cookie_from(&response, SESSION_COOKIE).ok_or("a sign-in set no session")?;
+                    let session = session_for(&fixture, &cookie).await;
+                    stored.push((flow, cookie, session));
+                }
+            }
+            steps[flow] += 1;
+        }
+        if !stored[0].2.ended.is_cancelled() {
+            return Err("the later sign-in left the earlier one's session".into());
+        }
+        if stored[1].2.ended.is_cancelled() {
+            return Err("the later sign-in's own session ended".into());
+        }
+
+        let (_, cookie, session) = stored
+            .iter()
+            .find(|(flow, _, _)| *flow == signs_out)
+            .expect("both sign-ins finished");
+        browser.set(SESSION_COOKIE, cookie);
+        let live = !session.ended.is_cancelled();
+        let mut headers = vec![("origin", OWN_ORIGIN)];
+        if live {
+            headers.push((CSRF_HEADER, session.csrf.as_str()));
+        }
+        let response = browse(
+            &fixture,
+            &mut browser,
+            "POST",
+            "/auth/sign-out",
+            false,
+            &headers,
+        )
+        .await;
+        let expected = if live {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        if response.status() != expected {
+            return Err(format!("sign-out answered {}", response.status()));
+        }
+        if stored
+            .iter()
+            .any(|(_, _, session)| !session.ended.is_cancelled())
+        {
+            return Err("a session outlived sign-out".into());
+        }
+        if probe(&fixture, &[("cookie", &cookie_for(&other_session))])
+            .await
+            .0
+            != StatusCode::OK
+        {
+            return Err("another browser was signed out".into());
+        }
+        if fixture.auth.sessions.len() != 1 {
+            return Err(format!(
+                "{} sessions left; only another browser's should be",
+                fixture.auth.sessions.len()
+            ));
+        }
+        Ok(())
     }
 
     // ── Ends that land while a request is under way ──────────────────

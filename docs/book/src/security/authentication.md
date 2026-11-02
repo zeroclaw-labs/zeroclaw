@@ -605,11 +605,13 @@ check it fails) or loses the access a page needs, that page's sockets and
 event streams close at once. Signing in again in the same browser ends
 the session it held before, whichever account that was, so a later
 sign-out leaves nothing of that browser signed in. That holds when two
-tabs sign in at once too: a browser marker cookie (`zc_browser`, or
-`__Host-zc_browser` over HTTPS at the root; random, `HttpOnly`,
-`SameSite=Lax`, and never a credential) ties the browser's sessions
-together, the sign-in that finishes later ends the other, and sign-out
-ends every session the marker names. A request admitted
+tabs sign in at once too: browser marker cookies (`zc_browser_<tag>`, or
+`__Host-zc_browser_<tag>` over HTTPS at the root; random, `HttpOnly`,
+`SameSite=Lax`, and never a credential) tie the browser's sessions
+together. Each marker has a name of its own, so a sign-in whose start
+is answered late adds a marker rather than replacing one. The sign-in
+that finishes later ends the other, and sign-out ends every session
+that shares a marker with the browser. A request admitted
 before its session ended that has not yet taken effect, such as a
 configuration change whose body is still arriving, is refused. A chat
 turn already running finishes unattended, as when a viewer leaves, and a

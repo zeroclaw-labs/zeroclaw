@@ -947,9 +947,11 @@ async fn handle_dashboard_sign_in(
         header::SET_COOKIE,
         scope.binding_cookie(&flow_state, &binding, FLOW_TTL.as_secs()),
     );
-    // A browser without a marker gets one. Two starts that race each give
-    // one; the browser keeps the last, and both callbacks carry that one.
-    if scope.browser_key(&headers).is_none() {
+    // A browser without a marker gets one, under a name of its own. Two
+    // starts that race each give one and the browser keeps both, also when
+    // one answer lands after the other sign-in has finished, so every later
+    // callback still carries the first marker this browser was given.
+    if scope.browser_keys(&headers).is_empty() {
         response.headers_mut().append(
             header::SET_COOKIE,
             scope.browser_cookie(&dashboard_session::random_token()),
@@ -1061,12 +1063,10 @@ async fn handle_sign_out(
     let (Some(Extension(dashboard)), Some(Extension(caller))) = (dashboard, caller) else {
         return dashboard_session::rejection_response(SessionRejection::Invalid);
     };
-    // Every session this browser's marker names ends too: one that an
-    // overlapping sign-in left behind holds no cookie this request carries.
+    // Every session that shares a marker with this browser ends too: one that
+    // an overlapping sign-in left behind holds no cookie this request carries.
     let end_browser = || {
-        if let Some(browser) = scope.browser_key(&headers) {
-            dashboard.end_browser(&browser);
-        }
+        dashboard.end_browser(&scope.browser_keys(&headers));
     };
     let session = match caller {
         DashboardCaller::Session(session) => session,
@@ -1441,8 +1441,8 @@ async fn finish_dashboard_sign_in(
         path_prefix: &state.path_prefix,
     };
     // The callback is a navigation from the identity provider's site, so the
-    // `SameSite=Lax` browser marker comes with it. Sessions it already names,
-    // from another tab's sign-in that overlapped this one, end as this one is
+    // `SameSite=Lax` browser markers come with it. Sessions sharing one, from
+    // another tab's sign-in that overlapped this one, end as this one is
     // stored.
     match dashboard
         .sign_in_browser(
@@ -1450,7 +1450,7 @@ async fn finish_dashboard_sign_in(
             provider,
             access_token,
             lifetime_secs,
-            scope.browser_key(headers),
+            scope.browser_keys(headers),
         )
         .await
     {
