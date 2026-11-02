@@ -136,10 +136,20 @@ impl SubAgentSpawn {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
     use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
 
-    fn config_with_agent(alias: &str) -> Config {
-        let mut config = Config::default();
+    /// `SecurityPolicy::for_agent` creates the agent's workspace under the
+    /// config's install root, so the config is rooted in a temp dir rather
+    /// than the real `$HOME/.zeroclaw`. Keep the returned `TempDir` alive
+    /// for the duration of the test.
+    fn config_with_agent(alias: &str) -> (TempDir, Config) {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
         config
             .risk_profiles
             .insert("default".to_string(), RiskProfileConfig::default());
@@ -150,12 +160,12 @@ mod tests {
                 ..AliasedAgentConfig::default()
             },
         );
-        config
+        (tmp, config)
     }
 
     #[test]
     fn for_agent_resolves_parent_identity_from_config() {
-        let config = config_with_agent("alpha");
+        let (_tmp, config) = config_with_agent("alpha");
         let ctx = SubAgentSpawn::for_agent(&config, "alpha")
             .expect("for_agent must succeed for a configured agent")
             .build(SubAgentOverrides::default())
@@ -179,7 +189,7 @@ mod tests {
 
     #[test]
     fn build_inherits_verbatim_when_overrides_are_default() {
-        let config = config_with_agent("alpha");
+        let (_tmp, config) = config_with_agent("alpha");
         let spawn = SubAgentSpawn::for_agent(&config, "alpha").unwrap();
         let parent_policy = spawn.parent_policy.clone();
         let parent_allowlist = spawn.parent_allowed_agent_aliases.clone();
@@ -191,7 +201,7 @@ mod tests {
 
     #[test]
     fn build_rejects_policy_override_that_escalates_paths() {
-        let config = config_with_agent("alpha");
+        let (_tmp, config) = config_with_agent("alpha");
         let spawn = SubAgentSpawn::for_agent(&config, "alpha").unwrap();
 
         let mut child_policy = (*spawn.parent_policy).clone();
@@ -212,7 +222,7 @@ mod tests {
 
     #[test]
     fn build_rejects_allowlist_override_with_alias_not_on_parent() {
-        let config = config_with_agent("alpha");
+        let (_tmp, config) = config_with_agent("alpha");
         let spawn = SubAgentSpawn::for_agent(&config, "alpha").unwrap();
 
         let mut rogue = HashSet::new();
@@ -232,7 +242,7 @@ mod tests {
 
     #[test]
     fn build_accepts_narrowed_allowlist_subset() {
-        let config = config_with_agent("alpha");
+        let (_tmp, config) = config_with_agent("alpha");
         let spawn = SubAgentSpawn::for_agent(&config, "alpha").unwrap();
 
         // Empty subset is still allowed; the bound parent alias is added back.
@@ -252,7 +262,7 @@ mod tests {
         // so spawning children cannot bypass `max_actions_per_hour`.
         // The override path (caller-supplied policy) is the one with
         // the bug; the inherit-verbatim path is correct by Arc reuse.
-        let config = config_with_agent("alpha");
+        let (_tmp, config) = config_with_agent("alpha");
         let spawn = SubAgentSpawn::for_agent(&config, "alpha").unwrap();
         let parent_policy = spawn.parent_policy.clone();
 
@@ -287,7 +297,7 @@ mod tests {
 
     #[test]
     fn for_agent_with_policy_preserves_session_workspace_dir() {
-        let config = config_with_agent("alpha");
+        let (_tmp, config) = config_with_agent("alpha");
 
         // The session cwd is some directory that is NOT
         // `config.agent_workspace_dir("alpha")`. Pick an absolute path
@@ -324,7 +334,7 @@ mod tests {
 
     #[test]
     fn for_agent_uses_config_workspace_dir() {
-        let config = config_with_agent("alpha");
+        let (_tmp, config) = config_with_agent("alpha");
         let ctx = SubAgentSpawn::for_agent(&config, "alpha")
             .unwrap()
             .build(SubAgentOverrides::default())
