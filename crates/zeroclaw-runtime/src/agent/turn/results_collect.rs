@@ -274,6 +274,7 @@ mod tests {
             } else {
                 Some(output.to_string())
             },
+            terminal_error: None,
             duration: Duration::from_millis(1),
             receipt: None,
             output_data: None,

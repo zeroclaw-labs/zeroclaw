@@ -60,6 +60,7 @@ struct Node {
     composite: bool,
     suppressed: bool,
     finalized: bool,
+    string_usage_eligible: bool,
     outcome: Option<AttemptUsageOutcome>,
 }
 
@@ -67,6 +68,7 @@ struct Node {
 struct CollectorState {
     closed: bool,
     logical_success: bool,
+    capture_string_usage: bool,
     nodes: Vec<Node>,
 }
 
@@ -76,6 +78,12 @@ pub(crate) struct CallAccountingCollector {
 }
 
 impl CallAccountingCollector {
+    pub(crate) fn with_string_usage() -> Self {
+        let collector = Self::default();
+        collector.state.lock().capture_string_usage = true;
+        collector
+    }
+
     pub(crate) async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
         ACTIVE_COLLECTOR
             .scope(
@@ -185,6 +193,19 @@ impl AttemptState {
 }
 
 impl AttemptLease {
+    /// Only a String dispatch poll may opt its own node into observation.
+    pub(crate) fn enable_string_usage(&self) {
+        let mut state = self.collector.lock();
+        if state.closed || !state.capture_string_usage {
+            return;
+        }
+        if let Some(node) = state.nodes.get_mut(self.node.0)
+            && !node.finalized
+        {
+            node.string_usage_eligible = true;
+        }
+    }
+
     pub(crate) fn begin(provider_ref: String, model: String) -> Option<Self> {
         ACTIVE_COLLECTOR
             .try_with(|collector| {
@@ -222,6 +243,7 @@ impl AttemptLease {
                     composite: false,
                     suppressed: false,
                     finalized: false,
+                    string_usage_eligible: false,
                     outcome: None,
                 });
                 if let Some(parent) = parent {
@@ -254,13 +276,15 @@ impl AttemptLease {
         }
     }
 
-    pub(crate) fn finish_missing_response(&self) {
+    pub(crate) fn finish_string_response(&self) {
         let mut state = self.collector.lock();
         if state.closed {
             return;
         }
         if let Some(node) = state.nodes.get_mut(self.node.0) {
-            node.outcome = Some(AttemptUsageOutcome::Missing);
+            if !node.string_usage_eligible || node.outcome.is_none() {
+                node.outcome = Some(AttemptUsageOutcome::Missing);
+            }
             node.finalized = true;
         }
     }
@@ -332,6 +356,104 @@ impl AttemptLease {
         {
             node.outcome = Some(outcome);
         }
+    }
+}
+
+/// Record an observation only on the currently polled eligible physical leaf.
+fn observe_string_outcome(outcome: AttemptUsageOutcome) {
+    let _ = ACTIVE_COLLECTOR.try_with(|collector| {
+        let key = collector_key(collector);
+        let node = POLL_STACK
+            .try_with(|stack| {
+                stack
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find_map(|(stack_key, node)| (*stack_key == key).then_some(*node))
+            })
+            .ok()
+            .flatten();
+        let Some(node) = node else { return };
+        let mut state = collector.lock();
+        if state.closed {
+            return;
+        }
+        if let Some(node) = state.nodes.get_mut(node.0)
+            && node.string_usage_eligible
+            && !node.composite
+            && !node.suppressed
+            && !node.finalized
+        {
+            node.outcome = Some(outcome);
+        }
+    });
+}
+
+pub(crate) fn observe_string_usage(usage: Option<TokenUsage>) {
+    if usage.is_some() {
+        observe_string_outcome(classify_usage(usage));
+    }
+}
+
+pub(crate) fn observe_malformed_string_usage(observed: TokenUsage) {
+    observe_string_outcome(AttemptUsageOutcome::Invalid {
+        observed,
+        reason: InvalidUsageReason::MalformedUsage,
+    });
+}
+
+/// Decode the three legacy OpenAI-style String usage objects independently so
+/// a bad optional field cannot break text parsing or erase valid dimensions.
+pub(crate) fn observe_raw_string_usage(raw: Option<&serde_json::Value>, cached: bool) {
+    let Some(raw) = raw.filter(|value| !value.is_null()) else {
+        return;
+    };
+    fn number(value: Option<&serde_json::Value>, malformed: &mut bool) -> Option<u64> {
+        match value {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(n) => Some(n),
+                None => {
+                    *malformed = true;
+                    None
+                }
+            },
+        }
+    }
+    let mut malformed = false;
+    let object = raw.as_object();
+    let input = number(object.and_then(|o| o.get("prompt_tokens")), &mut malformed);
+    let output = number(
+        object.and_then(|o| o.get("completion_tokens")),
+        &mut malformed,
+    );
+    let cache = if cached {
+        match object.and_then(|o| o.get("prompt_tokens_details")) {
+            None => None,
+            Some(serde_json::Value::Object(details)) => {
+                number(details.get("cached_tokens"), &mut malformed)
+            }
+            Some(_) => {
+                malformed = true;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if object.is_none() {
+        malformed = true;
+    }
+    let usage = TokenUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: cache,
+        cache_creation_input_tokens: None,
+    };
+    if malformed {
+        observe_malformed_string_usage(usage);
+    } else {
+        observe_string_usage(Some(usage));
     }
 }
 
@@ -599,6 +721,219 @@ fn classify_usage(usage: Option<TokenUsage>) -> AttemptUsageOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn string_test_usage() -> TokenUsage {
+        TokenUsage {
+            input_tokens: Some(8),
+            output_tokens: Some(3),
+            cached_input_tokens: Some(1),
+            cache_creation_input_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn string_observation_is_opt_in_and_uses_current_leaf() {
+        for enabled in [false, true] {
+            let collector = if enabled {
+                CallAccountingCollector::with_string_usage()
+            } else {
+                CallAccountingCollector::default()
+            };
+            collector
+                .scope(async {
+                    let lease = AttemptLease::begin("p".into(), "m".into()).unwrap();
+                    lease.enable_string_usage();
+                    lease.poll_scope(|| observe_string_usage(Some(string_test_usage())));
+                    lease.finish_string_response();
+                })
+                .await;
+            let (attempts, _) = collector.close();
+            if enabled {
+                assert!(
+                    matches!(attempts[0].outcome(), AttemptUsageOutcome::Complete(usage) if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+                );
+            } else {
+                assert!(matches!(
+                    attempts[0].outcome(),
+                    AttemptUsageOutcome::Missing
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn string_invalid_unknown_drop_and_late_observation() {
+        let collector = CallAccountingCollector::with_string_usage();
+        collector
+            .scope(async {
+                let invalid = AttemptLease::begin("p".into(), "invalid".into()).unwrap();
+                invalid.enable_string_usage();
+                invalid.poll_scope(|| observe_malformed_string_usage(string_test_usage()));
+                invalid.finish_string_response();
+                invalid.poll_scope(|| observe_string_usage(Some(string_test_usage())));
+                let failed = AttemptLease::begin("p".into(), "failed".into()).unwrap();
+                failed.enable_string_usage();
+                failed.poll_scope(|| observe_string_usage(Some(string_test_usage())));
+                failed.finish_error_with_usage(None);
+                let dropped = AttemptLease::begin("p".into(), "dropped".into()).unwrap();
+                dropped.enable_string_usage();
+                dropped.poll_scope(|| observe_string_usage(Some(string_test_usage())));
+                drop(dropped);
+            })
+            .await;
+        let (attempts, _) = collector.close();
+        assert!(matches!(
+            attempts[0].outcome(),
+            AttemptUsageOutcome::Invalid {
+                reason: InvalidUsageReason::MalformedUsage,
+                ..
+            }
+        ));
+        for attempt in &attempts[1..] {
+            assert!(
+                matches!(attempt.outcome(), AttemptUsageOutcome::OutcomeUnknown { observed: Some(usage) } if usage.input_tokens == Some(8))
+            );
+        }
+        observe_string_usage(Some(string_test_usage()));
+        assert!(collector.close().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn raw_string_usage_preserves_partial_malformed_dimensions() {
+        let collector = CallAccountingCollector::with_string_usage();
+        collector
+            .scope(async {
+                let lease = AttemptLease::begin("p".into(), "m".into()).unwrap();
+                lease.enable_string_usage();
+                lease.poll_scope(|| {
+                    observe_raw_string_usage(
+                        Some(&serde_json::json!({
+                            "prompt_tokens": 8, "completion_tokens": "bad",
+                            "prompt_tokens_details": {"cached_tokens": 2}, "ignored": []
+                        })),
+                        true,
+                    )
+                });
+                lease.finish_string_response();
+            })
+            .await;
+        let (attempts, _) = collector.close();
+        assert!(
+            matches!(attempts[0].outcome(), AttemptUsageOutcome::Invalid {
+            observed, reason: InvalidUsageReason::MalformedUsage
+        } if observed.input_tokens == Some(8) && observed.output_tokens.is_none()
+            && observed.cached_input_tokens == Some(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_string_usage_distinguishes_absent_partial_invalid_and_zero() {
+        let cases = [
+            (None, 0),
+            (Some(serde_json::Value::Null), 0),
+            (Some(serde_json::json!({"prompt_tokens": 8})), 1),
+            (
+                Some(serde_json::json!({"prompt_tokens": -1, "completion_tokens": 3})),
+                2,
+            ),
+            (
+                Some(serde_json::json!({"prompt_tokens": 0, "completion_tokens": 0})),
+                3,
+            ),
+            (
+                Some(
+                    serde_json::json!({"prompt_tokens": 8, "completion_tokens": 3, "prompt_tokens_details": {"cached_tokens": 9}}),
+                ),
+                4,
+            ),
+            (
+                Some(serde_json::json!({"prompt_tokens": u64::MAX, "completion_tokens": 1})),
+                5,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let collector = CallAccountingCollector::with_string_usage();
+            collector
+                .scope(async {
+                    let lease = AttemptLease::begin("p".into(), "m".into()).unwrap();
+                    lease.enable_string_usage();
+                    lease.poll_scope(|| observe_raw_string_usage(raw.as_ref(), true));
+                    lease.finish_string_response();
+                })
+                .await;
+            let (attempts, _) = collector.close();
+            let outcome = attempts[0].outcome();
+            assert!(match expected {
+                0 => matches!(outcome, AttemptUsageOutcome::Missing),
+                1 => matches!(
+                    outcome,
+                    AttemptUsageOutcome::Invalid {
+                        reason: InvalidUsageReason::MissingOutput,
+                        ..
+                    }
+                ),
+                2 =>
+                    matches!(outcome, AttemptUsageOutcome::Invalid { reason: InvalidUsageReason::MalformedUsage, observed } if observed.output_tokens == Some(3)),
+                3 =>
+                    matches!(outcome, AttemptUsageOutcome::Complete(usage) if usage.input_tokens == Some(0) && usage.output_tokens == Some(0)),
+                4 => matches!(
+                    outcome,
+                    AttemptUsageOutcome::Invalid {
+                        reason: InvalidUsageReason::CachedInputExceedsInput,
+                        ..
+                    }
+                ),
+                5 => matches!(
+                    outcome,
+                    AttemptUsageOutcome::Invalid {
+                        reason: InvalidUsageReason::TotalOverflow,
+                        ..
+                    }
+                ),
+                _ => false,
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn string_observer_ignores_composite_suppressed_and_closed_nodes() {
+        let collector = CallAccountingCollector::with_string_usage();
+        collector
+            .scope(async {
+                observe_string_usage(Some(string_test_usage())); // no current poll
+                let structured = AttemptLease::begin("p".into(), "structured".into()).unwrap();
+                structured.poll_scope(|| observe_string_usage(Some(string_test_usage())));
+                structured.finish_string_response();
+                let composite = AttemptLease::begin("p".into(), "composite".into()).unwrap();
+                composite.enable_string_usage();
+                composite.poll_scope(|| {
+                    mark_current_composite();
+                    observe_string_usage(Some(string_test_usage()));
+                });
+                composite.finish_string_response();
+                let suppressed = AttemptLease::begin("p".into(), "suppressed".into()).unwrap();
+                suppressed.enable_string_usage();
+                suppressed.poll_scope(|| {
+                    suppress_current_attempt();
+                    observe_string_usage(Some(string_test_usage()));
+                });
+                let closed = AttemptLease::begin("p".into(), "closed".into()).unwrap();
+                closed.enable_string_usage();
+                let (attempts, _) = collector.close();
+                assert_eq!(attempts.len(), 2);
+                assert!(matches!(
+                    attempts[0].outcome(),
+                    AttemptUsageOutcome::Missing
+                ));
+                assert!(matches!(
+                    attempts[1].outcome(),
+                    AttemptUsageOutcome::OutcomeUnknown { observed: None }
+                ));
+                closed.poll_scope(|| observe_string_usage(Some(string_test_usage())));
+            })
+            .await;
+        assert!(collector.close().0.is_empty());
+    }
 
     #[test]
     fn usage_classification_preserves_missing_zero_and_invalid_distinctions() {

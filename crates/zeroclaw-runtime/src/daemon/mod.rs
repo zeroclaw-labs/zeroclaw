@@ -780,7 +780,7 @@ pub async fn run_with_authority(
     // Construct the TUI registry early so both the gateway (for /api/tuis)
     // and the RPC socket (for tui/list) share the same Arc.
     let tui_registry =
-        std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
+        std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::for_config(&config));
 
     // Canonical live pairing authority for this daemon generation. The
     // gateway serves /pair, rotation, and revocation from THIS instance
@@ -1006,11 +1006,16 @@ pub async fn run_with_authority(
                 }
             });
         }
-        let session_backend = zeroclaw_infra::make_session_backend(
-            &config.data_dir,
-            &config.channels.session_backend,
+        let session_backend = open_rpc_session_backend(
+            || {
+                zeroclaw_infra::make_session_backend(
+                    &config.data_dir,
+                    &config.channels.session_backend,
+                )
+            },
+            RPC_SESSION_STORE_RETRY_DELAY,
         )
-        .ok();
+        .await;
 
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).
@@ -1411,6 +1416,10 @@ pub async fn run_with_authority(
     // drain as well as component workers before process ownership is released.
     live_config_authority.close_agent_lifecycle();
     channels_cancel.cancel();
+    // The gateway stops on its own shutdown signal, not the cancellation
+    // token. Without it the gateway is aborted at the grace window below and
+    // never withdraws what it published, such as its tunnel forwards.
+    let _ = gateway_shutdown_tx.send(true);
 
     // Retire the accepted RPC connections before the component handles are
     // touched. Each connection cancels and joins its prompts, and its listener
@@ -1766,6 +1775,53 @@ fn settle_exit_against_channel_retirement(
          down instead so a replacement generation cannot overlap it"
     );
     Ok(DaemonExit::Shutdown)
+}
+
+/// Pause before the RPC plane's one retry of a failed session-store open.
+const RPC_SESSION_STORE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Open the RPC plane's session store, retrying once.
+///
+/// Every `session/*` RPC method refuses without the store, so a failed open
+/// is reported at ERROR instead of being dropped, and retried once in case
+/// another component was creating the same fresh database at that moment.
+async fn open_rpc_session_backend<T>(
+    mut open: impl FnMut() -> std::io::Result<T>,
+    retry_delay: Duration,
+) -> Option<T> {
+    let first = match open() {
+        Ok(backend) => return Some(backend),
+        Err(error) => error,
+    };
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({ "error": format!("{first:#}") })),
+        "RPC session store failed to open; retrying once"
+    );
+    tokio::time::sleep(retry_delay).await;
+    match open() {
+        Ok(backend) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "RPC session store opened on retry"
+            );
+            Some(backend)
+        }
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                "RPC session store unavailable after a retry; session RPC methods will refuse until the daemon restarts"
+            );
+            None
+        }
+    }
 }
 
 fn spawn_component_supervisor<F, Fut>(
@@ -3129,6 +3185,39 @@ mod tests {
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
 
     #[tokio::test]
+    async fn rpc_session_store_open_is_retried_once_after_a_failure() {
+        let mut calls = 0;
+        let opened = open_rpc_session_backend(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(std::io::Error::other("database is locked"))
+                } else {
+                    Ok(calls)
+                }
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(opened, Some(2));
+    }
+
+    #[tokio::test]
+    async fn rpc_session_store_open_gives_up_after_one_retry() {
+        let mut calls = 0;
+        let opened: Option<()> = open_rpc_session_backend(
+            || {
+                calls += 1;
+                Err(std::io::Error::other("unable to open database file"))
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(opened, None);
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
     async fn retiring_channel_generation_clears_admission_and_joins_active_attempt() {
         let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let clearer_state = std::sync::Arc::clone(&cleared);
@@ -4034,6 +4123,7 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -4340,6 +4430,7 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -4372,6 +4463,7 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -4427,6 +4519,7 @@ mod tests {
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -4579,6 +4672,65 @@ mod tests {
         assert!(has_gateway_shutdown_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn daemon_exit_signals_the_gateway_instead_of_aborting_it() {
+        // Exit without the RPC reload helper, which signals the gateway itself:
+        // the same teardown a SIGTERM takes. The gateway must be told to stop
+        // so it can withdraw what it published (its tunnel) before returning,
+        // rather than being aborted when the component grace window ends.
+        let _broadcast_guard = hold_broadcast_hooks().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let (signalled_tx, mut signalled_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |_host,
+                  _port,
+                  _config,
+                  _live_config_authority,
+                  _event_tx,
+                  reload_controls,
+                  _tui_registry,
+                  _pairing,
+                  _ready_tx| {
+                let signalled_tx = signalled_tx.clone();
+                Box::pin(async move {
+                    let controls =
+                        reload_controls.expect("daemon should pass reload controls to gateway");
+                    let mut shutdown_rx = controls.shutdown_tx.subscribe();
+                    controls.reload_tx.send(true).expect("send reload signal");
+                    if shutdown_rx.wait_for(|stop| *stop).await.is_ok() {
+                        signalled_tx.send(()).ok();
+                    }
+                    Ok(())
+                })
+            },
+        ));
+
+        let exit = tokio::time::timeout(
+            DAEMON_DEADLOCK_GUARD,
+            run(
+                config,
+                "127.0.0.1".to_string(),
+                4243,
+                registry,
+                false,
+                false,
+            ),
+        )
+        .await
+        .expect("daemon must not deadlock on exit")
+        .expect("daemon run should succeed");
+
+        assert_eq!(exit, DaemonExit::Reload);
+        assert!(
+            signalled_rx.try_recv().is_ok(),
+            "the daemon aborted the gateway without signalling its shutdown"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -5213,15 +5365,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_gateway_bind_mode_starts_fresh_on_free_port() {
-        // Reserve an ephemeral port, then release it so the address is free.
+    async fn classify_gateway_bind_outcome_starts_fresh_on_successful_bind() {
+        // Keep the successful bind owned until classification instead of
+        // releasing the port and racing other listeners to bind it again.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
-            .expect("reserve port");
+            .expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
         assert_eq!(
-            detect_gateway_bind_mode(&Config::default(), "127.0.0.1", port).await,
+            classify_gateway_bind_outcome(Ok(listener), &Config::default(), "127.0.0.1", port)
+                .await,
             GatewayBindMode::StartFresh
         );
     }
@@ -7184,12 +7337,14 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn reload_waits_for_rpc_connection_drain_without_holding_other_components() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::{Duration, Instant, timeout};
 
+        let _broadcast_guard = hold_broadcast_hooks().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 

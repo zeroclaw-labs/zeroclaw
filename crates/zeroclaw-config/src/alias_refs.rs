@@ -1900,8 +1900,8 @@ mod tests {
     fn goal_verifier_provider_follows_model_alias_lifecycle() {
         let mut cfg = cfg_with_provider("anthropic", "default");
         cfg.goal.enabled = true;
-        cfg.goal.default_token_limit = 0;
-        cfg.goal.default_cost_limit_usd = 0.0;
+        cfg.goal.default_token_limit = Some(0);
+        cfg.goal.default_cost_limit_usd = Some(0.0);
         cfg.goal.verifier.model_provider = "anthropic.default".into();
         let kind = provider_kind("anthropic");
 

@@ -315,6 +315,9 @@ rpc_type! {
     /// parent-turn chunks and failures, use the normal `session/update` stream.
     pub enum SessionGoalUpdate {
         CommandFailed { session_id: String },
+        /// Successful parent candidate presentation fallback after ordinary
+        /// events drain. The legacy name is not a verifier verdict or proof of
+        /// durable candidate persistence; lifecycle updates carry those outcomes.
         VerifiedCandidate { session_id: String, candidate: String },
         Completed { session_id: String },
         PausedForBlocker { session_id: String },
@@ -814,6 +817,9 @@ rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
         pub set: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -873,6 +879,9 @@ rpc_type! {
     pub struct ConfigDeleteResult {
         pub prop: String,
         pub deleted: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -914,6 +923,9 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub created: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -929,6 +941,9 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub deleted: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -1004,6 +1019,10 @@ rpc_type! {
     pub struct AgentStatusEntry {
         pub alias: String,
         pub enabled: bool,
+        /// Current configured profile, not a running session's retained generation.
+        /// Absent when no configured runtime profile resolves for this agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub runtime_profile: Option<String>,
         #[serde(default)]
         pub live_sessions: usize,
         #[serde(default)]
@@ -1111,7 +1130,8 @@ rpc_type! {
     pub struct AgentSkillEntry {
         pub name: String,
         pub description: String,
-        /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+        /// `"built-in"` | `"workspace"` | `"open-skills"` | `"plugin"` |
+        /// `"bundle"`.
         pub origin: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plugin: Option<String>,
@@ -1392,6 +1412,8 @@ rpc_type! {
 rpc_type! {
     /// Config readiness status for the dashboard/TUI.
     pub struct ConfigStatusResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub application: Option<crate::config_application::ConfigApplicationStatus>,
         pub needs_quickstart: bool,
         pub reason: String,
         pub has_partial_state: bool,
@@ -1778,10 +1800,18 @@ pub enum SessionUpdateEvent {
     /// full context window (provider `context_window`), exposed distinctly so a
     /// client can render capacity and budget separately. Any may be absent when
     /// the provider doesn't report usage or the value can't be resolved.
+    ///
+    /// `input_tokens_source` states where `input_tokens` came from. It is
+    /// `provider` for a provider-reported count and `estimate` when the
+    /// provider omitted usage and the runtime substituted a local estimate so
+    /// the meter still has a numerator. Clients should render an estimated
+    /// value as approximate. It is absent when `input_tokens` is absent.
     ContextUsage {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens_source: Option<zeroclaw_api::agent::TokenCountSource>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1820,6 +1850,15 @@ pub enum SessionUpdateEvent {
         /// turn never reached a model call (refusals, missing sessions).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Box<TurnUsageTotals>>,
+    },
+    /// Recorded spend reached `cost.warn_at_percent` of a shared daily or
+    /// monthly limit. Non-blocking and at most once per turn; the turn
+    /// continues. `period` is `"day"` or `"month"`.
+    BudgetWarning {
+        session_id: String,
+        current_usd: f64,
+        limit_usd: f64,
+        period: zeroclaw_api::agent::BudgetWarningPeriod,
     },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
@@ -2115,6 +2154,50 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn session_goal_current_variants_match_the_native_client_fixture() {
+        use zeroclaw_goal::control::{GoalFailureReason, GoalResponse};
+
+        // The RPC-only client consumes this same fixture without linking the
+        // daemon. Exercise both independent serde owners against identical bytes.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/goal_wire_variants.json"
+        )))
+        .unwrap();
+        for value in fixture["failure_reasons"].as_array().unwrap() {
+            let reason: GoalFailureReason = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(reason).unwrap(), *value);
+            let update = SessionGoalUpdate::Failed {
+                session_id: "goal-session".into(),
+                reason,
+            };
+            assert_eq!(
+                serde_json::to_value(update).unwrap()["failed"]["reason"],
+                *value
+            );
+        }
+        let mut values = Vec::new();
+        for kind in fixture["unit_responses"].as_array().unwrap() {
+            values.push(json!({"kind": kind}));
+        }
+        for kind in fixture["status_responses"].as_array().unwrap() {
+            values.push(json!({"kind": kind, "status": fixture["status"]}));
+        }
+        for control in fixture["queued_controls"].as_array().unwrap() {
+            values.push(json!({"kind": "queued", "status": control}));
+        }
+        for action in fixture["pending_actions"].as_array().unwrap() {
+            values.push(json!({"kind": "transition_pending", "status": action}));
+        }
+        for value in values {
+            let response: GoalResponse = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&response).unwrap(), value);
+            let result = SessionGoalResult { response };
+            assert_eq!(serde_json::to_value(result).unwrap()["response"], value);
+        }
     }
 
     #[test]

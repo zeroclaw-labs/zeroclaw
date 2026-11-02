@@ -31,7 +31,7 @@ pub struct GoalBudgetLimits {
 /// Budget selection supplied by `start` or `budget set`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GoalBudgetSelection {
-    /// Use the configured defaults (valid only for `start`).
+    /// Use the configured defaults (valid only for `start`). Admission rejects this selection when the configured defaults select no budget.
     Defaults,
     /// Replace both dimensions; omitted dimensions are unlimited.
     Limits(GoalBudgetLimits),

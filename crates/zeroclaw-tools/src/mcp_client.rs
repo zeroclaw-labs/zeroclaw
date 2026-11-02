@@ -876,6 +876,12 @@ impl McpServer {
 
 // ── McpRegistry ───────────────────────────────────────────────────────────
 
+/// Joins an MCP server's name to one of its tools' names in the callable name
+/// the registry exposes: `<server>__<tool>`. MCP tools join a tool registry
+/// after plugin tools, so the plugin host refuses any plugin tool name that
+/// contains this separator.
+pub const MCP_TOOL_NAME_SEPARATOR: &str = "__";
+
 /// Registry of all connected MCP servers, with a flat tool index.
 pub struct McpRegistry {
     servers: Vec<McpServer>,
@@ -901,7 +907,8 @@ impl McpRegistry {
                     let tools = server.tools().await;
                     for tool in &tools {
                         // Prefix prevents name collisions across servers
-                        let prefixed = format!("{}__{}", config.name, tool.name);
+                        let prefixed =
+                            format!("{}{MCP_TOOL_NAME_SEPARATOR}{}", config.name, tool.name);
                         tool_index.insert(prefixed, (server_idx, tool.name.clone()));
                     }
                     servers.push(server);
@@ -1047,7 +1054,7 @@ impl McpRegistry {
             let name = server.name().await;
             let tools = server.tools().await;
             for tool in &tools {
-                let prefixed = format!("{}__{}", name, tool.name);
+                let prefixed = format!("{name}{MCP_TOOL_NAME_SEPARATOR}{}", tool.name);
                 tool_index.insert(prefixed, (idx, tool.name.clone()));
             }
             server_index.insert(name, idx);
@@ -1336,7 +1343,7 @@ impl McpRegistry {
     /// Split a `<server>__<rest>` prefixed name. Returns None if no prefix.
     pub fn split_prefixed(prefixed: &str) -> Option<(String, String)> {
         prefixed
-            .split_once("__")
+            .split_once(MCP_TOOL_NAME_SEPARATOR)
             .map(|(s, r)| (s.to_string(), r.to_string()))
     }
 

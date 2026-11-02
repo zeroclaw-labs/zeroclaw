@@ -1939,3 +1939,40 @@ async fn turn_streamed_history_no_duplicate_user_message() {
         "exactly one user message after turn_streamed, got {history_user_count}: {history:?}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 26. Runtime-approved argument tool names are built-in tool names
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `is_runtime_approved_arg_tool` matches literal names, so this test keeps a
+/// second copy of the five names. It checks that each is inventoried and
+/// approved, and that the predicate approves no other inventoried tool. It
+/// cannot see a new `matches!` arm for a name the inventory does not list.
+#[test]
+fn runtime_approved_arg_tool_names_are_inventoried() {
+    use std::collections::BTreeSet;
+    use zeroclaw_tools::inventory::{BUILTIN_TOOLS, is_builtin_tool_name};
+
+    let expected = BTreeSet::from(["shell", "schedule", "cron_add", "cron_update", "cron_run"]);
+    for name in &expected {
+        assert!(
+            is_builtin_tool_name(name),
+            "`{name}` receives the runtime-approved argument but is missing from the built-in inventory"
+        );
+        assert!(
+            crate::agent::is_runtime_approved_arg_tool(name),
+            "`{name}` must receive the runtime-approved argument"
+        );
+    }
+
+    let approved: BTreeSet<&str> = BUILTIN_TOOLS
+        .iter()
+        .map(|spec| spec.name)
+        .filter(|name| crate::agent::is_runtime_approved_arg_tool(name))
+        .collect();
+    assert_eq!(
+        approved, expected,
+        "is_runtime_approved_arg_tool changed which built-in tools receive the \
+         runtime-approved argument; update this test to the intended set"
+    );
+}

@@ -82,7 +82,7 @@ mod tests {
     use zeroclaw_config::policy::SecurityPolicy;
 
     fn registry() -> Vec<String> {
-        ["read_file", "write_file", "shell", "sop_advance"]
+        ["file_read", "file_write", "shell", "sop_advance"]
             .into_iter()
             .map(String::from)
             .collect()
@@ -91,16 +91,16 @@ mod tests {
     #[test]
     fn allow_scope_excludes_everything_else() {
         let scope = StepToolScope {
-            allow: Some(vec!["read_file".into()]),
+            allow: Some(vec!["file_read".into()]),
             deny: Vec::new(),
         };
 
         assert_eq!(
             resolve_excluded(&registry(), &scope, None, &[]),
             vec![
+                "file_write".to_string(),
                 "shell".to_string(),
-                "sop_advance".to_string(),
-                "write_file".to_string()
+                "sop_advance".to_string()
             ]
         );
     }
@@ -109,15 +109,15 @@ mod tests {
     fn deny_scope_subtracts_from_allow() {
         let scope = StepToolScope {
             allow: Some(vec!["fs".into()]),
-            deny: vec!["write_file".into()],
+            deny: vec!["file_write".into()],
         };
 
         assert_eq!(
             resolve_excluded(&registry(), &scope, None, &[]),
             vec![
+                "file_write".to_string(),
                 "shell".to_string(),
-                "sop_advance".to_string(),
-                "write_file".to_string()
+                "sop_advance".to_string()
             ]
         );
     }
@@ -125,21 +125,21 @@ mod tests {
     #[test]
     fn security_policy_can_only_narrow() {
         let policy = SecurityPolicy {
-            allowed_tools: Some(vec!["read_file".into()]),
+            allowed_tools: Some(vec!["file_read".into()]),
             excluded_tools: None,
             ..Default::default()
         };
         let scope = StepToolScope {
-            allow: Some(vec!["read_file".into(), "shell".into()]),
+            allow: Some(vec!["file_read".into(), "shell".into()]),
             deny: Vec::new(),
         };
 
         assert_eq!(
             resolve_excluded(&registry(), &scope, Some(&policy), &[]),
             vec![
+                "file_write".to_string(),
                 "shell".to_string(),
-                "sop_advance".to_string(),
-                "write_file".to_string()
+                "sop_advance".to_string()
             ]
         );
     }
@@ -155,9 +155,9 @@ mod tests {
         assert_eq!(
             resolve_excluded(&registry(), &scope, None, &mandatory),
             vec![
-                "read_file".to_string(),
-                "shell".to_string(),
-                "write_file".to_string()
+                "file_read".to_string(),
+                "file_write".to_string(),
+                "shell".to_string()
             ]
         );
     }
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn mandatory_infra_cannot_restore_policy_denied_tools() {
         let policy = SecurityPolicy {
-            allowed_tools: Some(vec!["read_file".into(), "shell".into()]),
+            allowed_tools: Some(vec!["file_read".into(), "shell".into()]),
             excluded_tools: Some(vec!["sop_advance".into()]),
             ..Default::default()
         };
@@ -177,7 +177,7 @@ mod tests {
 
         assert_eq!(
             resolve_excluded(&registry(), &scope, Some(&policy), &mandatory),
-            vec!["sop_advance".to_string(), "write_file".to_string()]
+            vec!["file_write".to_string(), "sop_advance".to_string()]
         );
     }
 }

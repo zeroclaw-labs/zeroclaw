@@ -508,16 +508,11 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         );
     }
 
-    // ── 6. Date ─────────────────────────────────────────────────
-    let now = chrono::Local::now();
-    let _ = writeln!(
-        prompt,
-        "## Current Date\n\n{} ({})\n",
-        now.format("%Y-%m-%d"),
-        now.format("%:z")
-    );
+    // Date is NOT injected here: wall-clock values bust
+    // the prompt cache across midnight. The interactive agent::run loop
+    // already prefixes each user message with [YYYY-MM-DD HH:MM:SS TZ].
 
-    // ── 7. Runtime ──────────────────────────────────────────────
+    // ── 6. Runtime ──────────────────────────────────────────────
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
     // The shell is reported next to the OS because the OS alone does not

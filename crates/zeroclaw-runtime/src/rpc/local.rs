@@ -1974,6 +1974,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_native_event_pressure_and_owned_child_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::{
+            GoalParentAdmissionCase, GoalParentEnding,
+        };
+        for ending in [
+            GoalParentEnding::EventBurstSuccess,
+            GoalParentEnding::EventBurstFailure,
+            GoalParentEnding::EventBurstProjectionFailure,
+            GoalParentEnding::PreparationFailure,
+        ] {
+            exercise_goal_parent_control_ending_over_local_ipc(
+                GoalParentAdmissionCase::DirectResume,
+                ending,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(unix)]
     async fn exercise_goal_parent_control_ending_over_local_ipc(
         case: crate::rpc::dispatch::connection_test_support::GoalParentAdmissionCase,
         ending: crate::rpc::dispatch::connection_test_support::GoalParentEnding,
@@ -2006,6 +2026,35 @@ mod tests {
         }
         let (registry, parent) =
             prepare_held_goal_parent_fixture(&mut ctx, tmp.path(), SID, OWNER, case).await;
+        let burst = if matches!(
+            ending,
+            GoalParentEnding::EventBurstSuccess
+                | GoalParentEnding::EventBurstFailure
+                | GoalParentEnding::EventBurstProjectionFailure
+        ) {
+            Some(
+                crate::rpc::dispatch::connection_test_support::prepare_native_burst_fixture(
+                    &ctx,
+                    tmp.path(),
+                    SID,
+                    &parent,
+                    ending == GoalParentEnding::EventBurstFailure,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if ending == GoalParentEnding::EventBurstProjectionFailure {
+            *ctx.goal_runtime
+                .test_parent_projection_failure
+                .lock()
+                .unwrap() = Some(SID.into());
+        }
+        if ending == GoalParentEnding::PreparationFailure {
+            crate::rpc::dispatch::connection_test_support::prepare_native_prefix_failure(&ctx, SID)
+                .await;
+        }
         let verifier_server = if budget_fence {
             Some(prepare_goal_budget_verifier(&ctx).await)
         } else {
@@ -2246,10 +2295,109 @@ mod tests {
             assert!(matches!(resumed.response, GoalResponse::Resumed(_)));
             events.announced = true;
         }
+        if ending == GoalParentEnding::PreparationFailure {
+            let mut failure=crate::rpc::dispatch::connection_test_support::NativePreparationFailureEvents::default();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if failure.observe(&frame) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("original preparation error must reach the real local IPC boundary");
+            assert_eq!(turn.calls.load(std::sync::atomic::Ordering::Acquire), 0);
+            assert_eq!(
+                registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                zeroclaw_api::task::TaskStatus::Failed
+            );
+            ctx.goal_runtime.dispose_session(SID).await.unwrap();
+            cancel.cancel();
+            drop(writer);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            return;
+        }
         tokio::time::timeout(Duration::from_secs(2), turn.started.notified())
             .await
             .expect("start/resume must launch the actual Goal parent call");
         parent.assert_resume_input(response);
+        if let Some(burst) = burst {
+            let mut typed =
+                crate::rpc::dispatch::connection_test_support::NativeBurstEvents::default();
+            if ending == GoalParentEnding::EventBurstSuccess {
+                writer
+                    .write_all(
+                        rpc_request(
+                            Method::SessionGoal,
+                            &serde_json::json!({"session_id":SID,"command":"/goal pause"}),
+                            40,
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let mut line = String::new();
+                        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if frame["id"] == 40 {
+                            let queued: SessionGoalResult =
+                                serde_json::from_value(frame["result"].clone()).unwrap();
+                            assert_eq!(
+                                queued.response,
+                                GoalResponse::Queued(GoalQueuedControl::Pause)
+                            );
+                            break;
+                        }
+                        assert!(!typed.observe(&frame, SID, ending));
+                    }
+                })
+                .await
+                .expect("typed event pressure must drain while the parent is held");
+            }
+            turn.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if typed.observe(&frame, SID, ending) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("buffered tail and native terminal outcome must drain");
+            typed.assert_complete(ending);
+            let task = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            burst.assert_child_and_ledger(tmp.path(), &task.id).await;
+            ctx.goal_runtime.dispose_session(SID).await.unwrap();
+            cancel.cancel();
+            drop(writer);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            return;
+        }
         if case.queued().is_some() {
             case.assert_intent(
                 tmp.path(),
@@ -3283,10 +3431,19 @@ mod tests {
     #[tokio::test]
     async fn goal_deferred_settings_failure_reports_once_local_ipc() {
         exercise_goal_boundary_completion_over_local_ipc(
-            "/goal budget set --tokens 100",
+            "/goal resume",
             crate::rpc::dispatch::connection_test_support::GoalBoundaryCompletion::SettingsFailure,
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_deferred_explicit_budget_preserves_malformed_unused_defaults_local_ipc() {
+        exercise_goal_boundary_completion_over_local_ipc(
+            "/goal budget set --tokens 100",
+            crate::rpc::dispatch::connection_test_support::GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault,
+        ).await;
     }
 
     #[cfg(unix)]
@@ -3321,7 +3478,11 @@ mod tests {
                 tmp.path(),
             );
         }
-        let held_turn = if matches!(completion, GoalBoundaryCompletion::FinishOrdinaryTurn) {
+        let held_turn = if matches!(
+            completion,
+            GoalBoundaryCompletion::FinishOrdinaryTurn
+                | GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault
+        ) {
             Some(insert_held_session_with_owner(&ctx, tmp.path(), SID, OWNER).await)
         } else {
             insert_immediate_session_with_owner(&ctx, tmp.path(), SID, OWNER).await;
@@ -3481,11 +3642,20 @@ mod tests {
             assert_eq!(ctx.sessions.session_queue.queue_depth(SID).await, 0);
             return;
         }
-        if matches!(completion, GoalBoundaryCompletion::SettingsFailure) {
+        if matches!(
+            completion,
+            GoalBoundaryCompletion::SettingsFailure
+                | GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault
+        ) {
             let mut config = ctx.config.snapshot();
-            config.goal.default_cost_limit_usd = -1.0;
+            config.goal.default_cost_limit_usd = Some(-1.0);
             ctx.config_authority.publish_for_test(config);
         }
+        let private_config_before = matches!(
+            completion,
+            GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault
+        )
+        .then(|| serde_json::to_value(ctx.config.snapshot()).unwrap());
         if matches!(completion, GoalBoundaryCompletion::LaunchFailure) {
             ctx.goal_runtime
                 .fail_test_launch_bind(key.clone(), before.execution_epoch + 1);
@@ -3647,7 +3817,7 @@ mod tests {
             // The fault has settled; restore valid settings for the read-only
             // response barrier that detects any duplicate final notification.
             let mut config = ctx.config.snapshot();
-            config.goal.default_cost_limit_usd = 0.0;
+            config.goal.default_cost_limit_usd = Some(0.0);
             ctx.config_authority.publish_for_test(config);
             writer
                 .write_all(
@@ -3734,6 +3904,22 @@ mod tests {
                 panic!("expected the committed budget lifecycle response");
             };
             assert_eq!(status.token_limit, Some(100));
+            if private_config_before.is_some() {
+                assert_eq!(status.task_id, before.id);
+                assert_eq!(status.execution_epoch, before.execution_epoch);
+                assert_eq!(
+                    serde_json::to_value(
+                        registry
+                            .current_goal_for_session(&key)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    serde_json::to_value(&before).unwrap(),
+                    "explicit budget edit preserves the exact durable owner"
+                );
+            }
             crate::rpc::dispatch::connection_test_support::assert_budget_intent_state(
                 tmp.path(),
                 &key,
@@ -3768,6 +3954,35 @@ mod tests {
                 Some(original_generation)
             );
             assert_eq!(ctx.sessions.session_queue.queue_depth(SID).await, 0);
+        }
+        if let Some(private_config) = private_config_before {
+            assert_eq!(
+                serde_json::to_value(ctx.config.snapshot()).unwrap(),
+                private_config,
+                "successful explicit budget edit leaves malformed unused defaults untouched"
+            );
+            writer
+                .write_all(
+                    rpc_request(
+                        Method::SessionGoal,
+                        &serde_json::json!({"session_id":SID,"command":"/goal status"}),
+                        5,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let (frame, status): (_, SessionGoalResult) =
+                tokio::time::timeout(Duration::from_secs(2), read_result(&mut reader))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                frame["id"], 5,
+                "no error or duplicate lifecycle frame before the status barrier"
+            );
+            assert!(
+                matches!(status.response,GoalResponse::Status(status) if status.task_id == before.id && status.token_limit == Some(100))
+            );
         }
         cancel.cancel();
         drop(writer);

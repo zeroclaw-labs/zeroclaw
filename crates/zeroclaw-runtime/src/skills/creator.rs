@@ -69,7 +69,8 @@ impl SkillCreator {
     /// from a *bounded* slice of the execution via a model-provider reflection
     /// call. If reflection fails — provider error, malformed output, empty
     /// body — it falls back to the deterministic `SKILL.toml` generator so a
-    /// creation attempt is never left half-done.
+    /// creation attempt is never left half-done. An active Goal child instead
+    /// returns the original reflection failure without writing a fallback.
     ///
     /// Gating (enabled flag, minimum tool calls, dedup, slug, LRU) is shared
     /// with [`Self::create_from_execution`].
@@ -109,6 +110,11 @@ impl SkillCreator {
                     .with_context(|| format!("Failed to write {}", md_path.display()))?;
             }
             Err(err) => {
+                if crate::goal_accounting::GoalForegroundContext::current()
+                    .is_some_and(|context| context.depth() > 0)
+                {
+                    return Err(err);
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -659,6 +665,23 @@ mod tests {
     use async_trait::async_trait;
     use zeroclaw_memory::embeddings::{EmbeddingProvider, NoopEmbedding};
 
+    fn set_test_modified_time(path: &std::path::Path, ordinal: u64) {
+        const TEST_MTIME_BASE_SECS: u64 = 1_000_000_000;
+        const TEST_MTIME_STEP_SECS: u64 = 60;
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(
+                        TEST_MTIME_BASE_SECS + ordinal * TEST_MTIME_STEP_SECS,
+                    ),
+            ))
+            .unwrap();
+    }
+
     // ── Slug generation ──────────────────────────────────────────
 
     #[test]
@@ -946,8 +969,9 @@ tags = ["auto-generated"]
         for (i, name) in ["old-skill", "new-skill"].iter().enumerate() {
             let skill_dir = skills_dir.join(name);
             tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+            let manifest = skill_dir.join("SKILL.toml");
             tokio::fs::write(
-                skill_dir.join("SKILL.toml"),
+                &manifest,
                 format!(
                     r#"[skill]
 name = "{name}"
@@ -960,8 +984,7 @@ tags = ["auto-generated"]
             )
             .await
             .unwrap();
-            // Small delay to ensure different timestamps.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            set_test_modified_time(&manifest, i as u64);
         }
 
         let creator = SkillCreator::new(dir.path().to_path_buf(), config);
@@ -1790,16 +1813,17 @@ tags = ["auto-generated"]
         let skills_dir = dir.path().join("skills");
 
         // Two auto-generated reflected (SKILL.md) skills with distinct mtimes.
-        for name in ["old-md", "new-md"] {
+        for (i, name) in ["old-md", "new-md"].into_iter().enumerate() {
             let skill_dir = skills_dir.join(name);
             tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+            let manifest = skill_dir.join("SKILL.md");
             tokio::fs::write(
-                skill_dir.join("SKILL.md"),
+                &manifest,
                 format!("---\nname: {name}\ndescription: A skill\nauthor: zeroclaw-auto\n---\n# {name}\n\nBody.\n"),
             )
             .await
             .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            set_test_modified_time(&manifest, i as u64);
         }
 
         let creator = SkillCreator::new(dir.path().to_path_buf(), config);

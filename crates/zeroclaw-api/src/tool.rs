@@ -1,6 +1,98 @@
 use crate::media::RenderedMarker;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+
+tokio::task_local! {
+    static TOOL_EXECUTION_CONTEXT: ToolExecutionContext;
+}
+
+/// Per-call execution inputs supplied by the turn owner.
+///
+/// The token is a handle to the owner's cancellation state. Spawned tasks do
+/// not inherit the task-local scope; capture the context or a child token
+/// before spawning work that should stop with the call.
+#[derive(Debug, Clone, Default)]
+pub struct ToolExecutionContext {
+    cancellation_token: Option<CancellationToken>,
+    goal_foreground: bool,
+}
+
+/// The execution future was dropped because its owner cancelled the call.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("Tool execution cancelled")]
+pub struct ToolExecutionCancelled;
+
+/// Marks an owned Goal child failure without replacing its underlying cause.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("Goal foreground child operation failed")]
+pub struct GoalChildOperationError;
+
+impl ToolExecutionContext {
+    pub fn new(cancellation_token: Option<CancellationToken>) -> Self {
+        Self {
+            cancellation_token,
+            goal_foreground: false,
+        }
+    }
+
+    /// Mark participation in a Goal foreground operation; this carries no authority.
+    pub fn with_goal_foreground(mut self) -> Self {
+        self.goal_foreground = true;
+        self
+    }
+
+    /// Whether this context participates in a Goal foreground operation.
+    pub fn is_goal_foreground(&self) -> bool {
+        self.goal_foreground
+    }
+
+    fn inherited(&self) -> Self {
+        let mut context = self.clone();
+        context.goal_foreground |= Self::current().is_some_and(|outer| outer.goal_foreground);
+        context
+    }
+
+    /// Install this context without racing or dropping the supplied future.
+    /// The caller owns cancellation and any asynchronous cleanup.
+    pub async fn scope_only<F: std::future::Future>(&self, future: F) -> F::Output {
+        TOOL_EXECUTION_CONTEXT.scope(self.inherited(), future).await
+    }
+
+    pub fn cancellation_token(&self) -> Option<&CancellationToken> {
+        self.cancellation_token.as_ref()
+    }
+
+    /// Context for the future currently being polled, if it has a scope.
+    pub fn current() -> Option<Self> {
+        TOOL_EXECUTION_CONTEXT.try_with(Clone::clone).ok()
+    }
+
+    /// Scope the future and drop it when the token is cancelled.
+    ///
+    /// An empty context masks any outer token. Cancellation wins when both
+    /// branches are ready, and a pre-cancelled token never polls the future.
+    /// Dropping a future does not undo side effects or await child cleanup.
+    pub async fn run<T>(
+        &self,
+        future: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        TOOL_EXECUTION_CONTEXT
+            .scope(self.inherited(), async {
+                match self.cancellation_token() {
+                    Some(token) => {
+                        tokio::select! {
+                            biased;
+                            () = token.cancelled() => Err(ToolExecutionCancelled.into()),
+                            result = future => result,
+                        }
+                    }
+                    None => future.await,
+                }
+            })
+            .await
+    }
+}
 
 #[macro_export]
 macro_rules! tool_attribution {
@@ -448,6 +540,12 @@ pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> 
 
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
+    /// Whether these arguments may invoke a native agent child. Wrappers and
+    /// composites must forward this conservatively; this does not grant access.
+    fn may_invoke_agent_child(&self, _args: &serde_json::Value) -> bool {
+        false
+    }
+
     /// True when this tool starts nested execution without carrying the RPC
     /// principal's current tool and agent ceilings. Constrained RPC sessions
     /// must omit it. Wrappers forward the target's value so a renamed skill
@@ -507,6 +605,18 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Execute with turn-scoped cancellation while preserving legacy tools.
+    /// Tools that start child work can override this method to pass the
+    /// context or a child token explicitly, and use [`ToolExecutionContext::run`]
+    /// to scope and cancel their execution future.
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        context.run(self.execute(args)).await
+    }
+
     /// Assemble this tool's spec. The default recomposes it from
     /// `parameters_schema()` and allocates a fresh `Arc` per call, so tools
     /// with large stored schemas override it to hand out `Arc::clone`
@@ -532,6 +642,208 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_context_nested_scopes_preserve_flag_but_mask_token() {
+        let token = CancellationToken::new();
+        let outer = ToolExecutionContext::new(Some(token)).with_goal_foreground();
+        outer
+            .scope_only(async {
+                ToolExecutionContext::default()
+                    .run(async {
+                        let current = ToolExecutionContext::current().unwrap();
+                        assert!(current.is_goal_foreground());
+                        assert!(current.cancellation_token().is_none());
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    ToolExecutionContext::current()
+                        .unwrap()
+                        .is_goal_foreground()
+                );
+            })
+            .await;
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_scope_only_does_not_drop_cancelled_future() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let context = ToolExecutionContext::new(Some(token)).with_goal_foreground();
+        let value = context.scope_only(async { 42 }).await;
+        assert_eq!(value, 42);
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_context_masks_and_restores_nested_scopes() {
+        assert!(ToolExecutionContext::current().is_none());
+        let token = CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+        let observed = context
+            .run(async {
+                assert!(
+                    ToolExecutionContext::current()
+                        .unwrap()
+                        .cancellation_token()
+                        .is_some()
+                );
+                let error = ToolExecutionContext::default()
+                    .run::<()>(async {
+                        assert!(
+                            ToolExecutionContext::current()
+                                .unwrap()
+                                .cancellation_token()
+                                .is_none()
+                        );
+                        let mut children = tokio::task::JoinSet::new();
+                        children.spawn(async { ToolExecutionContext::current() });
+                        assert!(children.join_next().await.unwrap().unwrap().is_none());
+                        anyhow::bail!("inner failure")
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.to_string(), "inner failure");
+                Ok(ToolExecutionContext::current()
+                    .unwrap()
+                    .cancellation_token()
+                    .unwrap()
+                    .clone())
+            })
+            .await
+            .unwrap();
+        assert!(ToolExecutionContext::current().is_none());
+        token.cancel();
+        assert!(observed.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn tool_context_scope_is_restored_when_future_is_dropped() {
+        let context = ToolExecutionContext::new(Some(CancellationToken::new()));
+        let mut call = Box::pin(context.run(async {
+            assert!(ToolExecutionContext::current().is_some());
+            std::future::pending::<anyhow::Result<()>>().await
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(call.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(ToolExecutionContext::current().is_none());
+        drop(call);
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_context_pre_cancelled_does_not_poll_ready_future() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let context = ToolExecutionContext::new(Some(token));
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let result = context
+            .run(std::future::poll_fn(|_| {
+                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::Ready(Ok(()))
+            }))
+            .await;
+        assert!(result.unwrap_err().is::<ToolExecutionCancelled>());
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_context_cancellation_drops_a_polled_future() {
+        struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut call = Box::pin(context.run(async {
+            let _guard = DropProbe(dropped.clone());
+            std::future::pending::<anyhow::Result<()>>().await
+        }));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(call.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        token.cancel();
+        assert!(call.await.unwrap_err().is::<ToolExecutionCancelled>());
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_context_concurrent_futures_keep_independent_tokens() {
+        let first_token = CancellationToken::new();
+        let second_token = CancellationToken::new();
+        let first = ToolExecutionContext::new(Some(first_token.clone()));
+        let second = ToolExecutionContext::new(Some(second_token.clone()));
+        let barrier = tokio::sync::Barrier::new(2);
+        let capture = || async {
+            barrier.wait().await;
+            tokio::task::yield_now().await;
+            Ok(ToolExecutionContext::current()
+                .unwrap()
+                .cancellation_token()
+                .unwrap()
+                .clone())
+        };
+        let (first_seen, second_seen) = tokio::join!(first.run(capture()), second.run(capture()));
+        let first_seen = first_seen.unwrap();
+        let second_seen = second_seen.unwrap();
+        first_token.cancel();
+        assert!(first_seen.is_cancelled());
+        assert!(!second_seen.is_cancelled());
+        second_token.cancel();
+        assert!(second_seen.is_cancelled());
+        assert!(ToolExecutionContext::current().is_none());
+    }
+
+    struct LegacyContextProbe;
+    crate::mock_tool_attribution!(LegacyContextProbe);
+
+    #[async_trait]
+    impl Tool for LegacyContextProbe {
+        fn name(&self) -> &str {
+            "legacy_context_probe"
+        }
+        fn description(&self) -> &str {
+            "Reads the scoped context through the legacy method"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            assert!(
+                ToolExecutionContext::current()
+                    .unwrap()
+                    .cancellation_token()
+                    .is_some()
+            );
+            Ok(ToolResult::ok("legacy completed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_context_default_bridge_scopes_legacy_execute() {
+        let context = ToolExecutionContext::new(Some(CancellationToken::new()));
+        let result = LegacyContextProbe
+            .execute_with_context(serde_json::json!({}), &context)
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(ToolExecutionContext::current().is_none());
+    }
 
     #[test]
     fn tool_spec_arc_parameters_serialize_transparently() {

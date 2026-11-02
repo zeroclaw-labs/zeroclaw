@@ -14,7 +14,7 @@ const OBJECTIVE_CLOSE: &str = "\n---";
 ///
 /// This input is process-local. Its system and user projections belong only
 /// to the working transcript, never to canonical session history.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GoalParentTurnInput {
     kind: GoalParentTurnKind,
     objective: String,
@@ -31,13 +31,15 @@ impl fmt::Debug for GoalParentTurnInput {
 
 /// Snapshot the exact controller-owned input for one parent turn.
 pub fn goal_parent_turn_input(turn: &GoalParentTurn) -> GoalParentTurnInput {
-    GoalParentTurnInput {
-        kind: turn.kind,
-        objective: turn.objective.clone(),
-    }
+    GoalParentTurnInput::new(turn.kind, turn.objective.clone())
 }
 
 impl GoalParentTurnInput {
+    /// Bind the exact controller-owned objective and kind before host preparation.
+    pub(crate) fn new(kind: GoalParentTurnKind, objective: String) -> Self {
+        Self { kind, objective }
+    }
+
     /// Compose the single leading system row, retaining ordinary base policy.
     ///
     /// The verbatim objective lies between the first and final Goal delimiters.

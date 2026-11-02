@@ -200,9 +200,11 @@ impl GoalExecutionSupervisor {
     /// A retired supervisor returns [`super::GoalSupervisorRetired`] before
     /// admission has any effects. The adapter must select a current supervisor
     /// before retrying the command.
+    /// Build settings from the current canonical config for this command;
+    /// queued controls retain intent, not these resolved settings.
     pub async fn admit_control(
         self: &Arc<Self>,
-        settings: GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
@@ -226,13 +228,18 @@ impl GoalExecutionSupervisor {
             .engine
             .runtime
             .host
-            .submit(&settings, ingress.clone(), driver.clone(), command.clone())
+            .submit(settings, ingress.clone(), driver.clone(), command.clone())
+            .await?;
+        let retry_guard = GoalLaunchGuard::new(self.launches.clone(), None, None);
+        self.engine
+            .runtime
+            .retry_launch_cleanup(settings, &submission, &retry_guard, false)
             .await?;
         let (rejection, current) = self
             .engine
             .runtime
             .controller
-            .preflight_normal(&settings, &submission)
+            .preflight_normal(settings, &submission)
             .await?;
         if let Some(response) = rejection {
             let result = GoalRuntimeSubmission {
@@ -245,9 +252,8 @@ impl GoalExecutionSupervisor {
                 None,
                 driver,
                 ingress,
+                GoalLaunchGuard::new(self.launches.clone(), None, None),
                 None,
-                None,
-                &mut custody,
             )));
         }
 
@@ -263,7 +269,7 @@ impl GoalExecutionSupervisor {
             )?;
             if self.owns_scope(&scope).await {
                 guard = Some(
-                    self.record_intent(&settings, &ingress, &command, current.as_ref())
+                    self.record_intent(settings, &ingress, &command, current.as_ref())
                         .await?,
                 );
                 if let Some(ticket) = self.register_deferred_control(&scope).await? {
@@ -323,26 +329,27 @@ impl GoalExecutionSupervisor {
                     .map(|commit| GoalControlAdmission::Direct(commit.into_direct()));
             }
             let previous = self.scope_for_session(&ingress).await?;
+            let mut launch_guard =
+                GoalLaunchGuard::new(self.launches.clone(), intake_admission, custody.take());
             let result = self
                 .engine
                 .runtime
-                .apply_submission(&settings, submission)
+                .apply_submission_with_launch_guard(settings, submission, Some(&mut launch_guard))
                 .await?;
             return Ok(GoalControlAdmission::Direct(self.execution_submission(
                 result,
                 previous,
                 driver,
                 ingress,
-                intake_admission,
+                launch_guard,
                 Some(boundary),
-                &mut custody,
             )));
         }
 
         let mut guard = match guard {
             Some(guard) => guard,
             None => {
-                self.record_intent(&settings, &ingress, &command, current.as_ref())
+                self.record_intent(settings, &ingress, &command, current.as_ref())
                     .await?
             }
         };
@@ -375,7 +382,7 @@ impl GoalExecutionSupervisor {
 
     async fn record_intent(
         &self,
-        settings: &GoalHostSettings,
+        settings: &GoalHostSettings<'_>,
         ingress: &GoalIngressContext,
         command: &GoalCommand,
         current: Option<&TaskRecord>,
@@ -673,7 +680,8 @@ impl GoalDeferredReady {
     /// predecessor drain, successor launch or rebind. If audit persistence fails
     /// after Start/Resume commits, terminalize the unlaunched epoch, release command
     /// and turn ownership, attempt its notice, and mark GoalLaunchFailureReported.
-    pub async fn commit(mut self, settings: GoalHostSettings) -> Result<GoalDeferredCommit> {
+    /// Build settings from the current canonical config after `wait` returns.
+    pub async fn commit(mut self, settings: &GoalHostSettings<'_>) -> Result<GoalDeferredCommit> {
         let control = &mut self.control;
         let command = control
             .command
@@ -728,6 +736,11 @@ impl GoalDeferredReady {
             .scope_for_session(&control.ingress)
             .await?;
         let needs_audit = response.is_none();
+        let mut launch_guard = GoalLaunchGuard::new(
+            control.supervisor.launches.clone(),
+            admission,
+            control.custody.take(),
+        );
         let runtime_submission = if let Some(response) = response {
             GoalRuntimeSubmission {
                 response,
@@ -739,12 +752,13 @@ impl GoalDeferredReady {
                 .supervisor
                 .engine
                 .runtime
-                .submit_bound(
-                    &settings,
+                .submit_bound_with_launch_guard(
+                    settings,
                     control.ingress.clone(),
                     control.driver.clone(),
                     command,
                     lease,
+                    &mut launch_guard,
                 )
                 .await?
         };
@@ -761,9 +775,8 @@ impl GoalDeferredReady {
             previous,
             control.driver.clone(),
             control.ingress.clone(),
-            admission,
+            launch_guard,
             None,
-            &mut control.custody,
         );
         if needs_audit {
             let settlement = if applied {
@@ -774,25 +787,22 @@ impl GoalDeferredReady {
                 }
             };
             if let Err(error) = control.guard.settle(settlement).await {
-                // A durable Start/Resume is not yet supervisor-owned. An
-                // audit error must not drop its only launch request and leave
-                // Running behind without an owner. Use the existing launch
-                // failure reconciliation; never admit model work on this path.
-                submission.launch_guard.failed();
-                let mut failure_reported = false;
-                if let Some(scope) = submission.launch_guard.scope() {
-                    let scope = scope.clone();
-                    let notice = control
-                        .supervisor
-                        .fail_unlaunched_execution(&scope)
-                        .await
-                        .context("reconcile unlaunched Goal after control audit failure")?;
-                    failure_reported = notice.is_some();
-                    // Release settled command/checkpoint/turn ownership before reacquisition.
-                    drop(submission._lease.take());
-                    drop(self.boundary.take());
-                    drop(control.resource.take());
-                    if let Some(notice) = notice {
+                let error = error.context("persist Goal control transition audit");
+                if submission.launch_guard.scope().is_none() {
+                    return Err(error);
+                }
+                submission.launch_guard.retain_primary(error);
+                let cleanup = control
+                    .supervisor
+                    .fail_unlaunched_execution(&mut submission.launch_guard)
+                    .await;
+                // Release command/checkpoint/turn ownership before notice
+                // reacquisition, while the guard still owns the primary.
+                drop(submission._lease.take());
+                drop(self.boundary.take());
+                drop(control.resource.take());
+                let failure_reported = match cleanup {
+                    Ok(Some(notice)) => {
                         control
                             .supervisor
                             .publish_unlaunched_failure_notice(
@@ -801,14 +811,27 @@ impl GoalDeferredReady {
                                 &control.ingress,
                             )
                             .await;
+                        true
                     }
-                }
-                submission.launch_guard.settled();
-                let error = error.context("persist Goal control transition audit");
+                    Ok(None) => false,
+                    Err(secondary) => {
+                        let primary = submission
+                            .launch_guard
+                            .take_primary()
+                            .context("Goal audit failure lost its original cause")?;
+                        return Err(primary.context(format!(
+                            "reconcile unlaunched Goal after control audit failure: {secondary:#}"
+                        )));
+                    }
+                };
+                let primary = submission
+                    .launch_guard
+                    .take_primary()
+                    .context("Goal audit failure lost its original cause")?;
                 return Err(if failure_reported {
-                    error.context(GoalLaunchFailureReported)
+                    primary.context(GoalLaunchFailureReported)
                 } else {
-                    error
+                    primary
                 });
             }
         }

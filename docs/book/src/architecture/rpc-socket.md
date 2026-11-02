@@ -45,7 +45,7 @@ named pipes carry the same byte stream as Unix sockets.
 
 ```
 {"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1},"id":1}\n
-{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.5"},"id":1}\n
+{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.7"},"id":1}\n
 ```
 
 ## Connection limits
@@ -103,6 +103,36 @@ the operating system:
 | `file/upload/begin`, `file/upload/chunk`, `file/upload/commit` | client -> daemon | Upload one file in ordered chunks; see [Chunked uploads](#chunked-uploads) |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
+
+### Goal controls and parent output
+
+`session/goal` uses the existing authenticated session and the same Goal control
+plane as Matrix. It is available through local IPC and WSS, not through Web
+chat. A TUI identity provides continuity; it is not an authorization grant.
+Session ownership and current permissions are rechecked after admission waits,
+before preparing a parent operation.
+
+Ordinary start, resume, pause and budget mutations acknowledge queued work
+promptly and apply at the current turn boundary. Cancel and `pause now`
+interrupt immediately while already admitted usage and cleanup settle. The
+channel-only `/stop` shortcut uses the same immediate-pause semantics.
+`resume [RESPONSE]` preserves multiline text in the same durable session before
+the next parent prepares its history. Plain resume inserts no user response.
+
+Parent thinking, drafts, text, tool calls, results and errors retain the normal
+`session/update` path. Goal lifecycle notices use `session/goal_update`.
+Started/resumed notices precede execution; an agent's question precedes a
+verifier-blocked pause. The legacy `verified_candidate` update is a successful
+parent's presentation fallback after its ordinary event stream drains. It is
+not a verifier verdict or a persistence acknowledgement. Saving the candidate
+is a separate, once-only durable append; its failure remains visible as an
+original error and the typed `candidate_persistence_failed` lifecycle reason.
+
+The native parent has no additional overall Goal timeout. Existing finite
+tool, child, summary and Matrix turn bounds remain enforced. A daemon restart
+requires explicit authorized resume; an ordinary client disconnect does not
+cancel a durable Goal. Session disposal and daemon-generation shutdown have
+their own fence-and-drain boundaries.
 
 ### Atomic configuration writes
 

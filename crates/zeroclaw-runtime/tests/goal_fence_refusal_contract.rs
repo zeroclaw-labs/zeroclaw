@@ -9,18 +9,25 @@ use tokio::{
     time::{Duration, timeout},
 };
 use zeroclaw_api::{model_provider::ChatMessage, model_provider::TokenUsage, task::TaskStatus};
-use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection, GoalCommand};
-use zeroclaw_config::{cost::CostTracker, schema::CostConfig};
+use zeroclaw_commands::goal::{GoalBudgetSelection, GoalCommand};
+use zeroclaw_config::{
+    cost::CostTracker,
+    goal::{GoalConfig, GoalVerifierConfig},
+    live::LiveConfig,
+    providers::ModelProviderRef,
+    schema::{Config, CostConfig, ModelProviderConfig, OpenAIModelProviderConfig},
+};
 use zeroclaw_goal::{
     GoalAccountingState, GoalExecutionNotice, GoalExecutionOutcome, GoalExecutionScope,
-    GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalOperationScope, GoalParentTurn, GoalParentTurnCheckpoint, GoalParentTurnKind,
-    GoalParentTurnResult, GoalPauseReason, GoalPauseState, GoalResponse, GoalRuntime,
-    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalTaskRegistry, GoalTransitionResult, GoalVerifierResult, GoalVerifierTurn,
+    GoalExecutionSupervisor, GoalFailureReason, GoalHostSettings, GoalHostSettingsSource,
+    GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
+    GoalParentTurnCheckpoint, GoalParentTurnKind, GoalParentTurnResult, GoalPauseReason,
+    GoalPauseState, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
+    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalTaskRegistry,
+    GoalTransitionResult, GoalVerifierResult, GoalVerifierTurn,
     accounting::{
-        GOAL_OPERATION_ACCOUNTING, GoalOperationFenced, GoalOperationRequest,
-        GoalOperationSettlement, GoalUsageEvent,
+        GOAL_OPERATION_ACCOUNTING, GoalAccountingFailure, GoalOperationFenced,
+        GoalOperationRequest, GoalOperationSettlement, GoalUsageEvent,
     },
 };
 use zeroclaw_runtime::{
@@ -52,6 +59,18 @@ enum Refusal {
     Plain,
     Pending,
     Missing,
+}
+
+fn accounting_failure_chain(refusal: Refusal) -> &'static str {
+    match refusal {
+        Refusal::Pending => {
+            "Goal failure lost its execution fence: Goal accounting is incomplete: an earlier Goal model call has not settled; no further Goal model call will be admitted"
+        }
+        Refusal::Missing => {
+            "Goal failure lost its execution fence: Goal accounting is incomplete: usage was not reported for an earlier Goal model call; no further Goal model call will be admitted"
+        }
+        _ => panic!("only incomplete accounting owns a native core error in this fixture"),
+    }
 }
 
 struct Observation {
@@ -123,6 +142,7 @@ impl Lease {
         self.observation.admissions.fetch_add(1, Ordering::SeqCst);
         accountant
             .settle(GoalOperationSettlement {
+                issues: Vec::new(),
                 accounting_state: GoalAccountingState::Complete,
                 events: vec![GoalUsageEvent {
                     provider_ref: "fixture.route".into(),
@@ -214,7 +234,10 @@ impl GoalSessionExecutionLease for Lease {
         &self.key
     }
 
-    fn canonical_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
+    async fn canonical_history(
+        &mut self,
+        _input: &zeroclaw_goal::control::GoalParentTurnInput,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
         Ok(vec![])
     }
 
@@ -257,6 +280,40 @@ impl GoalSessionExecutionLease for Lease {
     }
 
     async fn publish_goal_core_error(&mut self, error: &anyhow::Error) -> anyhow::Result<()> {
+        let failure = error.downcast_ref::<GoalAccountingFailure>().unwrap();
+        let pending = self.refusal == Refusal::Pending;
+        assert_eq!(
+            failure.accounting_state(),
+            if pending {
+                GoalAccountingState::Complete
+            } else {
+                assert_eq!(self.refusal, Refusal::Missing);
+                GoalAccountingState::Missing
+            }
+        );
+        assert_eq!(failure.has_pending_operation(), pending);
+        assert!(error.downcast_ref::<GoalOperationFenced>().is_none());
+        assert_eq!(format!("{error:#}"), accounting_failure_chain(self.refusal));
+
+        // The error retains its creation-time metadata. Drain owns the later
+        // pending settlement and terminal transition before native publication.
+        let task = self
+            .store
+            .current_goal_for_session(&self.key.durable_id())
+            .await?
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        let goal = self.store.get_goal_task(&task.id).await?.unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            if pending {
+                GoalAccountingState::OutcomeUnknown
+            } else {
+                GoalAccountingState::Missing
+            }
+        );
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
         self.observation
             .events
             .lock()
@@ -331,19 +388,34 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         },
     )
     .unwrap();
-    let settings = GoalHostSettings::new(
-        true,
-        GoalBudgetLimits {
-            token_limit: Some(100),
-            cost_limit_usd: None,
+    let mut config = Config {
+        goal: GoalConfig {
+            enabled: true,
+            default_token_limit: Some(100),
+            default_cost_limit_usd: Some(0.0),
+            include_channel_turn_context: true,
+            verifier: GoalVerifierConfig {
+                model_provider: ModelProviderRef::new("openai.default"),
+                model: None,
+            },
         },
-        42,
-        "fixture-boot",
-    )
-    .unwrap();
+        ..Default::default()
+    };
+    config.providers.models.openai.insert(
+        "default".to_owned(),
+        OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                model: Some("gpt-test".to_owned()),
+                ..Default::default()
+            },
+        },
+    );
+    let live = LiveConfig::new(config);
+    let settings_source = GoalHostSettingsSource::new(live.handle(), 42, "fixture-boot").unwrap();
+    let command_config = live.handle().snapshot();
     let mut start = supervisor
         .submit(
-            settings.clone(),
+            &GoalHostSettings::from_config(&command_config, 42, "fixture-boot").unwrap(),
             ingress.clone(),
             driver.clone(),
             GoalCommand::Start {
@@ -367,7 +439,7 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         "Fence-refusal fixture capture probe"
     );
     supervisor
-        .launch_after_response(settings.clone(), &mut start)
+        .launch_after_response(&settings_source, &mut start)
         .await
         .unwrap();
     timeout(Duration::from_secs(5), observation.ready.notified())
@@ -375,9 +447,10 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         .unwrap();
     let late = match control {
         Control::Pause | Control::Resume | Control::Cancel => {
+            let command_config = live.handle().snapshot();
             let mut submission = supervisor
                 .submit(
-                    settings.clone(),
+                    &GoalHostSettings::from_config(&command_config, 42, "fixture-boot").unwrap(),
                     ingress.clone(),
                     driver.clone(),
                     if control == Control::Cancel {
@@ -397,7 +470,7 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
             observation.release.notify_one();
             timeout(
                 Duration::from_secs(5),
-                supervisor.launch_after_response(settings.clone(), &mut submission),
+                supervisor.launch_after_response(&settings_source, &mut submission),
             )
             .await
             .unwrap()
@@ -511,8 +584,9 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         .unwrap()
         .unwrap();
     let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(task.id, original.id);
     let uncommitted = matches!(control, Control::StillRunning | Control::StillRunningBudget);
-    let failed = uncommitted || refusal != Refusal::Fenced;
+    let failed = uncommitted || matches!(refusal, Refusal::Pending | Refusal::Missing);
     let expected = if control == Control::Cancel {
         TaskStatus::Cancelled
     } else if failed {
@@ -539,6 +613,13 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         tracker.get_usage_totals_for_task(&task.id).unwrap().0,
         (operations * 12) as u64
     );
+    assert_eq!(
+        tracker
+            .get_summary_for_task(&task.id)
+            .unwrap()
+            .request_count,
+        operations
+    );
     assert!(goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none());
     assert_eq!(
         goal.accounting_state,
@@ -562,6 +643,23 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
             "no duplicate core error or failure notice: {events:?}"
         );
         assert_eq!(task.execution_epoch, original.execution_epoch + 1);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(&task.id, &key.durable_id())
+                .await
+                .unwrap(),
+            None
+        );
+        if refusal == Refusal::Plain {
+            assert_eq!(events, vec!["host_error:fixture untyped error after pause"]);
+            let Some(GoalResponse::Paused(paused)) = &late else {
+                panic!("the settled ordinary error must preserve the explicit pause response");
+            };
+            assert_eq!(paused.task_id, original.id);
+            assert_eq!(paused.execution_epoch, original.execution_epoch + 1);
+            assert_eq!(paused.accounting_state, GoalAccountingState::Complete);
+            assert_eq!(paused.pause_reason, Some(GoalPauseReason::OperatorPaused));
+        }
         if expected == TaskStatus::Paused {
             assert_eq!(
                 goal.pause_reason,
@@ -591,7 +689,8 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
             } else if refusal == Refusal::Pending {
                 "accounting_outcome_unknown"
             } else {
-                "executor_failed"
+                assert_eq!(refusal, Refusal::Missing);
+                "accounting_missing_or_invalid"
             })
         );
         assert_eq!(
@@ -600,11 +699,33 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         );
         if uncommitted {
             assert_eq!(events.len(), 2);
+            assert_eq!(
+                events[1],
+                format!(
+                    "notice:{:?}",
+                    GoalExecutionNotice::Failed(if window == Window::Parent {
+                        GoalFailureReason::AgentOperationFailed
+                    } else {
+                        GoalFailureReason::VerifierOperationFailed
+                    })
+                )
+            );
         } else {
             assert_eq!(events.len(), 3);
             assert_eq!(
-                events[1],
-                "core_error:Goal failure lost its execution fence"
+                events,
+                vec![
+                    "host_error:Goal task is not running".to_owned(),
+                    format!("core_error:{}", accounting_failure_chain(refusal)),
+                    format!(
+                        "notice:{:?}",
+                        GoalExecutionNotice::Failed(if refusal == Refusal::Pending {
+                            GoalFailureReason::OperationOutcomeUnknown
+                        } else {
+                            GoalFailureReason::AccountingIncomplete
+                        })
+                    ),
+                ]
             );
         }
     }
@@ -630,9 +751,10 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
         assert_eq!(terminal_diagnostics, 0);
     }
     if control == Control::Resume {
+        let command_config = live.handle().snapshot();
         let mut resumed = supervisor
             .submit(
-                settings.clone(),
+                &GoalHostSettings::from_config(&command_config, 42, "fixture-boot").unwrap(),
                 ingress,
                 driver,
                 GoalCommand::Resume { response: None },
@@ -651,7 +773,7 @@ async fn run_case(key: GoalSessionKey, window: Window, control: Control, refusal
             GoalExecutionScope::new(&running.id, key.durable_id(), running.execution_epoch)
                 .unwrap();
         supervisor
-            .launch_after_response(settings, &mut resumed)
+            .launch_after_response(&settings_source, &mut resumed)
             .await
             .unwrap();
         assert_eq!(
@@ -744,8 +866,8 @@ case!(
 );
 case!(clean_cancel, zerocode_clean_cancel, Parent, Cancel, Fenced);
 case!(
-    untyped_parent_error_remains_terminal,
-    zerocode_untyped_parent_error_remains_terminal,
+    settled_untyped_parent_error_preserves_operator_pause,
+    zerocode_settled_untyped_parent_error_preserves_operator_pause,
     Parent,
     Pause,
     Plain

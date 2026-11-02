@@ -276,6 +276,54 @@ pub fn ensure_server_materials_protected(
     Ok(materials)
 }
 
+/// The Subject Alternative Names carried by the current server leaf in `dir`
+/// (`server.crt`, as written by [`ensure_server_materials_protected`]), read
+/// from the certificate itself: DNS names verbatim, IP addresses in canonical
+/// text form - the same spelling callers pass as `server_sans`. `Ok(None)`
+/// when no leaf exists yet.
+///
+/// This lets a caller that cannot currently determine part of its desired SAN
+/// set (an unreachable identity source) keep the names the leaf already
+/// carries instead of regenerating it without them.
+pub fn server_leaf_sans(dir: &Path) -> Result<Option<Vec<String>>> {
+    use x509_parser::prelude::*;
+    let path = dir.join("server.crt");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let ders = crate::load_certs(&path.to_string_lossy())?;
+    let der = ders
+        .first()
+        .with_context(|| format!("{} holds no certificate", path.display()))?;
+    let (_, cert) = X509Certificate::from_der(der.as_ref())
+        .map_err(|e| anyhow::Error::msg(format!("parsing {}: {e}", path.display())))?;
+    let mut sans = Vec::new();
+    if let Some(ext) = cert
+        .subject_alternative_name()
+        .map_err(|e| anyhow::Error::msg(format!("reading SANs of {}: {e}", path.display())))?
+    {
+        for name in &ext.value.general_names {
+            match name {
+                GeneralName::DNSName(d) => sans.push((*d).to_string()),
+                GeneralName::IPAddress(bytes) => {
+                    let ip = match bytes.len() {
+                        4 => <[u8; 4]>::try_from(*bytes).map(std::net::IpAddr::from).ok(),
+                        16 => <[u8; 16]>::try_from(*bytes)
+                            .map(std::net::IpAddr::from)
+                            .ok(),
+                        _ => None,
+                    };
+                    if let Some(ip) = ip {
+                        sans.push(ip.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(Some(sans))
+}
+
 /// Issue a client certificate signed by the CA whose PEM cert + key are given.
 /// The returned key is generated fresh (server-side keygen path, e.g. the
 /// operator `issue-client-cert` CLI); the subject CN is the device identity.
@@ -637,6 +685,29 @@ mod tests {
             ca_before,
             std::fs::read_to_string(dir.path().join("ca.crt")).unwrap(),
             "CA must not rotate when only SANs change"
+        );
+    }
+
+    #[test]
+    fn server_leaf_sans_reads_the_leaf_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(server_leaf_sans(dir.path()).unwrap(), None);
+
+        let sans: Vec<String> = vec![
+            "localhost".into(),
+            "127.0.0.1".into(),
+            "node.tailnet.ts.net".into(),
+            "fd7a:115c:a1e0::1".into(),
+        ];
+        ensure_server_materials(dir.path(), &sans).unwrap();
+        assert_eq!(server_leaf_sans(dir.path()).unwrap(), Some(sans));
+
+        // Default leaf (no explicit SANs) reports the defaults.
+        let dir = tempfile::tempdir().unwrap();
+        ensure_server_materials(dir.path(), &[]).unwrap();
+        assert_eq!(
+            server_leaf_sans(dir.path()).unwrap(),
+            Some(default_server_sans())
         );
     }
 

@@ -1518,7 +1518,10 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, None, model)
             .await
-            .map(|response| response.text.unwrap_or_default())
+            .map(|response| {
+                crate::dispatch::accounting::observe_string_usage(response.usage);
+                response.text.unwrap_or_default()
+            })
     }
 
     async fn chat_with_history(
@@ -2033,6 +2036,45 @@ mod tests {
 
         assert!(events.is_empty());
         assert!(state.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_codex_request_and_text() {
+        let (mut provider, captured, server, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
+                "output_text": "ok", "output": [],
+                "usage": {"input_tokens": 8, "output_tokens": 3}
+            }))])
+            .await;
+        provider.multimodal.max_images = 1;
+        let dispatch = crate::dispatch::ProviderDispatch::new(std::sync::Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let message = format!("hello [IMAGE:{image}] [IMAGE:{image}]");
+        let text = scope
+            .scope(dispatch.chat_with_system(Some("system"), &message, "gpt-5-codex", Some(0.4)))
+            .await
+            .unwrap();
+        let report = scope.take();
+        server.abort();
+        assert_eq!(text, "ok");
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["model"], "gpt-5-codex");
+        assert_eq!(requests[0]["instructions"], "system");
+        assert!(requests[0]["input"].to_string().contains("hello"));
+        assert_eq!(
+            requests[0]["input"]
+                .to_string()
+                .matches("input_image")
+                .count(),
+            1
+        );
+        assert!(requests[0].get("temperature").is_none());
     }
 
     #[tokio::test]

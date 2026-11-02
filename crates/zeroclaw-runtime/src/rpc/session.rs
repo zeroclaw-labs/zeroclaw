@@ -1321,6 +1321,7 @@ impl SessionStore {
         id: &str,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
+        let explicit_model_selection = patch.model.is_some() || patch.model_provider.is_some();
         let merged = self.preview_overrides(id, &patch).await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(id)?;
@@ -1332,6 +1333,9 @@ impl SessionStore {
         let mut guard = agent.lock().await;
         if let Some(ref m) = overrides.model {
             guard.set_model_name(m.clone());
+        }
+        if explicit_model_selection {
+            guard.disable_automatic_model_routing();
         }
         if overrides.temperature.is_some() {
             guard.set_temperature(overrides.temperature);
@@ -1349,6 +1353,7 @@ impl SessionStore {
         generation: u64,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
+        let explicit_model_selection = patch.model.is_some() || patch.model_provider.is_some();
         let done = self.wait_test_gate().await;
         let merged = match self.preview_overrides(id, &patch).await {
             Some(merged) => merged,
@@ -1377,6 +1382,9 @@ impl SessionStore {
         let mut guard = agent.lock().await;
         if let Some(ref m) = overrides.model {
             guard.set_model_name(m.clone());
+        }
+        if explicit_model_selection {
+            guard.disable_automatic_model_routing();
         }
         if overrides.temperature.is_some() {
             guard.set_temperature(overrides.temperature);
@@ -1857,6 +1865,16 @@ impl SessionStore {
 
     pub async fn list_ids(&self) -> Vec<String> {
         self.sessions.lock().await.keys().cloned().collect()
+    }
+
+    /// Keep incarnation retirement and its ledger projection under the same
+    /// map guard. The closure must not await or acquire this map again.
+    pub(crate) async fn with_current_sessions<R>(
+        &self,
+        read: impl FnOnce(&HashMap<String, RpcSession>) -> R,
+    ) -> R {
+        let sessions = self.sessions.lock().await;
+        read(&sessions)
     }
 
     pub async fn list_ids_for_owner(&self, owner_tui_id: &str) -> Vec<String> {
