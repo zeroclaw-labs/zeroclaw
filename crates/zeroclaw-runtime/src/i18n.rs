@@ -2573,6 +2573,8 @@ mod tests {
         const VERSION: &str = "0.0.0";
         const DESCRIPTION: &str = "a tool";
         const ERROR: &str = "failed to instantiate: type mismatch (hint: rebuild against wit/v0)";
+        const CONFIG_ERROR: &str = "invalid plugin config: plugin 'tool-fixture' has configured values but declares no config_schema";
+        const KEY: &str = "zpi1_WyJ0b29sLWZpeHR1cmUiLCJ0b29sIiwidG9vbC1maXh0dXJlIl0";
 
         let row = [
             ("name", NAME),
@@ -2588,7 +2590,7 @@ mod tests {
         /// One parity case: the Fluent key, its arguments, and the substrings
         /// every locale's rendering must contain.
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
-        let cases: [ParityCase; 7] = [
+        let cases: [ParityCase; 8] = [
             (
                 "cli-plugin-list-entry-loads",
                 &row,
@@ -2606,6 +2608,11 @@ mod tests {
             ),
             ("cli-plugin-info-load-ok", &[], &["WIT"]),
             ("cli-plugin-info-load-failed", &[("error", ERROR)], &[ERROR]),
+            (
+                "cli-plugin-info-load-config-refused",
+                &[("error", CONFIG_ERROR), ("key", KEY)],
+                &["WIT", CONFIG_ERROR, KEY, "config_schema"],
+            ),
             ("cli-plugin-info-load-not-applicable", &[], &[]),
             (
                 "cli-plugin-info-load-failed-exit",

@@ -25,7 +25,7 @@
 let
   # Keep in sync with the workspace version (`Cargo.toml [workspace.package]`)
   # and the Rust packages in `flake.nix`.
-  version = "0.8.6";
+  version = "0.8.7";
 
   cargoLock = {
     lockFile = ../Cargo.lock;

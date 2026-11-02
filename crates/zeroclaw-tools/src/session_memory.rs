@@ -48,6 +48,17 @@ impl SessionMemoryRoute {
         }
     }
 
+    /// Whether [`Self::pin`] would accept `memory`, without pinning: an
+    /// unpinned route or one already pinned to this same handle.
+    pub fn check_pin(&self, memory: &Arc<dyn Memory>) -> anyhow::Result<()> {
+        match self.routed.get() {
+            Some(current) if !Arc::ptr_eq(&current.memory, memory) => anyhow::bail!(
+                "session memory is already routed to another plane; refusing to re-route"
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// The routed memory, once the session is pinned.
     pub fn routed(&self) -> Option<&RoutedMemory> {
         self.routed.get()
@@ -109,6 +120,19 @@ mod tests {
         assert!(Arc::ptr_eq(&route.routed().unwrap().memory, &owner));
         assert!(route.pin(none_memory(), security).is_err());
         assert!(Arc::ptr_eq(&route.routed().unwrap().memory, &owner));
+    }
+
+    #[test]
+    fn a_route_check_matches_pin_without_pinning() {
+        let route = SessionMemoryRoute::default();
+        let owner = none_memory();
+        route.check_pin(&owner).unwrap();
+        assert!(route.routed().is_none(), "a check must not pin the route");
+        route
+            .pin(Arc::clone(&owner), Arc::new(SecurityPolicy::default()))
+            .unwrap();
+        route.check_pin(&owner).unwrap();
+        assert!(route.check_pin(&none_memory()).is_err());
     }
 
     #[test]
