@@ -10455,6 +10455,9 @@ async fn process_channel_message_body(
     let recovery = zeroclaw_runtime::agent::loop_::ToolLoopRecovery::default();
     let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
+            // TurnState owns synchronization for one invocation. Reusing the
+            // logical-turn aggregate would replay prior results into history.
+            let mut invocation_messages = Vec::new();
             let thread_scope_id = msg
                 .interruption_scope_id
                 .clone()
@@ -10526,7 +10529,7 @@ async fn process_channel_message_body(
                     .map(|_| tool_receipts_collector.as_ref()),
                 event_tx: None,
                 steering: None,
-                new_messages_out: Some(&mut completed_turn_messages),
+                new_messages_out: Some(&mut invocation_messages),
                 image_cache: None,
                 memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
                     handle: ctx.memory.as_ref(),
@@ -10588,6 +10591,9 @@ async fn process_channel_message_body(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await;
+            // The future has ended, including interrupted closeout. Retain its
+            // delta once before any terminal path or model-switch continuation.
+            completed_turn_messages.append(&mut invocation_messages);
 
             if let LlmExecutionResult::Completed(Err(ref e)) = loop_result
                 && let Some((new_model_provider, new_model)) = is_model_switch_requested(e)
@@ -58784,6 +58790,331 @@ Done."#;
         async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
             self.0.fetch_add(1, Ordering::SeqCst);
             MockPriceTool.execute(args).await
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RecoverySwitchEnd {
+        Complete,
+        Timeout,
+        Error,
+        Cancel,
+    }
+
+    struct RecoverySwitchProvider {
+        native: bool,
+        end: RecoverySwitchEnd,
+        cancellation: CancellationToken,
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    impl RecoverySwitchProvider {
+        async fn respond(
+            &self,
+            messages: &[ChatMessage],
+            model: &str,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let index = {
+                let mut requests = self.requests.lock().unwrap();
+                let index = requests.len();
+                requests.push(messages.to_vec());
+                index
+            };
+            assert_eq!(
+                model,
+                if index < 2 {
+                    "test-model"
+                } else {
+                    "switched-model"
+                }
+            );
+            if index == 0 {
+                // Spend part of the one logical-turn deadline before switching.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            if index == 3 {
+                match self.end {
+                    RecoverySwitchEnd::Complete => {}
+                    RecoverySwitchEnd::Timeout => return std::future::pending().await,
+                    RecoverySwitchEnd::Error => {
+                        anyhow::bail!("synthetic terminal provider failure")
+                    }
+                    RecoverySwitchEnd::Cancel => {
+                        self.cancellation.cancel();
+                        return std::future::pending().await;
+                    }
+                }
+            }
+            let call = match index {
+                0 => Some((
+                    "before-switch",
+                    "mock_price",
+                    serde_json::json!({"symbol": "BTC"}),
+                )),
+                1 => Some((
+                    "switch-call",
+                    "model_switch",
+                    serde_json::json!({
+                        "action": "set", "model_provider": "openrouter.default", "model": "switched-model"
+                    }),
+                )),
+                2 => Some((
+                    "after-switch",
+                    "mock_price",
+                    serde_json::json!({"symbol": "BTC", "phase": "after"}),
+                )),
+                _ => None,
+            };
+            let (text, tool_calls) = match call {
+                Some((id, name, arguments)) if self.native => (
+                    None,
+                    vec![zeroclaw_providers::ToolCall {
+                        id: id.into(),
+                        name: name.into(),
+                        arguments: arguments.to_string(),
+                        extra_content: None,
+                    }],
+                ),
+                Some((_, name, arguments)) => (
+                    Some(format!(
+                        "<tool_call>\n{}\n</tool_call>",
+                        serde_json::json!({
+                            "name": name, "arguments": arguments
+                        })
+                    )),
+                    Vec::new(),
+                ),
+                None => (
+                    Some("Used the completed results without repeating operations.".into()),
+                    Vec::new(),
+                ),
+            };
+            Ok(zeroclaw_providers::ChatResponse {
+                text,
+                tool_calls,
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RecoverySwitchProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ToolCallingModelProvider.role()
+        }
+        fn alias(&self) -> &str {
+            "recovery-switch-provider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RecoverySwitchProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("fixture expects conversation history")
+        }
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: self.native,
+                ..Default::default()
+            }
+        }
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            model: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self
+                .respond(messages, model)
+                .await?
+                .text
+                .unwrap_or_default())
+        }
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            model: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.respond(request.messages, model).await
+        }
+    }
+
+    fn assert_switch_results_once(history: &[ChatMessage], native: bool, after_switch: bool) {
+        let expected_results = if after_switch { 2 } else { 1 };
+        assert_eq!(
+            history
+                .iter()
+                .filter(|m| {
+                    m.role == if native { "tool" } else { "user" } && m.content.contains("65000")
+                })
+                .count(),
+            expected_results,
+            "completed results duplicated or missing: {history:?}"
+        );
+        if native {
+            let ids: &[&str] = if after_switch {
+                &["before-switch", "switch-call", "after-switch"]
+            } else {
+                &["before-switch", "switch-call"]
+            };
+            for id in ids {
+                for role in ["assistant", "tool"] {
+                    assert_eq!(
+                        history
+                            .iter()
+                            .filter(|m| m.role == role && m.content.contains(id))
+                            .count(),
+                        1,
+                        "{role} record {id} duplicated or missing: {history:?}"
+                    );
+                }
+            }
+        } else {
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|m| m.role == "user"
+                        && m.content.starts_with("[Tool results]")
+                        && m.content.contains("65000"))
+                    .count(),
+                expected_results
+            );
+        }
+    }
+
+    async fn assert_channel_recovery_model_switch(native: bool, end: RecoverySwitchEnd) {
+        let channel = Arc::new(RecordingChannel::default());
+        let cancellation = CancellationToken::new();
+        let provider = Arc::new(RecoverySwitchProvider {
+            native,
+            end,
+            cancellation: cancellation.clone(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap()
+            .model = Some("switched-model".into());
+        let switch_tool = zeroclaw_runtime::tools::ModelSwitchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(config.clone()),
+        );
+        let mut ctx = test_runtime_ctx_with_observer_and_tools(
+            channel.clone(),
+            provider.clone(),
+            config,
+            Default::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![
+                Box::new(RecoveryCountingTool(executions.clone())),
+                Box::new(switch_tool),
+            ],
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let c = Arc::get_mut(&mut ctx).unwrap();
+            c.message_timeout_secs = 3;
+            c.pacing.message_timeout_scale_max = Some(1);
+            c.workspace_dir = Arc::new(tmp.path().to_path_buf());
+            c.session_store = Some(Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap()));
+            // Use the real switch resolution/cache path without network construction.
+            c.provider_cache.lock().unwrap().insert(
+                provider_cache_key("openrouter.default", None, 0),
+                provider.clone(),
+            );
+        }
+        let message = ChannelMessage {
+            id: "switch-first".into(),
+            sender: "operator".into(),
+            reply_target: "operator".into(),
+            content: "Complete the operation, switch models, then finish.".into(),
+            channel: channel.name().into(),
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        process_channel_message(ctx.clone(), message.clone(), cancellation).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 2, "{end:?}");
+        {
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 4, "{end:?}");
+            assert_switch_results_once(&requests[2], native, false);
+            assert_switch_results_once(&requests[3], native, true);
+        }
+        if matches!(end, RecoverySwitchEnd::Timeout) {
+            // Three seconds total plus the existing five-second closeout bound,
+            // not a fresh three-second budget after the two-second first provider.
+            assert_eq!(started.elapsed(), Duration::from_secs(8));
+        }
+        ctx.conversation_histories.lock().unwrap().clear();
+        process_channel_message(
+            ctx.clone(),
+            ChannelMessage {
+                id: "switch-resume".into(),
+                content: "Use recorded results; do not repeat operations.".into(),
+                ..message
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_switch_results_once(&requests[4], native, true);
+        if !matches!(end, RecoverySwitchEnd::Complete) {
+            assert_eq!(
+                requests[4]
+                    .iter()
+                    .filter(|m| m.content.contains("do not repeat completed changes"))
+                    .count(),
+                1,
+                "interruption marker must survive one SQLite reload: {:?}",
+                requests[4]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_recovery_model_switch_native_completion_keeps_each_result_once() {
+        assert_channel_recovery_model_switch(true, RecoverySwitchEnd::Complete).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_recovery_model_switch_prompt_completion_keeps_each_result_once() {
+        assert_channel_recovery_model_switch(false, RecoverySwitchEnd::Complete).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_recovery_model_switch_native_interruptions_keep_each_result_once() {
+        for end in [
+            RecoverySwitchEnd::Timeout,
+            RecoverySwitchEnd::Error,
+            RecoverySwitchEnd::Cancel,
+        ] {
+            assert_channel_recovery_model_switch(true, end).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_recovery_model_switch_prompt_interruptions_keep_each_result_once() {
+        for end in [
+            RecoverySwitchEnd::Timeout,
+            RecoverySwitchEnd::Error,
+            RecoverySwitchEnd::Cancel,
+        ] {
+            assert_channel_recovery_model_switch(false, end).await;
         }
     }
 
