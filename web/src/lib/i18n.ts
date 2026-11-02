@@ -816,7 +816,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'pairing.unpaired_title': "This browser isn't paired yet",
     'personality.chars': "chars",
     'personality.conflict_message': "changed on disk while you were editing. Pick how to resolve:",
-    'personality.editor_intro': "These markdown files shape your agent's voice and context. The runtime reads them at every request, so changes take effect on the next message — no daemon reload needed.",
+    'personality.editor_intro': "These markdown files shape your agent's voice and context. Dashboard and CLI sessions pick up changes on the next message. Channel agents read them when the daemon starts — restart the daemon (or call /admin/reload) to push an edit to channels.",
     'personality.empty': "(empty)",
     'personality.insert_template': "Insert template",
     'personality.insert_template_title': "Fill this tab with the default starter template",
