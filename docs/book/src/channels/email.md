@@ -77,3 +77,5 @@ Email isn't optimised for conversational latency. Expect:
 ## Safety
 
 Email has no auth at the protocol level beyond SMTP's envelope; anyone can claim to be anyone. Gate inbound senders with a peer group (above) before exposing the agent to an inbox that receives public mail.
+
+Automatic mail is never answered, following RFC 3834: a message with an `Auto-Submitted` header other than `no`, `Precedence: bulk`, `list` or `junk`, or a `List-Id` or `List-Unsubscribe` header is dropped before the peer-group check, so out-of-office replies, bounces and newsletters cannot start a turn or a mail loop. Each drop is logged as a `skip` event with `reason` set to `auto_submitted`, `precedence` or `mailing_list`; mail from a sender outside the peer group is logged as a `reject` event with `reason = "not_allowlisted"`. Both carry the `channel`, `alias`, `sender` and `subject`.
