@@ -96,13 +96,18 @@ impl SeatbeltSandbox {
         let read_write = resolve_roots(read_write)?;
         let read_only = resolve_roots(read_only)?;
         let write_only = resolve_roots(write_only)?;
+        let forbidden = resolve_roots(forbidden)?;
+        let home = home
+            .filter(|home| home.is_absolute())
+            .map(|home| resolve_policy_root(home, &mut symlinks))
+            .transpose()?;
         let mut policy = generate_policy_for_home(
             &workspace,
             &read_write,
             &read_only,
             &write_only,
-            forbidden,
-            home,
+            &forbidden,
+            home.as_deref(),
         );
         // Traversal must survive tier denials, without granting the contents of
         // a regular file that replaces a configured symlink after construction.
@@ -1130,6 +1135,208 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    fn check_production_home_aliases(test_name: &str, symlink_home: bool) {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        const FIXTURE_ENV: &str = "ZEROCLAW_TEST_SEATBELT_HOME_FIXTURE";
+        let Some(root) = std::env::var_os(FIXTURE_ENV).map(PathBuf::from) else {
+            // Change HOME only in the child process, never in the parallel test runner.
+            let fixture = HomeFixture::new("forbidden-home-aliases");
+            let root = fixture.path.canonicalize().unwrap();
+            let home = root.join("home.with.dots\"quoted");
+            for directory in [".cargo/bin", ".private-secrets", ".ssh"] {
+                std::fs::create_dir_all(home.join(directory)).unwrap();
+            }
+            std::fs::create_dir(root.join("workspace")).unwrap();
+            std::fs::create_dir_all(root.join("other-home/.cargo")).unwrap();
+            std::fs::write(home.join(".cargo/config.toml"), "tool-config-ok").unwrap();
+            std::fs::write(home.join(".private-secrets/token"), "fixture-secret").unwrap();
+            std::fs::write(home.join(".ssh/id_fixture"), "fixture-secret").unwrap();
+            std::fs::write(root.join("other-home/.cargo/config.toml"), "fixture-secret").unwrap();
+            let tool = home.join(".cargo/bin/config-probe");
+            std::fs::write(&tool, "#!/bin/sh\ncat \"$HOME/.cargo/config.toml\"\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::os::unix::fs::symlink(".private-secrets", home.join("vault-link")).unwrap();
+            // This target is created only after the production constructor resolves it.
+            std::os::unix::fs::symlink(".later-secrets", home.join("later-link")).unwrap();
+            let process_home = if symlink_home {
+                let alias = root.join("home-alias");
+                std::os::unix::fs::symlink(&home, &alias).unwrap();
+                alias
+            } else {
+                home
+            };
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(FIXTURE_ENV, &root)
+                .env("HOME", &process_home)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "production HOME case failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let workspace = root.join("workspace");
+        let sandbox = SeatbeltSandbox::with_roots(
+            Some(&workspace),
+            &[],
+            &[],
+            &[],
+            &[home.join("vault-link"), home.join("later-link/new")],
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join(".later-secrets/new")).unwrap();
+        std::fs::write(home.join(".later-secrets/new/token"), "fixture-secret").unwrap();
+        std::fs::write(home.join(".later-secrets/allowed.txt"), "tool-config-ok").unwrap();
+        for (index, command) in [
+            r#"cat "$HOME/.cargo/config.toml""#,
+            r#"exec "$HOME/.cargo/bin/config-probe""#,
+            r#"cat "$HOME/.later-secrets/allowed.txt""#,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let script = workspace.join(format!("allowed-{index}.sh"));
+            std::fs::write(&script, command).unwrap();
+            let output = sandboxed_sh(&sandbox, &workspace, r#"exec /bin/sh "$0""#, &script);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"tool-config-ok");
+        }
+        for (index, path) in [
+            "vault-link/token",
+            ".private-secrets/token",
+            "later-link/new/token",
+            ".later-secrets/new/token",
+            ".ssh/id_fixture",
+            "../other-home/.cargo/config.toml",
+        ]
+        .iter()
+        .enumerate()
+        {
+            // The command names only an admitted workspace script. The protected
+            // path is opened inside that program, beyond shell argument scanning.
+            let script = workspace.join(format!("denied-{index}.sh"));
+            std::fs::write(&script, format!("cat \"$HOME/{path}\"\n")).unwrap();
+            let output = sandboxed_sh(&sandbox, &workspace, r#"exec /bin/sh "$0""#, &script);
+            assert!(
+                !output.status.success(),
+                "protected path {path} was readable"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "protected contents must not escape"
+            );
+        }
+        if symlink_home {
+            std::fs::remove_file(&home).unwrap();
+            std::os::unix::fs::symlink(root.join("other-home"), &home).unwrap();
+            let output = sandboxed_sh(
+                &sandbox,
+                &workspace,
+                r#"cat "$0""#,
+                &home.join(".cargo/config.toml"),
+            );
+            assert!(
+                !output.status.success(),
+                "retargeted HOME must not gain a grant"
+            );
+            assert!(output.stdout.is_empty());
+        }
+    }
+
+    #[test]
+    fn seatbelt_production_constructor_denies_forbidden_aliases() {
+        check_production_home_aliases(
+            "security::seatbelt::tests::seatbelt_production_constructor_denies_forbidden_aliases",
+            false,
+        );
+    }
+
+    #[test]
+    fn seatbelt_production_constructor_resolves_symlink_home() {
+        check_production_home_aliases(
+            "security::seatbelt::tests::seatbelt_production_constructor_resolves_symlink_home",
+            true,
+        );
+    }
+
+    #[test]
+    fn seatbelt_home_and_forbidden_resolution_errors_are_propagated() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let cycle = fixture.path().join("cycle");
+        std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+        let file_child = fixture.path().join("file/child");
+        std::fs::write(fixture.path().join("file"), "fixture").unwrap();
+        for (forbidden, home, expected_kind) in [
+            (
+                vec![cycle.clone()],
+                Some(fixture.path()),
+                std::io::ErrorKind::Other,
+            ),
+            (vec![], Some(cycle.as_path()), std::io::ErrorKind::Other),
+            (
+                vec![file_child.clone()],
+                Some(fixture.path()),
+                std::io::ErrorKind::NotADirectory,
+            ),
+            (
+                vec![],
+                Some(file_child.as_path()),
+                std::io::ErrorKind::NotADirectory,
+            ),
+        ] {
+            let error = SeatbeltSandbox::with_roots_for_home(
+                Some(fixture.path()),
+                &[],
+                &[],
+                &[],
+                &forbidden,
+                home,
+            )
+            .err()
+            .expect("root resolution errors must reject construction");
+            assert_eq!(error.kind(), expected_kind);
+            if expected_kind == std::io::ErrorKind::Other {
+                assert!(error.to_string().contains("symlink limit exceeded"));
+            }
+        }
+    }
+
+    #[test]
+    fn seatbelt_constructor_preserves_absent_and_relative_home_no_grant() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        for home in [None, Some(Path::new("relative-home"))] {
+            let sandbox = SeatbeltSandbox::with_roots_for_home(
+                Some(fixture.path()),
+                &[],
+                &[],
+                &[],
+                &[],
+                home,
+            )
+            .unwrap();
+            let policy = std::fs::read_to_string(&sandbox.policy_path).unwrap();
+            assert!(!policy.contains("(allow file-read* (prefix "));
         }
     }
 
