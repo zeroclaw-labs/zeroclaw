@@ -688,6 +688,28 @@ mod tests {
     }
 
     #[test]
+    fn speech_to_speech_alias_projects_under_its_ingress_identity() {
+        // Configuration, inbound topics (`speech_to_speech/<alias>`), attribution
+        // records and this projection must name the channel the same way. While
+        // they disagreed, discovery reported no configured alias for a channel
+        // that was configured, and the setup link pointed at a page that does
+        // not exist.
+        let registry = build_registry(&[configured("speech_to_speech", "desk", true)]);
+        let kind = registry
+            .channels
+            .iter()
+            .find(|c| c.channel == "speech_to_speech")
+            .expect("speech_to_speech must appear in the channel projection");
+        assert!(
+            kind.configured,
+            "a configured alias must mark its own channel kind as configured"
+        );
+        assert_eq!(kind.aliases.len(), 1);
+        assert!(kind.aliases.iter().any(|a| a.alias == "desk" && a.enabled));
+        assert_eq!(kind.setup_path, "/config/channels/speech_to_speech");
+    }
+
+    #[test]
     fn condition_field_presence_matches_payload_contract() {
         // A source exposes a `condition` config field iff it carries a payload
         // contract. This is the anti-drift guard: add a `condition` field to a
