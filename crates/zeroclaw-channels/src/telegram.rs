@@ -44,6 +44,10 @@ static ORPHAN_THINK_TAG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyL
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+/// `sendRichMessage` text limit, in UTF-8 characters.
+const TELEGRAM_RICH_MAX_MESSAGE_LENGTH: usize = 32_768;
+/// Bot API rich tables accept at most this many columns.
+const TELEGRAM_RICH_MAX_TABLE_COLUMNS: usize = 20;
 
 /// Prefix for synthetic draft ids returned by `send_draft` in MultiMessage mode.
 const TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
@@ -61,10 +65,25 @@ struct MultiDraftKey {
 #[derive(Debug)]
 struct SendChunksError {
     delivered: usize,
+    /// HTML messages already accepted for `chunks[delivered]` after
+    /// `sendRichMessage` was rejected. A resume must continue that HTML
+    /// fallback instead of sending the rich chunk again.
+    html_fallback_skip: usize,
     /// The chunk failed because Telegram is still flood-limiting this chat.
     /// Callers must not resume or resend inside the penalty window.
     rate_limited: bool,
     source: anyhow::Error,
+}
+
+impl SendChunksError {
+    fn at(delivered: usize, rate_limited: bool, source: anyhow::Error) -> Self {
+        Self {
+            delivered,
+            html_fallback_skip: 0,
+            rate_limited,
+            source,
+        }
+    }
 }
 
 impl std::fmt::Display for SendChunksError {
@@ -140,6 +159,17 @@ struct MultiDraftState {
     /// split on the next flush before trusting `delivered_chunks` as a skip
     /// count, since tag-rewriting can change what the earlier chunks are.
     delivered_prefix: String,
+    /// HTML messages already accepted for the chunk at `delivered_chunks`
+    /// after `sendRichMessage` was rejected. The next flush resumes inside
+    /// that fallback instead of sending the accepted prefix again.
+    html_fallback_skip: usize,
+    /// Payload of the chunk `html_fallback_skip` belongs to. A mismatch on
+    /// the next flush drops the fallback position.
+    html_fallback_chunk: String,
+    /// Format used for the partial delivery that produced the progress above.
+    /// A resume must keep that format so chunk and HTML-fallback indexes stay
+    /// valid even if live `rich_messages` changes before the next flush.
+    delivery_rich: Option<bool>,
 }
 
 impl MultiDraftState {
@@ -152,6 +182,48 @@ impl MultiDraftState {
             last_sent_at: None,
             delivered_chunks: 0,
             delivered_prefix: String::new(),
+            html_fallback_skip: 0,
+            html_fallback_chunk: String::new(),
+            delivery_rich: None,
+        }
+    }
+
+    fn clear_delivery_progress(&mut self) {
+        self.delivered_chunks = 0;
+        self.delivered_prefix.clear();
+        self.html_fallback_skip = 0;
+        self.html_fallback_chunk.clear();
+        self.delivery_rich = None;
+    }
+
+    fn note_partial_delivery(
+        &mut self,
+        chunks: &[String],
+        rich: bool,
+        delivered: usize,
+        html_fallback_skip: usize,
+    ) {
+        self.delivered_chunks = delivered;
+        self.delivered_prefix = chunks
+            .iter()
+            .take(delivered)
+            .cloned()
+            .collect::<Vec<_>>()
+            .concat();
+        // Pin only when Telegram accepted something. A zero-progress failure
+        // must keep reading live config for the next attempt.
+        if delivered > 0 || html_fallback_skip > 0 {
+            self.delivery_rich = Some(rich);
+        } else {
+            self.delivery_rich = None;
+        }
+        if html_fallback_skip > 0 {
+            self.html_fallback_skip = html_fallback_skip;
+            self.html_fallback_chunk =
+                telegram_chunk_payload(chunks, delivered, rich).unwrap_or_default();
+        } else {
+            self.html_fallback_skip = 0;
+            self.html_fallback_chunk.clear();
         }
     }
 }
@@ -484,6 +556,961 @@ fn fit_telegram_bot_commands_to_body_budget(commands: &mut Vec<serde_json::Value
     dropped
 }
 
+struct MarkdownTableSpan {
+    start: usize,
+    end: usize,
+    columns: usize,
+}
+
+fn is_fence_delimiter(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn table_cells(line: &str) -> Option<Vec<&str>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let mut body = trimmed;
+    if let Some(rest) = body.strip_prefix('|') {
+        body = rest;
+    }
+    if let Some(rest) = body.strip_suffix('|') {
+        body = rest;
+    }
+    let cells: Vec<&str> = body.split('|').collect();
+    if cells.is_empty() { None } else { Some(cells) }
+}
+
+fn is_separator_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let core = trimmed.trim_matches(':');
+    core.len() >= 3 && core.chars().all(|ch| ch == '-')
+}
+
+fn separator_column_count(line: &str) -> Option<usize> {
+    let cells = table_cells(line)?;
+    if cells.iter().all(|cell| is_separator_cell(cell)) {
+        Some(cells.len())
+    } else {
+        None
+    }
+}
+
+fn looks_like_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.contains('|') && separator_column_count(trimmed).is_none()
+}
+
+fn markdown_lines(text: &str) -> Vec<(usize, usize, &str)> {
+    let mut offset = 0usize;
+    let mut lines = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        let end = offset + line.len();
+        offset = end;
+        lines.push((start, end, line.trim_end_matches(['\r', '\n'])));
+    }
+    lines
+}
+
+/// GitHub-flavored tables that are not inside a fence.
+fn markdown_table_spans(text: &str) -> Vec<MarkdownTableSpan> {
+    let lines = markdown_lines(text);
+    let mut spans = Vec::new();
+    let mut in_fence = false;
+    let mut index = 0usize;
+    while index < lines.len() {
+        let (_, _, content) = lines[index];
+        if is_fence_delimiter(content) {
+            in_fence = !in_fence;
+            index += 1;
+            continue;
+        }
+        if !in_fence
+            && index + 1 < lines.len()
+            && looks_like_table_row(content)
+            && let Some(columns) = separator_column_count(lines[index + 1].2)
+        {
+            let start = lines[index].0;
+            let mut end = lines[index + 1].1;
+            let mut next = index + 2;
+            while next < lines.len() {
+                let row = lines[next].2;
+                if is_fence_delimiter(row) || !looks_like_table_row(row) {
+                    break;
+                }
+                end = lines[next].1;
+                next += 1;
+            }
+            spans.push(MarkdownTableSpan {
+                start,
+                end,
+                columns,
+            });
+            index = next;
+            continue;
+        }
+        index += 1;
+    }
+    spans
+}
+
+/// Fenced regions whose body contains a table separator.
+fn fenced_table_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let lines = markdown_lines(text);
+    let mut ranges = Vec::new();
+    let mut fence_start: Option<usize> = None;
+    let mut fence_has_separator = false;
+    for (start, end, content) in lines {
+        if is_fence_delimiter(content) {
+            if let Some(open) = fence_start.take() {
+                if fence_has_separator {
+                    ranges.push(open..end);
+                }
+                fence_has_separator = false;
+            } else {
+                fence_start = Some(start);
+            }
+            continue;
+        }
+        if fence_start.is_some() && separator_column_count(content).is_some() {
+            fence_has_separator = true;
+        }
+    }
+    ranges
+}
+
+fn protected_markdown_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges: Vec<std::ops::Range<usize>> = markdown_table_spans(text)
+        .into_iter()
+        .map(|span| span.start..span.end)
+        .collect();
+    ranges.extend(fenced_table_ranges(text));
+    ranges.sort_by_key(|range| range.start);
+    ranges.retain(|range| range.start < range.end);
+    ranges
+}
+
+/// Wrap tables wider than `max_columns` in a fence so they render as code.
+/// `max_columns == 0` wraps every table.
+fn wrap_markdown_tables(text: &str, max_columns: usize) -> String {
+    let spans = markdown_table_spans(text);
+    if spans
+        .iter()
+        .all(|span| max_columns > 0 && span.columns <= max_columns)
+    {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len() + spans.len() * 8);
+    let mut cursor = 0usize;
+    for span in spans {
+        out.push_str(&text[cursor..span.start]);
+        if max_columns > 0 && span.columns <= max_columns {
+            out.push_str(&text[span.start..span.end]);
+        } else {
+            let raw = &text[span.start..span.end];
+            let body = raw.trim_end_matches(['\n', '\r']);
+            let trailing = &raw[body.len()..];
+            out.push_str("```\n");
+            out.push_str(body);
+            out.push('\n');
+            out.push_str("```");
+            out.push_str(trailing);
+        }
+        cursor = span.end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Split plain text at `limit`, closing and reopening a code fence that
+/// crosses a chunk boundary so the next message does not leave the fence.
+fn split_plain_keeping_fences(message: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    if message.is_empty() {
+        return Vec::new();
+    }
+    if message.chars().count() <= limit {
+        return vec![message.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = message;
+    let mut in_code_block = false;
+    while !remaining.is_empty() {
+        let starts_in_code_block = in_code_block;
+        let reopen_len = if starts_in_code_block {
+            TELEGRAM_FENCE_REOPEN.chars().count()
+        } else {
+            0
+        };
+        if remaining.chars().count() + reopen_len <= limit {
+            chunks.push(build_telegram_chunk(remaining, starts_in_code_block, false));
+            break;
+        }
+        let close_reserve = TELEGRAM_FENCE_CLOSE.chars().count() + 1;
+        let room = limit
+            .saturating_sub(reopen_len)
+            .saturating_sub(close_reserve)
+            .max(1);
+        let hard = byte_index_after_chars(remaining, room.min(remaining.chars().count()));
+        let mut end = hard;
+        if let Some(pos) = remaining[..hard].rfind('\n') {
+            let candidate = pos + '\n'.len_utf8();
+            if remaining[..pos].chars().count() >= room / 2 && candidate > 0 {
+                end = candidate;
+            }
+        }
+        if end == 0 {
+            end = remaining.chars().next().map_or(1, char::len_utf8);
+        }
+        let raw = &remaining[..end];
+        in_code_block = code_block_state_after(raw, starts_in_code_block);
+        chunks.push(build_telegram_chunk(
+            raw,
+            starts_in_code_block,
+            in_code_block,
+        ));
+        remaining = &remaining[end..];
+    }
+    chunks
+}
+
+fn split_plain_for_limit(text: &str, limit: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let limit = limit.max(1);
+    let mut chunks = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.chars().count() <= limit {
+            chunks.push(rest.to_string());
+            break;
+        }
+        let hard = byte_index_after_chars(rest, limit);
+        let mut end = hard;
+        if let Some(pos) = rest[..hard].rfind('\n') {
+            let candidate = pos + '\n'.len_utf8();
+            if rest[..pos].chars().count() >= limit / 2 && candidate > 0 {
+                end = candidate;
+            }
+        }
+        if end == 0 {
+            end = rest.chars().next().map_or(1, char::len_utf8);
+        }
+        chunks.push(rest[..end].to_string());
+        rest = &rest[end..];
+    }
+    chunks
+}
+
+fn merge_into_last(chunks: &mut [String], parts: &mut Vec<String>, limit: usize) {
+    if parts.is_empty() {
+        return;
+    }
+    if let Some(last) = chunks.last_mut()
+        && !last.is_empty()
+        && last.chars().count() + parts[0].chars().count() <= limit
+    {
+        last.push_str(&parts.remove(0));
+    }
+}
+
+/// Split `message`, keeping `protected` byte ranges intact when they fit in
+/// `limit`. A protected table that does not fit breaks between rows and
+/// repeats its header. Ranges must be char boundaries and non-overlapping.
+fn split_message_protecting(
+    message: &str,
+    limit: usize,
+    protected: &[std::ops::Range<usize>],
+) -> Vec<String> {
+    if protected.is_empty() {
+        let parts = split_plain_keeping_fences(message, limit);
+        return if parts.is_empty() {
+            vec![String::new()]
+        } else {
+            parts
+        };
+    }
+
+    let mut chunks = Vec::new();
+    let mut cursor = 0usize;
+    for range in protected {
+        if range.start < cursor || range.end > message.len() || range.start > range.end {
+            continue;
+        }
+        if range.start > cursor {
+            let mut parts = split_plain_keeping_fences(&message[cursor..range.start], limit);
+            merge_into_last(&mut chunks, &mut parts, limit);
+            chunks.extend(parts);
+        }
+        let piece = &message[range.start..range.end];
+        append_limited_pieces(&mut chunks, piece, limit);
+        cursor = range.end;
+    }
+    if cursor < message.len() {
+        let mut parts = split_plain_keeping_fences(&message[cursor..], limit);
+        merge_into_last(&mut chunks, &mut parts, limit);
+        chunks.extend(parts);
+    }
+    if chunks.is_empty() {
+        vec![String::new()]
+    } else {
+        chunks
+    }
+}
+
+fn append_plain_telegram_chunks(chunks: &mut Vec<String>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let mut parts = split_message_for_telegram(text);
+    let limit = TELEGRAM_MAX_MESSAGE_LENGTH
+        .saturating_sub(telegram_chunk_marker_len(true, true))
+        .max(1);
+    if let (Some(last), Some(first)) = (chunks.last(), parts.first()) {
+        let open_fence = code_block_state_after(last, false);
+        if !open_fence && !last.is_empty() && last.chars().count() + first.chars().count() <= limit
+        {
+            merge_into_last(chunks, &mut parts, limit);
+        }
+    }
+    chunks.extend(parts);
+}
+
+fn append_protected_piece(chunks: &mut Vec<String>, piece: &str) {
+    let limit = TELEGRAM_MAX_MESSAGE_LENGTH
+        .saturating_sub(telegram_chunk_marker_len(true, true))
+        .max(1);
+    append_limited_pieces(chunks, piece, limit);
+}
+
+fn append_limited_pieces(chunks: &mut Vec<String>, piece: &str, limit: usize) {
+    if piece.is_empty() {
+        return;
+    }
+    let parts = split_oversized_table(piece, limit);
+    for part in parts {
+        if let Some(last) = chunks.last_mut() {
+            let open_fence = code_block_state_after(last, false);
+            if !open_fence
+                && !last.is_empty()
+                && last.chars().count() + part.chars().count() <= limit
+            {
+                last.push_str(&part);
+                continue;
+            }
+        }
+        chunks.push(part);
+    }
+}
+
+/// Keep a markdown table intact when it fits in `limit`. Otherwise break it
+/// between rows and repeat the header and separator on each continuation.
+/// A single row that still does not fit is split as plain text so later rows
+/// are not dropped. A fenced table is split as code, closing and reopening
+/// the fence on each piece.
+fn split_oversized_table(table: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    if table.chars().count() <= limit {
+        return vec![table.to_string()];
+    }
+    let Some((header, separator, rows)) = table_header_and_rows(table) else {
+        // An opening fence (a wide table wrapped as code, or a table the
+        // caller already fenced) is not a header row. Split that block as
+        // code so each piece closes and reopens the fence.
+        return split_plain_keeping_fences(table, limit);
+    };
+    let prefix = format!("{header}\n{separator}\n");
+    if prefix.chars().count() >= limit {
+        return split_plain_for_limit(table, limit);
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = prefix.clone();
+    let mut has_row = false;
+    for row in rows {
+        let row_line = format!("{row}\n");
+        if current.chars().count() + row_line.chars().count() <= limit {
+            current.push_str(&row_line);
+            has_row = true;
+            continue;
+        }
+        if has_row {
+            chunks.push(std::mem::take(&mut current));
+            current = prefix.clone();
+        }
+        if current.chars().count() + row_line.chars().count() <= limit {
+            current.push_str(&row_line);
+            has_row = true;
+            continue;
+        }
+        let mut oversized = current.clone();
+        oversized.push_str(&row_line);
+        chunks.extend(split_plain_for_limit(&oversized, limit));
+        current = prefix.clone();
+        has_row = false;
+    }
+    if has_row || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn table_header_and_rows(table: &str) -> Option<(String, String, Vec<String>)> {
+    let lines: Vec<&str> = table
+        .split_inclusive('\n')
+        .map(|line| line.trim_end_matches(['\r', '\n']))
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() < 2 || !looks_like_table_row(lines[0]) {
+        return None;
+    }
+    let separator = lines[1];
+    separator_column_count(separator)?;
+    let rows = lines[2..].iter().map(|line| (*line).to_string()).collect();
+    Some((lines[0].to_string(), separator.to_string(), rows))
+}
+
+/// Like [`split_message_for_telegram`], but a markdown table is not broken
+/// mid-row. A table that exceeds Telegram's text limit continues on the next
+/// message with its header repeated.
+fn split_message_for_telegram_keeping_tables(message: &str) -> Vec<String> {
+    let spans = markdown_table_spans(message);
+    if spans.is_empty() {
+        return split_message_for_telegram(message);
+    }
+    let mut chunks = Vec::new();
+    let mut cursor = 0usize;
+    for span in spans {
+        if span.start > cursor {
+            append_plain_telegram_chunks(&mut chunks, &message[cursor..span.start]);
+        }
+        append_protected_piece(&mut chunks, &message[span.start..span.end]);
+        cursor = span.end;
+    }
+    if cursor < message.len() {
+        append_plain_telegram_chunks(&mut chunks, &message[cursor..]);
+    }
+    if chunks.is_empty() {
+        vec![String::new()]
+    } else {
+        chunks
+    }
+}
+
+fn neutralize_rich_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    let mut math_block: Option<String> = None;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let newline = &line[content.len()..];
+        if math_block.is_some() {
+            if content.trim() == "$$" {
+                let rendered = math_block.take().unwrap_or_default();
+                out.push_str(rendered.trim_end_matches(['\n', '\r']));
+                out.push_str(newline);
+            } else if let Some(body) = math_block.as_mut() {
+                body.push_str(line);
+            }
+            continue;
+        }
+        if is_fence_delimiter(content) {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            continue;
+        }
+        if content.trim() == "$$" {
+            math_block = Some(String::new());
+            continue;
+        }
+        out.push_str(&neutralize_rich_line(content));
+        out.push_str(newline);
+    }
+    if let Some(body) = math_block {
+        out.push_str("$$");
+        out.push('\n');
+        out.push_str(&body);
+    }
+    out
+}
+
+fn neutralize_rich_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    while index < line.len() {
+        if bytes[index] == b'\\' {
+            let ch = line[index..].chars().next().unwrap_or('\\');
+            out.push(ch);
+            index += ch.len_utf8();
+            if index < line.len() {
+                let next = line[index..].chars().next().unwrap_or('\0');
+                out.push(next);
+                index += next.len_utf8();
+            }
+            continue;
+        }
+        if bytes[index] == b'`'
+            && let Some(end) = matching_backtick_span(&line[index..])
+        {
+            out.push_str(&line[index..index + end]);
+            index += end;
+            continue;
+        }
+        if bytes[index] == b'!'
+            && let Some((len, replacement)) = rewrite_markdown_image(&line[index..])
+        {
+            out.push_str(&replacement);
+            index += len;
+            continue;
+        }
+        if bytes[index] == b'$'
+            && let Some((len, inner)) = take_math_span(&line[index..])
+        {
+            out.push_str(inner);
+            index += len;
+            continue;
+        }
+        let Some(ch) = line[index..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+/// Length of a backtick span whose closer is the same length as its opener.
+/// ``echo "$HOME$"`` is one span; a single backtick must not close it.
+fn matching_backtick_span(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    if bytes.first() != Some(&b'`') {
+        return None;
+    }
+    let open = bytes.iter().take_while(|byte| **byte == b'`').count();
+    let mut search = open;
+    while search < bytes.len() {
+        if bytes[search] != b'`' {
+            search += 1;
+            continue;
+        }
+        let close = bytes[search..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        if close == open {
+            return Some(search + close);
+        }
+        search += close;
+    }
+    None
+}
+
+fn take_math_span(line: &str) -> Option<(usize, &str)> {
+    if let Some(rest) = line.strip_prefix("$$") {
+        let end = find_unescaped(rest, "$$")?;
+        if end == 0 {
+            return None;
+        }
+        Some((end + 4, &rest[..end]))
+    } else if let Some(rest) = line.strip_prefix('$') {
+        let end = find_unescaped(rest, "$")?;
+        if end == 0 {
+            return None;
+        }
+        let inner = &rest[..end];
+        // `$400 and $x^2$` must not become one span. A real inline span does not
+        // start or end with whitespace, and it does not close in front of a digit.
+        if inner.starts_with(char::is_whitespace) || inner.ends_with(char::is_whitespace) {
+            return None;
+        }
+        if rest[end + 1..].starts_with(|ch: char| ch.is_ascii_digit()) {
+            return None;
+        }
+        Some((end + 2, inner))
+    } else {
+        None
+    }
+}
+
+/// Byte index of `delimiter` whose first byte is not escaped.
+///
+/// `$a\$b$` closes on the final dollar. The `\$` stays inside the span.
+fn find_unescaped(text: &str, delimiter: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index += 1;
+            if index < bytes.len() {
+                let next = text[index..].chars().next().unwrap_or('\0');
+                index += next.len_utf8();
+            }
+            continue;
+        }
+        if text[index..].starts_with(delimiter) {
+            return Some(index);
+        }
+        let ch = text[index..].chars().next().unwrap_or('\0');
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn rewrite_markdown_image(text: &str) -> Option<(usize, String)> {
+    let rest = text.strip_prefix("![")?;
+    let bracket_end = rest.find(']')?;
+    let alt = &rest[..bracket_end];
+    let after_bracket = rest.get(bracket_end + 1..)?;
+    let url_body = after_bracket.strip_prefix('(')?;
+    let paren_end = matching_paren_end(url_body)?;
+    let url = &url_body[..paren_end];
+    if url.is_empty() {
+        return None;
+    }
+    let replacement = if alt.is_empty() {
+        url.to_string()
+    } else {
+        format!("[{alt}]({url})")
+    };
+    let len = 2 + bracket_end + 1 + 1 + paren_end + 1;
+    Some((len, replacement))
+}
+
+/// Byte index of the `)` that closes a markdown destination.
+///
+/// `![](https://example.com/a_(b).png)` keeps the parenthesis in the path.
+/// The wrapper's closer is the one that returns the depth to zero.
+fn matching_paren_end(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut depth = 1usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index += 1;
+            if index < bytes.len() {
+                let next = body[index..].chars().next().unwrap_or('\0');
+                index += next.len_utf8();
+            }
+            continue;
+        }
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        let ch = body[index..].chars().next().unwrap_or('\0');
+        index += ch.len_utf8();
+    }
+    None
+}
+
+/// Markdown passed to `sendRichMessage`. Strips math delimiters and image
+/// embeds, and fences tables that exceed the 20-column limit.
+fn prepare_rich_markdown(text: &str) -> String {
+    let neutralized = neutralize_rich_markdown(text);
+    wrap_markdown_tables(&neutralized, TELEGRAM_RICH_MAX_TABLE_COLUMNS)
+}
+
+fn project_rich_message(value: &serde_json::Value) -> Option<String> {
+    let blocks = value.get("blocks")?.as_array()?;
+    let text = project_blocks(blocks);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Visible body of an inbound Telegram message.
+///
+/// A plain `text` string wins. Rich-only messages, and messages whose `text`
+/// is itself a RichText value (string, array, or typed object), become
+/// GitHub-flavored markdown. Models and the WebUI already consume that form.
+fn incoming_message_text(message: &serde_json::Value) -> Option<String> {
+    if let Some(text) = message.get("text") {
+        let rendered = match text {
+            serde_json::Value::String(text) if !text.is_empty() => text.clone(),
+            serde_json::Value::String(_) => String::new(),
+            other => project_rich_text(other),
+        };
+        let trimmed = rendered.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    message.get("rich_message").and_then(project_rich_message)
+}
+
+fn project_blocks(blocks: &[serde_json::Value]) -> String {
+    blocks
+        .iter()
+        .map(project_block)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn project_block(block: &serde_json::Value) -> String {
+    let kind = block
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match kind {
+        "table" => project_table(block),
+        "list" => project_list(block),
+        "heading" => {
+            let size = block
+                .get("size")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1);
+            let level = usize::try_from(size).unwrap_or(1).clamp(1, 6);
+            let text = block.get("text").map(project_rich_text).unwrap_or_default();
+            format!("{} {text}", "#".repeat(level))
+        }
+        "pre" => {
+            let lang = block
+                .get("language")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let text = block.get("text").map(project_rich_text).unwrap_or_default();
+            format!("```{lang}\n{text}\n```")
+        }
+        "divider" => "---".to_string(),
+        "mathematical_expression" => block
+            .get("expression")
+            .map(project_rich_text)
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| project_nested_content(block)),
+        "block_quotation" | "expandable_block_quotation" | "pull_quotation" => {
+            project_nested_content(block)
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => project_nested_content(block),
+    }
+}
+
+fn project_nested_content(block: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = block.get("text") {
+        let rendered = project_rich_text(text);
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
+    }
+    if let Some(summary) = block.get("summary") {
+        let rendered = project_rich_text(summary);
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
+    }
+    if let Some(caption) = block.get("caption") {
+        let rendered = project_rich_text(caption);
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
+    }
+    if let Some(blocks) = block.get("blocks").and_then(serde_json::Value::as_array) {
+        let nested = project_blocks(blocks);
+        if !nested.is_empty() {
+            parts.push(nested);
+        }
+    }
+    parts.join("\n")
+}
+
+fn project_rich_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items.iter().map(project_rich_text).collect(),
+        serde_json::Value::Object(map) => project_rich_text_object(map),
+        _ => String::new(),
+    }
+}
+
+fn project_rich_text_object(map: &serde_json::Map<String, serde_json::Value>) -> String {
+    let kind = map
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let inner = map.get("text").map(project_rich_text).unwrap_or_default();
+    let formatted = match kind {
+        "bold" => wrap_markdown_affix("**", &inner, "**"),
+        "italic" => wrap_markdown_affix("*", &inner, "*"),
+        "strikethrough" => wrap_markdown_affix("~~", &inner, "~~"),
+        "code" => wrap_inline_code(&inner),
+        "url" | "text_link" | "email_address" | "phone_number" | "text_mention" => {
+            project_rich_link(map, &inner)
+        }
+        "mathematical_expression" => first_nonempty_field(map, &["expression", "latex", "source"])
+            .unwrap_or_else(|| inner.clone()),
+        "custom_emoji" => first_nonempty_field(map, &["alternative_text", "emoji"])
+            .unwrap_or_else(|| inner.clone()),
+        "button" => map
+            .get("button")
+            .map(project_rich_text)
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| inner.clone()),
+        _ => String::new(),
+    };
+    let body = if !formatted.is_empty() {
+        formatted
+    } else if !inner.is_empty() {
+        inner
+    } else {
+        first_nonempty_field(
+            map,
+            &["source", "expression", "latex", "value", "alternative_text"],
+        )
+        .unwrap_or_default()
+    };
+    match map.get("credit").map(project_rich_text) {
+        Some(credit) if !credit.is_empty() && !body.is_empty() => format!("{body} {credit}"),
+        Some(credit) if !credit.is_empty() => credit,
+        _ => body,
+    }
+}
+
+fn wrap_markdown_affix(prefix: &str, text: &str, suffix: &str) -> String {
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}{text}{suffix}")
+    }
+}
+
+fn wrap_inline_code(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    if text.contains('`') {
+        format!("`` {text} ``")
+    } else {
+        format!("`{text}`")
+    }
+}
+
+fn project_rich_link(map: &serde_json::Map<String, serde_json::Value>, inner: &str) -> String {
+    let href = first_nonempty_field(map, &["url", "email", "email_address", "phone_number"]);
+    match (inner.is_empty(), href) {
+        (true, Some(href)) => href,
+        (false, Some(href)) if href != inner => format!("[{inner}]({href})"),
+        _ => inner.to_string(),
+    }
+}
+
+fn first_nonempty_field(
+    map: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        map.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn project_list(block: &serde_json::Value) -> String {
+    let Some(items) = block.get("items").and_then(serde_json::Value::as_array) else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for item in items {
+        let has_checkbox = item
+            .get("has_checkbox")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let checked = item
+            .get("is_checked")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let label = item
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let marker = if has_checkbox {
+            if checked { "- [x]" } else { "- [ ]" }
+        } else if label.is_empty() {
+            "-"
+        } else {
+            label
+        };
+        let body = item
+            .get("blocks")
+            .and_then(serde_json::Value::as_array)
+            .map(|blocks| project_blocks(blocks))
+            .unwrap_or_default();
+        if body.is_empty() {
+            lines.push(marker.to_string());
+            continue;
+        }
+        let mut body_lines = body.lines();
+        if let Some(first) = body_lines.next() {
+            lines.push(format!("{marker} {first}"));
+            for extra in body_lines {
+                lines.push(format!("  {extra}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn project_table(block: &serde_json::Value) -> String {
+    let Some(rows) = block.get("cells").and_then(serde_json::Value::as_array) else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let Some(cells) = row.as_array() else {
+            continue;
+        };
+        let rendered: Vec<String> = cells
+            .iter()
+            .map(|cell| {
+                cell.get("text")
+                    .map(project_rich_text)
+                    .unwrap_or_default()
+                    .replace('\n', " ")
+            })
+            .collect();
+        lines.push(format!("| {} |", rendered.join(" | ")));
+        if row_index == 0 {
+            let separator = vec!["---"; rendered.len()].join(" | ");
+            lines.push(format!("| {separator} |"));
+        }
+    }
+    if let Some(caption) = block.get("caption") {
+        let caption = project_rich_text(caption);
+        if !caption.is_empty() {
+            lines.push(caption);
+        }
+    }
+    lines.join("\n")
+}
+
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 /// The split budget includes continuation markers and synthetic code fences
@@ -567,6 +1594,69 @@ fn format_telegram_text_chunk(chunk: &str, index: usize, total: usize) -> String
         format!("{TELEGRAM_CONTINUED_PREFIX}{chunk}")
     } else {
         format!("{TELEGRAM_CONTINUED_PREFIX}{chunk}{TELEGRAM_CONTINUES_SUFFIX}")
+    }
+}
+
+/// Chunk list `send_text_chunks_resuming` posts for `rich`.
+///
+/// Narration progress indexes this list. A skip computed from another
+/// splitter would drop or repeat text.
+fn delivery_chunks(message: &str, rich: bool) -> Vec<String> {
+    if !rich {
+        return split_message_for_telegram(message);
+    }
+    let prepared = prepare_rich_markdown(message);
+    let budget = TELEGRAM_RICH_MAX_MESSAGE_LENGTH
+        .saturating_sub(telegram_chunk_marker_len(true, true))
+        .max(1);
+    split_message_protecting(&prepared, budget, &protected_markdown_ranges(&prepared))
+}
+
+/// Text actually handed to one send call for `chunks[index]`.
+fn telegram_chunk_payload(chunks: &[String], index: usize, rich: bool) -> Option<String> {
+    let chunk = chunks.get(index)?;
+    let marked = format_telegram_text_chunk(chunk, index, chunks.len());
+    let limit = if rich {
+        TELEGRAM_RICH_MAX_MESSAGE_LENGTH
+    } else {
+        TELEGRAM_MAX_MESSAGE_LENGTH
+    };
+    Some(if marked.chars().count() <= limit {
+        marked
+    } else {
+        chunk.clone()
+    })
+}
+
+/// `(skip_chunks, html_fallback_skip)` for a narration resume.
+///
+/// Complete chunks are trusted only when their concatenation still matches
+/// `prefix`. An HTML fallback position is trusted only when the chunk it
+/// belongs to is still the resume point.
+fn narration_resume_cursor(
+    chunks: &[String],
+    rich: bool,
+    delivered: usize,
+    prefix: &str,
+    html_fallback_skip: usize,
+    html_fallback_chunk: &str,
+) -> (usize, usize) {
+    let complete =
+        delivered > 0 && chunks.len() >= delivered && chunks[..delivered].concat() == prefix;
+    let skip = if complete { delivered } else { 0 };
+    if html_fallback_skip == 0 || html_fallback_chunk.is_empty() {
+        return (skip, 0);
+    }
+    let index = if delivered == 0 {
+        0
+    } else if complete {
+        delivered
+    } else {
+        return (0, 0);
+    };
+    match telegram_chunk_payload(chunks, index, rich) {
+        Some(payload) if payload == html_fallback_chunk => (index, html_fallback_skip),
+        _ => (skip, 0),
     }
 }
 
@@ -984,6 +2074,8 @@ pub struct TelegramChannel {
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
     mention_only: bool,
+    /// When true, final replies use Bot API `sendRichMessage`.
+    rich_messages: bool,
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
@@ -2608,6 +3700,7 @@ impl TelegramChannel {
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            rich_messages: false,
             per_user_session: true,
             passive_group_context: false,
             bot_username: Mutex::new(None),
@@ -2676,6 +3769,36 @@ impl TelegramChannel {
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
         self
+    }
+
+    /// Send final replies with Bot API rich messages when `enabled`.
+    ///
+    /// Headings, lists, quotes, and tables then render natively. Some clients
+    /// still show those messages as unsupported, so callers leave this off
+    /// unless every client in use can render them.
+    ///
+    /// This value is only the fallback for a handle with no live-config
+    /// authority. A wired authority is read at send time.
+    pub fn with_rich_messages(mut self, enabled: bool) -> Self {
+        self.rich_messages = enabled;
+        self
+    }
+
+    /// Whether final replies use `sendRichMessage`.
+    ///
+    /// A long-lived channel reads `channels.telegram.<alias>.rich_messages`
+    /// from the live config. The constructor snapshot is used only when no
+    /// authority is wired, as with one-shot handles and tests.
+    fn rich_messages_enabled(&self) -> bool {
+        let Some(authority) = &self.persist else {
+            return self.rich_messages;
+        };
+        let config = authority.live_handle();
+        let cfg = config.read();
+        cfg.channels
+            .telegram
+            .get(&self.alias)
+            .is_some_and(|telegram| telegram.rich_messages)
     }
 
     /// Set by the orchestrator from `[channels.telegram.<alias>].per_user_session`.
@@ -2902,8 +4025,7 @@ impl TelegramChannel {
                 .map(str::to_string)
             else {
                 draft.sent_text = current;
-                draft.delivered_chunks = 0;
-                draft.delivered_prefix = String::new();
+                draft.clear_delivery_progress();
                 return Ok(());
             };
             let thread_id = draft.thread_id.clone().or(parsed_thread);
@@ -2919,27 +4041,40 @@ impl TelegramChannel {
             let mut drafts = self.multi_message_drafts.lock();
             if let Some(draft) = drafts.get_mut(&key) {
                 draft.sent_text = current;
-                draft.delivered_chunks = 0;
-                draft.delivered_prefix = String::new();
+                draft.clear_delivery_progress();
             }
             return Ok(());
         }
 
         self.pace_multi_message_send(last_sent_at).await;
 
-        let skip = {
+        // One format for this flush. Chunk indexes and the HTML fallback
+        // position both address that format's pieces. A partial delivery pins
+        // its format on the draft so a live reload cannot retarget them.
+        let saved_rich = {
+            let drafts = self.multi_message_drafts.lock();
+            drafts.get(&key).and_then(|d| d.delivery_rich)
+        };
+        let rich = saved_rich.unwrap_or_else(|| self.rich_messages_enabled());
+        let (skip, html_fallback_skip) = {
             let drafts = self.multi_message_drafts.lock();
             let d = drafts.get(&key);
             let delivered = d.map(|d| d.delivered_chunks).unwrap_or(0);
             let prefix = d.map(|d| d.delivered_prefix.clone()).unwrap_or_default();
-            let chunks = split_message_for_telegram(cleaned);
-            let ok = delivered > 0
-                && chunks.len() >= delivered
-                && chunks[..delivered].concat() == prefix;
-            if ok { delivered } else { 0 }
+            let html_skip = d.map(|d| d.html_fallback_skip).unwrap_or(0);
+            let html_chunk = d.map(|d| d.html_fallback_chunk.clone()).unwrap_or_default();
+            let chunks = delivery_chunks(cleaned, rich);
+            narration_resume_cursor(&chunks, rich, delivered, &prefix, html_skip, &html_chunk)
         };
         match self
-            .send_text_chunks(cleaned, &chat_id, thread_id.as_deref(), skip)
+            .send_text_chunks_resuming(
+                cleaned,
+                &chat_id,
+                thread_id.as_deref(),
+                skip,
+                html_fallback_skip,
+                rich,
+            )
             .await
         {
             Ok(_) => {
@@ -2947,26 +4082,25 @@ impl TelegramChannel {
                 if let Some(draft) = drafts.get_mut(&key) {
                     draft.sent_text = current;
                     draft.last_sent_at = Some(std::time::Instant::now());
-                    draft.delivered_chunks = 0;
-                    draft.delivered_prefix = String::new();
+                    draft.clear_delivery_progress();
                 }
             }
             Err(e) => {
                 {
                     let mut drafts = self.multi_message_drafts.lock();
                     if let Some(draft) = drafts.get_mut(&key) {
-                        let chunks = split_message_for_telegram(cleaned);
-                        draft.delivered_chunks = e.delivered;
-                        draft.delivered_prefix = chunks
-                            .iter()
-                            .take(e.delivered)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .concat();
-                        // A partial failure still physically sent `e.delivered`
-                        // chunks; record it so the next pace (finalize / approval
-                        // prompt) spaces off the real last send.
-                        if e.delivered > 0 {
+                        let chunks = delivery_chunks(cleaned, rich);
+                        draft.note_partial_delivery(
+                            &chunks,
+                            rich,
+                            e.delivered,
+                            e.html_fallback_skip,
+                        );
+                        // A partial failure still physically sent either a whole
+                        // chunk or an HTML fallback piece. Record it so the next
+                        // pace (finalize / approval prompt) spaces off the real
+                        // last send.
+                        if e.delivered > 0 || e.html_fallback_skip > 0 {
                             draft.last_sent_at = Some(std::time::Instant::now());
                         }
                     }
@@ -3045,6 +4179,9 @@ impl TelegramChannel {
                         unsent.to_string(),
                         draft.delivered_chunks,
                         draft.delivered_prefix.clone(),
+                        draft.html_fallback_skip,
+                        draft.html_fallback_chunk.clone(),
+                        draft.delivery_rich,
                     )
                 });
             (
@@ -3064,28 +4201,44 @@ impl TelegramChannel {
         // (in-order delivery preserved); a permanent failure drops the narration
         // with a WARN and still delivers the final answer below, rather than
         // re-inserting unreachable orphaned draft state.
-        if let Some((unsent, delivered_chunks, delivered_prefix)) = pending
+        if let Some((
+            unsent,
+            delivered_chunks,
+            delivered_prefix,
+            saved_html_skip,
+            saved_html_chunk,
+            saved_rich,
+        )) = pending
             && !voice_only
         {
             let cleaned = strip_tool_call_tags(unsent.trim());
             let cleaned = cleaned.trim();
             if !cleaned.is_empty() {
-                let chunks = split_message_for_telegram(cleaned);
-                // Absolute count of physical chunks Telegram already accepted;
-                // advanced across retries so an accepted chunk is never re-sent.
-                let mut skip = if delivered_chunks > 0
-                    && chunks.len() >= delivered_chunks
-                    && chunks[..delivered_chunks].concat() == delivered_prefix
-                {
-                    delivered_chunks
-                } else {
-                    0
-                };
                 let mut attempt = 0u32;
+                // Retries share the format that produced any saved progress so
+                // `skip` and the HTML fallback position keep addressing the
+                // same chunk list, even if live config flipped in between.
+                let rich = saved_rich.unwrap_or_else(|| self.rich_messages_enabled());
+                let chunks = delivery_chunks(cleaned, rich);
+                let (mut skip, mut html_skip) = narration_resume_cursor(
+                    &chunks,
+                    rich,
+                    delivered_chunks,
+                    &delivered_prefix,
+                    saved_html_skip,
+                    &saved_html_chunk,
+                );
                 loop {
                     self.pace_multi_message_send(last_sent_at).await;
                     match self
-                        .send_text_chunks(cleaned, &chat_id, thread_id.as_deref(), skip)
+                        .send_text_chunks_resuming(
+                            cleaned,
+                            &chat_id,
+                            thread_id.as_deref(),
+                            skip,
+                            html_skip,
+                            rich,
+                        )
                         .await
                     {
                         Ok(_) => {
@@ -3093,10 +4246,14 @@ impl TelegramChannel {
                             break;
                         }
                         Err(e) => {
-                            // Resume past chunks this attempt physically delivered
-                            // so a retry never duplicates them.
-                            if e.delivered > skip {
+                            // Resume past chunks and HTML fallback pieces this
+                            // attempt physically delivered so a retry never
+                            // duplicates them.
+                            let progressed = e.delivered > skip
+                                || (e.delivered == skip && e.html_fallback_skip > html_skip);
+                            if progressed {
                                 skip = e.delivered;
+                                html_skip = e.html_fallback_skip;
                                 last_sent_at = Some(std::time::Instant::now());
                             }
                             // Telegram is flood-limiting this chat: neither
@@ -3117,6 +4274,7 @@ impl TelegramChannel {
                                         ::serde_json::json!({
                                             "error": format!("{}", e.source),
                                             "chunks_delivered": skip,
+                                            "html_fallback_skip": html_skip,
                                         })
                                     ),
                                     "Telegram flood limit during multi-message pending narration; not sending more narration or the final answer"
@@ -3124,7 +4282,7 @@ impl TelegramChannel {
                                 return Err(zeroclaw_api::channel::FinalizeUndelivered {
                                     reason: format!(
                                         "flood-limited while delivering pending narration \
-                                         ({skip} chunk(s) accepted): {:#}",
+                                         ({skip} chunk(s) accepted, {html_skip} html fallback piece(s)): {:#}",
                                         e.source
                                     ),
                                 }
@@ -3143,6 +4301,7 @@ impl TelegramChannel {
                                         ::serde_json::json!({
                                             "error": format!("{}", e.source),
                                             "chunks_delivered": skip,
+                                            "html_fallback_skip": html_skip,
                                         })
                                     ),
                                     "Telegram multi-message pending narration undeliverable after retries; dropping it and delivering the final answer"
@@ -4547,6 +5706,7 @@ impl TelegramChannel {
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some()
+            || incoming_message_text(message).is_some()
         {
             return true;
         }
@@ -4610,9 +5770,9 @@ impl TelegramChannel {
         // which simply finds no bind code and falls through to the
         // unauthorized-approval notice — the same outcome unauthorized
         // text senders already get.
-        let text = message
-            .get("text")
-            .and_then(serde_json::Value::as_str)
+        let rich_or_text = incoming_message_text(message);
+        let text = rich_or_text
+            .as_deref()
             .or_else(|| message.get("caption").and_then(serde_json::Value::as_str))
             .unwrap_or("");
 
@@ -5806,8 +6966,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             })
             .unwrap_or("unknown");
 
-        let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
-            text.to_string()
+        let reply_text = if let Some(text) = incoming_message_text(reply) {
+            text
         } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
             let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
             let chat_id = message
@@ -5868,7 +7028,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let message = update.get("message")?;
 
-        let text = message.get("text").and_then(serde_json::Value::as_str)?;
+        let text_owned = incoming_message_text(message)?;
+        let text = text_owned.as_str();
 
         let (_, sender_id, sender_identity) = Self::extract_sender_info(message);
 
@@ -5988,15 +7149,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">
     /// This mirrors OpenClaw's markdownToTelegramHtml approach.
     fn markdown_to_telegram_html(text: &str) -> String {
+        let text = wrap_markdown_tables(text, 0);
         let lines: Vec<&str> = text.split('\n').collect();
         let mut result_lines: Vec<String> = Vec::new();
+        let mut in_fence = false;
 
         for line in &lines {
             let trimmed_line = line.trim_start();
             if trimmed_line.starts_with("```") {
                 // Preserve fence lines so the second-pass block parser can consume them
                 // without interference from inline backtick handling.
+                in_fence = !in_fence;
                 result_lines.push(trimmed_line.to_string());
+                continue;
+            }
+            if in_fence {
+                // Telegram rejects inline HTML nested inside `<pre><code>`, so a
+                // fenced table must be escaped rather than formatted.
+                result_lines.push(Self::escape_html(line));
                 continue;
             }
 
@@ -6161,14 +7331,37 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         thread_id: Option<&str>,
         skip_chunks: usize,
     ) -> Result<usize, SendChunksError> {
-        let chunks = split_message_for_telegram(message);
+        self.send_text_chunks_resuming(
+            message,
+            chat_id,
+            thread_id,
+            skip_chunks,
+            0,
+            self.rich_messages_enabled(),
+        )
+        .await
+    }
+
+    async fn send_html_text_chunks(
+        &self,
+        message: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        skip_chunks: usize,
+    ) -> Result<usize, SendChunksError> {
+        let chunks = split_message_for_telegram_keeping_tables(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
             if index < skip_chunks {
                 continue;
             }
 
-            let text = format_telegram_text_chunk(chunk, index, chunks.len());
+            let marked = format_telegram_text_chunk(chunk, index, chunks.len());
+            let text = if marked.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
+                marked
+            } else {
+                chunk.to_string()
+            };
 
             let mut markdown_body = serde_json::json!({
                 "chat_id": chat_id,
@@ -6184,11 +7377,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             let (markdown_status, markdown_err) = match self
                 .send_message_honoring_rate_limit(&markdown_body)
                 .await
-                .map_err(|e| SendChunksError {
-                    delivered: index,
-                    rate_limited: false,
-                    source: e.into(),
-                })? {
+                .map_err(|e| SendChunksError::at(index, false, e.into()))?
+            {
                 SendMessageAttempt::Sent => {
                     if index < chunks.len() - 1 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -6196,13 +7386,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     continue;
                 }
                 SendMessageAttempt::RateLimited { status, body } => {
-                    return Err(SendChunksError {
-                        delivered: index,
-                        rate_limited: true,
-                        source: anyhow::Error::msg(format!(
+                    return Err(SendChunksError::at(
+                        index,
+                        true,
+                        anyhow::Error::msg(format!(
                             "Telegram sendMessage rate limited ({status}): {body}"
                         )),
-                    });
+                    ));
                 }
                 SendMessageAttempt::Failed { status, body } => (status, body),
             };
@@ -6226,35 +7416,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             match self
                 .send_message_honoring_rate_limit(&plain_body)
                 .await
-                .map_err(|e| SendChunksError {
-                    delivered: index,
-                    rate_limited: false,
-                    source: e.into(),
-                })? {
+                .map_err(|e| SendChunksError::at(index, false, e.into()))?
+            {
                 SendMessageAttempt::Sent => {}
                 SendMessageAttempt::RateLimited {
                     status: plain_status,
                     body: plain_err,
                 } => {
-                    return Err(SendChunksError {
-                        delivered: index,
-                        rate_limited: true,
-                        source: anyhow::Error::msg(format!(
+                    return Err(SendChunksError::at(
+                        index,
+                        true,
+                        anyhow::Error::msg(format!(
                             "Telegram sendMessage rate limited (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
                         )),
-                    });
+                    ));
                 }
                 SendMessageAttempt::Failed {
                     status: plain_status,
                     body: plain_err,
                 } => {
-                    return Err(SendChunksError {
-                        delivered: index,
-                        rate_limited: false,
-                        source: anyhow::Error::msg(format!(
+                    return Err(SendChunksError::at(
+                        index,
+                        false,
+                        anyhow::Error::msg(format!(
                             "Telegram sendMessage failed (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
                         )),
-                    });
+                    ));
                 }
             }
 
@@ -6266,6 +7453,125 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(chunks.len())
     }
 
+    /// Continue a send in the format chosen when it started.
+    ///
+    /// `skip_chunks` and `html_fallback_skip` index that format's pieces.
+    /// A retry must pass the same `rich` value. Choosing again from live
+    /// config would apply those indexes to a different chunk list, skipping
+    /// the rest of the answer or repeating a prefix.
+    async fn send_text_chunks_resuming(
+        &self,
+        message: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        skip_chunks: usize,
+        html_fallback_skip: usize,
+        rich: bool,
+    ) -> Result<usize, SendChunksError> {
+        if rich {
+            return self
+                .send_rich_text_chunks(message, chat_id, thread_id, skip_chunks, html_fallback_skip)
+                .await;
+        }
+        self.send_html_text_chunks(message, chat_id, thread_id, skip_chunks)
+            .await
+    }
+
+    async fn send_rich_text_chunks(
+        &self,
+        message: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        skip_chunks: usize,
+        html_fallback_skip: usize,
+    ) -> Result<usize, SendChunksError> {
+        let chunks = delivery_chunks(message, true);
+        for (index, chunk) in chunks.iter().enumerate() {
+            if index < skip_chunks {
+                continue;
+            }
+            let marked = format_telegram_text_chunk(chunk, index, chunks.len());
+            let text = if marked.chars().count() <= TELEGRAM_RICH_MAX_MESSAGE_LENGTH {
+                marked
+            } else {
+                chunk.to_string()
+            };
+            let resume_html = index == skip_chunks && html_fallback_skip > 0;
+            if !resume_html {
+                match self
+                    .send_rich_message_honoring_rate_limit(chat_id, thread_id, &text)
+                    .await
+                    .map_err(|error| SendChunksError::at(index, false, error.into()))?
+                {
+                    SendMessageAttempt::Sent => {
+                        if index + 1 < chunks.len() {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        continue;
+                    }
+                    SendMessageAttempt::RateLimited { status, body } => {
+                        return Err(SendChunksError::at(
+                            index,
+                            true,
+                            anyhow::Error::msg(format!(
+                                "Telegram sendRichMessage rate limited ({status}): {body}"
+                            )),
+                        ));
+                    }
+                    SendMessageAttempt::Failed { status, .. } => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                            "Telegram sendRichMessage failed; falling back to HTML"
+                        );
+                    }
+                }
+            }
+            if let Err(error) = self
+                .send_html_text_chunks(
+                    &text,
+                    chat_id,
+                    thread_id,
+                    if resume_html { html_fallback_skip } else { 0 },
+                )
+                .await
+            {
+                return Err(SendChunksError {
+                    delivered: index,
+                    html_fallback_skip: error.delivered,
+                    rate_limited: error.rate_limited,
+                    source: error.source,
+                });
+            }
+            if index + 1 < chunks.len() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Ok(chunks.len())
+    }
+
+    async fn send_rich_message_honoring_rate_limit(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        markdown: &str,
+    ) -> Result<SendMessageAttempt, reqwest::Error> {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "rich_message": { "markdown": markdown },
+        });
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+        self.post_bot_method_honoring_rate_limit("sendRichMessage", &body)
+            .await
+    }
+
     /// Posts one `sendMessage` request. On HTTP 429 it waits the server's
     /// `retry_after` (up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`]) and resends the
     /// same body, at most [`TELEGRAM_RATE_LIMIT_RETRIES`] times, so a flood
@@ -6274,11 +7580,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         &self,
         body: &serde_json::Value,
     ) -> Result<SendMessageAttempt, reqwest::Error> {
+        self.post_bot_method_honoring_rate_limit("sendMessage", body)
+            .await
+    }
+
+    async fn post_bot_method_honoring_rate_limit(
+        &self,
+        method: &str,
+        body: &serde_json::Value,
+    ) -> Result<SendMessageAttempt, reqwest::Error> {
         let mut retries = 0;
         loop {
             let resp = self
                 .http_client()
-                .post(self.api_url("sendMessage"))
+                .post(self.api_url(method))
                 .json(body)
                 .send()
                 .await?;
@@ -6296,6 +7611,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
+                            "method": method,
                             "retry_after_secs": wait.as_secs(),
                             "retries": retries,
                         })),
@@ -6309,6 +7625,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
+                        "method": method,
                         "retry_after_secs": wait.as_secs(),
                         "attempt": retries,
                     })),
@@ -6343,10 +7660,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         chat_id: &str,
         thread_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        match self.send_text_chunks(text, chat_id, thread_id, 0).await {
+        // Chunk indexes belong to the format chosen for this send. Keep that
+        // choice through the resume so a live reload cannot retarget them.
+        let rich = self.rich_messages_enabled();
+        match self
+            .send_text_chunks_resuming(text, chat_id, thread_id, 0, 0, rich)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(SendChunksError {
                 delivered: 0,
+                html_fallback_skip: 0,
                 rate_limited: true,
                 source,
             }) => Err(zeroclaw_api::channel::FinalizeUndelivered {
@@ -6355,25 +7679,43 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .into()),
             Err(SendChunksError {
                 delivered,
+                html_fallback_skip,
                 rate_limited: true,
                 ..
-            }) => Err(zeroclaw_api::channel::FinalizePartialDelivery { delivered }.into()),
+            }) => Err(zeroclaw_api::channel::FinalizePartialDelivery {
+                delivered: delivered.max(html_fallback_skip),
+            }
+            .into()),
             Err(SendChunksError {
                 delivered: 0,
+                html_fallback_skip: 0,
                 source,
                 ..
             }) => Err(source),
-            Err(SendChunksError { delivered, .. }) => {
+            Err(SendChunksError {
+                delivered,
+                html_fallback_skip,
+                ..
+            }) => {
                 // Some chunks are already posted. Resume from the first unsent
                 // chunk rather than restarting, then report the accepted prefix
-                // if it still cannot finish.
+                // if it still cannot finish. A rich chunk that already fell
+                // back to HTML resumes inside that fallback. `rich` stays the
+                // value from the start of this send.
                 match self
-                    .send_text_chunks(text, chat_id, thread_id, delivered)
+                    .send_text_chunks_resuming(
+                        text,
+                        chat_id,
+                        thread_id,
+                        delivered,
+                        html_fallback_skip,
+                        rich,
+                    )
                     .await
                 {
                     Ok(_) => Ok(()),
                     Err(e) => Err(zeroclaw_api::channel::FinalizePartialDelivery {
-                        delivered: e.delivered.max(delivered),
+                        delivered: e.delivered.max(delivered).max(e.html_fallback_skip),
                     }
                     .into()),
                 }
@@ -8126,6 +9468,43 @@ impl Channel for TelegramChannel {
             }
 
             return Ok(());
+        }
+
+        if self.rich_messages_enabled()
+            && let Some(id) = msg_id
+        {
+            let prepared = prepare_rich_markdown(text);
+            if prepared.chars().count() <= TELEGRAM_RICH_MAX_MESSAGE_LENGTH {
+                let body = serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": id,
+                    "rich_message": { "markdown": prepared },
+                });
+                if let Ok(resp) = self
+                    .http_client()
+                    .post(self.api_url("editMessageText"))
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    match Self::classify_edit_message_response(resp).await {
+                        EditMessageResult::Success | EditMessageResult::NotModified => {
+                            return Ok(());
+                        }
+                        EditMessageResult::Failed(status) => {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                                "Telegram finalize_draft rich edit failed; falling back to HTML"
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // If text exceeds limit, delete draft and send as chunked messages
@@ -10630,6 +12009,784 @@ mod tests {
         );
     }
 
+    /// A rejected `sendRichMessage` can fan out into several HTML messages.
+    /// If only some of those arrive, the resume must continue the HTML
+    /// fallback instead of skipping the rest of that rich chunk.
+    #[tokio::test]
+    async fn rich_html_fallback_resume_sends_remaining_html_chunks() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let message = "y".repeat(5_000);
+        let html_chunks = split_message_for_telegram(&message);
+        assert!(html_chunks.len() >= 2);
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "send failed"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_rich_messages(true)
+        .with_api_base(mock_server.uri());
+        let err = channel
+            .send_text_chunks(&message, "100", None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.delivered, 0, "the rich chunk itself is not finished");
+        assert_eq!(
+            err.html_fallback_skip, 1,
+            "the first HTML piece was accepted"
+        );
+
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 2 }
+            })))
+            .mount(&resume_server)
+            .await;
+        let channel = channel.with_api_base(resume_server.uri());
+        channel
+            .send_text_chunks_resuming(
+                &message,
+                "100",
+                None,
+                err.delivered,
+                err.html_fallback_skip,
+                true,
+            )
+            .await
+            .unwrap();
+        let resume_paths: Vec<String> = resume_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(
+            resume_paths
+                .iter()
+                .all(|path| path.ends_with("/sendMessage")),
+            "resume must not retry sendRichMessage: {resume_paths:?}"
+        );
+        assert_eq!(resume_paths.len(), html_chunks.len() - 1);
+    }
+
+    fn rich_html_narration() -> String {
+        format!("HEADTOKEN{}TAILTOKEN", "a".repeat(5_000))
+    }
+
+    fn rich_multi_message_channel(alias: &str) -> TelegramChannel {
+        let mut config = config_with_rich_messages(alias, true);
+        let telegram = config
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias");
+        telegram.multi_message_delay_ms = 0;
+        telegram.bot_token = "fake-token".into();
+        TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(LiveConfigAuthority::new(config))
+        .with_streaming(StreamMode::MultiMessage, 750)
+    }
+
+    fn seed_narration_draft(channel: &TelegramChannel, recipient: &str, narration: &str) -> String {
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        let mut state = MultiDraftState::new(None);
+        state.latest_visible = narration.to_string();
+        channel.multi_message_drafts.lock().insert(
+            TelegramChannel::multi_draft_key(recipient, &draft_id),
+            state,
+        );
+        draft_id
+    }
+
+    struct CountingSend {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_from: usize,
+        fail_until: usize,
+    }
+
+    impl wiremock::Respond for CountingSend {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let seen = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let failing = seen >= self.fail_from && seen < self.fail_until;
+            let status = if failing { 500 } else { 200 };
+            wiremock::ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                "ok": !failing,
+                "description": if failing { "send failed" } else { "ok" },
+                "result": { "message_id": 1 }
+            }))
+        }
+    }
+
+    /// A rejected rich narration accepts its first HTML piece and then fails.
+    /// The finalize retry must continue that HTML fallback instead of sending
+    /// the accepted prefix again.
+    #[tokio::test]
+    async fn finalize_multi_message_keeps_html_fallback_position_across_retries() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let alias = "telegram_test_alias";
+        let narration = rich_html_narration();
+        let html_chunks = split_message_for_telegram(&narration);
+        assert!(
+            html_chunks.len() >= 2,
+            "the narration must fan out into HTML"
+        );
+        assert!(html_chunks[0].contains("HEADTOKEN"));
+        assert!(!html_chunks[0].contains("TAILTOKEN"));
+        assert_eq!(delivery_chunks(&narration, true).len(), 1);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(CountingSend {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_from: 1,
+                fail_until: 3,
+            })
+            .mount(&server)
+            .await;
+
+        let channel = rich_multi_message_channel(alias).with_api_base(server.uri());
+        let recipient = "123";
+        let draft_id = seed_narration_draft(&channel, recipient, &narration);
+        channel
+            .finalize_multi_message_draft(recipient, &draft_id, "Final answer", true)
+            .await
+            .expect("retries finish the narration then send the final answer");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("HEADTOKEN"))
+                .count(),
+            1,
+            "the accepted HTML prefix must be sent once: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("TAILTOKEN")),
+            "the remaining HTML piece must still be sent: {bodies:?}"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("Final answer"))
+                .count(),
+            1,
+            "the final answer must follow the narration once"
+        );
+    }
+
+    /// `flush_unsent` saves the HTML fallback position. The next flush resumes
+    /// there instead of repeating the piece Telegram already accepted.
+    #[tokio::test]
+    async fn flush_unsent_resumes_rich_html_fallback_without_repeating_prefix() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let alias = "telegram_test_alias";
+        let narration = rich_html_narration();
+        assert!(split_message_for_telegram(&narration).len() >= 2);
+        assert_eq!(delivery_chunks(&narration, true).len(), 1);
+
+        let fail_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "send failed"
+            })))
+            .mount(&fail_server)
+            .await;
+
+        let channel = rich_multi_message_channel(alias).with_api_base(fail_server.uri());
+        let recipient = "123";
+        let draft_id = seed_narration_draft(&channel, recipient, &narration);
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("a partial flush is retained on the draft");
+        {
+            let drafts = channel.multi_message_drafts.lock();
+            let state = drafts
+                .get(&TelegramChannel::multi_draft_key(recipient, &draft_id))
+                .expect("draft survives a partial flush");
+            assert_eq!(state.delivered_chunks, 0);
+            assert_eq!(state.html_fallback_skip, 1);
+            assert!(state.html_fallback_chunk.contains("HEADTOKEN"));
+            assert_eq!(state.delivery_rich, Some(true));
+            assert_eq!(state.sent_text, "");
+        }
+
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 2 }
+            })))
+            .mount(&resume_server)
+            .await;
+        let channel = channel.with_api_base(resume_server.uri());
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("the next flush finishes the fallback");
+        let requests = resume_server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path().ends_with("/sendMessage")),
+            "resume must stay on the HTML fallback"
+        );
+        let bodies: Vec<String> = requests
+            .into_iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("HEADTOKEN"))
+                .count(),
+            0,
+            "the accepted HTML prefix must not be sent again: {bodies:?}"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("TAILTOKEN"))
+                .count(),
+            1,
+            "the unsent HTML piece must be sent once: {bodies:?}"
+        );
+    }
+
+    fn rich_multi_message_channel_with_authority(
+        alias: &str,
+    ) -> (TelegramChannel, LiveConfigAuthority) {
+        let mut config = config_with_rich_messages(alias, true);
+        let telegram = config
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias");
+        telegram.multi_message_delay_ms = 0;
+        telegram.bot_token = "fake-token".into();
+        let authority = LiveConfigAuthority::new(config);
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(authority.clone())
+        .with_streaming(StreamMode::MultiMessage, 750);
+        (channel, authority)
+    }
+
+    fn publish_rich_messages(authority: &LiveConfigAuthority, alias: &str, rich: bool) {
+        let mut config = authority.snapshot_config();
+        config
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias")
+            .rich_messages = rich;
+        authority.publish_for_test(config);
+    }
+
+    /// After a rich narration accepts its first HTML fallback piece, flipping
+    /// `rich_messages` off must not restart that fallback from chunk zero.
+    #[tokio::test]
+    async fn flush_unsent_keeps_rich_fallback_when_rich_messages_turns_off() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let alias = "telegram_test_alias";
+        let narration = rich_html_narration();
+        assert!(split_message_for_telegram(&narration).len() >= 2);
+        assert_eq!(delivery_chunks(&narration, true).len(), 1);
+
+        let fail_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "send failed"
+            })))
+            .mount(&fail_server)
+            .await;
+
+        let (channel, authority) = rich_multi_message_channel_with_authority(alias);
+        let channel = channel.with_api_base(fail_server.uri());
+        let recipient = "123";
+        let draft_id = seed_narration_draft(&channel, recipient, &narration);
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("a partial flush is retained on the draft");
+        {
+            let drafts = channel.multi_message_drafts.lock();
+            let state = drafts
+                .get(&TelegramChannel::multi_draft_key(recipient, &draft_id))
+                .expect("draft survives a partial flush");
+            assert_eq!(state.delivery_rich, Some(true));
+            assert_eq!(state.html_fallback_skip, 1);
+        }
+
+        publish_rich_messages(&authority, alias, false);
+        assert!(!channel.rich_messages_enabled());
+
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 2 }
+            })))
+            .mount(&resume_server)
+            .await;
+        let channel = channel.with_api_base(resume_server.uri());
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("the next flush finishes the pinned rich fallback");
+        let requests = resume_server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path().ends_with("/sendMessage")),
+            "resume must stay on the HTML fallback started under rich mode"
+        );
+        let bodies: Vec<String> = requests
+            .into_iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("HEADTOKEN"))
+                .count(),
+            0,
+            "the accepted HTML prefix must not be sent again after the setting flips: {bodies:?}"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("TAILTOKEN"))
+                .count(),
+            1,
+            "the unsent HTML piece must be sent once: {bodies:?}"
+        );
+    }
+
+    /// Same cross-flush case through finalize: the accepted HTML prefix must
+    /// stay unreposted after live `rich_messages` turns off.
+    #[tokio::test]
+    async fn finalize_multi_message_keeps_rich_fallback_when_rich_messages_turns_off() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let alias = "telegram_test_alias";
+        let narration = rich_html_narration();
+        assert!(split_message_for_telegram(&narration).len() >= 2);
+        assert_eq!(delivery_chunks(&narration, true).len(), 1);
+
+        let fail_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "send failed"
+            })))
+            .mount(&fail_server)
+            .await;
+
+        let (channel, authority) = rich_multi_message_channel_with_authority(alias);
+        let channel = channel.with_api_base(fail_server.uri());
+        let recipient = "123";
+        let draft_id = seed_narration_draft(&channel, recipient, &narration);
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("a partial flush is retained on the draft");
+
+        publish_rich_messages(&authority, alias, false);
+        assert!(!channel.rich_messages_enabled());
+
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 2 }
+            })))
+            .mount(&resume_server)
+            .await;
+        let channel = channel.with_api_base(resume_server.uri());
+        channel
+            .finalize_multi_message_draft(recipient, &draft_id, "Final answer", true)
+            .await
+            .expect("finalize resumes the pinned rich fallback then sends the final answer");
+
+        let bodies: Vec<String> = resume_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("HEADTOKEN"))
+                .count(),
+            0,
+            "the accepted HTML prefix must not be sent again after the setting flips: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("TAILTOKEN")),
+            "the remaining HTML piece must still be sent: {bodies:?}"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("Final answer"))
+                .count(),
+            1,
+            "the final answer must follow the narration once"
+        );
+    }
+
+    fn config_with_rich_messages(alias: &str, rich: bool) -> Config {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                rich_messages: rich,
+                ..TelegramConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Serves `succeed_before_fail` successes, then `fail_count` failures, then
+    /// successes. On call `flip_at` it publishes `rich_after` into the live config.
+    struct ScriptedSend {
+        calls: std::sync::atomic::AtomicUsize,
+        flip_at: usize,
+        rich_after: bool,
+        authority: LiveConfigAuthority,
+        alias: &'static str,
+        succeed_before_fail: usize,
+        fail_count: usize,
+    }
+
+    impl wiremock::Respond for ScriptedSend {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let seen = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if seen == self.flip_at {
+                let mut config = self.authority.snapshot_config();
+                config
+                    .channels
+                    .telegram
+                    .get_mut(self.alias)
+                    .expect("telegram alias")
+                    .rich_messages = self.rich_after;
+                self.authority.publish_for_test(config);
+            }
+            let failing = seen >= self.succeed_before_fail
+                && seen < self.succeed_before_fail + self.fail_count;
+            let status = if failing { 500 } else { 200 };
+            wiremock::ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                "ok": !failing,
+                "description": if failing { "send failed" } else { "ok" },
+                "result": { "message_id": 1 }
+            }))
+        }
+    }
+
+    struct FlipRichOnRichSend {
+        authority: LiveConfigAuthority,
+        alias: &'static str,
+        rich: bool,
+    }
+
+    impl wiremock::Respond for FlipRichOnRichSend {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let mut config = self.authority.snapshot_config();
+            config
+                .channels
+                .telegram
+                .get_mut(self.alias)
+                .expect("telegram alias")
+                .rich_messages = self.rich;
+            self.authority.publish_for_test(config);
+            wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            }))
+        }
+    }
+
+    fn two_format_message() -> String {
+        format!("HEADTOKEN{}TAILTOKEN", "a".repeat(5_000))
+    }
+
+    fn send_message_bodies_containing(requests: &[wiremock::Request], needle: &str) -> usize {
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter(|request| String::from_utf8_lossy(&request.body).contains(needle))
+            .count()
+    }
+
+    /// HTML chunks were already partly delivered. Turning rich messages on before
+    /// the resume must not skip the remaining HTML text just because it fits in
+    /// one rich chunk.
+    #[tokio::test]
+    async fn finalize_send_keeps_html_chunks_when_rich_messages_turns_on() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let alias = "telegram_test_alias";
+        let message = two_format_message();
+        let html_chunks = split_message_for_telegram(&message);
+        assert_eq!(
+            html_chunks.len(),
+            2,
+            "the fixture must be exactly two html chunks"
+        );
+        assert!(html_chunks[0].contains("HEADTOKEN"));
+        assert!(!html_chunks[0].contains("TAILTOKEN"));
+        assert!(html_chunks.last().unwrap().contains("TAILTOKEN"));
+        let prepared = prepare_rich_markdown(&message);
+        let rich_chunks = split_message_protecting(
+            &prepared,
+            TELEGRAM_RICH_MAX_MESSAGE_LENGTH
+                .saturating_sub(telegram_chunk_marker_len(true, true))
+                .max(1),
+            &protected_markdown_ranges(&prepared),
+        );
+        assert_eq!(
+            rich_chunks.len(),
+            1,
+            "the whole answer must fit in one rich chunk so skipping it would drop the tail"
+        );
+
+        let authority = LiveConfigAuthority::new(config_with_rich_messages(alias, false));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ScriptedSend {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                flip_at: 1,
+                rich_after: true,
+                authority: authority.clone(),
+                alias,
+                succeed_before_fail: 1,
+                fail_count: 2,
+            })
+            .mount(&server)
+            .await;
+
+        let channel =
+            TelegramChannel::new("token".into(), alias, Arc::new(|| vec!["*".into()]), false)
+                .with_rich_messages(true)
+                .with_persistence_authority(authority)
+                .with_api_base(server.uri());
+
+        channel
+            .finalize_send_chunks(&message, "100", None)
+            .await
+            .expect("resume must finish the html chunks already started");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path().ends_with("/sendMessage")),
+            "a send that started as html must not switch to sendRichMessage"
+        );
+        assert_eq!(send_message_bodies_containing(&requests, "HEADTOKEN"), 1);
+        // The unfinished chunk is posted three times: HTML failure, plain
+        // failure, then the successful resume. Skipping it would leave two.
+        assert_eq!(send_message_bodies_containing(&requests, "TAILTOKEN"), 3);
+    }
+
+    /// A rich chunk already fell back to HTML and delivered its first piece.
+    /// Turning rich messages off before the resume must not restart that HTML
+    /// fallback from the beginning.
+    #[tokio::test]
+    async fn finalize_send_keeps_rich_fallback_when_rich_messages_turns_off() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let alias = "telegram_test_alias";
+        let message = two_format_message();
+        let authority = LiveConfigAuthority::new(config_with_rich_messages(alias, true));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(FlipRichOnRichSend {
+                authority: authority.clone(),
+                alias,
+                rich: false,
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ScriptedSend {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                flip_at: usize::MAX,
+                rich_after: false,
+                authority: authority.clone(),
+                alias,
+                succeed_before_fail: 1,
+                fail_count: 2,
+            })
+            .mount(&server)
+            .await;
+
+        let channel =
+            TelegramChannel::new("token".into(), alias, Arc::new(|| vec!["*".into()]), false)
+                .with_rich_messages(false)
+                .with_persistence_authority(authority)
+                .with_api_base(server.uri());
+
+        channel
+            .finalize_send_chunks(&message, "100", None)
+            .await
+            .expect("resume must finish the html fallback already started");
+
+        let requests = server.received_requests().await.unwrap();
+        let rich_posts = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/sendRichMessage"))
+            .count();
+        assert_eq!(rich_posts, 1, "the rejected rich send is not retried");
+        assert_eq!(
+            send_message_bodies_containing(&requests, "HEADTOKEN"),
+            1,
+            "the html piece already delivered must not be sent again"
+        );
+        // Same unfinished chunk: HTML failure, plain failure, then resume.
+        assert_eq!(send_message_bodies_containing(&requests, "TAILTOKEN"), 3);
+    }
+
     /// Regression: when finalization chunks a long final answer and a later
     /// chunk fails after an earlier one was accepted, `finalize_draft` must
     /// surface [`zeroclaw_api::channel::FinalizePartialDelivery`] rather than a
@@ -12644,6 +14801,467 @@ mod tests {
         assert_eq!(rendered, "<pre><code>let x = 1;</code></pre>");
         assert!(!rendered.contains("language-"));
         assert!(!rendered.contains("onclick"));
+    }
+
+    #[test]
+    fn telegram_markdown_to_html_wraps_table_in_pre() {
+        let rendered =
+            TelegramChannel::markdown_to_telegram_html("| A | B |\n| --- | --- |\n| 1 | 2 |\n");
+        assert!(rendered.contains("<pre><code>"));
+        assert!(rendered.contains("| A | B |"));
+        assert!(rendered.contains("| 1 | 2 |"));
+        assert!(!rendered.contains("<table"));
+    }
+
+    #[test]
+    fn telegram_markdown_to_html_escapes_formatted_table_cells() {
+        let rendered = TelegramChannel::markdown_to_telegram_html(
+            "| **A** | `x` |\n| --- | --- |\n| [n](https://example.com) | 1 |\n",
+        );
+        assert!(rendered.contains("<pre><code>"));
+        assert!(rendered.contains("**A**"));
+        assert!(rendered.contains("`x`"));
+        assert!(rendered.contains("[n](https://example.com)"));
+        assert!(!rendered.contains("<b>"));
+        assert!(!rendered.contains("<code>x</code>"));
+        assert!(!rendered.contains("<a "));
+    }
+
+    #[test]
+    fn split_rich_plain_reopens_code_fence_within_limit() {
+        let mut body = String::from("```\n");
+        body.push_str(&"code line\n".repeat(400));
+        body.push_str("```\nAfter the block.\n");
+        let chunks = split_plain_keeping_fences(&body, 2_000);
+        assert!(chunks.len() > 1, "the fenced block must cross the limit");
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= 2_000,
+                "chunk length {}",
+                chunk.chars().count()
+            );
+        }
+        assert!(
+            chunks.iter().skip(1).any(|chunk| chunk.starts_with("```")),
+            "a continued code block must reopen its fence: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.contains("After the block."))
+        );
+    }
+
+    fn rich_text_budget() -> usize {
+        TELEGRAM_RICH_MAX_MESSAGE_LENGTH
+            .saturating_sub(telegram_chunk_marker_len(true, true))
+            .max(1)
+    }
+
+    fn assert_balanced_fenced_chunks(chunks: &[String], budget: usize) {
+        assert!(chunks.len() > 1, "the fenced table must cross the limit");
+        for chunk in chunks {
+            assert!(
+                chunk.chars().count() <= budget,
+                "chunk length {} exceeds {budget}",
+                chunk.chars().count()
+            );
+            assert!(
+                !code_block_state_after(chunk, false),
+                "a chunk must close every fence it opens: {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_long_fenced_table_reopens_fence_within_rich_limit() {
+        let budget = rich_text_budget();
+        let mut table = String::from("```\n| A | B |\n| --- | --- |\n");
+        let mut index = 0usize;
+        while table.chars().count() <= budget {
+            table.push_str(&format!("| row{index} | value{index} |\n"));
+            index += 1;
+        }
+        table.push_str("```\nAfter the table.\n");
+        let ranges = protected_markdown_ranges(&table);
+        assert!(
+            !ranges.is_empty(),
+            "an existing fenced table must stay protected"
+        );
+        let chunks = split_message_protecting(&table, budget, &ranges);
+        assert_balanced_fenced_chunks(&chunks, budget);
+        assert!(
+            chunks.iter().skip(1).any(|chunk| chunk.starts_with("```")),
+            "a continued fenced table must reopen its fence"
+        );
+        let after = chunks
+            .iter()
+            .find(|chunk| chunk.contains("After the table."))
+            .expect("prose after the table");
+        let at = after.find("After the table.").expect("prose offset");
+        assert!(
+            !code_block_state_after(&after[..at], false),
+            "prose after the closing fence must stay outside the code block: {after}"
+        );
+        assert!(chunks.iter().any(|chunk| chunk.contains("| row0 |")));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.contains(&format!("| row{} |", index - 1)))
+        );
+    }
+
+    #[test]
+    fn split_wide_table_keeps_fence_across_rich_chunks() {
+        let budget = rich_text_budget();
+        let header = (0..21)
+            .map(|column| format!("c{column}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let separator = (0..21).map(|_| "---").collect::<Vec<_>>().join(" | ");
+        let mut body = format!("| {header} |\n| {separator} |\n");
+        let mut index = 0usize;
+        while body.chars().count() <= budget {
+            let row = (0..21)
+                .map(|column| format!("r{index}c{column}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            body.push_str(&format!("| {row} |\n"));
+            index += 1;
+        }
+        let message = format!("Before.\n\n{body}\nAfter the table.\n");
+        let prepared = prepare_rich_markdown(&message);
+        assert!(
+            prepared.contains("```\n"),
+            "a table wider than 20 columns must be fenced"
+        );
+        let chunks =
+            split_message_protecting(&prepared, budget, &protected_markdown_ranges(&prepared));
+        assert_balanced_fenced_chunks(&chunks, budget);
+        assert!(
+            chunks.iter().skip(1).any(|chunk| chunk.starts_with("```")),
+            "a continued wide table must reopen its fence"
+        );
+        let after = chunks
+            .iter()
+            .find(|chunk| chunk.contains("After the table."))
+            .expect("prose after the table");
+        let at = after.find("After the table.").expect("prose offset");
+        assert!(
+            !code_block_state_after(&after[..at], false),
+            "prose after a wide table must stay outside the code block: {after}"
+        );
+        assert!(chunks.iter().any(|chunk| chunk.contains("r0c0")));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.contains(&format!("r{}c0", index - 1)))
+        );
+    }
+
+    #[test]
+    fn rich_messages_enabled_reads_live_config_not_the_snapshot() {
+        let mut enabled = Config::default();
+        let telegram = zeroclaw_config::schema::TelegramConfig {
+            rich_messages: true,
+            ..Default::default()
+        };
+        enabled
+            .channels
+            .telegram
+            .insert("home".to_string(), telegram);
+        let from_live = TelegramChannel::new(
+            "token".into(),
+            "home".to_string(),
+            Arc::new(Vec::<String>::new),
+            false,
+        )
+        .with_rich_messages(false)
+        .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(enabled));
+        assert!(from_live.rich_messages_enabled());
+
+        let mut disabled = Config::default();
+        disabled.channels.telegram.insert(
+            "home".to_string(),
+            zeroclaw_config::schema::TelegramConfig::default(),
+        );
+        let from_live_off = TelegramChannel::new(
+            "token".into(),
+            "home".to_string(),
+            Arc::new(Vec::<String>::new),
+            false,
+        )
+        .with_rich_messages(true)
+        .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(disabled));
+        assert!(!from_live_off.rich_messages_enabled());
+
+        let snapshot = TelegramChannel::new(
+            "token".into(),
+            "home".to_string(),
+            Arc::new(Vec::<String>::new),
+            false,
+        )
+        .with_rich_messages(true);
+        assert!(snapshot.rich_messages_enabled());
+    }
+
+    #[test]
+    fn prepare_rich_markdown_keeps_currency_and_rewrites_images() {
+        let prepared = prepare_rich_markdown(
+            "Cost is $400 and $x^2$.\n\n![shot](https://example.com/a.png)\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n",
+        );
+        assert!(prepared.contains("$400"));
+        assert!(prepared.contains("x^2"));
+        assert!(!prepared.contains("$x^2$"));
+        assert!(prepared.contains("[shot](https://example.com/a.png)"));
+        assert!(!prepared.contains("![shot]"));
+        assert!(prepared.contains("| A | B |"));
+        assert!(!prepared.contains("```\n| A | B |"));
+    }
+
+    #[test]
+    fn prepare_rich_markdown_leaves_math_and_images_inside_code() {
+        let prepared =
+            prepare_rich_markdown("```\n$x^2$\n![a](https://example.com/a.png)\n```\n`$y$`");
+        assert!(prepared.contains("$x^2$"));
+        assert!(prepared.contains("![a](https://example.com/a.png)"));
+        assert!(prepared.contains("`$y$`"));
+    }
+
+    #[test]
+    fn prepare_rich_markdown_fences_tables_wider_than_20_columns() {
+        let header = (0..21)
+            .map(|index| format!("c{index}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let separator = (0..21).map(|_| "---").collect::<Vec<_>>().join(" | ");
+        let row = (0..21)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let prepared =
+            prepare_rich_markdown(&format!("| {header} |\n| {separator} |\n| {row} |\n"));
+        assert!(prepared.starts_with("```\n"));
+        assert!(prepared.contains("| c0 |"));
+        assert!(prepared.trim_end().ends_with("```"));
+    }
+
+    #[test]
+    fn split_keeps_markdown_table_intact() {
+        let mut message = "a".repeat(4080);
+        message.push_str("\n| A | B |\n| --- | --- |\n| 1 | 2 |\n");
+        let chunks = split_message_for_telegram_keeping_tables(&message);
+        assert!(
+            chunks.len() >= 2,
+            "table must stay in its own chunk once the prefix fills the limit"
+        );
+        let table = chunks
+            .iter()
+            .find(|chunk| chunk.contains("| --- |"))
+            .expect("table chunk");
+        assert!(table.contains("| A | B |"));
+        assert!(table.contains("| 1 | 2 |"));
+        assert!(!table.contains(&"a".repeat(100)));
+    }
+
+    #[test]
+    fn split_long_table_repeats_header_within_telegram_limit() {
+        let mut message = String::from("| Name | Value |\n| --- | --- |\n");
+        for index in 0..400 {
+            message.push_str(&format!("| row{index} | value{index} |\n"));
+        }
+        assert!(message.chars().count() > TELEGRAM_MAX_MESSAGE_LENGTH);
+        let chunks = split_message_for_telegram_keeping_tables(&message);
+        let budget = TELEGRAM_MAX_MESSAGE_LENGTH
+            .saturating_sub(telegram_chunk_marker_len(true, true))
+            .max(1);
+        assert!(chunks.len() > 1, "a table past the limit must continue");
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= budget,
+                "chunk length {} exceeds {budget}",
+                chunk.chars().count()
+            );
+            assert!(chunk.contains("| Name | Value |"));
+            assert!(chunk.contains("| --- | --- |"));
+        }
+        let joined = chunks.join("");
+        for index in 0..400 {
+            assert!(joined.contains(&format!("row{index}")));
+        }
+    }
+
+    #[test]
+    fn split_huge_table_row_stays_within_telegram_limit() {
+        let cell = "x".repeat(5_000);
+        let message = format!("| A | B |\n| --- | --- |\n| 1 | {cell} |\n| 2 | ok |\n");
+        let chunks = split_message_for_telegram_keeping_tables(&message);
+        let budget = TELEGRAM_MAX_MESSAGE_LENGTH
+            .saturating_sub(telegram_chunk_marker_len(true, true))
+            .max(1);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= budget);
+        }
+        let joined = chunks.join("");
+        assert!(joined.contains(&"x".repeat(100)));
+        assert!(joined.contains("| 2 | ok |"));
+    }
+
+    #[test]
+    fn prepare_rich_markdown_keeps_dollars_inside_double_backticks() {
+        let prepared = prepare_rich_markdown("Run ``echo \"$HOME$\"`` then $x^2$.");
+        assert!(prepared.contains("$HOME$"));
+        assert!(prepared.contains("echo \"$HOME$\""));
+        assert!(prepared.contains("x^2"));
+        assert!(!prepared.contains("$x^2$"));
+    }
+
+    #[test]
+    fn prepare_rich_markdown_keeps_parentheses_in_image_urls() {
+        let prepared = prepare_rich_markdown(
+            "See ![](https://example.com/a_(b).png) and ![plot](https://example.com/a_(b).png).",
+        );
+        assert_eq!(
+            prepared,
+            "See https://example.com/a_(b).png and [plot](https://example.com/a_(b).png)."
+        );
+    }
+
+    #[test]
+    fn prepare_rich_markdown_keeps_escaped_dollars_in_math() {
+        let prepared = prepare_rich_markdown("See $a\\$b$ and $$c\\$d$$. `$a\\$b$`");
+        assert_eq!(prepared, "See a\\$b and c\\$d. `$a\\$b$`");
+    }
+
+    #[test]
+    fn project_rich_message_reads_heading_list_and_table() {
+        let rich = serde_json::json!({
+            "blocks": [
+                { "type": "heading", "size": 2, "text": "Status" },
+                {
+                    "type": "list",
+                    "items": [
+                        {
+                            "label": "-",
+                            "has_checkbox": true,
+                            "is_checked": false,
+                            "blocks": [{ "type": "paragraph", "text": "open" }]
+                        }
+                    ]
+                },
+                {
+                    "type": "table",
+                    "cells": [
+                        [{ "text": "A" }, { "text": "B" }],
+                        [{ "text": "1" }, { "text": "2" }]
+                    ]
+                }
+            ]
+        });
+        let projected = project_rich_message(&rich).unwrap();
+        assert!(projected.contains("## Status"));
+        assert!(projected.contains("- [ ] open"));
+        assert!(projected.contains("| A | B |"));
+        assert!(projected.contains("| 1 | 2 |"));
+    }
+
+    #[test]
+    fn parse_update_message_projects_rich_message_without_text() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let update = serde_json::json!({
+            "update_id": 9,
+            "message": {
+                "message_id": 4,
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 42 },
+                "rich_message": {
+                    "blocks": [
+                        { "type": "paragraph", "text": "hello from rich" }
+                    ]
+                }
+            }
+        });
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("rich-only message should parse");
+        assert_eq!(msg.content, "hello from rich");
+        assert_eq!(msg.sender, "alice");
+    }
+
+    #[test]
+    fn project_rich_message_keeps_inline_markdown_for_models() {
+        let rich = serde_json::json!({
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "text": [
+                        "all ",
+                        { "type": "bold", "text": "green" },
+                        " ",
+                        { "type": "code", "text": "ok" }
+                    ]
+                },
+                {
+                    "type": "mathematical_expression",
+                    "expression": "E = mc^2"
+                },
+                {
+                    "type": "photo",
+                    "caption": { "text": "chart", "credit": "ops" }
+                }
+            ]
+        });
+        let projected = project_rich_message(&rich).unwrap();
+        assert!(projected.contains("all **green** `ok`"));
+        assert!(projected.contains("E = mc^2"));
+        assert!(projected.contains("chart ops"));
+    }
+
+    #[test]
+    fn parse_update_message_reads_reply_to_rich_message() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let update = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 5,
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 42 },
+                "text": "what about this",
+                "reply_to_message": {
+                    "message_id": 4,
+                    "from": { "username": "zeroclaw" },
+                    "rich_message": {
+                        "blocks": [
+                            { "type": "heading", "size": 2, "text": "Status" },
+                            {
+                                "type": "paragraph",
+                                "text": [
+                                    { "type": "bold", "text": "green" }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("reply to a rich message should parse");
+        assert!(msg.content.contains("> @zeroclaw:"));
+        assert!(msg.content.contains("> ## Status"));
+        assert!(msg.content.contains("> **green**"));
+        assert!(msg.content.contains("what about this"));
     }
 
     #[test]
@@ -20511,6 +23129,92 @@ mod tests {
         assert!(
             sent_text.contains("Invalid binding code"),
             "expected the pairing branch's wrong-code reply from a captioned /bind, got: {sent_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_unauthorized_message_reads_rich_only_bind_and_text() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 1, &[r#""chat_id":"3030""#]).await;
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+        let bind_update = serde_json::json!({
+            "update_id": 9_100,
+            "message": {
+                "message_id": 70,
+                "chat": {"id": 3030, "type": "private"},
+                "from": {"id": 170_000, "username": "zeroclaw_unauthorized"},
+                "rich_message": {
+                    "blocks": [{
+                        "type": "paragraph",
+                        "text": "/bind not-a-real-code"
+                    }]
+                }
+            }
+        });
+        ch.handle_unauthorized_message(&bind_update).await;
+        let sent_text = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .find_map(|body| {
+                body.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        assert!(
+            sent_text.contains("Invalid binding code"),
+            "rich-only /bind should reach pairing, got: {sent_text}"
+        );
+
+        let notice_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&notice_server, 2, &[r#""chat_id":"3031""#]).await;
+        let notice_channel = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_mock_api_base(notice_server.uri());
+        let hello = serde_json::json!({
+            "update_id": 9_101,
+            "message": {
+                "message_id": 71,
+                "chat": {"id": 3031, "type": "private"},
+                "from": {"id": 170_001, "username": "zeroclaw_unauthorized"},
+                "rich_message": {
+                    "blocks": [{ "type": "paragraph", "text": "hello from rich" }]
+                }
+            }
+        });
+        notice_channel.handle_unauthorized_message(&hello).await;
+        let notice = notice_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .find_map(|body| {
+                body.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        assert!(
+            notice.contains("requires operator approval"),
+            "rich-only text should get the approval notice, got: {notice}"
         );
     }
 
