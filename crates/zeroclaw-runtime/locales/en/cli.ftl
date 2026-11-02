@@ -1722,6 +1722,8 @@ rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop 
 
 skill-http-request-timeout = HTTP request timed out
 cli-sop-run-unavailable = SOP run unavailable in this session.
+cli-sop-step-owner-principal-mismatch = SOP step refused: this run belongs to a different principal than the one this turn's capabilities act for.
+cli-sop-step-owner-memory-unavailable = SOP step failed: the memory of this run's owner is unavailable ({ $error }).
 
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.

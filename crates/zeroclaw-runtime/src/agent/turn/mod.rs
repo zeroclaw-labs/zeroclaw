@@ -4480,9 +4480,9 @@ async fn drive_live_sop_actions(
                                                 != Some(owner.principal_id.as_str())
                                         }) =>
                                     {
-                                        Err(anyhow::Error::msg(
-                                            "SOP step refused: the run's memory owner is not the principal this turn's capabilities resolve for",
-                                        ))
+                                        Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                                            "cli-sop-step-owner-principal-mismatch",
+                                        )))
                                     }
                                     Some(bound) => {
                                         assemble_owned_execution_with_capabilities(
@@ -9404,6 +9404,12 @@ mod sop_step_reassembly_tests {
                 memory.agents.lock().is_empty(),
                 "{principal:?}: no memory is opened for the refused step"
             );
+            assert_eq!(
+                result.output,
+                crate::i18n::get_required_cli_string("cli-sop-step-owner-principal-mismatch"),
+                "{principal:?}: the refusal reads from the catalogue"
+            );
+            assert!(!result.output.starts_with('{'), "{}", result.output);
         }
     }
 

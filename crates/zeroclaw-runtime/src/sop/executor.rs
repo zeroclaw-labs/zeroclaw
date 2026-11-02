@@ -738,6 +738,15 @@ impl Drop for HeadlessDriverLease {
     }
 }
 
+/// The step failure for an owned run whose owner's memory could not be
+/// built, in the operator's language.
+fn owner_memory_unavailable(error: &anyhow::Error) -> anyhow::Error {
+    anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
+        "cli-sop-step-owner-memory-unavailable",
+        &[("error", &format!("{error:#}"))],
+    ))
+}
+
 /// The memory override for a headless step of `owner`'s run: the owner's
 /// plane for the step agent. `None` for an unowned run, whose step turn builds
 /// the agent's memory as before.
@@ -1084,12 +1093,7 @@ async fn drive_headless_run(
                                     ),
                                     "SOP headless driver: the run owner's memory is unavailable; failing the step"
                                 );
-                                (
-                                    Err(anyhow::Error::msg(format!(
-                                        "the memory of this run's owner is unavailable: {e:#}"
-                                    ))),
-                                    None,
-                                )
+                                (Err(owner_memory_unavailable(&e)), None)
                             }
                         }
                     }
@@ -1751,6 +1755,24 @@ mod tests {
     #[tokio::test]
     async fn an_owned_run_restored_and_resumed_off_session_is_audited_on_its_owners_plane() {
         resume_an_owned_run_off_session(true).await;
+    }
+
+    /// The failure a headless step of an owned run reports when the owner's
+    /// memory cannot be built reads from the catalogue and keeps the cause.
+    #[test]
+    fn an_unavailable_owner_memory_fails_the_step_in_the_catalogues_words() {
+        let reported = owner_memory_unavailable(&anyhow::Error::msg("disk detached")).to_string();
+        assert_eq!(
+            reported,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-sop-step-owner-memory-unavailable",
+                &[("error", "disk detached")],
+            )
+        );
+        assert!(
+            reported.contains("disk detached") && !reported.starts_with('{'),
+            "{reported}"
+        );
     }
 
     /// A resumed step of an owned run runs over the owner's plane for the
