@@ -103,7 +103,7 @@ name = "sem"
 transport = "stdio"
 command = "/absolute/path/to/sem"
 args = ["mcp"]
-env = { SEM_REPO = "/absolute/path/to/checkout", SEM_NO_NETWORK = "1", SEM_NO_TELEMETRY = "1" }
+env = { SEM_REPO = "/absolute/path/to/checkout", SEM_LOCAL = "1", SEM_MCP_NO_SHARED = "1", SEM_NO_NETWORK = "1", SEM_NO_TELEMETRY = "1" }
 
 [mcp_bundles.code_lookup]
 servers = ["sem"]
@@ -111,6 +111,11 @@ servers = ["sem"]
 [agents.assistant]
 mcp_bundles = ["code_lookup"]
 ```
+
+`SEM_LOCAL` disables Sem's MCP cloud client. `SEM_MCP_NO_SHARED` starts a
+dedicated stdio server instead of reusing a shared daemon that may have started
+with different settings. These flags and the CLI network/telemetry controls
+do not restrict network access by commands exposed through the server.
 
 Merge these entries into your existing configuration. Append `"code_lookup"`
 to the intended agent's existing grants instead of replacing them, then
@@ -128,7 +133,7 @@ of the `__` auto-admit rule below. Do not automatically approve the whole server
 Sem can write local index/cache data. `SEM_REPO` selects the checkout but is
 not a filesystem sandbox; the process runs with the host user's permissions.
 Use OS/container isolation when required. Returned source excerpts enter the
-agent context and may reach its model provider even with Sem's own network
+agent context and may reach its model provider even with Sem's MCP cloud client
 and telemetry disabled. To disconnect, remove `"sem"` from the bundles granted
 to the agent and restart the session.
 
