@@ -4023,8 +4023,6 @@ impl Channel for DiscordChannel {
         self.pending_approvals.lock().await.insert(
             token.clone(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: Self::canonical_approval_destination(recipient),
                 tool_name: request.tool_name.clone(),
@@ -7905,8 +7903,6 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "abc123".to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
@@ -7981,8 +7977,6 @@ mod tests {
         approvals.lock().await.insert(
             token.to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
@@ -8016,8 +8010,6 @@ mod tests {
         approvals.lock().await.insert(
             token.to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
@@ -8064,8 +8056,6 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "tok123".to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
@@ -8135,8 +8125,6 @@ mod tests {
         approvals.lock().await.insert(
             token.to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),
@@ -8182,8 +8170,6 @@ mod tests {
         approvals.lock().await.insert(
             token.to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "c1".to_string(),
                 tool_name: "tool".to_string(),

@@ -8829,8 +8829,6 @@ impl TelegramChannel {
         self.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: chat_id.to_string(),
                 tool_name: request.tool_name.clone(),
@@ -19577,8 +19575,6 @@ mod tests {
             ch.pending_approvals.lock().await.insert(
                 format!("approval-{i}"),
                 crate::util::PendingApproval {
-                    #[cfg(any(feature = "channel-matrix", test))]
-                    prompt_binding: None,
                     sender,
                     destination: "-2001".to_string(),
                     tool_name: format!("tool-{i}"),
@@ -23964,8 +23960,6 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
@@ -24021,8 +24015,6 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "approve-id".to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: approve_tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
@@ -24136,8 +24128,6 @@ mod tests {
         channel.pending_approvals.lock().await.insert(
             "approval-id".to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: approval_tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
@@ -24251,8 +24241,6 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
@@ -24517,8 +24505,6 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: resp_tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
@@ -24873,8 +24859,6 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "a1".to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
@@ -24906,8 +24890,6 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "a2".to_string(),
             crate::util::PendingApproval {
-                #[cfg(any(feature = "channel-matrix", test))]
-                prompt_binding: None,
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),

@@ -2,23 +2,11 @@
     test,
     feature = "channel-discord",
     feature = "channel-lark",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram"
 ))]
 use std::{collections::HashMap, sync::Arc};
-
-#[cfg(any(
-    test,
-    feature = "channel-discord",
-    feature = "channel-lark",
-    feature = "channel-matrix",
-    feature = "channel-signal",
-    feature = "channel-slack",
-    feature = "channel-telegram"
-))]
-type ApprovalEntryMatcher<V> = Box<dyn Fn(&V) -> bool + Send + Sync>;
 
 /// Removes a pending approval if its requesting future is cancelled.
 ///
@@ -29,7 +17,6 @@ type ApprovalEntryMatcher<V> = Box<dyn Fn(&V) -> bool + Send + Sync>;
     test,
     feature = "channel-discord",
     feature = "channel-lark",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram"
@@ -37,14 +24,12 @@ type ApprovalEntryMatcher<V> = Box<dyn Fn(&V) -> bool + Send + Sync>;
 pub(crate) struct PendingApprovalGuard<V: Send + 'static> {
     pending: Arc<tokio::sync::Mutex<HashMap<String, V>>>,
     token: Option<String>,
-    matches: Option<ApprovalEntryMatcher<V>>,
 }
 
 #[cfg(any(
     test,
     feature = "channel-discord",
     feature = "channel-lark",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram"
@@ -54,27 +39,6 @@ impl<V: Send + 'static> PendingApprovalGuard<V> {
         Self {
             pending,
             token: Some(token),
-            matches: None,
-        }
-    }
-
-    #[cfg(any(feature = "channel-matrix", test))]
-    pub(crate) fn new_matching(
-        pending: Arc<tokio::sync::Mutex<HashMap<String, V>>>,
-        token: String,
-        matches: impl Fn(&V) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        let mut guard = Self::new(pending, token);
-        guard.matches = Some(Box::new(matches));
-        guard
-    }
-
-    fn remove_matching(&self, entries: &mut HashMap<String, V>, token: &str) {
-        if entries
-            .get(token)
-            .is_some_and(|entry| self.matches.as_ref().is_none_or(|matches| matches(entry)))
-        {
-            entries.remove(token);
         }
     }
 
@@ -88,7 +52,7 @@ impl<V: Send + 'static> PendingApprovalGuard<V> {
         let Some(token) = self.token.as_deref() else {
             return;
         };
-        self.remove_matching(&mut *self.pending.lock().await, token);
+        self.pending.lock().await.remove(token);
         self.token = None;
     }
 }
@@ -97,7 +61,6 @@ impl<V: Send + 'static> PendingApprovalGuard<V> {
     test,
     feature = "channel-discord",
     feature = "channel-lark",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram"
@@ -109,7 +72,7 @@ impl<V: Send + 'static> Drop for PendingApprovalGuard<V> {
         };
         let pending = Arc::clone(&self.pending);
         let removed = if let Ok(mut entries) = pending.try_lock() {
-            self.remove_matching(&mut entries, &token);
+            entries.remove(&token);
             true
         } else {
             false
@@ -117,15 +80,8 @@ impl<V: Send + 'static> Drop for PendingApprovalGuard<V> {
         if removed {
             return;
         }
-        let matches = self.matches.take();
         zeroclaw_spawn::spawn!(async move {
-            let mut entries = pending.lock().await;
-            if entries
-                .get(&token)
-                .is_some_and(|entry| matches.as_ref().is_none_or(|matches| matches(entry)))
-            {
-                entries.remove(&token);
-            }
+            pending.lock().await.remove(&token);
         });
     }
 }
@@ -770,17 +726,8 @@ pub(crate) fn build_approve_deny_approval_prompt(
     )
 }
 
-#[cfg(any(feature = "channel-matrix", test))]
-pub(crate) struct ApprovalPromptBinding {
-    /// Creates this registration's identity; guards hold references to it so
-    /// an old guard or delayed send cannot mutate a later reuse of the token.
-    pub(crate) registration: Arc<()>,
-    pub(crate) message_id: Option<String>,
-}
-
 #[cfg(any(
     feature = "channel-discord",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
@@ -790,10 +737,6 @@ pub(crate) struct PendingApproval {
     pub(crate) sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
     pub(crate) destination: String,
     pub(crate) tool_name: String,
-    /// Creates the binding between a pending decision and its outbound prompt.
-    /// Keeping it here makes resolution and guard cleanup retire both together.
-    #[cfg(any(feature = "channel-matrix", test))]
-    pub(crate) prompt_binding: Option<ApprovalPromptBinding>,
 }
 
 #[cfg(any(
@@ -829,7 +772,6 @@ impl PendingApprovalResolution {
 
 #[cfg(any(
     feature = "channel-discord",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     test
@@ -854,7 +796,6 @@ pub(crate) async fn resolve_pending_approval(
 
 #[cfg(any(
     feature = "channel-discord",
-    feature = "channel-matrix",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
@@ -868,61 +809,6 @@ pub(crate) async fn resolve_pending_approval_with_tool(
     destination: &str,
 ) -> (PendingApprovalResolution, Option<String>) {
     let mut pending_approvals = pending_approvals.lock().await;
-    resolve_locked_pending_approval(
-        &mut pending_approvals,
-        token,
-        response,
-        responder_allowed,
-        destination,
-    )
-}
-
-#[cfg(any(feature = "channel-matrix", test))]
-pub(crate) async fn resolve_pending_approval_reaction(
-    pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
-    message_id: &str,
-    response: zeroclaw_api::channel::ChannelApprovalResponse,
-    responder_allowed: bool,
-    destination: &str,
-) -> PendingApprovalResolution {
-    let mut pending = pending_approvals.lock().await;
-    let token = pending.iter().find_map(|(token, approval)| {
-        (approval
-            .prompt_binding
-            .as_ref()
-            .and_then(|prompt| prompt.message_id.as_deref())
-            == Some(message_id))
-        .then(|| token.clone())
-    });
-    let Some(token) = token else {
-        return PendingApprovalResolution::NotFound;
-    };
-    // Recognition and removal share the lock, so a tap cannot race token reuse.
-    resolve_locked_pending_approval(
-        &mut pending,
-        &token,
-        response,
-        responder_allowed,
-        destination,
-    )
-    .0
-}
-
-#[cfg(any(
-    feature = "channel-discord",
-    feature = "channel-matrix",
-    feature = "channel-signal",
-    feature = "channel-slack",
-    feature = "channel-telegram",
-    test
-))]
-fn resolve_locked_pending_approval(
-    pending_approvals: &mut std::collections::HashMap<String, PendingApproval>,
-    token: &str,
-    response: zeroclaw_api::channel::ChannelApprovalResponse,
-    responder_allowed: bool,
-    destination: &str,
-) -> (PendingApprovalResolution, Option<String>) {
     let Some(pending) = pending_approvals.get(token) else {
         return (PendingApprovalResolution::NotFound, None);
     };
@@ -933,6 +819,7 @@ fn resolve_locked_pending_approval(
     let Some(pending) = pending_approvals.remove(token) else {
         return (PendingApprovalResolution::NotFound, None);
     };
+    drop(pending_approvals);
     if pending.sender.send(response).is_ok() {
         (PendingApprovalResolution::Resolved, Some(pending.tool_name))
     } else {
@@ -985,97 +872,6 @@ pub(crate) async fn ensure_success(
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn matrix_prompt_binding_resolves_only_its_event() {
-        let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
-        let registration = std::sync::Arc::new(());
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        pending.lock().await.insert(
-            "APPROVAL".to_string(),
-            super::PendingApproval {
-                sender,
-                destination: "!room:example.invalid".to_string(),
-                tool_name: "shell".to_string(),
-                prompt_binding: Some(super::ApprovalPromptBinding {
-                    registration: std::sync::Arc::clone(&registration),
-                    message_id: Some("$prompt:example.invalid".to_string()),
-                }),
-            },
-        );
-        assert!(std::sync::Arc::ptr_eq(
-            &pending.lock().await["APPROVAL"]
-                .prompt_binding
-                .as_ref()
-                .unwrap()
-                .registration,
-            &registration
-        ));
-        assert_eq!(
-            super::resolve_pending_approval_reaction(
-                &pending,
-                "$other:example.invalid",
-                zeroclaw_api::channel::ChannelApprovalResponse::Approve,
-                true,
-                "!room:example.invalid"
-            )
-            .await,
-            super::PendingApprovalResolution::NotFound
-        );
-        assert_eq!(
-            super::resolve_pending_approval_reaction(
-                &pending,
-                "$prompt:example.invalid",
-                zeroclaw_api::channel::ChannelApprovalResponse::Approve,
-                true,
-                "!room:example.invalid"
-            )
-            .await,
-            super::PendingApprovalResolution::Resolved
-        );
-        assert_eq!(
-            receiver.await.unwrap(),
-            zeroclaw_api::channel::ChannelApprovalResponse::Approve
-        );
-    }
-
-    #[tokio::test]
-    async fn matrix_stale_registration_guard_preserves_reused_token() {
-        use std::sync::Arc;
-        for contended in [false, true] {
-            let pending = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-            let original = Arc::new(());
-            pending
-                .lock()
-                .await
-                .insert("APPROVAL".to_string(), Arc::clone(&original));
-            let checked = Arc::new(tokio::sync::Notify::new());
-            let notify_checked = Arc::clone(&checked);
-            let mut guard = crate::util::PendingApprovalGuard::new_matching(
-                Arc::clone(&pending),
-                "APPROVAL".to_string(),
-                move |current| {
-                    notify_checked.notify_one();
-                    Arc::ptr_eq(current, &original)
-                },
-            );
-            let replacement = Arc::new(());
-            pending
-                .lock()
-                .await
-                .insert("APPROVAL".to_string(), Arc::clone(&replacement));
-            if contended {
-                let entries = pending.lock().await;
-                drop(guard);
-                drop(entries);
-                checked.notified().await;
-            } else {
-                guard.remove().await;
-                drop(guard);
-            }
-            assert!(Arc::ptr_eq(&pending.lock().await["APPROVAL"], &replacement));
-        }
-    }
-
     use super::*;
 
     #[cfg(feature = "channel-qq")]
@@ -1867,7 +1663,6 @@ mod tests {
         pending.lock().await.insert(
             "approval-id".to_string(),
             PendingApproval {
-                prompt_binding: None,
                 sender: tx,
                 destination: "room-a".to_string(),
                 tool_name: "tool".to_string(),
@@ -1942,7 +1737,6 @@ mod tests {
         pending.lock().await.insert(
             "approval-id".to_string(),
             PendingApproval {
-                prompt_binding: None,
                 sender: tx,
                 destination: "room-a".to_string(),
                 tool_name: "tool".to_string(),
