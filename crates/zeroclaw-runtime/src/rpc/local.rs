@@ -1910,6 +1910,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn goal_pause_now_supersedes_queued_budget_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{
@@ -1922,6 +1923,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn goal_cancel_overtakes_queued_resume_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{
@@ -1936,6 +1938,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn goal_queued_budget_then_pause_apply_fifo_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{
@@ -1948,6 +1951,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn goal_pause_waits_for_admitted_verifier_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{
