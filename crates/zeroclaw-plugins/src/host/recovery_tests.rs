@@ -1189,6 +1189,119 @@ fn real_active_stage_survives_and_abandoned_protocol_stage_is_cleaned() {
     assert!(!root.path().join(name).exists());
 }
 
+/// An install killed after staging its package and before publishing it
+/// leaves the stage behind. The next install of the name clears that stage,
+/// whose lease died with the process, before staging its own.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[test]
+fn the_next_install_clears_the_stage_a_killed_install_left() {
+    let root = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    tests::write_tool_source(source.path(), "race", b"\0asm interrupted");
+    Paused::start_install(root.path(), "rename-before-move", source.path()).crash();
+    let stage = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|name| name.starts_with(".race.installing-v1-"))
+        .expect("the killed install left its stage");
+    assert!(root.path().join(&stage).join("lease").is_file());
+    assert!(
+        root.path()
+            .join(&stage)
+            .join("package/manifest.toml")
+            .is_file()
+    );
+    assert!(!root.path().join("race").exists());
+
+    tests::write_tool_source(source.path(), "race", b"\0asm reinstalled");
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    assert_eq!(
+        host.install(source.path().to_str().unwrap()).unwrap(),
+        "race"
+    );
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [".zeroclaw-package-lock-v1", "race"]
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("race/plugin.wasm")).unwrap(),
+        b"\0asm reinstalled"
+    );
+}
+
+/// An install never clears a stage of its name whose lease is still held:
+/// the process holding it has not finished. The abandoned stage next to it
+/// shows the sweep reached both and kept the held one for its lease.
+#[test]
+fn an_install_keeps_a_stage_whose_lease_is_held() {
+    let root = tempfile::tempdir().unwrap();
+    let stage = Paused::start(root.path(), "stage-owned", "stage");
+    let name = stage
+        .lines
+        .lines()
+        .find_map(|line| line.strip_prefix("STAGE:"))
+        .unwrap()
+        .to_string();
+    let source = tempfile::tempdir().unwrap();
+    tests::write_tool_source(source.path(), "race", b"\0asm installed");
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    {
+        let abandoned = host
+            .root()
+            .unwrap()
+            .transaction("race", "installing")
+            .unwrap();
+        abandoned.dir.create_dir(recovery::PACKAGE).unwrap();
+        abandoned.dir.write("package/bytes", b"abandoned").unwrap();
+    }
+    assert_eq!(
+        host.install(source.path().to_str().unwrap()).unwrap(),
+        "race"
+    );
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [name.as_str(), ".zeroclaw-package-lock-v1", "race"]
+    );
+    assert!(root.path().join(&name).join("lease").is_file());
+    assert_eq!(
+        std::fs::read(root.path().join(&name).join("package/bytes")).unwrap(),
+        b"active owner"
+    );
+    stage.crash();
+}
+
+/// A coordination lock replaced while an install sweeps an abandoned stage
+/// refuses the install before it stages anything of its own.
+#[cfg(unix)]
+#[test]
+fn an_install_whose_sweep_meets_a_replaced_lock_refuses_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    Paused::start(root.path(), "stage-owned", "stage").crash();
+    let abandoned = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|name| name.starts_with(".race.installing-v1-"))
+        .unwrap();
+    let source = tempfile::tempdir().unwrap();
+    tests::write_tool_source(source.path(), "race", b"\0asm refused");
+    let paused = Paused::start_install(root.path(), "before-stage-delete", source.path());
+    std::fs::rename(
+        root.path().join(".zeroclaw-package-lock-v1"),
+        root.path().join("old-lock"),
+    )
+    .unwrap();
+    std::fs::write(root.path().join(".zeroclaw-package-lock-v1"), b"").unwrap();
+    let output = paused.resume();
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert!(!root.path().join("race").exists());
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [abandoned.as_str(), ".zeroclaw-package-lock-v1", "old-lock"]
+    );
+    assert_eq!(
+        std::fs::read(root.path().join(&abandoned).join("package/bytes")).unwrap(),
+        b"active owner"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn paused_stage_cleanup_does_not_delete_replacement_generation() {
