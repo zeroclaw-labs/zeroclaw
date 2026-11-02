@@ -358,12 +358,14 @@ cli-update-long-about =
     Use --check to only check for updates without installing.
     Use --force to skip the confirmation prompt.
     Use --version to target a specific release instead of latest.
+    Use --standard in a CLI-only build to switch it to the standard build, which adds the dashboard and web gateway.
 
     Examples:
       zeroclaw update                      # download and install latest
       zeroclaw update --check              # check only, don't install
       zeroclaw update --force              # install without confirmation
       zeroclaw update --version 0.6.0      # install specific version
+      zeroclaw update --standard           # CLI-only build: switch to the standard build
 
 cli-self-test-long-about =
     Run diagnostic self-tests to verify the ZeroClaw installation.
@@ -541,6 +543,7 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
 cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
 cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+cli-self-test-gateway-not-in-build = not included in this build (CLI-only)
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
@@ -1009,6 +1012,9 @@ cli-status-agent-no-risk-profile-summary = {$alias}=<no risk_profile>
 cli-status-runtime = ⚙️  Runtime:       {$v}
 cli-status-web-ui-found = 🌐 Web UI:        FOUND ({$path})
 cli-status-web-ui-missing = 🌐 Web UI:        MISSING
+cli-status-web-ui-not-in-build = 🌐 Web UI:        not included in this build (CLI-only)
+# A build without the gateway answers this for `zeroclaw gateway …` and `zeroclaw desktop`.
+cli-no-dashboard-in-build = This ZeroClaw build has no dashboard or web gateway (CLI-only build). To use them, install the standard build: curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 cli-status-heartbeat = 💓 Heartbeat:      {$v}
 cli-status-heartbeat-every-minutes = every {$minutes}min
 cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
@@ -1264,6 +1270,12 @@ cli-update-prebuilt-channel-note = Pre-built updates use the lean standard distr
 cli-update-available = Update available: v{$current} -> v{$latest}
 cli-update-forcing-reinstall = Forcing reinstall: v{$current} -> v{$latest}
 cli-update-not-writable = install directory {$dir} is not writable ({$error}); re-run `zeroclaw update` with elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)
+# A CLI-only build (no gateway) answers `zeroclaw update` with this unless --standard is given.
+cli-update-cli-only-needs-standard =
+    This is a CLI-only build, and releases publish only the standard build. The standard build adds the dashboard and web gateway, which start with the daemon, by default on {$address} with pairing required.
+    To switch to the standard build, run: zeroclaw update --standard
+    To stay CLI-only, re-run the installer: install.sh --cli-only
+cli-update-switching-to-standard = Switching this CLI-only build to the standard build, which adds the dashboard and web gateway.
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
@@ -1560,6 +1572,10 @@ cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
 cli-enroll-pairing-code = {"    "}pairing code : {$code}
 cli-enroll-sas = {"    "}SAS          : {$sas}
 cli-tunnel-tcp-service-published = {"  "}🔒 Tunnel {$service} (TLS passthrough): {$endpoint}
+
+# ── Supplied capabilities (CLI session channel, delegate tool preparation) ──
+cli-agent-error-channel-unavailable = This agent has no channel for the CLI session.
+tool-delegate-error-target-tools-initialization = Tools could not be prepared safely for agent '{$agent_name}'.
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
