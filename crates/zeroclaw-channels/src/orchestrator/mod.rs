@@ -59054,9 +59054,10 @@ Done."#;
             assert_switch_results_once(&requests[3], native, true);
         }
         if matches!(end, RecoverySwitchEnd::Timeout) {
-            // Three seconds total plus the existing five-second closeout bound,
-            // not a fresh three-second budget after the two-second first provider.
-            assert_eq!(started.elapsed(), Duration::from_secs(8));
+            // The cancellation-aware provider settles at the original deadline,
+            // without consuming the optional closeout allowance. Switching must
+            // not restart the budget after the two-second first provider.
+            assert_eq!(started.elapsed(), Duration::from_secs(3));
         }
         ctx.conversation_histories.lock().unwrap().clear();
         process_channel_message(
