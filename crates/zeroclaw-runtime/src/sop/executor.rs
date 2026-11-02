@@ -854,7 +854,9 @@ fn headless_step_agent<'a>(
 /// Build the step's tool-scope contract for the fresh `agent::run` that
 /// executes it. The engine owns the canonical `SopConfig`, so the enforcement
 /// flag and mandatory-tool list are read from it rather than re-derived.
-fn headless_step_scope(
+/// The live nested-step driver installs the same contract around its nested
+/// loop, so tools that start child runs see one boundary on both paths.
+pub(crate) fn headless_step_scope(
     engine: &Arc<Mutex<SopEngine>>,
     run_id: &str,
     step: &SopStep,

@@ -33,7 +33,7 @@ SubAgentSpawn::for_agent(config, parent_alias)?     // resolve parent identity
 
 Synchronous, in-process, single tokio runtime. Nothing crosses the process boundary.
 
-1. Parent's tool loop dispatches `spawn_subagent`. The tool reads its `prompt` argument, refuses if empty.
+1. Parent's tool loop dispatches `spawn_subagent`. The tool reads its `prompt` argument, refuses if empty, and resolves an optional `model_hint` against `[[model_routes]]`, refusing an undeclared one (see [Running a SubAgent on another model](#running-a-subagent-on-another-model-model_hint)).
 2. The tool checks two guards in order:
    - **Depth-1 cap.** If the calling run was itself a SubAgent (`AgentRunOverrides.is_subagent == true`), refuse with `"spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"`. SubAgents cannot recurse.
    - **Risk-profile tool gate.** If the parent's `[risk_profiles.<alias>].deny_all_tools` is `true`, or `allowed_tools` is non-empty and does not list `spawn_subagent`, or `excluded_tools` lists it, refuse with a message naming the parent alias. An omitted or empty `allowed_tools` leaves the tool available (the legacy unrestricted state).
@@ -44,6 +44,52 @@ Synchronous, in-process, single tokio runtime. Nothing crosses the process bound
    - Success: `ToolResult { success: true, output: <child's final response>, error: None }`. Empty output is replaced with the literal `"subagent completed without output"`.
    - Failure: `ToolResult { success: false, error: Some("subagent run failed: ...") }`.
 7. The parent's tool loop continues with that `ToolResult` in its conversation context. The child's intermediate turns and tool calls are NOT replayed into the parent's history; only the final response surfaces.
+
+## Running a SubAgent on another model (`model_hint`)
+
+By default a SubAgent runs on its parent's model. A parent can instead run it on
+the model of an operator-declared [`[[model_routes]]`](../providers/routing.md)
+entry by passing that route's `hint`:
+
+```toml
+[[model_routes]]
+hint = "light"
+model_provider = "custom.local-low"   # same model, lower reasoning effort
+model = "my-local-model"
+```
+
+```json
+{ "prompt": "List every changed file and its purpose.", "model_hint": "light" }
+```
+
+Only the model changes. The SubAgent keeps the parent's identity, workspace,
+security policy, and memory allowlist, so it can still read the files the parent
+is working on. Every option owned by the route's provider applies, including
+`chat_template_kwargs` and `temperature`, which is what makes a lower-effort
+alias of the same model useful for broad, mechanical passes while the parent
+keeps a higher one for the work that needs it.
+
+Choosing a route takes two permissions, and both must hold:
+
+- **The route exists.** The tool enumerates exactly the declared hints and
+  refuses any other value, including a blank or malformed one, before
+  spawning, rather than silently falling back to the parent's model.
+- **The parent may switch models.** A route sends the child's requests, and
+  anything the parent writes into its prompt, to another provider. So the
+  parent's risk profile must admit `model_switch`, and switching must not
+  require approval: an `always_ask` entry for `model_switch`, or a Supervised
+  profile that does not auto-approve it, refuses the routed spawn. Being allowed
+  to spawn does not stand in for that approval. Inside an SOP step, headless or
+  live, an enforced step scope that excludes `model_switch` refuses the routed
+  spawn too, whatever the profile allows. Unhinted spawning is unaffected.
+
+The tool offers `model_hint` only to a parent that holds both. To let an agent
+use routes, add `model_switch` to its risk profile's `auto_approve` list (and to
+`allowed_tools`, if that profile restricts tools), or run it under Full autonomy
+without `model_switch` in `always_ask`.
+
+Declare routes only to providers you would trust with the context of every
+agent allowed to choose them.
 
 ## What gets delivered back upstream
 
