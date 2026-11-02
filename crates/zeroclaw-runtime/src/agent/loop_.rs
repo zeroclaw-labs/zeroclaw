@@ -1972,13 +1972,12 @@ pub async fn run(
                 "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
             ),
         ];
-        if matches!(
-            eff_prompt_injection_mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-        ) {
+        if crate::skills::skills_require_read_tool(&skills, eff_prompt_injection_mode) {
             tool_descs.push((
                 "read_skill",
-                "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+                crate::i18n::get_tool_description("read_skill").unwrap_or(
+                    "Load the full source for an available skill by name. Use when: its prompt entry marks the instructions as on-demand.",
+                ),
             ));
         }
         tool_descs.push((
@@ -3936,10 +3935,7 @@ async fn process_message_inner(
             ("screenshot", "Capture a screenshot."),
             ("image_info", "Read image metadata."),
         ];
-        if matches!(
-            eff_prompt_injection_mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-        ) {
+        if crate::skills::skills_require_read_tool(&skills, eff_prompt_injection_mode) {
             tool_descs.push((
                 "read_skill",
                 "Load the full source for an available skill by name.",

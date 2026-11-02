@@ -86,6 +86,8 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 libc = "0.2"
 
 [dev-dependencies]
+# A plain HTTP/2 (h2c) client for the connection-drain tests.
+h2 = "0.4"
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }
 rand = "0.10"
 rcgen = "0.13"

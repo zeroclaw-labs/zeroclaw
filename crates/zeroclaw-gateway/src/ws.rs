@@ -2838,7 +2838,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .expect("local WebSocket gateway serves");
         });
 
-        let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web"))
+        let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web")) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
             .await
             .expect("WebSocket upgrade");
         let first = client
