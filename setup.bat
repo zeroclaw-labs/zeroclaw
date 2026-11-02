@@ -193,16 +193,11 @@ echo   Extracting...
 mkdir "%USERPROFILE%\.zeroclaw\bin" 2>nul
 tar -xf "%TEMP%\zeroclaw-windows.zip" -C "%USERPROFILE%\.zeroclaw\bin"
 if %ERRORLEVEL% NEQ 0 (
-    powershell -Command "Expand-Archive -Force '%TEMP%\zeroclaw-windows.zip' '%USERPROFILE%\.zeroclaw\bin'"
+    powershell -NoProfile -Command "Expand-Archive -Force -Path (Join-Path $env:TEMP 'zeroclaw-windows.zip') -DestinationPath (Join-Path $env:USERPROFILE '.zeroclaw\bin')"
 )
 
-:: Add to PATH if not already there
-echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    setx PATH "%PATH%;%USERPROFILE%\.zeroclaw\bin" >nul 2>&1
-    set "PATH=%PATH%;%USERPROFILE%\.zeroclaw\bin"
-    echo   %GREEN%OK%RESET% Added to PATH
-)
+:: Persist only the user PATH (never setx the merged process PATH).
+call :add_zeroclaw_bin_to_user_path
 
 echo   %GREEN%OK%RESET% Binary installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe
 if exist "%USERPROFILE%\.zeroclaw\bin\zerocode.exe" (
@@ -308,13 +303,8 @@ if defined BINARY_MB (
     echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe ^(size unavailable^)
 )
 
-:: Add to PATH if not already there
-echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    setx PATH "%PATH%;%USERPROFILE%\.zeroclaw\bin" >nul 2>&1
-    set "PATH=%PATH%;%USERPROFILE%\.zeroclaw\bin"
-    echo   %GREEN%OK%RESET% Added to PATH
-)
+:: Persist only the user PATH (never setx the merged process PATH).
+call :add_zeroclaw_bin_to_user_path
 
 :: Build and install the web dashboard so the gateway serves it. Mirrors
 :: install.sh: assets must land where the gateway auto-detects them
@@ -437,6 +427,23 @@ exit /b 1
 echo.
 echo   %GREEN%Dry run complete.%RESET% No changes were made.
 goto :end
+
+
+:: ---- Persist %USERPROFILE%\.zeroclaw\bin on the user PATH only ----
+:: Reads/writes HKCU via [Environment]::Get/SetEnvironmentVariable so we never
+:: copy the machine PATH into the user value or hit setx's 1024-character crop.
+:add_zeroclaw_bin_to_user_path
+set "ZC_BIN=%USERPROFILE%\.zeroclaw\bin"
+set "ZC_PATH_RESULT="
+for /f "usebackq delims=" %%R in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$norm = { param($s) if ($null -eq $s) { return '' }; $t = ([string]$s).Trim().Trim([char]34); while ($t.EndsWith('\') -or $t.EndsWith('/')) { $t = $t.Substring(0, $t.Length - 1) }; $t }; $dst = & $norm $env:ZC_BIN; if ([string]::IsNullOrWhiteSpace($dst)) { $dst = & $norm (Join-Path $env:USERPROFILE '.zeroclaw\bin') }; $e = [Environment]; $userPath = $e::GetEnvironmentVariable('Path', 'User'); if ($null -eq $userPath) { $userPath = '' }; $parts = @($userPath -split ';' | Where-Object { $_ -ne '' }); $has = $false; foreach ($p in $parts) { if ((& $norm $p) -eq $dst) { $has = $true; break } }; if (-not $has) { $e::SetEnvironmentVariable('Path', (($dst + ';' + $userPath).TrimEnd(';')), 'User'); 'ADDED' } else { 'PRESENT' }"`) do set "ZC_PATH_RESULT=%%R"
+if /I "%ZC_PATH_RESULT%"=="ADDED" (
+    echo   %GREEN%OK%RESET% Added to user PATH
+)
+echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    set "PATH=%ZC_BIN%;%PATH%"
+)
+goto :eof
 
 :: ---- Clean exit ----
 :end
