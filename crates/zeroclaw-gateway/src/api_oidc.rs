@@ -54,6 +54,7 @@ use rand::TryRng as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, SemaphorePermit};
+use zeroclaw_runtime::i18n::get_required_cli_string;
 use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment, PkceFlow};
 
 use crate::{AppState, SlidingWindowRateLimiter};
@@ -651,7 +652,10 @@ async fn handle_pkce_login(
     };
     let mut secret = [0_u8; 32];
     if rand::rngs::SysRng.try_fill_bytes(&mut secret).is_err() {
-        return error_json(StatusCode::INTERNAL_SERVER_ERROR, "could not start sign-in");
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &get_required_cli_string("cli-oidc-browser-start-failed"),
+        );
     }
     let secret = hex::encode(secret);
     let secure_cookie = redirect_uri
@@ -659,7 +663,12 @@ async fn handle_pkce_login(
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
     let cookie = match binding_cookie(&flow.state, &secret, secure_cookie, FLOW_TTL.as_secs()) {
         Ok(cookie) => cookie,
-        Err(_) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, "could not start sign-in"),
+        Err(_) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &get_required_cli_string("cli-oidc-browser-start-failed"),
+            );
+        }
     };
     let authorize_url = flow.authorize_url.clone();
     if let Err(full) = relay.flows.insert(PendingPkce {
