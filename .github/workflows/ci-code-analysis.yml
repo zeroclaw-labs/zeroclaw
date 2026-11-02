@@ -6,7 +6,8 @@
 #   branch introduces are reported; on master push it does a full scan. Results upload
 #   as SARIF to the GitHub Security tab. Report-only (no --error) — surfaced, never
 #   gating. .semgrepignore suppresses known false-positive surfaces (tests, examples,
-#   docs theme).
+#   docs theme). Before upload, the SARIF drops findings silenced inline with
+#   `nosemgrep`.
 #
 # Deep CodeQL taint analysis (Rust and JS/TS) lives in the sibling codeql.yml
 # (master push + daily schedule + manual dispatch). It is deliberately not
@@ -63,6 +64,16 @@ jobs:
             semgrep/semgrep@sha256:06938c1f365d3f67b8cedd8bc117607ae64253f88a0e768e9da9408548927dd6 \
             sh -c "git config --global --add safe.directory /src && \
                    semgrep scan --config auto ${baseline} --sarif --output semgrep.sarif"
+      - name: Drop findings suppressed with nosemgrep
+        if: always() && hashFiles('semgrep.sarif') != ''
+        run: |
+          set -euo pipefail
+          # Semgrep keeps findings silenced by an inline `nosemgrep` comment in the
+          # SARIF, marked as in-source suppressions, and code scanning still opens
+          # alerts for them. Drop them so the comment works.
+          jq '.runs[].results |= map(select((.suppressions // []) | length == 0))' \
+            semgrep.sarif > semgrep.filtered.sarif
+          mv semgrep.filtered.sarif semgrep.sarif
       - name: Upload SARIF to code scanning
         if: always()
         # Fork PRs may have read-only tokens; trusted-event upload failures stay visible.
