@@ -358,12 +358,14 @@ cli-update-long-about =
     Use --check to only check for updates without installing.
     Use --force to skip the confirmation prompt.
     Use --version to target a specific release instead of latest.
+    Use --standard in a CLI-only build to switch it to the standard build, which adds the dashboard and web gateway.
 
     Examples:
       zeroclaw update                      # download and install latest
       zeroclaw update --check              # check only, don't install
       zeroclaw update --force              # install without confirmation
       zeroclaw update --version 0.6.0      # install specific version
+      zeroclaw update --standard           # CLI-only build: switch to the standard build
 
 cli-self-test-long-about =
     Run diagnostic self-tests to verify the ZeroClaw installation.
@@ -1268,6 +1270,12 @@ cli-update-prebuilt-channel-note = Pre-built updates use the lean standard distr
 cli-update-available = Update available: v{$current} -> v{$latest}
 cli-update-forcing-reinstall = Forcing reinstall: v{$current} -> v{$latest}
 cli-update-not-writable = install directory {$dir} is not writable ({$error}); re-run `zeroclaw update` with elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)
+# A CLI-only build (no gateway) answers `zeroclaw update` with this unless --standard is given.
+cli-update-cli-only-needs-standard =
+    This is a CLI-only build, and releases publish only the standard build. The standard build adds the dashboard and web gateway, which start with the daemon, by default on {$address} with pairing required.
+    To switch to the standard build, run: zeroclaw update --standard
+    To stay CLI-only, re-run the installer: install.sh --cli-only
+cli-update-switching-to-standard = Switching this CLI-only build to the standard build, which adds the dashboard and web gateway.
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
