@@ -3685,6 +3685,22 @@ impl OpenAiCompatibleModelProvider {
                 // bytes, and fall back to the most recent assistant tool call.
                 let recovered_tool_call_id = (message.role == "tool").then(|| {
                     let recovered = recover_leading_tool_call_id(&message.content)
+                        .map(|raw_id| {
+                            // Resolve through the same map the whole-envelope
+                            // branch uses: a contract that rewrites ids (Mistral
+                            // uses nine alphanumeric characters) must see the call
+                            // and its result carry the same id, or the request is
+                            // rejected just like the missing-field case.
+                            tool_call_id_map.get(raw_id.as_str()).cloned().unwrap_or_else(|| {
+                                let normalized = reserve_tool_call_id_for_contract(
+                                    targets_mistral_tool_call_contract,
+                                    Some(raw_id.clone()),
+                                    &mut used_tool_call_ids,
+                                );
+                                tool_call_id_map.insert(raw_id, normalized.clone());
+                                normalized
+                            })
+                        })
                         .or_else(|| last_assistant_tool_call_ids.first().cloned());
                     if recovered.is_none() {
                         ::zeroclaw_log::record!(
@@ -11546,6 +11562,39 @@ mod tests {
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
         ));
+    }
+
+    /// A contract that rewrites ids (Mistral allows nine alphanumeric
+    /// characters) must see the assistant call and its tool result carry the
+    /// same id, including when the result envelope only parses as a leading
+    /// JSON value because a replayed turn was appended to it.
+    #[test]
+    fn convert_messages_for_native_maps_recovered_tool_id_through_contract() {
+        let input = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                "{\"tool_call_id\":\"call_1\",\"content\":\"out\",\"attachments\":[]}\n\ngo again",
+            ),
+        ];
+        let provider = make_model_provider("mistral", "https://api.mistral.ai", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+
+        let call_id = converted[1]
+            .tool_calls
+            .as_ref()
+            .expect("the assistant turn keeps its tool call")[0]
+            .id
+            .clone()
+            .expect("the assistant call carries an id");
+        assert_eq!(call_id.len(), 9, "the Mistral contract rewrites ids");
+        assert_eq!(
+            converted[2].tool_call_id.as_deref(),
+            Some(call_id.as_str()),
+            "a recovered result id must be resolved through the same map as the call"
+        );
     }
 
     #[tokio::test]
