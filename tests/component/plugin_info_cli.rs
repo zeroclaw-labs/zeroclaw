@@ -297,3 +297,134 @@ fn plugin_list_verify_names_the_failure_and_exits_zero_while_plain_list_stays_a_
         "plain plugin list never runs the load check: {plain_text}"
     );
 }
+
+/// A tool whose configuration the runtime refuses, through the real binary:
+/// the in-tree tool component installed under a manifest with no
+/// `config_schema`, beside a `[[plugins.entries]]` row that still holds a
+/// value. It needs the component to instantiate, so it builds the fixture.
+#[cfg(feature = "plugins-wasm-cranelift")]
+mod refused_configuration {
+    use super::{combined, run_zeroclaw};
+    use std::path::{Path, PathBuf};
+
+    /// The runtime's reason for refusing values handed to a package without
+    /// a `config_schema`. Like a load failure's cause, it is not translated.
+    const NO_SCHEMA_REFUSAL: &str = "has configured values but declares no config_schema";
+
+    const MANIFEST: &str = "name = \"tool-fixture\"\nversion = \"0.0.0\"\n\
+                            wasm_path = \"tool-fixture.wasm\"\ncapabilities = [\"tool\"]\n\
+                            permissions = []\n";
+
+    /// The in-tree tool component, built once per test process into its own
+    /// target directory, as the binary's own load-check tests build it.
+    fn fixture_wasm() -> PathBuf {
+        static FIXTURE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        FIXTURE
+            .get_or_init(|| {
+                let target_dir = std::env::current_exe()
+                    .expect("test binary path")
+                    .ancestors()
+                    .nth(3)
+                    .expect("test binary should sit under <target>/<profile>/deps/")
+                    .join("tmp/plugin-load-check-fixture");
+                let status = std::process::Command::new(env!("CARGO"))
+                    .current_dir(
+                        Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("crates/zeroclaw-plugins/tests/fixtures/tool-fixture"),
+                    )
+                    .args(["build", "--locked", "--quiet", "--package"])
+                    .args(["zeroclaw-tool-plugin-fixture", "--target", "wasm32-wasip2"])
+                    .arg("--target-dir")
+                    .arg(&target_dir)
+                    .status()
+                    .expect("run Cargo for the tool component fixture");
+                assert!(
+                    status.success(),
+                    "tool fixture must build; install the wasm32-wasip2 target"
+                );
+                let wasm = target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm");
+                assert!(wasm.is_file(), "tool fixture WASM was not produced");
+                wasm
+            })
+            .clone()
+    }
+
+    /// The key of the package's tool row, derived the way the host derives it.
+    fn tool_row_key() -> String {
+        let manifest: zeroclaw::plugins::PluginManifest =
+            toml::from_str(MANIFEST).expect("manifest");
+        zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
+            &manifest,
+            zeroclaw::plugins::PluginCapability::Tool,
+            std::iter::empty(),
+        )
+        .expect("scope")
+        .id()
+        .config_entry_key()
+        .expect("key")
+    }
+
+    /// Write the config: the plugins dir, and the tool row, holding `values`.
+    fn write_config(config_dir: &Path, values: &str) {
+        let plugins_dir = config_dir.join("plugins");
+        let plugins_dir = plugins_dir.to_str().expect("utf-8 temp path");
+        assert!(
+            !plugins_dir.contains('\''),
+            "a TOML literal string cannot carry a single quote: {plugins_dir}"
+        );
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "schema_version = 3\n\n[plugins]\nplugins_dir = '{plugins_dir}'\n\n\
+                 [[plugins.entries]]\nname = \"{}\"\n\n[plugins.entries.config]\n{values}",
+                tool_row_key()
+            ),
+        )
+        .expect("write config");
+    }
+
+    /// `plugin info` exits non-zero and names the refusal and the row, and
+    /// `plugin list --verify` reports it on the row and exits zero. With the
+    /// value gone the same package loads and `plugin info` exits zero.
+    #[test]
+    fn a_tool_whose_configuration_the_runtime_refuses_does_not_load() {
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let package = config_dir.path().join("plugins/tool-fixture");
+        std::fs::create_dir_all(&package).expect("create the installed plugin dir");
+        std::fs::write(package.join("manifest.toml"), MANIFEST).expect("write manifest");
+        std::fs::copy(fixture_wasm(), package.join("tool-fixture.wasm")).expect("copy component");
+        write_config(config_dir.path(), "label = \"masked\"\n");
+
+        let info = run_zeroclaw(config_dir.path(), &["plugin", "info", "tool-fixture"]);
+        let info_text = combined(&info);
+        assert!(
+            !info.status.success(),
+            "plugin info must exit non-zero: {info_text}"
+        );
+        assert!(
+            info_text.contains(NO_SCHEMA_REFUSAL) && info_text.contains(&tool_row_key()),
+            "plugin info names the refusal and the row: {info_text}"
+        );
+
+        let list = run_zeroclaw(config_dir.path(), &["plugin", "list", "--verify"]);
+        let list_text = combined(&list);
+        assert!(
+            list.status.success(),
+            "plugin list --verify is a report: {list_text}"
+        );
+        assert!(
+            String::from_utf8_lossy(&list.stdout)
+                .lines()
+                .any(|line| line.contains("tool-fixture") && line.contains(NO_SCHEMA_REFUSAL)),
+            "the verified row names the refusal: {list_text}"
+        );
+
+        write_config(config_dir.path(), "");
+        let info = run_zeroclaw(config_dir.path(), &["plugin", "info", "tool-fixture"]);
+        assert!(
+            info.status.success(),
+            "without the value the package loads: {}",
+            combined(&info)
+        );
+    }
+}

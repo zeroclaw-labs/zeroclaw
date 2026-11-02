@@ -1422,6 +1422,18 @@ impl Agent {
             .and_then(|cfg| cfg.config.as_deref())
     }
 
+    fn turn_pacing(&self) -> zeroclaw_config::schema::PacingConfig {
+        self.provider_switch_config
+            .as_ref()
+            .and_then(|config| config.live_config.as_ref())
+            .map(|config| config.read().pacing.clone())
+            .or_else(|| self.full_config().map(|config| config.pacing.clone()))
+            .unwrap_or_else(|| zeroclaw_config::schema::PacingConfig {
+                loop_detection_enabled: false,
+                ..zeroclaw_config::schema::PacingConfig::default()
+            })
+    }
+
     fn tool_loop_cost_tracking_context(&self) -> crate::agent::loop_::ToolLoopCostTrackingContext {
         if let Ok(Some(context)) =
             crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.try_with(Clone::clone)
@@ -3954,6 +3966,10 @@ impl Agent {
         // reports come from the same generation.
         self.sync_config_generation();
 
+        let pacing = self.turn_pacing();
+        let repetition_guard =
+            std::sync::Mutex::new(super::turn::repetition::RepetitionGuard::default());
+
         let model_selection = self.classify_model(user_message)?;
         let effective_model = model_selection.selector;
         let attempt_allowlist = model_selection.allowed_provider_refs;
@@ -4097,13 +4113,6 @@ impl Agent {
             provider_attempt_allowlist: attempt_allowlist.clone(),
             yield_to_steering: false,
         };
-        // E3 never had pattern-based loop detection; default pacing turns it
-        // on. Keep the embedder contract (an N-step identical-args tool chain
-        // completes) until the Agent surface grows a pacing config of its own.
-        let pacing = zeroclaw_config::schema::PacingConfig {
-            loop_detection_enabled: false,
-            ..zeroclaw_config::schema::PacingConfig::default()
-        };
 
         // Keep the loop call as a plain `.await` on this task. Caller-scoped
         // task-locals (session key, cost tracking, tool choice / thinking
@@ -4119,7 +4128,7 @@ impl Agent {
             Some(cost_context.clone()),
             crate::agent::tool_receipts::scope_receipts(
                 receipt_scope.clone(),
-                Box::pin(crate::agent::loop_::run_tool_call_loop(
+                Box::pin(super::turn::run_tool_call_loop_with_guard(
                     crate::agent::loop_::ToolLoop {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
@@ -4212,6 +4221,7 @@ impl Agent {
                             })
                         }),
                     },
+                    Some(&repetition_guard),
                 )),
             ),
         );
@@ -4496,6 +4506,9 @@ impl Agent {
         // route, so a mid-turn `model_switch` rebuilds the provider from the
         // same generation the limits below are resolved from.
         self.sync_config_generation();
+        let pacing = self.turn_pacing();
+        let repetition_guard =
+            std::sync::Mutex::new(super::turn::repetition::RepetitionGuard::default());
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
@@ -4666,13 +4679,6 @@ impl Agent {
             // This wrapper judges and writes steering itself; the loop only
             // stops after a tool round when a message is waiting.
             yield_to_steering: true,
-        };
-        // The streaming engine never had pattern-based loop detection; default
-        // pacing turns it on. Keep the embedder contract until this surface
-        // grows a pacing config of its own (matches `Agent::turn`).
-        let pacing = zeroclaw_config::schema::PacingConfig {
-            loop_detection_enabled: false,
-            ..zeroclaw_config::schema::PacingConfig::default()
         };
 
         let cost_context = self.tool_loop_cost_tracking_context();
@@ -4866,6 +4872,7 @@ impl Agent {
                         },
                         initial_ingress_subject,
                         carried_reported_usage.take(),
+                        Some(&repetition_guard),
                     )),
                 ),
             );
@@ -4991,6 +4998,10 @@ impl Agent {
                     let tree_budget_finalized = execution_tree_budget
                         .as_ref()
                         .is_some_and(|budget| budget.remaining() == 0);
+                    let repetition_exhausted = repetition_guard
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_exhausted();
                     // Pending steering is prepared here, where it decides
                     // whether another round runs. Each message is judged
                     // before its own memory write and all of them again after
@@ -5001,7 +5012,7 @@ impl Agent {
                     // between. A cancelled turn prepares nothing: the next
                     // round's top records the interruption if steering is
                     // pending, and no cancelled message is written to memory.
-                    if !tree_budget_finalized {
+                    if !tree_budget_finalized && !repetition_exhausted {
                         let cancelled = cancel_token
                             .as_ref()
                             .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);

@@ -1157,6 +1157,44 @@ fn plugin_config_values(
         })
 }
 
+/// Resolve one plugin instance's configuration from canonical config: the row
+/// under `config_entry_key`, validated by
+/// [`zeroclaw_plugins::config::resolve_plugin_config_from`] under `scope`, with
+/// the instance's TLS secret material reserved for the host and the TLS
+/// coherence witness of the same config view.
+///
+/// This is the runtime's whole per-instance config check. The host services'
+/// resolver runs it for every instance the runtime constructs, and
+/// [`crate::plugin_runtime::tool_instance_config_verdict`] runs it for a
+/// report, so the two cannot disagree. `read` yields the config view; it is
+/// called at most once, after the schema and grant checks that need no values.
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn resolve_instance_config<C: std::ops::Deref<Target = Config>>(
+    manifest: &zeroclaw_plugins::PluginManifest,
+    scope: &zeroclaw_plugins::instance::PluginInstanceScope,
+    config_entry_key: &str,
+    read: impl FnOnce() -> C,
+) -> Result<zeroclaw_plugins::config::ResolvedPluginConfig, zeroclaw_plugins::error::PluginError> {
+    let package = scope.id().package();
+    // Filled from the same config view the values come from, so the reserved
+    // set and the secrets it withholds share one revision.
+    let mut host_only = Vec::new();
+    let mut witness = None;
+    let resolved = zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+        let config = read();
+        witness = Some(plugin_tls_config_witness(&config, config_entry_key)?);
+        host_only = plugin_tls_secret_properties(&config, config_entry_key);
+        plugin_config_values(&config, config_entry_key, package)
+    })?;
+    let resolved = resolved.reserve_for_host(host_only);
+    // A schema permitted to withhold config does not invoke the source
+    // closure. Preserve that empty view; it cannot materialize TLS secrets.
+    Ok(match witness {
+        Some(witness) => resolved.with_tls_config_witness(witness),
+        None => resolved,
+    })
+}
+
 #[cfg(feature = "plugins-wasm")]
 pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
@@ -1178,41 +1216,18 @@ pub(crate) fn plugin_host_services(
         let manifest = host
             .manifest(package)
             .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
-        // Filled from the same config view the values come from, so the
-        // reserved set and the secrets it withholds share one revision.
-        let mut host_only = Vec::new();
-        let mut witness = None;
-        let resolved = if let Some(live_config) = &live_config {
-            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
-                // Transient per-call view: schema/grant checks happen before
-                // this access, and the global lock is released before guest
-                // setup.
-                let config = live_config.read();
-                witness = Some(plugin_tls_config_witness(&config, &config_entry_key)?);
-                host_only = plugin_tls_secret_properties(&config, &config_entry_key);
-                plugin_config_values(&config, &config_entry_key, package)
-            })
+        if let Some(live_config) = &live_config {
+            // Transient per-call view: schema/grant checks happen before this
+            // access, and the global lock is released before guest setup.
+            resolve_instance_config(manifest, scope, &config_entry_key, || live_config.read())
         } else {
             let config = fallback_config.as_ref().ok_or_else(|| {
                 zeroclaw_plugins::error::PluginError::InvalidConfig(
                     "plugin config source is unavailable".to_string(),
                 )
             })?;
-            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
-                witness = Some(plugin_tls_config_witness(config, &config_entry_key)?);
-                host_only = plugin_tls_secret_properties(config, &config_entry_key);
-                plugin_config_values(config, &config_entry_key, package)
-            })
-        };
-        resolved.map(|resolved| {
-            let resolved = resolved.reserve_for_host(host_only);
-            // A schema permitted to withhold config does not invoke the source
-            // closure. Preserve that empty view; it cannot materialize TLS secrets.
-            match witness {
-                Some(witness) => resolved.with_tls_config_witness(witness),
-                None => resolved,
-            }
-        })
+            resolve_instance_config(manifest, scope, &config_entry_key, || &**config)
+        }
     });
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
@@ -1903,13 +1918,16 @@ fn all_tools_with_runtime_on_thread(
         );
     }
 
-    if matches!(
+    let effective_skills =
+        crate::skills::load_skills_for_agent_from_config(root_config, agent_alias);
+    if crate::skills::skills_require_read_tool(
+        &effective_skills,
         root_config.effective_skills_prompt_mode(agent_alias),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) && select_tool!("read_skill")
     {
-        // ReadSkillTool holds full config to support workspace skills,
-        // open-skills, agent-bound bundles, and plugin skills.
+        // ReadSkillTool holds full config to resolve the effective set again at
+        // call time: workspace skills, open-skills, agent-bound bundles,
+        // plugin skills, and embedded built-ins.
         register_tool!(
             "read_skill",
             Arc::new(ReadSkillTool::new(config.clone(), agent_alias.to_string(),))
@@ -7062,7 +7080,7 @@ permissions = ["http_client"]
     }
 
     #[test]
-    fn all_tools_excludes_read_skill_for_explicit_global_full() {
+    fn all_tools_includes_read_skill_for_on_demand_builtin_in_full_mode() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -7076,6 +7094,56 @@ permissions = ["http_client"]
         let http = zeroclaw_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"read_skill"));
+    }
+
+    #[test]
+    fn all_tools_excludes_read_skill_for_operator_override_in_full_mode() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.skills.prompt_injection_mode = zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let override_dir = cfg
+            .agent_workspace_dir("test-agent")
+            .join("skills/zeroclaw-docs");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        std::fs::write(
+            override_dir.join("SKILL.md"),
+            "---\nname: zeroclaw-docs\ndescription: Operator override\n---\n\n# Override\n",
+        )
+        .unwrap();
 
         let tools = all_tools(
             Arc::new(cfg.clone()),
@@ -7275,7 +7343,7 @@ permissions = ["http_client"]
     }
 
     #[test]
-    fn all_tools_omits_read_skill_for_full_agent_override_over_global_compact() {
+    fn all_tools_keeps_read_skill_for_on_demand_builtin_with_full_agent_override() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -7333,8 +7401,8 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
-            !names.contains(&"read_skill"),
-            "full runtime-profile override should omit read_skill even when global is compact"
+            names.contains(&"read_skill"),
+            "the on-demand built-in should register read_skill even when the effective mode is full"
         );
     }
 
