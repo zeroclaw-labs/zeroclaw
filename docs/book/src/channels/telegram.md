@@ -277,6 +277,31 @@ Telegram.
   route, `/model --user <hint>` / `/model --agent <hint>` for the broader
   scopes (if permitted), and `/models <provider>` to list models of a provider.
 
+## Voice and audio failures
+
+If a recording is permanently rejected, for example because it is too large or
+uses an unsupported format, ZeroClaw discards the pending update and attempts
+to notify the sender. Temporary download or transcription failures are retried
+up to ten consecutive failed attempts for the same voice or audio update.
+
+After those ten failures, ZeroClaw attempts to send a notice asking the sender
+to resend, logs an error, and acknowledges and discards the update without
+delivering it to the agent. This allows later messages to proceed. The notice
+is best effort: if sending it fails or times out, the recording is still
+discarded from processing. **A voice or audio message can therefore be lost
+without the sender receiving a notice.**
+
+Service recovery does not automatically replay a discarded update. The sender
+must resend the recording after service recovers, or send its contents as
+text. Discarding an update does not delete the recording from the Telegram
+chat. Operators can look for `Transient failure budget exhausted` in the logs
+when investigating a missing voice or audio message.
+
+The ten-attempt limit is not an elapsed-time deadline: a download or
+transcription request that remains pending can still delay processing. This
+retry limit applies only to voice and audio, not photo, document, or
+media-group downloads.
+
 ## Logs and troubleshooting
 
 For an installed service:
