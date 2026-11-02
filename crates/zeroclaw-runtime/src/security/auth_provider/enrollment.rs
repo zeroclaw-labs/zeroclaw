@@ -593,6 +593,27 @@ impl Enrollment {
     /// (issuer, audience, expiry, nonce) before anything is returned; a
     /// present but malformed id_token fails the exchange.
     pub async fn pkce_exchange(&self, flow: &PkceFlow, code: &str) -> Result<EnrolledToken> {
+        self.exchange_code(flow, code, false).await
+    }
+
+    /// [`Self::pkce_exchange`] for a browser sign-in, where the id_token is
+    /// the evidence of the authentication event (ADR-017): a token response
+    /// without one is refused rather than accepted on the access token
+    /// alone. The id_token is validated exactly as above and then discarded.
+    pub async fn pkce_exchange_requiring_id_token(
+        &self,
+        flow: &PkceFlow,
+        code: &str,
+    ) -> Result<EnrolledToken> {
+        self.exchange_code(flow, code, true).await
+    }
+
+    async fn exchange_code(
+        &self,
+        flow: &PkceFlow,
+        code: &str,
+        require_id_token: bool,
+    ) -> Result<EnrolledToken> {
         // The exchange posts this client's credentials to the token endpoint
         // pinned when the flow started. If the alias was repointed to another
         // issuer or client while the flow was pending, refuse before any
@@ -649,6 +670,9 @@ impl Enrollment {
         let raw: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(&body).context("token response is not valid JSON")?;
         match raw.get("id_token") {
+            None if require_id_token => {
+                bail!("token response carries no id_token; this sign-in requires one")
+            }
             None => {}
             Some(serde_json::Value::String(id_token)) => {
                 validate_id_token(id_token, flow, now_unix())?;
@@ -1783,6 +1807,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(token.access_token, "at-pkce");
+    }
+
+    /// The CLI and the enrollment relay accept a token response without an
+    /// id_token; a browser sign-in does not, because the id_token is its
+    /// evidence of the authentication event.
+    #[tokio::test]
+    async fn a_sign_in_exchange_refuses_a_response_without_an_id_token() {
+        let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+        let flow = enrollment
+            .pkce_start("http://127.0.0.1:7777/callback")
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-no-id-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let err = enrollment
+            .pkce_exchange_requiring_id_token(&flow, "auth-code-1")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no id_token"), "{err}");
+
+        let token = enrollment
+            .pkce_exchange(&flow, "auth-code-1")
+            .await
+            .expect("enrollment keeps accepting a response without an id_token");
+        assert_eq!(token.access_token, "at-no-id-token");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_exchange_validates_the_id_token_it_requires() {
+        let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+        let flow = enrollment
+            .pkce_start("http://127.0.0.1:7777/callback")
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains(format!(
+                "code_verifier={}",
+                flow.verifier
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-signed-in",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "id_token": id_token_with(valid_claims(&flow)),
+            })))
+            .mount(&server)
+            .await;
+        let token = enrollment
+            .pkce_exchange_requiring_id_token(&flow, "auth-code-1")
+            .await
+            .unwrap();
+        assert_eq!(token.access_token, "at-signed-in");
+
+        let server = idp_with_pkce(Some(serde_json::json!(["S256"]))).await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+        let flow = enrollment
+            .pkce_start("http://127.0.0.1:7777/callback")
+            .await
+            .unwrap();
+        let mut claims = valid_claims(&flow);
+        claims["nonce"] = serde_json::json!("some-other-flows-nonce");
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-substituted",
+                "token_type": "Bearer",
+                "id_token": id_token_with(claims),
+            })))
+            .mount(&server)
+            .await;
+        let err = enrollment
+            .pkce_exchange_requiring_id_token(&flow, "auth-code-1")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nonce"), "{err}");
     }
 
     #[tokio::test]

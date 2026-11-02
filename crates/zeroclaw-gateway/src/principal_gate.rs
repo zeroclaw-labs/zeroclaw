@@ -56,6 +56,7 @@ use zeroclaw_runtime::rpc::transport::TransportKind;
 use zeroclaw_runtime::security::auth_provider::Credential;
 
 use crate::ConfigWriteGuard;
+use crate::dashboard_session::{DashboardCaller, SessionAuth, SessionRejection};
 
 /// Header naming the auth provider to verify the bearer with, mirroring
 /// the RPC handshake's `auth_provider` field (e.g. `oidc.corp`). Absent
@@ -117,10 +118,30 @@ impl GatewayInboundAuth {
         self.inner.publish_accepted(persisted, revision)
     }
 
+    /// The grants `auth` holds under the accepted policy in force now; see
+    /// [`RpcInboundAuth::current_grants`].
+    pub(crate) fn current_grants(
+        &self,
+        auth: &ConnectionAuth,
+    ) -> Result<zeroclaw_api::grants::ResolvedGrants, AuthDenied> {
+        self.inner.current_grants(auth)
+    }
+
+    /// A handle naming this authority, for a binding that must notice when
+    /// a later generation's authority replaced it.
+    pub(crate) fn authority_ref(&self) -> std::sync::Weak<RpcInboundAuth> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// Whether `authority` names this authority.
+    pub(crate) fn is_authority(&self, authority: &std::sync::Weak<RpcInboundAuth>) -> bool {
+        std::sync::Weak::ptr_eq(authority, &Arc::downgrade(&self.inner))
+    }
+
     /// Verify a bearer against an explicitly selected provider and
     /// resolve it to a principal with grants, both against the accepted
     /// policy snapshot as it stands.
-    async fn authenticate_scoped(
+    pub(crate) async fn authenticate_scoped(
         &self,
         token: &str,
         provider: &str,
@@ -132,6 +153,21 @@ impl GatewayInboundAuth {
                 Some(token),
                 Some(provider),
             )
+            .await
+    }
+
+    /// [`Self::authenticate_scoped`] for a bearer bound to the provider as
+    /// it was configured when the bearer was issued: refused before it is
+    /// sent if the accepted policy's provider by that name is another one
+    /// now. See [`RpcInboundAuth::authenticate_bound`].
+    pub(crate) async fn authenticate_bound(
+        &self,
+        token: &str,
+        provider: &str,
+        binding: &zeroclaw_runtime::rpc::auth::OidcBinding,
+    ) -> Result<ConnectionAuth, AuthDenied> {
+        self.inner
+            .authenticate_bound(TransportKind::Wss, token, provider, binding)
             .await
     }
 
@@ -180,6 +216,9 @@ fn forbidden(message: impl Into<String>) -> Response {
 pub struct WriteDenied {
     status: StatusCode,
     message: String,
+    /// The session layer's reason, for a write whose dashboard session
+    /// ended, so the dashboard answers it as it answers any ended session.
+    reason: Option<&'static str>,
 }
 
 impl WriteDenied {
@@ -187,6 +226,7 @@ impl WriteDenied {
         Self {
             status: StatusCode::FORBIDDEN,
             message,
+            reason: None,
         }
     }
 
@@ -199,17 +239,26 @@ impl WriteDenied {
         Self {
             status,
             message: denied.message,
+            reason: None,
+        }
+    }
+
+    fn session_ended(rejection: SessionRejection) -> Self {
+        Self {
+            status: rejection.status(),
+            message: rejection.message().to_owned(),
+            reason: Some(rejection.reason()),
         }
     }
 }
 
 impl IntoResponse for WriteDenied {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "error": self.message })),
-        )
-            .into_response()
+        let mut body = serde_json::json!({ "error": self.message });
+        if let Some(reason) = self.reason {
+            body["reason"] = reason.into();
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -240,6 +289,11 @@ fn method_floor(method: &Method) -> Option<&'static [Verb]> {
 pub struct RequestAuth {
     principal: Option<Arc<ConnectionAuth>>,
     authority: Arc<GatewayInboundAuth>,
+    /// The dashboard session that admitted the request, when its cookie
+    /// did. Ending the session (sign-out, its hard expiry, eviction, its
+    /// provider taken off sign-in) is that credential's revocation, so the
+    /// check at the write binds it as it binds the token's.
+    session: Option<Arc<SessionAuth>>,
 }
 
 /// The extractor a mutating handler declares to receive its
@@ -406,6 +460,9 @@ fn current_grants(
     conn: &ConnectionAuth,
     _guard: &ConfigWriteGuard,
 ) -> Result<ResolvedGrants, WriteDenied> {
+    if let Some(rejection) = request.session.as_deref().and_then(SessionAuth::ended_now) {
+        return Err(WriteDenied::session_ended(rejection));
+    }
     request
         .authority
         .inner
@@ -504,6 +561,41 @@ pub async fn config_route_auth(
         return next.run(request).await;
     }
 
+    // A signed-in dashboard session carries no bearer: the session layer
+    // already verified it and resolved the grants in force now, and put
+    // its verdict on the request. An explicit credential always wins, so
+    // this applies only when the request presents none.
+    if !request
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION)
+        && !request.headers().contains_key(AUTH_PROVIDER_HEADER)
+        && let Some(caller) = request.extensions().get::<DashboardCaller>().cloned()
+    {
+        let session = match caller {
+            DashboardCaller::Session(session) => session,
+            DashboardCaller::Rejected(rejection) => {
+                return crate::dashboard_session::rejection_response(rejection);
+            }
+        };
+        let Some(floor) = method_floor(request.method()) else {
+            return forbidden("Unsupported method for the config surface");
+        };
+        if !floor
+            .iter()
+            .any(|verb| session.grants.permits(Resource::Config, *verb))
+        {
+            return forbidden("Principal lacks the config grant required for this method");
+        }
+        let mut conn = session.connection.clone();
+        conn.grants = session.grants.clone();
+        request.extensions_mut().insert(RequestAuth {
+            principal: Some(Arc::new(conn)),
+            authority: Arc::clone(&auth),
+            session: Some(session),
+        });
+        return next.run(request).await;
+    }
+
     // A provider header that is present but blank or not text is a
     // malformed selection, not an absent one: it never falls through to
     // the native provider or the open posture.
@@ -528,6 +620,7 @@ pub async fn config_route_auth(
         request.extensions_mut().insert(RequestAuth {
             principal: None,
             authority: Arc::clone(&auth),
+            session: None,
         });
         return next.run(request).await;
     }
@@ -565,6 +658,7 @@ pub async fn config_route_auth(
     request.extensions_mut().insert(RequestAuth {
         principal: Some(Arc::new(conn)),
         authority: Arc::clone(&auth),
+        session: None,
     });
     next.run(request).await
 }

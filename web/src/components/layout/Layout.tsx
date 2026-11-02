@@ -1,12 +1,15 @@
 import { useState, useEffect } from 'react';
-import { Outlet, useLocation } from 'react-router-dom';
+import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import Sidebar from '@/components/layout/Sidebar';
 import Header from '@/components/layout/Header';
 import ReloadBanner from '@/components/layout/ReloadBanner';
 import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
 import CommandPalette, { useCommandPalette } from '@/components/CommandPalette';
+import { NotAvailable } from '@/components/auth/NotAvailable';
 import { ErrorBoundary } from '@/App';
+import { useAuth } from '@/hooks/useAuth';
 import { t } from '@/lib/i18n';
+import { homePathFor, navAccessFor, pathAccess } from '@/lib/navAccess';
 
 // First-path-segment → i18n title key, so the browser tab/history/bookmark
 // reflects the current page instead of a constant "ZeroClaw".
@@ -31,6 +34,11 @@ export default function Layout() {
   const { pathname } = useLocation();
   const { open: paletteOpen, openPalette, closePalette } = useCommandPalette();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // A signed-in account without the operator dashboard lands on chat or
+  // config, and a deep link to another page says it isn't available.
+  const { session } = useAuth();
+  const access = navAccessFor(session);
+  const routeAccess = pathAccess(pathname, access);
 
   // Close the mobile drawer on route change.
   useEffect(() => {
@@ -76,7 +84,13 @@ export default function Layout() {
             on every section click and reset scroll/state. */}
         <main className="flex-1 overflow-y-auto min-h-0">
           <ErrorBoundary key={pathname.split('/')[1] ?? ''}>
-            <Outlet />
+            {pathname === '/' && !access.operatorPages ? (
+              <Navigate to={homePathFor(access)} replace />
+            ) : routeAccess === 'allowed' ? (
+              <Outlet />
+            ) : (
+              <NotAvailable access={routeAccess} />
+            )}
           </ErrorBoundary>
         </main>
       </div>

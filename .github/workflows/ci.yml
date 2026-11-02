@@ -2154,6 +2154,9 @@ jobs:
       - name: Run SOP editor regressions
         working-directory: web
         run: npm run test:sop-editor
+      - name: Run dashboard sign-in regressions
+        working-directory: web
+        run: npm run test:auth
 
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
