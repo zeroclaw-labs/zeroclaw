@@ -34,7 +34,7 @@ native_tools = true
 
 With `native_tools = true` the request carries `tools`, and tool results are replayed as native `role = "tool"` messages. Leave it unset (or `false`) for an endpoint that only understands the text protocol. Do not force `runtime_profiles.<profile>.tool_dispatcher = "native"` on a chat-completions alias that does not set `native_tools = true`: the dispatcher then expects native tool calls that the request never carries.
 
-A `custom` alias with `wire_api = "responses"` is not affected by any of the above. The factory selects the Responses provider before `native_tools` is consulted, so the alias ignores `native_tools` and always sends native tool calls; setting `native_tools = false` does not disable them.
+A `custom` alias with `wire_api = "responses"` is not affected by any of the above. The factory selects the Responses provider before `native_tools` is consulted, so the alias ignores `native_tools` and retains native tool support; setting `native_tools = false` does not disable that support.
 
 ### Connection warmup
 

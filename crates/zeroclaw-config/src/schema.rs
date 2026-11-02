@@ -1139,6 +1139,9 @@ pub struct ModelProviderConfig {
     /// Set this only after confirming the configured endpoint and model
     /// accept the native tool schema. Providers routed through
     /// `wire_api = "responses"` are inherently native and ignore this setting.
+    /// Groq and Custom chat-completions aliases default to text-fallback;
+    /// set `native_tools = true` for endpoints and models that support it.
+    /// Hailo-Ollama has no native tool calling and rejects `Some(true)`.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
