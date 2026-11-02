@@ -101,6 +101,7 @@ class Pool:
                     detail = log.read(2048).decode(errors='replace').strip()
                     raise RuntimeError('SSH connection failed; not retried in this task: ' + detail)
             if entry['failed'] or entry['process'].poll() is not None:
+                entry['failed'] = True
                 raise RuntimeError('SSH transport unavailable; diagnose before starting a new task')
             entry['active'] += 1
             entry['last'] = self.clock()
@@ -129,7 +130,11 @@ class Pool:
     def expire(self):
         with self.lock:
             for key, entry in list(self.entries.items()):
-                if not entry['active'] and self.clock() - entry['last'] >= self.idle:
+                if entry['failed'] or entry['process'].poll() is not None:
+                    # Reclaim resources but retain the task's failure tombstone.
+                    entry['failed'] = True
+                    self.stop(entry)
+                elif not entry['active'] and self.clock() - entry['last'] >= self.idle:
                     self.stop(entry)
                     del self.entries[key]
 

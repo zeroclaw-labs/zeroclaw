@@ -64,6 +64,54 @@ class TaskTransportTests(unittest.TestCase):
         self.assertEqual(self.pool.entries, {})
         self.assertEqual(FakeMaster.starts[0].poll(), 0)
 
+    def test_healthy_idle_transport_can_be_recreated(self):
+        self.pool.acquire('same', [], 'host')
+        self.pool.release('same')
+        self.clock += 1800
+        self.pool.expire()
+        self.pool.acquire('same', [], 'host')
+        self.assertEqual(len(FakeMaster.starts), 2)
+        self.assertEqual(FakeMaster.starts[0].poll(), 0)
+        self.assertIsNone(FakeMaster.starts[1].poll())
+
+    def test_failed_connect_remains_unavailable_after_idle_expiry(self):
+        FakeMaster.fail = True
+        with self.assertRaisesRegex(RuntimeError, 'not retried'):
+            self.pool.acquire('same', [], 'host')
+        entry = self.pool.entries['same']
+        FakeMaster.fail = False
+        for _ in range(2):
+            self.clock += 1801
+            self.pool.expire()
+            with self.assertRaisesRegex(RuntimeError, 'unavailable'):
+                self.pool.acquire('same', [], 'host')
+            self.assertEqual(len(FakeMaster.starts), 1)
+        self.assertTrue(entry['log'].closed)
+        self.assertFalse(pathlib.Path(entry['path']).exists())
+        self.pool.close()
+        self.assertEqual(self.pool.entries, {})
+
+    def test_dead_transport_remains_unavailable_after_idle_expiry(self):
+        for reject_before_expiry in (False, True):
+            with self.subTest(reject_before_expiry=reject_before_expiry):
+                key = str(reject_before_expiry)
+                self.pool.acquire(key, [], 'host')
+                self.pool.release(key)
+                entry = self.pool.entries[key]
+                entry['process'].returncode = 255
+                starts = len(FakeMaster.starts)
+                if reject_before_expiry:
+                    with self.assertRaisesRegex(RuntimeError, 'unavailable'):
+                        self.pool.acquire(key, [], 'host')
+                for _ in range(2):
+                    self.clock += 1801
+                    self.pool.expire()
+                    with self.assertRaisesRegex(RuntimeError, 'unavailable'):
+                        self.pool.acquire(key, [], 'host')
+                    self.assertEqual(len(FakeMaster.starts), starts)
+                self.assertTrue(entry['log'].closed)
+                self.assertFalse(pathlib.Path(entry['path']).exists())
+
     def test_task_end_closes_all_hosts_immediately_and_rejects_new_commands(self):
         self.pool.acquire('one', [], 'host-a')
         self.pool.acquire('two', [], 'host-b')
