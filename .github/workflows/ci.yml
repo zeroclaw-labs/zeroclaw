@@ -1695,7 +1695,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           components: clippy
           # The CLI-only set enables plugins-wasm, whose tests build the tool fixture for this target.
           targets: wasm32-wasip2
