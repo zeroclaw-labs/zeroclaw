@@ -550,9 +550,14 @@ denied` and these attributes:
 | `method` | The JSON-RPC method refused. |
 | `reason` | A stable identifier for the refusal, from the table below. |
 | `denial_message` | The refusal text, rendered in the daemon's locale. |
-| `code` | The JSON-RPC error code of the refusal: `-32010` (`AUTH_REQUIRED`), `-32012` (`FORBIDDEN`), `-32602` (`INVALID_PARAMS`), or `-32003` (`SESSION_NOT_OWNED`). |
+| `code` | The denial record's classification code: `-32010` (`AUTH_REQUIRED`), `-32012` (`FORBIDDEN`), `-32602` (`INVALID_PARAMS`), or `-32003` (`SESSION_NOT_OWNED`). Steering admission can return a different code, as described below. |
 | `principal_id` | The principal the connection was bound to, or `null` when it was not bound. |
 | `auth_provider` | The provider that verified that principal, such as `peercred` or `oidc.<alias>`, or `null` when the connection was not bound. |
+
+Releases v0.8.6 and v0.8.7 store the refusal text in `reason`. When upgrading,
+update log consumers to display `denial_message` and group or alert on the
+stable `reason` identifier. Retained records from those releases still have
+the old field meaning; consumers reading both formats must account for it.
 
 Group and alert on `reason`, not `denial_message`. The identifier does not
 change with wording or locale, while a message names the path, agent, or grant
@@ -563,6 +568,10 @@ recognize as a generic refusal.
 
 Some cases read differently:
 
+- A remote caller's `session/steer` refusal for a session with local
+  capabilities is recorded as `session_local_capabilities` with code `-32003`
+  (`SESSION_NOT_OWNED`). If the immediate steering admission is refused, its
+  RPC response still uses `-32012` (`FORBIDDEN`).
 - `cron_job_agent_not_entitled` is recorded while the client is told the job
   was not found, the answer a missing job gets, so the response does not
   confirm that the job exists. The record's `denial_message` names the owning
