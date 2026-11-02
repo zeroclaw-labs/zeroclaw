@@ -18880,6 +18880,50 @@ const FILESYSTEM_BROAD_ROOTS: [&str; 8] = [
     "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp",
 ];
 
+/// WSL DrvFs mounts look like `/mnt/c`. Watching one is as broad as watching a
+/// Windows drive root; named bind mounts such as `/mnt/inbox` stay allowed.
+fn filesystem_path_is_drvfs_mnt_letter(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    let Some(rest) = trimmed.strip_prefix("/mnt/") else {
+        return false;
+    };
+    // Collapse `.` / empty segments so `/mnt/./c`, `/mnt//c`, and `/mnt/c/.`
+    // still count as the WSL drive root `/mnt/c`.
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let _ = parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    matches!(
+        parts.as_slice(),
+        [letter]
+            if letter.len() == 1 && letter.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    )
+}
+
+#[cfg(test)]
+mod filesystem_path_drvfs_tests {
+    use super::filesystem_path_is_drvfs_mnt_letter;
+
+    #[test]
+    fn normalizes_equivalent_spellings() {
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/c"));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/c/"));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/./c"));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt//c"));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/c/."));
+        assert!(filesystem_path_is_drvfs_mnt_letter("/mnt/./c/."));
+        assert!(!filesystem_path_is_drvfs_mnt_letter("/mnt/c/Users"));
+        assert!(!filesystem_path_is_drvfs_mnt_letter("/mnt"));
+        assert!(!filesystem_path_is_drvfs_mnt_letter("/media/c"));
+    }
+}
+
 impl FilesystemConfig {
     /// Validate the filesystem listener configuration.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -18892,6 +18936,11 @@ impl FilesystemConfig {
             if !self.allow_broad_roots && FILESYSTEM_BROAD_ROOTS.contains(&normalized) {
                 anyhow::bail!(
                     "path '{path}' is a broad system root; set allow_broad_roots = true to watch it"
+                );
+            }
+            if !self.allow_broad_roots && filesystem_path_is_drvfs_mnt_letter(normalized) {
+                anyhow::bail!(
+                    "path '{path}' is a WSL drive mount; set allow_broad_roots = true to watch it"
                 );
             }
         }
@@ -30750,6 +30799,40 @@ zeroclaw-operators = "operator"
     }
 
     #[test]
+    async fn filesystem_validate_rejects_drvfs_mnt_letter_by_default() {
+        for root in ["/mnt/c", "/mnt/C/", "/mnt/d"] {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("WSL drive mount"),
+                "root {root} must be rejected by default: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn filesystem_validate_allows_named_mnt_bind_and_drvfs_escape_hatch() {
+        let named = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/mnt/inbox".into()],
+            ..FilesystemConfig::default()
+        };
+        assert!(named.validate().is_ok());
+
+        let escape = FilesystemConfig {
+            enabled: true,
+            paths: vec!["/mnt/c".into()],
+            allow_broad_roots: true,
+            ..FilesystemConfig::default()
+        };
+        assert!(escape.validate().is_ok());
+    }
+
+    #[test]
     async fn filesystem_defaults_are_safe() {
         let cfg = FilesystemConfig::default();
         assert!(!cfg.enabled);
@@ -30762,6 +30845,7 @@ zeroclaw-operators = "operator"
         assert_eq!(cfg.max_content_bytes, Some(65536));
         assert_eq!(cfg.events.len(), 4);
     }
+
     use super::*;
     use std::ffi::OsString;
     #[cfg(unix)]
