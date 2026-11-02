@@ -8289,6 +8289,81 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn sync_ingress_consumes_late_replies_after_timeout_or_cancellation_in_any_room() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            let other_room = room_id!("!other:localhost");
+            matrix.sync_joined_room(&client, test_room()).await;
+            matrix.sync_joined_room(&client, other_room).await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut messages) = mpsc::channel(4);
+            let mut ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            ctx.peer_resolver = Arc::new(|| vec!["@operator:localhost".to_string()]);
+            let mut guards = Vec::new();
+            for token in ["TIMEOUT1", "CANCEL01"] {
+                let (sender, _receiver) = oneshot::channel();
+                let registration = Arc::new(());
+                ctx.pending_approvals.lock().await.pending.insert(
+                    token.to_string(),
+                    crate::matrix::approval::Pending {
+                        sender,
+                        destination: test_room().to_string(),
+                        registration: Arc::clone(&registration),
+                        message_id: Some(format!("${token}:localhost")),
+                    },
+                );
+                guards.push(crate::matrix::approval::Guard::new(
+                    Arc::clone(&ctx.pending_approvals),
+                    token.to_string(),
+                    registration,
+                ));
+            }
+            // The timeout arm calls `remove`; a dropped request runs `Drop`.
+            let cancelled = guards.pop().unwrap();
+            let mut timed_out = guards.pop().unwrap();
+            timed_out.remove().await;
+            drop(cancelled);
+            assert!(ctx.pending_approvals.lock().await.pending.is_empty());
+
+            let _handlers = register_event_handlers(&client, &ctx);
+            for (id, room, body) in [
+                ("$late-timeout:localhost", test_room(), "TIMEOUT1 always"),
+                ("$late-cancel:localhost", test_room(), "CANCEL01 approve"),
+                ("$late-other-room:localhost", other_room, "TIMEOUT1 deny"),
+            ] {
+                let event = serde_json::json!({
+                    "type":"m.room.message", "event_id":id, "sender":"@operator:localhost",
+                    "origin_server_ts":1, "content":{"msgtype":"m.text","body":body}
+                });
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(room).add_timeline_event(timeline_raw(&event)),
+                    )
+                    .await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), messages.recv())
+                    .await
+                    .is_err(),
+                "a late reply to a retired approval must not dispatch a model turn"
+            );
+            // The other room still dispatches ordinary chat, so the silence
+            // above comes from retired-token consumption, not room admission.
+            let chat = serde_json::json!({
+                "type":"m.room.message", "event_id":"$chat:localhost", "sender":"@operator:localhost",
+                "origin_server_ts":2, "content":{"msgtype":"m.text","body":"hello"}
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(other_room).add_timeline_event(timeline_raw(&chat)),
+                )
+                .await;
+            assert_eq!(recv_forwarded(&mut messages).await.content, "hello");
+        }
+
+        #[tokio::test]
         async fn sync_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
             let matrix = MatrixMockServer::new().await;
             let client = matrix.client_builder().build().await;
