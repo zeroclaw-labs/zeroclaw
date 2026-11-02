@@ -16,10 +16,11 @@ use futures_util::TryStreamExt;
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
 use pulldown_cmark::{Options, Parser, html};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::ClientConfig;
 use rustls_pki_types::DnsName;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -31,7 +32,7 @@ use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_tools::email_imap::{ImapSession, TlsStreamTolerant};
+use zeroclaw_tools::email_imap::{ImapSession, TlsStreamTolerant, imap_root_store, tls_ca_certs};
 
 pub use zeroclaw_config::scattered_types::EmailConfig;
 
@@ -270,11 +271,8 @@ impl EmailChannel {
         let tcp = TcpStream::connect(&addr).await?;
 
         // Establish TLS using rustls.
-        let certs = RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-        };
         let config = ClientConfig::builder()
-            .with_root_certificates(certs)
+            .with_root_certificates(imap_root_store(&self.config)?)
             .with_no_client_auth();
         let tls_connector: TlsConnector = Arc::new(config).into();
         let sni: DnsName = self.config.imap_host.clone().try_into()?;
@@ -858,19 +856,27 @@ impl EmailChannel {
     }
 
     fn create_smtp_transport(&self) -> Result<SmtpTransport> {
-        let creds = self.smtp_credentials();
-        let transport = if self.config.smtp_tls {
-            SmtpTransport::relay(&self.config.smtp_host)?
-                .port(self.config.smtp_port)
-                .credentials(creds)
-                .build()
+        let builder = SmtpTransport::builder_dangerous(&self.config.smtp_host)
+            .port(self.config.smtp_port)
+            .credentials(self.smtp_credentials());
+        // Same TLS setup as `SmtpTransport::relay`, plus the
+        // `tls_ca_cert_path` roots.
+        let builder = if self.config.smtp_tls {
+            builder.tls(Tls::Wrapper(self.smtp_tls_parameters()?))
         } else {
-            SmtpTransport::builder_dangerous(&self.config.smtp_host)
-                .port(self.config.smtp_port)
-                .credentials(creds)
-                .build()
+            builder
         };
-        Ok(transport)
+        Ok(builder.build())
+    }
+
+    /// TLS parameters for SMTP: lettre's default roots plus the certificates
+    /// in `tls_ca_cert_path`.
+    fn smtp_tls_parameters(&self) -> Result<TlsParameters> {
+        let mut builder = TlsParameters::builder(self.config.smtp_host.clone());
+        for cert in tls_ca_certs(&self.config)? {
+            builder = builder.add_root_certificate(Certificate::from_der(cert.to_vec())?);
+        }
+        Ok(builder.build()?)
     }
 
     /// Build the outbound `lettre` message for a `SendMessage`, including
@@ -1249,6 +1255,130 @@ mod tests {
         assert!(config.smtp_tls);
     }
 
+    /// A one-connection TLS server for `localhost` whose certificate is
+    /// signed by a fresh private CA. Returns the CA's PEM file, the port, and
+    /// a handle that yields whether the TLS handshake succeeded. After the
+    /// handshake it sends `greeting`, reads one request and closes.
+    async fn spawn_private_ca_tls_server(
+        greeting: &'static [u8],
+    ) -> (tempfile::NamedTempFile, u16, tokio::task::JoinHandle<bool>) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["Email test CA".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let server_cert = CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), ca_cert.pem()).unwrap();
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                rustls_pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = zeroclaw_spawn::spawn!(async move {
+            // Bounded so a client that never connects or stalls the
+            // handshake fails the test instead of hanging it.
+            let handshake = timeout(Duration::from_secs(10), async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                acceptor.accept(tcp).await
+            })
+            .await
+            .expect("the client never connected or finished the TLS handshake");
+            let Ok(mut tls) = handshake else {
+                return false;
+            };
+            let _ = timeout(Duration::from_secs(5), tls.write_all(greeting)).await;
+            let mut buf = [0_u8; 1024];
+            let _ = timeout(Duration::from_secs(5), tls.read(&mut buf)).await;
+            true
+        });
+        (ca_file, port, server)
+    }
+
+    fn private_ca_config(port: u16, ca: Option<&tempfile::NamedTempFile>) -> EmailConfig {
+        EmailConfig {
+            imap_host: "localhost".to_string(),
+            imap_port: port,
+            smtp_host: "localhost".to_string(),
+            smtp_port: port,
+            smtp_tls: true,
+            tls_ca_cert_path: ca.map(|f| f.path().display().to_string()),
+            username: "user@example.invalid".to_string(),
+            password: "secret".to_string(),
+            from_address: "bot@example.invalid".to_string(),
+            ..EmailConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_imap_trusts_tls_ca_cert_path() {
+        for trust_ca in [false, true] {
+            let (ca, port, server) = spawn_private_ca_tls_server(b"* BYE test\r\n").await;
+            let channel = EmailChannel::new(
+                private_ca_config(port, trust_ca.then_some(&ca)),
+                "email_test_alias",
+                empty_resolver(),
+            );
+
+            // The session never opens (the server says BYE); the handshake is
+            // what is under test.
+            assert!(channel.connect_imap().await.is_err());
+            assert_eq!(server.await.unwrap(), trust_ca, "trust_ca = {trust_ca}");
+        }
+    }
+
+    // `send` drives lettre's blocking transport on the test thread, so the
+    // TLS server task needs a second worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_over_smtp_tls_trusts_tls_ca_cert_path() {
+        for trust_ca in [false, true] {
+            let (ca, port, server) =
+                spawn_private_ca_tls_server(b"554 test server refuses\r\n").await;
+            let channel = EmailChannel::new(
+                private_ca_config(port, trust_ca.then_some(&ca)),
+                "email_test_alias",
+                empty_resolver(),
+            );
+
+            let result = channel
+                .send(&SendMessage::new("hello", "peer@example.invalid"))
+                .await;
+            assert!(result.is_err());
+            assert_eq!(server.await.unwrap(), trust_ca, "trust_ca = {trust_ca}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tls_ca_cert_path_fails_the_connection() {
+        let channel = EmailChannel::new(
+            EmailConfig {
+                tls_ca_cert_path: Some("relative/ca.pem".to_string()),
+                ..private_ca_config(1, None)
+            },
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let err = channel
+            .send(&SendMessage::new("hello", "peer@example.invalid"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be absolute"), "{err}");
+    }
+
     #[test]
     fn default_idle_timeout_is_29_minutes() {
         assert_eq!(default_idle_timeout(), 1740);
@@ -1334,6 +1464,7 @@ mod tests {
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 465,
             smtp_tls: true,
+            tls_ca_cert_path: None,
             username: "user@example.com".to_string(),
             password: "pass123".to_string(),
             smtp_username: None,
@@ -1364,6 +1495,7 @@ mod tests {
             smtp_host: "smtp.test.com".to_string(),
             smtp_port: 587,
             smtp_tls: true,
+            tls_ca_cert_path: None,
             username: "user@test.com".to_string(),
             password: "secret".to_string(),
             smtp_username: None,
@@ -1393,6 +1525,7 @@ mod tests {
             smtp_host: "smtp.example.invalid".to_string(),
             smtp_port: 465,
             smtp_tls: true,
+            tls_ca_cert_path: None,
             username: "private-user@example.invalid".to_string(),
             password: "secret".to_string(),
             smtp_username: None,
@@ -2190,6 +2323,7 @@ mod tests {
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             smtp_tls: true,
+            tls_ca_cert_path: None,
             username: "user@example.com".to_string(),
             password: "password123".to_string(),
             smtp_username: None,

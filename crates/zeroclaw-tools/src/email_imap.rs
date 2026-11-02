@@ -8,7 +8,8 @@ use std::task::{Context as TaskContext, Poll};
 use anyhow::{Context, Result};
 use async_imap::Session;
 use rustls::{ClientConfig, RootCertStore};
-use rustls_pki_types::DnsName;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, DnsName};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -65,6 +66,37 @@ pub fn is_tls_close_notify(e: &io::Error) -> bool {
 
 pub type ImapSession = Session<TlsStreamTolerant>;
 
+/// The certificates in `tls_ca_cert_path`, or none when it is not set. The
+/// file is read with the same rules as an MCP server's `tls_ca_cert_path`;
+/// an invalid file or one with no certificate is an error.
+pub fn tls_ca_certs(cfg: &EmailConfig) -> Result<Vec<CertificateDer<'static>>> {
+    let Some(path) = cfg.tls_ca_cert_path.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let pem = crate::mcp_transport::load_tls_ca_pem("email channel", path)?;
+    let certs = CertificateDer::pem_slice_iter(&pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("email channel: invalid PEM CA certificate at `{path}`"))?;
+    if certs.is_empty() {
+        anyhow::bail!("email channel: CA certificate file `{path}` contained no certificates");
+    }
+    Ok(certs)
+}
+
+/// Roots trusted for IMAP TLS: the bundled web PKI roots plus
+/// `tls_ca_cert_path`.
+pub fn imap_root_store(cfg: &EmailConfig) -> Result<RootCertStore> {
+    let mut roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+    };
+    for cert in tls_ca_certs(cfg)? {
+        roots
+            .add(cert)
+            .context("email channel: unusable certificate in tls_ca_cert_path")?;
+    }
+    Ok(roots)
+}
+
 pub async fn imap_connect(
     cfg: &EmailConfig,
     auth_service: Option<&Arc<zeroclaw_providers::auth::AuthService>>,
@@ -75,11 +107,8 @@ pub async fn imap_connect(
         .await
         .context("TCP connect failed")?;
 
-    let certs = RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-    };
     let tls_config = ClientConfig::builder()
-        .with_root_certificates(certs)
+        .with_root_certificates(imap_root_store(cfg)?)
         .with_no_client_auth();
     let connector: TlsConnector = Arc::new(tls_config).into();
     let sni: DnsName = cfg
@@ -177,6 +206,56 @@ mod tests {
         // exact substring `close_notify` triggers the string fallback.
         let benign = io::Error::other("operation successful");
         assert!(!is_tls_close_notify(&benign));
+    }
+
+    #[test]
+    fn tls_ca_cert_path_adds_its_certificates_to_the_imap_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["mail.internal".into()]).unwrap();
+        std::fs::write(&path, cert.cert.pem()).unwrap();
+        let cfg = EmailConfig {
+            tls_ca_cert_path: Some(path.display().to_string()),
+            ..EmailConfig::default()
+        };
+
+        assert_eq!(tls_ca_certs(&cfg).unwrap().len(), 1);
+        let base = imap_root_store(&EmailConfig::default()).unwrap().len();
+        assert_eq!(imap_root_store(&cfg).unwrap().len(), base + 1);
+        assert!(tls_ca_certs(&EmailConfig::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tls_ca_cert_path_follows_the_mcp_file_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let err_for = |path: String| {
+            tls_ca_certs(&EmailConfig {
+                tls_ca_cert_path: Some(path),
+                ..EmailConfig::default()
+            })
+            .unwrap_err()
+            .to_string()
+        };
+
+        assert!(err_for("ca.pem".into()).contains("must be absolute"));
+        assert!(err_for("~/ca.pem".into()).contains("must be absolute"));
+        let missing = dir.path().join("absent.pem").display().to_string();
+        assert!(err_for(missing).contains("cannot read TLS CA certificate"));
+        // Windows refuses to open a directory for reading at all.
+        let dir_err = err_for(dir.path().display().to_string());
+        assert!(
+            dir_err.contains("must name a regular file")
+                || dir_err.contains("cannot read TLS CA certificate"),
+            "{dir_err}"
+        );
+
+        let big = dir.path().join("big.pem");
+        std::fs::write(&big, vec![b'a'; 1024 * 1024 + 1]).unwrap();
+        assert!(err_for(big.display().to_string()).contains("byte limit"));
+
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "not a certificate").unwrap();
+        assert!(err_for(empty.display().to_string()).contains("contained no certificates"));
     }
 
     #[test]
