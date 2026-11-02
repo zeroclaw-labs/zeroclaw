@@ -13,6 +13,13 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 const VALID_URGENCY_LEVELS: &[&str] = &["low", "medium", "high", "critical"];
 
+#[derive(Default)]
+struct AlertOutcome {
+    accepted_names: Vec<String>,
+    /// Acceptance belongs to the resolved origin object, not its registry key.
+    origin_accepted: bool,
+}
+
 /// Agent-callable tool for escalating situations to a human operator with urgency routing.
 pub struct EscalateToHumanTool {
     security: Arc<SecurityPolicy>,
@@ -61,22 +68,22 @@ impl EscalateToHumanTool {
     /// Send best-effort alerts to configured alert channels for high/critical
     /// urgency.
     ///
-    /// Returns the names of channels that actually accepted the message, so
-    /// callers can distinguish "notified a human somewhere" from "notified
-    /// nobody". Channels whose `send` is a no-op (`supports_outbound_send()`
+    /// Reports accepted target names and whether the resolved origin accepted
+    /// the message, so callers can preserve its reply wait after a retry.
+    /// Channels whose `send` is a no-op (`supports_outbound_send()`
     /// is false) are skipped rather than counted as delivered — otherwise an
     /// alert-channel list made solely of back-channels would look successful.
     ///
-    /// `already_sent` is the channel that has just received the escalation
-    /// directly, if any. It is skipped by pointer identity rather than by name:
-    /// one channel is commonly reachable under both a bare type key
-    /// (`discord`) and a dotted alias (`discord.default`), so comparing names
-    /// would still deliver the message twice into the same room.
+    /// Once `origin` accepts the direct send or an alert retry, later aliases
+    /// of that same object are skipped. Pointer identity matters: a channel is
+    /// commonly reachable under both a bare key (`discord`) and a dotted alias
+    /// (`discord.default`), and a registry key can change owners during a send.
     async fn send_alerts(
         &self,
         text: &str,
-        already_sent: Option<&Arc<dyn Channel>>,
-    ) -> Vec<String> {
+        origin: &Arc<dyn Channel>,
+        origin_already_accepted: bool,
+    ) -> AlertOutcome {
         // Collect Arc clones while holding the lock, then drop the guard before awaiting.
         let targets: Vec<(String, Arc<dyn Channel>)> = {
             let channels = self.channel_map.read();
@@ -109,15 +116,19 @@ impl EscalateToHumanTool {
                         );
                         return None;
                     }
-                    if already_sent.is_some_and(|origin| Arc::ptr_eq(origin, ch)) {
-                        return None;
-                    }
                     Some((name.clone(), Arc::clone(ch)))
                 })
                 .collect()
         };
-        let mut delivered = Vec::new();
+        let mut outcome = AlertOutcome {
+            origin_accepted: origin_already_accepted,
+            ..AlertOutcome::default()
+        };
         for (name, ch) in targets {
+            let is_origin = Arc::ptr_eq(origin, &ch);
+            if is_origin && outcome.origin_accepted {
+                continue;
+            }
             let msg = SendMessage::new(text, "");
             if let Err(e) = ch.send(&msg).await {
                 ::zeroclaw_log::record!(
@@ -128,10 +139,11 @@ impl EscalateToHumanTool {
                     "escalate_to_human: alert to channel failed"
                 );
             } else {
-                delivered.push(name);
+                outcome.accepted_names.push(name);
+                outcome.origin_accepted |= is_origin;
             }
         }
-        delivered
+        outcome
     }
 }
 
@@ -319,7 +331,9 @@ impl Tool for EscalateToHumanTool {
             } else {
                 // Nothing was delivered on the origin channel here, so there is
                 // no prior send to deduplicate against.
-                self.send_alerts(&text, None).await
+                self.send_alerts(&text, &channel, false)
+                    .await
+                    .accepted_names
             };
 
             if delivered.is_empty() {
@@ -401,18 +415,25 @@ impl Tool for EscalateToHumanTool {
         // an alert reached anyone when every configured channel refused.
         let alert_requested =
             (urgency == "high" || urgency == "critical") && !self.alert_channels.is_empty();
-        let alerted_to = if alert_requested {
-            // Exclude the origin only once it has actually accepted the
-            // message. An origin that failed holds nothing to duplicate, and
-            // skipping it there would drop the one target still worth trying.
-            let already_delivered = origin_error.is_none().then_some(&channel);
-            self.send_alerts(&text, already_delivered).await
+        let AlertOutcome {
+            accepted_names: alerted_to,
+            origin_accepted,
+        } = if alert_requested {
+            // A failed origin remains eligible for an alert retry. Acceptance
+            // on that same object restores its reply path and excludes later
+            // aliases, even if the registry changes while the send is pending.
+            self.send_alerts(&text, &channel, origin_error.is_none())
+                .await
         } else {
-            Vec::new()
+            AlertOutcome {
+                origin_accepted: origin_error.is_none(),
+                ..AlertOutcome::default()
+            }
         };
 
-        if let Some(origin_error) = origin_error {
-            // The origin did not take it. Succeed only if an alert channel did,
+        if let Some(origin_error) = origin_error.filter(|_| !origin_accepted) {
+            // Neither the direct send nor an alert retry reached the origin.
+            // Succeed only if a distinct alert channel did,
             // and say plainly which one, so the model never reads this as the
             // human having seen it on the channel it was talking to.
             if alerted_to.is_empty() {
@@ -528,6 +549,7 @@ mod tests {
     use super::*;
     use parking_lot::RwLock;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A stub channel that records sent messages but never produces incoming messages.
     struct SilentChannel {
@@ -1527,5 +1549,243 @@ mod tests {
                 .contains("wait_for_response"),
             "the model must be told which argument to drop",
         );
+    }
+
+    /// A free-form channel that rejects its first send and answers only when
+    /// execute actually starts its listener. The hook can replace a registry
+    /// entry at either send boundary without changing the operation's Arc.
+    struct RecoveringChannel {
+        inner: RespondingChannel,
+        attempts: AtomicUsize,
+        listens: AtomicUsize,
+        on_send: Option<Box<dyn Fn(usize) + Send + Sync>>,
+    }
+
+    impl RecoveringChannel {
+        fn new(name: &str, response: &str) -> Self {
+            Self {
+                inner: RespondingChannel::new(name, response),
+                attempts: AtomicUsize::new(0),
+                listens: AtomicUsize::new(0),
+                on_send: None,
+            }
+        }
+
+        fn with_send_hook(mut self, hook: impl Fn(usize) + Send + Sync + 'static) -> Self {
+            self.on_send = Some(Box::new(hook));
+            self
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RecoveringChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for RecoveringChannel {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(hook) = &self.on_send {
+                hook(attempt);
+            }
+            if attempt == 1 {
+                anyhow::bail!("origin send temporarily unavailable");
+            }
+            self.inner.send(message).await
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.listens.fetch_add(1, Ordering::SeqCst);
+            self.inner.listen(tx).await
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_recovery_returns_human_response() {
+        for (requested, urgency) in [("origin", "high"), ("origin.default", "critical")] {
+            let origin = Arc::new(RecoveringChannel::new("origin", "Approved after recovery"));
+            let tool = make_tool_with_channels_and_alerts(
+                vec![
+                    ("origin", Arc::clone(&origin) as Arc<dyn Channel>),
+                    ("origin.default", Arc::clone(&origin) as Arc<dyn Channel>),
+                ],
+                vec!["origin"],
+            );
+
+            let result = tool
+                .execute(json!({
+                    "summary": "Need a human decision",
+                    "channel": requested,
+                    "urgency": urgency,
+                    "wait_for_response": true,
+                    "timeout_secs": 1,
+                }))
+                .await
+                .unwrap();
+
+            assert!(result.success, "error: {:?}", result.error);
+            assert_eq!(result.output, "Approved after recovery");
+            assert!(result.error.is_none());
+            assert_eq!(origin.attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(origin.inner.sent.read().len(), 1);
+            assert_eq!(origin.listens.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_recovery_deduplicates_only_original_aliases() {
+        let origin = Arc::new(RecoveringChannel::new("origin", "Unused response"));
+        // Distinct objects may share the channel's type/name. Accepting the
+        // origin must not suppress either of these configured alternates.
+        let first_alternate = Arc::new(SilentChannel::new("origin"));
+        let last_alternate = Arc::new(SilentChannel::new("origin"));
+        let tool = make_tool_with_channels_and_alerts(
+            vec![
+                ("origin", Arc::clone(&origin) as Arc<dyn Channel>),
+                ("origin.default", Arc::clone(&origin) as Arc<dyn Channel>),
+                (
+                    "pager-first",
+                    Arc::clone(&first_alternate) as Arc<dyn Channel>,
+                ),
+                (
+                    "pager-last",
+                    Arc::clone(&last_alternate) as Arc<dyn Channel>,
+                ),
+            ],
+            vec!["pager-first", "origin", "origin.default", "pager-last"],
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Need an operator",
+                "channel": "origin.default",
+                "urgency": "critical",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(origin.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(origin.inner.sent.read().len(), 1);
+        assert_eq!(origin.listens.load(Ordering::SeqCst), 0);
+        assert_eq!(first_alternate.sent.read().len(), 1);
+        assert_eq!(last_alternate.sent.read().len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["status"], "escalated");
+        assert_eq!(parsed["channel"], "origin.default");
+        assert_eq!(
+            parsed["alerted_to"],
+            json!(["pager-first", "origin", "pager-last"])
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_recovery_does_not_accept_same_name_replacement() {
+        let tool = make_tool_with_channels_and_alerts(vec![], vec!["origin"]);
+        let map = Arc::downgrade(&tool.channel_map);
+        let replacement = Arc::new(RespondingChannel::new("origin", "Different listener"));
+        let replacement_for_hook: Arc<dyn Channel> = replacement.clone();
+        let origin = Arc::new(
+            RecoveringChannel::new("origin", "Original listener").with_send_hook(move |attempt| {
+                if attempt == 1 {
+                    map.upgrade()
+                        .unwrap()
+                        .write()
+                        .insert("origin".to_string(), Arc::clone(&replacement_for_hook));
+                }
+            }),
+        );
+        tool.channel_map.write().insert(
+            "origin".to_string(),
+            Arc::clone(&origin) as Arc<dyn Channel>,
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Need a decision",
+                "channel": "origin",
+                "urgency": "high",
+                "wait_for_response": true,
+                "timeout_secs": 1,
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a distinct replacement is still an alternate"
+        );
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("wait_for_response")
+        );
+        assert_eq!(origin.attempts.load(Ordering::SeqCst), 1);
+        assert!(origin.inner.sent.read().is_empty());
+        assert_eq!(origin.listens.load(Ordering::SeqCst), 0);
+        assert_eq!(replacement.sent.read().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn origin_recovery_uses_accepted_target_not_later_map_lookup() {
+        let tool = make_tool_with_channels_and_alerts(vec![], vec!["origin"]);
+        let map = Arc::downgrade(&tool.channel_map);
+        let replacement = Arc::new(RespondingChannel::new("origin", "Wrong listener"));
+        let replacement_for_hook: Arc<dyn Channel> = replacement.clone();
+        let origin = Arc::new(
+            RecoveringChannel::new("origin", "Reply from accepted origin").with_send_hook(
+                move |attempt| {
+                    if attempt == 2 {
+                        map.upgrade()
+                            .unwrap()
+                            .write()
+                            .insert("origin".to_string(), Arc::clone(&replacement_for_hook));
+                    }
+                },
+            ),
+        );
+        tool.channel_map.write().insert(
+            "origin".to_string(),
+            Arc::clone(&origin) as Arc<dyn Channel>,
+        );
+
+        let result = tool
+            .execute(json!({
+                "summary": "Need a decision",
+                "channel": "origin",
+                "urgency": "high",
+                "wait_for_response": true,
+                "timeout_secs": 1,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(result.output, "Reply from accepted origin");
+        assert_eq!(origin.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(origin.inner.sent.read().len(), 1);
+        assert_eq!(origin.listens.load(Ordering::SeqCst), 1);
+        assert!(replacement.sent.read().is_empty());
+        let replacement: Arc<dyn Channel> = replacement;
+        assert!(Arc::ptr_eq(
+            tool.channel_map.read().get("origin").unwrap(),
+            &replacement,
+        ));
     }
 }
