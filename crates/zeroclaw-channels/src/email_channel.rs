@@ -22,8 +22,8 @@ use pulldown_cmark::{Options, Parser, html};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
@@ -49,6 +49,9 @@ pub struct EmailChannel {
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     seen_messages: Arc<Mutex<HashSet<String>>>,
+    /// Messages received since start, kept so a reply can quote the one it
+    /// answers (`quote_original`). Bounded; the oldest is dropped first.
+    recent_inbound: Arc<StdMutex<RecentInbound>>,
     auth_service: Option<Arc<zeroclaw_providers::auth::AuthService>>,
 }
 
@@ -63,6 +66,7 @@ impl EmailChannel {
             alias: alias.into(),
             peer_resolver,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
+            recent_inbound: Arc::new(StdMutex::new(RecentInbound::default())),
             auth_service: None,
         }
     }
@@ -128,6 +132,19 @@ impl EmailChannel {
             .and_then(|a| a.address())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown".into())
+    }
+
+    /// The From mailbox as a person reads it: `Name <address>`, or the bare
+    /// address when the header carries no display name.
+    fn extract_sender_display(parsed: &mail_parser::Message) -> String {
+        let Some(addr) = parsed.from().and_then(|addr| addr.first()) else {
+            return "unknown".into();
+        };
+        let address = addr.address().unwrap_or("unknown");
+        match addr.name().map(str::trim).filter(|name| !name.is_empty()) {
+            Some(name) => format!("{name} <{address}>"),
+            None => address.to_string(),
+        }
     }
 
     /// Extract the Reply-To address from a parsed email, if present.
@@ -405,6 +422,11 @@ impl EmailChannel {
                     .unwrap_or(0)
             });
         let attachments = self.extract_attachments(parsed);
+        let original = QuotedOriginal {
+            sender: Self::extract_sender_display(parsed),
+            date: parsed.date().map(|d| d.to_rfc822()),
+            text: truncate_chars(&body_text, QUOTE_MAX_CHARS),
+        };
         ParsedEmail {
             msg_id,
             sender,
@@ -414,6 +436,7 @@ impl EmailChannel {
             content,
             timestamp,
             attachments,
+            original,
         }
     }
 
@@ -808,6 +831,9 @@ impl EmailChannel {
             }
             None => email.sender.clone(),
         };
+        if self.config.quote_original {
+            self.remember_inbound(email.msg_id.clone(), email.original);
+        }
         let msg = ChannelMessage {
             id: email.msg_id,
             reply_target,
@@ -873,6 +899,78 @@ impl EmailChannel {
         Ok(transport)
     }
 
+    fn remember_inbound(&self, msg_id: String, original: QuotedOriginal) {
+        if let Ok(mut recent) = self.recent_inbound.lock() {
+            recent.insert(msg_id, original);
+        }
+    }
+
+    /// The received message a reply answers, when quoting is on and the
+    /// message is still remembered.
+    fn original_for(&self, message: &SendMessage) -> Option<QuotedOriginal> {
+        if !self.config.quote_original {
+            return None;
+        }
+        let reply_id = message.in_reply_to.as_deref()?;
+        self.recent_inbound.lock().ok()?.get(reply_id).cloned()
+    }
+
+    /// The attribution line that introduces a quoted original.
+    fn attribution(original: &QuotedOriginal) -> String {
+        match &original.date {
+            Some(date) => format!("On {date}, {} wrote:", original.sender),
+            None => format!("{} wrote:", original.sender),
+        }
+    }
+
+    /// The plain-text body of an outbound message: the agent's text,
+    /// followed by the quoted original when there is one.
+    fn compose_plain(body: &str, original: Option<&QuotedOriginal>) -> String {
+        let Some(original) = original else {
+            return body.to_string();
+        };
+        let quoted_lines: String = original
+            .text
+            .lines()
+            .map(|line| {
+                if line.is_empty() {
+                    ">\n".to_string()
+                } else {
+                    format!("> {line}\n")
+                }
+            })
+            .collect();
+        format!(
+            "{}\n\n{}\n{quoted_lines}",
+            body.trim_end(),
+            Self::attribution(original)
+        )
+    }
+
+    /// The HTML body of an outbound message: the rendered agent text,
+    /// followed by the quoted original when there is one. Only built when
+    /// the channel sends an HTML part.
+    fn compose_html(body: &str, original: Option<&QuotedOriginal>) -> String {
+        let html_body = markdown_to_html(body);
+        let Some(original) = original else {
+            return html_body;
+        };
+        format!(
+            "{html_body}<br>\n<div>{}</div>\n<blockquote style=\"margin:0 0 0 .8ex;\
+             border-left:1px solid #ccc;padding-left:1ex\">{}</blockquote>\n",
+            escape_html(&Self::attribution(original)),
+            escape_html(&original.text).replace('\n', "<br>\n"),
+        )
+    }
+
+    #[cfg(test)]
+    fn compose_bodies(body: &str, original: Option<&QuotedOriginal>) -> (String, String) {
+        (
+            Self::compose_plain(body, original),
+            Self::compose_html(body, original),
+        )
+    }
+
     /// Build the outbound `lettre` message for a `SendMessage`, including
     /// subject/body derivation, attachments, and reply threading headers
     /// (`In-Reply-To` / `References`). Pure and side-effect free so it can be
@@ -913,11 +1011,14 @@ impl EmailChannel {
             builder = builder.references(references.join(" "));
         }
         let att_parts = build_attachment_parts(&message.attachments);
+        let original = self.original_for(message);
+        let plain_body = Self::compose_plain(body, original.as_ref());
 
         let email = if self.config.html_body {
+            let html_body = Self::compose_html(body, original.as_ref());
             let alt = MultiPart::alternative()
-                .singlepart(SinglePart::plain(body.to_string()))
-                .singlepart(SinglePart::html(markdown_to_html(body)));
+                .singlepart(SinglePart::plain(plain_body))
+                .singlepart(SinglePart::html(html_body));
             if att_parts.is_empty() {
                 builder.multipart(alt)?
             } else {
@@ -928,7 +1029,7 @@ impl EmailChannel {
                 builder.multipart(mixed)?
             }
         } else {
-            let plain = SinglePart::plain(body.to_string());
+            let plain = SinglePart::plain(plain_body);
             if att_parts.is_empty() {
                 builder.singlepart(plain)?
             } else {
@@ -954,6 +1055,58 @@ struct ParsedEmail {
     content: String,
     timestamp: u64,
     attachments: Vec<zeroclaw_api::media::MediaAttachment>,
+    original: QuotedOriginal,
+}
+
+/// How many received messages are kept for quoting replies.
+const QUOTE_CACHE_CAPACITY: usize = 256;
+/// The longest original text a reply quotes, in characters.
+const QUOTE_MAX_CHARS: usize = 20_000;
+
+/// What a reply needs to quote the message it answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QuotedOriginal {
+    sender: String,
+    date: Option<String>,
+    text: String,
+}
+
+/// Received messages by Message-ID; past the capacity the oldest is dropped.
+#[derive(Default)]
+struct RecentInbound {
+    order: VecDeque<String>,
+    by_id: HashMap<String, QuotedOriginal>,
+}
+
+impl RecentInbound {
+    fn insert(&mut self, msg_id: String, original: QuotedOriginal) {
+        if self.by_id.insert(msg_id.clone(), original).is_none() {
+            self.order.push_back(msg_id);
+        }
+        while self.order.len() > QUOTE_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_id.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, msg_id: &str) -> Option<&QuotedOriginal> {
+        self.by_id.get(msg_id)
+    }
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}\n[…]", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Result from waiting on IDLE
@@ -1347,6 +1500,7 @@ mod tests {
             excluded_tools: vec![],
             oauth2: None,
             observer_mode: false,
+            quote_original: false,
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -1377,6 +1531,7 @@ mod tests {
             excluded_tools: vec![],
             oauth2: None,
             observer_mode: false,
+            quote_original: false,
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -1406,6 +1561,7 @@ mod tests {
             excluded_tools: vec![],
             oauth2: None,
             observer_mode: false,
+            quote_original: false,
         }
     }
 
@@ -2203,6 +2359,7 @@ mod tests {
             html_body: true,
             oauth2: None,
             observer_mode: false,
+            quote_original: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -2371,5 +2528,180 @@ mod tests {
             "  smtp_pass  ".to_string(),
         );
         assert_eq!(creds, expected);
+    }
+
+    // -- quote_original tests --
+
+    fn quoting_channel(quote_original: bool) -> EmailChannel {
+        let mut config = mailbox_identity_config();
+        config.quote_original = quote_original;
+        EmailChannel::new(
+            config,
+            "email_test_alias",
+            resolver_from(vec!["@example.invalid".to_string()]),
+        )
+    }
+
+    fn sample_original() -> QuotedOriginal {
+        QuotedOriginal {
+            sender: "Jane Doe <jane@example.invalid>".to_string(),
+            date: Some("Wed, 21 Oct 2026 22:06:48 +0100".to_string()),
+            text: "Can we meet on Thursday?\n\nThanks <Jane>".to_string(),
+        }
+    }
+
+    fn reply_to_original(content: &str) -> SendMessage {
+        SendMessage::new(content, "jane@example.invalid")
+            .in_reply_to(Some("orig@example.invalid".to_string()))
+    }
+
+    #[test]
+    fn quote_original_defaults_off() {
+        assert!(!EmailConfig::default().quote_original);
+    }
+
+    #[test]
+    fn reply_quotes_the_message_it_answers() {
+        let channel = quoting_channel(true);
+        channel.remember_inbound("orig@example.invalid".to_string(), sample_original());
+        let message = reply_to_original("Yes, Thursday works.");
+        let original = channel.original_for(&message);
+        let (plain, html) = EmailChannel::compose_bodies(&message.content, original.as_ref());
+
+        assert_eq!(
+            plain,
+            "Yes, Thursday works.\n\n\
+             On Wed, 21 Oct 2026 22:06:48 +0100, Jane Doe <jane@example.invalid> wrote:\n\
+             > Can we meet on Thursday?\n\
+             >\n\
+             > Thanks <Jane>\n"
+        );
+        assert!(html.starts_with("<p>Yes, Thursday works.</p>"), "{html}");
+        assert!(
+            html.contains("Jane Doe &lt;jane@example.invalid&gt; wrote:"),
+            "{html}"
+        );
+        assert!(html.contains("<blockquote"), "{html}");
+        assert!(html.contains("Thanks &lt;Jane&gt;</blockquote>"), "{html}");
+    }
+
+    #[test]
+    fn reply_without_a_date_still_names_the_sender() {
+        let channel = quoting_channel(true);
+        let mut original = sample_original();
+        original.date = None;
+        channel.remember_inbound("orig@example.invalid".to_string(), original);
+        let message = reply_to_original("Yes.");
+        let (plain, _) =
+            EmailChannel::compose_bodies(&message.content, channel.original_for(&message).as_ref());
+        assert!(
+            plain.contains("\n\nJane Doe <jane@example.invalid> wrote:\n> Can we"),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn reply_is_not_quoted_when_off_unknown_or_unthreaded() {
+        let off = quoting_channel(false);
+        off.remember_inbound("orig@example.invalid".to_string(), sample_original());
+        assert_eq!(off.original_for(&reply_to_original("Yes.")), None);
+
+        let on = quoting_channel(true);
+        on.remember_inbound("orig@example.invalid".to_string(), sample_original());
+        let unknown = SendMessage::new("Yes.", "jane@example.invalid")
+            .in_reply_to(Some("other@example.invalid".to_string()));
+        assert_eq!(on.original_for(&unknown), None);
+        let unthreaded = SendMessage::new("Yes.", "jane@example.invalid");
+        assert_eq!(on.original_for(&unthreaded), None);
+
+        let (plain, html) = EmailChannel::compose_bodies("Yes.", None);
+        assert_eq!(plain, "Yes.");
+        assert_eq!(html, markdown_to_html("Yes."));
+    }
+
+    #[test]
+    fn quoted_reply_is_in_the_sent_message() {
+        let channel = quoting_channel(true);
+        channel.remember_inbound("orig@example.invalid".to_string(), sample_original());
+        let email = channel
+            .build_email_message(&reply_to_original("Yes, Thursday works."))
+            .unwrap();
+        let wire = String::from_utf8_lossy(&email.formatted()).into_owned();
+        assert!(wire.contains("> Can we meet on Thursday?"), "{wire}");
+        assert!(wire.contains("<blockquote"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn received_message_is_quoted_in_the_reply_to_it() {
+        let channel = quoting_channel(true);
+        let parsed = parse_test_email(
+            b"From: Jane Doe <jane@example.invalid>\r\n\
+              Message-ID: <orig@example.invalid>\r\n\
+              Date: Wed, 21 Oct 2026 22:06:48 +0100\r\n\
+              Subject: Thursday\r\n\
+              \r\n\
+              Can we meet on Thursday?",
+        );
+        let email = channel.build_parsed_email(&parsed, 7, Some(1));
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(channel.dispatch_email(email, &tx).await.unwrap());
+        let msg = rx.recv().await.unwrap();
+
+        let reply = SendMessage::reply_to(&msg, "Yes, Thursday works.");
+        let (plain, _) =
+            EmailChannel::compose_bodies(&reply.content, channel.original_for(&reply).as_ref());
+        assert!(
+            plain.contains("Jane Doe <jane@example.invalid> wrote:\n> Can we meet on Thursday?"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("On Wed, 21 Oct 2026 22:06:48 +0100,"),
+            "{plain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_sender_is_not_remembered() {
+        let mut config = mailbox_identity_config();
+        config.quote_original = true;
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let parsed = parse_test_email(
+            b"From: stranger@elsewhere.invalid\r\n\
+              Message-ID: <stranger@elsewhere.invalid>\r\n\
+              Subject: Hi\r\n\
+              \r\n\
+              hello",
+        );
+        let email = channel.build_parsed_email(&parsed, 8, Some(1));
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(channel.dispatch_email(email, &tx).await.unwrap());
+        let reply = SendMessage::new("x", "stranger@elsewhere.invalid")
+            .in_reply_to(Some("stranger@elsewhere.invalid".to_string()));
+        assert_eq!(channel.original_for(&reply), None);
+    }
+
+    #[test]
+    fn recent_inbound_drops_the_oldest_past_capacity() {
+        let mut recent = RecentInbound::default();
+        for i in 0..=QUOTE_CACHE_CAPACITY {
+            recent.insert(format!("m{i}@example.invalid"), sample_original());
+        }
+        assert!(recent.get("m0@example.invalid").is_none());
+        assert!(recent.get("m1@example.invalid").is_some());
+        assert!(
+            recent
+                .get(&format!("m{QUOTE_CACHE_CAPACITY}@example.invalid"))
+                .is_some()
+        );
+        assert_eq!(recent.order.len(), QUOTE_CACHE_CAPACITY);
+
+        recent.insert("m1@example.invalid".to_string(), sample_original());
+        assert_eq!(recent.order.len(), QUOTE_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn long_originals_are_cut_on_a_character_boundary() {
+        assert_eq!(truncate_chars("héllo", 3), "hél\n[…]");
+        assert_eq!(truncate_chars("héllo", 5), "héllo");
     }
 }
