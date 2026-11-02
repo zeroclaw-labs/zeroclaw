@@ -1630,6 +1630,8 @@ mod tests {
             "zeroclaw-aarch64-linux-android.tar.gz",
             "zeroclaw-aarch64-unknown-linux-gnu.tar.gz",
             "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+            "zeroclaw-aarch64-unknown-linux-musl.tar.gz",
+            "zeroclaw-x86_64-unknown-linux-musl.tar.gz",
             "zeroclaw-x86_64-apple-darwin.tar.gz",
             "zeroclaw-aarch64-apple-darwin.tar.gz",
             "zeroclaw-x86_64-pc-windows-msvc.tar.gz",
