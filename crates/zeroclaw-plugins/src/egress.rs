@@ -48,6 +48,166 @@ use crate::instance::{PluginInstanceId, PluginInstanceScope};
 #[cfg(feature = "plugins-wasmtime")]
 pub(crate) const EGRESS_CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Budget for the TCP connect when nothing narrower is set: a `wasi:http`
+/// request without its own `connect_timeout`, and every WebSocket and socket
+/// dial. It sits well under the plugin call deadline, so a destination with no
+/// reachable address fails as a connect error instead of as the whole call's
+/// timeout.
+#[cfg(feature = "plugins-wasmtime")]
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a pinned dial waits on one address before it also starts the
+/// next: RFC 8305's recommended Connection Attempt Delay.
+#[cfg(feature = "plugins-wasmtime")]
+const CONNECTION_ATTEMPT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How many of a destination's pinned addresses one dial tries, after the
+/// families are interleaved. The resolver's answer has no size limit, and a
+/// granted wildcard can put its DNS in a plugin author's hands.
+#[cfg(feature = "plugins-wasmtime")]
+const MAX_DIAL_ADDRESSES: usize = 8;
+
+/// How many attempts one dial keeps in flight at once, so a destination whose
+/// addresses never answer costs a few half-open sockets, not one per address.
+#[cfg(feature = "plugins-wasmtime")]
+const MAX_ATTEMPTS_IN_FLIGHT: usize = 4;
+
+/// Why [`connect_pinned_addresses`] connected to none of the addresses.
+#[cfg(feature = "plugins-wasmtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PinnedConnectError {
+    /// The deadline passed, before an attempt could start or with one still
+    /// waiting for an answer.
+    TimedOut,
+    /// Every address refused or was unreachable before the deadline.
+    Refused,
+    /// There was no address to dial.
+    NoAddresses,
+}
+
+/// Connect to one of `addresses`, the set the egress boundary validated, and
+/// return the first connection that comes up and the address it reached.
+///
+/// Attempts are staggered as RFC 8305 describes, not serial. The next address,
+/// alternating address families, starts as soon as the previous attempt fails
+/// or after [`CONNECTION_ATTEMPT_DELAY`] without an answer, so an address that
+/// never answers, such as an IPv6 path that drops SYNs, cannot spend the budget
+/// the other addresses need. The first connection wins and the attempts still
+/// pending are dropped, which closes their sockets. They all share `deadline`,
+/// so several addresses never multiply the caller's budget. At most
+/// [`MAX_DIAL_ADDRESSES`] addresses are tried, [`MAX_ATTEMPTS_IN_FLIGHT`] at a
+/// time.
+///
+/// Only these addresses are dialed, by `SocketAddr`; nothing is resolved again.
+#[cfg(feature = "plugins-wasmtime")]
+pub(crate) async fn connect_pinned_addresses(
+    addresses: &[SocketAddr],
+    deadline: tokio::time::Instant,
+) -> Result<(tokio::net::TcpStream, SocketAddr), PinnedConnectError> {
+    connect_staggered(
+        addresses,
+        deadline,
+        CONNECTION_ATTEMPT_DELAY,
+        tokio::net::TcpStream::connect,
+    )
+    .await
+}
+
+/// [`connect_pinned_addresses`] with the delay and the connect step supplied.
+#[cfg(feature = "plugins-wasmtime")]
+async fn connect_staggered<S, F>(
+    addresses: &[SocketAddr],
+    deadline: tokio::time::Instant,
+    attempt_delay: std::time::Duration,
+    connect: impl Fn(SocketAddr) -> F,
+) -> Result<(S, SocketAddr), PinnedConnectError>
+where
+    F: std::future::Future<Output = std::io::Result<S>>,
+{
+    use tokio::time::{Instant, sleep_until};
+
+    if addresses.is_empty() {
+        return Err(PinnedConnectError::NoAddresses);
+    }
+    let mut candidates = interleave_address_families(addresses);
+    candidates.truncate(MAX_DIAL_ADDRESSES);
+    let mut candidates = candidates.into_iter().peekable();
+    // Polled in place rather than spawned: dropping this, on return or when
+    // the caller gives up, drops every pending attempt and its socket at once.
+    let mut attempts: Vec<(SocketAddr, std::pin::Pin<Box<F>>)> = Vec::new();
+    let mut next_start = Instant::now();
+    loop {
+        // A ready loopback connect can win its first poll even after the
+        // deadline has passed; a spent budget must not fund another attempt.
+        if deadline <= Instant::now() {
+            return Err(PinnedConnectError::TimedOut);
+        }
+        let room = attempts.len() < MAX_ATTEMPTS_IN_FLIGHT;
+        if attempts.is_empty() || (room && next_start <= Instant::now()) {
+            match candidates.next() {
+                Some(address) => {
+                    attempts.push((address, Box::pin(connect(address))));
+                    next_start = Instant::now() + attempt_delay;
+                    continue;
+                }
+                None if attempts.is_empty() => return Err(PinnedConnectError::Refused),
+                None => {}
+            }
+        }
+        let more = room && candidates.peek().is_some();
+        tokio::select! {
+            biased;
+            () = sleep_until(deadline) => return Err(PinnedConnectError::TimedOut),
+            (address, result) = next_finished(&mut attempts) => match result {
+                Ok(stream) => return Ok((stream, address)),
+                // A failed address starts the next one at once.
+                Err(_) => next_start = Instant::now(),
+            },
+            () = sleep_until(next_start), if more => {}
+        }
+    }
+}
+
+/// The first of `attempts` to finish, removed from the list with its address.
+#[cfg(feature = "plugins-wasmtime")]
+fn next_finished<S, F>(
+    attempts: &mut Vec<(SocketAddr, std::pin::Pin<Box<F>>)>,
+) -> impl std::future::Future<Output = (SocketAddr, std::io::Result<S>)> + '_
+where
+    F: std::future::Future<Output = std::io::Result<S>>,
+{
+    std::future::poll_fn(move |cx| {
+        for index in 0..attempts.len() {
+            if let std::task::Poll::Ready(result) = attempts[index].1.as_mut().poll(cx) {
+                let (address, _) = attempts.swap_remove(index);
+                return std::task::Poll::Ready((address, result));
+            }
+        }
+        std::task::Poll::Pending
+    })
+}
+
+/// `addresses` reordered so the two families alternate, starting with the
+/// family of the first, keeping each family's own order (RFC 8305, section 4).
+#[cfg(feature = "plugins-wasmtime")]
+fn interleave_address_families(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+    let Some(first) = addresses.first() else {
+        return Vec::new();
+    };
+    let (preferred, other): (Vec<_>, Vec<_>) = addresses
+        .iter()
+        .copied()
+        .partition(|address| address.is_ipv4() == first.is_ipv4());
+    let mut other = other.into_iter();
+    let mut ordered = Vec::with_capacity(addresses.len());
+    for address in preferred {
+        ordered.push(address);
+        ordered.extend(other.next());
+    }
+    ordered.extend(other);
+    ordered
+}
+
 /// Protocol family and confidentiality mode requested by a plugin adapter.
 ///
 /// The distinction the host cares about is which effective grant a transport
@@ -2241,5 +2401,401 @@ mod tests {
             matches!(error, EgressError::DestinationNotGranted { .. }),
             "unexpected error: {error}"
         );
+    }
+}
+
+/// Address sets with a blackholed member, for the dial tests of every transport.
+///
+/// Each constructor returns why it could not build its set on this host, so a
+/// test that has to skip says what was missing.
+#[cfg(all(test, feature = "plugins-wasmtime"))]
+pub(crate) mod dial_test_support {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::time::Duration;
+
+    /// A loopback listener whose accept queue is full and never drained. The
+    /// kernel drops further SYNs to it, so a connect never completes, as for a
+    /// destination whose path loses SYNs.
+    pub(crate) struct Blackhole {
+        pub(crate) address: SocketAddr,
+        _listener: tokio::net::TcpListener,
+        _queued: Vec<tokio::net::TcpStream>,
+    }
+
+    /// A blackhole at `address`; port 0 takes any free port.
+    async fn blackhole_at(address: SocketAddr) -> Result<Blackhole, String> {
+        let socket = if address.is_ipv6() {
+            tokio::net::TcpSocket::new_v6()
+        } else {
+            tokio::net::TcpSocket::new_v4()
+        }
+        .map_err(|error| format!("cannot open a socket for {address}: {error}"))?;
+        socket
+            .bind(address)
+            .map_err(|error| format!("cannot bind {address}: {error}"))?;
+        let listener = socket
+            .listen(1)
+            .map_err(|error| format!("cannot listen on {address}: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("no local address for {address}: {error}"))?;
+        let mut queued = Vec::new();
+        for _ in 0..64 {
+            match tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::net::TcpStream::connect(address),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => queued.push(stream),
+                Ok(Err(error)) => {
+                    return Err(format!(
+                        "a connect to {address} failed while its accept queue filled: {error}"
+                    ));
+                }
+                Err(_) => {
+                    return Ok(Blackhole {
+                        address,
+                        _listener: listener,
+                        _queued: queued,
+                    });
+                }
+            }
+        }
+        Err(format!(
+            "{address} completed {} connects; its accept queue never filled",
+            queued.len()
+        ))
+    }
+
+    /// A blackhole at `ip` and a live `127.0.0.1` listener, on one port when
+    /// `one_port` is set, as one pinned destination resolves them.
+    async fn blackholed_and_live(
+        ip: IpAddr,
+        one_port: bool,
+    ) -> Result<(Blackhole, std::net::TcpListener), String> {
+        let mut reason = String::new();
+        for _ in 0..8 {
+            let live = std::net::TcpListener::bind("127.0.0.1:0")
+                .map_err(|error| format!("cannot bind a live 127.0.0.1 listener: {error}"))?;
+            let port = match live.local_addr() {
+                Ok(address) if one_port => address.port(),
+                Ok(_) => 0,
+                Err(error) => return Err(format!("no address for the live listener: {error}")),
+            };
+            match blackhole_at(SocketAddr::new(ip, port)).await {
+                Ok(blackhole) => return Ok((blackhole, live)),
+                Err(error) => reason = error,
+            }
+        }
+        Err(reason)
+    }
+
+    /// A blackholed `[::1]:port` and a live `127.0.0.1:port`: a resolver
+    /// answer with an unreachable IPv6 address first. Needs an IPv6 loopback.
+    pub(crate) async fn blackholed_v6_and_live_v4()
+    -> Result<(Blackhole, std::net::TcpListener), String> {
+        blackholed_and_live(Ipv6Addr::LOCALHOST.into(), true).await
+    }
+
+    /// A blackholed `127.0.0.2:port` and a live `127.0.0.1:port`, the same
+    /// shape over IPv4 alone. Needs `127.0.0.2` to be local, as it is on Linux.
+    pub(crate) async fn blackholed_and_live_v4_on_one_port()
+    -> Result<(Blackhole, std::net::TcpListener), String> {
+        blackholed_and_live(Ipv4Addr::new(127, 0, 0, 2).into(), true).await
+    }
+
+    /// A blackhole and a live listener on two `127.0.0.1` ports, for a dialer
+    /// handed raw addresses. Needs nothing beyond IPv4 loopback.
+    pub(crate) async fn blackholed_and_live_v4()
+    -> Result<(Blackhole, std::net::TcpListener), String> {
+        blackholed_and_live(Ipv4Addr::LOCALHOST.into(), false).await
+    }
+
+    /// A lone blackhole on a `127.0.0.1` port.
+    pub(crate) async fn blackhole_v4() -> Result<Blackhole, String> {
+        blackhole_at(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await
+    }
+}
+
+#[cfg(all(test, feature = "plugins-wasmtime"))]
+mod staggered_dial_tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum Answer {
+        Never,
+        Refuse,
+        Accept,
+    }
+
+    type Attempt =
+        std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<SocketAddr>> + Send>>;
+
+    /// A connect step that answers each address as `answer` says and records
+    /// when each attempt started, relative to `start`.
+    fn scripted(
+        start: Instant,
+        answer: impl Fn(SocketAddr) -> Answer,
+        started: Arc<Mutex<Vec<(SocketAddr, Duration)>>>,
+    ) -> impl Fn(SocketAddr) -> Attempt {
+        move |address| {
+            started.lock().unwrap().push((address, start.elapsed()));
+            match answer(address) {
+                Answer::Never => Box::pin(std::future::pending()),
+                Answer::Refuse => Box::pin(std::future::ready(Err(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionRefused,
+                )))),
+                Answer::Accept => Box::pin(std::future::ready(Ok(address))),
+            }
+        }
+    }
+
+    fn v4(last: u8) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::new(192, 0, 2, last), 443))
+    }
+
+    fn v6(last: u16) -> SocketAddr {
+        SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last), 443))
+    }
+
+    async fn dial(
+        addresses: &[SocketAddr],
+        budget: Duration,
+        answer: impl Fn(SocketAddr) -> Answer,
+    ) -> (
+        Result<(SocketAddr, SocketAddr), PinnedConnectError>,
+        Duration,
+        Vec<(SocketAddr, Duration)>,
+    ) {
+        let start = Instant::now();
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let outcome = connect_staggered(
+            addresses,
+            start + budget,
+            CONNECTION_ATTEMPT_DELAY,
+            scripted(start, answer, Arc::clone(&started)),
+        )
+        .await;
+        let started = started.lock().unwrap().clone();
+        (outcome, start.elapsed(), started)
+    }
+
+    /// An address that never answers holds up the next one for one attempt
+    /// delay, not for the whole budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_first_address_does_not_hold_up_the_next() {
+        let (outcome, elapsed, started) = dial(&[v6(1), v4(1)], Duration::from_secs(10), |a| {
+            if a.is_ipv6() {
+                Answer::Never
+            } else {
+                Answer::Accept
+            }
+        })
+        .await;
+        assert_eq!(outcome, Ok((v4(1), v4(1))));
+        assert_eq!(elapsed, CONNECTION_ATTEMPT_DELAY);
+        assert_eq!(
+            started,
+            [(v6(1), Duration::ZERO), (v4(1), CONNECTION_ATTEMPT_DELAY)]
+        );
+    }
+
+    /// A refusal starts the next address at once, without waiting the delay.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusing_address_starts_the_next_at_once() {
+        let (outcome, elapsed, _) = dial(&[v4(1), v4(2)], Duration::from_secs(10), |a| {
+            if a == v4(1) {
+                Answer::Refuse
+            } else {
+                Answer::Accept
+            }
+        })
+        .await;
+        assert_eq!(outcome, Ok((v4(2), v4(2))));
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_address_refusing_is_a_refused_connect() {
+        let (outcome, _, started) =
+            dial(&[v6(1), v4(1)], Duration::from_secs(10), |_| Answer::Refuse).await;
+        assert_eq!(outcome, Err(PinnedConnectError::Refused));
+        assert_eq!(started.len(), 2);
+    }
+
+    /// Silent addresses start one delay apart and all share one deadline, so
+    /// several of them cost one budget, not one each.
+    #[tokio::test(start_paused = true)]
+    async fn silent_addresses_time_out_together_at_the_shared_deadline() {
+        let budget = Duration::from_secs(2);
+        let (outcome, elapsed, started) =
+            dial(&[v4(1), v4(2), v4(3)], budget, |_| Answer::Never).await;
+        assert_eq!(outcome, Err(PinnedConnectError::TimedOut));
+        assert_eq!(elapsed, budget);
+        let delay = CONNECTION_ATTEMPT_DELAY;
+        assert_eq!(
+            started,
+            [(v4(1), Duration::ZERO), (v4(2), delay), (v4(3), 2 * delay)]
+        );
+    }
+
+    /// Families alternate from the first address's family, each in its own
+    /// resolver order.
+    #[tokio::test(start_paused = true)]
+    async fn address_families_alternate_from_the_first_address() {
+        let (_, _, started) = dial(
+            &[v6(1), v6(2), v4(1), v4(2), v4(3)],
+            Duration::from_secs(2),
+            |_| Answer::Refuse,
+        )
+        .await;
+        let order: Vec<_> = started.into_iter().map(|(address, _)| address).collect();
+        assert_eq!(order, [v6(1), v4(1), v6(2), v4(2), v4(3)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_dialed_without_an_address_or_a_budget() {
+        let (outcome, _, started) = dial(&[], Duration::from_secs(1), |_| Answer::Accept).await;
+        assert_eq!(outcome, Err(PinnedConnectError::NoAddresses));
+        assert!(started.is_empty());
+
+        let (outcome, _, started) = dial(&[v4(1)], Duration::ZERO, |_| Answer::Accept).await;
+        assert_eq!(outcome, Err(PinnedConnectError::TimedOut));
+        assert!(started.is_empty(), "a spent budget funds no attempt");
+    }
+
+    fn v4s(count: u8) -> Vec<SocketAddr> {
+        (1..=count).map(v4).collect()
+    }
+
+    /// However many addresses never answer, one dial keeps at most four
+    /// attempts open; the rest wait for a slot that never frees.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_keeps_at_most_four_attempts_in_flight() {
+        let budget = Duration::from_secs(10);
+        let (outcome, elapsed, started) = dial(&v4s(12), budget, |_| Answer::Never).await;
+        assert_eq!(outcome, Err(PinnedConnectError::TimedOut));
+        assert_eq!(elapsed, budget);
+        let delay = CONNECTION_ATTEMPT_DELAY;
+        assert_eq!(
+            started,
+            [
+                (v4(1), Duration::ZERO),
+                (v4(2), delay),
+                (v4(3), 2 * delay),
+                (v4(4), 3 * delay)
+            ]
+        );
+    }
+
+    /// A long resolver answer is cut to its first eight addresses, so a DNS
+    /// answer the plugin author controls cannot buy more connects.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_tries_at_most_eight_addresses() {
+        let addresses = v4s(12);
+        let (outcome, _, started) =
+            dial(&addresses, Duration::from_secs(10), |_| Answer::Refuse).await;
+        assert_eq!(outcome, Err(PinnedConnectError::Refused));
+        let order: Vec<_> = started.into_iter().map(|(address, _)| address).collect();
+        assert_eq!(order, &addresses[..8]);
+    }
+
+    /// The cut comes after the families are interleaved, so a long answer in
+    /// one family does not crowd out the other.
+    #[tokio::test(start_paused = true)]
+    async fn the_address_cut_keeps_both_families() {
+        let mut addresses: Vec<_> = (1..=10).map(v6).collect();
+        addresses.extend([v4(1), v4(2)]);
+        let (_, _, started) = dial(&addresses, Duration::from_secs(10), |_| Answer::Refuse).await;
+        let order: Vec<_> = started.into_iter().map(|(address, _)| address).collect();
+        assert_eq!(
+            order,
+            [v6(1), v4(1), v6(2), v4(2), v6(3), v6(4), v6(5), v6(6)]
+        );
+    }
+
+    /// An address whose turn would come after the deadline is never dialed,
+    /// even one that would have answered.
+    #[tokio::test(start_paused = true)]
+    async fn an_address_whose_turn_is_past_the_deadline_is_not_dialed() {
+        let budget = Duration::from_millis(600);
+        let (outcome, elapsed, started) = dial(&v4s(4), budget, |address| {
+            if address == v4(4) {
+                Answer::Accept
+            } else {
+                Answer::Never
+            }
+        })
+        .await;
+        assert_eq!(outcome, Err(PinnedConnectError::TimedOut));
+        assert_eq!(elapsed, budget);
+        assert_eq!(started.len(), 3);
+    }
+
+    /// A socket that keeps count of how many of its kind are open.
+    struct CountedSocket(Arc<AtomicUsize>);
+
+    impl CountedSocket {
+        fn open(open: &Arc<AtomicUsize>) -> Self {
+            open.fetch_add(1, Ordering::SeqCst);
+            Self(Arc::clone(open))
+        }
+    }
+
+    impl Drop for CountedSocket {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Only the winning connection outlives the dial. Two attempts connect at
+    /// the same instant while a third is still waiting; the dial returns one,
+    /// and the sockets of the other two close before it returns.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_winning_socket_outlives_the_dial() {
+        let open = Arc::new(AtomicUsize::new(0));
+        let start = Instant::now();
+        let connected_at = start + Duration::from_millis(600);
+        // Each attempt opens its socket when it starts, as a real connect
+        // does. The first two connect at `connected_at`; the third never does.
+        let connect = |address: SocketAddr| {
+            let socket = CountedSocket::open(&open);
+            let answers = address != v4(3);
+            async move {
+                if answers {
+                    tokio::time::sleep_until(connected_at).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, std::io::Error>(socket)
+            }
+        };
+
+        let (winner, address) = connect_staggered(
+            &v4s(3),
+            start + Duration::from_secs(10),
+            CONNECTION_ATTEMPT_DELAY,
+            connect,
+        )
+        .await
+        .expect("an address connected");
+
+        assert_eq!(start.elapsed(), Duration::from_millis(600));
+        assert!(address == v4(1) || address == v4(2), "{address}");
+        assert_eq!(
+            open.load(Ordering::SeqCst),
+            1,
+            "only the winner's socket may be open once the dial returns"
+        );
+        drop(winner);
+        assert_eq!(open.load(Ordering::SeqCst), 0);
     }
 }

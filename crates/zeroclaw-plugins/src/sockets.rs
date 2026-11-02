@@ -24,8 +24,8 @@ use wasmtime::component::Resource;
 
 use crate::component::{PluginState, bindings};
 use crate::egress::{
-    AuthorizedEgress, EGRESS_CONNECT_DEADLINE, EgressError, EgressRequest, EgressTransport,
-    StartTlsState,
+    AuthorizedEgress, DEFAULT_CONNECT_TIMEOUT, EGRESS_CONNECT_DEADLINE, EgressError, EgressRequest,
+    EgressTransport, StartTlsState, connect_pinned_addresses,
 };
 use zeroclaw_infra::net_guard::NetworkGuardError;
 
@@ -349,11 +349,12 @@ fn map_command_send_error(error: mpsc::error::TrySendError<ActorCommand>) -> Soc
     }
 }
 
+/// Connect to the pinned addresses, staggered so one that never answers cannot
+/// hold up the rest ([`connect_pinned_addresses`]).
 async fn connect_pinned(authorized: &AuthorizedEgress) -> Result<TcpStream, SocketFailure> {
-    let addresses = authorized.destination().addresses();
-    let stream = tokio::time::timeout(EGRESS_CONNECT_DEADLINE, TcpStream::connect(addresses))
+    let deadline = tokio::time::Instant::now() + DEFAULT_CONNECT_TIMEOUT;
+    let (stream, _) = connect_pinned_addresses(authorized.destination().addresses(), deadline)
         .await
-        .map_err(|_| SocketFailure::ConnectFailed)?
         .map_err(|_| SocketFailure::ConnectFailed)?;
     stream
         .set_nodelay(true)
@@ -1173,6 +1174,110 @@ mod tests {
                 .await
                 .is_err(),
             "no plaintext connection may be opened before TLS material resolves"
+        );
+    }
+
+    /// A first address that never answers, as an IPv6 path that loses SYNs,
+    /// does not hold up the dial: the reachable address connects.
+    #[tokio::test]
+    async fn a_blackholed_first_address_does_not_hold_up_the_dial() {
+        match crate::egress::dial_test_support::blackholed_v6_and_live_v4().await {
+            Ok((blackhole, live)) => assert_the_reachable_address_connects(blackhole, live).await,
+            Err(reason) => eprintln!("skipped: {reason}"),
+        }
+    }
+
+    /// The same over IPv4 alone, for a host without an IPv6 loopback.
+    #[tokio::test]
+    async fn a_blackholed_first_address_does_not_hold_up_the_dial_over_ipv4() {
+        match crate::egress::dial_test_support::blackholed_and_live_v4_on_one_port().await {
+            Ok((blackhole, live)) => assert_the_reachable_address_connects(blackhole, live).await,
+            Err(reason) => eprintln!("skipped: {reason}"),
+        }
+    }
+
+    async fn assert_the_reachable_address_connects(
+        blackhole: crate::egress::dial_test_support::Blackhole,
+        live: std::net::TcpListener,
+    ) {
+        let live_address = live.local_addr().expect("loopback address");
+        let service = service(["service.example"], [], 2);
+        let request = EgressRequest::new(
+            scope("main"),
+            EgressTransport::Tcp,
+            "service.example",
+            live_address.port(),
+        )
+        .expect("valid test request");
+        let authorization = service
+            .authorize_addresses(request, [blackhole.address, live_address])
+            .expect("test request is authorized");
+        let started = std::time::Instant::now();
+
+        let stream = tokio::time::timeout(Duration::from_secs(5), connect_pinned(&authorization))
+            .await
+            .expect("the silent address must not stall the dial")
+            .expect("the reachable address must connect");
+
+        assert_eq!(stream.peer_addr().expect("connected peer"), live_address);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the silent address held the dial for {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `SocketFailure` has no timeout case, so a dial that reaches no address
+    /// is `ConnectFailed` whether the addresses refused or never answered.
+    #[tokio::test]
+    async fn a_dial_that_reaches_no_address_is_a_failed_connect() {
+        let service = service(["service.example"], [], 2);
+        let refusing = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            listener.local_addr().expect("loopback address")
+        };
+        let authorization = authorize(
+            &service,
+            "main",
+            EgressTransport::Tcp,
+            "service.example",
+            refusing,
+            None,
+        );
+        assert!(matches!(
+            connect_pinned(&authorization).await,
+            Err(SocketFailure::ConnectFailed)
+        ));
+        drop(authorization);
+
+        let blackhole = match crate::egress::dial_test_support::blackhole_v4().await {
+            Ok(blackhole) => blackhole,
+            Err(reason) => {
+                eprintln!("skipped the silent case: {reason}");
+                return;
+            }
+        };
+        let authorization = authorize(
+            &service,
+            "main",
+            EgressTransport::Tcp,
+            "service.example",
+            blackhole.address,
+            None,
+        );
+        // Paused once the blackhole is set up, so the connect default passes
+        // without the wait.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            connect_pinned(&authorization).await,
+            Err(SocketFailure::ConnectFailed)
+        ));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= DEFAULT_CONNECT_TIMEOUT
+                && elapsed < DEFAULT_CONNECT_TIMEOUT + Duration::from_secs(1),
+            "gave up after {elapsed:?}"
         );
     }
 

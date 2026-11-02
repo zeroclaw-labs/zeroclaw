@@ -31,7 +31,8 @@ use wasmtime::component::Resource;
 
 use crate::component::{PluginState, bindings};
 use crate::egress::{
-    AuthorizedEgress, EGRESS_CONNECT_DEADLINE, EgressError, EgressRequest, EgressTransport,
+    AuthorizedEgress, DEFAULT_CONNECT_TIMEOUT, EGRESS_CONNECT_DEADLINE, EgressError, EgressRequest,
+    EgressTransport, PinnedConnectError, connect_pinned_addresses,
 };
 
 const MAX_URL_BYTES: usize = 4 * 1024;
@@ -406,12 +407,30 @@ async fn dial_authorized(
     } else {
         None
     };
-    let mut last_error = WebSocketError::ConnectFailed;
-    for address in authorized.destination().addresses() {
-        let tcp = match TcpStream::connect(address).await {
-            Ok(tcp) => tcp,
-            Err(_) => continue,
+    // Each round races the addresses not yet connected to
+    // (`connect_pinned_addresses`), so one that never answers cannot hold up
+    // the rest, and an address that connected but then failed TLS or the
+    // handshake is not dialed again. An address that refused in an earlier
+    // round is dialed again: the race does not report which addresses
+    // refused, and a refusal costs a round trip, not the budget. `deadline` is
+    // wall clock, so the time TLS and the handshake spend on an address that
+    // then fails comes out of the connect budget of the rounds after it.
+    let deadline = tokio::time::Instant::now() + DEFAULT_CONNECT_TIMEOUT;
+    let mut remaining = authorized.destination().addresses().to_vec();
+    let mut last_error = None;
+    while !remaining.is_empty() {
+        let (tcp, address) = match connect_pinned_addresses(&remaining, deadline).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                return Err(last_error.unwrap_or(match error {
+                    PinnedConnectError::TimedOut => WebSocketError::Timeout,
+                    PinnedConnectError::Refused | PinnedConnectError::NoAddresses => {
+                        WebSocketError::ConnectFailed
+                    }
+                }));
+            }
         };
+        remaining.retain(|candidate| *candidate != address);
         let _ = tcp.set_nodelay(true);
         let transport = if let Some(server_name) = server_name.clone() {
             let Some(config) = tls_config.clone() else {
@@ -420,7 +439,7 @@ async fn dial_authorized(
             match TlsConnector::from(config).connect(server_name, tcp).await {
                 Ok(stream) => MaybeTlsStream::Rustls(stream),
                 Err(_) => {
-                    last_error = WebSocketError::TlsFailed;
+                    last_error = Some(WebSocketError::TlsFailed);
                     continue;
                 }
             }
@@ -438,10 +457,10 @@ async fn dial_authorized(
                 let subprotocol = selected_subprotocol(&response, &prepared.subprotocols)?;
                 return Ok((socket, subprotocol));
             }
-            Err(error) => last_error = map_handshake_error(&error),
+            Err(error) => last_error = Some(map_handshake_error(&error)),
         }
     }
-    Err(last_error)
+    Err(last_error.unwrap_or(WebSocketError::ConnectFailed))
 }
 
 fn websocket_config() -> WebSocketConfig {
@@ -1203,6 +1222,146 @@ mod tests {
             Err(WebSocketError::PayloadTooLarge)
         );
         assert!(validate_message(&WebSocketMessage::Text("x".repeat(MAX_MESSAGE_BYTES))).is_ok());
+    }
+
+    /// A first address that never answers, as an IPv6 path that loses SYNs,
+    /// does not hold up the dial: the reachable address connects and finishes
+    /// the handshake.
+    #[tokio::test]
+    async fn a_blackholed_first_address_does_not_hold_up_the_dial() {
+        match crate::egress::dial_test_support::blackholed_v6_and_live_v4().await {
+            Ok((blackhole, live)) => assert_the_reachable_address_connects(blackhole, live).await,
+            Err(reason) => eprintln!("skipped: {reason}"),
+        }
+    }
+
+    /// The same over IPv4 alone, for a host without an IPv6 loopback.
+    #[tokio::test]
+    async fn a_blackholed_first_address_does_not_hold_up_the_dial_over_ipv4() {
+        match crate::egress::dial_test_support::blackholed_and_live_v4_on_one_port().await {
+            Ok((blackhole, live)) => assert_the_reachable_address_connects(blackhole, live).await,
+            Err(reason) => eprintln!("skipped: {reason}"),
+        }
+    }
+
+    async fn assert_the_reachable_address_connects(
+        blackhole: crate::egress::dial_test_support::Blackhole,
+        live: std::net::TcpListener,
+    ) {
+        live.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(live).unwrap();
+        let address = listener.local_addr().unwrap();
+        let ca = PrivateCa::new();
+        let acceptor = ca.acceptor.clone();
+        let _server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(stream).await.unwrap();
+            let _socket = tokio_tungstenite::accept_async(tls).await.unwrap();
+        });
+
+        let prepared = prepare_connection(ca.options(address.port(), "/")).unwrap();
+        let egress = ca.service(1);
+        let authorization = egress
+            .authorize_addresses(
+                websocket_request(scope("blackhole"), &prepared),
+                [blackhole.address, address],
+            )
+            .unwrap();
+        let tls_config = ca.client_config(&authorization);
+        let started = std::time::Instant::now();
+        let dialed = tokio::time::timeout(
+            Duration::from_secs(5),
+            dial_authorized(&prepared, &authorization, Some(tls_config)),
+        )
+        .await
+        .map(|dialed| dialed.map(|_| ()));
+
+        assert_eq!(dialed, Ok(Ok(())), "the reachable address must connect");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the silent address held the dial for {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// With every address silent, the dial gives up as a timeout once the
+    /// connect default runs out. Time is paused once the blackhole is set up,
+    /// so the wait costs nothing.
+    #[tokio::test]
+    async fn only_silent_addresses_time_out_at_the_connect_default() {
+        let blackhole = match crate::egress::dial_test_support::blackhole_v4().await {
+            Ok(blackhole) => blackhole,
+            Err(reason) => {
+                eprintln!("skipped: {reason}");
+                return;
+            }
+        };
+        let ca = PrivateCa::new();
+        let prepared = prepare_connection(ca.options(blackhole.address.port(), "/")).unwrap();
+        let egress = ca.service(1);
+        let authorization = egress
+            .authorize_addresses(
+                websocket_request(scope("silent"), &prepared),
+                [blackhole.address],
+            )
+            .unwrap();
+        let tls_config = ca.client_config(&authorization);
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        // The outer bound only keeps a dial with no deadline of its own from
+        // waiting on the kernel's SYN retries.
+        let dialed = tokio::time::timeout(
+            2 * DEFAULT_CONNECT_TIMEOUT,
+            dial_authorized(&prepared, &authorization, Some(tls_config)),
+        )
+        .await
+        .map(|dialed| dialed.map(|_| ()));
+
+        assert_eq!(dialed, Ok(Err(WebSocketError::Timeout)));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= DEFAULT_CONNECT_TIMEOUT
+                && elapsed < DEFAULT_CONNECT_TIMEOUT + Duration::from_secs(1),
+            "gave up after {elapsed:?}"
+        );
+    }
+
+    /// An address that connects but fails TLS is the error reported, even
+    /// when the address dialed after it fails only to connect.
+    #[tokio::test]
+    async fn a_tls_failure_is_reported_over_a_later_connect_failure() {
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = live.local_addr().unwrap();
+        // Nothing listens on the IPv6 loopback at this port, so that address
+        // refuses. Binding it and closing it again shows the host has it.
+        let refusing = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, address.port()));
+        if let Err(error) = std::net::TcpListener::bind(refusing) {
+            eprintln!("skipped: cannot use {refusing} as a refusing address: {error}");
+            return;
+        }
+        // The live address accepts one connection and closes it before TLS
+        // can finish.
+        let _server = std::thread::spawn(move || drop(live.accept()));
+
+        let ca = PrivateCa::new();
+        let prepared = prepare_connection(ca.options(address.port(), "/")).unwrap();
+        let egress = ca.service(1);
+        let authorization = egress
+            .authorize_addresses(
+                websocket_request(scope("tls-then-refused"), &prepared),
+                [address, refusing],
+            )
+            .unwrap();
+        let tls_config = ca.client_config(&authorization);
+        let dialed = tokio::time::timeout(
+            Duration::from_secs(5),
+            dial_authorized(&prepared, &authorization, Some(tls_config)),
+        )
+        .await
+        .map(|dialed| dialed.map(|_| ()));
+
+        assert_eq!(dialed, Ok(Err(WebSocketError::TlsFailed)));
     }
 
     #[tokio::test]

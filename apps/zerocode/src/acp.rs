@@ -39,6 +39,11 @@ impl Acp {
         self.inner.commit_reconnect_handoff();
     }
 
+    /// Reclaim only dispatched clipboard temporaries during a normal TUI exit.
+    pub(crate) fn cleanup_active_turn_on_shutdown(&mut self) {
+        self.inner.cleanup_active_turn_on_shutdown();
+    }
+
     pub(crate) fn terminal_statuses(&self) -> Vec<(crate::turn_status::TurnStatus, String)> {
         self.inner.terminal_statuses()
     }
@@ -105,6 +110,10 @@ impl Acp {
 
     pub(crate) fn tick_transport_events(&mut self) {
         self.inner.tick_transport_events();
+    }
+
+    pub(crate) fn has_pending_transport_events(&self) -> bool {
+        self.inner.has_pending_transport_events()
     }
 
     pub(crate) fn draw_with_dock(
@@ -212,6 +221,10 @@ impl Acp {
 
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         self.inner.selected_agent()
+    }
+
+    pub(crate) fn focused_runtime_context(&self) -> Option<chat::FocusedRuntimeContext<'_>> {
+        self.inner.focused_runtime_context()
     }
 
     pub(crate) fn current_cwd(&self) -> Option<&str> {

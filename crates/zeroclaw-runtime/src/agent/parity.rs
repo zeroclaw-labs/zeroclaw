@@ -254,6 +254,7 @@ fn a4_policy() -> Arc<SecurityPolicy> {
 fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
     AllToolsResult {
         tools,
+        reserved_host_names: std::collections::HashSet::new(),
         delegate_handle: None,
         ask_user_handle: None,
         reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),

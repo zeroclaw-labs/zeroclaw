@@ -187,7 +187,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 
     # Release build — zeroclaw (daemon)
     # >>> generated:container-standard by `cargo generate installers` - do not edit <<<
-    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
+    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,plugins-wasm-cranelift,schema-export,tool-claude-code,tool-claude-code-runner,tool-codex-cli,tool-composio,tool-gemini-cli,tool-google-workspace,tool-jira,tool-linkedin,tool-microsoft365,tool-notion,tool-opencode-cli,tool-project-intel,tools-external,whatsapp-web"
 # >>> end generated:container-standard <<<
     CARGO_TARGET_DIR=/target \
     cargo build \
@@ -217,13 +217,25 @@ COPY --from=config-gen /rootfs/ /rootfs/
 # Copy web dashboard dist
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
 
+# The upstream StageX bundle still contains an incident root. Materialize only
+# the filtered bundle and aliases: copying its original per-root files would
+# let native consumers or update-ca-certificates restore the distrusted roots.
+FROM docker.io/stagex/pallet-rust@sha256:abe9b95c93a5afa271f69fcd5eb18c8cd405fe5df6491a63c9418e3a170573dc AS ca-bundle
+COPY --from=docker.io/stagex/core-ca-certificates@sha256:fe24a3809eba30972b64ddd8b611a6494bebea7631f805d795cec4241f5a11c6 /etc/ssl/certs/ca-certificates.crt /tmp/source-ca.crt
+COPY dev/ci/filter-emudhra-ca-bundle.sh /tmp/filter-emudhra-ca-bundle.sh
+RUN mkdir -p /rootfs/etc/ssl/certs /rootfs/etc/ssl1.1 \
+    && sh /tmp/filter-emudhra-ca-bundle.sh /tmp/source-ca.crt /rootfs/etc/ssl/certs/ca-certificates.crt \
+    && ln -s certs/ca-certificates.crt /rootfs/etc/ssl/cert.pem \
+    && ln -s ../ssl/cert.pem /rootfs/etc/ssl1.1/cert.pem \
+    && ln -s ../ssl/certs /rootfs/etc/ssl1.1/certs
+
 # ── Stage: package (minimal runtime) ─────────────────────────
 FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96ca181ea224df7bff40e1833c3db13 AS package
 
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build /rootfs/ /
 COPY --from=build --chown=65534:65534 /rootfs/zeroclaw-data /zeroclaw-data
-COPY --from=docker.io/stagex/core-ca-certificates@sha256:7773dae6630aa3bdcc82cfec6c9265c0c501aaf0af67cc73631b09e1cff1b094 / /
+COPY --from=ca-bundle /rootfs/ /
 
 ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
@@ -276,7 +288,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
 
     # Release build — zeroclaw (all channels)
     # >>> generated:container-fat by `cargo generate installers` - do not edit <<<
-    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
+    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-filesystem,channel-git,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,plugins-wasm-cranelift,plugins-wasm-pulley,plugins-wasm-runtime-only,probe,provider-gitea,provider-github,sandbox-bubblewrap,sandbox-landlock,schema-export,tool-claude-code,tool-claude-code-runner,tool-codex-cli,tool-composio,tool-gemini-cli,tool-google-workspace,tool-jira,tool-linkedin,tool-microsoft365,tool-notion,tool-opencode-cli,tool-project-intel,tools-external,webauthn,whatsapp-web"
 # >>> end generated:container-fat <<<
     CARGO_TARGET_DIR=/target \
     cargo build \
@@ -312,7 +324,7 @@ FROM docker.io/stagex/core-filesystem@sha256:da28831927652291b0fa573092fd41c8c96
 # Copy binaries, web dist, and default config; set data dir ownership to nobody(65534)
 COPY --from=build-fat /rootfs/ /
 COPY --from=build-fat --chown=65534:65534 /rootfs/zeroclaw-data /zeroclaw-data
-COPY --from=docker.io/stagex/core-ca-certificates@sha256:7773dae6630aa3bdcc82cfec6c9265c0c501aaf0af67cc73631b09e1cff1b094 / /
+COPY --from=ca-bundle /rootfs/ /
 
 ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data

@@ -4802,9 +4802,7 @@ impl RpcDispatcher {
         // built from the prior generation (or publish midway through Agent
         // construction). Persistence lookup above does not depend on config and
         // deliberately remains outside this boundary.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_generation_guard = self.ctx.config_authority.lock_config_writer().await;
         let config = self.ctx.config.read().clone();
 
         // The wait for the config-generation lock above is also unbounded, and
@@ -5974,9 +5972,7 @@ impl RpcDispatcher {
         // generation. This path cannot block on it: config mutation waits for
         // live-session refresh while holding the same gate. A contended build
         // is therefore published pending and reconciled before prompt dispatch.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .try_lock_owned()
-            .ok();
+        let config_generation_guard = self.ctx.config_authority.try_lock_config_writer();
         let config = Box::new(self.ctx.config.read().clone());
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
@@ -6238,9 +6234,7 @@ impl RpcDispatcher {
     ) -> bool {
         // Acquire the gate (blocking) so we are guaranteed to read a config at
         // least as new as whatever committed while the Agent was being built.
-        let _gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _gate = ctx.config_authority.lock_config_writer().await;
         // Take the per-session ordering boundary for the whole publication,
         // the same guard `prepare_live_sessions_refresh` holds. Without it this
         // repair would be the only live-provider writer in the file that does
@@ -7484,9 +7478,7 @@ impl RpcDispatcher {
         // gate, so parking here with the gate held would block the very
         // task that wait is waiting on (and stall every other config write
         // until the timeout).
-        let _config_write_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _config_write_guard = self.ctx.config_authority.lock_config_writer().await;
 
         // Capture the session generation /before/ acquiring the per-session
         // update lock. If the session is replaced while we wait for the lock,
@@ -10675,6 +10667,9 @@ impl RpcDispatcher {
                 AgentStatusEntry {
                     alias: alias.clone(),
                     enabled: agent_cfg.enabled,
+                    runtime_profile: config
+                        .runtime_profile_for_agent(alias)
+                        .map(|_| agent_cfg.runtime_profile.trim().to_string()),
                     live_sessions: rpc,
                     persisted_sessions: persisted,
                     channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
@@ -11448,22 +11443,12 @@ impl RpcDispatcher {
         })
     }
 
-    /// Open a subscription on `source` for this connection and start its
-    /// delivery task. Returns the id and the newest sequence number.
-    ///
-    /// The hub holds the frames; the task only moves a cursor. `since_seq`
-    /// replays what is still buffered, and any gap, whether evicted, lost on
-    /// the bus, or from before a restart, is reported as
-    /// `subscription/lagged` before delivery resumes. A subscription outlives
-    /// the call that opened it, so every delivery is held to the connection's
-    /// authority: the credential must still be live and, whenever the
-    /// accepted policy has moved, the principal is resolved again against
-    /// `method`. The first refusal ends the stream. An unbound dispatcher (the
-    /// direct unit-test handlers) has nothing to recheck.
-    /// Refuse the global streams to a scoped principal (neither an
-    /// administrator nor the shared operator), using its current grants
-    /// rather than the bind-time copy. An
-    /// unbound dispatcher (the direct unit-test handlers) is not checked.
+    /// Refuse the daemon-wide log and event reads to a scoped principal
+    /// (neither an administrator nor the shared operator), using its current
+    /// grants rather than the bind-time copy: the global streams, the event
+    /// history, and the persisted log behind `logs/query` and `logs/get`. See
+    /// [`sees_every_principal`]. An unbound dispatcher (the direct unit-test
+    /// handlers) is not checked.
     fn require_global_stream_access(&self, method: Method) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Ok(());
@@ -11477,6 +11462,18 @@ impl RpcDispatcher {
         Err(rpc_err(denied.code, denied.message))
     }
 
+    /// Open a subscription on `source` for this connection and start its
+    /// delivery task. Returns the id and the newest sequence number.
+    ///
+    /// The hub holds the frames; the task only moves a cursor. `since_seq`
+    /// replays what is still buffered, and any gap, whether evicted, lost on
+    /// the bus, or from before a restart, is reported as
+    /// `subscription/lagged` before delivery resumes. A subscription outlives
+    /// the call that opened it, so every delivery is held to the connection's
+    /// authority: the credential must still be live and, whenever the
+    /// accepted policy has moved, the principal is resolved again against
+    /// `method`. The first refusal ends the stream. An unbound dispatcher (the
+    /// direct unit-test handlers) has nothing to recheck.
     fn open_subscription(
         &self,
         source: crate::rpc::subscription::Source,
@@ -11563,6 +11560,7 @@ impl RpcDispatcher {
 
     #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
+        self.require_global_stream_access(Method::LogsQuery)?;
         let p: LogsQueryParams = parse_params(params)?;
 
         let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
@@ -11636,6 +11634,7 @@ impl RpcDispatcher {
     /// retained archives oldest-first, so archive events returned by
     /// `logs/query` are always findable by id.
     async fn handle_logs_get(&self, params: &Value) -> RpcResult {
+        self.require_global_stream_access(Method::LogsGet)?;
         let p: LogsGetParams = parse_params(params)?;
         let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
@@ -13175,14 +13174,17 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
     registry.lock().remove(&subscription_id);
 }
 
-/// The daemon-wide log and event streams, and the event history, carry
-/// frames from every principal's work: session messages, cron results, log
-/// lines. Many name no owner, so they cannot be filtered per principal. Until
-/// frames carry reliable ownership they are unscoped-only, with the same
-/// definition session ownership uses ([`RpcDispatcher::scoped_principal_id`]):
-/// an administrator, or the unauthenticated shared operator. Reaching every
-/// agent (the `*` agent selector) is not enough; it addresses every agent
-/// but owns only its own sessions.
+/// The daemon-wide log and event streams, the event history, and the
+/// persisted log behind `logs/query` and `logs/get` carry records of every
+/// principal's work: session messages, cron results, log lines, and other
+/// principals' authorization denials, which can name what a refusal kept
+/// from its client. Many name no owner, so they cannot be filtered per
+/// principal. Until records carry reliable ownership they are unscoped-only,
+/// with the same definition session ownership uses
+/// ([`RpcDispatcher::scoped_principal_id`]): an administrator, or the
+/// unauthenticated shared operator. Reaching every agent (the `*` agent
+/// selector) is not enough; it addresses every agent but owns only its own
+/// sessions.
 fn sees_every_principal(
     auth: &crate::rpc::auth::ConnectionAuth,
     grants: &zeroclaw_api::grants::ResolvedGrants,
@@ -13190,9 +13192,10 @@ fn sees_every_principal(
     grants.admin || !auth.principal.is_authenticated()
 }
 
-const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the daemon-wide log \
-     and event streams: their frames are not attributed to an owning principal, so these \
-     streams and the event history are limited to administrators and the shared operator";
+const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the daemon-wide logs \
+     and events: their records are not attributed to an owning principal, so the log and event \
+     streams, the event history, and the persisted log are limited to administrators and the \
+     shared operator";
 
 /// Hold one delivery (a frame or a `lagged` notice) to the connection's
 /// authority. The credential must still be live, and whenever the accepted
@@ -13792,6 +13795,16 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => SessionUpdateEvent::BudgetWarning {
+            session_id: session_id.to_string(),
+            current_usd: *current_usd,
+            limit_usd: *limit_usd,
+            period: *period,
+        },
         _ => return None,
     };
 
@@ -14127,7 +14140,11 @@ mod tests {
     #[tokio::test]
     async fn local_session_factory_populates_channels_and_resume_preserves_them() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
         dispatcher.local_session_channel_factory = Some(session_factory_stub());
         dispatcher.set_tui_id_for_test(Some("tui-local".into()));
@@ -14431,7 +14448,11 @@ mod tests {
     #[tokio::test]
     async fn local_acp_rehydration_restores_session_channels() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let data_dir = config.data_dir.clone();
         let (mut dispatcher, sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
@@ -18620,6 +18641,11 @@ mod tests {
         std::fs::write(&secret, "outside every agent root").unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, started_rx, _release_tx) = gated_provider();
+        // A live session holds the resolved workspace, as `session/new` and
+        // rehydration store it. The raw temp-dir spelling can be an alias
+        // (`/var` on macOS, an 8.3 short name on Windows), and a scoped prompt
+        // refuses a session held under one before it ever judges an attachment
+        // source.
         install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
@@ -18627,7 +18653,7 @@ mod tests {
             provider,
             None,
             Some("user:alice"),
-            &agent_workspace,
+            &agent_workspace.canonicalize().unwrap(),
         )
         .await;
         (ctx, agent_workspace, inside, secret, started_rx)
@@ -24712,6 +24738,244 @@ mod tests {
         );
     }
 
+    /// A `rolling` log writer persisting under a temporary directory, so
+    /// `logs/query` and `logs/get` read a real log. It holds the writer test
+    /// lock for its whole life. Its `Drop` runs before its fields drop, so the
+    /// disabled writer it installs goes in while the lock is still held, and
+    /// neither a later test nor a failed assertion here leaves a writer on the
+    /// removed directory.
+    struct PersistedLog<G> {
+        dir: tempfile::TempDir,
+        _writer_guard: G,
+    }
+
+    fn persisted_log() -> PersistedLog<impl Drop> {
+        let writer_guard = zeroclaw_log::__private_test_writer_lock();
+        // The capture layer carries `record!`, and with it the RPC denial
+        // records, to the writer.
+        zeroclaw_log::try_install_capture_subscriber();
+        let dir = tempfile::TempDir::new().expect("a temporary log directory");
+        zeroclaw_log::init_from_config(&persisted_log_config("rolling"), dir.path());
+        PersistedLog {
+            dir,
+            _writer_guard: writer_guard,
+        }
+    }
+
+    fn persisted_log_config(log_persistence: &str) -> zeroclaw_log::LogConfig {
+        zeroclaw_log::LogConfig {
+            log_persistence: log_persistence.into(),
+            log_persistence_path: "state/runtime-trace.jsonl".into(),
+            ..Default::default()
+        }
+    }
+
+    impl<G> Drop for PersistedLog<G> {
+        fn drop(&mut self) {
+            zeroclaw_log::init_from_config(&persisted_log_config("none"), self.dir.path());
+        }
+    }
+
+    /// [`cron_roster_config_in`] plus readers of the persisted log: `alice`,
+    /// scoped to `alpha`, also holds `Logs:Read`; `zeroclaw_user` (uid 4747)
+    /// holds `Logs:Read` with every agent (`*`); `zeroclaw_maintainer` (uid
+    /// 4545) is an administrator that also holds `Logs:Read` explicitly, so
+    /// demoting it leaves the grant in place.
+    fn log_reader_roster_in(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::{Resource, Verb, WILDCARD};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let mut config = cron_roster_config_in(tmp, 4242);
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the cron fixture profile exists")
+            .grants
+            .insert(Resource::Logs, vec![Verb::Read]);
+        let log_reads = || std::collections::HashMap::from([(Resource::Logs, vec![Verb::Read])]);
+        for (name, uid, profile) in [
+            (
+                "zeroclaw_user",
+                4747,
+                PermissionProfileConfig {
+                    allowed_agents: vec![WILDCARD.into()],
+                    grants: log_reads(),
+                    ..PermissionProfileConfig::default()
+                },
+            ),
+            (
+                "zeroclaw_maintainer",
+                4545,
+                PermissionProfileConfig {
+                    admin: true,
+                    grants: log_reads(),
+                    ..PermissionProfileConfig::default()
+                },
+            ),
+        ] {
+            config.permission_profiles.insert(name.into(), profile);
+            config.users.insert(
+                name.into(),
+                UserConfig {
+                    principal_id: None,
+                    uid: Some(uid),
+                    permission_profiles: vec![name.into()],
+                },
+            );
+        }
+        config
+    }
+
+    /// Persist the audit record of a refusal its client never sees as one:
+    /// `alice` asks `cron/get` for `job_id`, a `beta` job, and is told it was
+    /// not found, the answer a missing job gets, while its cron entitlement
+    /// guard records the owning agent and the job. Returns the record as the
+    /// administrator (`zeroclaw_maintainer`) reads it through `logs/query`, so
+    /// a refusal asserted afterwards cannot pass on an empty log.
+    async fn persisted_cron_denial(ctx: &Arc<RpcContext>, job_id: &str) -> Value {
+        let (mut alice, mut rx) = roster_peer(ctx, 4242).await;
+        let masked = rpc(&mut alice, &mut rx, 1, "cron/get", json!({"id": job_id})).await;
+        assert_eq!(masked["error"]["code"], json!(INVALID_PARAMS), "{masked}");
+        zeroclaw_log::flush_for_test().expect("the log writer flushes");
+
+        let (mut admin, mut rx) = roster_peer(ctx, 4545).await;
+        let page = rpc(&mut admin, &mut rx, 1, "logs/query", json!({"q": job_id})).await;
+        page["result"]["events"]
+            .as_array()
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|event| event["attributes"]["method"] == json!("cron/get"))
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("an administrator reads the cron/get denial: {page}"))
+    }
+
+    /// The persisted log holds every principal's records, among them audit
+    /// records naming what a refusal kept from its client, so `logs/query`
+    /// and `logs/get` follow the global streams' rule. A principal scoped to
+    /// one agent or to every agent (`*`) is refused even with `Logs:Read`,
+    /// and cannot learn from the log that the job it was told does not exist
+    /// is `beta`'s. Each refusal is audited like the streams' refusals.
+    #[tokio::test]
+    async fn persisted_log_reads_refuse_a_scoped_principal() {
+        let _log = persisted_log();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = log_reader_roster_in(&tmp);
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config);
+        let record = persisted_cron_denial(&ctx, &beta.id).await;
+
+        for uid in [4242, 4747] {
+            let (mut scoped, mut rx) = roster_peer(&ctx, uid).await;
+            for (id, method, params) in [
+                (1, "logs/query", json!({"q": beta.id})),
+                (2, "logs/get", json!({"id": record["id"]})),
+            ] {
+                let response = rpc(&mut scoped, &mut rx, id, method, params).await;
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(FORBIDDEN),
+                    "uid {uid} {method}: {response}"
+                );
+                assert!(
+                    !response.to_string().contains(&beta.id),
+                    "uid {uid} {method} must not disclose the record: {response}"
+                );
+            }
+        }
+
+        zeroclaw_log::flush_for_test().expect("the log writer flushes");
+        let (mut admin, mut rx) = roster_peer(&ctx, 4545).await;
+        let page = rpc(
+            &mut admin,
+            &mut rx,
+            1,
+            "logs/query",
+            json!({"action": "reject", "q": "logs/", "limit": 100}),
+        )
+        .await;
+        let denials = page["result"]["events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an administrator reads the denials: {page}"));
+        for principal in ["user:alice", "user:zeroclaw_user"] {
+            for method in ["logs/query", "logs/get"] {
+                assert!(
+                    denials.iter().any(|event| {
+                        event["attributes"]["principal_id"] == json!(principal)
+                            && event["attributes"]["method"] == json!(method)
+                            && event["attributes"]["code"] == json!(FORBIDDEN)
+                    }),
+                    "{principal}'s refused {method} must leave a denial record: {page}"
+                );
+            }
+        }
+    }
+
+    /// An administrator and the shared operator read the persisted log
+    /// through both methods. Demoting the administrator refuses its next read
+    /// on the same connection, although it keeps `Logs:Read` and gains every
+    /// agent: the principal is held to the policy in force, not the one it
+    /// bound under.
+    #[tokio::test]
+    async fn persisted_log_reads_serve_unscoped_principals_until_demoted() {
+        let _log = persisted_log();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = log_reader_roster_in(&tmp);
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config.clone());
+        let record = persisted_cron_denial(&ctx, &beta.id).await;
+        // What `alice` was not told: the job exists, and `beta` owns it.
+        assert_eq!(
+            record["attributes"]["principal_id"],
+            json!("user:alice"),
+            "{record}"
+        );
+        assert!(record.to_string().contains("beta"), "{record}");
+
+        let (mut admin, mut admin_rx) = roster_peer(&ctx, 4545).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        for (reader, rx) in [
+            (&mut admin, &mut admin_rx),
+            (&mut operator, &mut operator_rx),
+        ] {
+            let page = rpc(reader, rx, 1, "logs/query", json!({"q": beta.id})).await;
+            assert!(
+                page["result"]["events"]
+                    .as_array()
+                    .is_some_and(|events| events.iter().any(|event| event["id"] == record["id"])),
+                "{page}"
+            );
+            let fetched = rpc(reader, rx, 2, "logs/get", json!({"id": record["id"]})).await;
+            assert_eq!(fetched["result"]["event"]["id"], record["id"], "{fetched}");
+        }
+
+        let mut demoted = config;
+        let maintainer = demoted
+            .permission_profiles
+            .get_mut("zeroclaw_maintainer")
+            .expect("the administrator profile exists");
+        maintainer.admin = false;
+        maintainer.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+        ctx.auth
+            .refresh_from_config(&demoted)
+            .expect("the demoted policy compiles");
+        for (id, method, params) in [
+            (3, "logs/query", json!({"q": beta.id})),
+            (4, "logs/get", json!({"id": record["id"]})),
+        ] {
+            let response = rpc(&mut admin, &mut admin_rx, id, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{method}: {response}"
+            );
+            assert!(
+                !response.to_string().contains(&beta.id),
+                "a demoted administrator's {method} must not disclose the record: {response}"
+            );
+        }
+    }
+
     fn make_cost_query_test_dispatcher(data_dir: &std::path::Path) -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -27409,6 +27673,23 @@ mod tests {
     }
 
     #[test]
+    fn budget_warning_notification() {
+        let event = TurnEvent::BudgetWarning {
+            current_usd: 8.25,
+            limit_usd: 10.0,
+            period: zeroclaw_api::agent::BudgetWarningPeriod::Day,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "budget_warning");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["current_usd"], 8.25);
+        assert_eq!(v["params"]["limit_usd"], 10.0);
+        assert_eq!(v["params"]["period"], "day");
+    }
+
+    #[test]
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
@@ -28695,6 +28976,19 @@ mod tests {
         risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
 
         zeroclaw_config::schema::Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: vec![
+                    "calculator",
+                    "delegate",
+                    "sessions_list",
+                    "sessions_history",
+                    "sessions_current",
+                    "sessions_send",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
             data_dir: workspace_dir,
             config_path: tmp.path().join("config.toml"),
             providers,
@@ -28702,6 +28996,39 @@ mod tests {
             risk_profiles,
             ..zeroclaw_config::schema::Config::default()
         }
+    }
+
+    #[tokio::test]
+    async fn agents_status_runtime_profile_resolves_config_and_omits_unresolved_profiles() {
+        use zeroclaw_config::schema::RuntimeProfileConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .runtime_profiles
+            .insert("coding".into(), RuntimeProfileConfig::default());
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = " coding ".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config.clone());
+
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert_eq!(agent["runtime_profile"], "coding");
+
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = "missing".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config);
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert!(agent.get("runtime_profile").is_none());
     }
 
     fn make_acp_test_dispatcher(
@@ -35314,11 +35641,18 @@ mod tests {
         dispatcher
     }
 
-    fn make_shared_sessions_dispatcher(
+    /// Another connection's dispatcher on `first`'s daemon: it shares the
+    /// session store and the config write lock, as every connection shares
+    /// the daemon's one context in production, so it queues behind a
+    /// transaction `first` holds open. Its config is its own, so a successor
+    /// it builds stays distinguishable from stale work built from `first`'s.
+    fn make_second_connection_dispatcher(
+        first: &RpcContext,
         config: zeroclaw_config::schema::Config,
-        sessions: Arc<crate::rpc::session::SessionStore>,
     ) -> RpcDispatcher {
-        let ctx = RpcContext::minimal(config, sessions);
+        let authority =
+            crate::LiveConfigAuthority::for_tests_sharing_writer(config, &first.config_authority);
+        let ctx = RpcContext::for_authority(&authority, Arc::clone(&first.sessions));
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         dispatcher.set_authenticated_for_test();
@@ -35339,7 +35673,7 @@ mod tests {
             }),
         )));
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = crate::LiveConfigAuthority::new(config);
+        let authority = crate::LiveConfigAuthority::for_tests(config);
         let data_dir = authority.live_handle().read().data_dir.clone();
         let acp_session_store = Some(Arc::new(
             zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir)
@@ -39276,6 +39610,49 @@ mod tests {
         serde_json::from_str(&frame).expect("response frame is valid JSON")
     }
 
+    /// `config/validate` checks an opt-in tool's own settings only in a build
+    /// that carries the tool. A build without project intelligence accepts an
+    /// enabled section whose templates directory does not exist here; a
+    /// build with it still reports the config invalid.
+    #[tokio::test]
+    async fn config_validate_checks_an_opt_in_tool_only_where_it_is_compiled() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "root-operator".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir =
+            Some(tmp.path().join("absent-templates").display().to_string());
+        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
+
+        let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/validate", json!({})).await;
+        let compiled = OptInTool::ProjectIntel.compiled();
+        assert_eq!(response["result"]["valid"], json!(!compiled), "{response}");
+        if compiled {
+            assert!(
+                response["result"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("project_intel.templates_dir")),
+                "{response}"
+            );
+        }
+    }
+
     fn alice_user_sets() -> Value {
         json!([
             {"prop": "users.alice.uid", "value": 1001},
@@ -40587,7 +40964,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -40640,7 +41017,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -40829,7 +41206,7 @@ mod tests {
         runner.register(Box::new(_hook));
 
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -41423,9 +41800,7 @@ mod tests {
     where
         F: std::future::Future<Output = RpcResult> + Send + 'static,
     {
-        let guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let guard = ctx.config_authority.lock_config_writer().await;
         let task = zeroclaw_spawn::spawn!(rpc_call);
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -42398,6 +42773,14 @@ mod tests {
     /// meant to reach has to carry that caller's id: an unstamped session is
     /// invisible to it, and the test would exercise the ownership denial
     /// instead of whatever it meant to check.
+    ///
+    /// The session holds `workspace` as given, but `session/new` and
+    /// rehydration hold the resolved path, and a scoped caller's prompt,
+    /// steer, or resume refuses a session held under any other spelling. A
+    /// test that needs one of those to reach the check under test passes the
+    /// canonicalized workspace. The temp dir is not spelled canonically on
+    /// every platform: on macOS it is under `/var`, a link to `/private/var`,
+    /// and on Windows it can go through an 8.3 short name.
     #[allow(clippy::too_many_arguments)]
     async fn install_state_test_session_owned_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
@@ -43888,6 +44271,7 @@ mod tests {
             "old-model"
         );
 
+        let first_ctx = Arc::clone(&dispatcher.ctx);
         let sessions = Arc::clone(&dispatcher.ctx.sessions);
         let (entered, release, done) = sessions.set_test_gated_op_pause();
         let sid = session_id.clone();
@@ -43918,10 +44302,8 @@ mod tests {
         // Explicitly end the old incarnation before recreating the same ID.
         // A live same-ID session/new must resume rather than replace it.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
-            make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
-        );
+        let dispatcher2 =
+            make_second_connection_dispatcher(&first_ctx, make_model_refresh_test_config(&tmp));
         let replace_sid = session_id.clone();
         let replace = zeroclaw_spawn::spawn!(async move {
             dispatcher2
@@ -44034,9 +44416,9 @@ mod tests {
 
         // Explicitly end the old incarnation before recreating the same ID.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
+        let dispatcher2 = make_second_connection_dispatcher(
+            &dispatcher.ctx,
             make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
         );
         let workspace = tmp.path().join("workspace");
         let replace_sid = session_id.clone();
@@ -44810,9 +45192,7 @@ mod tests {
         // agent route unresolvable before its queued reconciliation can read
         // config. The construction-time provider remains last-known-good, but
         // pending must prevent callers from observing it with the newer config.
-        let config_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         let rehydrated = dispatcher
             .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
             .await
@@ -44832,9 +45212,7 @@ mod tests {
         // settled before the assertion.
         tokio::task::yield_now().await;
         drop(config_gate);
-        let settled_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let settled_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         drop(settled_gate);
 
         assert!(matches!(

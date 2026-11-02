@@ -11,6 +11,9 @@ use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_api::model_provider::TokenUsage;
 use zeroclaw_providers::{ChatResponse, ToolCall};
 
+#[path = "safety_net_loop_recovery.rs"]
+mod loop_recovery;
+
 // ── shared fixtures ─────────────────────────────────────────────────────
 
 struct TestAgent {
