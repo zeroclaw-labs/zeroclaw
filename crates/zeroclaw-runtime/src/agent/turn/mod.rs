@@ -4445,11 +4445,15 @@ async fn drive_live_sop_actions(
                         step_needs_reassembly(agent_alias, step_alias) || foreign_owner;
                     let reassembly_alias = step_alias.or(agent_alias);
                     // A foreign owner's execution is memoized apart from this
-                    // session's own, so neither is ever served for the other.
+                    // session's own, and keyed by the owner's whole scope: the
+                    // execution's memory and audit are on that scope's plane, so
+                    // runs of one principal in another agent, namespace or tenant
+                    // never share it.
                     let cache_key = reassembly_alias.map(|alias| match &run_owner {
-                        Some(owner) if foreign_owner => {
-                            format!("{alias}\u{0}{}", owner.principal_id)
-                        }
+                        Some(owner) if foreign_owner => format!(
+                            "{alias}\u{0}{}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
+                            owner.principal_id, owner.agent_alias, owner.namespace, owner.tenant_id
+                        ),
                         _ => alias.to_string(),
                     });
                     let mut assembly_error: Option<anyhow::Error> = None;
@@ -9216,6 +9220,114 @@ mod sop_step_reassembly_tests {
         );
     }
 
+    /// Runs of one principal in different namespaces or tenants are different
+    /// owners. An unowned session driving both must not serve the second run's
+    /// step from the execution it assembled for the first, whose tools write
+    /// the first scope's plane.
+    #[tokio::test]
+    async fn owned_runs_in_different_scopes_never_share_a_step_execution() {
+        use crate::composition::test_support::RecordingProviders;
+        use zeroclaw_api::memory_traits::PrincipalScope;
+
+        struct FixedMemory(Arc<dyn zeroclaw_memory::Memory>);
+        #[async_trait::async_trait]
+        impl crate::composition::MemorySource for FixedMemory {
+            async fn memory(
+                &self,
+                _request: &crate::composition::MemoryRequest<'_>,
+            ) -> anyhow::Result<Arc<dyn zeroclaw_memory::Memory>> {
+                Ok(Arc::clone(&self.0))
+            }
+        }
+
+        let first = PrincipalScope::new("user:alice")
+            .with_agent(Some("outer".to_string()))
+            .with_namespace(Some("first".to_string()));
+        for second in [
+            first.clone().with_namespace(Some("second".to_string())),
+            first.clone().with_tenant(Some("second".to_string())),
+        ] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let config = stepper_config(tmp.path());
+            let shared: Arc<dyn zeroclaw_memory::Memory> = Arc::new(
+                zeroclaw_memory::SqliteMemory::new("sqlite", &tmp.path().join("bound")).unwrap(),
+            );
+            let bound = crate::composition::BoundCapabilities {
+                capabilities: crate::composition::RuntimeCapabilities {
+                    providers: Arc::new(RecordingProviders::default()),
+                    memory: Arc::new(FixedMemory(Arc::clone(&shared))),
+                    ..crate::composition::RuntimeCapabilities::config_backed_unobserved()
+                },
+                principal: Some(zeroclaw_api::principal::PrincipalId(
+                    "user:alice".to_string(),
+                )),
+            };
+            let mut exec_cache = std::collections::HashMap::new();
+            for owner in [&first, &second] {
+                let (engine, _run_id, action) =
+                    start_single_cross_agent_step_for("stepper", Some(owner.clone()));
+                let handle = SopStepReassembly {
+                    config: &config,
+                    capabilities: Some(&bound),
+                    live_config: None,
+                    memory_owner: None,
+                };
+                let parent_tools =
+                    crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+                let mut history = vec![ChatMessage::system("parent system prompt")];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    drive_step(
+                        Arc::clone(&engine),
+                        action,
+                        &TextProvider,
+                        &parent_tools,
+                        &crate::observability::NoopObserver {},
+                        &mut history,
+                        None,
+                        None,
+                        None,
+                        Some("outer"),
+                        Some(handle),
+                        None,
+                        &mut exec_cache,
+                    ),
+                )
+                .await
+                .expect("the driver settles");
+            }
+            assert_eq!(
+                exec_cache.len(),
+                2,
+                "{second:?}: each owner scope gets its own step execution"
+            );
+            let mut on_second = 0;
+            for (index, owned) in exec_cache.values().enumerate() {
+                let key = format!("scope-marker-{index}");
+                let stored = run_step_tool(
+                    owned,
+                    "memory_store",
+                    serde_json::json!({"key": key, "content": "SCOPE-MARKER"}),
+                )
+                .await;
+                assert!(stored.success, "{stored:?}");
+                let plane = second.clone().with_agent(Some("stepper".to_string()));
+                if shared
+                    .get_for_principal(&plane, &key)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    on_second += 1;
+                }
+            }
+            assert_eq!(
+                on_second, 1,
+                "{second:?}: one execution writes the second run's plane"
+            );
+        }
+    }
+
     /// A bound turn's principal selects the step's provider credentials. A
     /// step whose memory owner is another principal, or an owned step on an
     /// anonymous bound turn, is refused before any provider is asked.
@@ -9366,7 +9478,8 @@ mod sop_step_reassembly_tests {
             "the step is audited on the run owner's plane"
         );
         let owned = exec_cache
-            .get("stepper\u{0}user:alice")
+            .iter()
+            .find_map(|(key, owned)| (key != "stepper").then_some(owned))
             .expect("the driver re-assembled the step agent under the run's owner");
         let stored = run_step_tool(
             owned,
