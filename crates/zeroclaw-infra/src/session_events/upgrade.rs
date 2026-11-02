@@ -202,6 +202,8 @@ pub fn upgrade_installation(
         backups.push(path.with_extension("trim_breadcrumb"));
     }
     acp::import_all(&guard, store.as_ref())?;
+    crate::cost_ledger::CostLedger::open_for_backend(data_dir, target)
+        .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?;
     #[cfg(test)]
     super::crash_tests::crash_boundary("installation_imported");
     // Renames are idempotent and synced individually. A restart can finish a

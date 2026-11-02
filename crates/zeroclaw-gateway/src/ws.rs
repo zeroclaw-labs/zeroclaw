@@ -2371,7 +2371,7 @@ async fn process_chat_message(
 
             // Trace the failed turn so the doctor / replay tool sees the
             // failure mode and the turn_id can be cross-referenced with
-            // costs.jsonl.follow-through.
+            // backend cost ledger.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)

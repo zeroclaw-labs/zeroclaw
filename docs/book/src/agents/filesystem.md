@@ -11,7 +11,7 @@ each get their own top-level directory.
 │   ├── sessions/                 — standard session events and archived legacy sources
 │   │   └── session-format.json, session-events.db or session-events-jsonl/, *.backup
 │   ├── state/                    — runtime state
-│   │   └── costs.jsonl, runtime-trace.jsonl
+│   │   └── runtime-trace.jsonl
 │   ├── devices.db                — paired-device metadata
 │   └── memory/                   — shared instance memory
 │       └── brain.db, audit.db, response_cache.db,

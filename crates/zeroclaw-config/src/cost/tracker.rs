@@ -6,10 +6,14 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+
+#[cfg(test)]
+use std::fs::{self, OpenOptions};
+#[cfg(test)]
+use std::io::{BufRead, BufReader, Write};
 
 /// Process-local subtree accounting for one hop of a delegation chain.
 ///
@@ -168,7 +172,7 @@ pub struct CostTracker {
     /// Live cost policy. This is hot-swapped on config reload so budget checks
     /// see new global limits without rebuilding the tracker.
     config: Arc<RwLock<CostConfig>>,
-    /// Durable JSONL ledger plus cached day/month aggregates for that ledger.
+    /// Backend-native durable ledger plus cached day/month aggregates.
     storage: Arc<Mutex<CostStorage>>,
     /// Process-local tracker session id used to group records emitted by this
     /// daemon lifetime.
@@ -207,7 +211,7 @@ struct AgentTotals {
 impl CostTracker {
     /// Create a new cost tracker.
     pub fn new(config: CostConfig, workspace_dir: &Path) -> Result<Self> {
-        let storage_path = resolve_storage_path(workspace_dir)?;
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(workspace_dir)?;
         let storage = CostStorage::new(&storage_path).with_context(|| {
             format!(
                 "Failed to open cost storage at {}",
@@ -935,7 +939,7 @@ impl CostTracker {
         config: CostConfig,
         workspace_dir: &Path,
     ) -> Option<Arc<Self>> {
-        let storage_path = match resolve_storage_path(workspace_dir) {
+        let storage_path = match zeroclaw_infra::cost_ledger::resolve_path(workspace_dir) {
             Ok(path) => path,
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -982,44 +986,6 @@ impl CostTracker {
             }
         }
     }
-}
-
-fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
-    let storage_path = workspace_dir.join("state").join("costs.jsonl");
-    let legacy_path = workspace_dir.join(".zeroclaw").join("costs.db");
-
-    if !storage_path.exists() && legacy_path.exists() {
-        if let Some(parent) = storage_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create directory {}",
-                    parent.display().to_string()
-                )
-            })?;
-        }
-
-        if let Err(error) = fs::rename(&legacy_path, &storage_path) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "Failed to move legacy cost storage from {} to {}: {error}; falling back to copy",
-                    legacy_path.display().to_string(),
-                    storage_path.display().to_string()
-                )
-            );
-            fs::copy(&legacy_path, &storage_path).with_context(|| {
-                format!(
-                    "Failed to copy legacy cost storage from {} to {}",
-                    legacy_path.display().to_string(),
-                    storage_path.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(storage_path)
 }
 
 fn build_model_stats<'a, I>(records: I) -> HashMap<String, ModelStats>
@@ -1167,8 +1133,7 @@ impl CostSummaryAccumulator {
 }
 
 struct CostStorage {
-    /// JSONL ledger path.
-    path: PathBuf,
+    ledger: zeroclaw_infra::cost_ledger::CostLedger,
     /// Cached total for the current UTC day.
     daily_cost_usd: f64,
     /// Cached total for the current UTC month.
@@ -1232,17 +1197,10 @@ impl ReportingPeriod {
 impl CostStorage {
     /// Create or open cost storage.
     fn new(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create directory {}",
-                    parent.display().to_string()
-                )
-            })?;
-        }
+        let ledger = zeroclaw_infra::cost_ledger::CostLedger::open(path)?;
         let now = Utc::now();
         Ok(Self {
-            path: path.to_path_buf(),
+            ledger,
             daily_cost_usd: 0.0,
             monthly_cost_usd: 0.0,
             daily_cost_by_agent: HashMap::new(),
@@ -1276,29 +1234,11 @@ impl CostStorage {
     where
         F: FnMut(CostRecord),
     {
-        if !self.path.exists() {
-            return Ok(0);
-        }
-
-        let file = File::open(&self.path).with_context(|| {
-            format!(
-                "Failed to read cost storage from {}",
-                self.path.display().to_string()
-            )
-        })?;
-        let reader = BufReader::new(file);
-
         let mut rejected_records = 0_usize;
-        for (line_number, line) in reader.lines().enumerate() {
-            let raw_line = line.with_context(|| {
-                format!(
-                    "Failed to read line {} from cost storage {}",
-                    line_number + 1,
-                    self.path.display()
-                )
-            })?;
-
-            let trimmed = raw_line.trim();
+        for (line_number, raw_line) in self.ledger.read_records()?.into_iter().enumerate() {
+            let trimmed = std::str::from_utf8(&raw_line)
+                .context("cost record is not UTF-8")?
+                .trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -1318,7 +1258,7 @@ impl CostStorage {
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({
-                                "path": self.path.display().to_string(),
+                                "path": self.ledger.path().display().to_string(),
                                 "line": line_number + 1,
                                 "parse_error": parse_error.to_string(),
                                 "recovery_error": recovery_error.to_string(),
@@ -1388,25 +1328,8 @@ impl CostStorage {
     ) -> Result<AppendOutcome> {
         self.ensure_period_cache_current()?;
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| {
-                format!(
-                    "Failed to open cost storage at {}",
-                    self.path.display().to_string()
-                )
-            })?;
-
-        let mut line = serde_json::to_string(&record)?;
-        line.push('\n');
-        file.write_all(line.as_bytes()).with_context(|| {
-            format!(
-                "Failed to write cost record to {}",
-                self.path.display().to_string()
-            )
-        })?;
+        let line = serde_json::to_vec(&record)?;
+        let append = self.ledger.append(&line, sync_file)?;
 
         let timestamp = record.usage.timestamp.naive_utc();
         if timestamp.date() == self.cached_day {
@@ -1427,16 +1350,11 @@ impl CostStorage {
             self.monthly_cost_usd += record.usage.cost_usd;
         }
 
-        let sync_result = sync_file(&file).with_context(|| {
-            format!(
-                "Failed to sync cost storage at {}",
-                self.path.display().to_string()
-            )
-        });
-
-        Ok(match sync_result {
-            Ok(()) => AppendOutcome::Synced,
-            Err(error) => AppendOutcome::AppendedButSyncFailed(error),
+        Ok(match append {
+            zeroclaw_infra::cost_ledger::AppendOutcome::Synced => AppendOutcome::Synced,
+            zeroclaw_infra::cost_ledger::AppendOutcome::AppendedButSyncFailed(error) => {
+                AppendOutcome::AppendedButSyncFailed(error)
+            }
         })
     }
 
@@ -1669,7 +1587,7 @@ mod tests {
 
         // Simulate the legacy interleaved-write artifact: collapse the two
         // newline-separated records into one concatenated `{..}{..}` line.
-        let path = resolve_storage_path(tmp.path()).unwrap();
+        let path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
         let joined: String = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -1976,7 +1894,7 @@ mod tests {
     #[test]
     fn task_usage_totals_read_legacy_recovered_records() {
         let tmp = TempDir::new().unwrap();
-        let path = resolve_storage_path(tmp.path()).unwrap();
+        let path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -2036,7 +1954,7 @@ mod tests {
     #[test]
     fn summary_by_model_is_daily_scoped() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -2080,7 +1998,7 @@ mod tests {
     #[test]
     fn summaries_use_one_cached_period_for_task_and_model_rollups() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
         let period = ReportingPeriod {
             day: NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
             year: 2025,
@@ -2156,7 +2074,7 @@ mod tests {
     #[test]
     fn current_month_model_stats_keep_earlier_month_unpriced_usage_visible() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
         let period = ReportingPeriod {
             day: NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
             year: 2025,
@@ -2220,7 +2138,7 @@ mod tests {
     #[test]
     fn malformed_lines_are_ignored_while_loading() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -2477,7 +2395,9 @@ mod tests {
             .record_usage(TokenUsage::new("test/model", 10, 5, 0, 1.0, 2.0, 0.0))
             .unwrap();
         assert!(
-            resolve_storage_path(second_tmp.path()).unwrap().exists(),
+            zeroclaw_infra::cost_ledger::resolve_path(second_tmp.path())
+                .unwrap()
+                .exists(),
             "usage after data-dir change must land in the new canonical ledger"
         );
     }
@@ -3098,7 +3018,7 @@ mod tests {
         storage.ensure_period_cache_current().unwrap();
         assert_eq!(
             storage.daily_cost_by_agent,
-            ledger_daily_by_agent(&storage.path),
+            ledger_daily_by_agent(storage.ledger.path()),
             "per-alias day buckets must match a from-scratch ledger fold after appends"
         );
         drop(storage);
@@ -3115,7 +3035,7 @@ mod tests {
         let storage = tracker.lock_storage();
         assert_eq!(
             storage.daily_cost_by_agent,
-            ledger_daily_by_agent(&storage.path),
+            ledger_daily_by_agent(storage.ledger.path()),
             "per-alias day buckets must match a from-scratch ledger fold after a rebuild"
         );
         assert!(
@@ -3650,7 +3570,7 @@ mod tests {
     #[test]
     fn torn_trailing_line_is_reported_as_rejected() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -3690,7 +3610,7 @@ mod tests {
     #[test]
     fn torn_tail_after_a_complete_record_is_reported_as_rejected() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -3722,7 +3642,7 @@ mod tests {
     #[test]
     fn fully_recovered_concatenated_records_are_not_rejected() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }

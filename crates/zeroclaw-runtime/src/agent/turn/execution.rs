@@ -716,8 +716,10 @@ mod run_model_query_tests {
         assert_eq!(summaries[0].cached_input_tokens, Some(4_000));
         assert_eq!(summaries[0].output_tokens, Some(200));
         let projected = summaries[0].cost_usd.expect("rejected cost is priced");
-        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
-            .expect("costs.jsonl should be written");
+        let stored = std::fs::read_to_string(
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path()).expect("cost ledger path"),
+        )
+        .expect("cost ledger should be written");
         let record: zeroclaw_config::cost::types::CostRecord =
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert_eq!(record.usage.cache_creation_input_tokens, 1_000);

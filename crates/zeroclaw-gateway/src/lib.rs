@@ -1772,9 +1772,6 @@ pub async fn run_gateway_with_plugin_webhooks(
     let tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>> =
         Arc::new(tools_registry_by_agent);
 
-    // Cost tracker — process-global singleton so channels share the same instance
-    let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
-
     // The live-pricing refresher and the gateway-start hook belong to the
     // process that owns this listener (the daemon, or the standalone
     // `zeroclaw gateway` command), not to the listener: the refresher must run
@@ -1998,6 +1995,10 @@ pub async fn run_gateway_with_plugin_webhooks(
             );
         }
     }
+
+    // Cost tracker — initialize after the session installation has selected
+    // and published its native backend, so the ledger follows that backend.
+    let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
 
     // ── Pairing guard ──────────────────────────────────────
     // Supervised runs share the daemon's live authority so pairing and
@@ -3493,7 +3494,7 @@ pub(crate) async fn run_gateway_chat_with_parts(
         );
 
         // Scope the cost tracking context so per-LLM-call usage flows into
-        // the gateway's cost tracker and costs.jsonl. A separate
+        // the gateway's cost tracker and backend cost ledger. A separate
         // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals so
         // the runtime-owned lifecycle guard can annotate its `AgentEnd`
         // without racing concurrent requests sharing the same tracker.

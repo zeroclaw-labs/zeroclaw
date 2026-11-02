@@ -497,6 +497,10 @@ pub(super) fn migrate_locked(
         return installation.finish(target);
     }
     let image = export(data_dir, source, None)?;
+    let source_costs = crate::cost_ledger::CostLedger::open_for_backend(data_dir, source)
+        .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?
+        .read_records()
+        .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?;
     let families = installation::session_ids(data_dir, source)?;
     let _leases = families
         .keys()
@@ -522,6 +526,10 @@ pub(super) fn migrate_locked(
         NativeBackend::Sqlite => SqliteEventStore::open(data_dir)?.import_native(&image)?,
         NativeBackend::Jsonl => JsonlEventStore::open(data_dir)?.import_native(&image)?,
     }
+    crate::cost_ledger::CostLedger::open_for_backend(data_dir, target)
+        .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?
+        .import_records(&source_costs)
+        .map_err(|error| AppendError::StorageUnavailable(error.to_string()))?;
     #[cfg(test)]
     super::crash_tests::crash_boundary("native_migration_imported");
     let verified = export(data_dir, target, None)?.digest()?;
