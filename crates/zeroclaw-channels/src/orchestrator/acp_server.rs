@@ -106,6 +106,7 @@ impl Default for AcpServerConfig {
 
 struct Session {
     agent: Agent,
+    _lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentSessionLease,
     last_active: Instant,
     /// Agent alias (e.g. `"clamps"`) for attributable span logs.
     agent_alias: String,
@@ -121,13 +122,14 @@ struct Session {
 
 enum ConfigSource {
     Standalone(Box<Config>),
-    Live(Arc<parking_lot::RwLock<Config>>),
+    Live(zeroclaw_config::live::LiveConfigHandle),
 }
 
 pub struct AcpServer {
-    /// The sole authority for `Config`-backed settings. Standalone ACP owns an
-    /// immutable config; gateway ACP resolves the shared daemon config.
+    /// The sole authority for `Config`-backed settings. Managed stdio and
+    /// gateway ACP resolve their shared authority's config.
     config_source: ConfigSource,
+    agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
     acp_config: AcpServerConfig,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
     rpc: Arc<RpcOutbound>,
@@ -169,10 +171,28 @@ pub struct AcpServer {
 }
 
 impl AcpServer {
+    /// Create a stdio server retaining the caller's config and lifecycle authority.
+    pub fn new_stdio_with_authority(
+        authority: &zeroclaw_runtime::LiveConfigAuthority,
+        acp_config: AcpServerConfig,
+        store: Option<Arc<AcpSessionStore>>,
+    ) -> Self {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
+        Self::with_writer(
+            ConfigSource::Live(authority.live_handle()),
+            authority.agent_lifecycle(),
+            acp_config,
+            writer_tx,
+            Some(writer_rx),
+            store,
+        )
+    }
+
     pub fn new(config: Config, acp_config: AcpServerConfig) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
         Self::with_writer(
             ConfigSource::Standalone(Box::new(config)),
+            Default::default(),
             acp_config,
             writer_tx,
             Some(writer_rx),
@@ -187,6 +207,7 @@ impl AcpServer {
     ) -> Self {
         Self::with_writer(
             ConfigSource::Standalone(Box::new(config)),
+            Default::default(),
             acp_config,
             writer_tx,
             None,
@@ -202,6 +223,7 @@ impl AcpServer {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
         Self::with_writer(
             ConfigSource::Standalone(Box::new(config)),
+            Default::default(),
             acp_config,
             writer_tx,
             Some(writer_rx),
@@ -217,6 +239,7 @@ impl AcpServer {
     ) -> Self {
         Self::with_writer(
             ConfigSource::Standalone(Box::new(config)),
+            Default::default(),
             acp_config,
             writer_tx,
             None,
@@ -229,12 +252,14 @@ impl AcpServer {
     /// The server retains no parallel `Config` clone and resolves an on-demand
     /// view whenever it handles a request.
     pub fn new_with_live_config_and_writer(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
     ) -> Self {
         Self::with_writer(
             ConfigSource::Live(live_config),
+            agent_lifecycle,
             acp_config,
             writer_tx,
             None,
@@ -247,13 +272,15 @@ impl AcpServer {
     /// The server retains no parallel `Config` clone and resolves an on-demand
     /// view whenever it handles a request.
     pub fn new_with_live_config_and_writer_and_store(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+        live_config: zeroclaw_config::live::LiveConfigHandle,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
         store: Arc<AcpSessionStore>,
     ) -> Self {
         Self::with_writer(
             ConfigSource::Live(live_config),
+            agent_lifecycle,
             acp_config,
             writer_tx,
             None,
@@ -263,6 +290,7 @@ impl AcpServer {
 
     fn with_writer(
         config_source: ConfigSource,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
         writer_rx: Option<mpsc::Receiver<String>>,
@@ -270,6 +298,7 @@ impl AcpServer {
     ) -> Self {
         Self {
             config_source,
+            agent_lifecycle,
             acp_config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
@@ -317,8 +346,8 @@ impl AcpServer {
     ) -> Result<Agent> {
         let Some(store) = self.store.as_ref() else {
             return if let ConfigSource::Live(live_config) = &self.config_source {
-                Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
-                    Arc::clone(live_config),
+                Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
+                    live_config.clone(),
                     agent_alias,
                     Some(workspace_dir),
                     enable_mcp,
@@ -327,6 +356,10 @@ impl AcpServer {
                     self.sop_engine.clone(),
                     self.sop_audit.clone(),
                     self.canvas_store.clone(),
+                    Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
+                        live_config.clone(),
+                        self.agent_lifecycle.clone(),
+                    )),
                 )
                 .await
             } else {
@@ -345,8 +378,12 @@ impl AcpServer {
             };
         };
         if let ConfigSource::Live(live_config) = &self.config_source {
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
-                Arc::clone(live_config),
+            let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
+                live_config.clone(),
+                self.agent_lifecycle.clone(),
+            );
+            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
+                live_config.clone(),
                 agent_alias,
                 Some(workspace_dir),
                 enable_mcp,
@@ -357,6 +394,7 @@ impl AcpServer {
                 self.sop_audit.clone(),
                 self.canvas_store.clone(),
                 Arc::clone(store),
+                Some(execution_capability),
             )
             .await
         } else {
@@ -761,6 +799,25 @@ impl AcpServer {
         }
     }
 
+    fn agent_admission_error(
+        error: zeroclaw_runtime::live_config_authority::AgentAdmissionError,
+    ) -> RpcError {
+        let message = match error {
+            zeroclaw_runtime::live_config_authority::AgentAdmissionError::Deleting { alias }
+            | zeroclaw_runtime::live_config_authority::AgentAdmissionError::StaleGeneration {
+                alias,
+            } => format!("Agent `{alias}` changed while the session was being created"),
+            zeroclaw_runtime::live_config_authority::AgentAdmissionError::GenerationClosing => {
+                "Agent sessions are unavailable while the daemon reloads".to_string()
+            }
+        };
+        RpcError {
+            code: INVALID_PARAMS,
+            message,
+            data: None,
+        }
+    }
+
     /// Alias a new session on this connection would use when the client does
     /// not pass an explicit `agentAlias`: the connection-scoped default
     /// (`?agent=`), then `[acp].default_agent`, then the sole configured
@@ -839,6 +896,10 @@ impl AcpServer {
                 data: None,
             })?;
         Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
+        let admission = self
+            .agent_lifecycle
+            .reserve_admission(agent_alias.clone())
+            .map_err(Self::agent_admission_error)?;
 
         // Default workspace is the per-agent directory. An explicit
         // `cwd`/`workspaceDir`/`workspace_dir` is the session's file-access
@@ -1022,6 +1083,18 @@ impl AcpServer {
             }
         }
 
+        let lifecycle_lease = match admission.publish() {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                if let Some(store) = &self.store {
+                    let store = Arc::clone(store);
+                    let sid = session_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || store.delete_session(&sid)).await;
+                }
+                return Err(Self::agent_admission_error(error));
+            }
+        };
         let now = Instant::now();
         // Atomically insert and release the reservation.
         {
@@ -1032,6 +1105,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: agent_alias.clone(),
                     model_provider: config
@@ -1187,6 +1261,16 @@ impl AcpServer {
         // ACP default (or sole agent, or "default") only when the persisted
         // owner is missing or not dispatchable. `?agent=` is not consulted.
         let restore_alias = Self::resolve_restore_agent_alias(&config, &data.agent_alias);
+        let admission = match self
+            .agent_lifecycle
+            .reserve_admission(restore_alias.clone())
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(Self::agent_admission_error(error));
+            }
+        };
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
@@ -1316,6 +1400,13 @@ impl AcpServer {
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
 
+        let lifecycle_lease = match admission.publish() {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(Self::agent_admission_error(error));
+            }
+        };
         let now = Instant::now();
         // The session is about to become live, so `session/close` owns the gate
         // from here on.
@@ -1329,6 +1420,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
                     model_provider: config
@@ -1503,6 +1595,16 @@ impl AcpServer {
         // ACP default (or sole agent, or "default") only when the persisted
         // owner is missing or not dispatchable. `?agent=` is not consulted.
         let restore_alias = Self::resolve_restore_agent_alias(&config, &data.agent_alias);
+        let admission = match self
+            .agent_lifecycle
+            .reserve_admission(restore_alias.clone())
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(Self::agent_admission_error(error));
+            }
+        };
 
         // MCP init follows the restored agent's own opt-in
         // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
@@ -1591,6 +1693,13 @@ impl AcpServer {
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
 
+        let lifecycle_lease = match admission.publish() {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(Self::agent_admission_error(error));
+            }
+        };
         let now = Instant::now();
         // The session is about to become live, so `session/close` owns the gate
         // from here on.
@@ -1604,6 +1713,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
                     model_provider: config
@@ -3879,6 +3989,7 @@ mod tests {
             provider_ref: "stub".into(),
             model: "stub-model".into(),
             accepted: true,
+            estimated_input_tokens: None,
         };
 
         assert!(notification_for_turn_event("session", &event).is_none());
@@ -3918,6 +4029,75 @@ mod tests {
             store.load_session(session_id).unwrap().unwrap().token_count,
             1000,
             "rejected usage is billing-only"
+        );
+    }
+
+    /// Boundary (persistence): a display estimate must never become a durable
+    /// session token count. The ACP drain extracts `input_tokens` from the
+    /// event — never `estimated_input_tokens` — so an accepted usage-less
+    /// response clears the stale count instead of persisting the estimate.
+    #[tokio::test]
+    async fn estimated_usage_is_never_persisted_as_a_session_token_count() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-acp-estimate-not-persisted";
+        store
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
+            .unwrap();
+
+        // Establish a real measured count first.
+        persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
+        assert_eq!(
+            store.load_session(session_id).unwrap().unwrap().token_count,
+            1000
+        );
+
+        // An accepted response where the provider reported nothing, but the
+        // runtime formed a display estimate.
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "llamacpp.default".into(),
+            model: "local-model".into(),
+            accepted: true,
+            estimated_input_tokens: Some(4_200),
+        };
+
+        // Mirror the drain's extraction: persistence reads the measured field.
+        let TurnEvent::Usage {
+            input_tokens,
+            accepted,
+            estimated_input_tokens,
+            ..
+        } = &event
+        else {
+            panic!("fixture must be a Usage event");
+        };
+        assert_eq!(
+            *estimated_input_tokens,
+            Some(4_200),
+            "fixture must carry an estimate"
+        );
+        assert_eq!(
+            *input_tokens, None,
+            "the measured field must stay absent so persistence cannot store an estimate"
+        );
+        persist_acp_usage_snapshot_ordered(&store, session_id, *input_tokens, *accepted).await;
+
+        assert_eq!(
+            store.load_session(session_id).unwrap().unwrap().token_count,
+            0,
+            "estimate must clear the stale measured count, never be persisted as one"
         );
     }
 
@@ -5506,6 +5686,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(32);
         let mut config = make_test_config(workspace.path());
+        // This transcript exercises selected delivery on the minimal ACP catalog plus deliver_file.
+        config.tools.optional = vec!["deliver_file".into()];
         config
             .risk_profiles
             .get_mut("default")
@@ -6624,6 +6806,43 @@ mod tests {
         assert!(server.sessions.lock().await.contains_key(session_id));
     }
 
+    #[tokio::test]
+    async fn published_session_blocks_delete_until_close_releases_lease() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+        let lifecycle = server.agent_lifecycle.clone();
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must publish");
+        let session_id = result["sessionId"].as_str().unwrap();
+
+        assert_eq!(lifecycle.live_session_count("test-agent"), 1);
+        assert!(matches!(
+            lifecycle.begin_delete("test-agent"),
+            Err(
+                zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::LiveSessions {
+                    count: 1,
+                    ..
+                }
+            )
+        ));
+
+        server
+            .handle_session_close(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/close must release lifecycle lease");
+        assert_eq!(lifecycle.live_session_count("test-agent"), 0);
+        assert!(lifecycle.begin_delete("test-agent").is_ok());
+    }
+
     fn make_test_config(cwd: &std::path::Path) -> Config {
         let mut cfg = Config {
             data_dir: cwd.to_path_buf(),
@@ -6657,16 +6876,19 @@ mod tests {
     #[test]
     fn gateway_backed_server_initialize_uses_reloaded_config() {
         let cwd = tempfile::tempdir().unwrap();
-        let config = Arc::new(parking_lot::RwLock::new(make_test_config(cwd.path())));
+        // The server's live view is the read-only handle; keep the storage
+        // owner on the side so the test can publish a "reloaded" pair.
+        let live = zeroclaw_config::live::LiveConfig::new(make_test_config(cwd.path()));
         let (writer_tx, _writer_rx) = mpsc::channel::<String>(1);
         let server = AcpServer::new_with_live_config_and_writer(
-            Arc::clone(&config),
+            live.handle(),
+            Default::default(),
             AcpServerConfig::default(),
             writer_tx,
         );
 
-        config
-            .write()
+        let mut reloaded = live.snapshot();
+        reloaded
             .providers
             .models
             .anthropic
@@ -6674,6 +6896,8 @@ mod tests {
             .unwrap()
             .base
             .model = Some("reloaded-model".to_string());
+        live.publish(live.next_revision().unwrap(), reloaded)
+            .unwrap();
 
         assert_eq!(
             server.handle_initialize(&serde_json::json!({})).unwrap()["_meta"]["zeroclaw"]["defaultModel"],

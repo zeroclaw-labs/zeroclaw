@@ -264,6 +264,12 @@ pub mod error_codes {
     pub const SESSION_LIMIT_REACHED: i32 = -32001;
     pub const SESSION_BUSY: i32 = -32002;
     pub const SESSION_NOT_OWNED: i32 = -32003;
+    /// The local IPC endpoint is at its connection ceiling.
+    ///
+    /// The gateway's A2A surface also answers `-32004`, meaning
+    /// `UnsupportedOperationError` in that protocol. The two never share a
+    /// connection; a client reads a code in the protocol it spoke.
+    pub const CONNECTION_LIMIT_REACHED: i32 = -32004;
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
     pub const FORBIDDEN: i32 = -32012;

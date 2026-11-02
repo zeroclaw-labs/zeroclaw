@@ -1,5 +1,15 @@
 # ZeroCode Session Root Selection Design
 
+> **Historical note, superseded for fresh local roots by #11219 (2026-10-02).**
+> The fresh/restarted local `cwd: null` and agent-workspace default described
+> below caused #11044's launch-project regression. The current contract is in
+> [Running zerocode](../../book/src/zerocode/running.md): fresh/restarted local
+> Chat and Code send the launch directory, explicit selection wins, and capture
+> failure refuses creation while restoring an existing sibling and its notice.
+> Resume still omits `cwd`; WSS Chat uses the daemon workspace and WSS Code uses
+> the daemon-side picker. The original design and completed steps below remain
+> historical evidence, including the superseded local-request test instructions.
+
 **Date:** 2026-09-21
 **Follow-up issue:** [#10826](https://github.com/zeroclaw-labs/zeroclaw/issues/10826)
 **Parent decision:** [PR #10565](https://github.com/zeroclaw-labs/zeroclaw/pull/10565)

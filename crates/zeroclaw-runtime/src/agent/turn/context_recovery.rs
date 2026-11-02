@@ -56,6 +56,23 @@ pub(crate) fn record_llm_failure(
     );
 }
 
+/// What the in-loop context-overflow recovery attempt concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextRecovery {
+    /// The failure was not a context-window overflow.
+    NotOverflow,
+    /// History was trimmed; the provider call is worth retrying.
+    Recovered,
+    /// It was an overflow and there is nothing left to trim.
+    Unrecoverable,
+}
+
+impl ContextRecovery {
+    pub(crate) fn recovered(self) -> bool {
+        self == Self::Recovered
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_recover_context_overflow(
     injected_memory_preamble: &mut Option<super::MemoryPreamble>,
@@ -72,7 +89,7 @@ pub(crate) async fn try_recover_context_overflow(
     // `history_trim::insert_breadcrumb_deduped`); set when this recovery
     // inserts a fresh crumb so classification never depends on text.
     crumb_present: &mut bool,
-) -> bool {
+) -> ContextRecovery {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
             WARN,
@@ -191,7 +208,7 @@ pub(crate) async fn try_recover_context_overflow(
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                 unsatisfiable_floor: None,
             });
-            return true;
+            return ContextRecovery::Recovered;
         }
 
         let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
@@ -220,8 +237,9 @@ pub(crate) async fn try_recover_context_overflow(
                 "Context overflow unrecoverable: only one turn left, cannot trim further"
             );
         }
+        return ContextRecovery::Unrecoverable;
     }
-    false
+    ContextRecovery::NotOverflow
 }
 
 #[cfg(test)]
@@ -258,7 +276,7 @@ mod tests {
         let mut crumb = false;
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let error = anyhow::Error::msg("maximum context length exceeded");
-        assert!(
+        assert_eq!(
             super::try_recover_context_overflow(
                 &mut injected,
                 &mut history,
@@ -272,7 +290,8 @@ mod tests {
                 "test",
                 &mut crumb,
             )
-            .await
+            .await,
+            ContextRecovery::Recovered
         );
         let first = rx.try_recv().unwrap();
         let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
@@ -312,7 +331,7 @@ mod tests {
         // Internal retry feedback is a newer user boundary. A later trim may
         // remove the injected message itself; never strip the same-looking
         // genuine input that then occupies a nearby position.
-        assert!(
+        assert_eq!(
             super::try_recover_context_overflow(
                 &mut injected,
                 &mut history,
@@ -326,7 +345,8 @@ mod tests {
                 "test",
                 &mut crumb,
             )
-            .await
+            .await,
+            ContextRecovery::Recovered
         );
         let second = rx.try_recv().unwrap();
         let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
@@ -354,7 +374,7 @@ mod tests {
         observer: &dyn Observer,
         context_limits: zeroclaw_config::schema::ResolvedContextLimits,
         crumb_present: &mut bool,
-    ) -> bool {
+    ) -> ContextRecovery {
         super::try_recover_context_overflow(
             injected_memory_preamble,
             history,
@@ -420,7 +440,7 @@ mod tests {
             &mut false,
         )
         .await;
-        assert!(recovered);
+        assert_eq!(recovered, ContextRecovery::Recovered);
         let events = observer.0.lock().expect("trim events lock");
         assert!(events.iter().any(|event| matches!(
             event,
@@ -463,7 +483,11 @@ mod tests {
         )
         .await;
 
-        assert!(recovered, "an overflowing history must trim and recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Recovered,
+            "an overflowing history must trim and recover"
+        );
         let delta = delta_rx
             .try_recv()
             .expect("context recovery must emit a lifecycle delta");
@@ -497,7 +521,11 @@ mod tests {
         )
         .await;
 
-        assert!(!recovered, "a non-overflow error must not report recovery");
+        assert_eq!(
+            recovered,
+            ContextRecovery::NotOverflow,
+            "a non-overflow error must not report recovery"
+        );
         assert!(
             delta_rx.try_recv().is_err(),
             "no lifecycle state may be emitted when compaction never ran"
@@ -534,8 +562,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            !recovered,
+        assert_eq!(
+            recovered,
+            ContextRecovery::Unrecoverable,
             "an overflow with a single turn cannot be recovered"
         );
         assert_eq!(
@@ -569,7 +598,11 @@ mod tests {
         )
         .await;
 
-        assert!(recovered, "an overflowing history must trim and recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Recovered,
+            "an overflowing history must trim and recover"
+        );
         // The retried history must carry the model-visible breadcrumb after the
         // leading system messages, matching the turn-boundary contract.
         let breadcrumb_text = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
@@ -656,7 +689,11 @@ mod tests {
         )
         .await;
 
-        assert!(recovered, "an overflowing history must trim and recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Recovered,
+            "an overflowing history must trim and recover"
+        );
         let event = rx.try_recv().expect("recovery must emit a TurnEvent");
         match event {
             zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
@@ -704,7 +741,11 @@ mod tests {
         )
         .await;
 
-        assert!(recovered, "an overflowing history must trim and recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Recovered,
+            "an overflowing history must trim and recover"
+        );
         let event = rx.try_recv().expect("recovery must emit a TurnEvent");
         match event {
             zeroclaw_api::agent::TurnEvent::HistoryTrimmed { token_budget, .. } => {
@@ -746,8 +787,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            !recovered,
+        assert_eq!(
+            recovered,
+            ContextRecovery::Unrecoverable,
             "single-turn floor overflow must not retry (no #5808 loop)"
         );
         assert!(
@@ -783,7 +825,11 @@ mod tests {
         )
         .await;
 
-        assert!(!recovered, "a non-overflow error must not trigger recovery");
+        assert_eq!(
+            recovered,
+            ContextRecovery::NotOverflow,
+            "a non-overflow error must not trigger recovery"
+        );
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
     }
 
@@ -824,7 +870,11 @@ mod tests {
             &mut false,
         )
         .await;
-        assert!(!recovered, "floor-dominates overflow must not recover");
+        assert_eq!(
+            recovered,
+            ContextRecovery::Unrecoverable,
+            "floor-dominates overflow must not recover"
+        );
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s
         // deadline, tolerating `Lagged` from parallel broadcast traffic.

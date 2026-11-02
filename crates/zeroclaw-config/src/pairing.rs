@@ -1,4 +1,4 @@
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -342,6 +342,16 @@ fn take_live(slot: &mut Option<PendingCode>) -> Option<PendingCode> {
     slot.clone()
 }
 
+/// The paired-token set held by [`PairingGuard::hold_paired_tokens`].
+pub struct HeldPairedTokens<'a>(RwLockReadGuard<'a, HashSet<String>>);
+
+impl HeldPairedTokens<'_> {
+    /// Whether `token_hash` is paired, as of this hold.
+    pub fn contains_hash(&self, token_hash: &str) -> bool {
+        self.0.contains(token_hash)
+    }
+}
+
 // TODO: I've just made this work with parking_lot but it should use either flume or tokio's async mutexes
 #[derive(Debug, Clone)]
 pub struct PairingGuard {
@@ -349,8 +359,16 @@ pub struct PairingGuard {
     require_pairing: bool,
     /// One-time pairing code (generated on startup, consumed on first pair).
     pairing_code: Arc<Mutex<Option<PendingCode>>>,
+    /// One-time certificate-enrollment code, kept apart from `pairing_code`
+    /// so it authorizes a certificate and never a bearer: it may reach parties
+    /// that must not pair (the relay-terminated frontdoor, a shared link).
+    /// It shares this guard's policy, lifetime and lockout accounting.
+    enrollment_code: Arc<Mutex<Option<PendingCode>>>,
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
-    paired_tokens: Arc<Mutex<HashSet<String>>>,
+    /// A reader-writer lock so that a caller holding it across an effect
+    /// (see [`PairingGuard::hold_paired_tokens`]) delays only pairing and
+    /// revocation, not other liveness checks.
+    paired_tokens: Arc<RwLock<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt state + last sweep timestamp.
     failed_attempts: Arc<Mutex<(HashMap<String, FailedAttemptState>, Instant)>>,
     /// The admin token this gateway run accepts on the pairing-code admin
@@ -367,6 +385,8 @@ pub struct PairingGuard {
 #[derive(Debug)]
 pub struct PairingReservation {
     guard: PairingGuard,
+    /// The slot the code was reserved from, and is restored to on drop.
+    slot: CodeSlot,
     code: String,
     /// Preserved so restoring the code on a failed issuance does not reset its
     /// lifetime.
@@ -384,7 +404,7 @@ impl PairingReservation {
     /// Commit the reservation, consuming the one-time code and storing the token.
     pub fn commit(mut self) -> String {
         let token = self.token.clone();
-        self.guard.paired_tokens.lock().insert(hash_token(&token));
+        self.guard.paired_tokens.write().insert(hash_token(&token));
         self.committed = true;
         token
     }
@@ -395,10 +415,62 @@ impl Drop for PairingReservation {
         if self.committed {
             return;
         }
-        let mut slot = self.guard.pairing_code.lock();
+        let mut slot = self.guard.code_slot(self.slot).lock();
         if slot.is_none() {
             *slot = Some(PendingCode::restored(self.code.clone(), self.minted_at));
         }
+    }
+}
+
+/// Which pending-code slot of a [`PairingGuard`] a code lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeSlot {
+    /// Gateway pairing code: pairs a bearer at `/pair`, and may also enroll.
+    Pairing,
+    /// Certificate-enrollment code: enrolls only.
+    Enrollment,
+}
+
+/// What redeeming a code is for, which decides the slots it may match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedemptionScope {
+    /// Establishes a bearer principal (`/pair`, channel pairing): only a
+    /// gateway pairing code qualifies.
+    Principal,
+    /// Authorizes one certificate issuance: an enrollment code, or a gateway
+    /// pairing code (already a principal credential, so enrolling with it
+    /// grants nothing new).
+    Enrollment,
+}
+
+impl RedemptionScope {
+    fn slots(self) -> &'static [CodeSlot] {
+        match self {
+            Self::Principal => &[CodeSlot::Pairing],
+            Self::Enrollment => &[CodeSlot::Enrollment, CodeSlot::Pairing],
+        }
+    }
+}
+
+/// A reserved code for one certificate enrollment.
+///
+/// Unlike [`PairingReservation`] it cannot be committed: enrollment proves
+/// possession of the code but pairs no bearer token, so nothing is added to
+/// (or later persisted from) the paired-token set. Dropping it without
+/// [`Self::consume`] restores the code, exactly as for a pairing reservation.
+#[derive(Debug)]
+pub struct EnrollmentReservation(PairingReservation);
+
+impl EnrollmentReservation {
+    /// An opaque, unguessable id for this issuance, for audit correlation.
+    /// It is not a credential and nothing authenticates against it.
+    pub fn issuance_id(&self) -> String {
+        self.0.token_hash()
+    }
+
+    /// Consume the one-time code. No token is paired.
+    pub fn consume(mut self) {
+        self.0.committed = true;
     }
 }
 
@@ -434,7 +506,8 @@ impl PairingGuard {
         Self {
             require_pairing,
             pairing_code: Arc::new(Mutex::new(code)),
-            paired_tokens: Arc::new(Mutex::new(tokens)),
+            enrollment_code: Arc::new(Mutex::new(None)),
+            paired_tokens: Arc::new(RwLock::new(tokens)),
             failed_attempts: Arc::new(Mutex::new((HashMap::new(), Instant::now()))),
             admin_token: Arc::new(Mutex::new(None)),
         }
@@ -483,6 +556,19 @@ impl PairingGuard {
         }
     }
 
+    /// Test-only: rewind the enrollment code's mint time, as
+    /// [`Self::age_pairing_code`] does for the gateway code.
+    #[cfg(test)]
+    fn age_enrollment_code(&self, by: Duration) {
+        let mut slot = self.enrollment_code.lock();
+        if let Some(pending) = slot.as_mut() {
+            pending.minted_at = pending
+                .minted_at
+                .checked_sub(by)
+                .expect("test rewind must stay within Instant range");
+        }
+    }
+
     /// Whether pairing is required at all.
     pub fn require_pairing(&self) -> bool {
         self.require_pairing
@@ -492,6 +578,7 @@ impl PairingGuard {
         &self,
         code: &str,
         client_id: &str,
+        scope: RedemptionScope,
     ) -> Result<Option<PairingReservation>, u64> {
         let client_id = normalize_client_key(client_id);
         let now = Instant::now();
@@ -520,7 +607,7 @@ impl PairingGuard {
             }
         }
 
-        if let Some(reservation) = self.try_reserve_code(code) {
+        if let Some(reservation) = self.try_reserve_code(code, scope) {
             // Reset failed attempts for this client on success
             let mut guard = self.failed_attempts.lock();
             guard.0.remove(&client_id);
@@ -566,7 +653,7 @@ impl PairingGuard {
 
     fn try_pair_blocking(&self, code: &str, client_id: &str) -> Result<Option<String>, u64> {
         Ok(self
-            .reserve_pair_blocking(code, client_id)?
+            .reserve_pair_blocking(code, client_id, RedemptionScope::Principal)?
             .map(PairingReservation::commit))
     }
 
@@ -574,42 +661,83 @@ impl PairingGuard {
     /// restores the code on drop unless `commit()` is called.
     /// Constant-time code check + reservation, with NO lockout bookkeeping.
     /// The shared core of the keyed and unkeyed paths.
-    fn try_reserve_code(&self, code: &str) -> Option<PairingReservation> {
-        let mut pairing_code = self.pairing_code.lock();
-        // An expired code is cleared here, not merely ignored, so it cannot be
-        // redeemed later and does not linger in memory.
-        let pending = take_live(&mut pairing_code)?;
-        if constant_time_eq(code.trim(), pending.code.trim()) {
-            let reservation = PairingReservation {
-                guard: self.clone(),
-                code: pending.code.clone(),
-                minted_at: pending.minted_at,
-                token: generate_token(),
-                committed: false,
+    fn try_reserve_code(&self, code: &str, scope: RedemptionScope) -> Option<PairingReservation> {
+        // Slots are locked one at a time, never nested, so no lock order
+        // exists to get wrong.
+        for &slot in scope.slots() {
+            let mut pending_code = self.code_slot(slot).lock();
+            // An expired code is cleared here, not merely ignored, so it
+            // cannot be redeemed later and does not linger in memory.
+            let Some(pending) = take_live(&mut pending_code) else {
+                continue;
             };
-            // Reserve the pairing code so concurrent requests cannot both
-            // issue, but restore it on drop if issuance fails before commit.
-            *pairing_code = None;
-            return Some(reservation);
+            if constant_time_eq(code.trim(), pending.code.trim()) {
+                let reservation = PairingReservation {
+                    guard: self.clone(),
+                    slot,
+                    code: pending.code.clone(),
+                    minted_at: pending.minted_at,
+                    token: generate_token(),
+                    committed: false,
+                };
+                // Reserve the code so concurrent requests cannot both issue,
+                // but restore it on drop if issuance fails before commit.
+                *pending_code = None;
+                return Some(reservation);
+            }
         }
         None
     }
 
-    /// Code check WITHOUT per-client lockout accounting, for callers whose
-    /// peers all share one network identity and which apply their own
-    /// class-wide rate policy instead. The relay enrollment bridge is the
-    /// canonical case: every relay-routed client reaches the daemon from
+    fn code_slot(&self, slot: CodeSlot) -> &Mutex<Option<PendingCode>> {
+        match slot {
+            CodeSlot::Pairing => &self.pairing_code,
+            CodeSlot::Enrollment => &self.enrollment_code,
+        }
+    }
+
+    /// Reserve a live code for certificate enrollment, with per-client lockout.
+    ///
+    /// Matches the enrollment code or the gateway pairing code. The enrollment
+    /// code exists even when gateway pairing is disabled, because enrollment
+    /// always requires a code. The returned reservation can only be consumed,
+    /// never committed: issuing a certificate establishes no bearer principal.
+    pub async fn reserve_enrollment(
+        &self,
+        code: &str,
+        client_id: &str,
+    ) -> Result<Option<EnrollmentReservation>, u64> {
+        let this = self.clone();
+        let code = code.to_string();
+        let client_id = client_id.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            this.reserve_pair_blocking(&code, &client_id, RedemptionScope::Enrollment)
+        });
+
+        Ok(handle
+            .await
+            .expect("failed to spawn blocking task this should not happen")?
+            .map(EnrollmentReservation))
+    }
+
+    /// [`Self::reserve_enrollment`] WITHOUT per-client lockout accounting, for
+    /// callers whose peers all share one network identity and which apply
+    /// their own class-wide rate policy instead. The relay enrollment bridge is
+    /// the canonical case: every relay-routed client reaches the daemon from
     /// loopback, so keying lockout on the peer address would let five wrong
     /// codes from ONE hostile client lock out EVERY relay-routed enrollee
     /// (shared-fate lockout). Never expose this to a caller that has a real
-    /// per-client identity - use [`PairingGuard::reserve_pair`] there.
-    pub async fn reserve_pair_unkeyed(&self, code: &str) -> Option<PairingReservation> {
+    /// per-client identity - use [`Self::reserve_enrollment`] there.
+    pub async fn reserve_enrollment_unkeyed(&self, code: &str) -> Option<EnrollmentReservation> {
         let this = self.clone();
         let code = code.to_string();
-        let handle = tokio::task::spawn_blocking(move || this.try_reserve_code(&code));
+        let handle = tokio::task::spawn_blocking(move || {
+            this.try_reserve_code(&code, RedemptionScope::Enrollment)
+        });
         handle
             .await
             .expect("failed to spawn blocking task this should not happen")
+            .map(EnrollmentReservation)
     }
 
     pub async fn reserve_pair(
@@ -620,8 +748,9 @@ impl PairingGuard {
         let this = self.clone();
         let code = code.to_string();
         let client_id = client_id.to_string();
-        let handle =
-            tokio::task::spawn_blocking(move || this.reserve_pair_blocking(&code, &client_id));
+        let handle = tokio::task::spawn_blocking(move || {
+            this.reserve_pair_blocking(&code, &client_id, RedemptionScope::Principal)
+        });
 
         handle
             .await
@@ -649,7 +778,7 @@ impl PairingGuard {
             return true;
         }
         let hashed = hash_token(token);
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         tokens.contains(&hashed)
     }
 
@@ -661,42 +790,65 @@ impl PairingGuard {
     /// so an empty token set denies everything.
     pub fn token_is_paired(&self, token: &str) -> bool {
         let hashed = hash_token(token);
-        self.paired_tokens.lock().contains(&hashed)
+        self.paired_tokens.read().contains(&hashed)
     }
 
     /// Strict membership check by pre-computed SHA-256 hash (see
     /// [`Self::token_is_paired`]). Lets an established connection re-check
     /// liveness of its pairing without retaining the bearer itself.
     pub fn token_hash_is_paired(&self, token_hash: &str) -> bool {
-        self.paired_tokens.lock().contains(token_hash)
+        self.paired_tokens.read().contains(token_hash)
+    }
+
+    /// Hold the paired-token set still: no token can be paired or revoked
+    /// until the returned guard is dropped, while other readers proceed.
+    ///
+    /// For a caller that must keep a liveness decision true through the
+    /// effect it guards. Keep the hold short, and do not call this guard's
+    /// other methods while holding it: a pairing or revocation queued behind
+    /// the hold makes a second read on the same thread wait forever.
+    pub fn hold_paired_tokens(&self) -> HeldPairedTokens<'_> {
+        HeldPairedTokens(self.paired_tokens.read())
+    }
+
+    /// Whether a pairing or revocation has claimed the paired-token set and
+    /// is waiting behind a reader that still holds it (see
+    /// [`Self::hold_paired_tokens`]). False once no reader holds it, whether
+    /// the writer is then running, finished, or never came. A diagnostic for
+    /// tests that must observe a writer queued behind a hold; it keeps no
+    /// lock.
+    #[doc(hidden)]
+    pub fn token_write_queued_behind_a_hold(&self) -> bool {
+        self.paired_tokens.is_locked_exclusive()
+            && self.paired_tokens.try_read_recursive().is_some()
     }
 
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         !tokens.is_empty()
     }
 
     /// Get all paired token hashes (for persisting to config).
     pub fn tokens(&self) -> Vec<String> {
-        let tokens = self.paired_tokens.lock();
+        let tokens = self.paired_tokens.read();
         tokens.iter().cloned().collect()
     }
 
     pub fn revoke_token(&self, token: &str) -> bool {
         let hashed = hash_token(token);
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         tokens.remove(&hashed)
     }
 
     /// Revoke a paired token by its SHA-256 hash. Returns true if removed.
     pub fn revoke_token_hash(&self, token_hash: &str) -> bool {
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         tokens.remove(token_hash)
     }
 
     pub fn revoke_all_tokens(&self) -> usize {
-        let mut tokens = self.paired_tokens.lock();
+        let mut tokens = self.paired_tokens.write();
         let count = tokens.len();
         tokens.clear();
         count
@@ -739,6 +891,30 @@ impl PairingGuard {
         let new_code = code_policy.generate();
         *slot = Some(PendingCode::new(new_code.clone()));
         Ok(new_code)
+    }
+
+    /// The live enrollment code, or a freshly minted one when none is live.
+    ///
+    /// This is the code the daemon advertises for certificate enrollment at
+    /// startup. It never reuses or replaces the gateway pairing code, and it
+    /// is minted even when gateway pairing is disabled, because enrollment
+    /// always requires a code. It cannot pair a bearer at `/pair`.
+    pub fn enrollment_code(&self, code_policy: PairingCodePolicy) -> String {
+        let mut slot = self.enrollment_code.lock();
+        if let Some(pending) = take_live(&mut slot) {
+            return pending.code;
+        }
+        let new_code = code_policy.generate();
+        *slot = Some(PendingCode::new(new_code.clone()));
+        new_code
+    }
+
+    /// Replace the enrollment code with a fresh one. The gateway pairing code
+    /// is left untouched.
+    pub fn mint_enrollment_code(&self, code_policy: PairingCodePolicy) -> String {
+        let new_code = code_policy.generate();
+        *self.enrollment_code.lock() = Some(PendingCode::new(new_code.clone()));
+        new_code
     }
 
     /// Get the token hash for a given plaintext token (for device registry lookup).
@@ -1892,6 +2068,173 @@ mod tests {
             .generate_pairing_code_if_vacant(PairingCodePolicy::default())
             .unwrap_err();
         assert_eq!(err, GeneratePairingCodeError::PairingDisabled);
+    }
+
+    // ── Certificate enrollment on the shared authority ───────
+    //
+    // Enrollment and gateway pairing share one guard (policy, TTL, lockout)
+    // but not one code: an enrollment code issues a certificate and nothing
+    // else, so a party that observed it (the relay-terminated frontdoor, a
+    // leaked link) cannot turn it into a bearer at `/pair`. A gateway code,
+    // already a principal credential, may also enroll.
+
+    #[test]
+    async fn an_enrollment_code_enrolls_without_pairing_a_token() {
+        let guard = new_guard(true, &[]);
+        let code = guard.enrollment_code(PairingCodePolicy::default());
+        let reservation = guard
+            .reserve_enrollment(&code, "198.51.100.7")
+            .await
+            .unwrap()
+            .expect("the live enrollment code must reserve");
+        assert_eq!(reservation.issuance_id().len(), 64);
+        reservation.consume();
+        assert!(
+            guard.reserve_enrollment_unkeyed(&code).await.is_none(),
+            "the code is one-time"
+        );
+        assert!(
+            !guard.is_paired(),
+            "enrollment must not pair a bearer token nobody holds"
+        );
+        assert!(guard.tokens().is_empty());
+    }
+
+    #[test]
+    async fn an_enrollment_code_is_refused_at_pair_and_survives_the_attempt() {
+        let guard = new_guard(true, &[]);
+        let code = guard.enrollment_code(PairingCodePolicy::default());
+        assert_eq!(guard.try_pair(&code, "198.51.100.7").await.unwrap(), None);
+        assert!(
+            guard
+                .reserve_pair(&code, "198.51.100.8")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        guard
+            .reserve_enrollment(&code, "198.51.100.9")
+            .await
+            .unwrap()
+            .expect("a refused /pair attempt must not burn the enrollment code")
+            .consume();
+        assert!(guard.tokens().is_empty());
+    }
+
+    #[test]
+    async fn a_gateway_code_enrolls_and_is_consumed_without_pairing() {
+        let guard = new_guard(true, &["zc_existing".into()]);
+        let code = guard
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("pairing is required");
+        guard
+            .reserve_enrollment(&code, "198.51.100.7")
+            .await
+            .unwrap()
+            .expect("an unbound gateway code may enroll")
+            .consume();
+        assert!(guard.pairing_code().is_none(), "the gateway code is spent");
+        assert_eq!(guard.tokens().len(), 1, "no token was paired");
+    }
+
+    #[test]
+    async fn dropped_enrollment_reservations_restore_the_code_to_its_own_slot() {
+        let guard = new_guard(true, &[]);
+        let gateway = guard.pairing_code().expect("startup code");
+        let enrollment = guard.enrollment_code(PairingCodePolicy::default());
+
+        drop(guard.reserve_enrollment_unkeyed(&enrollment).await.unwrap());
+        drop(guard.reserve_enrollment_unkeyed(&gateway).await.unwrap());
+
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(gateway.as_str()),
+            "the gateway code is restored to the gateway slot"
+        );
+        assert_eq!(
+            guard.enrollment_code(PairingCodePolicy::default()),
+            enrollment,
+            "the enrollment code is restored to the enrollment slot"
+        );
+        assert_eq!(
+            guard.try_pair(&enrollment, "198.51.100.7").await.unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    async fn enrollment_requires_a_code_even_when_gateway_pairing_is_disabled() {
+        let guard = new_guard(false, &[]);
+        assert!(guard.pairing_code().is_none());
+        let code = guard.enrollment_code(PairingCodePolicy::default());
+        assert_eq!(guard.try_pair(&code, "198.51.100.7").await.unwrap(), None);
+        guard
+            .reserve_enrollment(&code, "198.51.100.9")
+            .await
+            .unwrap()
+            .expect("enrollment always admits a live code")
+            .consume();
+        assert!(guard.tokens().is_empty());
+    }
+
+    #[test]
+    async fn enrollment_code_reuses_the_live_enrollment_code_only() {
+        let guard = new_guard(true, &[]);
+        let gateway = guard.pairing_code().expect("startup code");
+        let first = guard.enrollment_code(PairingCodePolicy::default());
+        assert_ne!(
+            first, gateway,
+            "the gateway code is not advertised for enrollment"
+        );
+        assert_eq!(guard.enrollment_code(PairingCodePolicy::default()), first);
+        assert_eq!(guard.pairing_code().as_deref(), Some(gateway.as_str()));
+    }
+
+    #[test]
+    async fn mint_enrollment_code_replaces_only_the_enrollment_code() {
+        let guard = new_guard(true, &[]);
+        let gateway = guard.pairing_code().expect("startup code");
+        let first = guard.mint_enrollment_code(PairingCodePolicy::default());
+        let second = guard.mint_enrollment_code(PairingCodePolicy::default());
+        assert_ne!(first, second);
+        assert!(guard.reserve_enrollment_unkeyed(&first).await.is_none());
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(gateway.as_str()),
+            "minting an enrollment code must not cancel a pending gateway code"
+        );
+        guard
+            .reserve_enrollment_unkeyed(&second)
+            .await
+            .expect("the newest enrollment code is live")
+            .consume();
+    }
+
+    #[test]
+    async fn generating_a_gateway_code_does_not_cancel_the_enrollment_code() {
+        let guard = new_guard(true, &["zc_existing".into()]);
+        let enrollment = guard.mint_enrollment_code(PairingCodePolicy::default());
+        guard
+            .generate_new_pairing_code(PairingCodePolicy::default())
+            .expect("pairing is required");
+        guard
+            .reserve_enrollment_unkeyed(&enrollment)
+            .await
+            .expect("the enrollment code survives a gateway mint")
+            .consume();
+    }
+
+    #[test]
+    async fn an_expired_enrollment_code_is_refused_and_cleared() {
+        let guard = new_guard(true, &[]);
+        let code = guard.enrollment_code(PairingCodePolicy::default());
+        guard.age_enrollment_code(PAIRING_CODE_TTL);
+        assert!(guard.reserve_enrollment_unkeyed(&code).await.is_none());
+        assert_ne!(
+            guard.enrollment_code(PairingCodePolicy::default()),
+            code,
+            "an expired code is cleared, so a fresh one is minted"
+        );
     }
 
     // ── One shared policy across every issuing path ──────────

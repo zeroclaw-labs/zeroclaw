@@ -13,6 +13,13 @@ use tokio::process::Command;
 /// environment without propagating variables that are irrelevant to the host
 /// platform.
 #[cfg(not(target_os = "windows"))]
+#[cfg(any(
+    test,
+    feature = "tool-claude-code",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+))]
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
@@ -20,6 +27,13 @@ const SAFE_ENV_VARS: &[&str] = &[
 /// Windows process-startup variables plus the profile locations where coding
 /// CLIs discover authentication and user configuration.
 #[cfg(target_os = "windows")]
+#[cfg(any(
+    test,
+    feature = "tool-claude-code",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+))]
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH",
     "PATHEXT",
@@ -240,6 +254,12 @@ pub fn add_safe_env(command: &mut CodingCliCommand, safe_vars: &[&str], passthro
 
 /// Add the canonical base environment plus operator-configured passthrough
 /// variables to a coding CLI command.
+#[cfg(any(
+    feature = "tool-claude-code",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+))]
 pub(crate) fn add_coding_cli_env(command: &mut CodingCliCommand, passthrough: &[String]) {
     add_safe_env(command, SAFE_ENV_VARS, passthrough);
 }
@@ -247,36 +267,6 @@ pub(crate) fn add_coding_cli_env(command: &mut CodingCliCommand, passthrough: &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude_code::ClaudeCodeTool;
-    use crate::codex_cli::CodexCliTool;
-    use crate::gemini_cli::GeminiCliTool;
-    use crate::opencode_cli::OpenCodeCliTool;
-    use std::sync::Mutex;
-    use zeroclaw_api::tool::Tool;
-    use zeroclaw_config::autonomy::AutonomyLevel;
-    use zeroclaw_config::policy::SecurityPolicy;
-    use zeroclaw_config::schema::{
-        ClaudeCodeConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
-    };
-
-    #[derive(Default)]
-    struct RecordingExecutor {
-        commands: Mutex<Vec<CodingCliCommand>>,
-    }
-
-    #[async_trait]
-    impl CodingCliExecutor for RecordingExecutor {
-        async fn output(
-            &self,
-            command: CodingCliCommand,
-        ) -> Result<Output, CodingCliExecutionError> {
-            self.commands
-                .lock()
-                .expect("recorded command lock should not be poisoned")
-                .push(command);
-            Err(CodingCliExecutionError::Timeout)
-        }
-    }
 
     #[test]
     fn host_native_windows_program_preserves_known_cli_shims() {
@@ -380,109 +370,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn every_adapter_applies_the_canonical_environment_boundary() {
-        let workspace = tempfile::tempdir().expect("temporary workspace");
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            workspace_dir: workspace.path().to_path_buf(),
-            ..SecurityPolicy::default()
-        });
-        let recorder = Arc::new(RecordingExecutor::default());
-        let passthrough_key = if cfg!(target_os = "windows") {
-            "PROCESSOR_ARCHITECTURE"
-        } else {
-            "PWD"
-        };
-        assert!(
-            std::env::var_os(passthrough_key).is_some(),
-            "test process should define {passthrough_key}"
-        );
-        let passthrough = vec![passthrough_key.to_string()];
-        let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(ClaudeCodeTool::new_with_executor(
-                security.clone(),
-                ClaudeCodeConfig {
-                    env_passthrough: passthrough.clone(),
-                    ..ClaudeCodeConfig::default()
-                },
-                recorder.clone(),
-            )),
-            Box::new(CodexCliTool::new_with_executor(
-                security.clone(),
-                CodexCliConfig {
-                    env_passthrough: passthrough.clone(),
-                    ..CodexCliConfig::default()
-                },
-                recorder.clone(),
-            )),
-            Box::new(GeminiCliTool::new_with_executor(
-                security.clone(),
-                GeminiCliConfig {
-                    env_passthrough: passthrough.clone(),
-                    ..GeminiCliConfig::default()
-                },
-                recorder.clone(),
-            )),
-            Box::new(OpenCodeCliTool::new_with_executor(
-                security,
-                OpenCodeCliConfig {
-                    env_passthrough: passthrough,
-                    ..OpenCodeCliConfig::default()
-                },
-                recorder.clone(),
-            )),
-        ];
-        for tool in tools {
-            tool.execute(serde_json::json!({"prompt": "environment probe"}))
-                .await
-                .unwrap_or_else(|error| panic!("{} adapter failed: {error}", tool.name()));
-        }
-
-        let commands = std::mem::take(
-            &mut *recorder
-                .commands
-                .lock()
-                .expect("recorded command lock should not be poisoned"),
-        );
-        assert_eq!(
-            commands
-                .iter()
-                .map(|command| command.program.clone())
-                .collect::<Vec<_>>(),
-            ["claude", "codex", "gemini", "opencode"]
-                .map(OsString::from)
-                .to_vec()
-        );
-
-        // Compare names only so assertion failures cannot expose host paths.
-        let mut expected_env_keys = SAFE_ENV_VARS
-            .iter()
-            .filter(|key| std::env::var_os(**key).is_some())
-            .map(|key| OsString::from(*key))
-            .collect::<std::collections::BTreeSet<_>>();
-        expected_env_keys.insert(OsString::from(passthrough_key));
-
-        for command in commands {
-            assert_eq!(
-                command
-                    .env
-                    .iter()
-                    .map(|(key, _)| key.clone())
-                    .collect::<std::collections::BTreeSet<_>>(),
-                expected_env_keys,
-                "{} must use the canonical coding CLI environment",
-                command.program.to_string_lossy()
-            );
-            assert_eq!(
-                command.runtime_env_keys,
-                vec![OsString::from(passthrough_key)],
-                "{} must keep configured passthrough explicit at runtime boundaries",
-                command.program.to_string_lossy()
-            );
-        }
-    }
-
+    #[cfg(any(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn direct_executor_runs_windows_child_with_only_allowlisted_environment() {
@@ -589,5 +482,149 @@ mod tests {
             ],
             "coding CLI subprocess inheritance must remain an explicit security allowlist"
         );
+    }
+
+    /// The adapter tests need all four coding-CLI tools compiled in.
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
+    mod adapters {
+        use super::*;
+        use crate::claude_code::ClaudeCodeTool;
+        use crate::codex_cli::CodexCliTool;
+        use crate::gemini_cli::GeminiCliTool;
+        use crate::opencode_cli::OpenCodeCliTool;
+        use std::sync::Mutex;
+        use zeroclaw_api::tool::Tool;
+        use zeroclaw_config::autonomy::AutonomyLevel;
+        use zeroclaw_config::policy::SecurityPolicy;
+        use zeroclaw_config::schema::{
+            ClaudeCodeConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
+        };
+
+        #[derive(Default)]
+        struct RecordingExecutor {
+            commands: Mutex<Vec<CodingCliCommand>>,
+        }
+
+        #[async_trait]
+        impl CodingCliExecutor for RecordingExecutor {
+            async fn output(
+                &self,
+                command: CodingCliCommand,
+            ) -> Result<Output, CodingCliExecutionError> {
+                self.commands
+                    .lock()
+                    .expect("recorded command lock should not be poisoned")
+                    .push(command);
+                Err(CodingCliExecutionError::Timeout)
+            }
+        }
+
+        #[tokio::test]
+        async fn every_adapter_applies_the_canonical_environment_boundary() {
+            let workspace = tempfile::tempdir().expect("temporary workspace");
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: workspace.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            });
+            let recorder = Arc::new(RecordingExecutor::default());
+            let passthrough_key = if cfg!(target_os = "windows") {
+                "PROCESSOR_ARCHITECTURE"
+            } else {
+                "PWD"
+            };
+            assert!(
+                std::env::var_os(passthrough_key).is_some(),
+                "test process should define {passthrough_key}"
+            );
+            let passthrough = vec![passthrough_key.to_string()];
+            let tools: Vec<Box<dyn Tool>> = vec![
+                Box::new(ClaudeCodeTool::new_with_executor(
+                    security.clone(),
+                    ClaudeCodeConfig {
+                        env_passthrough: passthrough.clone(),
+                        ..ClaudeCodeConfig::default()
+                    },
+                    recorder.clone(),
+                )),
+                Box::new(CodexCliTool::new_with_executor(
+                    security.clone(),
+                    CodexCliConfig {
+                        env_passthrough: passthrough.clone(),
+                        ..CodexCliConfig::default()
+                    },
+                    recorder.clone(),
+                )),
+                Box::new(GeminiCliTool::new_with_executor(
+                    security.clone(),
+                    GeminiCliConfig {
+                        env_passthrough: passthrough.clone(),
+                        ..GeminiCliConfig::default()
+                    },
+                    recorder.clone(),
+                )),
+                Box::new(OpenCodeCliTool::new_with_executor(
+                    security,
+                    OpenCodeCliConfig {
+                        env_passthrough: passthrough,
+                        ..OpenCodeCliConfig::default()
+                    },
+                    recorder.clone(),
+                )),
+            ];
+            for tool in tools {
+                tool.execute(serde_json::json!({"prompt": "environment probe"}))
+                    .await
+                    .unwrap_or_else(|error| panic!("{} adapter failed: {error}", tool.name()));
+            }
+
+            let commands = std::mem::take(
+                &mut *recorder
+                    .commands
+                    .lock()
+                    .expect("recorded command lock should not be poisoned"),
+            );
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(|command| command.program.clone())
+                    .collect::<Vec<_>>(),
+                ["claude", "codex", "gemini", "opencode"]
+                    .map(OsString::from)
+                    .to_vec()
+            );
+
+            // Compare names only so assertion failures cannot expose host paths.
+            let mut expected_env_keys = SAFE_ENV_VARS
+                .iter()
+                .filter(|key| std::env::var_os(**key).is_some())
+                .map(|key| OsString::from(*key))
+                .collect::<std::collections::BTreeSet<_>>();
+            expected_env_keys.insert(OsString::from(passthrough_key));
+
+            for command in commands {
+                assert_eq!(
+                    command
+                        .env
+                        .iter()
+                        .map(|(key, _)| key.clone())
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    expected_env_keys,
+                    "{} must use the canonical coding CLI environment",
+                    command.program.to_string_lossy()
+                );
+                assert_eq!(
+                    command.runtime_env_keys,
+                    vec![OsString::from(passthrough_key)],
+                    "{} must keep configured passthrough explicit at runtime boundaries",
+                    command.program.to_string_lossy()
+                );
+            }
+        }
     }
 }

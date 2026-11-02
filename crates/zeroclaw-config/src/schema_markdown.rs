@@ -249,7 +249,12 @@ pub fn field_table(
         }
         let resolved = resolve(prop_schema, defs);
         let is_secret = resolved.get("x-secret").and_then(Value::as_bool) == Some(true);
-        let ty = if is_secret {
+        // A secret `HashMap<String, String>` (MCP `env`/`headers`, …) is set
+        // one entry at a time; the bare map path is not settable.
+        let is_secret_map = is_secret && is_object_schema(resolved);
+        let ty = if is_secret_map {
+            "secret map".to_owned()
+        } else if is_secret {
             "secret".to_owned()
         } else {
             type_label(resolved, defs)
@@ -263,7 +268,12 @@ pub fn field_table(
         };
         let secret_mark = if is_secret { " 🔑" } else { "" };
         let full_path = format!("{prefix}.{key}");
-        let set_cmd = if is_secret {
+        let set_cmd = if is_secret_map {
+            format!(
+                "zeroclaw config set {full_path}.<KEY>    # masked input, stored encrypted\n\
+                 zeroclaw config set {full_path}.<KEY> \"\"    # empty value removes the entry"
+            )
+        } else if is_secret {
             format!("zeroclaw config set {full_path}    # masked input, stored encrypted")
         } else {
             format!("zeroclaw config set {full_path} <value>")
@@ -311,6 +321,16 @@ pub fn field_table(
     }
 
     format!("<div class=\"cfg-fields\">\n\n{rows}</div>\n")
+}
+
+/// Whether a resolved property schema describes a JSON object (a map), for
+/// both `"type": "object"` and nullable `"type": ["object", "null"]`.
+fn is_object_schema(resolved: &Value) -> bool {
+    match resolved.get("type") {
+        Some(Value::String(t)) => t == "object",
+        Some(Value::Array(types)) => types.iter().any(|t| t == "object"),
+        _ => false,
+    }
 }
 
 /// Plain Markdown field table (no accordion), used when no config prefix is
@@ -852,6 +872,23 @@ mod tests {
                 "mcp.servers field table missing `{field}`"
             );
         }
+    }
+
+    #[test]
+    fn secret_map_fields_document_per_entry_set_commands() {
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let table = field_table_for_path(&schema.to_value(), "mcp.servers", false, None)
+            .expect("mcp.servers should resolve to its entry struct fields");
+        assert!(table.contains("<code>secret map</code>"), "{table}");
+        assert!(
+            table.contains("zeroclaw config set mcp.servers.env.&lt;KEY&gt;")
+                || table.contains("zeroclaw config set mcp.servers.env.<KEY>"),
+            "env must document the per-entry set command"
+        );
+        assert!(
+            !table.contains("zeroclaw config set mcp.servers.env    #"),
+            "the bare map path is not settable and must not be documented"
+        );
     }
 
     #[test]

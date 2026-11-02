@@ -32,7 +32,10 @@ deny = []
 # publicly bound with open, tokenless admission. For any real deployment,
 # delete this line and set relay_token or mode = "allowlist".
 allow_public_open = true
-# Optional shared-secret gate a daemon must present in its Hello.
+# Optional shared-secret gate a daemon must present in its Hello. It is checked
+# before the allow list, in every mode. Leave it unset on an allowlist relay
+# that serves daemons enrolled with `zeroclaw relay claim`: a claim does not
+# deliver this token, so those daemons would be refused.
 # relay_token = "change-me"
 # Outer-mTLS variant (additive admission on the OUTER TLS; the inner mTLS is
 # unaffected). "off" (default), "optional", or "required"; when on, outer_client_ca

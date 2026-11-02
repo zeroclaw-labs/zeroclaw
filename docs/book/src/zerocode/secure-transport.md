@@ -106,8 +106,15 @@ its console/log on start. The code is **single-use and expires 10 minutes after
 it is minted** - it is the only bearer credential for certificate issuance, and
 it lands in consoles and logs, so a copied code must stop working shortly after
 the operator has used it. An expired code is refused and cleared; mint a
-replacement from the gateway's pairing API when you need a fresh one. Then, on
-the workstation:
+replacement with `zeroclaw security enroll-paircode --new`.
+
+This **enrollment code** issues a certificate and nothing else: `POST /pair`
+refuses it, so a party that sees it cannot turn it into a bearer token. It is
+separate from the gateway's pairing code, and minting either one leaves the
+other pending. Enrollment always requires a code, even when
+`[gateway].require_pairing` is off. A gateway pairing code is also accepted by
+`POST /enroll`, once: enrolling with it spends it, so it can no longer pair.
+Then, on the workstation:
 
 ```sh
 # Interactive: a certless client auto-enrolls on first connect.
@@ -134,8 +141,9 @@ auto-renews at ~50% of its lifetime (~15 days) over the live mTLS session; a
 revoked cert cannot self-renew.
 
 Enrollment issues a certificate only, not a bearer token. Before the daemon
-accepts a session, pair with the gateway for a `zc_...` token and give it to
-zerocode via `ZEROCLAW_AUTH_TOKEN`, `auth_token_file`, or `auth_token` (see
+accepts a session, pair with the gateway for a `zc_...` token using a gateway
+pairing code (`zeroclaw gateway get-paircode --new`), not the enrollment code,
+and give it to zerocode via `ZEROCLAW_AUTH_TOKEN`, `auth_token_file`, or `auth_token` (see
 [Bearer token](./remote.md#bearer-token-required-for-every-connection)). With the
 token in place, `zerocode --connect wss://<remote-host>:9781` (or just `zerocode`
 if `uri` is in config) needs no more flags.
@@ -231,7 +239,9 @@ mode = "open"
 allow = []
 deny  = []
 # A public (non-loopback) relay MUST gate registration: set a shared secret here
-# (each daemon presents it via [relay] relay_token) or use mode = "allowlist".
+# (each daemon presents it via [relay] token) or use mode = "allowlist".
+# A relay that serves daemons enrolled with `zeroclaw relay claim` must use
+# mode = "allowlist" and leave relay_token unset (see 2d).
 # Otherwise an OPEN, tokenless relay on a public bind refuses to start, because
 # any daemon on the internet could register and squat unclaimed node-ids. (A
 # loopback bind for local development is exempt; a deliberate open public relay
@@ -270,6 +280,12 @@ control. `allowlist` mode keys on the daemon's registration pubkey fingerprint
 add fingerprints to `allow` (and reload with `kill -HUP <pid>`). A node-id is
 bound to its first registrant's pubkey, so a different key cannot hijack a live
 node-id (it gets `node_taken`).
+
+The relay checks `relay_token` before the allow list, in every mode. A relay that
+serves self-serve claims (2d) must therefore use `allowlist` with `relay_token`
+unset: a claim never delivers the shared token, so a claimed daemon would be
+refused with `forbidden: bad relay token`. The allow list already gates a public
+relay on its own, so the token adds nothing there.
 
 **Docker.** `apps/zerorelay/Dockerfile` runs distroless with
 `CMD ["--config", "/etc/zerorelay/relay.toml"]` and a shell-less
@@ -326,6 +342,44 @@ For a relay that authenticates daemons on the outer layer too, set the
 relay's `[admission].outer_client_auth = "required"` + `outer_client_ca`, and on
 the daemon `[relay].outer_client_cert` / `outer_client_key`. This is additive on
 the outer TLS and never touches the inner mTLS.
+
+### 2d. Self-serve enrollment with `zeroclaw relay claim`
+
+When the relay is run alongside a ZeroRelay control plane, an operator can enroll
+a daemon with a one-time claim token instead of editing the relay's allow list by
+hand. The control plane issues the token and prints the command to run on the
+daemon host:
+
+```sh
+zeroclaw relay claim <TOKEN> --control https://control.example.com
+```
+
+The daemon signs the claim with its existing registration key, so the fingerprint
+the control plane allow-lists is exactly the key the daemon registers with. On a
+verified success the control plane adds that fingerprint to the relay's allow
+list and reloads the relay, and the daemon writes `[relay]` `enabled`, `url`,
+`node_id`, and `relay_host`. Start or restart the daemon to register.
+
+Before claiming:
+
+- **The relay must admit by fingerprint alone.** Use `mode = "allowlist"` and
+  leave `relay_token` unset (see 2a). A claim does not deliver the shared token.
+- **Enable `[wss]`.** The relay refuses registration until the WSS listener is
+  enabled. A claim made without it is still saved, and takes effect on the next
+  start after `[wss]` is enabled.
+- **Configure trust for the relay's outer certificate first**, as in 2b
+  (`relay_ca_path`, `tofu`, or public roots). The claim writes only the four
+  fields above and leaves the rest of `[relay]` alone.
+- **Do not set the claim-managed fields through environment overrides.** If
+  `relay.enabled`, `relay.url`, `relay.node_id`, or `relay.relay_host` is
+  overridden, the claim refuses before sending anything, because the override
+  would discard the written values.
+
+`--control` must be `https`, or `http` on a loopback address. Redirects and
+proxies are disabled so the token cannot reach another origin. Every refusal says
+`no config was written`. A token is single-use: once the control plane accepts
+it, it is spent, even if the daemon then refuses the response (for example an
+unusable relay address). In that case, fix the cause and mint a new token.
 
 ---
 
@@ -439,7 +493,10 @@ the browsers that use it, in two distinct ways:
   performs it on the browser's behalf: it fetches the daemon CA, then makes the
   CA-pinned `POST /enroll` carrying the pairing code. **The relay sees the
   pairing code and the issued certificate, and could use an observed pairing
-  code to enrol a client of its own.**
+  code to enrol a client of its own.** Give the frontdoor an enrollment code
+  (`zeroclaw security enroll-paircode --new`): the gateway's `POST /pair`
+  refuses it. A gateway pairing code also enrolls here, but a relay that saw
+  one could pair a bearer token with it instead, if it can reach the gateway.
 
 What the relay does **not** get is the private key: the browser generates the
 keypair with WebCrypto and transmits only a CSR.
