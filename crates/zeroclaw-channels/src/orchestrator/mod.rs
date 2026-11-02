@@ -13224,6 +13224,7 @@ fn build_channel_by_id(
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_passive_group_context(tg.passive_group_context)
+                .with_voice_without_mention(tg.voice_without_mention)
                 .with_transcription_manager(
                     config.transcription.clone(),
                     resolved_transcription_manager(&config, &format!("telegram.{alias}")),
@@ -14805,6 +14806,7 @@ fn collect_configured_channels_with_authority(
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_passive_group_context(tg.passive_group_context)
+                    .with_voice_without_mention(tg.voice_without_mention)
                     .with_transcription_manager(
                         config.transcription.clone(),
                         resolved_transcription_manager(&config, &format!("telegram.{alias}")),
@@ -53530,6 +53532,7 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                voice_without_mention: false,
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
@@ -53563,6 +53566,7 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                voice_without_mention: false,
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
