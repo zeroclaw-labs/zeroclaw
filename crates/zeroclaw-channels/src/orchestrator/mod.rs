@@ -49798,7 +49798,7 @@ This is an example JSON object for profile settings."#;
             );
         }
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
@@ -49827,7 +49827,7 @@ This is an example JSON object for profile settings."#;
             );
         }
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
@@ -49851,7 +49851,7 @@ This is an example JSON object for profile settings."#;
             );
         }
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         assert_eq!(
             channels
