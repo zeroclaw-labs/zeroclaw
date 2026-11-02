@@ -2335,6 +2335,7 @@ allowed_users = ["user1"]
     ) -> zeroclaw_config::schema::TranscriptionConfig {
         zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
+            default_provider: None,
             api_key: None,
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "whisper-large-v3".to_string(),

@@ -9455,8 +9455,11 @@ async fn process_channel_message_body(
         // but typed providers are configured), fall back to an empty shell
         // so with_typed_providers() can still populate the registry.
         let transcription_manager = {
-            let base = crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
-                .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
+            let base = crate::transcription::TranscriptionManager::new(
+                &ctx.transcription_config,
+                ctx.transcription_config.default_provider.clone(),
+            )
+            .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
             let m = base
                 .with_typed_providers(&ctx.prompt_config.providers.transcription)
                 .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());

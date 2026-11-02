@@ -2813,6 +2813,7 @@ mod tests {
 
         let transcription_config = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
+            default_provider: None,
             api_key: None,
             api_url: String::new(),
             model: "whisper-1".to_string(),

@@ -2603,6 +2603,85 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
     }
 }
 
+fn fold_v2_transcription_into_providers(
+    passthrough: &mut toml::Table,
+    new_providers: &mut toml::Table,
+) {
+    let Some(toml::Value::Table(transcription_table)) = passthrough.get_mut("transcription") else {
+        return;
+    };
+
+    let mut transcription_aliased = toml::Table::new();
+
+    // Per-family sub-blocks: move to transcription_providers.<family>.default.
+    const V3_TRANSCRIPTION_FAMILIES: &[&str] = &[
+        "openai",
+        "deepgram",
+        "assemblyai",
+        "google",
+        "local_whisper",
+    ];
+    for family in V3_TRANSCRIPTION_FAMILIES {
+        if let Some(value) = transcription_table.remove(*family) {
+            let mut wrapped = toml::Table::new();
+            wrapped.insert("default".to_string(), value);
+            transcription_aliased.insert((*family).to_string(), toml::Value::Table(wrapped));
+        }
+    }
+
+    let mut groq_entry = toml::Table::new();
+    for groq_field in &["api_key", "api_url", "model", "language", "initial_prompt"] {
+        if let Some(v) = transcription_table.remove(*groq_field) {
+            groq_entry.insert((*groq_field).to_string(), v);
+        }
+    }
+    if !groq_entry.is_empty() {
+        let mut wrapped = toml::Table::new();
+        wrapped.insert("default".to_string(), toml::Value::Table(groq_entry));
+        transcription_aliased.insert("groq".to_string(), toml::Value::Table(wrapped));
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "[transcription] Groq fields promoted to [transcription_providers.groq.default]"
+        );
+    }
+
+    // Drop legacy default-provider keys that have no V3 field. Operators
+    // select transcription per agent (`agent.<X>.transcription_provider`) or
+    // via the deployment-wide `[transcription].default_provider`, which is a
+    // valid V3 key again вЂ” so it passes through untouched.
+    for legacy_default in &["default_model_provider", "default_transcription_provider"] {
+        if transcription_table.remove(*legacy_default).is_some() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"legacy_default": legacy_default})),
+                &format!(
+                    "[transcription].{legacy_default} dropped (V3 has no global default-provider; set agent.<X>.transcription_provider instead)"
+                )
+            );
+        }
+    }
+
+    if !transcription_aliased.is_empty() {
+        // Merge into existing providers.transcription if any (operator may
+        // have written V3-style entries already).
+        let providers_transcription = new_providers
+            .entry("transcription".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(existing) = providers_transcription.as_table_mut() {
+            for (family, value) in transcription_aliased {
+                existing.entry(family).or_insert(value);
+            }
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "[transcription.<family>] sub-blocks promoted to [transcription_providers.<family>.default]"
+        );
+    }
+}
+
 fn rename_route_provider_field(new_providers: &mut toml::Table, routes_key: &str) {
     let Some(toml::Value::Array(routes)) = new_providers.get_mut(routes_key) else {
         return;
