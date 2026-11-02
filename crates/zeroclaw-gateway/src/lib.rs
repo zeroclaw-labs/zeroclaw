@@ -623,11 +623,32 @@ fn auto_detect_web_dist_dir() -> Option<std::path::PathBuf> {
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        for candidate in xff.split(',') {
-            if let Some(ip) = parse_client_ip(candidate) {
+    // Appending proxies add the connecting peer at the right-hand end. Prefer
+    // that hop so a client-supplied leading entry cannot pick the rate-limit key.
+    // Skip loopback hops: a real client never arrives as loopback through a
+    // proxy, and a same-host proxy chain can append 127.0.0.1 while the real
+    // caller sits further left.
+    if let Some(xff) = headers.get("X-Forwarded-For") {
+        let mut rightmost_loopback = None;
+        // A proxy can append a valid address to a caller's opaque header
+        // bytes. Decode each hop separately so that prefix cannot hide the
+        // proxy's suffix and restore the loopback peer's limiter exemption.
+        for candidate in xff.as_bytes().rsplit(|byte| *byte == b',') {
+            if let Some(ip) = std::str::from_utf8(candidate)
+                .ok()
+                .and_then(parse_client_ip)
+            {
+                if ip.is_loopback() {
+                    if rightmost_loopback.is_none() {
+                        rightmost_loopback = Some(ip);
+                    }
+                    continue;
+                }
                 return Some(ip);
             }
+        }
+        if rightmost_loopback.is_some() {
+            return rightmost_loopback;
         }
     }
 
@@ -643,7 +664,20 @@ pub(crate) fn client_key_from_request(
     trust_forwarded_headers: bool,
 ) -> String {
     if trust_forwarded_headers && let Some(ip) = forwarded_client_ip(headers) {
-        return ip.to_string();
+        // A real loopback caller never arrives through a proxy with a
+        // forwarded header. Treat a loopback-only forwarded value as spoofed.
+        if !ip.is_loopback() {
+            return ip.to_string();
+        }
+        // Do not inherit a loopback peer exemption from a proxied path — that
+        // would let a remote caller behind a same-host proxy skip per-client
+        // limits. Prefer a non-loopback peer; otherwise a non-exempt sentinel.
+        if let Some(addr) = peer_addr {
+            if !addr.ip().is_loopback() {
+                return addr.ip().to_string();
+            }
+        }
+        return "unknown".to_string();
     }
 
     peer_addr
@@ -9112,11 +9146,69 @@ path = "{trigger_path}"
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Forwarded-For",
+            // Client-supplied leftmost entry, then the address the immediate
+            // proxy appended (rightmost).
             HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
         );
 
         let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "203.0.113.11");
+    }
+
+    #[test]
+    fn client_key_preserves_proxy_suffix_after_opaque_xff_prefix() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        for value in [
+            &b"\x80, 198.51.100.10"[..],
+            &b"\x80, 198.51.100.10, 127.0.0.1"[..],
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Forwarded-For", HeaderValue::from_bytes(value).unwrap());
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, true),
+                "198.51.100.10"
+            );
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, false),
+                "127.0.0.1"
+            );
+        }
+    }
+
+    #[test]
+    fn client_key_ignores_spoofed_loopback_forwarded_header() {
+        let peer = SocketAddr::from(([203, 0, 113, 50], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "203.0.113.50");
+    }
+
+    #[test]
+    fn client_key_skips_rightmost_loopback_for_earlier_xff_hop() {
+        // Same-host proxy chain: immediate hop appended loopback; the real
+        // caller remains further left. Must not fall back to a loopback peer
+        // (that would grant the local-only limiter exemption).
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            HeaderValue::from_static("198.51.100.10, 127.0.0.1"),
+        );
+
+        let key = client_key_from_request(Some(peer), &headers, true);
         assert_eq!(key, "198.51.100.10");
+    }
+
+    #[test]
+    fn client_key_loopback_only_xff_with_loopback_peer_is_non_exempt() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "unknown");
     }
 
     #[test]

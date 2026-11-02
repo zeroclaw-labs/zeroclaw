@@ -318,7 +318,18 @@ the store away from everyone else for the ten minutes those flows live. Loopback
 exempt from the per-client budgets, as they are from every other gateway
 auth limit, so a reverse proxy sitting on the same host must enable
 `trust_forwarded_headers` for the per-client limits to apply to the real
-callers behind it. Every enrollment response carries
+callers behind it. When that setting is on, the gateway takes the
+rightmost address from `X-Forwarded-For` (the hop the immediate proxy
+added) or else `X-Real-IP`. Configure the proxy to append or overwrite
+rather than forward a client-supplied list unchanged, for example nginx
+`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
+If you set only `X-Real-IP`, also clear the higher-priority list with
+`proxy_set_header X-Forwarded-For "";` together with
+`proxy_set_header X-Real-IP $remote_addr;`; otherwise a client-supplied
+`X-Forwarded-For` still wins. A forwarded loopback address is skipped so
+it cannot claim the local-only limiter exemption; when the chain is
+loopback-only the gateway uses a non-exempt key rather than the loopback
+peer. Every enrollment response carries
 `Cache-Control: no-store` and `Pragma: no-cache` on top of the gateway's
 `no-referrer` policy, because device codes and access tokens travel in
 those bodies.
