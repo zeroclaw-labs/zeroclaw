@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 use zeroclaw_api::session_keys::sanitize_session_key;
@@ -26,7 +27,24 @@ pub struct QdrantMemory {
     embedder: RwLock<Arc<dyn EmbeddingProvider>>,
     /// Tracks whether collection has been initialized (lazy init for sync factory).
     initialized: OnceCell<()>,
+    /// `[storage.qdrant.<alias>].hybrid`: create a missing collection with a
+    /// `bm25` sparse vector filled by Qdrant's server-side BM25 inference.
+    hybrid: bool,
+    /// The collection carries the `bm25` sparse vector (created that way, or
+    /// found with it). Only then are points written with it and recall run
+    /// as dense + BM25.
+    hybrid_active: AtomicBool,
+    /// `memory.vector_weight` / `memory.keyword_weight`, the same blend the
+    /// SQLite backend applies, so hybrid scores stay on its 0-1 scale.
+    vector_weight: f32,
+    keyword_weight: f32,
 }
+
+/// Sparse vector holding the server-side BM25 representation of a point's
+/// key and content (the same text that is embedded).
+const BM25_VECTOR: &str = "bm25";
+/// Qdrant's built-in BM25 inference model (Qdrant >= 1.15).
+const BM25_MODEL: &str = "qdrant/bm25";
 
 impl QdrantMemory {
     fn add_time_range_filter(
@@ -96,7 +114,29 @@ impl QdrantMemory {
             api_key,
             embedder: RwLock::new(embedder),
             initialized: OnceCell::new(),
+            hybrid: false,
+            hybrid_active: AtomicBool::new(false),
+            vector_weight: 0.7,
+            keyword_weight: 0.3,
         }
+    }
+
+    /// Opt in to hybrid (dense + BM25) storage and recall for a collection this
+    /// backend creates. An existing collection is used as found: hybrid when it
+    /// already has the `bm25` sparse vector, dense-only otherwise.
+    #[must_use]
+    pub fn with_hybrid(mut self, hybrid: bool) -> Self {
+        self.hybrid = hybrid;
+        self
+    }
+
+    /// Weights for merging dense and BM25 scores (`memory.vector_weight`,
+    /// `memory.keyword_weight`).
+    #[must_use]
+    pub fn with_weights(mut self, vector_weight: f32, keyword_weight: f32) -> Self {
+        self.vector_weight = vector_weight;
+        self.keyword_weight = keyword_weight;
+        self
     }
 
     /// Replace the live embedder in place Existing `Arc<dyn Memory>`
@@ -201,7 +241,7 @@ impl QdrantMemory {
                     session_id: payload.session_id,
                     score: None,
                     namespace: "default".into(),
-                    importance: None,
+                    importance: payload.importance,
                     superseded_by: None,
                     kind: None,
                     pinned: false,
@@ -327,7 +367,7 @@ impl QdrantMemory {
                     session_id: payload.session_id,
                     score: None,
                     namespace: "default".into(),
-                    importance: None,
+                    importance: payload.importance,
                     superseded_by: None,
                     kind: None,
                     pinned: false,
@@ -361,6 +401,158 @@ impl QdrantMemory {
             .await
     }
 
+    /// Rank points for `query`: a dense cosine search, plus a BM25 sparse
+    /// search when the collection is hybrid, merged with the SQLite backend's
+    /// `vector::hybrid_merge` so scores keep its 0-1 scale (and its
+    /// `min_relevance_score` semantics). A failed BM25 leg degrades to
+    /// dense-only rather than failing recall.
+    async fn ranked_points(
+        &self,
+        embedding: Vec<f32>,
+        query: &str,
+        filter: Option<serde_json::Value>,
+        limit: usize,
+        context: &'static str,
+    ) -> Result<Vec<QdrantScoredPoint>> {
+        let hybrid = self.hybrid_active.load(Ordering::Relaxed);
+        // Over-fetch each leg so the merge can promote a point that only one
+        // leg ranks highly.
+        let candidates = if hybrid {
+            limit.saturating_mul(2)
+        } else {
+            limit
+        };
+
+        let mut search_body = serde_json::json!({
+            "vector": embedding,
+            "limit": candidates,
+            "with_payload": true
+        });
+        if let Some(f) = &filter {
+            search_body["filter"] = f.clone();
+        }
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/collections/{}/points/search", self.collection),
+            )
+            .json(&search_body)
+            .send()
+            .await
+            .context(context)?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant search failed ({status}): {text}");
+        }
+        let dense: QdrantSearchResult = resp.json().await?;
+        if !hybrid {
+            return Ok(dense.result);
+        }
+
+        let keyword = match self.bm25_points(query, filter, candidates).await {
+            Ok(points) => points,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e:#}")})),
+                    "Qdrant BM25 search failed; using dense-only recall"
+                );
+                let mut points = dense.result;
+                points.truncate(limit);
+                return Ok(points);
+            }
+        };
+
+        Ok(Self::merge_ranked(
+            dense.result,
+            keyword,
+            self.vector_weight,
+            self.keyword_weight,
+            limit,
+        ))
+    }
+
+    /// BM25 leg of hybrid recall: Qdrant embeds `query` with its built-in
+    /// BM25 model and scores it against the `bm25` sparse vector.
+    async fn bm25_points(
+        &self,
+        query: &str,
+        filter: Option<serde_json::Value>,
+        limit: usize,
+    ) -> Result<Vec<QdrantScoredPoint>> {
+        let mut body = serde_json::json!({
+            "query": { "text": query, "model": BM25_MODEL },
+            "using": BM25_VECTOR,
+            "limit": limit,
+            "with_payload": true
+        });
+        if let Some(f) = filter {
+            body["filter"] = f;
+        }
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/collections/{}/points/query", self.collection),
+            )
+            .json(&body)
+            .send()
+            .await
+            .context("failed to run Qdrant BM25 query")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant BM25 query failed ({status}): {text}");
+        }
+        let result: QdrantQueryResult = resp.json().await?;
+        Ok(result.result.points)
+    }
+
+    /// Merge dense and BM25 hits into one ranking via `vector::hybrid_merge`.
+    fn merge_ranked(
+        dense: Vec<QdrantScoredPoint>,
+        keyword: Vec<QdrantScoredPoint>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        limit: usize,
+    ) -> Vec<QdrantScoredPoint> {
+        fn point_key(id: &serde_json::Value) -> String {
+            match id {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            }
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        fn scores(points: &[QdrantScoredPoint]) -> Vec<(String, f32)> {
+            points
+                .iter()
+                .map(|p| (point_key(&p.id), p.score as f32))
+                .collect()
+        }
+        let merged = super::vector::hybrid_merge(
+            &scores(&dense),
+            &scores(&keyword),
+            vector_weight,
+            keyword_weight,
+            limit,
+        );
+
+        let mut by_id: HashMap<String, QdrantScoredPoint> = HashMap::new();
+        for point in dense.into_iter().chain(keyword) {
+            by_id.entry(point_key(&point.id)).or_insert(point);
+        }
+        merged
+            .into_iter()
+            .filter_map(|r| {
+                let mut point = by_id.remove(&r.id)?;
+                point.score = f64::from(r.final_score);
+                Some(point)
+            })
+            .collect()
+    }
+
     async fn ensure_collection(&self) -> Result<()> {
         let dims = self.embedder.read().dimensions();
         if dims == 0 {
@@ -385,7 +577,24 @@ impl QdrantMemory {
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                // Collection exists
+                // Collection exists: go hybrid only if it already carries the
+                // BM25 sparse vector (one can't be added to existing points).
+                let info: serde_json::Value = r.json().await.unwrap_or_default();
+                let has_bm25 = info
+                    .pointer(&format!(
+                        "/result/config/params/sparse_vectors/{BM25_VECTOR}"
+                    ))
+                    .is_some();
+                self.hybrid_active.store(has_bm25, Ordering::Relaxed);
+                if self.hybrid && !has_bm25 {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"collection": self.collection})),
+                        "Qdrant hybrid requested but the existing collection has no bm25 sparse vector; using dense-only recall"
+                    );
+                }
                 return Ok(());
             }
             Ok(r) if r.status().as_u16() == 404 => {
@@ -402,12 +611,18 @@ impl QdrantMemory {
         }
 
         // Create collection with vector config
-        let create_body = serde_json::json!({
+        let mut create_body = serde_json::json!({
             "vectors": {
                 "size": dims,
                 "distance": "Cosine"
             }
         });
+        if self.hybrid {
+            // IDF is applied server-side, so points only carry term frequencies.
+            create_body["sparse_vectors"] = serde_json::json!({
+                BM25_VECTOR: { "modifier": "idf" }
+            });
+        }
 
         let resp = self
             .request(
@@ -424,13 +639,20 @@ impl QdrantMemory {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Qdrant collection creation failed ({status}): {text}");
         }
+        self.hybrid_active.store(self.hybrid, Ordering::Relaxed);
 
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "Created Qdrant collection '{}' with {} dimensions",
-                self.collection, dims
+                "Created Qdrant collection '{}' with {} dimensions{}",
+                self.collection,
+                dims,
+                if self.hybrid {
+                    " + bm25 sparse vector"
+                } else {
+                    ""
+                }
             )
         );
 
@@ -606,7 +828,7 @@ impl QdrantMemory {
                 session_id: payload.session_id,
                 score: None,
                 namespace: "default".into(),
-                importance: None,
+                importance: payload.importance,
                 superseded_by: None,
                 kind: None,
                 pinned: false,
@@ -658,6 +880,8 @@ struct MemoryPayload {
     session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    importance: Option<f64>,
 }
 
 /// Qdrant search result
@@ -671,6 +895,17 @@ struct QdrantScoredPoint {
     id: serde_json::Value,
     score: f64,
     payload: Option<MemoryPayload>,
+}
+
+/// Qdrant Query API result (`/points/query`)
+#[derive(Debug, Deserialize)]
+struct QdrantQueryResult {
+    result: QdrantQueryPoints,
+}
+
+#[derive(Debug, Deserialize)]
+struct QdrantQueryPoints {
+    points: Vec<QdrantScoredPoint>,
 }
 
 /// Qdrant scroll result
@@ -767,36 +1002,12 @@ impl Memory for QdrantMemory {
         }
         Self::add_time_range_filter(&mut must, since, until);
 
-        let mut search_body = serde_json::json!({
-            "vector": embedding,
-            "limit": limit,
-            "with_payload": true
-        });
+        let filter = (!must.is_empty()).then(|| serde_json::json!({ "must": must }));
+        let points = self
+            .ranked_points(embedding, query, filter, limit, "failed to search Qdrant")
+            .await?;
 
-        if !must.is_empty() {
-            search_body["filter"] = serde_json::json!({ "must": must });
-        }
-
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/collections/{}/points/search", self.collection),
-            )
-            .json(&search_body)
-            .send()
-            .await
-            .context("failed to search Qdrant")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Qdrant search failed ({status}): {text}");
-        }
-
-        let result: QdrantSearchResult = resp.json().await?;
-
-        let mut entries: Vec<MemoryEntry> = result
-            .result
+        let mut entries: Vec<MemoryEntry> = points
             .into_iter()
             .filter_map(|point| {
                 let payload = point.payload?;
@@ -816,7 +1027,7 @@ impl Memory for QdrantMemory {
                     session_id: payload.session_id,
                     score: Some(point.score),
                     namespace: "default".into(),
-                    importance: None,
+                    importance: payload.importance,
                     superseded_by: None,
                     kind: None,
                     pinned: false,
@@ -904,7 +1115,7 @@ impl Memory for QdrantMemory {
                     session_id: payload.session_id,
                     score: None,
                     namespace: "default".into(),
-                    importance: None,
+                    importance: payload.importance,
                     superseded_by: None,
                     kind: None,
                     pinned: false,
@@ -1057,7 +1268,7 @@ impl Memory for QdrantMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
         _namespace: Option<&str>,
-        _importance: Option<f64>,
+        importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> Result<()> {
         self.ensure_initialized().await?;
@@ -1080,16 +1291,25 @@ impl Memory for QdrantMemory {
             timestamp,
             session_id: session_id.map(str::to_string),
             agent_id: Some(resolved_agent_id.clone()),
+            importance,
         };
 
         self.delete_points_matching(&[("key", key), ("agent_id", resolved_agent_id.as_str())])
             .await
             .context("qdrant pre-upsert cleanup failed")?;
 
+        let vector = if self.hybrid_active.load(Ordering::Relaxed) {
+            serde_json::json!({
+                "": embedding,
+                BM25_VECTOR: { "text": combined_text, "model": BM25_MODEL }
+            })
+        } else {
+            serde_json::json!(embedding)
+        };
         let upsert_body = serde_json::json!({
             "points": [{
                 "id": id,
-                "vector": embedding,
+                "vector": vector,
                 "payload": payload
             }]
         });
@@ -1162,33 +1382,17 @@ impl Memory for QdrantMemory {
         }));
         Self::add_time_range_filter(&mut must, since, until);
 
-        let search_body = serde_json::json!({
-            "vector": embedding,
-            "limit": limit,
-            "with_payload": true,
-            "filter": { "must": must }
-        });
-
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/collections/{}/points/search", self.collection),
+        let points = self
+            .ranked_points(
+                embedding,
+                query,
+                Some(serde_json::json!({ "must": must })),
+                limit,
+                "failed to search Qdrant for allowed agent set",
             )
-            .json(&search_body)
-            .send()
-            .await
-            .context("failed to search Qdrant for allowed agent set")?;
+            .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Qdrant search failed ({status}): {text}");
-        }
-
-        let result: QdrantSearchResult = resp.json().await?;
-
-        let mut entries: Vec<MemoryEntry> = result
-            .result
+        let mut entries: Vec<MemoryEntry> = points
             .into_iter()
             .filter_map(|point| {
                 let payload = point.payload?;
@@ -1208,7 +1412,7 @@ impl Memory for QdrantMemory {
                     session_id: payload.session_id,
                     score: Some(point.score),
                     namespace: "default".into(),
-                    importance: None,
+                    importance: payload.importance,
                     superseded_by: None,
                     kind: None,
                     pinned: false,
@@ -1499,6 +1703,7 @@ mod tests {
             timestamp: "2026-02-20T00:00:00Z".into(),
             session_id: Some("session-1".into()),
             agent_id: None,
+            importance: None,
         };
 
         let json = serde_json::to_string(&payload).unwrap();
@@ -1516,10 +1721,230 @@ mod tests {
             timestamp: "2026-02-20T00:00:00Z".into(),
             session_id: None,
             agent_id: None,
+            importance: None,
         };
 
         let json = serde_json::to_string(&payload).unwrap();
         assert!(!json.contains("session_id"));
         assert!(!json.contains("agent_id"));
+    }
+
+    struct FixedEmbedding;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for FixedEmbedding {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+    }
+
+    fn scored(id: &str, score: f64) -> QdrantScoredPoint {
+        QdrantScoredPoint {
+            id: serde_json::json!(id),
+            score,
+            payload: Some(MemoryPayload {
+                key: id.to_string(),
+                content: format!("content-{id}"),
+                category: "core".into(),
+                timestamp: "2026-11-02T00:00:00Z".into(),
+                session_id: None,
+                agent_id: Some("alpha".into()),
+                importance: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn merge_ranked_blends_dense_and_bm25_like_sqlite() {
+        // Dense cosine is already 0-1; BM25 is normalized by its max, then the
+        // two are weighted 0.7 / 0.3 over the weights each point has.
+        let dense = vec![scored("a", 0.9), scored("b", 0.5)];
+        let keyword = vec![scored("b", 8.0), scored("c", 4.0)];
+        let merged = QdrantMemory::merge_ranked(dense, keyword, 0.7, 0.3, 10);
+
+        let got: Vec<(String, f64)> = merged
+            .iter()
+            .map(|p| (p.id.as_str().unwrap().to_string(), p.score))
+            .collect();
+        let score = |id: &str| got.iter().find(|(i, _)| i == id).unwrap().1;
+
+        assert_eq!(got.len(), 3, "union of both legs: {got:?}");
+        assert!((score("a") - 0.9).abs() < 1e-6, "dense-only keeps cosine");
+        assert!((score("b") - (0.7 * 0.5 + 0.3 * 1.0)).abs() < 1e-6);
+        assert!((score("c") - 0.5).abs() < 1e-6, "keyword-only: 4/8");
+        assert_eq!(got[0].0, "a", "highest blended score first: {got:?}");
+        assert!(
+            merged.iter().all(|p| p.payload.is_some()),
+            "payloads survive the merge"
+        );
+    }
+
+    #[test]
+    fn payload_importance_round_trips_and_defaults_to_none() {
+        let legacy: MemoryPayload = serde_json::from_value(serde_json::json!({
+            "key": "k", "content": "c", "category": "core",
+            "timestamp": "2026-11-02T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy.importance, None, "points written before importance");
+
+        let mut payload = legacy;
+        payload.importance = Some(0.8);
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["importance"], 0.8);
+    }
+
+    #[tokio::test]
+    async fn hybrid_collection_stores_bm25_and_recalls_with_both_legs() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::Mutex as StdMutex;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<StdMutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+        let seen_server = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let request = read_http_request_any(&mut stream);
+                let line = request.lines().next().unwrap().to_string();
+                let body: serde_json::Value = request
+                    .split_once("\r\n\r\n")
+                    .and_then(|(_, b)| serde_json::from_str(b).ok())
+                    .unwrap_or_default();
+                let path = line.split_whitespace().nth(1).unwrap().to_string();
+                let response = if line.starts_with("GET /collections/mem ") {
+                    serde_json::json!({"result": {"config": {"params": {
+                        "vectors": {"size": 3, "distance": "Cosine"},
+                        "sparse_vectors": {"bm25": {"modifier": "idf"}}
+                    }}, "points_count": 0}})
+                } else if path.contains("/points/scroll") {
+                    serde_json::json!({"result": {"points": [], "next_page_offset": null}})
+                } else if path.contains("/points/search") {
+                    serde_json::json!({"result": [
+                        {"id": "p1", "score": 0.9, "payload": {"key": "dense_hit",
+                          "content": "c1", "category": "core",
+                          "timestamp": "2026-11-02T00:00:00Z", "agent_id": "alpha",
+                          "importance": 0.8}}
+                    ]})
+                } else if path.contains("/points/query") {
+                    serde_json::json!({"result": {"points": [
+                        {"id": "p2", "score": 3.0, "payload": {"key": "air_filter",
+                          "content": "c2", "category": "core",
+                          "timestamp": "2026-11-02T00:00:00Z", "agent_id": "alpha"}}
+                    ]}})
+                } else {
+                    serde_json::json!({"result": {"status": "completed"}, "status": "ok"})
+                };
+                let done = path.contains("/points/query");
+                seen_server.lock().unwrap().push((line, body));
+                let response = response.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+                if done {
+                    break;
+                }
+            }
+        });
+
+        let mem = QdrantMemory::new_lazy("test", &endpoint, "mem", None, Arc::new(FixedEmbedding))
+            .with_hybrid(true);
+        mem.store_with_agent(
+            "air_filter",
+            "changed the air filter",
+            MemoryCategory::Core,
+            None,
+            None,
+            Some(0.8),
+            Some("alpha"),
+        )
+        .await
+        .unwrap();
+        let recalled = mem
+            .recall_for_agents(&["alpha"], "air filter", 5, None, None, None)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        let seen = seen.lock().unwrap();
+        let upsert = &seen
+            .iter()
+            .find(|(line, _)| line.starts_with("PUT /collections/mem/points"))
+            .expect("store must upsert")
+            .1;
+        let point = &upsert["points"][0];
+        assert_eq!(point["vector"][""], serde_json::json!([1.0, 0.0, 0.0]));
+        assert_eq!(point["vector"]["bm25"]["model"], "qdrant/bm25");
+        assert_eq!(
+            point["vector"]["bm25"]["text"],
+            "air_filter\nchanged the air filter"
+        );
+        assert_eq!(point["payload"]["importance"], 0.8);
+
+        let query = &seen
+            .iter()
+            .find(|(line, _)| line.contains("/points/query"))
+            .expect("hybrid recall must run the BM25 leg")
+            .1;
+        assert_eq!(query["using"], "bm25");
+        assert_eq!(query["query"]["text"], "air filter");
+        assert!(
+            query["filter"]["must"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|c| c["key"] == "agent_id")),
+            "the BM25 leg keeps the agent scope"
+        );
+
+        let keys: Vec<&str> = recalled.iter().map(|e| e.key.as_str()).collect();
+        // A keyword-only hit with the top BM25 score blends to 1.0 (weights are
+        // normalized over the legs a point appears in, as in SQLite), so it
+        // outranks the 0.9 dense-only hit.
+        assert_eq!(keys, vec!["air_filter", "dense_hit"]);
+        assert_eq!(recalled[1].importance, Some(0.8));
+        assert!(recalled.iter().all(|e| e.score.is_some_and(|s| s <= 1.0)));
+    }
+
+    /// Like `read_http_request`, but also accepts body-less requests (GET).
+    fn read_http_request_any(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(read > 0, "Qdrant fixture closed mid-request");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .map_or(0, |v| v.parse::<usize>().unwrap());
+            if request.len() >= header_end + 4 + content_length {
+                return String::from_utf8(request).unwrap();
+            }
+        }
     }
 }
