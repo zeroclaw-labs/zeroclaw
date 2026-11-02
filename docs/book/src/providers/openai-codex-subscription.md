@@ -186,10 +186,10 @@ your own routing, not here.
 
 ### Prompt cache affinity
 
-Cached input is priced below fresh input on OpenAI's published rates, and an
-agent turn re-sends the same system prompt and history on every tool iteration,
-so cache hits decide how far the included allowance goes. The Codex backend only
-reuses a cache reliably when a request says which conversation it belongs to.
+An agent turn re-sends the same system prompt and history on every tool
+iteration. In the measured Codex-backend comparison, identifying the conversation
+improved cache reuse. That measurement covers cached input tokens; its effect on
+a ChatGPT plan's included allowance has not been measured.
 On the ChatGPT Codex backend ZeroClaw therefore sends a per-conversation key
 with every request made inside a conversation, as the `prompt_cache_key` body
 field and the `session-id` header. A custom `uri` endpoint receives neither.

@@ -37,9 +37,6 @@ pub struct OpenAiCodexModelProvider {
     auth_profile_override: Option<String>,
     responses_url: String,
     custom_endpoint: bool,
-    /// Whether requests carry a per-conversation prompt cache key. On for the
-    /// ChatGPT Codex backend, off for an operator-configured endpoint.
-    cache_affinity: bool,
     /// Install secret the prompt cache key is derived with.
     install_secrets: zeroclaw_config::secrets::SecretStore,
     gateway_api_key: Option<String>,
@@ -156,7 +153,6 @@ impl OpenAiCodexModelProvider {
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
             custom_endpoint: !is_default_responses_url(&responses_url),
-            cache_affinity: is_default_responses_url(&responses_url),
             install_secrets,
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
@@ -186,7 +182,7 @@ impl OpenAiCodexModelProvider {
     /// The scope is a task-local that does not cross a spawn, so the streaming
     /// path must call this before entering `zeroclaw_spawn::spawn!`.
     fn prompt_cache_key(&self) -> Option<String> {
-        if !self.cache_affinity {
+        if self.custom_endpoint {
             return None;
         }
         let scope = crate::conversation_affinity::scope()?;
@@ -1772,7 +1768,7 @@ mod tests {
         tempfile::TempDir,
         crate::RuntimeProxyTestGuard,
     ) {
-        use axum::http::header;
+        use axum::http::{HeaderMap, header};
         use axum::response::IntoResponse;
         use axum::{Json, Router, routing::post};
         use std::collections::VecDeque;
@@ -1787,32 +1783,50 @@ mod tests {
 
         let app = Router::new().route(
             "/responses",
-            post(move |Json(body): Json<serde_json::Value>| {
-                let captured = Arc::clone(&captured_clone);
-                let replies = Arc::clone(&replies_clone);
-                async move {
-                    captured.lock().unwrap().push(body);
-                    match replies
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or(MockCodexReply::Status(
-                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            "",
-                        )) {
-                        MockCodexReply::Sse(body) => (
-                            axum::http::StatusCode::OK,
-                            [(header::CONTENT_TYPE, "text/event-stream")],
-                            body.to_string(),
-                        )
-                            .into_response(),
-                        MockCodexReply::Json(body) => Json(body).into_response(),
-                        MockCodexReply::Status(status, body) => {
-                            (status, body.to_string()).into_response()
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_clone);
+                    let replies = Arc::clone(&replies_clone);
+                    async move {
+                        let key = body.get("prompt_cache_key").and_then(Value::as_str);
+                        assert_eq!(
+                            headers
+                                .get("session-id")
+                                .map(|value| value.to_str().unwrap()),
+                            key,
+                            "the wire header must match the body key, including its absence"
+                        );
+                        if key.is_some() {
+                            assert_eq!(
+                                headers.get("authorization").unwrap(),
+                                "Bearer test-codex-oauth-token"
+                            );
+                            assert_eq!(headers.get("chatgpt-account-id").unwrap(), "test-account");
+                            assert!(headers.get("x-openai-access-token").is_none());
+                        }
+                        captured.lock().unwrap().push(body);
+                        match replies
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or(MockCodexReply::Status(
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                "",
+                            )) {
+                            MockCodexReply::Sse(body) => (
+                                axum::http::StatusCode::OK,
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                body.to_string(),
+                            )
+                                .into_response(),
+                            MockCodexReply::Json(body) => Json(body).into_response(),
+                            MockCodexReply::Status(status, body) => {
+                                (status, body.to_string()).into_response()
+                            }
                         }
                     }
-                }
-            }),
+                },
+            ),
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2392,8 +2406,53 @@ mod tests {
         server_handle.abort();
     }
 
-    /// The mock endpoint is a custom endpoint, where cache affinity is off;
-    /// these tests exercise the ChatGPT-backend behavior against it.
+    /// Construct the default backend with an isolated synthetic OAuth profile,
+    /// then redirect only the transport URL to the local server. The constructor's
+    /// endpoint policy and credential selection remain unchanged.
+    async fn mock_default_codex_provider(
+        replies: Vec<MockCodexReply>,
+    ) -> (
+        OpenAiCodexModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+        crate::RuntimeProxyTestGuard,
+    ) {
+        let (mock, captured, server_handle, temp_dir, proxy_guard) =
+            mock_codex_provider(replies).await;
+        let options = ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(temp_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let mut provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+        assert!(!provider.custom_endpoint);
+        provider.responses_url = mock.responses_url;
+        provider
+            .auth
+            .store_openai_tokens(
+                "default",
+                crate::auth::profiles::TokenSet {
+                    access_token: "test-codex-oauth-token".to_string(),
+                    refresh_token: None,
+                    id_token: None,
+                    expires_at: None,
+                    token_type: None,
+                    scope: None,
+                },
+                Some("test-account".to_string()),
+                true,
+            )
+            .await
+            .expect("store the synthetic OAuth profile without provisioning an install key");
+        let credentials = provider.resolve_credentials().await.unwrap();
+        assert!(!credentials.use_gateway_api_key_auth);
+        assert_eq!(credentials.bearer_token, "test-codex-oauth-token");
+        assert_eq!(credentials.account_id.as_deref(), Some("test-account"));
+        assert!(!temp_dir.path().join(".secret_key").exists());
+        (provider, captured, server_handle, temp_dir, proxy_guard)
+    }
+
     async fn mock_codex_provider_with_cache_affinity(
         replies: Vec<MockCodexReply>,
     ) -> (
@@ -2403,9 +2462,8 @@ mod tests {
         tempfile::TempDir,
         crate::RuntimeProxyTestGuard,
     ) {
-        let (mut provider, captured, server_handle, temp_dir, proxy_guard) =
-            mock_codex_provider(replies).await;
-        provider.cache_affinity = true;
+        let (provider, captured, server_handle, temp_dir, proxy_guard) =
+            mock_default_codex_provider(replies).await;
         provider
             .install_secrets
             .keyed_digest_or_create(b"zeroclaw.test.provision", b"")
@@ -2429,19 +2487,33 @@ mod tests {
         }))
     }
 
-    #[test]
-    fn cache_affinity_is_on_for_the_chatgpt_backend_only() {
-        let default_endpoint =
-            OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
-                .unwrap();
-        assert!(default_endpoint.cache_affinity);
-
-        let options = ModelProviderRuntimeOptions {
-            provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
-            ..ModelProviderRuntimeOptions::default()
-        };
-        let custom = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
-        assert!(!custom.cache_affinity);
+    #[tokio::test]
+    async fn cache_affinity_is_on_for_the_chatgpt_backend_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let secrets = zeroclaw_config::secrets::SecretStore::new(temp_dir.path(), false);
+        secrets
+            .keyed_digest_or_create(b"zeroclaw.test.provision", b"")
+            .unwrap();
+        for endpoint in [
+            None,
+            Some(DEFAULT_CODEX_RESPONSES_URL),
+            Some("https://example.com/v1"),
+        ] {
+            let options = ModelProviderRuntimeOptions {
+                provider_api_url: endpoint.map(str::to_string),
+                zeroclaw_dir: Some(temp_dir.path().to_path_buf()),
+                secrets_encrypt: false,
+                ..ModelProviderRuntimeOptions::default()
+            };
+            let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+            let key = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                .scope(Some("gw_one".to_string()), async {
+                    provider.prompt_cache_key()
+                })
+                .await;
+            let is_default = endpoint.is_none_or(|url| url == DEFAULT_CODEX_RESPONSES_URL);
+            assert_eq!(key.is_some(), is_default, "endpoint: {endpoint:?}");
+        }
     }
 
     #[tokio::test]
@@ -2479,9 +2551,8 @@ mod tests {
 
     #[tokio::test]
     async fn install_without_a_secret_key_sends_no_prompt_cache_key() {
-        let (mut provider, captured, server_handle, temp_dir, _proxy_guard) =
-            mock_codex_provider(vec![ok_reply()]).await;
-        provider.cache_affinity = true;
+        let (provider, captured, server_handle, temp_dir, _proxy_guard) =
+            mock_default_codex_provider(vec![ok_reply()]).await;
         let messages = vec![ChatMessage::user("hello")];
 
         zeroclaw_api::TOOL_LOOP_SESSION_KEY
