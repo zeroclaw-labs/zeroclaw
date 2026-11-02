@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Check binary file size against safeguard thresholds.
+# Check binary file size against the configured safeguard.
 #
 # Usage: check_binary_size.sh <binary_path> [label]
 #
@@ -7,10 +7,10 @@
 #   binary_path  Path to the binary to check (required)
 #   label        Optional label for step summary (e.g. target triple)
 #
-# Thresholds (overridable via environment):
-#   BINARY_SIZE_HARD_LIMIT  — hard error (default: 20MB for CI, override for release)
-#   >15MB  — warning (advisory)
-#   >5MB   — warning (target)
+# BINARY_SIZE_HARD_LIMIT sets the hard error threshold (default: 20 MiB for CI;
+# release callers supply their own cap). The former 5/15 MiB advisory targets
+# no longer describe current distributions; retain measured bytes and the hard
+# gate instead of warning on every release.
 #
 # Writes to GITHUB_STEP_SUMMARY when the variable is set and label is provided.
 
@@ -39,10 +39,6 @@ HARD_LIMIT_MB=$((HARD_LIMIT / 1024 / 1024))
 if [ "$SIZE" -gt "$HARD_LIMIT" ]; then
   echo "::error::Binary exceeds ${HARD_LIMIT_MB}MB safeguard (${SIZE_MB}MB)"
   exit 1
-elif [ "$SIZE" -gt 15728640 ]; then
-  echo "::warning::Binary exceeds 15MB advisory target (${SIZE_MB}MB)"
-elif [ "$SIZE" -gt 5242880 ]; then
-  echo "::warning::Binary exceeds 5MB target (${SIZE_MB}MB)"
 else
-  echo "Binary size within target."
+  echo "Binary size within safeguard."
 fi
