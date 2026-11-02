@@ -127,7 +127,11 @@ body {
 }
 
 #root {
-  min-height: 100vh;
+  /* Match the app shell's dynamic viewport height. On mobile browsers 100vh
+     includes the collapsing URL bar, which made the whole page (including the
+     chat composer) scroll. */
+  height: 100vh;
+  height: 100dvh;
 }
 
 /* Focus ring — solid accent for a strong, legible, WCAG-friendly ring

@@ -317,7 +317,7 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   }, [tabs]);
 
   return (
-    <div translate="no" className="notranslate flex flex-col h-full min-h-0">
+    <div translate="no" className="notranslate flex flex-col h-full min-h-0 overflow-hidden">
       <ChatTabBar
         tabs={labelledTabs}
         activeKey={activeTab?.key ?? ''}
@@ -333,7 +333,7 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
       {/* Content area. Every open chat is mounted here at all times; only CSS
           visibility changes between tab/layout switches, so background sockets
           stay alive. In split layout the two visible panes share the width. */}
-      <div className={effectiveLayout === 'split' ? 'flex flex-col md:flex-row flex-1 min-h-0 divide-y md:divide-y-0 md:divide-x divide-pc-border' : 'flex-1 min-h-0'}>
+      <div className={effectiveLayout === 'split' ? 'flex flex-col md:flex-row flex-1 min-h-0 min-w-0 divide-y md:divide-y-0 md:divide-x divide-pc-border' : 'flex-1 min-h-0 min-w-0'}>
         {tabs.map((tab) => {
           const visible = visibleKeys.has(tab.key);
           // In split, each visible pane takes an equal share of the row.

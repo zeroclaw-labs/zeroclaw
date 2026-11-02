@@ -534,7 +534,7 @@ export function AgentChatInner({
        t() i18n, so losing browser translation on it is intentional. */
     <div
       translate="no"
-      className="notranslate relative flex flex-col h-full min-h-0"
+      className="notranslate relative flex flex-col h-full min-h-0 overflow-hidden"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -658,7 +658,7 @@ export function AgentChatInner({
 
       {/* Messages area. */}
       <div
-        className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
+        className={`flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
       >
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in text-pc-text-muted">
@@ -728,7 +728,7 @@ export function AgentChatInner({
       )}
 
       {/* Input area */}
-      <div className="border-t border-pc-border bg-pc-surface p-4">
+      <div className="shrink-0 border-t border-pc-border bg-pc-surface p-4">
         {/* Slash-command autocomplete popover (#7137) */}
         {showCommandHint && matchedCommands.length > 0 && (
           <div className="relative max-w-4xl mx-auto">
