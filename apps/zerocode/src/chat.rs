@@ -26873,7 +26873,7 @@ mod tests {
 
         let after = apply(&mut chat, trim("sess-1", 4, Some(90_000)));
         assert!(
-            after.contains("~90,000 / 200,000"),
+            after.contains("~ 90,000 / 200,000"),
             "real terminal status cells: {after}"
         );
         assert!(
