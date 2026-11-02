@@ -311,6 +311,14 @@ pub struct DelegateTool {
     workspace_dir: PathBuf,
     /// Cancellation token for cascade control of background tasks.
     cancellation_token: CancellationToken,
+    /// The running turn's cancellation lineage, handed to an instance built
+    /// inside a spawned task. A parallel worker's own delegate tool runs with
+    /// no turn scope, so this is the only way the turn reaches what it
+    /// delegates; the bounded child's own tool is dispatched inside its
+    /// sub-loop's scope and keeps this as a fallback. `None` on the root tool
+    /// and on background workers, whose foreground children bind to their
+    /// own token instead.
+    turn_token: Option<CancellationToken>,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
     /// nested model provider map for brain resolution.
@@ -384,6 +392,11 @@ enum DelegateAdmission {
     /// caller-side tool authorization plus target reachability checks.
     Required,
     Prevalidated,
+}
+
+struct DelegateApprovalContext<'a> {
+    target_config: Option<&'a Config>,
+    registry: &'a (dyn Fn(&Config) -> Option<crate::tools::PerToolChannelHandle> + Send + Sync),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,6 +501,7 @@ impl DelegateTool {
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
+            turn_token: None,
             memory: None,
             providers_models: Arc::new(HashMap::new()),
             risk_profiles: Arc::new(HashMap::new()),
@@ -545,6 +559,7 @@ impl DelegateTool {
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
+            turn_token: None,
             memory: None,
             providers_models: Arc::new(HashMap::new()),
             risk_profiles: Arc::new(HashMap::new()),
@@ -618,6 +633,26 @@ impl DelegateTool {
     /// Return the cancellation token for external cascade control.
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
+    }
+
+    /// A child token for work that belongs to the running turn. It hangs off
+    /// the turn's cancellation when a turn is executing this tool, so an abort
+    /// of the turn reaches the parallel and agentic children the turn started
+    /// (their tasks outlive the dropped tool future); off the turn lineage
+    /// this instance was handed when it was built inside a spawned task that
+    /// runs without a turn scope; and off this tool's own token otherwise. Background tasks never take this
+    /// token: they derive from `cancellation_token`, outlive the turn by
+    /// design, and are cancelled through `cancel_task`.
+    fn turn_bound_child_token(&self) -> CancellationToken {
+        if let Some(turn) = zeroclaw_api::tool::ToolExecutionContext::current()
+            .and_then(|context| context.cancellation_token().cloned())
+        {
+            return turn.child_token();
+        }
+        self.turn_token
+            .as_ref()
+            .unwrap_or(&self.cancellation_token)
+            .child_token()
     }
 
     /// Attach memory for namespace isolation on delegate agents.
@@ -1115,6 +1150,25 @@ impl DelegateTool {
             .unwrap_or(DelegateExecutionMode::Bounded)
     }
 
+    // A target-owned route is the only approval authority forwarded into an
+    // independent child. In particular, no parent channel or session grant is
+    // inherited, and bounded children keep their separate policy contract.
+    fn independent_approval_route(
+        mode: DelegateExecutionMode,
+        profile: &RiskProfileConfig,
+    ) -> Option<&zeroclaw_config::autonomy::ApprovalRoute> {
+        if mode != DelegateExecutionMode::Independent {
+            return None;
+        }
+        profile.approval_route.as_ref().filter(|route| {
+            !route.approver_channel.trim().is_empty()
+                && route
+                    .approver_recipient
+                    .as_deref()
+                    .is_some_and(|recipient| !recipient.trim().is_empty())
+        })
+    }
+
     fn unsupported_agentic_always_ask_refusal_from_config(
         &self,
         config: &Config,
@@ -1122,10 +1176,9 @@ impl DelegateTool {
     ) -> Option<ToolResult> {
         let target_mode = config.delegate_target_mode(&self.caller_alias, target_alias)?;
         let target_agent = config.agents.get(target_alias)?;
-        // Independent targets have no approval backchannel at all. Bounded
-        // one-shot targets do not execute tools, so `always_ask` is irrelevant;
-        // bounded agentic loops must fail closed until approval forwarding is
-        // implemented.
+        // Bounded one-shot targets do not execute tools. Bounded agentic
+        // targets still have no approval route; independent targets may opt
+        // into their own explicitly configured operator route.
         if target_mode == DelegateExecutionMode::Bounded {
             let target_is_agentic = config
                 .runtime_profile_for_agent(target_alias)
@@ -1141,6 +1194,9 @@ impl DelegateTool {
         }
 
         let profile = config.risk_profiles.get(target_risk_profile)?;
+        if Self::independent_approval_route(target_mode, profile).is_some() {
+            return None;
+        }
         let always_ask_entries: Vec<String> = profile
             .always_ask
             .iter()
@@ -2896,6 +2952,7 @@ impl DelegateTool {
             agent_config,
             &model,
             &[],
+            None,
             prompt_workspace,
             false,
             None,
@@ -3250,7 +3307,18 @@ impl DelegateTool {
         let max_delegation_depth = self.max_delegation_depth;
         let background_task_management = self.background_task_management;
         let operator_approval_available = self.operator_approval_available;
-        let parent_tools = Arc::clone(&self.parent_tools);
+        // The rebuilt worker runs as the target (`security` above), so its
+        // bounded assembly cannot apply this caller's name filter itself.
+        // Hand it only the inherited tools this caller may use: the filter
+        // the synchronous path applies with the caller's own policy.
+        let parent_tools = Arc::new(RwLock::new(
+            self.parent_tools
+                .read()
+                .iter()
+                .filter(|tool| self.security.is_tool_allowed(tool.name()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
         let runtime = self.runtime.clone();
         let multimodal_config = self.multimodal_config.clone();
         let delegate_config = self.delegate_config.clone();
@@ -3371,6 +3439,7 @@ impl DelegateTool {
                     delegate_config,
                     workspace_dir: workspace_dir.clone(),
                     cancellation_token: child_token.clone(),
+                    turn_token: None,
                     memory,
                     providers_models,
                     risk_profiles,
@@ -3673,7 +3742,12 @@ impl DelegateTool {
             let multimodal_config = self.multimodal_config.clone();
             let delegate_config = self.delegate_config.clone();
             let workspace_dir = self.workspace_dir.clone();
+            // The worker's own delegate tool keeps the two lineages apart,
+            // as the bounded child's does: background tasks it launches
+            // descend from this tool's token, its foreground children
+            // follow the turn.
             let cancellation_token = self.cancellation_token.child_token();
+            let turn_token = self.turn_bound_child_token();
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
@@ -3737,6 +3811,7 @@ impl DelegateTool {
                         delegate_config,
                         workspace_dir,
                         cancellation_token,
+                        turn_token: Some(turn_token),
                         memory,
                         providers_models,
                         risk_profiles,
@@ -4455,6 +4530,7 @@ impl DelegateTool {
             agent_config,
             model_name,
             sub_tools,
+            None,
             workspace_dir,
             sends_native_tool_specs,
             skills_override,
@@ -4462,6 +4538,7 @@ impl DelegateTool {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_enriched_system_prompt_from_config(
         &self,
         config: Option<&Config>,
@@ -4469,6 +4546,7 @@ impl DelegateTool {
         agent_config: &AliasedAgentConfig,
         model_name: &str,
         sub_tools: &[Box<dyn Tool>],
+        hidden_builtin_names: Option<&HashSet<String>>,
         workspace_dir: &Path,
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
@@ -4535,6 +4613,7 @@ impl DelegateTool {
             agent_workspace_dir: workspace_dir,
             model_name,
             tools: prompt_tools,
+            hidden_builtin_names,
             skills,
             skills_prompt_mode: agent_config.resolved.prompt_injection_mode,
             identity_config: None,
@@ -4628,6 +4707,39 @@ impl DelegateTool {
         admission: DelegateAdmission,
         target_config: Option<&Config>,
     ) -> anyhow::Result<ToolResult> {
+        self.execute_agentic_with_approval_registry(
+            agent_name,
+            agent_config,
+            provider_type,
+            model,
+            model_provider,
+            full_prompt,
+            temperature,
+            admission,
+            DelegateApprovalContext {
+                target_config,
+                registry: &crate::agent::loop_::live_approval_channel_registry,
+            },
+        )
+        .await
+    }
+
+    async fn execute_agentic_with_approval_registry(
+        &self,
+        agent_name: &str,
+        agent_config: &AliasedAgentConfig,
+        provider_type: &str,
+        model: &str,
+        model_provider: &dyn ModelProvider,
+        full_prompt: &str,
+        temperature: Option<f64>,
+        admission: DelegateAdmission,
+        approval_context: DelegateApprovalContext<'_>,
+    ) -> anyhow::Result<ToolResult> {
+        let DelegateApprovalContext {
+            target_config,
+            registry: approval_registry,
+        } = approval_context;
         let Some(tool_policy) =
             self.resolve_tool_policy_from_config(target_config, &agent_config.risk_profile)
         else {
@@ -4660,12 +4772,10 @@ impl DelegateTool {
         let target_mode = target_config
             .map(|config| self.mode_for_target_from_config(config, agent_name))
             .unwrap_or_else(|| self.mode_for_target(agent_name));
-        // Every delegated agentic turn is non-interactive: there is no operator
-        // route inside the child loop. Resolve the target's canonical profile
-        // before entering the loop and create a fresh manager so prompt-required
-        // non-delegate tools fail closed before dispatch while explicitly
-        // auto-approved tools still run. Use the admitted config generation
-        // when present; the configless test builder supplies named profiles.
+        // Resolve one admitted target generation and create a fresh approval
+        // manager for this child. A complete independent target route may ask
+        // its configured operator; other children stay non-interactive and
+        // fail closed. No parent approval grants cross this boundary.
         let target_risk_profile = match target_config.or(self.root_config.as_deref()) {
             Some(config) => config.risk_profile_for_agent(agent_name),
             None => self.risk_profiles.get(agent_config.risk_profile.trim()),
@@ -4680,9 +4790,21 @@ impl DelegateTool {
                 )),
             });
         };
+        let approval_route = Self::independent_approval_route(target_mode, target_risk_profile);
+        let approval_channel = approval_route.and_then(|route| {
+            target_config
+                .or(self.root_config.as_deref())
+                .and_then(approval_registry)
+                .map(|handles| {
+                    crate::agent::agent::RoutedApprovalChannel::new(handles, route.clone())
+                })
+        });
         let approval_manager = Some(match target_mode {
             DelegateExecutionMode::Bounded => {
                 ApprovalManager::for_bounded_non_interactive(target_risk_profile)
+            }
+            DelegateExecutionMode::Independent if approval_route.is_some() => {
+                ApprovalManager::for_non_interactive_backchannel(target_risk_profile)
             }
             DelegateExecutionMode::Independent => {
                 ApprovalManager::for_non_interactive(target_risk_profile)
@@ -4857,7 +4979,16 @@ impl DelegateTool {
                         multimodal_config: self.multimodal_config.clone(),
                         delegate_config: self.delegate_config.clone(),
                         workspace_dir: self.workspace_dir.clone(),
+                        // The child's own delegate tool keeps the two
+                        // lineages apart. Its background tasks descend from
+                        // this tool's own token, as they would from the root,
+                        // so stopping the turn does not stop work launched to
+                        // outlive it. Its foreground children follow the turn:
+                        // the sub-loop scopes its token around each tool call,
+                        // and `turn_token` carries the same lineage as a
+                        // fallback outside that scope.
                         cancellation_token: self.cancellation_token.child_token(),
+                        turn_token: Some(self.turn_bound_child_token()),
                         memory: self.memory.clone(),
                         providers_models: Arc::clone(&self.providers_models),
                         risk_profiles: Arc::clone(&self.risk_profiles),
@@ -4967,12 +5098,26 @@ impl DelegateTool {
         // the skill prompt content matches the target's skill tools; bounded delegation
         // keeps the caller's `self.workspace_dir`.
         let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
+        let hidden_builtin_names = sub_tools.hidden_builtin_names();
+        if let Some(state) = &sub_activated {
+            let section = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .deferred_builtin_prompt_section();
+            if !section.is_empty() {
+                if !sub_deferred_section.is_empty() {
+                    sub_deferred_section.push_str("\n\n");
+                }
+                sub_deferred_section.push_str(&section);
+            }
+        }
         let enriched_system_prompt = self.build_enriched_system_prompt_from_config(
             target_config,
             agent_name,
             agent_config,
             model,
             &sub_tools,
+            Some(&hidden_builtin_names),
             prompt_workspace,
             native_tools,
             sub_skills.as_deref(),
@@ -5120,10 +5265,12 @@ impl DelegateTool {
                 injected_memory_preamble: &mut subagent_injected_memory_preamble,
                 channel_name: "delegate",
                 channel_reply_target: None,
-                cancellation_token: Some(self.cancellation_token.child_token()),
+                cancellation_token: Some(self.turn_bound_child_token()),
                 on_delta: None,
                 shared_budget: execution_tree_budget.clone(),
-                channel: None,
+                channel: approval_channel
+                    .as_ref()
+                    .map(|channel| channel as &dyn zeroclaw_api::channel::Channel),
                 collected_receipts,
                 event_tx: None,
                 steering: None,
@@ -5134,7 +5281,8 @@ impl DelegateTool {
                 memory: None,
                 ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
                 agent_alias: Some(agent_name),
-                parent_agent_alias: None,
+                parent_agent_alias: (target_mode == DelegateExecutionMode::Independent)
+                    .then_some(self.caller_alias.as_str()),
                 turn_id: &turn_id,
             })
             .instrument(::zeroclaw_log::attribution_span!(
@@ -5243,6 +5391,14 @@ impl Tool for ToolArcRef {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner.execute_with_context(args, context).await
     }
 }
 
@@ -7852,7 +8008,23 @@ mod tests {
 
     struct LocalChatServer {
         uri: String,
+        /// Connections whose client hung up while their reply was held on
+        /// the gate: a caller that dropped its request mid-flight, which is
+        /// what a cancelled tool loop does. Always zero for an ungated server.
+        hung_up_before_release: Arc<std::sync::atomic::AtomicUsize>,
         _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl LocalChatServer {
+        /// A server with no gate, so nothing is ever held and nothing can
+        /// hang up while held.
+        fn ungated(uri: String, task: tokio::task::JoinHandle<()>) -> Self {
+            Self {
+                uri,
+                hung_up_before_release: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                _task: task,
+            }
+        }
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -7936,7 +8108,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_primary_failure_then_final_chat_server()
@@ -7970,7 +8142,7 @@ mod tests {
             .await;
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_tool_call_chat_server() -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>)
@@ -7994,7 +8166,7 @@ mod tests {
             .await;
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_text_tool_then_final_chat_server() -> (
@@ -8027,7 +8199,7 @@ mod tests {
         });
 
         (
-            LocalChatServer { uri, _task: task },
+            LocalChatServer::ungated(uri, task),
             requests,
             request_bodies,
         )
@@ -8047,7 +8219,7 @@ mod tests {
             tokio::time::sleep(delay).await;
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
@@ -8088,7 +8260,7 @@ mod tests {
             }
         });
 
-        LocalChatServer { uri, _task: task }
+        LocalChatServer::ungated(uri, task)
     }
 
     async fn start_final_chat_server(contents: Vec<&'static str>) -> LocalChatServer {
@@ -8118,7 +8290,7 @@ mod tests {
             }
         });
 
-        LocalChatServer { uri, _task: task }
+        LocalChatServer::ungated(uri, task)
     }
 
     async fn assert_stored_for_target_only(fixture: &DelegateMemoryFixture, key: &str) {
@@ -10462,7 +10634,8 @@ mod tests {
                 delegation_policy: DelegationPolicy {
                     mode: DelegationMode::Allow,
                 },
-                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                // The bounded child inherits only what its caller holds.
+                allowed_tools: vec![DelegateTool::NAME.to_string(), "echo_tool".to_string()],
                 ..RiskProfileConfig::default()
             },
         );
@@ -10801,7 +10974,8 @@ mod tests {
                 delegation_policy: DelegationPolicy {
                     mode: DelegationMode::Allow,
                 },
-                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                // The bounded child inherits only what its caller holds.
+                allowed_tools: vec![DelegateTool::NAME.to_string(), "gate_tool".to_string()],
                 ..RiskProfileConfig::default()
             },
         );
@@ -12917,6 +13091,70 @@ mod tests {
         assert!(token.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn in_turn_child_tokens_follow_the_running_turn() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+
+        let turn = CancellationToken::new();
+        let bound = zeroclaw_api::tool::ToolExecutionContext::new(Some(turn.clone()))
+            .run(async { Ok(tool.turn_bound_child_token()) })
+            .await
+            .unwrap();
+        assert!(!bound.is_cancelled());
+        turn.cancel();
+        assert!(
+            bound.is_cancelled(),
+            "aborting the turn reaches its children"
+        );
+        assert!(
+            !tool.cancellation_token().is_cancelled(),
+            "the tool's own token, which background tasks use, is untouched"
+        );
+
+        let detached = tool.turn_bound_child_token();
+        assert!(!detached.is_cancelled());
+        tool.cancel_all_background_tasks();
+        assert!(
+            detached.is_cancelled(),
+            "outside a turn the child falls back to the tool's own token"
+        );
+    }
+
+    /// The bounded child's own delegate tool is built inside a spawned task,
+    /// where the turn's task-local token is not visible, so it is handed the
+    /// turn lineage separately. Its foreground children follow that lineage;
+    /// its own token, which its background tasks derive from, stays apart
+    /// from the turn in both directions.
+    #[tokio::test]
+    async fn handed_turn_lineage_binds_foreground_children_without_touching_background_lineage() {
+        let turn = CancellationToken::new();
+        let mut tool = DelegateTool::new(sample_agents(), None, test_security());
+        tool.turn_token = Some(turn.child_token());
+
+        let foreground = tool.turn_bound_child_token();
+        assert!(!foreground.is_cancelled());
+        turn.cancel();
+        assert!(
+            foreground.is_cancelled(),
+            "outside a turn scope the handed lineage still reaches foreground children"
+        );
+        assert!(
+            !tool.cancellation_token().is_cancelled(),
+            "the turn does not reach the token background tasks descend from"
+        );
+
+        let turn = CancellationToken::new();
+        let mut tool = DelegateTool::new(sample_agents(), None, test_security());
+        tool.turn_token = Some(turn.child_token());
+        let foreground = tool.turn_bound_child_token();
+        tool.cancel_all_background_tasks();
+        assert!(
+            !foreground.is_cancelled(),
+            "cancelling background work does not reach the turn's foreground children"
+        );
+        assert!(!turn.is_cancelled());
+    }
+
     #[test]
     fn with_cancellation_token_replaces_default() {
         let custom_token = CancellationToken::new();
@@ -14505,6 +14743,7 @@ mod tests {
         Sync,
         Background,
         Parallel,
+        ParallelMany(&'static [&'static str]),
         ListResults,
     }
 
@@ -14513,6 +14752,344 @@ mod tests {
     /// result is in history the final text closes the loop. The tool-result
     /// message is captured so tests can assert exactly what the sub-agent's
     /// delegation returned to the delegating loop.
+    /// Stopping the root turn stops every worker of a parallel fan-out. The
+    /// workers run in spawned tasks with no turn scope of their own, so this
+    /// is the path that depends on the lineage handed to the worker's tool.
+    #[tokio::test]
+    async fn cancelling_the_root_turn_stops_every_parallel_worker() {
+        let temp = TempDir::new().unwrap();
+        // Each worker's model first asks for one more delegation, so a worker
+        // that is still alive after the cancel makes a second request. The
+        // replies are held until the test releases them, after the cancel.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (server, captured) = start_scripted_chat_server_released_by(
+            &[
+                chat_completion_tool_call(
+                    DelegateTool::NAME,
+                    "call_more_a",
+                    serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+                ),
+                chat_completion_tool_call(
+                    DelegateTool::NAME,
+                    "call_more_b",
+                    serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+                ),
+                serde_json::json!({"choices": [{"message": {"content": "worker finished"}}]}),
+                serde_json::json!({"choices": [{"message": {"content": "worker finished"}}]}),
+            ],
+            Some(Arc::clone(&release)),
+        )
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap3"),
+                ("middle", &["leaf", "other"], "cap3"),
+                ("leaf", &["deep"], "cap3"),
+                ("other", &["deep"], "cap3"),
+                ("deep", &[], "cap3"),
+            ],
+            &[("cap3", 3, 20)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = Arc::new(DelegateCallThenFinalModelProvider::new_parallel_many(&[
+            "leaf", "other",
+        ]));
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let turn = CancellationToken::new();
+        let foreground = {
+            let turn = turn.clone();
+            let provider = Arc::clone(&provider);
+            zeroclaw_spawn::spawn!(async move {
+                zeroclaw_api::tool::ToolExecutionContext::new(Some(turn))
+                    .run(async move {
+                        tool.execute_agentic(
+                            "middle",
+                            &middle_config,
+                            "custom.local",
+                            "test-model",
+                            provider.as_ref(),
+                            "fan out, then get stopped",
+                            None,
+                        )
+                        .await
+                    })
+                    .await
+            })
+        };
+
+        // Both workers are up, each waiting in its first model call.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if captured.lock().unwrap().len() >= 2 {
+                break;
+            }
+            assert!(
+                provider.tool_message().is_none(),
+                "the fan-out settled before its workers reached the provider: {:?}",
+                provider.tool_message().map(|m| decoded_tool_message(&m))
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the parallel workers never started"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        turn.cancel();
+
+        // Each worker's exit is observed, not inferred: a cancelled tool loop
+        // drops its in-flight model call, and the server sees that client
+        // hang up while its reply is still held on the gate.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let hung_up = server
+                .hung_up_before_release
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if hung_up >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {hung_up} of 2 parallel workers dropped its model call after the cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        release.notify_one();
+        release.notify_one();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), foreground)
+            .await
+            .expect("the fan-out must stop once the turn is cancelled")
+            .expect("the foreground task must not panic");
+        match outcome {
+            Ok(result) => assert!(
+                !result.success,
+                "the cancelled fan-out must not report success: {result:?}"
+            ),
+            Err(error) => assert!(
+                error.to_string().to_lowercase().contains("cancel"),
+                "unexpected foreground error: {error:#}"
+            ),
+        }
+
+        // Both workers hung up before anything was released, so neither
+        // could have acted on a reply: the request log holds their two
+        // first requests and nothing else.
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "every parallel worker must stop with the turn, not go on to a second request: {bodies:?}"
+        );
+    }
+
+    /// Middle's model for the turn-cancellation test: the first call launches
+    /// `target_agent` in the background, the call after the tool result
+    /// records the receipt and then hangs, so the foreground worker ends only
+    /// because the turn it belongs to is cancelled.
+    struct DelegateBackgroundThenHangModelProvider {
+        target_agent: &'static str,
+        tool_message: std::sync::Mutex<Option<String>>,
+    }
+
+    impl DelegateBackgroundThenHangModelProvider {
+        fn new(target_agent: &'static str) -> Self {
+            Self {
+                target_agent,
+                tool_message: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn tool_message(&self) -> Option<String> {
+            self.tool_message.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for DelegateBackgroundThenHangModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
+                *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                return Ok(ChatResponse {
+                    text: Some("middle finished after all".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_leaf_bg".to_string(),
+                    name: DelegateTool::NAME.to_string(),
+                    arguments: serde_json::json!({
+                        "agent": self.target_agent,
+                        "prompt": "subtask from parent loop",
+                        "background": true
+                    })
+                    .to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for DelegateBackgroundThenHangModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "DelegateBackgroundThenHangModelProvider"
+        }
+    }
+
+    /// Stopping the root turn stops the foreground child it started and
+    /// spares the background grandchild that child launched: the two
+    /// cancellation lineages stay apart through a nested delegate tool.
+    #[tokio::test]
+    async fn cancelling_the_root_turn_stops_the_foreground_child_and_spares_its_background_grandchild()
+     {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_turn_cancel_spares_bg_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let temp = TempDir::new().unwrap();
+        // The leaf's model answers only once the test releases it, after the
+        // root turn has been cancelled, so the leaf cannot complete early and
+        // let a wrong lineage pass unnoticed.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (server, _captured) = start_scripted_chat_server_released_by(
+            &[serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]})],
+            Some(Arc::clone(&release)),
+        )
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap2"),
+                ("middle", &["leaf"], "cap2"),
+                ("leaf", &[], "cap2"),
+            ],
+            &[("cap2", 2, 20)],
+        );
+        let task_store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let mut tool = bounded_subdelegation_tool(&config)
+            .with_workspace_dir(workspace.clone())
+            .with_task_control_plane(task_control_plane(Arc::clone(&task_store)));
+        let reader = bounded_subdelegation_tool(&config)
+            .with_workspace_dir(workspace.clone())
+            .with_task_control_plane(task_control_plane(Arc::clone(&task_store)));
+        let provider = Arc::new(DelegateBackgroundThenHangModelProvider::new("leaf"));
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let turn = CancellationToken::new();
+        // Hand the lineage to the child without wrapping its future in an
+        // outer cancellation select: this must prove the child loop stops.
+        tool.turn_token = Some(turn.clone());
+        let foreground = {
+            let provider = Arc::clone(&provider);
+            zeroclaw_spawn::spawn!(async move {
+                tool.execute_agentic(
+                    "middle",
+                    &middle_config,
+                    "custom.local",
+                    "test-model",
+                    provider.as_ref(),
+                    "background hop, then hang",
+                    None,
+                )
+                .await
+            })
+        };
+
+        // Both workers are up: middle has launched leaf in the background and
+        // is sitting in its hanging model call.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tool_message = loop {
+            if let Some(message) = provider.tool_message() {
+                break message;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "middle never received the background receipt"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let task_id = decoded_tool_message(&tool_message)
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .map(str::trim)
+            .map(str::to_string)
+            .expect("background delegation must report a task_id");
+
+        turn.cancel();
+        release.notify_one();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), foreground)
+            .await
+            .expect("the foreground child must stop once the turn is cancelled")
+            .expect("the foreground task must not panic");
+        match outcome {
+            Ok(result) => assert!(
+                !result.success,
+                "the cancelled foreground child must not report success: {result:?}"
+            ),
+            Err(error) => assert!(
+                error.to_string().to_lowercase().contains("cancel"),
+                "unexpected foreground error: {error:#}"
+            ),
+        }
+
+        let waited = wait_for_terminal_background_result(&reader, &task_id).await;
+        assert_eq!(
+            waited.status,
+            BackgroundTaskStatus::Completed,
+            "the background grandchild must outlive the cancelled turn: {waited:?}"
+        );
+        assert!(
+            waited
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("leaf finished"),
+            "the background grandchild must deliver its result: {waited:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     struct DelegateCallThenFinalModelProvider {
         target_agent: &'static str,
         transport: MockDelegationTransport,
@@ -14530,6 +15107,10 @@ mod tests {
 
         fn new_parallel(target_agent: &'static str) -> Self {
             Self::with_transport(target_agent, MockDelegationTransport::Parallel)
+        }
+
+        fn new_parallel_many(targets: &'static [&'static str]) -> Self {
+            Self::with_transport(targets[0], MockDelegationTransport::ParallelMany(targets))
         }
 
         fn new_list_results() -> Self {
@@ -14590,6 +15171,10 @@ mod tests {
                     "parallel": [self.target_agent],
                     "prompt": "subtask from parent loop"
                 }),
+                MockDelegationTransport::ParallelMany(targets) => serde_json::json!({
+                    "parallel": targets,
+                    "prompt": "subtask from parent loop"
+                }),
                 MockDelegationTransport::ListResults => {
                     serde_json::json!({"action": "list_results"})
                 }
@@ -14638,31 +15223,96 @@ mod tests {
     async fn start_scripted_chat_server(
         responses: &[serde_json::Value],
     ) -> (LocalChatServer, Arc<std::sync::Mutex<Vec<String>>>) {
+        start_scripted_chat_server_released_by(responses, None).await
+    }
+
+    /// Like `start_scripted_chat_server`, but every response waits for one
+    /// `release.notify_one()` first, so a sub-agent served by it is still
+    /// running until the test lets it finish.
+    async fn start_scripted_chat_server_released_by(
+        responses: &[serde_json::Value],
+        release: Option<Arc<tokio::sync::Notify>>,
+    ) -> (LocalChatServer, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let uri = format!("http://{}", listener.local_addr().unwrap());
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_clone = Arc::clone(&captured);
-        let scripted: Vec<serde_json::Value> = responses.to_vec();
+        let scripted: Arc<Vec<serde_json::Value>> = Arc::new(responses.to_vec());
+        let hung_up = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hung_up_for_server = Arc::clone(&hung_up);
         let task = zeroclaw_spawn::spawn!(async move {
-            let mut served = 0;
+            let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
-                let request = read_http_request(&mut socket).await;
-                captured_clone
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&request).to_string());
-                let response = scripted.get(served).cloned().unwrap_or_else(|| {
-                    serde_json::json!({"error": {"message": "unexpected extra provider request"}})
-                });
-                write_json_response(&mut socket, response).await;
-                served += 1;
+                let captured = Arc::clone(&captured_clone);
+                let scripted = Arc::clone(&scripted);
+                let served = Arc::clone(&served);
+                let hung_up = Arc::clone(&hung_up_for_server);
+                let gated = release.is_some();
+                let release = release.clone();
+                let serve = async move {
+                    let request = read_http_request(&mut socket).await;
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request).to_string());
+                    let index = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = scripted.get(index).cloned().unwrap_or_else(|| {
+                        serde_json::json!({"error": {"message": "unexpected extra provider request"}})
+                    });
+                    if let Some(release) = &release {
+                        // A held reply waits for the gate, unless the client
+                        // hangs up first: that is the exit signal a cancelled
+                        // caller gives, and it is counted instead of served.
+                        tokio::select! {
+                            () = release.notified() => {}
+                            () = client_hung_up(&mut socket) => {
+                                hung_up.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                    }
+                    write_json_response(&mut socket, response).await;
+                };
+                // Held replies must not hold the listener: a gated server
+                // serves its connections concurrently, so several callers can
+                // be waiting on the gate at once. Ungated ones keep the
+                // request order the scripted replies rely on.
+                if gated {
+                    zeroclaw_spawn::spawn!(serve);
+                } else {
+                    serve.await;
+                }
             }
         });
 
-        (LocalChatServer { uri, _task: task }, captured)
+        (
+            LocalChatServer {
+                uri,
+                hung_up_before_release: hung_up,
+                _task: task,
+            },
+            captured,
+        )
+    }
+
+    /// Resolves once the peer closes `socket` (or it errors). Bytes the peer
+    /// sends while a reply is held are drained and ignored.
+    async fn client_hung_up(socket: &mut tokio::net::TcpStream) {
+        let mut scratch = [0u8; 64];
+        loop {
+            if socket.readable().await.is_err() {
+                return;
+            }
+            match socket.try_read(&mut scratch) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
     }
 
     async fn start_final_text_chat_server(
@@ -16107,6 +16757,8 @@ command = "echo hi"
     struct FullTargetProbeProvider {
         system_prompts: std::sync::Mutex<Vec<String>>,
         tool_messages: std::sync::Mutex<Vec<String>>,
+        native_tools: bool,
+        request_tool_names: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     #[cfg(unix)]
@@ -16128,6 +16780,10 @@ command = "echo hi"
     #[cfg(unix)]
     #[async_trait]
     impl ModelProvider for FullTargetProbeProvider {
+        fn supports_native_tools(&self) -> bool {
+            self.native_tools
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -16154,6 +16810,14 @@ command = "echo hi"
                     .unwrap()
                     .push(system.content.clone());
             }
+            self.request_tool_names.lock().unwrap().push(
+                request
+                    .tools
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect(),
+            );
             let tool_messages: Vec<String> = request
                 .messages
                 .iter()
@@ -16232,7 +16896,11 @@ command = "echo hi"
             "target".to_string(),
             RiskProfileConfig {
                 level: zeroclaw_config::autonomy::AutonomyLevel::Full,
-                allowed_tools: vec!["shell".to_string()],
+                allowed_tools: vec![
+                    "shell".to_string(),
+                    "memory_forget".to_string(),
+                    "tool_search".to_string(),
+                ],
                 ..RiskProfileConfig::default()
             },
         );
@@ -16241,6 +16909,8 @@ command = "echo hi"
             RuntimeProfileConfig {
                 agentic: true,
                 max_tool_iterations: 2,
+                deferred_builtin_tools: true,
+                strict_tool_parsing: false,
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -16281,63 +16951,88 @@ command = "echo hi"
             .with_runtime_profiles(config.runtime_profiles.clone())
             .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
         let target = config.agents.get("target").unwrap();
-        let provider = FullTargetProbeProvider::default();
+        for native_tools in [false, true] {
+            let provider = FullTargetProbeProvider {
+                native_tools,
+                ..Default::default()
+            };
 
-        let result = delegate
-            .execute_agentic(
-                "target",
-                target,
-                "test",
-                "test-model",
-                &provider,
-                "echo the marker phrase",
-                None,
-            )
-            .await
-            .unwrap();
+            let result = delegate
+                .execute_agentic(
+                    "target",
+                    target,
+                    "test",
+                    "test-model",
+                    &provider,
+                    "echo the marker phrase",
+                    None,
+                )
+                .await
+                .unwrap();
 
-        assert!(
-            result.success,
-            "independent Full target must complete: {result:?}"
-        );
+            assert!(
+                result.success,
+                "independent Full target must complete: {result:?}"
+            );
 
-        // Prompt side: the enriched prompt states the target manager's exact
-        // Full + empty-always_ask contract, not generic Supervised guidance.
-        let prompt = provider.system_prompt();
-        assert!(
-            prompt
-                .contains("Full autonomy auto-approves tools that are not listed in `always_ask`"),
-            "Full target prompt must state the Full contract, got: {prompt}"
-        );
-        assert!(
-            prompt.contains("No tools are listed in `always_ask`"),
-            "Full target with no always_ask must see the empty-list contract, got: {prompt}"
-        );
-        assert!(
-            !prompt.contains("Ask for approval when the runtime policy requires it"),
-            "Full target must not receive generic Supervised guidance, got: {prompt}"
-        );
+            // Prompt side: the enriched prompt states the target manager's exact
+            // Full + empty-always_ask contract, not generic Supervised guidance.
+            let prompt = provider.system_prompt();
+            assert!(
+                prompt.contains("memory_forget - "),
+                "target must discover its deferred built-in: {prompt}"
+            );
+            assert!(
+                !prompt.contains("**memory_forget**"),
+                "text prompts must omit the deferred definition: {prompt}"
+            );
+            assert!(
+                !prompt.contains("delegate - "),
+                "removed recursion must not enter discovery"
+            );
+            if native_tools {
+                let requests = provider.request_tool_names.lock().unwrap();
+                assert!(requests[0].iter().any(|name| name == "tool_search"));
+                assert!(requests[0].iter().any(|name| name == "shell"));
+                assert!(!requests[0].iter().any(|name| name == "memory_forget"));
+            }
+            assert!(
+                prompt.contains(
+                    "Full autonomy auto-approves tools that are not listed in `always_ask`"
+                ),
+                "Full target prompt must state the Full contract, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("No tools are listed in `always_ask`"),
+                "Full target with no always_ask must see the empty-list contract, got: {prompt}"
+            );
+            assert!(
+                !prompt.contains("Ask for approval when the runtime policy requires it"),
+                "Full target must not receive generic Supervised guidance, got: {prompt}"
+            );
 
-        // Enforcement side: the uncovered tool executed directly — the tool
-        // result carries the real command output, not an approval denial.
-        let tool_messages = provider.tool_messages();
-        assert!(
-            tool_messages
-                .iter()
-                .any(|message| message.contains("delegate-full-ran")),
-            "uncovered Full tool must execute and report real output: {tool_messages:?}"
-        );
-        assert!(
-            !tool_messages
-                .iter()
-                .any(|message| message.contains("requires approval")),
-            "uncovered Full tool must not be gated: {tool_messages:?}"
-        );
+            // Enforcement side: the uncovered tool executed directly — the tool
+            // result carries the real command output, not an approval denial.
+            let tool_messages = provider.tool_messages();
+            assert!(
+                tool_messages
+                    .iter()
+                    .any(|message| message.contains("delegate-full-ran")),
+                "uncovered Full tool must execute and report real output: {tool_messages:?}"
+            );
+            assert!(
+                !tool_messages
+                    .iter()
+                    .any(|message| message.contains("requires approval")),
+                "uncovered Full tool must not be gated: {tool_messages:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn independent_delegate_denies_prompt_required_skill_tools_without_approval_route() {
+    fn independent_approval_fixture(
+        profile: Option<RiskProfileConfig>,
+    ) -> (TempDir, PathBuf, Arc<Config>, DelegateTool) {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
@@ -16380,14 +17075,14 @@ command = "rm independent-delegate-marker"
         );
         config.risk_profiles.insert(
             "target".to_string(),
-            RiskProfileConfig {
+            profile.unwrap_or(RiskProfileConfig {
                 level: AutonomyLevel::Supervised,
                 allowed_commands: vec!["rm".to_string()],
                 allowed_tools: vec!["shell".to_string()],
                 block_high_risk_commands: true,
                 require_approval_for_medium_risk: true,
                 ..RiskProfileConfig::default()
-            },
+            }),
         );
         config.runtime_profiles.insert(
             "agentic".to_string(),
@@ -16433,6 +17128,13 @@ command = "rm independent-delegate-marker"
             .with_risk_profiles(config.risk_profiles.clone())
             .with_runtime_profiles(config.runtime_profiles.clone())
             .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+        (tmp, marker, config, delegate)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn independent_delegate_denies_prompt_required_skill_tools_without_approval_route() {
+        let (_tmp, marker, config, delegate) = independent_approval_fixture(None);
         let target = config.agents.get("target").unwrap();
         let provider = IndependentRiskPolicyModelProvider::default();
 
@@ -16470,6 +17172,345 @@ command = "rm independent-delegate-marker"
             }),
             "built-in shell must still receive approved=false and enforce command policy: {tool_messages:?}"
         );
+    }
+
+    #[cfg(unix)]
+    struct DelegateApprovalProbeChannel {
+        responses: std::sync::Mutex<
+            std::collections::VecDeque<Option<zeroclaw_api::channel::ChannelApprovalResponse>>,
+        >,
+        requests: std::sync::Mutex<Vec<(String, zeroclaw_api::channel::ChannelApprovalRequest)>>,
+    }
+
+    #[cfg(unix)]
+    impl ::zeroclaw_api::attribution::Attributable for DelegateApprovalProbeChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Cli,
+            )
+        }
+        fn alias(&self) -> &str {
+            "approval-probe"
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl zeroclaw_api::channel::Channel for DelegateApprovalProbeChannel {
+        fn name(&self) -> &str {
+            "approval-probe"
+        }
+        async fn send(&self, _: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_approval(
+            &self,
+            recipient: &str,
+            request: &zeroclaw_api::channel::ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((recipient.into(), request.clone()));
+            Ok(self.responses.lock().unwrap().pop_front().flatten())
+        }
+    }
+
+    #[cfg(unix)]
+    fn delegate_approval_profile(always_ask: bool) -> RiskProfileConfig {
+        RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            allowed_commands: vec!["rm".into()],
+            allowed_tools: vec!["shell".into()],
+            always_ask: if always_ask {
+                vec!["shell".into()]
+            } else {
+                Vec::new()
+            },
+            approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                approver_channel: "ops".into(),
+                approver_recipient: Some("operator".into()),
+                timeout_secs: 1,
+                ..Default::default()
+            }),
+            ..RiskProfileConfig::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn independent_delegate_approval_route_gates_real_shell_and_scopes_grants() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        // A supervised shell must ask through its target's route. Always from
+        // the first child must not approve the next child automatically.
+        let (_tmp, marker, config, delegate) =
+            independent_approval_fixture(Some(delegate_approval_profile(false)));
+        let channel = Arc::new(DelegateApprovalProbeChannel {
+            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                Some(ChannelApprovalResponse::AlwaysApprove),
+                Some(ChannelApprovalResponse::Deny),
+            ])),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let handles = Arc::new(RwLock::new(HashMap::from([(
+            "ops".into(),
+            Arc::clone(&channel) as Arc<dyn zeroclaw_api::channel::Channel>,
+        )])));
+        for approved in [true, false] {
+            std::fs::write(&marker, b"must survive denial").unwrap();
+            let provider = ApprovalProbeModelProvider {
+                tool_name: "shell",
+                tool_arguments: json!({
+                    "command": "rm independent-delegate-marker",
+                    "approved": true,
+                })
+                .to_string(),
+                tool_messages: std::sync::Mutex::new(Vec::new()),
+            };
+            let result = delegate
+                .execute_agentic_with_approval_registry(
+                    "target",
+                    &config.agents["target"],
+                    "test",
+                    "test-model",
+                    &provider,
+                    "remove the marker",
+                    None,
+                    DelegateAdmission::Required,
+                    DelegateApprovalContext {
+                        target_config: Some(&config),
+                        registry: &|_| Some(Arc::clone(&handles)),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(result.success, "{result:?}");
+            assert_eq!(
+                marker.exists(),
+                !approved,
+                "approval must control the actual command"
+            );
+            if !approved {
+                assert!(
+                    provider
+                        .tool_messages
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|message| message.contains("Denied by user"))
+                );
+            }
+        }
+        let requests = channel.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "Always must stay within the first child run"
+        );
+        for (recipient, request) in requests.iter() {
+            assert_eq!(recipient, "operator");
+            assert_eq!(request.tool_name, "shell");
+            assert!(
+                request
+                    .arguments_summary
+                    .starts_with("Independent delegate \"target\" from \"caller\"\n")
+            );
+            assert_eq!(
+                request.raw_arguments.as_ref().unwrap()["approved"],
+                false,
+                "model-supplied approval must be cleared before asking the operator"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn independent_delegate_always_ask_route_dispatches_only_with_operator_approval() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        // Foreground and parallel workers use normal admission; detached
+        // background workers use the prevalidated path.
+        for admission in [DelegateAdmission::Required, DelegateAdmission::Prevalidated] {
+            for response in [Some(ChannelApprovalResponse::Approve), None] {
+                let approved = response.is_some();
+                let (_tmp, marker, config, mut delegate) =
+                    independent_approval_fixture(Some(delegate_approval_profile(true)));
+                assert!(
+                    delegate
+                        .unsupported_agentic_always_ask_refusal_from_config(&config, "target")
+                        .is_none()
+                );
+                if admission == DelegateAdmission::Prevalidated {
+                    delegate.security =
+                        Arc::new(SecurityPolicy::for_agent(&config, "target").unwrap());
+                }
+                let channel = Arc::new(DelegateApprovalProbeChannel {
+                    responses: std::sync::Mutex::new(std::collections::VecDeque::from([response])),
+                    requests: std::sync::Mutex::new(Vec::new()),
+                });
+                let handles = Arc::new(RwLock::new(HashMap::from([(
+                    "ops".into(),
+                    channel as Arc<dyn zeroclaw_api::channel::Channel>,
+                )])));
+                let provider = ApprovalProbeModelProvider {
+                    tool_name: "shell",
+                    tool_arguments:
+                        json!({"command": "rm independent-delegate-marker", "approved": true})
+                            .to_string(),
+                    tool_messages: std::sync::Mutex::new(Vec::new()),
+                };
+                let result = delegate
+                    .execute_agentic_with_approval_registry(
+                        "target",
+                        &config.agents["target"],
+                        "test",
+                        "test-model",
+                        &provider,
+                        "remove the marker",
+                        None,
+                        admission,
+                        DelegateApprovalContext {
+                            target_config: Some(&config),
+                            registry: &|_| Some(Arc::clone(&handles)),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(marker.exists(), !approved);
+                if !approved {
+                    assert!(
+                        provider
+                            .tool_messages
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|message| message.contains("no operator decision was available"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn independent_delegate_configured_route_without_registry_controls_shell_execution() {
+        // A configured route is authoritative even in a channel-less process.
+        // Compare actual shell output with no route and explicit policy grants.
+        for (route, full, auto_approve, always_ask, executes) in [
+            (false, false, false, false, true),
+            (true, false, false, false, false),
+            (true, false, true, false, true),
+            (true, true, false, false, true),
+            (true, true, false, true, false),
+        ] {
+            let mut profile = delegate_approval_profile(always_ask);
+            profile.allowed_commands = vec!["cat".into()];
+            if !route {
+                profile.approval_route = None;
+            }
+            if full {
+                profile.level = AutonomyLevel::Full;
+            }
+            if auto_approve {
+                profile.auto_approve = vec!["shell".into()];
+            }
+            let (_tmp, marker, config, delegate) = independent_approval_fixture(Some(profile));
+            std::fs::write(&marker, b"registry-none-control-marker").unwrap();
+            let provider = ApprovalProbeModelProvider {
+                tool_name: "shell",
+                tool_arguments:
+                    json!({"command": "cat independent-delegate-marker", "approved": true})
+                        .to_string(),
+                tool_messages: std::sync::Mutex::new(Vec::new()),
+            };
+            let result = delegate
+                .execute_agentic_with_approval_registry(
+                    "target",
+                    &config.agents["target"],
+                    "test",
+                    "test-model",
+                    &provider,
+                    "read the marker",
+                    None,
+                    DelegateAdmission::Required,
+                    DelegateApprovalContext {
+                        target_config: Some(&config),
+                        registry: &|_| None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(result.success, "{result:?}");
+            let messages = provider.tool_messages.lock().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("registry-none-control-marker")),
+                executes,
+                "route={route}, full={full}, auto_approve={auto_approve}, always_ask={always_ask}: {messages:?}"
+            );
+            if !executes {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| { message.contains("no operator decision was available") })
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn independent_delegate_approval_route_missing_channel_never_inherits_originator() {
+        for inherit in [false, true] {
+            let mut profile = delegate_approval_profile(true);
+            if inherit {
+                profile.approval_route.as_mut().unwrap().on_no_approver =
+                    zeroclaw_config::autonomy::OnNoApprover::InheritOriginator;
+            }
+            let (_tmp, marker, config, delegate) = independent_approval_fixture(Some(profile));
+            let provider = ApprovalProbeModelProvider {
+                tool_name: "shell",
+                tool_arguments:
+                    json!({"command": "rm independent-delegate-marker", "approved": true})
+                        .to_string(),
+                tool_messages: std::sync::Mutex::new(Vec::new()),
+            };
+            let handles = Arc::new(RwLock::new(HashMap::new()));
+            let result = delegate
+                .execute_agentic_with_approval_registry(
+                    "target",
+                    &config.agents["target"],
+                    "test",
+                    "test-model",
+                    &provider,
+                    "remove the marker",
+                    None,
+                    DelegateAdmission::Required,
+                    DelegateApprovalContext {
+                        target_config: Some(&config),
+                        registry: &|_| Some(Arc::clone(&handles)),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(result.success, "{result:?}");
+            assert!(marker.exists());
+            assert!(
+                provider
+                    .tool_messages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message.contains("no operator decision was available"))
+            );
+        }
     }
 
     // Finding: an independent delegate to a non-native, strict-tool-parsing target must
@@ -17502,6 +18543,222 @@ command = "rm independent-delegate-marker"
         }
     }
 
+    /// A bounded child never holds a tool its caller is denied by name, in
+    /// either execution mode. The caller allows only `delegate` and the
+    /// target also allows `file_read`; the real factory, scoped caller
+    /// registry and builtin stack run, and the scripted provider records
+    /// what the child was offered and what its `file_read` calls returned.
+    #[tokio::test]
+    async fn bounded_background_delegate_applies_caller_tool_name_filter() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            for background in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let outside = temp.path().join("outside-caller.txt");
+                std::fs::write(&outside, "outside-caller-text").unwrap();
+                let (server, captured) = start_scripted_chat_server(&[
+                    chat_completion_tool_call(
+                        "file_read",
+                        "call_inside",
+                        json!({"path": "caller-name-filter.txt"}),
+                    ),
+                    chat_completion_tool_call(
+                        "file_read",
+                        "call_outside",
+                        json!({"path": outside.to_str().unwrap()}),
+                    ),
+                    json!({"choices": [{"message": {"content": "child finished"}}]}),
+                ])
+                .await;
+                let mut config = bounded_depth_matrix_fixture(
+                    &temp,
+                    &server.uri,
+                    &[("caller", &["target"], "loop"), ("target", &[], "loop")],
+                    &[("loop", 3, 100)],
+                );
+                {
+                    let config = Arc::get_mut(&mut config).unwrap();
+                    for alias in ["caller", "target"] {
+                        let profile = config.risk_profiles.get_mut(alias).unwrap();
+                        profile.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+                        profile.allowed_tools = vec![DelegateTool::NAME.to_string()];
+                        profile.auto_approve = vec![DelegateTool::NAME.to_string()];
+                    }
+                    config
+                        .risk_profiles
+                        .get_mut("target")
+                        .unwrap()
+                        .allowed_tools
+                        .push("file_read".to_string());
+                    config.plugins.enabled = false;
+                }
+                let caller = Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap());
+                assert!(caller.is_tool_allowed(DelegateTool::NAME));
+                assert!(!caller.is_tool_allowed("file_read"));
+                let canary = "caller-workspace-name-filter-canary";
+                std::fs::write(caller.workspace_dir.join("caller-name-filter.txt"), canary)
+                    .unwrap();
+                let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+                    Arc::new(zeroclaw_memory::none::NoneMemory::new("caller"));
+                let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
+                    Arc::new(crate::platform::NativeRuntime::new());
+                let built = crate::tools::all_tools_with_runtime(
+                    Arc::clone(&config),
+                    &caller,
+                    config.risk_profiles.get("caller").unwrap(),
+                    "caller",
+                    Arc::clone(&runtime),
+                    memory,
+                    None,
+                    None,
+                    &config.browser,
+                    &config.http_request,
+                    &config.web_fetch,
+                    &caller.workspace_dir,
+                    &config.agents,
+                    None,
+                    &config,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let delegate = Arc::clone(built.delegate_tool.as_ref().unwrap());
+                assert!(
+                    delegate
+                        .task_control_plane
+                        .set(task_control_plane(Arc::new(
+                            SqliteTaskStore::new_in_memory().unwrap(),
+                        )))
+                        .is_ok()
+                );
+                let scoped = crate::tools::scoped::ScopedToolRegistry::assemble(
+                    crate::tools::scoped::ScopedAssembly {
+                        config: &config,
+                        agent_alias: "caller",
+                        security: &caller,
+                        built,
+                        skills: &[],
+                        runtime,
+                        caller_allowed: None,
+                        connect_mcp: false,
+                        connect_peripherals: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: false,
+                        emit_assembly_logs: false,
+                        mcp_registry: None,
+                    },
+                )
+                .await;
+                // The caller's own registry is name-filtered, the target's
+                // policy admits `file_read`, and the inherited source still
+                // holds the builtin: only the caller filter can drop it.
+                assert!(
+                    scoped
+                        .registry
+                        .iter()
+                        .any(|tool| tool.name() == DelegateTool::NAME)
+                );
+                assert!(
+                    !scoped
+                        .registry
+                        .iter()
+                        .any(|tool| tool.name() == "file_read")
+                );
+                assert!(
+                    delegate
+                        .policy_for_target("target")
+                        .unwrap()
+                        .is_tool_allowed("file_read")
+                );
+                assert!(
+                    delegate
+                        .parent_tools
+                        .read()
+                        .iter()
+                        .any(|tool| tool.name() == "file_read")
+                );
+
+                let result = delegate
+                    .execute(json!({
+                        "agent": "target",
+                        "prompt": "read the files",
+                        "background": background,
+                    }))
+                    .await
+                    .unwrap();
+                assert!(result.success, "background={background}: {result:?}");
+                if background {
+                    let task_id = result
+                        .output
+                        .lines()
+                        .find_map(|line| line.strip_prefix("task_id: "))
+                        .unwrap();
+                    let terminal = wait_for_terminal_background_result(&delegate, task_id).await;
+                    assert_eq!(
+                        terminal.status,
+                        BackgroundTaskStatus::Completed,
+                        "{terminal:?}"
+                    );
+                }
+                server._task.abort();
+                assert!(server._task.await.unwrap_err().is_cancelled());
+
+                let bodies = captured.lock().unwrap().clone();
+                assert_eq!(bodies.len(), 3, "background={background}: {bodies:?}");
+                let requests: Vec<serde_json::Value> = bodies
+                    .iter()
+                    .map(|body| {
+                        serde_json::from_str(body.split_once("\r\n\r\n").unwrap().1).unwrap()
+                    })
+                    .collect();
+                let names: Vec<&str> = requests[0]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["function"]["name"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    names,
+                    [DelegateTool::NAME],
+                    "background={background}: child offered a caller-denied tool"
+                );
+                let outputs: Vec<String> = requests[1..]
+                    .iter()
+                    .map(|request| {
+                        let message = request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .rev()
+                            .find(|message| message["role"] == "tool")
+                            .unwrap();
+                        decoded_tool_message(message["content"].as_str().unwrap())
+                    })
+                    .collect();
+                for output in &outputs {
+                    assert!(
+                        output.contains("Unknown tool: file_read"),
+                        "background={background}: {outputs:?}"
+                    );
+                    assert!(
+                        !output.contains(canary),
+                        "background={background}: {outputs:?}"
+                    );
+                    assert!(
+                        !output.contains("outside-caller-text"),
+                        "background={background}: {outputs:?}"
+                    );
+                }
+            }
+        })
+        .await
+        .expect("both bounded delegations must finish within thirty seconds");
+    }
+
     #[tokio::test]
     async fn delegate_filters_parent_tools_through_parent_policy() {
         let config = agentic_agent_config();
@@ -18028,7 +19285,7 @@ command = "rm independent-delegate-marker"
             }
         });
 
-        (LocalChatServer { uri, _task: task }, requests)
+        (LocalChatServer::ungated(uri, task), requests)
     }
 
     /// Caller + agentic targets sharing one delegatable risk profile, with a

@@ -59,14 +59,38 @@ pub fn sandbox_posture(
         return sandbox_posture_result(requested_backend, active.name(), active.description());
     }
 
-    let active_backend =
+    let (active_backend, _) =
         configured_backend_selection(&sandbox.backend, runtime_kind, workspace_dir, extra_roots);
 
     sandbox_posture_result(
         requested_backend,
         active_backend.name(),
-        active_backend.description(),
+        firejail_args_description(active_backend, &sandbox.firejail_args)
+            .unwrap_or_else(|| active_backend.description()),
     )
+}
+
+/// When Firejail is the active backend and its configured `firejail_args`
+/// would be rejected, the posture says so (and that commands are blocked)
+/// rather than describing Firejail as if those arguments applied.
+fn firejail_args_description(
+    active_backend: SelectedSandboxBackend,
+    firejail_args: &[String],
+) -> Option<String> {
+    if !matches!(active_backend, SelectedSandboxBackend::Firejail) {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        super::firejail::FirejailSandbox::validate_extra_args(firejail_args)
+            .err()
+            .map(|error| firejail_args_rejected_description(&error))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = firejail_args;
+        None
+    }
 }
 
 fn sandbox_posture_result(
@@ -145,10 +169,16 @@ fn configured_backend_selection(
     runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
-) -> SelectedSandboxBackend {
-    configured_backend_selection_with(backend, runtime_kind, |selected| {
-        sandbox_backend_available(selected, workspace_dir, extra_roots)
-    })
+) -> (SelectedSandboxBackend, Option<String>) {
+    let mut rejection = None;
+    let selected = configured_backend_selection_with(backend, runtime_kind, |selected| {
+        let (available, reason) = probe_requested_backend(selected, workspace_dir, extra_roots);
+        if !available && rejection.is_none() {
+            rejection = reason;
+        }
+        available
+    });
+    (selected, rejection)
 }
 
 fn configured_backend_selection_with(
@@ -244,6 +274,48 @@ fn detect_best_backend_with(
     }
 
     runtime_fallback_backend(runtime_kind)
+}
+
+/// Probe the explicitly requested backend and, when it refuses, return the
+/// explanation it produced. Only bubblewrap can explain itself today, so the
+/// other backends keep the generic fallback warning. The reason comes from the
+/// same probe that decided availability: re-probing on the failure path would
+/// run the launcher a second time, without a timeout, and could disagree with
+/// the first result.
+fn probe_requested_backend(
+    backend: SelectedSandboxBackend,
+    workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
+) -> (bool, Option<String>) {
+    if matches!(backend, SelectedSandboxBackend::Bubblewrap) {
+        return bubblewrap_availability();
+    }
+    (
+        sandbox_backend_available(backend, workspace_dir, extra_roots),
+        None,
+    )
+}
+
+#[cfg(all(
+    feature = "sandbox-bubblewrap",
+    any(target_os = "linux", target_os = "macos")
+))]
+fn bubblewrap_availability() -> (bool, Option<String>) {
+    match super::bubblewrap::BubblewrapSandbox::probe() {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(error.to_string())),
+    }
+}
+
+#[cfg(not(all(
+    feature = "sandbox-bubblewrap",
+    any(target_os = "linux", target_os = "macos")
+)))]
+fn bubblewrap_availability() -> (bool, Option<String>) {
+    (
+        false,
+        Some("the bubblewrap backend is not compiled for this build".to_string()),
+    )
 }
 
 fn sandbox_backend_available(
@@ -351,11 +423,15 @@ pub fn create_sandbox(
     }
 
     match backend {
-        SandboxBackend::Auto | SandboxBackend::None => {
-            detect_best_sandbox(runtime_kind, workspace_dir, extra_roots, &sandbox.image)
-        }
+        SandboxBackend::Auto | SandboxBackend::None => detect_best_sandbox(
+            runtime_kind,
+            workspace_dir,
+            extra_roots,
+            &sandbox.image,
+            &sandbox.firejail_args,
+        ),
         requested => {
-            let selected =
+            let (selected, unavailable_reason) =
                 configured_backend_selection(requested, runtime_kind, workspace_dir, extra_roots);
             if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
                 if matches!(requested, SandboxBackend::Docker) {
@@ -367,12 +443,19 @@ pub fn create_sandbox(
                 }
                 return Arc::new(super::traits::NoopSandbox);
             }
-            if let Some(built) =
-                create_selected_sandbox(selected, workspace_dir, extra_roots, &sandbox.image)
-            {
+            if let Some(built) = create_selected_sandbox(
+                selected,
+                workspace_dir,
+                extra_roots,
+                &sandbox.image,
+                &sandbox.firejail_args,
+            ) {
                 return built;
             }
-            log_requested_backend_unavailable(selected_backend_label(requested));
+            log_requested_backend_unavailable(
+                selected_backend_label(requested),
+                unavailable_reason,
+            );
             Arc::new(super::traits::NoopSandbox)
         }
     }
@@ -383,13 +466,16 @@ fn detect_best_sandbox(
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
     image: &str,
+    firejail_args: &[String],
 ) -> Arc<dyn Sandbox> {
     let selected = detect_best_backend(runtime_kind, workspace_dir, extra_roots);
     if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
         log_auto_backend_selection(selected, runtime_kind);
         return Arc::new(super::traits::NoopSandbox);
     }
-    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots, image) {
+    if let Some(sandbox) =
+        create_selected_sandbox(selected, workspace_dir, extra_roots, image, firejail_args)
+    {
         log_auto_backend_selection(selected, runtime_kind);
         return sandbox;
     }
@@ -429,11 +515,70 @@ impl Sandbox for FailedSeatbeltSandbox {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn firejail_args_rejected_description(error: &std::io::Error) -> String {
+    crate::i18n::get_required_cli_string_with_args(
+        "cli-security-status-sandbox-description-firejail-args-rejected",
+        &[("reason", &error.to_string())],
+    )
+}
+
+/// Firejail was selected but its configured `firejail_args` were rejected.
+/// Running the command without them would present configured hardening as
+/// active when it is not, and running it unsandboxed would drop the sandbox
+/// altogether, so every command is refused with the reason instead.
+#[cfg(target_os = "linux")]
+struct RejectedFirejailArgsSandbox {
+    error: std::io::Error,
+    description: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Sandbox for RejectedFirejailArgsSandbox {
+    fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+        self.check_initialization()
+    }
+
+    fn check_initialization(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            self.error.kind(),
+            self.error.to_string(),
+        ))
+    }
+
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn name(&self) -> &str {
+        "firejail"
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_firejail_sandbox(firejail_args: &[String]) -> Option<Arc<dyn Sandbox>> {
+    match super::firejail::FirejailSandbox::with_args(firejail_args) {
+        Ok(sandbox) => Some(Arc::new(sandbox)),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            Some(Arc::new(RejectedFirejailArgsSandbox {
+                description: firejail_args_rejected_description(&error),
+                error,
+            }))
+        }
+        Err(_) => None,
+    }
+}
+
 fn create_selected_sandbox(
     selected: SelectedSandboxBackend,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
     image: &str,
+    firejail_args: &[String],
 ) -> Option<Arc<dyn Sandbox>> {
     match selected {
         SelectedSandboxBackend::None => None,
@@ -462,12 +607,11 @@ fn create_selected_sandbox(
         SelectedSandboxBackend::Firejail => {
             #[cfg(target_os = "linux")]
             {
-                super::firejail::FirejailSandbox::new()
-                    .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
-                    .ok()
+                create_firejail_sandbox(firejail_args)
             }
             #[cfg(not(target_os = "linux"))]
             {
+                let _ = firejail_args;
                 None
             }
         }
@@ -536,12 +680,20 @@ fn selected_backend_label(backend: &SandboxBackend) -> &'static str {
     }
 }
 
-fn log_requested_backend_unavailable(label: &'static str) {
+fn log_requested_backend_unavailable(label: &'static str, reason: Option<String>) {
+    let detail = match reason {
+        Some(reason) => format!(
+            "{label} requested but not available ({reason}), falling back to application-layer"
+        ),
+        None => {
+            format!("{label} requested but not available, falling back to application-layer")
+        }
+    };
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-        &format!("{label} requested but not available, falling back to application-layer")
+        &detail
     );
 }
 
@@ -791,6 +943,70 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_firejail_with_rejected_args_blocks_commands_instead_of_dropping_them() {
+        // The args are checked before Firejail is probed, so this
+        // holds whether or not firejail is installed.
+        let sandbox = create_selected_sandbox(
+            SelectedSandboxBackend::Firejail,
+            None,
+            &SandboxExtraRoots::default(),
+            DEFAULT_SANDBOX_IMAGE,
+            &[
+                "--net=none".to_string(),
+                "--profile=/tmp/weaker.profile".to_string(),
+            ],
+        )
+        .expect("rejected firejail_args must not fall back to no sandbox");
+        assert_eq!(sandbox.name(), "firejail");
+        assert!(!sandbox.is_available());
+        let mut command = std::process::Command::new("/bin/echo");
+        let error = sandbox.wrap_command(&mut command).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("--profile"), "{error}");
+        assert_eq!(command.get_program(), "/bin/echo");
+        assert!(sandbox.check_initialization().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn firejail_posture_reports_rejected_args() {
+        let rejected = firejail_args_description(
+            SelectedSandboxBackend::Firejail,
+            &["--ignore=noroot".to_string()],
+        )
+        .expect("rejected args are reported");
+        let reason = super::super::firejail::FirejailSandbox::validate_extra_args(&[
+            "--ignore=noroot".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            rejected,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-security-status-sandbox-description-firejail-args-rejected",
+                &[("reason", &reason)],
+            )
+        );
+        assert!(rejected.contains("--ignore"), "{rejected}");
+        assert_eq!(
+            firejail_args_description(
+                SelectedSandboxBackend::Firejail,
+                &["--net=none".to_string()]
+            ),
+            None
+        );
+        assert_eq!(
+            firejail_args_description(
+                SelectedSandboxBackend::Landlock,
+                &["--ignore=noroot".to_string()]
+            ),
+            None,
+            "firejail_args only matter when Firejail is the active backend"
+        );
+    }
+
     #[test]
     fn detect_best_sandbox_returns_something() {
         let sandbox = detect_best_sandbox(
@@ -798,6 +1014,7 @@ mod tests {
             None,
             &SandboxExtraRoots::default(),
             DEFAULT_SANDBOX_IMAGE,
+            &[],
         );
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
@@ -867,6 +1084,7 @@ mod tests {
             None,
             &SandboxExtraRoots::default(),
             DEFAULT_SANDBOX_IMAGE,
+            &[],
         );
         assert_ne!(sandbox.name(), "docker");
     }
@@ -971,6 +1189,98 @@ mod tests {
         });
 
         assert_eq!(selected, SelectedSandboxBackend::Docker);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_auto_selection_keeps_a_coding_cli_capable_backend() {
+        // bubblewrap declares `coding_cli_unsupported_reason`, so auto-selecting
+        // it ahead of firejail rejects coding CLI commands that previously ran.
+        // Selection must keep the capable backend until it can consult backend
+        // capabilities, not just reachability.
+        let selected = detect_best_backend_with(RuntimeKind::Native, |backend| {
+            matches!(
+                backend,
+                SelectedSandboxBackend::Bubblewrap | SelectedSandboxBackend::Firejail
+            )
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::Firejail);
+    }
+
+    #[test]
+    fn only_bubblewrap_explains_its_own_rejection() {
+        for backend in [SandboxBackend::Firejail, SandboxBackend::Landlock] {
+            let (_, reason) = configured_backend_selection(
+                &backend,
+                RuntimeKind::Native,
+                None,
+                &SandboxExtraRoots::default(),
+            );
+
+            assert!(
+                reason.is_none(),
+                "{backend:?} must keep the generic warning"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "sandbox-bubblewrap"))]
+    #[test]
+    fn bubblewrap_missing_from_the_build_reports_that_reason() {
+        let (selected, reason) = configured_backend_selection(
+            &SandboxBackend::Bubblewrap,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+
+        assert_eq!(selected, SelectedSandboxBackend::None);
+        let reason = reason.expect("a build without bubblewrap must explain the rejection");
+        assert!(reason.contains("not compiled"), "{reason}");
+    }
+
+    #[cfg(all(feature = "sandbox-bubblewrap", target_os = "linux"))]
+    #[test]
+    fn bubblewrap_launcher_probe_failure_explains_the_rejection() {
+        // The launcher probe resolves `bwrap` from this process's PATH, so
+        // isolate the test the same way the bootstrap capture tests do: re-run
+        // only this test in a child whose PATH cannot contain a launcher.
+        let test_name = std::thread::current()
+            .name()
+            .expect("named lib test")
+            .to_owned();
+        const CHILD: &str = "ZEROCLAW_TEST_BWRAP_PROBE_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok(test_name.as_str()) {
+            let empty_path = tempfile::TempDir::new().expect("tempdir");
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("lib test executable"))
+                    .args(["--exact", &test_name, "--test-threads=1", "--nocapture"])
+                    .env(CHILD, &test_name)
+                    .env("PATH", empty_path.path())
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .expect("run isolated bubblewrap probe test");
+            assert!(
+                output.status.success(),
+                "isolated bubblewrap probe failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        let (selected, reason) = configured_backend_selection(
+            &SandboxBackend::Bubblewrap,
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+        );
+
+        assert_eq!(selected, SelectedSandboxBackend::None);
+        let reason = reason.expect("a failed launcher probe must explain the rejection");
+        assert!(reason.to_lowercase().contains("bwrap"), "{reason}");
     }
 
     #[test]
