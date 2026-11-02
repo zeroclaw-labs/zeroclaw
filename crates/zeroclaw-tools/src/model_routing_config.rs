@@ -696,9 +696,9 @@ impl ModelRoutingConfigTool {
             || !matches!(temperature_update, MaybeSet::Unset);
 
         if !any_update {
-            anyhow::bail!(
-                "set_default requires at least one of: model_provider, model, temperature"
-            );
+            anyhow::bail!(crate::i18n::get_required_tool_string(
+                "tool-model-routing-config-error-no-update"
+            ));
         }
 
         let mut cfg = self.load_config_without_env()?;
@@ -716,9 +716,10 @@ impl ModelRoutingConfigTool {
                             .strip_prefix(&profile)
                             .and_then(|suffix| suffix.strip_prefix('.'));
                         if model_alias == Some("") {
-                            anyhow::bail!(
-                                "model_provider `{model_provider}` must use `<type>.<alias>` or `<type>.<alias>.<model>` form"
-                            );
+                            anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                                "tool-model-routing-config-error-invalid-reference",
+                                &[("model_provider", model_provider)],
+                            ));
                         }
                         model_alias.map(str::to_string)
                     }
@@ -733,9 +734,9 @@ impl ModelRoutingConfigTool {
             && matches!(model_update, MaybeSet::Unset)
             && matches!(temperature_update, MaybeSet::Unset)
         {
-            anyhow::bail!(
-                "a `<type>.<alias>.<model>` model_provider requires `model` or `temperature` to set on that model entry"
-            );
+            anyhow::bail!(crate::i18n::get_required_tool_string(
+                "tool-model-routing-config-error-nested-reference-update"
+            ));
         }
 
         // Determine which models entry to update.
