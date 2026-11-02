@@ -533,7 +533,7 @@ pub struct OpenAiCompatibleBuilder {
     /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user_preserving_native`]
     /// to enable the merge behaviour without disabling native tool calling.
     merge_system_into_user_preserve_native: bool,
-    /// Set to `Some(false)` by [`OpenAiCompatibleBuilder::without_native_tools`].
+    /// Set to `Some(bool)` by [`OpenAiCompatibleBuilder::with_native_tools`].
     /// `None` preserves the default derived from `merge_system_into_user`.
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
@@ -664,10 +664,17 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
-    /// Disable native tool calling, forcing prompt-guided tool use instead.
-    pub fn without_native_tools(mut self) -> Self {
-        self.native_tool_calling_override = Some(false);
+    /// Override native tool calling for this provider instance.
+    ///
+    /// When disabled, tools are injected into the system prompt as text.
+    pub fn with_native_tools(mut self, native_tool_calling: bool) -> Self {
+        self.native_tool_calling_override = Some(native_tool_calling);
         self
+    }
+
+    /// Disable native tool calling, forcing prompt-guided tool use instead.
+    pub fn without_native_tools(self) -> Self {
+        self.with_native_tools(false)
     }
 
     /// Override the HTTP request timeout for LLM API calls. Values of 0
@@ -12651,9 +12658,10 @@ mod tests {
     async fn provider_boundary_honours_the_configured_multimodal_policy() {
         // The provider boundary re-normalizes messages, and that pass now
         // decodes pixels and applies `max_images`. Under
-        // `MultimodalConfig::default()` it would trim to 4 images, silently
-        // discarding one the runtime had already accepted under a configured
-        // `max_images = 8`. The configured policy must reach the provider.
+        // `MultimodalConfig::default()` it would evict down to 2 images,
+        // silently discarding three the runtime had already accepted under a
+        // configured `max_images = 8`. The configured policy must reach the
+        // provider.
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let mut markers = String::from("compare these");
         for index in 0..5 {
@@ -12690,15 +12698,16 @@ mod tests {
         assert_eq!(
             surviving, 5,
             "all five images must survive the configured max_images = 8; \
-             a default-config boundary pass would have trimmed to 4: {content}"
+             a default-config boundary pass would have evicted down to 2: {content}"
         );
 
-        // The default policy is what the boundary used before this fix. With
-        // per-image eviction the same five-image message is trimmed to the
-        // default cap of 4 — the oldest image is evicted even though the
-        // operator's configuration had accepted all five. That boundary-side
-        // re-trim is the data loss the configured policy prevents, so pin it
-        // so a regression cannot quietly restore the default-config pass.
+        // The default policy is what the boundary used before this fix. The
+        // same five-image message is past the default cap of 4, so the
+        // boundary evicts down to the low-water mark of 2, discarding three
+        // images the operator's configuration had accepted. That
+        // boundary-side re-trim is the data loss the configured policy
+        // prevents, so pin it so a regression cannot quietly restore the
+        // default-config pass.
         let default_provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("Test")
             .base_url("https://example.invalid/v1")
@@ -12714,8 +12723,8 @@ mod tests {
             .matches("[IMAGE:data:image/png;base64,")
             .count();
         assert_eq!(
-            default_surviving, 4,
-            "under the default max_images = 4 the boundary pass evicts the oldest image; \
+            default_surviving, 2,
+            "under the default max_images = 4 the boundary pass evicts down to two images; \
              that re-trim is what the configured policy prevents"
         );
     }

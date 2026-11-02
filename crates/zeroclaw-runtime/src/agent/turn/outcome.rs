@@ -1,5 +1,6 @@
 //! Turn-loop control-flow outcomes: cancellation and model-switch errors.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// Callback type for checking if model has been switched during tool execution.
@@ -25,6 +26,11 @@ tokio::task_local! {
     /// Pending model switch for one active tool loop. The loop owns this state;
     /// tools only borrow the current task-local handle while they execute.
     static MODEL_SWITCH_REQUEST: ModelSwitchCallback;
+
+    /// Provider profiles that a model-issued switch may target in this tool
+    /// loop. This is separate from the general provider-attempt scope so
+    /// unrelated tools keep their own network and provider policies.
+    static MODEL_SWITCH_PROVIDER_ALLOWLIST: Option<Arc<HashSet<String>>>;
 }
 
 pub(crate) fn current_model_switch_state() -> anyhow::Result<ModelSwitchCallback> {
@@ -38,6 +44,26 @@ where
     F: std::future::Future,
 {
     MODEL_SWITCH_REQUEST.scope(state, future).await
+}
+
+pub(crate) fn model_switch_provider_allowed(provider_ref: &str) -> bool {
+    MODEL_SWITCH_PROVIDER_ALLOWLIST
+        .try_with(|allowed| {
+            allowed
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(provider_ref))
+        })
+        .unwrap_or(true)
+}
+
+pub(crate) async fn scope_model_switch_provider_allowlist<F>(
+    allowed: Option<Arc<HashSet<String>>>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    MODEL_SWITCH_PROVIDER_ALLOWLIST.scope(allowed, future).await
 }
 
 #[derive(Debug)]
@@ -58,8 +84,57 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 /// The complete provider-facing request cannot fit the active model's capacity.
 #[derive(Debug)]
 pub struct ContextWindowExceeded {
+    /// The count the refusal was decided on: the raw estimate, scaled up by
+    /// the calibration ratio when provider-reported usage supplied one.
     pub estimated_tokens: usize,
     pub model_context_window: usize,
+    /// The same request's raw estimate, before calibration. The shares below
+    /// are parts of this total, never of `estimated_tokens`.
+    pub raw_estimated_tokens: usize,
+    /// Raw estimate of the leading system messages' share of the request.
+    pub system_tokens: usize,
+    /// Raw estimate of the native tool schemas' share of the request; `0`
+    /// when the request carried no native tools.
+    pub tool_schema_tokens: usize,
+}
+
+impl ContextWindowExceeded {
+    /// Operator-facing account of what filled the window.
+    ///
+    /// The `Display` text is the localized user-facing remediation and
+    /// deliberately carries no numbers, which left the operator's own log line
+    /// empty: the one place the cause should be recoverable said nothing.
+    ///
+    /// Every share is in raw-estimate units and the conversation share is the
+    /// remainder of the raw total. Calibration against provider-reported usage
+    /// is shown as its own term instead of being folded into any share: folded
+    /// into the conversation, a 2x correction on a schema-heavy request would
+    /// report a long conversation and point the operator at the wrong fix.
+    #[must_use]
+    pub fn breakdown(&self) -> String {
+        let conversation = self
+            .raw_estimated_tokens
+            .saturating_sub(self.system_tokens)
+            .saturating_sub(self.tool_schema_tokens);
+        let calibration = self
+            .estimated_tokens
+            .saturating_sub(self.raw_estimated_tokens);
+        let calibration = if calibration > 0 {
+            format!(", calibration +{calibration}")
+        } else {
+            String::new()
+        };
+        format!(
+            "context window exceeded: ~{} tokens against a {}-token window \
+             (system prompt ~{}, tool schemas ~{}, conversation ~{}{}); request not sent",
+            self.estimated_tokens,
+            self.model_context_window,
+            self.system_tokens,
+            self.tool_schema_tokens,
+            conversation,
+            calibration,
+        )
+    }
 }
 
 impl std::fmt::Display for ContextWindowExceeded {
@@ -94,31 +169,6 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
 impl std::error::Error for StreamInterruptedAfterOutput {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.cause)
-    }
-}
-
-/// A transport stream failure before user-visible output. The cumulative usage
-/// snapshot is retained so Reliable recovery can bill the exact selected
-/// stream attempt once.
-#[derive(Debug)]
-pub(crate) struct StreamErrorWithUsage {
-    pub(crate) message: String,
-    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
-    /// The typed stream error that produced this outcome. `Terminal` is
-    /// load-bearing: the provider-call step reads it to skip the
-    /// non-streaming fallback the error's producer already performed.
-    pub(crate) source: zeroclaw_api::model_provider::StreamError,
-}
-
-impl std::fmt::Display for StreamErrorWithUsage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for StreamErrorWithUsage {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
     }
 }
 
@@ -424,6 +474,26 @@ impl std::fmt::Display for ModelSwitchRequested {
 
 impl std::error::Error for ModelSwitchRequested {}
 
+/// A loop running with `LoopKnobs::yield_to_steering` stopped after a tool
+/// round because steering is waiting. The round's messages are already in the
+/// canonical buffer; `display_text` is the text the round showed, for the
+/// caller to commit before it starts the steered round. `reported_usage` is
+/// the last request's provider-reported usage, for the caller to hand to the
+/// resumed run so its token calibration carries over.
+#[derive(Debug)]
+pub(crate) struct SteeringPending {
+    pub(crate) display_text: String,
+    pub(crate) reported_usage: Option<super::ReportedRequestUsage>,
+}
+
+impl std::fmt::Display for SteeringPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop yielded to pending steering")
+    }
+}
+
+impl std::error::Error for SteeringPending {}
+
 pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)> {
     err.chain()
         .filter_map(|source| source.downcast_ref::<ModelSwitchRequested>())
@@ -440,6 +510,9 @@ mod tests {
         let error = anyhow::Error::new(ContextWindowExceeded {
             estimated_tokens: 40_000,
             model_context_window: 32_768,
+            raw_estimated_tokens: 40_000,
+            system_tokens: 6_000,
+            tool_schema_tokens: 9_000,
         })
         .context("private prompt and provider diagnostics");
         let exceeded = context_window_exceeded_from_error(&error).expect("typed inner cause");
@@ -459,6 +532,72 @@ mod tests {
         let untyped = anyhow::Error::msg("context window exceeded");
         assert!(context_window_exceeded_from_error(&untyped).is_none());
         assert!(terminal_completion_error_message(&untyped, None).is_none());
+    }
+
+    /// The operator line must say what filled the window. An empty cause is
+    /// what made a long-running failure unrecoverable from the journal.
+    #[test]
+    fn context_window_breakdown_names_every_share_and_the_window() {
+        let exceeded = ContextWindowExceeded {
+            estimated_tokens: 132_000,
+            model_context_window: 131_072,
+            raw_estimated_tokens: 132_000,
+            system_tokens: 13_400,
+            tool_schema_tokens: 11_000,
+        };
+        let line = exceeded.breakdown();
+        for expected in [
+            "~132000 tokens",
+            "131072-token window",
+            "system prompt ~13400",
+            "tool schemas ~11000",
+            "conversation ~107600",
+            "request not sent",
+        ] {
+            assert!(line.contains(expected), "missing {expected:?} in {line:?}");
+        }
+        assert!(
+            !line.contains("calibration"),
+            "an uncalibrated count has no correction to show: {line:?}"
+        );
+    }
+
+    /// A calibrated total must not be attributed to the conversation. On a
+    /// schema-heavy request, a 2x correction folded into the remainder would
+    /// report a long conversation and point the operator at the wrong fix.
+    #[test]
+    fn context_window_breakdown_shows_calibration_apart_from_every_share() {
+        let exceeded = ContextWindowExceeded {
+            estimated_tokens: 49_000,
+            model_context_window: 32_768,
+            raw_estimated_tokens: 24_500,
+            system_tokens: 13_400,
+            tool_schema_tokens: 11_000,
+        };
+        let line = exceeded.breakdown();
+        for expected in [
+            "~49000 tokens",
+            "system prompt ~13400",
+            "tool schemas ~11000",
+            "conversation ~100",
+            "calibration +24500",
+        ] {
+            assert!(line.contains(expected), "missing {expected:?} in {line:?}");
+        }
+    }
+
+    /// Raw shares that exceed the raw total, which only inconsistent inputs
+    /// could produce, must clamp rather than underflow.
+    #[test]
+    fn context_window_breakdown_never_underflows() {
+        let exceeded = ContextWindowExceeded {
+            estimated_tokens: 100,
+            model_context_window: 50,
+            raw_estimated_tokens: 100,
+            system_tokens: 80,
+            tool_schema_tokens: 80,
+        };
+        assert!(exceeded.breakdown().contains("conversation ~0"));
     }
 
     #[test]
@@ -794,13 +933,9 @@ mod tests {
 
     #[test]
     fn streamed_refusal_cause_projects_safety_guidance() {
-        let error = anyhow::Error::new(StreamErrorWithUsage {
-            message: "model_provider stream error: refusal".to_string(),
-            usage: None,
-            source: zeroclaw_api::model_provider::StreamError::ModelRefusal(Box::new(
-                private_refusal(),
-            )),
-        });
+        let error = anyhow::Error::new(zeroclaw_api::model_provider::StreamError::ModelRefusal(
+            Box::new(private_refusal()),
+        ));
 
         let message = terminal_completion_error_message_in_english(&error, None)
             .expect("a streamed refusal must project a user-facing message");

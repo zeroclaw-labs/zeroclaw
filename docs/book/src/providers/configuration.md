@@ -487,7 +487,7 @@ dashboard upload.
 ```toml
 [multimodal]
 max_image_size_mb = 20   # per image, decoded bytes (default: 20, clamped to 1-20)
-max_images        = 4    # images kept per request (default: 4, clamped to 1-16)
+max_images        = 4    # most images kept per request (default: 4, clamped to 1-16)
 ```
 
 `max_image_size_mb` is measured before base64 encoding, so the encoded payload
@@ -501,6 +501,15 @@ single image over 10 MB base64-encoded, about 7.5 MiB decoded, and its client
 enforces that regardless of what `max_image_size_mb` allows. Model context cost
 does not track bytes: providers rasterize images and bill by pixel dimensions,
 so a large file and a small one at the same resolution cost roughly the same.
+
+`max_images` counts every image still in the conversation, not only new ones,
+so a long session reaches it. Past the limit, the oldest images are removed in
+one batch, down to half the limit rounded up (4 to 2, 16 to 8), and the count
+then grows back to the limit before the next batch. Removing an image changes
+an earlier message, so a provider's prompt cache is rebuilt from that message
+on; batching means that happens once every `max_images / 2 + 1` new images
+rather than on every one. Right after a batch the model sees fewer older images
+than the limit allows. Raise the limit for screenshot-heavy sessions.
 
 ## Per-family knobs: worked examples
 
@@ -647,6 +656,18 @@ Agents reference a provider by dotted alias. Provider entries on their own do no
 `risk_profile` and `runtime_profile` reference independent alias maps, so their names need not match (`runtime_profile` is also optional). `Config::validate()` fails loud at startup if `model_provider` doesn't resolve to a configured `[providers.models.<type>.<alias>]` entry, or if `risk_profile` doesn't resolve to a configured `[risk_profiles.<alias>]` entry.
 
 For multiple agents pointing at different providers, see [Routing](./routing.md).
+
+## Single-tool-round support
+
+The agent runtime profile's `single_tool_rounds` setting is default-off. See [Single-tool rounds](../agents/internals.md#single-tool-rounds) for configuration, accounting, and rollback behavior. It requests one call per response only when the actual model route and every reachable fallback honor a native control.
+
+| Configured provider path | Native control | Support |
+| --- | --- | --- |
+| `openai`, API-key auth, official OpenAI endpoint, chat-completions or Responses wire | `parallel_tool_calls: false` | Supported |
+| `anthropic`, official Anthropic endpoint | `tool_choice.disable_parallel_tool_use: true` | Supported |
+| Custom or compatible endpoints, OVH, Codex subscription auth, and other adapters | No verified control | Batch with a visible limitation notice |
+
+Responses and Anthropic send the control in streaming and non-streaming requests. OpenAI chat-completions uses its existing non-streaming implementation, including when a router projects that response as stream events. Requests without tools keep their existing wire shape. Sharing an adapter with a supported provider does not establish support for another endpoint. A mixed fallback chain stays batch even if its primary provider supports the control.
 
 ## Fallback on failure
 

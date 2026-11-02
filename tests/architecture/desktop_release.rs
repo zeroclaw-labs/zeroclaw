@@ -90,8 +90,14 @@ fn macos_desktop_sidecar_embeds_the_web_artifact() {
         .expect("desktop kernel preparation script should be readable");
     assert!(
         prepare.lines().any(|line| {
-            line.contains("cargo build") && line.contains("--features \"$FEATURES\"")
+            line.contains("cargo build") && line.contains("--features \"$resolved_features\"")
         }),
-        "prepare-kernel.sh must forward the requested Cargo features"
+        "prepare-kernel.sh must build the resolved distribution and requested Cargo features"
+    );
+    assert!(
+        prepare.contains("cargo run --quiet --locked -p xtask --bin generate -- features")
+            && prepare.contains("--selection \"$DISTRIBUTION\" --target \"$triple\"")
+            && prepare.contains("resolved_features=\"$resolved_features,$FEATURES\""),
+        "the desktop build must resolve its distribution and append requested features"
     );
 }

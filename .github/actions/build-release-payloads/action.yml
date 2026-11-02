@@ -1,0 +1,111 @@
+name: Build release payloads
+description: Build the canonical main and companion payloads with the Stable recipe.
+inputs:
+  target:
+    description: Existing release-matrix target; must be explicitly supplied.
+    required: true
+  linker_env:
+    description: Existing release-matrix linker environment variable, or empty.
+    required: false
+  linker:
+    description: Existing release-matrix linker command, or empty.
+    required: false
+  use_cross:
+    description: Existing release-matrix cross selector; only true selects cross.
+    required: false
+  cargo-jobs:
+    description: Optional positive Cargo job count; empty preserves the existing command.
+    required: false
+    default: ''
+  emit_features:
+    description: Explicitly false for Stable; true only for qualification evidence.
+    required: true
+outputs:
+  features:
+    description: Canonically resolved features; emitted only when explicitly enabled.
+    value: ${{ steps.build.outputs.features }}
+runs:
+  using: composite
+  steps:
+    - id: build
+      shell: bash
+      env:
+        RELEASE_TARGET: ${{ inputs.target }}
+        RELEASE_LINKER_ENV: ${{ inputs.linker_env || '' }}
+        RELEASE_LINKER: ${{ inputs.linker || '' }}
+        RELEASE_USE_CROSS: ${{ inputs.use_cross || 'false' }}
+        RELEASE_FEATURES_EVIDENCE: ${{ inputs.emit_features }}
+        RELEASE_CARGO_JOBS: ${{ inputs.cargo-jobs }}
+      run: |
+        # BEGIN release input/evidence adapter
+        if [ -z "$RELEASE_TARGET" ]; then
+          echo "release payload target input is required" >&2
+          exit 2
+        fi
+        case "$RELEASE_FEATURES_EVIDENCE" in
+          true|false) ;;
+          *)
+            echo "emit_features must be explicitly true or false" >&2
+            exit 2
+            ;;
+        esac
+        # END release input/evidence adapter
+        if [ -n "$RELEASE_LINKER_ENV" ] && [ -n "$RELEASE_LINKER" ]; then
+          export "$RELEASE_LINKER_ENV=$RELEASE_LINKER"
+        fi
+        # Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556)
+        # Ubuntu 22.04's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
+        # which segfaults on ARMv6 devices (e.g. Raspberry Pi Zero W).
+        if [ "$RELEASE_TARGET" = "arm-unknown-linux-gnueabihf" ]; then
+          export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+          export CXXFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+          export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
+        fi
+        # Resolve the feature set from the canonical registry
+        # (`cargo generate features`), the single source of truth that
+        # install.sh and packaging surfaces also consume. `dist` is the lean
+        # standard distribution set and carries the default leaves, so every
+        # target builds with --no-default-features against the explicit list,
+        # with no implicit feature drift.
+        FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "$RELEASE_TARGET")"
+        echo "Resolved features: $FEATURES"
+        # BEGIN qualification-only FEATURES output adapter
+        if [ "$RELEASE_FEATURES_EVIDENCE" = "true" ]; then
+          if [ -z "$FEATURES" ]; then
+            echo "qualification evidence requires nonempty resolved features" >&2
+            exit 2
+          fi
+          printf 'features=%s\n' "$FEATURES" >> "$GITHUB_OUTPUT"
+        fi
+        # END qualification-only FEATURES output adapter
+        # MUSL targets build via cross-rs (cross-compiled in a container);
+        # all other targets use the host cargo toolchain directly.
+        if [ "$RELEASE_USE_CROSS" = "true" ]; then
+          BUILD_CMD="cross build"
+        else
+          BUILD_CMD="cargo build"
+        fi
+        # BEGIN optional build concurrency adapter
+        if [ -n "${RELEASE_CARGO_JOBS:-}" ]; then
+          if [[ ! "$RELEASE_CARGO_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "cargo-jobs must be a positive integer" >&2
+            exit 2
+          fi
+          BUILD_CMD="$BUILD_CMD --jobs $RELEASE_CARGO_JOBS"
+        fi
+        # END optional build concurrency adapter
+        # Always build --no-default-features against the generator's explicit
+        # per-target list: FEATURES already carries the default leaves for the
+        # target, so this applies the canonical per-target exclusions with no
+        # implicit feature drift. Unioning the root crate's defaults back in
+        # (by omitting --no-default-features) would silently re-enable a
+        # feature the generator excludes for this target (e.g. the Prometheus
+        # exporter on ARM).
+        $BUILD_CMD --release --locked --no-default-features --features "${FEATURES}" --target "$RELEASE_TARGET"
+        # Build the zerocode TUI and the zerorelay nominated relay alongside the
+        # main binary so they ship in the release archive. Skipped on Android,
+        # which lacks the terminal deps.
+        if [ "$RELEASE_TARGET" != "aarch64-linux-android" ]; then
+          $BUILD_CMD --release --locked -p zerocode --target "$RELEASE_TARGET"
+          $BUILD_CMD --release --locked -p zerorelay --target "$RELEASE_TARGET"
+        fi
