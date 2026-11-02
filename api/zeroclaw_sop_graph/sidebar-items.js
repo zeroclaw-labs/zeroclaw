@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["LAYOUT_COL_GAP","LAYOUT_NODE_H","LAYOUT_NODE_W","LAYOUT_ORIGIN","LAYOUT_ROW_GAP","TRIGGER_NODE_BASE"],"enum":["FlowRole","GraphSeverity","NodeKind","NodeRunState","PinClass"],"struct":["GraphDiagnostic","GraphLayout","GraphLegend","GraphNode","GraphPin","GraphWire","LayoutGeometry","LegendEntry","NodePosition","SopGraph"]};

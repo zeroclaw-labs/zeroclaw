@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MCP_TOOL_NAME_SEPARATOR"],"struct":["McpRegistry","McpServer","McpServerCapabilities"]};

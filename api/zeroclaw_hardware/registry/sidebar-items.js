@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["known_boards","lookup_board"],"struct":["BoardInfo"]};

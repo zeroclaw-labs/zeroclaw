@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ScanOutcome","ScreenVerdict"],"fn":["cap_untrusted","frame_untrusted","new_marker_id","sanitize_untrusted","scan_untrusted","scrub_outbound"],"struct":["ContentSafety","FramingPolicy","OutboundPolicy","ScanPolicy"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["IngressDecision","InternalPrincipal","SourceClass","Transport","TrustClass","TurnOrigin"],"struct":["IngressContext","UntrustedFraming"]};

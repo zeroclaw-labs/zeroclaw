@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["bytes_to_vec","cosine_similarity","hybrid_merge","vec_to_bytes"],"struct":["ScoredResult"]};

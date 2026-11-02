@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["validate_plugin_package_name"],"struct":["InvalidPluginPackageName"]};
