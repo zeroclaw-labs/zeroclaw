@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -540,7 +540,13 @@ impl SignalChannel {
     }
 
     fn http_client(&self) -> Client {
-        let builder = Client::builder().connect_timeout(Duration::from_secs(10));
+        self.http_client_with_redirect_policy(reqwest::redirect::Policy::default())
+    }
+
+    fn http_client_with_redirect_policy(&self, redirect: reqwest::redirect::Policy) -> Client {
+        let builder = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(redirect);
         let builder = zeroclaw_config::schema::apply_channel_proxy_to_builder(
             builder,
             "channel.signal",
@@ -747,22 +753,39 @@ impl SignalChannel {
             "id": id,
         });
 
-        let resp = self
-            .http_client()
+        // A response or connection failure after a redirect says nothing
+        // about whether an earlier endpoint executed this send. Observe this
+        // request's redirect chain without changing the normal redirect policy.
+        let redirected = Arc::new(AtomicBool::new(false));
+        let redirect_observer = Arc::clone(&redirected);
+        let client = self.http_client_with_redirect_policy(reqwest::redirect::Policy::custom(
+            move |attempt| {
+                redirect_observer.store(true, Ordering::Release);
+                reqwest::redirect::Policy::default().redirect(attempt)
+            },
+        ));
+        let request = client
             .post(&url)
             .timeout(Duration::from_secs(30))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
+            .build()
+            .map_err(|error| SignalRpcFailure {
+                kind: RpcFailureKind::Rejected,
+                error: error.into(),
+            })?;
+        let resp = client
+            .execute(request)
             .await
             .map_err(|error| SignalRpcFailure {
-                kind: if error.is_connect() || error.is_builder() {
+                kind: if error.is_connect() && !redirected.load(Ordering::Acquire) {
                     RpcFailureKind::Rejected
                 } else {
                     RpcFailureKind::Unknown
                 },
                 error: error.into(),
             })?;
+        let direct_response = !redirected.load(Ordering::Acquire);
 
         // 201 = success with no body (e.g. typing indicators)
         if resp.status().as_u16() == 201 {
@@ -777,7 +800,7 @@ impl SignalChannel {
         if text.is_empty() {
             if !status.is_success() {
                 return Err(SignalRpcFailure {
-                    kind: if status.is_client_error() {
+                    kind: if direct_response && status.is_client_error() {
                         RpcFailureKind::Rejected
                     } else {
                         RpcFailureKind::Unknown
@@ -800,13 +823,20 @@ impl SignalChannel {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown");
             return Err(SignalRpcFailure {
-                kind: RpcFailureKind::Rejected,
+                // Only protocol rejection precedes command dispatch. Daemon
+                // user/I/O/internal errors can include a partially completed
+                // send, even when returned in a successful HTTP response.
+                kind: if direct_response && matches!(code, -32700 | -32600 | -32601 | -32602) {
+                    RpcFailureKind::Rejected
+                } else {
+                    RpcFailureKind::Unknown
+                },
                 error: anyhow::Error::msg(format!("Signal RPC error {code}: {msg}")),
             });
         }
         if !status.is_success() {
             return Err(SignalRpcFailure {
-                kind: if status.is_client_error() {
+                kind: if direct_response && status.is_client_error() {
                     RpcFailureKind::Rejected
                 } else {
                     RpcFailureKind::Unknown
@@ -4007,7 +4037,7 @@ mod tests {
             .and(path("/api/v1/rpc"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "jsonrpc": "2.0",
-                "error": { "code": -1, "message": "rejected" },
+                "error": { "code": -32602, "message": "Specified account does not exist" },
                 "id": "ignored"
             })))
             .expect(1)
@@ -4030,6 +4060,217 @@ mod tests {
                 .is_err()
         );
         assert_eq!(ch.self_send_guard.snapshot(), (0, 0, false));
+        let note = make_sent_sync_envelope(
+            Some(&ch.account),
+            Some(&ch.account),
+            Some("not sent"),
+            None,
+            None,
+        );
+        let messages = ch.process_envelope_async(&note).await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "a rejected send must not hide a genuine note"
+        );
+        assert_eq!(messages[0].content, "not sent");
+    }
+
+    fn self_send_rpc_channel(url: String) -> SignalChannel {
+        SignalChannel::new(
+            url,
+            "+15550000008".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["+15550000008".to_string()]),
+            false,
+            false,
+        )
+    }
+
+    async fn assert_failed_send_suppresses_late_echo(ch: &SignalChannel) {
+        assert!(
+            ch.send(&SendMessage::new("possibly sent", &ch.account))
+                .await
+                .is_err()
+        );
+        assert_eq!(ch.self_send_guard.snapshot(), (0, 0, true));
+        let echo = make_sent_sync_envelope(
+            Some(&ch.account),
+            Some(&ch.account),
+            Some("possibly sent"),
+            None,
+            None,
+        );
+        assert!(ch.process_envelope_async(&echo).await.is_empty());
+        assert!(
+            ch.send(&SendMessage::new("another reply", &ch.account))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_send_errors_keep_note_to_self_closed() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // signal-cli can return a timestamp and per-recipient network failure
+        // inside error.data after attempting a send. The error is not a receipt
+        // proving that no linked device can receive a sent-sync event.
+        for code in [Some(-1), Some(-3), Some(-32603), Some(-32000), None] {
+            let server = MockServer::start().await;
+            let mut error = serde_json::json!({
+                "message": "send outcome unavailable",
+                "data": {"response": {
+                    "timestamp": 1_700_000_000_000_u64,
+                    "results": [{"type": "NETWORK_FAILURE"}]
+                }}
+            });
+            if let Some(code) = code {
+                error["code"] = serde_json::json!(code);
+            }
+            Mock::given(method("POST"))
+                .and(path("/api/v1/rpc"))
+                .and(body_partial_json(serde_json::json!({"method": "send"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": "ignored", "error": error
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_failed_send_suppresses_late_echo(&self_send_rpc_channel(server.uri())).await;
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_connect_failure_does_not_poison_note_to_self_ingress() {
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", unavailable.local_addr().unwrap());
+        drop(unavailable);
+        let ch = self_send_rpc_channel(endpoint);
+        assert!(
+            ch.send(&SendMessage::new("not sent", &ch.account))
+                .await
+                .is_err()
+        );
+        assert_eq!(ch.self_send_guard.snapshot(), (0, 0, false));
+        let note = make_sent_sync_envelope(
+            Some(&ch.account),
+            Some(&ch.account),
+            Some("not sent"),
+            None,
+            None,
+        );
+        assert_eq!(ch.process_envelope_async(&note).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redirected_connect_failure_keeps_note_to_self_closed() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [307, 308] {
+            let server = MockServer::start().await;
+            let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let destination = format!("http://{}/rpc", unavailable.local_addr().unwrap());
+            drop(unavailable);
+            Mock::given(method("POST"))
+                .and(path("/api/v1/rpc"))
+                .and(body_partial_json(serde_json::json!({"method": "send"})))
+                .respond_with(ResponseTemplate::new(status).insert_header("Location", destination))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_failed_send_suppresses_late_echo(&self_send_rpc_channel(server.uri())).await;
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn redirected_rejection_keeps_note_to_self_closed() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for response in [
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": "ignored",
+                "error": {"code": -32602, "message": "Specified account does not exist"}
+            })),
+        ] {
+            let server = MockServer::start().await;
+            let destination = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/v1/rpc"))
+                .respond_with(
+                    ResponseTemplate::new(307).insert_header("Location", destination.uri()),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(serde_json::json!({"method": "send"})))
+                .respond_with(response)
+                .expect(1)
+                .mount(&destination)
+                .await;
+            assert_failed_send_suppresses_late_echo(&self_send_rpc_channel(server.uri())).await;
+            server.verify().await;
+            destination.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn redirected_success_preserves_note_to_self_correlation() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rpc"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", destination.uri()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "send", "params": {"message": "confirmed reply"}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": "ignored",
+                "result": {"timestamp": 1_700_000_000_000_u64}
+            })))
+            .expect(1)
+            .mount(&destination)
+            .await;
+        let ch = self_send_rpc_channel(server.uri());
+        ch.send(&SendMessage::new("confirmed reply", &ch.account))
+            .await
+            .unwrap();
+        assert_eq!(ch.self_send_guard.snapshot(), (0, 1, false));
+        let echo = make_sent_sync_envelope(
+            Some(&ch.account),
+            Some(&ch.account),
+            Some("confirmed reply"),
+            None,
+            None,
+        );
+        assert!(ch.process_envelope_async(&echo).await.is_empty());
+        assert_eq!(ch.self_send_guard.snapshot(), (0, 0, false));
+        let note = make_sent_sync_envelope(
+            Some(&ch.account),
+            Some(&ch.account),
+            Some("next phone note"),
+            None,
+            None,
+        );
+        assert_eq!(ch.process_envelope_async(&note).await.len(), 1);
+        server.verify().await;
+        destination.verify().await;
     }
 
     #[tokio::test]
