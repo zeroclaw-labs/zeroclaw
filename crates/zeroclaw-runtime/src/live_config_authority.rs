@@ -2027,6 +2027,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
 
+        let _spawning = SPAWN_VS_LOCK_REACQUIRE.blocking_write();
         let temp = tempfile::TempDir::new().unwrap();
         let lock_dir = temp
             .path()
