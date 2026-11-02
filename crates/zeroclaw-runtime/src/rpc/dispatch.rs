@@ -10483,7 +10483,7 @@ impl RpcDispatcher {
                     self.recheck_config_write_authority(
                         Method::ConfigMapKeyRename,
                         Some(path),
-                        &config_write_guard,
+                        &config_commit,
                     )?;
                     working.mark_dirty(path);
                 }
@@ -10501,6 +10501,7 @@ impl RpcDispatcher {
                 // control all live in a task that request cancellation
                 // cannot abort.
                 let cleanup_sessions = Arc::clone(&self.ctx.sessions);
+                let cleanup_auth = Arc::clone(&self.ctx.auth);
                 let cleanup_reload_tx = self.ctx.reload_tx.clone();
                 let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
                 let from = req.from.clone();
@@ -10532,6 +10533,10 @@ impl RpcDispatcher {
                                 working.clone(),
                             )
                             .await?;
+                            publish_accepted_config_policy(
+                                &cleanup_auth,
+                                &config_commit.current_config(),
+                            );
                         }
                         // Committed: advance both alias generations exactly
                         // once — synchronous, no await since the publication.
