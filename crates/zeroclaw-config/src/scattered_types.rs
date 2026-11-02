@@ -585,8 +585,15 @@ pub struct EmailConfig {
     pub smtp_host: String,
     #[serde(default = "default_smtp_port")]
     pub smtp_port: u16,
+    /// Connect to SMTP over implicit TLS (SMTPS, usually port 465). When
+    /// both this and `smtp_starttls` are `false`, SMTP is plain text.
     #[serde(default = "default_true")]
     pub smtp_tls: bool,
+    /// Connect to SMTP in plain text and upgrade with STARTTLS, which must
+    /// succeed before credentials are sent (typically port 587, e.g.
+    /// `smtp.office365.com`). Takes precedence over `smtp_tls`.
+    #[serde(default)]
+    pub smtp_starttls: bool,
     #[serde(default)]
     pub smtp_username: Option<String>,
     #[secret]
@@ -644,6 +651,7 @@ impl Default for EmailConfig {
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             smtp_tls: true,
+            smtp_starttls: false,
             smtp_username: None,
             smtp_password: None,
             username: String::new(),
