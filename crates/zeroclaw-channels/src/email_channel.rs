@@ -504,12 +504,15 @@ impl EmailChannel {
 
     /// Fetch messages with UID >= uid_threshold. Never modifies any flag.
     /// Returns parsed messages and the new threshold (max fetched UID + 1).
-    async fn fetch_new(
+    async fn fetch_new<S>(
         &self,
-        session: &mut ImapSession,
+        session: &mut async_imap::Session<S>,
         uid_threshold: u32,
         uid_validity: Option<u32>,
-    ) -> Result<(Vec<ParsedEmail>, u32)> {
+    ) -> Result<(Vec<ParsedEmail>, u32)>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+    {
         let search = format!("UID {}:*", uid_threshold);
         let uids = session.uid_search(&search).await?;
 
@@ -723,6 +726,11 @@ impl EmailChannel {
         uid_validity: Option<u32>,
     ) -> Result<()> {
         loop {
+            // Check before every IDLE: mail that arrived since the last search
+            // (including during startup) does not wake an IDLE started later.
+            uid_threshold = self
+                .process_new(&mut session, tx, uid_threshold, uid_validity)
+                .await?;
             match self.wait_for_changes(session).await {
                 Ok((IdleWaitResult::NewMail, returned_session)) => {
                     ::zeroclaw_log::record!(
@@ -731,15 +739,9 @@ impl EmailChannel {
                         "New mail notification received"
                     );
                     session = returned_session;
-                    uid_threshold = self
-                        .process_new(&mut session, tx, uid_threshold, uid_validity)
-                        .await?;
                 }
                 Ok((IdleWaitResult::Timeout, returned_session)) => {
                     session = returned_session;
-                    uid_threshold = self
-                        .process_new(&mut session, tx, uid_threshold, uid_validity)
-                        .await?;
                 }
                 Ok((IdleWaitResult::Interrupted, _)) => {
                     ::zeroclaw_log::record!(
@@ -828,23 +830,35 @@ impl EmailChannel {
     }
 
     /// Process newly arrived messages (UID >= uid_threshold). Returns updated threshold.
-    async fn process_new(
+    ///
+    /// Searches again after every batch until nothing new is found. A message
+    /// that lands while a batch is fetched is announced by an `EXISTS` that
+    /// arrives outside IDLE and never wakes the next IDLE, so without the
+    /// re-check it would wait for the IDLE timeout.
+    async fn process_new<S>(
         &self,
-        session: &mut ImapSession,
+        session: &mut async_imap::Session<S>,
         tx: &mpsc::Sender<ChannelMessage>,
-        uid_threshold: u32,
+        mut uid_threshold: u32,
         uid_validity: Option<u32>,
-    ) -> Result<u32> {
-        let (messages, new_threshold) =
-            self.fetch_new(session, uid_threshold, uid_validity).await?;
-
-        for email in messages {
-            if !self.dispatch_email(email, tx).await? {
-                return Ok(new_threshold); // channel closed
+    ) -> Result<u32>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+    {
+        loop {
+            let (messages, new_threshold) =
+                self.fetch_new(session, uid_threshold, uid_validity).await?;
+            if new_threshold == uid_threshold {
+                return Ok(uid_threshold);
             }
-        }
 
-        Ok(new_threshold)
+            for email in messages {
+                if !self.dispatch_email(email, tx).await? {
+                    return Ok(new_threshold); // channel closed
+                }
+            }
+            uid_threshold = new_threshold;
+        }
     }
 
     fn smtp_credentials(&self) -> Credentials {
@@ -2371,5 +2385,74 @@ mod tests {
             "  smtp_pass  ".to_string(),
         );
         assert_eq!(creds, expected);
+    }
+
+    /// Fake IMAP server over an in-memory stream. It answers LOGIN,
+    /// `UID SEARCH UID n:*` and `UID FETCH`, and adds `arrives_during_fetch`
+    /// to the mailbox while the first FETCH runs, the way new mail races a
+    /// fetch on a real server.
+    async fn fake_imap_session(
+        mut mailbox: Vec<u32>,
+        mut arrives_during_fetch: Vec<u32>,
+    ) -> async_imap::Session<tokio::io::DuplexStream> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        zeroclaw_spawn::spawn!(async move {
+            let (read, mut write) = tokio::io::split(server_io);
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let (tag, command) = line.split_once(' ').unwrap();
+                let mut reply = String::new();
+                if let Some(range) = command.strip_prefix("UID SEARCH UID ") {
+                    let from: u32 = range.trim_end_matches(":*").parse().unwrap();
+                    let hits: Vec<String> = mailbox
+                        .iter()
+                        .filter(|&&uid| uid >= from)
+                        .map(u32::to_string)
+                        .collect();
+                    reply.push_str(&format!("* SEARCH {}\r\n", hits.join(" ")));
+                } else if let Some(rest) = command.strip_prefix("UID FETCH ") {
+                    let uids = rest.split(' ').next().unwrap();
+                    for uid in uids.split(',') {
+                        let raw = format!(
+                            "From: sender@example.invalid\r\nMessage-ID: <{uid}@example.invalid>\r\nSubject: m{uid}\r\n\r\nbody {uid}\r\n"
+                        );
+                        reply.push_str(&format!(
+                            "* {uid} FETCH (UID {uid} BODY[] {{{}}}\r\n{raw})\r\n",
+                            raw.len()
+                        ));
+                    }
+                    mailbox.append(&mut arrives_during_fetch);
+                }
+                reply.push_str(&format!("{tag} OK done\r\n"));
+                write.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        async_imap::Client::new(client_io)
+            .login("user@example.invalid", "secret")
+            .await
+            .map_err(|(e, _)| e)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn process_new_picks_up_mail_that_arrives_during_a_fetch() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(vec!["@example.invalid".to_string()]),
+        );
+        let mut session = fake_imap_session(vec![5], vec![6]).await;
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let threshold = channel
+            .process_new(&mut session, &tx, 5, Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(threshold, 7);
+        assert_eq!(rx.recv().await.unwrap().id, "5@example.invalid");
+        assert_eq!(rx.recv().await.unwrap().id, "6@example.invalid");
     }
 }
