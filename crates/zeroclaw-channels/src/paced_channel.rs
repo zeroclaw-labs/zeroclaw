@@ -506,6 +506,26 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn set_explicit_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        add: bool,
+    ) -> Result<()> {
+        // Agent-driven writes must keep the explicit flag through pacing, or
+        // the inner channel treats them as automatic ack writes: unverified
+        // removals become silent no-ops reported as success, and ack cleanup
+        // is free to erase the tool's reaction.
+        self.inner
+            .set_explicit_reaction(channel_id, message_id, emoji, add)
+            .await
+    }
+
+    fn supports_orchestrator_ack_reactions(&self) -> bool {
+        self.inner.supports_orchestrator_ack_reactions()
+    }
+
     async fn pin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         self.inner.pin_message(channel_id, message_id).await
     }
@@ -676,6 +696,62 @@ mod tests {
         ) -> Result<()> {
             self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    /// Records explicit-reaction forwarding and can decline the generic
+    /// orchestrator acks, mirroring the production wrapper gap this pins.
+    struct ExplicitReactionChannel {
+        seen: std::sync::Mutex<Vec<(String, String, String, bool)>>,
+        decline_acks: bool,
+    }
+
+    impl Attributable for ExplicitReactionChannel {
+        fn role(&self) -> Role {
+            // Reuse an existing channel kind for testing only.
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "explicit-reaction"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ExplicitReactionChannel {
+        fn name(&self) -> &str {
+            "explicit-reaction"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn send_final(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        async fn set_explicit_reaction(
+            &self,
+            channel_id: &str,
+            message_id: &str,
+            emoji: &str,
+            add: bool,
+        ) -> Result<()> {
+            self.seen.lock().unwrap().push((
+                channel_id.to_string(),
+                message_id.to_string(),
+                emoji.to_string(),
+                add,
+            ));
+            // The inner channel's honest failure for an unverified removal
+            // must propagate through the wrapper unchanged.
+            if !add {
+                anyhow::bail!("cannot verify removal of {emoji}")
+            }
+            Ok(())
+        }
+        fn supports_orchestrator_ack_reactions(&self) -> bool {
+            !self.decline_acks
         }
     }
 
@@ -1310,6 +1386,72 @@ mod tests {
             2,
             "both sends eventually dispatch exactly once each",
         );
+    }
+
+    /// With reply pacing enabled, the reaction tool and orchestrator see the
+    /// PacedChannel handle. Both new reaction methods must forward to the
+    /// inner channel: the explicit flag survives wrapping (or unverified
+    /// removals become silent no-ops reported as success again) and the
+    /// inner channel's ack opt-out survives (or generic completion acks run
+    /// on channels that own a native ack).
+    #[tokio::test]
+    async fn explicit_reaction_semantics_survive_pacing_wrapper() {
+        let inner = Arc::new(ExplicitReactionChannel {
+            seen: std::sync::Mutex::new(Vec::new()),
+            decline_acks: true,
+        });
+        let cfg = PacingFixture {
+            interval_secs: 5,
+            depth: 0,
+        };
+        let wrapped = PacedChannel::wrap(inner.clone() as Arc<dyn Channel>, &cfg);
+
+        wrapped
+            .set_explicit_reaction("chat", "42", "\u{1F44D}", true)
+            .await
+            .unwrap();
+
+        let err = wrapped
+            .set_explicit_reaction("chat", "42", "\u{1F44D}", false)
+            .await
+            .expect_err("unverified removal must stay a failure through pacing");
+        assert!(
+            err.to_string().contains("cannot verify removal"),
+            "rendered: {err}"
+        );
+
+        let seen = inner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].3, "add flag must survive the wrapper");
+        assert!(
+            !seen[1].3,
+            "removal must arrive as an explicit call, not an automatic one"
+        );
+
+        assert!(
+            !wrapped.supports_orchestrator_ack_reactions(),
+            "the inner channel's ack opt-out must survive wrapping"
+        );
+    }
+
+    /// A channel without an override keeps the trait's default capability
+    /// through the wrapper: pacing must not change ack behavior for
+    /// channels that accept generic orchestrator acks.
+    #[tokio::test]
+    async fn paced_wrapper_inherits_default_ack_capability() {
+        let inner: Arc<dyn Channel> = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let wrapped = PacedChannel::wrap(
+            inner,
+            &PacingFixture {
+                interval_secs: 5,
+                depth: 0,
+            },
+        );
+        assert!(wrapped.supports_orchestrator_ack_reactions());
     }
 }
 

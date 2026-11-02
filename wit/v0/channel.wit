@@ -151,7 +151,8 @@ interface channel {
     ///   `cancel-draft`                     → `ok(())`
     ///   `supports-multi-message-streaming` → `false`
     ///   `multi-message-delay-ms`           → `800`
-    ///   `add-reaction` / `remove-reaction` /
+    ///   `add-reaction` / `remove-reaction` → `err` (reactions unsupported;
+    ///                                        never a fabricated success)
     ///   `pin-message` / `unpin-message` /
     ///   `redact-message`                   → `ok(())`
     ///   `request-approval`                 → `ok(none)`

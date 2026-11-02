@@ -547,19 +547,6 @@ impl Channel for VoiceCallChannel {
         Ok(())
     }
 
-    async fn add_reaction(&self, _channel_id: &str, _message_id: &str, _emoji: &str) -> Result<()> {
-        Ok(())
-    }
-
-    async fn remove_reaction(
-        &self,
-        _channel_id: &str,
-        _message_id: &str,
-        _emoji: &str,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     async fn pin_message(&self, _channel_id: &str, _message_id: &str) -> Result<()> {
         Ok(())
     }
@@ -638,6 +625,25 @@ mod tests {
     fn channel_name() {
         let channel = VoiceCallChannel::new("testbot", test_config());
         assert_eq!(channel.name(), "voice_call");
+    }
+
+    /// Voice calls have no message reactions; the channel must not report a
+    /// reaction as applied when nothing was sent.
+    #[tokio::test]
+    async fn reactions_fail_closed() {
+        let channel = VoiceCallChannel::new("testbot", test_config());
+        assert!(
+            channel
+                .add_reaction("call-1", "msg-1", "\u{1F44D}")
+                .await
+                .is_err()
+        );
+        assert!(
+            channel
+                .remove_reaction("call-1", "msg-1", "\u{1F44D}")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

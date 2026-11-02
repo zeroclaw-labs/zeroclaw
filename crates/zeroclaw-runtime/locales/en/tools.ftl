@@ -36,6 +36,8 @@ tool-channel-room-error-missing-param = Missing '{ $param }' parameter.
 tool-channel-room-error-string-param = '{ $param }' must be a string.
 tool-channel-room-error-bool-param = '{ $param }' must be a boolean.
 
+tool-reaction-error-unsupported = Reactions are not supported on the { $channel } channel.
+
 tool-cloud-ops = Cloud transformation advisory tool. Analyzes IaC plans, assesses migration paths, reviews costs, and checks architecture against Well-Architected Framework pillars. Read-only: does not create or modify cloud resources.
 
 tool-cloud-patterns = Cloud pattern library. Given a workload description, suggests applicable cloud-native architectural patterns (containerization, serverless, database modernization, etc.).

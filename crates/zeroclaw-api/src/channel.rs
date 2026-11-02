@@ -23,6 +23,21 @@ pub const CHANNEL_SOP_SUBJECT_PREFIX: &str = "zeroclaw:sop-event:";
 /// same matcher serves agent-loop message triggers and forge event triggers.
 pub struct ChannelSopTopic;
 
+/// Returned by a channel's reaction methods when the channel cannot send
+/// reactions at all. A typed error rather than message text, so the
+/// `reaction` tool can recognise it and render a localized message without
+/// this crate depending on the runtime's i18n.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReactionsUnsupported;
+
+impl fmt::Display for ReactionsUnsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("reactions are not supported by this channel")
+    }
+}
+
+impl std::error::Error for ReactionsUnsupported {}
+
 impl ChannelSopTopic {
     const ALIAS_SEP: char = '.';
     const EVENT_SEP: char = ':';
@@ -1292,14 +1307,29 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Whether generic orchestrator-driven acknowledgement reactions (the
+    /// early 👀 and the end-of-turn completion swap) run on this channel.
+    /// Channels that own a native ack mechanism override this to `false` so
+    /// the two mechanisms do not compete for the same reaction slot.
+    fn supports_orchestrator_ack_reactions(&self) -> bool {
+        true
+    }
+
     /// Add a reaction (emoji) to a message.
+    ///
+    /// Automatic, auxiliary reactions (acknowledgements) flow through this
+    /// method and its `remove_reaction` counterpart. Agent-driven reactions
+    /// flow through `set_explicit_reaction` so channels can tell the two
+    /// apart. Channels that support reactions must override these; the
+    /// defaults fail loudly so an unimplemented channel never surfaces a
+    /// fabricated success to agents (see `ReactionTool`).
     async fn add_reaction(
         &self,
         _channel_id: &str,
         _message_id: &str,
         _emoji: &str,
     ) -> anyhow::Result<()> {
-        Ok(())
+        Err(ReactionsUnsupported.into())
     }
 
     /// Remove a reaction (emoji) from a message previously added by this bot.
@@ -1309,7 +1339,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _message_id: &str,
         _emoji: &str,
     ) -> anyhow::Result<()> {
-        Ok(())
+        Err(ReactionsUnsupported.into())
+    }
+
+    /// Add or remove an agent-driven (explicit) reaction from the `reaction`
+    /// tool. Channels use the explicit flag to protect user-requested
+    /// reactions from later automatic-acknowledgement cleanup. The default
+    /// delegates to `add_reaction` / `remove_reaction`.
+    async fn set_explicit_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        add: bool,
+    ) -> anyhow::Result<()> {
+        if add {
+            self.add_reaction(channel_id, message_id, emoji).await
+        } else {
+            self.remove_reaction(channel_id, message_id, emoji).await
+        }
     }
 
     /// Pin a message in the channel.
