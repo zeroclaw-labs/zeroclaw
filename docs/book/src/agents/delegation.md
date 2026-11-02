@@ -76,6 +76,10 @@ The agent loop applies a per-turn duplicate-call guard: a tool called twice with
 
 When parallel tool execution is enabled (`parallel_tools = true` in the runtime profile), multiple `spawn_subagent` calls in one turn run concurrently and every child's final response is returned to the parent, keyed to its own tool call. `delegate` has its own explicit fan-out via the `parallel: [...]` argument (see the output-strings section); that path spawns each target on its own task and aggregates all results.
 
+Goal foreground work keeps `delegate` and `spawn_subagent` available when the existing tool, target, approval, and principal policies permit them, but executes child operations synchronously. Prepared Goal tool batches run sequentially in model order, including calls that do not themselves start children; parallel delegate fan-out is not a foreground Goal path. A completed child returns to depth zero, so a later sibling may run, while a depth-one child cannot start another agent child through any tool. Ordinary non-Goal parallel calls, delegation modes, and their authorization rules are unchanged.
+
+Goal children use the same operation accountant and ledger as their parent, and their terminal outcome is settled before the parent continues. Existing provider methods that return a legacy `String` may not expose token usage; usage is observed only where genuinely available, and missing usage fails closed for Goal progress rather than being invented. This limitation does not change ordinary non-Goal `String` response handling.
+
 ## ZeroCode transcript inspection
 
 Foreground `spawn_subagent` and `delegate` calls have expandable transcript cards showing the task, delegate target names when provided, and retained result text. Parallel delegation remains one invocation with the existing per-target result blocks. Additional arguments, such as context, remain visible in the input field. Malformed or oversized arguments fall back to the generic tool card. Expansion retains the tool display limits of 8 KiB or 100 lines per field; Copy uses the original retained entry, whose result may already have been capped at 16 KiB.

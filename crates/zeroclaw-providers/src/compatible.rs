@@ -4242,9 +4242,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             extra_body: self.extra_body.clone(),
         };
         // No cache breakpoints here, deliberately: this text-only helper
-        // never surfaces response usage to dispatch accounting, so a
-        // premium cache write it triggered could never be accounted for
-        // (fallback re-entries through this path return `usage: None`).
+        // must preserve its existing request policy even when an opted-in
+        // accounting scope observes usage returned on this path.
         // The flag is honored on the structured paths (`chat`,
         // `chat_with_tools`, `stream_chat`), which capture usage; the
         // provider docs describe this usage-capture boundary.
@@ -4273,6 +4272,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+        crate::dispatch::accounting::observe_string_usage(
+            chat_response.usage.map(UsageInfo::into_provider_usage),
+        );
 
         chat_response
             .choices
@@ -5512,6 +5514,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn goal_string_usage_keeps_compatible_request_and_text_policy() {
+        let (provider, captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 3}
+        }))
+        .await;
+        let dispatch = crate::dispatch::ProviderDispatch::new(std::sync::Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let text = scope
+            .scope(dispatch.chat_with_system(Some("be brief"), "hello", "test-model", None))
+            .await
+            .unwrap();
+        let report = scope.take();
+        let ordinary_scope = crate::dispatch::AccountedChatScope::new();
+        let ordinary_text = ordinary_scope
+            .scope(dispatch.chat_with_system(Some("be brief"), "hello", "test-model", None))
+            .await
+            .unwrap();
+        let ordinary_report = ordinary_scope.take();
+        server.abort();
+        assert_eq!(text, "ok");
+        assert_eq!(ordinary_text, text);
+        assert!(matches!(
+            ordinary_report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Missing
+        ));
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hello"}],
+                "stream": false
+            })
+        );
+    }
+
     /// Capture mock for the TTL path: passthrough on or off, provider
     /// built with the requested `cache_ttl` when set. Same wire as
     /// [`Self::mock_streaming_cache_capture`] so tests pin both paths
@@ -5549,7 +5593,8 @@ mod tests {
                             .into_response();
                     }
                     Json(serde_json::json!({
-                        "choices": [{"message": {"content": "ok"}}]
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": {"prompt_tokens": 8, "completion_tokens": 3}
                     }))
                     .into_response()
                 }
@@ -5574,6 +5619,31 @@ mod tests {
         let provider = builder.build();
 
         (provider, captured, server)
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_does_not_enable_premium_cache_breakpoints() {
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(true, Some(CacheTtl::OneHour)).await;
+        let dispatch = crate::dispatch::ProviderDispatch::new(std::sync::Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        assert_eq!(
+            scope
+                .scope(dispatch.chat_with_system(Some("system"), "hello", "model", None))
+                .await
+                .unwrap(),
+            "ok"
+        );
+        let report = scope.take();
+        server.abort();
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests[0]["messages"][0]["content"], "system");
+        assert_eq!(requests[0]["messages"][1]["content"], "hello");
+        assert!(!requests[0].to_string().contains("cache_control"));
     }
 
     /// D2 + D5: behind the flag, the 1h lifetime lands on every breakpoint

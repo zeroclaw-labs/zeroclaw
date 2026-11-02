@@ -21,6 +21,8 @@ pub enum InvalidUsageReason {
     MissingOutput,
     CachedInputExceedsInput,
     TotalOverflow,
+    /// An optional legacy String response usage field was malformed.
+    MalformedUsage,
 }
 
 /// Completeness of one physical provider attempt's usage observation.
@@ -358,14 +360,24 @@ pub struct AccountedChatScope {
 }
 
 impl AccountedChatScope {
-    /// Start the only lifecycle scope allowed by the providers/runtime
-    /// accounting contract. `Default` is intentionally not implemented: it
-    /// would add an unaudited second public construction capability.
+    /// Start an ordinary accounting scope without legacy String capture.
+    /// `Default` is intentionally not implemented; callers select the
+    /// appropriate scope explicitly.
     #[allow(clippy::new_without_default)]
     #[must_use]
     pub fn new() -> Self {
         Self {
             collector: accounting::CallAccountingCollector::default(),
+            inner: crate::reliable::ReliableCallAccountingScope::default(),
+        }
+    }
+
+    /// Start an accounting scope that captures usage observed by eligible
+    /// legacy String response leaves. Ordinary scopes do not capture it.
+    #[must_use]
+    pub fn new_with_string_usage() -> Self {
+        Self {
+            collector: accounting::CallAccountingCollector::with_string_usage(),
             inner: crate::reliable::ReliableCallAccountingScope::default(),
         }
     }
@@ -554,6 +566,9 @@ where
     let mut attempt = accounting::AttemptState::unstarted(provider_ref, model);
     futures_util::future::poll_fn(move |cx| {
         attempt.start();
+        if let Some(lease) = attempt.lease() {
+            lease.enable_string_usage();
+        }
         let mut poll = || Pin::as_mut(&mut future).poll(cx);
         let result = match attempt.lease() {
             Some(lease) => lease.poll_scope(poll),
@@ -563,7 +578,7 @@ where
             && let Some(lease) = attempt.lease()
         {
             match result {
-                Ok(_) => lease.finish_missing_response(),
+                Ok(_) => lease.finish_string_response(),
                 Err(error) => {
                     lease.finish_error_with_usage(crate::reliable::terminal_error_usage(error))
                 }

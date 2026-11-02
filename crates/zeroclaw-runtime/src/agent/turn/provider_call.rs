@@ -12,7 +12,7 @@ use super::redact::scrub_credentials;
 use super::stream_consume::{
     StreamProviderFailure, consume_provider_streaming_response_with_policy,
 };
-use crate::agent::cost::check_tool_loop_budget;
+use crate::agent::cost::{admit_goal_operation_if_scoped, check_tool_loop_budget};
 use crate::cost::types::{BudgetCheck, UsagePeriod};
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -298,6 +298,8 @@ pub(crate) fn announce_budget_warning(
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
 /// cancel asymmetry this function must preserve.
+/// An active Goal foreground token or absolute deadline is checked before
+/// accountant admission; once admitted, existing settlement and drain apply.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
@@ -312,6 +314,16 @@ pub(crate) async fn call_provider(
     iteration: usize,
     guard_tools: Option<&[ToolSpec]>,
 ) -> Result<ProviderCallOutcome> {
+    let foreground = crate::goal_accounting::GoalForegroundContext::current();
+    if foreground.as_ref().is_some_and(|context| {
+        context.token().is_cancelled()
+            || context
+                .deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    }) {
+        return Err(ToolLoopCancelled.into());
+    }
+    admit_goal_operation_if_scoped(ctx.provider_name, active_model).await?;
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
@@ -323,7 +335,11 @@ pub(crate) async fn call_provider(
         // The stream is lazily consumed inside this call-scoped owner. Its
         // permitted non-stream recovery therefore shares the same Reliable
         // attempt ledger instead of opening a second scope.
-        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        let scope = if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            zeroclaw_providers::dispatch::AccountedChatScope::new_with_string_usage()
+        } else {
+            zeroclaw_providers::dispatch::AccountedChatScope::new()
+        };
         let (result, live_deltas, protocol_suppressed, visible_text, recovered_image_request) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
                     match consume_provider_streaming_response_with_policy(
@@ -587,7 +603,11 @@ pub(crate) async fn call_provider(
         // Non-streaming path: wrap with optional per-step timeout from
         // pacing config to catch hung model responses.
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        let scope = if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            zeroclaw_providers::dispatch::AccountedChatScope::new_with_string_usage()
+        } else {
+            zeroclaw_providers::dispatch::AccountedChatScope::new()
+        };
         // Both attempts belong to one inference step: recovery must not
         // outlive cancellation or receive a fresh timeout allowance.
         let chat_future = async {
@@ -1255,6 +1275,259 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
             serving_provider_name: None,
             serving_model: None,
+        }
+    }
+
+    struct AdmissionProvider {
+        chat: AtomicUsize,
+        stream: AtomicUsize,
+    }
+
+    impl Attributable for AdmissionProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "admission-provider"
+        }
+    }
+
+    fn admission_usage() -> TokenUsage {
+        TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for AdmissionProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            unreachable!("structured chat is used")
+        }
+        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: Option<f64>) -> Result<ChatResponse> {
+            self.chat.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("response".into()),
+                tool_calls: vec![],
+                usage: Some(admission_usage()),
+                reasoning_content: None,
+            })
+        }
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn stream_chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta("response"),
+                )),
+                Ok(StreamEvent::Usage(admission_usage())),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
+    struct AdmissionSpy {
+        forbidden: bool,
+        admits: AtomicUsize,
+        settles: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for AdmissionSpy {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> Result<()> {
+            assert!(!self.forbidden, "unexpected accountant admission");
+            assert_eq!(request.model_provider, "test-provider");
+            assert_eq!(request.model, "test-model");
+            self.admits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> Result<()> {
+            self.settles.fetch_add(1, Ordering::SeqCst);
+            panic!("call_provider must not settle")
+        }
+        async fn pricing_complete(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    async fn admission_call(
+        provider: &AdmissionProvider,
+        streaming: bool,
+    ) -> Result<ProviderCallOutcome> {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = recovery_test_ctx(&observer, &pacing);
+        let messages = [ChatMessage::user("hello")];
+        call_provider(
+            &ctx,
+            provider,
+            "test-provider",
+            "test-model",
+            "test-model",
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            None,
+            streaming,
+            ToolRoundPolicy::Batch,
+            0,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_provider_admission_rejects_stopped_or_expired_root() {
+        for streaming in [false, true] {
+            for cancelled in [false, true] {
+                let directory = tempfile::TempDir::new().unwrap();
+                let handle =
+                    crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap();
+                let token = tokio_util::sync::CancellationToken::new();
+                let now = tokio::time::Instant::now();
+                let deadline = if cancelled {
+                    now + Duration::from_secs(60)
+                } else {
+                    now
+                };
+                if cancelled {
+                    token.cancel();
+                }
+                let root = crate::goal_accounting::GoalForegroundContext::new_root(
+                    zeroclaw_goal::GoalExecutionScope::new(
+                        "goal-accounting",
+                        "matrix_goal-accounting",
+                        1,
+                    )
+                    .unwrap(),
+                    handle,
+                    token,
+                    Some(deadline),
+                );
+                let provider = AdmissionProvider {
+                    chat: AtomicUsize::new(0),
+                    stream: AtomicUsize::new(0),
+                };
+                let spy = Arc::new(AdmissionSpy {
+                    forbidden: true,
+                    admits: AtomicUsize::new(0),
+                    settles: AtomicUsize::new(0),
+                });
+                let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+                    spy.clone();
+                let result = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .scope(
+                        Some(accountant),
+                        root.scope(admission_call(&provider, streaming)),
+                    )
+                    .await;
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("stopped Goal was admitted"),
+                };
+                assert!(error.downcast_ref::<ToolLoopCancelled>().is_some());
+                assert_eq!(provider.chat.load(Ordering::SeqCst), 0);
+                assert_eq!(provider.stream.load(Ordering::SeqCst), 0);
+                assert_eq!(spy.admits.load(Ordering::SeqCst), 0);
+                assert_eq!(spy.settles.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_settlement_provider_admission_live_and_unscoped_succeed() {
+        for streaming in [false, true] {
+            for scoped in [false, true] {
+                let directory = tempfile::TempDir::new().unwrap();
+                let handle =
+                    crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap();
+                let root = crate::goal_accounting::GoalForegroundContext::new_root(
+                    zeroclaw_goal::GoalExecutionScope::new(
+                        "goal-accounting",
+                        "matrix_goal-accounting",
+                        1,
+                    )
+                    .unwrap(),
+                    handle,
+                    tokio_util::sync::CancellationToken::new(),
+                    Some(tokio::time::Instant::now() + Duration::from_secs(60)),
+                );
+                let provider = AdmissionProvider {
+                    chat: AtomicUsize::new(0),
+                    stream: AtomicUsize::new(0),
+                };
+                let spy = Arc::new(AdmissionSpy {
+                    forbidden: false,
+                    admits: AtomicUsize::new(0),
+                    settles: AtomicUsize::new(0),
+                });
+                let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+                    spy.clone();
+                let outcome = if scoped {
+                    zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                        .scope(
+                            Some(accountant),
+                            root.scope(admission_call(&provider, streaming)),
+                        )
+                        .await
+                } else {
+                    admission_call(&provider, streaming).await
+                }
+                .unwrap();
+                assert!(outcome.chat_result.is_ok());
+                assert_eq!(
+                    provider.chat.load(Ordering::SeqCst),
+                    usize::from(!streaming)
+                );
+                assert_eq!(
+                    provider.stream.load(Ordering::SeqCst),
+                    usize::from(streaming)
+                );
+                assert_eq!(spy.admits.load(Ordering::SeqCst), usize::from(scoped));
+                assert_eq!(spy.settles.load(Ordering::SeqCst), 0);
+                assert_eq!(outcome.attempts.len(), 1);
+                let attempt = &outcome.attempts[0];
+                assert_eq!(
+                    attempt.provider_ref(),
+                    if streaming {
+                        "admission-provider"
+                    } else {
+                        "test-provider"
+                    }
+                );
+                assert_eq!(attempt.model(), "test-model");
+                match attempt.outcome() {
+                    zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage) => {
+                        assert_eq!(usage.input_tokens, Some(10));
+                        assert_eq!(usage.output_tokens, Some(2));
+                    }
+                    other => panic!("unexpected attempt outcome: {other:?}"),
+                }
+            }
         }
     }
     struct RejectedImageThenPendingProvider {

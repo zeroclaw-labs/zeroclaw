@@ -222,6 +222,10 @@ pub struct ArcToolRef(pub Arc<dyn Tool>);
 
 #[async_trait]
 impl Tool for ArcToolRef {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        self.0.may_invoke_agent_child(args)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.0.requires_unrestricted_principal()
     }
@@ -360,6 +364,10 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        self.inner.may_invoke_agent_child(args)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.inner.requires_unrestricted_principal()
     }
@@ -3355,6 +3363,40 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
         MemoryConfig, SopApprovalConfig,
     };
+
+    struct ChildPredicateProbe;
+    zeroclaw_api::mock_tool_attribution!(ChildPredicateProbe);
+
+    #[async_trait]
+    impl Tool for ChildPredicateProbe {
+        fn name(&self) -> &str {
+            "predicate_probe"
+        }
+        fn description(&self) -> &str {
+            "argument-sensitive child predicate"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args.get("action").and_then(|v| v.as_str()) != Some("list_results")
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            panic!("predicate must not execute the target")
+        }
+    }
+
+    #[test]
+    fn arc_tool_wrappers_forward_argument_sensitive_child_predicate() {
+        let inner: Arc<dyn Tool> = Arc::new(ChildPredicateProbe);
+        let direct = ArcToolRef(inner.clone());
+        let delegated = ArcDelegatingTool::boxed(inner);
+        for wrapper in [&direct as &dyn Tool, delegated.as_ref()] {
+            assert!(wrapper.may_invoke_agent_child(&serde_json::json!({"action":"delegate"})));
+            assert!(!wrapper.may_invoke_agent_child(&serde_json::json!({"action":"list_results"})));
+            assert!(wrapper.may_invoke_agent_child(&serde_json::json!({})));
+        }
+    }
 
     #[test]
     fn git_write_boundary_rejects_docker_runtime_writes() {

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::{
     Arc,
@@ -79,6 +79,146 @@ fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String
         message.push_str(&cleanup);
     }
     message
+}
+
+fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
+    use crate::wire::{GoalPendingAction, GoalQueuedControl, GoalResponse};
+
+    let key = match response {
+        GoalResponse::Help => "zc-goal-help",
+        GoalResponse::Disabled => "zc-goal-disabled",
+        GoalResponse::Queued(GoalQueuedControl::Start) => "zc-goal-queued-start",
+        GoalResponse::Queued(GoalQueuedControl::Resume) => "zc-goal-queued-resume",
+        GoalResponse::Queued(GoalQueuedControl::Pause) => "zc-goal-queued-pause",
+        GoalResponse::Queued(GoalQueuedControl::Budget) => "zc-goal-queued-budget",
+        GoalResponse::Started(_) => "zc-goal-started",
+        GoalResponse::Status(_) => "zc-goal-status",
+        GoalResponse::Budget(_) => "zc-goal-budget",
+        GoalResponse::BudgetUpdated(_) => "zc-goal-budget-updated",
+        GoalResponse::Paused(_) | GoalResponse::AlreadyPaused(_) => "zc-goal-paused",
+        GoalResponse::TransitionPending(GoalPendingAction::Pause) => "zc-goal-pause-pending",
+        GoalResponse::TransitionPending(GoalPendingAction::Cancel) => "zc-goal-cancel-pending",
+        GoalResponse::Resumed(_) => "zc-goal-resumed",
+        GoalResponse::Cancelled(_) | GoalResponse::AlreadyCancelled(_) => "zc-goal-cancelled",
+        GoalResponse::NoCurrentGoal => "zc-goal-none",
+        GoalResponse::AlreadyActive => "zc-goal-already-active",
+        GoalResponse::BudgetRequired => "zc-goal-budget-required",
+        GoalResponse::Terminal(_) => "zc-goal-terminal",
+        GoalResponse::Stale => "zc-goal-stale",
+    };
+    crate::i18n::t(key)
+}
+
+fn goal_failure_message(reason: crate::wire::GoalFailureReason) -> String {
+    use crate::wire::GoalFailureReason;
+
+    let key = match reason {
+        GoalFailureReason::AgentOperationFailed => "zc-goal-failure-agent-operation",
+        GoalFailureReason::ToolResultsUnpaired => "zc-goal-failure-tool-results-unpaired",
+        GoalFailureReason::EmptyAgentResponse => "zc-goal-failure-empty-agent-response",
+        GoalFailureReason::VerifierOperationFailed => "zc-goal-failure-verifier-operation",
+        GoalFailureReason::VerifierResponseInvalid => "zc-goal-failure-verifier-response",
+        GoalFailureReason::AccountingIncomplete => "zc-goal-failure-accounting",
+        GoalFailureReason::PricingIncomplete => "zc-goal-failure-pricing",
+        GoalFailureReason::OperationOutcomeUnknown => "zc-goal-failure-outcome-unknown",
+        GoalFailureReason::ExecutorStartFailed => "zc-goal-failure-executor-start",
+        GoalFailureReason::ExecutorFailed => "zc-goal-failure-executor",
+        GoalFailureReason::CandidatePersistenceFailed => "zc-goal-failure-candidate-persistence",
+        GoalFailureReason::Other => "zc-goal-failure-other",
+    };
+    crate::i18n::t(key)
+}
+
+fn goal_command_starts_execution(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("/goal"))
+        && words.next().is_some_and(|word| {
+            word.eq_ignore_ascii_case("start") || word.eq_ignore_ascii_case("resume")
+        })
+}
+
+fn notification_session_id(notif: &RpcNotification) -> Option<String> {
+    match notif.method.as_str() {
+        "session/update" => {
+            parse_session_update(&notif.params).map(|update| update.session_id().to_string())
+        }
+        "session/goal_update" => parse_goal_update(&notif.params).map(|update| match update {
+            GoalUpdate::VerifiedCandidate { session_id, .. }
+            | GoalUpdate::Completed { session_id }
+            | GoalUpdate::PausedForBlocker { session_id }
+            | GoalUpdate::Failed { session_id, .. }
+            | GoalUpdate::CommandFailed { session_id }
+            | GoalUpdate::Lifecycle { session_id, .. } => session_id.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// The daemon serializes `SessionGoalUpdate` as an externally tagged enum.
+/// Reject ambiguous or malformed notifications instead of treating an
+/// arbitrary object member as an update chosen by the daemon.
+enum GoalUpdate<'a> {
+    CommandFailed {
+        session_id: &'a str,
+    },
+    VerifiedCandidate {
+        session_id: &'a str,
+        candidate: &'a str,
+    },
+    Completed {
+        session_id: &'a str,
+    },
+    PausedForBlocker {
+        session_id: &'a str,
+    },
+    Failed {
+        session_id: &'a str,
+        reason: crate::wire::GoalFailureReason,
+    },
+    Lifecycle {
+        session_id: &'a str,
+        response: crate::wire::GoalResponse,
+    },
+}
+
+fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
+    let object = params.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let (kind, payload) = object.iter().next()?;
+    let payload = payload.as_object()?;
+    let session_id = payload.get("session_id")?.as_str()?;
+    match kind.as_str() {
+        "command_failed" if payload.len() == 1 => Some(GoalUpdate::CommandFailed { session_id }),
+        "verified_candidate" => Some(GoalUpdate::VerifiedCandidate {
+            session_id,
+            candidate: payload.get("candidate")?.as_str()?,
+        }),
+        "completed" => Some(GoalUpdate::Completed { session_id }),
+        "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker { session_id }),
+        "failed" => {
+            if payload.len() != 2 {
+                return None;
+            }
+            Some(GoalUpdate::Failed {
+                session_id,
+                reason: serde_json::from_value(payload.get("reason")?.clone()).ok()?,
+            })
+        }
+        "lifecycle" => {
+            if payload.len() != 2 {
+                return None;
+            }
+            Some(GoalUpdate::Lifecycle {
+                session_id,
+                response: serde_json::from_value(payload.get("response")?.clone()).ok()?,
+            })
+        }
+        _ => None,
+    }
 }
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
@@ -533,6 +673,15 @@ pub(crate) struct Chat {
     /// from leaving the matching local turn stuck in flight.
     prompt_completion_tx: mpsc::Sender<PromptCompletion>,
     prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
+    /// Typed completions for Goal control commands. Unlike prompt completions,
+    /// these never alter turn or queue state.
+    goal_completion_tx: mpsc::Sender<GoalCompletion>,
+    goal_completion_rx: mpsc::Receiver<GoalCompletion>,
+    /// Start/resume replies and session notifications use independent client
+    /// queues. Hold execution notifications until the matching acknowledgement
+    /// is rendered so a fast Goal cannot appear to run before it was accepted.
+    goal_launch_pending: BTreeMap<String, usize>,
+    deferred_goal_notifications: BTreeMap<String, VecDeque<RpcNotification>>,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// Where a fresh session reads the directory zerocode was launched from.
@@ -876,6 +1025,12 @@ fn token_source_fluent_key(source: &str) -> String {
     }
 }
 
+struct GoalCompletion {
+    session_id: String,
+    releases_launch_barrier: bool,
+    result: Result<crate::wire::GoalResponse, String>,
+}
+
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -889,6 +1044,7 @@ impl Chat {
         let (session_resync_tx, session_resync_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         let (prompt_completion_tx, prompt_completion_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
+        let (goal_completion_tx, goal_completion_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -906,6 +1062,10 @@ impl Chat {
             session_resync_in_flight: HashMap::new(),
             prompt_completion_tx,
             prompt_completion_rx,
+            goal_completion_tx,
+            goal_completion_rx,
+            goal_launch_pending: BTreeMap::new(),
+            deferred_goal_notifications: BTreeMap::new(),
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -2741,6 +2901,15 @@ impl Chat {
         let mut reconciles: Vec<String> = Vec::new();
         loop {
             match self.notif_rx.try_recv() {
+                Ok(notif)
+                    if let Some(session_id) = notification_session_id(&notif)
+                        && self.goal_launch_pending.contains_key(&session_id) =>
+                {
+                    self.deferred_goal_notifications
+                        .entry(session_id)
+                        .or_default()
+                        .push_back(notif);
+                }
                 Ok(notif) if notif.method == "session/update" => {
                     if let Some(update) = parse_session_update(&notif.params) {
                         // Route by session id: background sessions receive
@@ -2786,6 +2955,12 @@ impl Chat {
                         }
                     }
                 }
+                Ok(notif) if notif.method == "session/goal_update" => {
+                    let Some(update) = parse_goal_update(&notif.params) else {
+                        continue;
+                    };
+                    self.apply_goal_update(update);
+                }
                 Ok(_) => continue,
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     self.begin_notification_resync();
@@ -2802,6 +2977,68 @@ impl Chat {
         }
     }
 
+    fn apply_goal_update(&mut self, update: GoalUpdate<'_>) {
+        let session_id = match &update {
+            GoalUpdate::VerifiedCandidate { session_id, .. }
+            | GoalUpdate::Completed { session_id }
+            | GoalUpdate::PausedForBlocker { session_id }
+            | GoalUpdate::Failed { session_id, .. }
+            | GoalUpdate::CommandFailed { session_id }
+            | GoalUpdate::Lifecycle { session_id, .. } => *session_id,
+        };
+        let Some(state) = self.state_for_session_mut(session_id) else {
+            return;
+        };
+
+        match update {
+            GoalUpdate::CommandFailed { .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                        "zc-goal-command-failed",
+                    ))));
+                state.mark_dirty_append();
+            }
+            GoalUpdate::VerifiedCandidate { candidate, .. } => {
+                // Ordinary session/update chunks are authoritative when present;
+                // the full candidate is a fallback for clients that missed them.
+                state.commit_turn(candidate.to_owned(), true);
+            }
+            GoalUpdate::Completed { .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                        "zc-goal-completed",
+                    ))));
+                state.mark_dirty_append();
+            }
+            GoalUpdate::PausedForBlocker { .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                        "zc-goal-paused",
+                    ))));
+                state.mark_dirty_append();
+            }
+            GoalUpdate::Failed { reason, .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                        goal_failure_message(reason),
+                    )));
+                state.mark_dirty_append();
+            }
+            GoalUpdate::Lifecycle { response, .. } => {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                        goal_response_message(&response),
+                    )));
+                state.mark_dirty_append();
+            }
+        }
+    }
+
     /// Whether a `session/update` is this session's live terminal frame (the
     /// daemon either echoes the client turn generation or omits it).
     fn turn_complete_matches_generation(update: &SessionUpdate, generation: u64) -> bool {
@@ -2810,6 +3047,50 @@ impl Chat {
                 client_turn_generation,
                 ..
             } => client_turn_generation.is_none_or(|turn| turn == generation),
+            _ => false,
+        }
+    }
+
+    fn apply_session_notification(&mut self, notif: RpcNotification) -> bool {
+        match notif.method.as_str() {
+            "session/update" => {
+                let Some(update) = parse_session_update(&notif.params) else {
+                    return false;
+                };
+                // Route by session id: background sessions receive their stream
+                // too, so transcripts and status dots stay current while unfocused.
+                let session_id = update.session_id().to_string();
+                let mut applied = false;
+                let mut terminal_reconcile = false;
+                if !self.session_resync_in_flight.contains_key(&session_id)
+                    && let Some(state) = self.state_for_session_mut(&session_id)
+                    && state.last_error != Some(SessionError::ResyncFailed)
+                {
+                    if state
+                        .lag_reattach
+                        .as_ref()
+                        .is_some_and(|lag| lag.generation == state.turn_generation)
+                        && Self::turn_complete_matches_generation(&update, state.turn_generation)
+                    {
+                        state.intercept_terminal_frame_for_reload(update);
+                        terminal_reconcile = true;
+                    } else {
+                        state.apply_update(update);
+                        applied = true;
+                    }
+                }
+                if terminal_reconcile {
+                    self.begin_session_resync(session_id, SessionResyncMode::ReattachTerminal);
+                }
+                applied
+            }
+            "session/goal_update" => {
+                let Some(update) = parse_goal_update(&notif.params) else {
+                    return false;
+                };
+                self.apply_goal_update(update);
+                false
+            }
             _ => false,
         }
     }
@@ -2939,6 +3220,50 @@ impl Chat {
             self.begin_session_resync(sid, SessionResyncMode::ReattachTerminal);
         }
         if settled {
+            self.pump_all_queues();
+        }
+    }
+
+    fn drain_goal_completions(&mut self) {
+        let mut applied = false;
+        while let Ok(completion) = self.goal_completion_rx.try_recv() {
+            let message = match completion.result {
+                Ok(response) => goal_response_message(&response),
+                Err(_) => crate::i18n::t("zc-goal-command-failed"),
+            };
+            if let Some(state) = self.state_for_session_mut(&completion.session_id) {
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+                state.mark_dirty_append();
+            }
+
+            let release_notifications = if completion.releases_launch_barrier {
+                match self.goal_launch_pending.get_mut(&completion.session_id) {
+                    Some(pending) if *pending > 1 => {
+                        *pending -= 1;
+                        false
+                    }
+                    Some(_) => {
+                        self.goal_launch_pending.remove(&completion.session_id);
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if release_notifications
+                && let Some(mut notifications) = self
+                    .deferred_goal_notifications
+                    .remove(&completion.session_id)
+            {
+                while let Some(notif) = notifications.pop_front() {
+                    applied |= self.apply_session_notification(notif);
+                }
+            }
+        }
+        if applied {
             self.pump_all_queues();
         }
     }
@@ -3837,6 +4162,10 @@ impl Chat {
         // is the correlation fence that prevents an old TurnComplete from
         // settling the first post-resync prompt.
         self.drain_entry_retry_results();
+        // A resolved start/resume should release any ordered notification
+        // barrier before the notification queue is drained. Notifications
+        // already read ahead of the RPC task are replayed by this call.
+        self.drain_goal_completions();
         self.drain_notifications();
         self.drain_session_resync_results();
         self.drain_prompt_completions();
@@ -4464,6 +4793,33 @@ impl Chat {
                     state.clear_info_notice();
                     state.resume_queue();
                     let prompt = text.unwrap_or_default();
+                    if attachments.is_empty() && prompt.trim_start().starts_with("/goal") {
+                        let session_id = state.session_id.clone();
+                        let releases_launch_barrier = goal_command_starts_execution(&prompt);
+                        if releases_launch_barrier {
+                            *self
+                                .goal_launch_pending
+                                .entry(session_id.clone())
+                                .or_default() += 1;
+                        }
+                        let rpc = Arc::clone(&self.rpc);
+                        let tx = self.goal_completion_tx.clone();
+                        tokio::spawn(async move {
+                            let result = rpc
+                                .session_goal(&session_id, &prompt)
+                                .await
+                                .map(|result| result.response)
+                                .map_err(|error| error.to_string());
+                            let _ = tx
+                                .send(GoalCompletion {
+                                    session_id,
+                                    releases_launch_barrier,
+                                    result,
+                                })
+                                .await;
+                        });
+                        return false;
+                    }
                     let enq = state.enqueue_message(prompt, attachments);
                     self.after_enqueue(enq);
                     return false;
@@ -11843,10 +12199,12 @@ impl ChatState {
                         if outcome == TurnEndOutcome::Failed {
                             self.last_error = Some(classify_turn_failure(&content));
                         }
+                        // Settle streamed text/thinking before displaying the terminal error.
+                        // Otherwise commit_turn flushes the partial response after its error row.
+                        self.commit_turn(String::new(), false);
                         self.entries
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
                         self.mark_dirty_append();
-                        self.commit_turn(String::new(), false);
                     }
                 }
             }
@@ -12839,6 +13197,174 @@ pub async fn open_editor_for_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_catalogue_help_lists_commands() {
+        assert_eq!(
+            goal_response_message(&crate::wire::GoalResponse::Help),
+            "Goal commands: start, status, budget, pause, resume, cancel, help."
+        );
+    }
+
+    #[test]
+    fn goal_current_failure_variants_round_trip_and_render_without_missing_keys() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/goal_wire_variants.json"
+        )))
+        .unwrap();
+        for value in fixture["failure_reasons"].as_array().unwrap() {
+            let reason: crate::wire::GoalFailureReason =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(reason).unwrap(), *value);
+            let rendered = goal_failure_message(reason);
+            assert!(!rendered.is_empty());
+            assert!(
+                !rendered.starts_with('{'),
+                "missing Goal failure message: {value}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<crate::wire::GoalFailureReason>(serde_json::json!(
+                "future_unknown_reason"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn goal_current_response_variants_round_trip_and_render() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/goal_wire_variants.json"
+        )))
+        .unwrap();
+        let mut values = Vec::new();
+        for kind in fixture["unit_responses"].as_array().unwrap() {
+            values.push(serde_json::json!({"kind": kind}));
+        }
+        for kind in fixture["status_responses"].as_array().unwrap() {
+            values.push(serde_json::json!({"kind": kind, "status": fixture["status"]}));
+        }
+        for control in fixture["queued_controls"].as_array().unwrap() {
+            values.push(serde_json::json!({"kind": "queued", "status": control}));
+        }
+        for action in fixture["pending_actions"].as_array().unwrap() {
+            values.push(serde_json::json!({"kind": "transition_pending", "status": action}));
+        }
+        for value in values {
+            let response: crate::wire::GoalResponse =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&response).unwrap(), value);
+            let rendered = goal_response_message(&response);
+            assert!(!rendered.is_empty());
+            assert!(
+                !rendered.starts_with('{'),
+                "missing Goal response message: {value}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<crate::wire::GoalResponse>(
+                serde_json::json!({"kind": "future_unknown_response"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn goal_budget_required_explains_finite_budget_options() {
+        let rendered = goal_response_message(&crate::wire::GoalResponse::BudgetRequired);
+        for option in [
+            "--tokens",
+            "--cost-usd",
+            "goal.default_token_limit",
+            "goal.default_cost_limit_usd",
+        ] {
+            assert!(
+                rendered.contains(option),
+                "missing budget guidance: {option}"
+            );
+        }
+        assert!(!rendered.contains("--unlimited"));
+    }
+
+    #[test]
+    fn goal_catalogue_status_describes_read_only_result() {
+        let projection = serde_json::from_value(serde_json::json!({
+            "task_id": "goal-fixture",
+            "status": "running",
+            "execution_epoch": 1,
+            "token_limit": null,
+            "cost_limit_usd": null,
+            "accounting_state": "complete",
+            "pause_reason": null,
+            "resumable": false
+        }))
+        .unwrap();
+        let rendered = goal_response_message(&crate::wire::GoalResponse::Status(projection));
+
+        assert_eq!(rendered.lines().next(), Some("Goal status is available."));
+    }
+
+    #[test]
+    fn goal_queued_controls_round_trip_and_render() {
+        for (control, message) in [
+            (
+                "start",
+                "Goal start queued; it begins after the current turn.",
+            ),
+            (
+                "resume",
+                "Goal resume queued; it continues after the current turn.",
+            ),
+            (
+                "pause",
+                "Goal pause queued; it applies after the current step.",
+            ),
+            (
+                "budget",
+                "Goal budget change queued; it applies after the current step.",
+            ),
+        ] {
+            let value = serde_json::json!({"kind": "queued", "status": control});
+            let response: crate::wire::GoalResponse =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&response).unwrap(), value);
+            assert_eq!(goal_response_message(&response), message);
+        }
+        assert!(
+            serde_json::from_value::<crate::wire::GoalResponse>(
+                serde_json::json!({"kind": "queued", "status": "unknown"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn goal_late_budget_lifecycle_uses_the_native_renderer() {
+        let value = serde_json::json!({"lifecycle": {
+            "session_id": "goal-fixture",
+            "response": {"kind": "budget_updated", "status": {
+                "task_id": "goal-task", "status": "paused", "execution_epoch": 2,
+                "token_limit": 100, "cost_limit_usd": null,
+                "accounting_state": "complete", "pause_reason": "operator_paused",
+                "resumable": true
+            }}
+        }});
+        let GoalUpdate::Lifecycle {
+            session_id,
+            response,
+        } = parse_goal_update(&value).unwrap()
+        else {
+            panic!("expected the native late lifecycle update");
+        };
+        assert_eq!(session_id, "goal-fixture");
+        let crate::wire::GoalResponse::BudgetUpdated(status) = &response else {
+            panic!("expected the final budget result");
+        };
+        assert_eq!(status.token_limit, Some(100));
+        assert_eq!(goal_response_message(&response), "Goal budget updated.");
+    }
 
     /// Async env-lock for `#[tokio::test]` cases that resolve config through
     /// environment variables and hold the guard across await points. Serializes
@@ -24768,6 +25294,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_command_routes_to_session_goal_not_prompt_submission() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let outbound = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+            let mut chat = Chat::new(client, kind);
+            let mut active = state();
+            active.input_bar.insert_text("/goal help");
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+
+            chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                .await;
+
+            let request = next_rpc_request(&mut rx, "goal command must use session/goal").await;
+            assert_eq!(request["method"], method::SESSION_GOAL);
+            assert_eq!(request["params"]["session_id"], "sess-1");
+            assert_eq!(request["params"]["command"], "/goal help");
+            respond_ok(
+                &outbound,
+                &request,
+                serde_json::json!({
+                    "response": { "kind": "help" }
+                }),
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                rx.try_recv().is_err(),
+                "goal commands must not fall through to session/prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_start_ack_is_rendered_before_buffered_execution_events() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.goal_launch_pending.insert("sess-1".into(), 1);
+
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_message_chunk",
+                "session_id": "sess-1",
+                "text": "first Goal output",
+            }),
+        );
+        chat.rpc.push_notification_for_test(
+            "session/goal_update",
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "sess-1",
+                    "candidate": "first Goal output",
+                }
+            }),
+        );
+        chat.rpc.push_notification_for_test(
+            "session/goal_update",
+            serde_json::json!({
+                "completed": { "session_id": "sess-1" }
+            }),
+        );
+        chat.drain_notifications();
+        assert!(active_state(&mut chat).entries().is_empty());
+
+        chat.goal_completion_tx
+            .try_send(GoalCompletion {
+                session_id: "sess-1".into(),
+                releases_launch_barrier: false,
+                result: Ok(crate::wire::GoalResponse::Help),
+            })
+            .unwrap();
+        chat.drain_goal_completions();
+        assert!(active_state(&mut chat).entries().iter().all(|entry| {
+            !matches!(entry, ChatEntry::AgentMessage(text) if text.as_ref() == "first Goal output")
+        }));
+
+        chat.goal_completion_tx
+            .try_send(GoalCompletion {
+                session_id: "sess-1".into(),
+                releases_launch_barrier: true,
+                result: Ok(crate::wire::GoalResponse::Started(
+                    crate::wire::GoalStatusProjection {
+                        task_id: "goal-1".into(),
+                        status: "running".into(),
+                        execution_epoch: 1,
+                        token_limit: None,
+                        cost_limit_usd: None,
+                        accounting_state: "complete".into(),
+                        pause_reason: None,
+                        resumable: false,
+                    },
+                )),
+            })
+            .unwrap();
+        chat.drain_goal_completions();
+
+        let entries = active_state(&mut chat).entries();
+        let started_heading = crate::i18n::t("zc-goal-started");
+        let started = entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ChatEntry::SystemMessage(text) if text.as_ref().lines().next() == Some(started_heading.as_str()))
+            })
+            .expect("start acknowledgement should be visible");
+        let agent = entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ChatEntry::AgentMessage(text) if text.as_ref() == "first Goal output")
+            })
+            .expect("agent output should remain visible");
+        let completed = entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
+            })
+            .expect("lifecycle completion should remain visible");
+        assert!(started < agent && agent < completed);
+    }
+
+    #[test]
+    fn only_goal_start_and_resume_commands_install_the_render_barrier() {
+        assert!(goal_command_starts_execution(
+            "/goal start --unlimited finish this"
+        ));
+        assert!(goal_command_starts_execution(
+            "/goal resume Go with A\nthen continue"
+        ));
+        assert!(goal_command_starts_execution(
+            "  /GOAL RESUME\nmultiline response"
+        ));
+        assert!(!goal_command_starts_execution("/goal status"));
+        assert!(!goal_command_starts_execution("/goal pause now"));
+        assert!(!goal_command_starts_execution("/goal cancel"));
+        assert!(!goal_command_starts_execution("/goalism start"));
+    }
+
+    #[tokio::test]
     async fn rtg_9739_approval_enter_approves_without_submitting_composer() {
         use crossterm::event::KeyCode;
 
@@ -29245,6 +29917,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_turn_displays_streamed_response_before_error() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "partial agent response".to_string(),
+        });
+
+        s.apply_update(SessionUpdate::TurnComplete {
+            session_id: "sess-1".to_string(),
+            client_turn_generation: None,
+            message_count: None,
+            outcome: TurnEndOutcome::Failed,
+            content: "turn failed: provider returned 429".to_string(),
+        });
+
+        assert_eq!(s.entries().len(), 2);
+        assert!(
+            matches!(&s.entries()[0], ChatEntry::AgentMessage(text) if text.as_ref() == "partial agent response")
+        );
+        assert!(
+            matches!(&s.entries()[1], ChatEntry::SystemMessage(text) if text.as_ref() == "turn failed: provider returned 429")
+        );
+    }
+
     /// When tool calls were made during a turn but no text was streamed and
     /// final text is empty, commit_turn must NOT add a diagnostic — the tool
     /// entries are the visible record of work.
@@ -32788,6 +33485,336 @@ mod tests {
             0,
             "only a refusal issued before the turn started requeues"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_command_failure_is_strict_and_session_scoped() {
+        for invalid in [
+            serde_json::json!({"command_failed": {}}),
+            serde_json::json!({"command_failed": {"session_id": 1}}),
+            serde_json::json!({"command_failed": {"session_id": "sess-1", "error": "private detail"}}),
+            serde_json::json!({"command_failed": {"session_id": "sess-1"}, "completed": {"session_id": "sess-1"}}),
+        ] {
+            assert!(parse_goal_update(&invalid).is_none(), "{invalid}");
+        }
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        for session_id in ["other-session", "sess-1"] {
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/goal_update".into(),
+                    params: serde_json::json!({"command_failed": {"session_id": session_id}}),
+                })
+                .unwrap();
+        }
+        chat.drain_notifications();
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0], ChatEntry::SystemMessage(text)
+            if text.as_ref() == crate::i18n::t("zc-goal-command-failed")));
+    }
+
+    #[tokio::test]
+    async fn goal_updates_require_one_canonical_variant_for_the_target_session() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(8);
+        chat.notif_rx = notif_rx;
+
+        for params in [
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "sess-1",
+                    "candidate": "accepted result"
+                },
+                "completed": { "session_id": "sess-1" }
+            }),
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "other-session",
+                    "candidate": "must not be displayed"
+                }
+            }),
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "sess-1",
+                    "candidate": "accepted result"
+                }
+            }),
+            serde_json::json!({ "completed": { "session_id": "sess-1" } }),
+            serde_json::json!({
+                "lifecycle": {
+                    "session_id": "sess-1",
+                    "response": { "kind": "transition_pending", "status": "pause" }
+                }
+            }),
+            serde_json::json!({
+                "lifecycle": {
+                    "session_id": "sess-1",
+                    "response": {
+                        "kind": "paused",
+                        "status": {
+                            "task_id": "goal-1",
+                            "status": "paused",
+                            "execution_epoch": 3,
+                            "token_limit": null,
+                            "cost_limit_usd": null,
+                            "accounting_state": "complete",
+                            "pause_reason": "operator",
+                            "resumable": true
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "lifecycle": { "session_id": "sess-1", "response": { "kind": "unknown" } }
+            }),
+        ] {
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/goal_update".to_string(),
+                    params,
+                })
+                .unwrap();
+        }
+
+        active_state(&mut chat).apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "accepted result".to_string(),
+        });
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 4);
+        assert!(
+            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result"),
+            "the candidate must settle streamed output without duplicating it"
+        );
+        assert!(
+            matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
+        );
+        assert!(matches!(
+            &entries[2],
+            ChatEntry::SystemMessage(text)
+                if text.as_ref() == crate::i18n::t("zc-goal-pause-pending")
+        ));
+        let paused_heading = crate::i18n::t("zc-goal-paused");
+        assert!(matches!(
+            &entries[3],
+            ChatEntry::SystemMessage(text) if text.as_ref().lines().next() == Some(paused_heading.as_str())
+        ));
+    }
+
+    #[tokio::test]
+    async fn goal_current_budget_and_persistence_updates_reach_native_presentation() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".into(),
+                params: serde_json::json!({"lifecycle": {
+                    "session_id": "sess-1", "response": {"kind": "budget_required"}
+                }}),
+            })
+            .unwrap();
+        chat.drain_notifications();
+        assert!(!chat.apply_session_notification(RpcNotification {
+            method: "session/goal_update".into(),
+            params: serde_json::json!({"failed": {
+                "session_id": "sess-1", "reason": "candidate_persistence_failed"
+            }}),
+        }));
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(&entries[0], ChatEntry::SystemMessage(text)
+            if text.as_ref() == goal_response_message(&crate::wire::GoalResponse::BudgetRequired)));
+        assert!(matches!(&entries[1], ChatEntry::SystemMessage(text)
+            if text.as_ref() == goal_failure_message(crate::wire::GoalFailureReason::CandidatePersistenceFailed)));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
+            "lifecycle results must not fabricate an agent answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_current_variants_reach_final_native_terminal_cells() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // Exercise the production notification pump, app frame, and chat pane
+        // renderer. This proves visible semantic chat output, not socket/TLS
+        // transport behavior.
+        for width in [120, 160] {
+            let (mut chat, _writer_rx) = test_chat();
+            chat.phase = ChatPhase::Active(Box::new(state()));
+            let mut acp = crate::acp::Acp::new(chat.rpc.clone());
+
+            chat.rpc.push_notification_for_test(
+                "session/goal_update",
+                serde_json::json!({"lifecycle": {
+                    "session_id": "sess-1",
+                    "response": {"kind": "budget_required"}
+                }}),
+            );
+            chat.rpc.push_notification_for_test(
+                "session/goal_update",
+                serde_json::json!({"failed": {
+                    "session_id": "sess-1",
+                    "reason": "candidate_persistence_failed"
+                }}),
+            );
+            chat.tick_transport_events();
+
+            let height = 48;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    crate::app::draw_app_frame(
+                        frame,
+                        crate::app::Mode::Chat,
+                        &mut chat,
+                        &mut acp,
+                        |frame, rows, chat, _acp| {
+                            chat.draw_with_dock(frame, rows[1], None, None);
+                            chat.draw_dock_overlay(frame);
+                        },
+                    );
+                })
+                .unwrap();
+
+            let transcript_area = active_state(&mut chat)
+                .transcript_snapshot
+                .as_ref()
+                .expect("production chat draw captures transcript area")
+                .area;
+            let rendered = overlay_text(&terminal, transcript_area);
+            let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+            let budget = goal_response_message(&crate::wire::GoalResponse::BudgetRequired)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let persistence_failure = crate::i18n::t("zc-goal-failure-candidate-persistence")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let budget_at = normalized.find(&budget).unwrap_or_else(|| {
+                panic!("missing localized finite-budget guidance at width {width}: {rendered}")
+            });
+            let failure_at = normalized.find(&persistence_failure).unwrap_or_else(|| {
+                panic!("missing localized persistence failure at width {width}: {rendered}")
+            });
+            assert!(
+                budget_at < failure_at,
+                "Goal notifications reordered: {rendered}"
+            );
+            assert_eq!(normalized.matches(&budget).count(), 1, "{rendered}");
+            assert_eq!(
+                normalized.matches(&persistence_failure).count(),
+                1,
+                "{rendered}"
+            );
+            for option in [
+                "--tokens",
+                "--cost-usd",
+                "goal.default_token_limit",
+                "goal.default_cost_limit_usd",
+            ] {
+                assert!(
+                    normalized.contains(option),
+                    "finite-budget guidance omitted {option}: {rendered}"
+                );
+            }
+            assert!(
+                !normalized.contains("--unlimited"),
+                "finite-budget guidance suggested removing the limit: {rendered}"
+            );
+            for key in [
+                "zc-goal-budget-required",
+                "zc-goal-failure-candidate-persistence",
+                "budget_required",
+                "candidate_persistence_failed",
+            ] {
+                assert!(
+                    !normalized.contains(key),
+                    "untranslated or wire text {key}: {rendered}"
+                );
+            }
+            assert!(
+                !normalized.contains("**") && !normalized.contains('`'),
+                "literal Markdown leaked into terminal cells: {rendered}"
+            );
+            assert!(
+                active_state(&mut chat)
+                    .entries()
+                    .iter()
+                    .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
+                "lifecycle notifications must not fabricate an agent answer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_failure_update_keeps_the_typed_reason_for_its_session() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+
+        let notification = RpcNotification {
+            method: "session/goal_update".to_string(),
+            params: serde_json::json!({
+                "failed": {
+                    "session_id": "sess-1",
+                    "reason": "tool_results_unpaired"
+                }
+            }),
+        };
+        assert_eq!(
+            notification_session_id(&notification).as_deref(),
+            Some("sess-1")
+        );
+        notif_tx.send(notification).unwrap();
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".to_string(),
+                params: serde_json::json!({
+                    "failed": {
+                        "session_id": "sess-1",
+                        "reason": "unrecognized"
+                    }
+                }),
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        // The completion pump can route this notification through the
+        // alternate handler; both paths must render the same typed reason.
+        assert!(!chat.apply_session_notification(RpcNotification {
+            method: "session/goal_update".to_string(),
+            params: serde_json::json!({
+                "failed": {
+                    "session_id": "sess-1",
+                    "reason": "tool_results_unpaired"
+                }
+            }),
+        }));
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 2, "invalid typed reasons must be rejected");
+        for entry in entries {
+            assert!(matches!(
+                entry,
+                ChatEntry::SystemMessage(text)
+                    if text.as_ref() == goal_failure_message(crate::wire::GoalFailureReason::ToolResultsUnpaired)
+            ));
+        }
     }
 
     #[test]

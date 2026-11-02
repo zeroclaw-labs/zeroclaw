@@ -238,6 +238,10 @@ pub struct RpcContext {
     /// `commit_config_with_live_session_refresh`. See `ConfigCommitPause`.
     #[cfg(test)]
     pub config_commit_pause: Option<Arc<ConfigCommitPause>>,
+
+    /// Process-local ZeroCode Goal worker ownership. Durable Goal facts stay
+    /// in the control plane; this only retains fenced execution handles.
+    pub goal_runtime: Arc<crate::rpc::goal::RpcGoalRuntime>,
 }
 
 /// Test-only pause point inside `commit_config_with_live_session_refresh`:
@@ -298,6 +302,7 @@ impl RpcContext {
             auth,
             #[cfg(test)]
             config_commit_pause: None,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -339,6 +344,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -371,6 +377,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit: None,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -412,6 +419,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -494,6 +502,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit: None,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -530,6 +539,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit: None,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -571,6 +581,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit: None,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -607,6 +618,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit: None,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -643,6 +655,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit: None,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -680,6 +693,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit: None,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -717,6 +731,7 @@ impl RpcContext {
             config_commit_pause: None,
             cert_audit: None,
             auth,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 }

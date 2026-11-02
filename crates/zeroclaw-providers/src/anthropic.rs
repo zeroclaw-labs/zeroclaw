@@ -2939,6 +2939,9 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let chat_response: NativeChatResponse = response.json().await?;
+        crate::dispatch::accounting::observe_string_usage(Self::normalize_usage(
+            chat_response.usage.as_ref(),
+        ));
         commit_safeguard_fallback(None);
         Self::check_refusal(&chat_response, model)?;
         let safeguard_notice = Self::server_fallback_notice(&chat_response, model);
@@ -9935,10 +9938,17 @@ data: {\"type\":\"message_stop\"}\n\n";
         });
         let (addr, server) = spawn_messages_server(body).await;
         let provider = refusal_test_provider(addr);
-
-        let result = provider
-            .chat_with_system(Some("be helpful"), "hello", "claude-sonnet-4-6", None)
+        let dispatch = crate::dispatch::ProviderDispatch::new(std::sync::Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let result = scope
+            .scope(dispatch.chat_with_system(
+                Some("be helpful"),
+                "hello",
+                "claude-sonnet-4-6",
+                None,
+            ))
             .await;
+        let report = scope.take();
         server.abort();
 
         let err = result.expect_err("a refusal must surface as an error");
@@ -9949,6 +9959,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(
             typed.usage.as_ref().and_then(|usage| usage.input_tokens),
             Some(5)
+        );
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::OutcomeUnknown { observed: Some(usage) }
+            if usage.input_tokens == Some(5) && usage.output_tokens == Some(0))
         );
     }
 

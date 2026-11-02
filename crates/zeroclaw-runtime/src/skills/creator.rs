@@ -69,7 +69,8 @@ impl SkillCreator {
     /// from a *bounded* slice of the execution via a model-provider reflection
     /// call. If reflection fails — provider error, malformed output, empty
     /// body — it falls back to the deterministic `SKILL.toml` generator so a
-    /// creation attempt is never left half-done.
+    /// creation attempt is never left half-done. An active Goal child instead
+    /// returns the original reflection failure without writing a fallback.
     ///
     /// Gating (enabled flag, minimum tool calls, dedup, slug, LRU) is shared
     /// with [`Self::create_from_execution`].
@@ -109,6 +110,11 @@ impl SkillCreator {
                     .with_context(|| format!("Failed to write {}", md_path.display()))?;
             }
             Err(err) => {
+                if crate::goal_accounting::GoalForegroundContext::current()
+                    .is_some_and(|context| context.depth() > 0)
+                {
+                    return Err(err);
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

@@ -1166,6 +1166,7 @@ fn resolve_ws_session_cwd(
 fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) -> &'static str {
     match error {
         crate::session_queue::SessionQueueError::QueueFull { .. } => "SESSION_QUEUE_FULL",
+        crate::session_queue::SessionQueueError::Evicting { .. } => "SESSION_EVICTING",
         crate::session_queue::SessionQueueError::Timeout { .. } => "SESSION_QUEUE_TIMEOUT",
     }
 }
@@ -4851,6 +4852,12 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 depth: 2,
             }),
             "SESSION_QUEUE_FULL"
+        );
+        assert_eq!(
+            session_queue_ws_error_code(&SessionQueueError::Evicting {
+                session_id: "gw_test".into(),
+            }),
+            "SESSION_EVICTING"
         );
         assert_eq!(
             session_queue_ws_error_code(&SessionQueueError::Timeout {

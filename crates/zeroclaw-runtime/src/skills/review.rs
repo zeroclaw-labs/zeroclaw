@@ -41,8 +41,58 @@ pub async fn maybe_run_skill_review(
     cancellation_token: Option<&CancellationToken>,
     agent_alias: Option<&str>,
 ) {
+    if let Err(e) = try_run_skill_review(
+        full_config,
+        workspace_dir,
+        config,
+        allow_scripts,
+        history,
+        failed_slugs,
+        provider,
+        provider_name,
+        model_name,
+        observer,
+        multimodal,
+        pacing,
+        max_tool_result_chars,
+        context_token_budget,
+        cancellation_token,
+        agent_alias,
+    )
+    .await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+            "Skill review fork failed"
+        );
+    }
+}
+
+/// Run the existing review fork while retaining its original failure for Goal children.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn try_run_skill_review(
+    full_config: Option<&zeroclaw_config::schema::Config>,
+    workspace_dir: PathBuf,
+    config: SkillImprovementConfig,
+    allow_scripts: bool,
+    history: Vec<ChatMessage>,
+    failed_slugs: Vec<String>,
+    provider: &dyn ModelProvider,
+    provider_name: &str,
+    model_name: &str,
+    observer: &dyn Observer,
+    multimodal: &MultimodalConfig,
+    pacing: &PacingConfig,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
+    cancellation_token: Option<&CancellationToken>,
+    agent_alias: Option<&str>,
+) -> anyhow::Result<()> {
     if !config.enabled {
-        return;
+        return Ok(());
     }
     if SKILL_REVIEW_ACTIVE.try_with(|()| ()).is_ok() {
         ::zeroclaw_log::record!(
@@ -50,7 +100,7 @@ pub async fn maybe_run_skill_review(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Skill review: recursion guard tripped, skipping nested review"
         );
-        return;
+        return Ok(());
     }
     if !should_trigger(&history, config.nudge_interval_iterations) {
         ::zeroclaw_log::record!(
@@ -63,7 +113,7 @@ pub async fn maybe_run_skill_review(
             ),
             "Skill review: iteration budget not reached, skipping"
         );
-        return;
+        return Ok(());
     }
 
     let review_tools = build_review_tools(workspace_dir.clone(), config.clone(), allow_scripts);
@@ -221,16 +271,9 @@ pub async fn maybe_run_skill_review(
                 );
             }
         }
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
-                "Skill review fork failed"
-            );
-        }
+        Err(e) => return Err(e),
     }
+    Ok(())
 }
 
 fn build_review_tools(

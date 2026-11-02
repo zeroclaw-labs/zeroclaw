@@ -10,12 +10,14 @@ publish = true
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-commands.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config = { workspace = true, default-features = false }
 zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
+zeroclaw-goal.workspace = true
 zeroclaw-runtime.workspace = true
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools = { workspace = true, optional = true }

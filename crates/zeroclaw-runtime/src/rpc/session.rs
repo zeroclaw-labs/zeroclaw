@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use zeroclaw_api::plan::PlanEntry;
-use zeroclaw_infra::session_queue::SessionActorQueue;
+use zeroclaw_infra::session_queue::{SessionActorQueue, SessionEvictionGuard};
 use zeroclaw_providers::ModelProvider;
 
 /// Error returned by [`SessionStore::lock_model_provider_update_with_timeout`].
@@ -108,6 +108,10 @@ pub struct RpcSession {
     /// Share the Agent's canonical channel map so steering can recheck live
     /// capabilities without acquiring the Agent mutex held by its turn.
     reaction_channels: crate::tools::PerToolChannelHandle,
+    /// Serializes Goal lifecycle commands for this exact live session. It is
+    /// session-owned so removal and same-ID replacement cannot leave a
+    /// daemon-lifetime lock entry behind.
+    goal_command: Arc<Mutex<()>>,
     /// Orders provider refreshes and configuration within this session.
     model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
@@ -210,6 +214,22 @@ impl ResumeExistingError {
     }
 }
 
+/// The authoritative live-session facts required to admit a Goal command.
+///
+/// Goal admission must read these facts together: independent reads can span a
+/// same-ID replacement and accidentally combine the old generation with the
+/// successor's owner or agent. This remains a read-only projection of the
+/// canonical session store, not a second session registry.
+pub(crate) struct GoalSessionSnapshot {
+    pub(crate) agent: Arc<Mutex<Agent>>,
+    pub(crate) reaction_channels: crate::tools::PerToolChannelHandle,
+    pub(crate) agent_alias: String,
+    pub(crate) chat_mode: crate::rpc::types::ChatMode,
+    pub(crate) owner_tui_id: Option<String>,
+    pub(crate) generation: u64,
+    pub(crate) goal_command: Arc<Mutex<()>>,
+}
+
 impl RpcSession {
     pub fn new(
         agent: Agent,
@@ -222,6 +242,7 @@ impl RpcSession {
             reaction_channels: Arc::clone(&agent.channel_handles().reaction),
             agent: Arc::new(Mutex::new(agent)),
             lifecycle_lease: None,
+            goal_command: Arc::new(Mutex::new(())),
             model_provider_update: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
             last_active: Instant::now(),
@@ -300,6 +321,12 @@ type RemovalSignalPause = (
 
 type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 
+#[derive(Debug, Clone)]
+pub(crate) struct SameModeSiblingEvictionCandidate {
+    pub(crate) id: String,
+    pub(crate) generation: u64,
+}
+
 #[cfg(test)]
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
@@ -350,6 +377,10 @@ pub struct SessionStore {
     pub(crate) test_rehydration_published_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
     pub(crate) test_construction_publication_pause:
+        std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only gate after session/new captures its authorized incarnation.
+    #[cfg(test)]
+    pub(crate) test_goal_replacement_capture_pause:
         std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
     test_prompt_rehydration_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
@@ -448,6 +479,8 @@ impl SessionStore {
             test_rehydration_published_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_construction_publication_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_goal_replacement_capture_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_rehydration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1085,11 +1118,54 @@ impl SessionStore {
         matches
     }
 
-    /// Await the test-only pause gate before validating a captured session
-    /// identity or generation. Returns the
-    /// `done` notifier which must be signalled after the generation check
-    /// (and any apply attempt) completes so tests don't observe the
-    /// successor before the stale work has run its course.
+    /// Read the exact Goal-admission facts under one session-store lock.
+    pub(crate) async fn goal_session_snapshot(&self, id: &str) -> Option<GoalSessionSnapshot> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| GoalSessionSnapshot {
+                agent: Arc::clone(&session.agent),
+                reaction_channels: Arc::clone(&session.reaction_channels),
+                agent_alias: session.agent_alias.clone(),
+                chat_mode: session.chat_mode.clone(),
+                owner_tui_id: session.owner_tui_id.clone(),
+                generation: session.generation,
+                goal_command: Arc::clone(&session.goal_command),
+            })
+    }
+
+    /// Serialize a lifecycle action with Goal commands for one exact live
+    /// session generation. The generation is checked both before waiting and
+    /// after acquiring the session-owned lock, so a caller that was delayed by
+    /// a same-ID replacement cannot act on the successor's Goal.
+    pub(crate) async fn lock_goal_lifecycle(
+        &self,
+        id: &str,
+        expected_generation: u64,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(id)?;
+            if session.generation != expected_generation {
+                return None;
+            }
+            Arc::clone(&session.goal_command)
+        };
+        let guard = lock.lock_owned().await;
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .filter(|session| session.generation == expected_generation)
+            .map(|_| guard)
+    }
+
+    /// Await the test-only pause gate before validating captured session
+    /// identity/generation in `set_overrides_gated` and
+    /// `apply_model_provider`. Returns the `done` notifier which must be
+    /// signalled after the check (and any apply attempt) completes so tests
+    /// don't observe the successor before stale work has run its course.
     #[cfg(test)]
     async fn wait_test_gate(&self) -> Option<Arc<tokio::sync::Notify>> {
         let (entered, release, done) = {
@@ -1686,12 +1762,12 @@ impl SessionStore {
         true
     }
 
-    pub async fn evict_same_mode_sibling(
+    pub(crate) async fn same_mode_sibling_eviction_candidates(
         &self,
         tui_id: &str,
         chat_mode: &crate::rpc::types::ChatMode,
         except_id: &str,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<SameModeSiblingEvictionCandidate> {
         let in_flight: std::collections::HashSet<String> = self
             .cancel_tokens
             .lock()
@@ -1699,8 +1775,9 @@ impl SessionStore {
             .keys()
             .cloned()
             .collect();
-        let mut sessions = self.sessions.lock().await;
-        let victims: Vec<String> = sessions
+        self.sessions
+            .lock()
+            .await
             .iter()
             .filter(|(key, s)| {
                 key.as_str() != except_id
@@ -1708,23 +1785,54 @@ impl SessionStore {
                     && &s.chat_mode == chat_mode
                     && !in_flight.contains(key.as_str())
             })
-            .map(|(key, _)| key.clone())
-            .collect();
-        let mut evicted = Vec::with_capacity(victims.len());
-        let mut pending = Vec::new();
-        for key in victims {
-            if let Some(s) = sessions.remove(&key) {
-                if let Some(notify) = s.pending_generation {
-                    pending.push(notify);
-                }
-                evicted.push((key, s.agent_alias));
-            }
+            .map(|(key, session)| SameModeSiblingEvictionCandidate {
+                id: key.clone(),
+                generation: session.generation,
+            })
+            .collect()
+    }
+
+    /// Remove one exact idle sibling while its actor queue is reserved for
+    /// eviction. Both the live generation and owner/mode stamps are checked
+    /// under the session-store lock; a later incarnation under the same id is
+    /// never removed by stale LRU work.
+    pub(crate) async fn evict_same_mode_sibling_candidate(
+        &self,
+        guard: &SessionEvictionGuard,
+        candidate: &SameModeSiblingEvictionCandidate,
+        tui_id: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        except_id: &str,
+    ) -> Option<(String, String)> {
+        debug_assert_eq!(guard.session_id(), candidate.id);
+        if guard.session_id() != candidate.id || candidate.id == except_id {
+            return None;
         }
+
+        let mut sessions = self.sessions.lock().await;
+        let has_cancel_token = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&candidate.id);
+        if has_cancel_token
+            || !sessions.get(&candidate.id).is_some_and(|session| {
+                session.generation == candidate.generation
+                    && session.owner_tui_id.as_deref() == Some(tui_id)
+                    && &session.chat_mode == chat_mode
+            })
+        {
+            return None;
+        }
+
+        let session = sessions.remove(&candidate.id)?;
+        let pending = session.pending_generation;
+        let agent_alias = session.agent_alias;
         drop(sessions);
-        for notify in pending {
+        if let Some(notify) = pending {
             notify.notify_waiters();
         }
-        evicted
+        Some((candidate.id.clone(), agent_alias))
     }
 
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
@@ -3032,12 +3140,33 @@ mod tests {
             .await
             .unwrap();
 
-        let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+        let candidates = store
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
             .await;
-
-        let ids: Vec<&str> = evicted.iter().map(|(id, _)| id.as_str()).collect();
+        let ids: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["old_chat"]);
+        assert!(
+            store.get_agent("old_chat").await.is_some(),
+            "candidate discovery must not remove a session"
+        );
+        let eviction_guard = store
+            .session_queue
+            .try_begin_eviction("old_chat")
+            .await
+            .expect("idle candidate can be reserved");
+        let evicted = store
+            .evict_same_mode_sibling_candidate(
+                &eviction_guard,
+                &candidates[0],
+                "tui1",
+                &ChatMode::Chat,
+                "new_chat",
+            )
+            .await;
+        assert_eq!(evicted, Some(("old_chat".to_string(), "a".to_string())));
         assert!(
             store.get_agent("new_chat").await.is_some(),
             "new session preserved"
@@ -3054,6 +3183,53 @@ mod tests {
             store.get_agent("old_chat").await.is_none(),
             "abandoned same-mode session evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_same_mode_eviction_candidate_preserves_replacement_generation() {
+        use crate::rpc::types::ChatMode;
+        let store = make_store(8);
+        let mk = || {
+            RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                .with_owner(Some("tui1".to_string()))
+        };
+        store.insert("old_chat".into(), mk()).await.unwrap();
+        let candidate = store
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
+            .await
+            .remove(0);
+
+        let admission = store.session_queue.acquire("old_chat").await.unwrap();
+        assert!(
+            store
+                .remove_generation("old_chat", candidate.generation)
+                .await
+        );
+        store
+            .insert_admitted(&admission, "old_chat".to_string(), mk())
+            .await
+            .unwrap();
+        drop(admission);
+
+        let eviction_guard = store
+            .session_queue
+            .try_begin_eviction("old_chat")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .evict_same_mode_sibling_candidate(
+                    &eviction_guard,
+                    &candidate,
+                    "tui1",
+                    &ChatMode::Chat,
+                    "new_chat",
+                )
+                .await
+                .is_none(),
+            "stale LRU work must not remove a same-id successor"
+        );
+        assert!(store.get_agent("old_chat").await.is_some());
     }
 
     #[tokio::test]
@@ -3078,7 +3254,7 @@ mod tests {
         store.register_cancel_token("busy_chat", token.clone());
 
         let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
             .await;
 
         assert!(
@@ -3092,6 +3268,36 @@ mod tests {
         assert!(
             !token.is_cancelled(),
             "eviction must not fire a mid-turn cancel token"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_same_mode_sibling_skips_session_queue_owner() {
+        use crate::rpc::types::ChatMode;
+        let store = make_store(8);
+        let mk = |owner: &str| {
+            RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                .with_owner(Some(owner.to_string()))
+        };
+        store.insert("busy_chat".into(), mk("tui1")).await.unwrap();
+        store.insert("new_chat".into(), mk("tui1")).await.unwrap();
+        let _turn_guard = store.session_queue.acquire("busy_chat").await.unwrap();
+
+        let candidates = store
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
+            .await;
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            store
+                .session_queue
+                .try_begin_eviction(&candidates[0].id)
+                .await
+                .is_none()
+        );
+
+        assert!(
+            store.get_agent("busy_chat").await.is_some(),
+            "session must remain until its actor releases the queue"
         );
     }
 
@@ -3376,6 +3582,71 @@ mod tests {
         assert_ne!(
             g_a, g_a2,
             "replacing a same-ID session must bump the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_snapshot_reads_one_generation_with_its_authority_facts() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "goal".into(),
+                RpcSession::new(make_agent(), "first", ".", ChatMode::Chat)
+                    .with_owner(Some("tui-first".into())),
+            )
+            .await
+            .unwrap();
+        let first = store
+            .goal_session_snapshot("goal")
+            .await
+            .expect("first Goal session snapshot");
+        assert_eq!(first.agent_alias, "first");
+        assert_eq!(first.owner_tui_id.as_deref(), Some("tui-first"));
+        assert_eq!(first.chat_mode, ChatMode::Chat);
+        assert!(Arc::ptr_eq(
+            &first.reaction_channels,
+            &first.agent.lock().await.channel_handles().reaction,
+        ));
+
+        let first_goal_command = Arc::clone(&first.goal_command);
+        let reattached = store
+            .goal_session_snapshot("goal")
+            .await
+            .expect("reattached Goal session snapshot");
+        assert!(
+            Arc::ptr_eq(&first_goal_command, &reattached.goal_command),
+            "same live session must retain its Goal command lock"
+        );
+        assert!(Arc::ptr_eq(
+            &first.reaction_channels,
+            &reattached.reaction_channels,
+        ));
+
+        store
+            .insert(
+                "goal".into(),
+                RpcSession::new(make_agent(), "second", ".", ChatMode::Acp)
+                    .with_owner(Some("tui-second".into())),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .goal_session_snapshot("goal")
+            .await
+            .expect("replacement Goal session snapshot");
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(second.agent_alias, "second");
+        assert_eq!(second.owner_tui_id.as_deref(), Some("tui-second"));
+        assert_eq!(second.chat_mode, ChatMode::Acp);
+        assert!(!Arc::ptr_eq(
+            &first.reaction_channels,
+            &second.reaction_channels,
+        ));
+        assert!(
+            !Arc::ptr_eq(&first_goal_command, &second.goal_command),
+            "same-ID replacement must receive a fresh Goal command lock"
         );
     }
 

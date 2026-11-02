@@ -1,0 +1,27 @@
+{
+  "status": {
+    "task_id": "goal-fixture",
+    "status": "paused",
+    "execution_epoch": 2,
+    "token_limit": 100,
+    "cost_limit_usd": 1.5,
+    "accounting_state": "complete",
+    "pause_reason": "operator_paused",
+    "resumable": true
+  },
+  "unit_responses": [
+    "help", "disabled", "no_current_goal", "already_active", "budget_required", "stale"
+  ],
+  "status_responses": [
+    "started", "status", "budget", "budget_updated", "paused", "already_paused",
+    "resumed", "cancelled", "already_cancelled", "terminal"
+  ],
+  "queued_controls": ["start", "resume", "pause", "budget"],
+  "pending_actions": ["pause", "cancel"],
+  "failure_reasons": [
+    "agent_operation_failed", "tool_results_unpaired", "empty_agent_response",
+    "verifier_operation_failed", "verifier_response_invalid", "accounting_incomplete",
+    "pricing_incomplete", "operation_outcome_unknown", "executor_start_failed",
+    "executor_failed", "candidate_persistence_failed", "other"
+  ]
+}

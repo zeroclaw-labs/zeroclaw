@@ -54,6 +54,8 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -540,6 +542,7 @@ impl ModelProvider for OpenAiModelProvider {
         }
 
         let chat_response: ChatResponse = response.json().await?;
+        crate::dispatch::accounting::observe_raw_string_usage(chat_response.usage.as_ref(), true);
 
         chat_response
             .choices
@@ -1390,6 +1393,9 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             return Err(super::api_error("OpenAI", response).await);
         }
         let body: ResponsesApiBody = response.json().await?;
+        crate::dispatch::accounting::observe_string_usage(parse_responses_usage(
+            body.usage.as_ref(),
+        ));
         extract_responses_api_text(&body)
             .ok_or_else(|| anyhow::Error::msg("No response from OpenAI"))
     }
@@ -1959,6 +1965,149 @@ mod tool_round_policy_tests {
         let body = captured.lock().unwrap().take().unwrap();
         assert_eq!(body["model"], "fixture-model");
         body
+    }
+
+    #[tokio::test]
+    async fn goal_openai_string_raw_usage_is_optional_and_lossless() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let replies = Arc::new(Mutex::new(std::collections::VecDeque::from(vec![
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}]}),
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":null}),
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8}}),
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8,"completion_tokens":"bad"}}),
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8,"completion_tokens":"bad"}}),
+        ])));
+        let replies_for_route = Arc::clone(&replies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let replies = Arc::clone(&replies_for_route);
+                async move { Json(replies.lock().unwrap().pop_front().unwrap()) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiModelProvider::builder("fixture")
+            .base_url(&url)
+            .credential(Some("test-key"))
+            .build();
+        let dispatch = ProviderDispatch::new(Arc::new(provider));
+        for case in 0..4 {
+            let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+            assert_eq!(
+                scope
+                    .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+            let report = scope.take();
+            let outcome = report.attempts()[0].outcome();
+            assert!(match case {
+                0 | 1 => matches!(outcome, crate::dispatch::AttemptUsageOutcome::Missing),
+                2 => matches!(
+                    outcome,
+                    crate::dispatch::AttemptUsageOutcome::Invalid {
+                        reason: crate::dispatch::InvalidUsageReason::MissingOutput,
+                        ..
+                    }
+                ),
+                _ =>
+                    matches!(outcome, crate::dispatch::AttemptUsageOutcome::Invalid { reason: crate::dispatch::InvalidUsageReason::MalformedUsage, observed } if observed.input_tokens == Some(8)),
+            });
+        }
+        let ordinary = crate::dispatch::AccountedChatScope::new();
+        assert_eq!(
+            ordinary
+                .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                .await
+                .unwrap(),
+            "ok"
+        );
+        assert!(matches!(
+            ordinary.take().attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Missing
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_openai_and_anthropic_wires() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        for wire in 0..3 {
+            let captured = Arc::new(Mutex::new(None));
+            let capture = Arc::clone(&captured);
+            let path = match wire {
+                0 => "/chat/completions",
+                1 => "/responses",
+                _ => "/v1/messages",
+            };
+            let app = Router::new().route(path, post(move |Json(body): Json<serde_json::Value>| {
+                let capture = Arc::clone(&capture);
+                async move {
+                    *capture.lock().unwrap() = Some(body);
+                    Json(match wire {
+                        0 => serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8,"completion_tokens":3}}),
+                        1 => serde_json::json!({"output_text":"ok","output":[],"usage":{"input_tokens":8,"output_tokens":3}}),
+                        _ => serde_json::json!({"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":8,"output_tokens":3}}),
+                    })
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider: Arc<dyn ModelProvider> = match wire {
+                0 => Arc::new(
+                    OpenAiModelProvider::builder("fixture")
+                        .base_url(&url)
+                        .credential(Some("test-key"))
+                        .build(),
+                ),
+                1 => Arc::new(
+                    OpenAiResponsesModelProvider::builder("fixture")
+                        .api_url(&url)
+                        .credential(Some("test-key"))
+                        .build(),
+                ),
+                _ => Arc::new(
+                    crate::anthropic::AnthropicModelProvider::builder("fixture")
+                        .base_url(&url)
+                        .credential(Some("test-key"))
+                        .build(),
+                ),
+            };
+            let dispatch = ProviderDispatch::new(provider);
+            let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+            let text = scope
+                .scope(dispatch.chat_with_system(
+                    Some("system"),
+                    "hello",
+                    "fixture-model",
+                    Some(0.4),
+                ))
+                .await
+                .unwrap();
+            let report = scope.take();
+            server.abort();
+            assert_eq!(text, "ok");
+            assert!(
+                matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+                if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+            );
+            let body = captured.lock().unwrap().take().unwrap();
+            assert_eq!(body["model"], "fixture-model");
+            assert_eq!(body["temperature"], 0.4);
+            assert!(body.to_string().contains("system"));
+            assert!(body.to_string().contains("hello"));
+            if wire == 2 {
+                assert!(body.get("thinking").is_none());
+            }
+        }
     }
 
     #[tokio::test]

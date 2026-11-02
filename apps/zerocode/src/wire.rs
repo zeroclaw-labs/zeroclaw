@@ -6,6 +6,80 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GoalStatusProjection {
+    pub task_id: String,
+    pub status: String,
+    pub execution_epoch: i64,
+    pub token_limit: Option<u64>,
+    pub cost_limit_usd: Option<f64>,
+    pub accounting_state: String,
+    pub pause_reason: Option<String>,
+    pub resumable: bool,
+}
+
+/// Hand-maintained wire mirror of the daemon's typed Goal failure reason.
+/// ZeroCode stays RPC-only; the daemon remains authoritative for classification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalFailureReason {
+    AgentOperationFailed,
+    ToolResultsUnpaired,
+    EmptyAgentResponse,
+    VerifierOperationFailed,
+    VerifierResponseInvalid,
+    AccountingIncomplete,
+    PricingIncomplete,
+    OperationOutcomeUnknown,
+    ExecutorStartFailed,
+    ExecutorFailed,
+    CandidatePersistenceFailed,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "status", rename_all = "snake_case")]
+pub enum GoalResponse {
+    Help,
+    Disabled,
+    Queued(GoalQueuedControl),
+    Started(GoalStatusProjection),
+    Status(GoalStatusProjection),
+    Budget(GoalStatusProjection),
+    BudgetUpdated(GoalStatusProjection),
+    Paused(GoalStatusProjection),
+    AlreadyPaused(GoalStatusProjection),
+    TransitionPending(GoalPendingAction),
+    Resumed(GoalStatusProjection),
+    Cancelled(GoalStatusProjection),
+    AlreadyCancelled(GoalStatusProjection),
+    NoCurrentGoal,
+    AlreadyActive,
+    BudgetRequired,
+    Terminal(GoalStatusProjection),
+    Stale,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalPendingAction {
+    Pause,
+    Cancel,
+}
+
+/// Candidate-only mirror of the daemon's deferred-control acknowledgement.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalQueuedControl {
+    Start,
+    Resume,
+    Pause,
+    Budget,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionGoalResult {
+    pub response: GoalResponse,
+}
+
 // ── Initialize shapes ───────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

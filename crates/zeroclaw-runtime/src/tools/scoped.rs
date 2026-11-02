@@ -1464,6 +1464,2364 @@ mod tests {
         built_with_counting_tools(calls, &["shell", "file_write"])
     }
 
+    async fn assemble_real_delegate_pipeline(
+        delegate: Arc<dyn Tool>,
+        effects: Arc<AtomicUsize>,
+        skills: &[Skill],
+    ) -> ScopedAssembled {
+        assemble_real_children_pipeline(vec![delegate], effects, skills).await
+    }
+
+    async fn assemble_real_children_pipeline(
+        mut children: Vec<Arc<dyn Tool>>,
+        effects: Arc<AtomicUsize>,
+        skills: &[Skill],
+    ) -> ScopedAssembled {
+        let shell: Arc<dyn Tool> = Arc::new(CountingTool {
+            name: "shell",
+            calls: effects,
+        });
+        children.push(shell);
+        let mut allowed: Vec<String> = children
+            .iter()
+            .map(|child| child.name().to_string())
+            .collect();
+        let step_allowed = allowed.clone();
+        allowed.push(tools::PipelineTool::NAME.into());
+        allowed.extend([
+            "ops__chain".into(),
+            "ops__manage".into(),
+            "ops__create".into(),
+        ]);
+        let mut built = built_with(
+            children
+                .iter()
+                .cloned()
+                .map(|child| Box::new(tools::ArcToolRef(child)) as Box<dyn Tool>)
+                .collect(),
+        );
+        built.unfiltered_tool_arcs = children;
+        let mut config = Config::default();
+        config.pipeline.enabled = true;
+        config.pipeline.allowed_tools = step_allowed;
+        config.tools.optional.push(tools::PipelineTool::NAME.into());
+        let security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(allowed.clone()),
+            ..SecurityPolicy::default()
+        });
+        let caller = allowed;
+        ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "main",
+            security: &security,
+            built,
+            skills,
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: Some(&caller),
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await
+    }
+
+    struct RegisteredGoalFixture {
+        _directory: tempfile::TempDir,
+        root: crate::goal_accounting::GoalForegroundContext,
+        accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        tracker: Arc<zeroclaw_config::cost::CostTracker>,
+        handle: crate::control_plane::ControlPlaneHandle,
+        identity: zeroclaw_goal::GoalExecutionScope,
+    }
+
+    struct ScopedHeldSettlement {
+        inner: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for ScopedHeldSettlement {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.inner.admit(request).await
+        }
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.settle(settlement).await
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            self.inner.pricing_complete().await
+        }
+    }
+
+    struct ScopedHeldTerminal {
+        inner: Arc<dyn crate::control_plane::TaskRegistry>,
+        mode: ScopedTerminalMode,
+    }
+
+    enum ScopedTerminalMode {
+        Hold {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        },
+        Fail {
+            attempts: Arc<AtomicUsize>,
+        },
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("registered pipeline child terminal storage failure")]
+    struct ScopedChildTerminalFailure;
+    #[async_trait]
+    impl crate::control_plane::TaskRegistry for ScopedHeldTerminal {
+        async fn create(&self, row: crate::control_plane::TaskRecord) -> anyhow::Result<()> {
+            self.inner.create(row).await
+        }
+        async fn heartbeat(&self, id: &str, boot: &str) -> anyhow::Result<()> {
+            self.inner.heartbeat(id, boot).await
+        }
+        async fn update_status(
+            &self,
+            id: &str,
+            status: crate::control_plane::TaskStatus,
+            output: Option<String>,
+            error: Option<String>,
+        ) -> anyhow::Result<()> {
+            self.inner.update_status(id, status, output, error).await
+        }
+        async fn transition_terminal_if_owner(
+            &self,
+            id: &str,
+            pid: u32,
+            boot: &str,
+            status: crate::control_plane::TaskStatus,
+            output: Option<String>,
+            error: Option<String>,
+        ) -> anyhow::Result<bool> {
+            match &self.mode {
+                ScopedTerminalMode::Hold { entered, release } => {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                ScopedTerminalMode::Fail { attempts } => {
+                    let row = self.inner.get_snapshot(id).await?.unwrap().task;
+                    assert_eq!(row.kind, crate::control_plane::TaskKind::Subagent);
+                    assert_eq!(row.status, crate::control_plane::TaskStatus::Running);
+                    assert_eq!(row.owner_pid, pid);
+                    assert_eq!(row.owner_boot_id, boot);
+                    assert_eq!(status, crate::control_plane::TaskStatus::Completed);
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    return Err(ScopedChildTerminalFailure.into());
+                }
+            }
+            self.inner
+                .transition_terminal_if_owner(id, pid, boot, status, output, error)
+                .await
+        }
+        async fn claim_owner(&self, id: &str, pid: u32, boot: &str) -> anyhow::Result<()> {
+            self.inner.claim_owner(id, pid, boot).await
+        }
+        async fn get(&self, id: &str) -> anyhow::Result<Option<crate::control_plane::TaskRecord>> {
+            self.inner.get(id).await
+        }
+        async fn get_snapshot(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::control_plane::TaskSnapshot>> {
+            self.inner.get_snapshot(id).await
+        }
+        async fn list_running(&self) -> anyhow::Result<Vec<crate::control_plane::TaskRecord>> {
+            self.inner.list_running().await
+        }
+        async fn list_by_agent(
+            &self,
+            agent: &str,
+        ) -> anyhow::Result<Vec<crate::control_plane::TaskRecord>> {
+            self.inner.list_by_agent(agent).await
+        }
+        async fn reconcile_lost(&self, id: &str, boot: &str) -> anyhow::Result<bool> {
+            self.inner.reconcile_lost(id, boot).await
+        }
+    }
+
+    fn registered_goal_resources() -> (
+        tempfile::TempDir,
+        crate::control_plane::ControlPlaneHandle,
+        Arc<zeroclaw_config::cost::CostTracker>,
+        Arc<crate::goal_accounting::RuntimeGoalOperationAccountingFactory>,
+    ) {
+        use std::collections::HashMap;
+        let directory = tempfile::TempDir::new().unwrap();
+        let handle = crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap();
+        let store = handle.goal_store().unwrap();
+        let tracker = Arc::new(
+            zeroclaw_config::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let rates = HashMap::from([
+            ("fixture-model.input".to_string(), 1.0),
+            ("fixture-model.output".to_string(), 2.0),
+        ]);
+        let pricer = Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+            Arc::new(HashMap::from([("ollama.local".to_string(), rates)])),
+        ));
+        let factory = Arc::new(
+            crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+                store,
+                tracker.clone(),
+                "main",
+                pricer,
+            )
+            .unwrap(),
+        );
+        (directory, handle, tracker, factory)
+    }
+
+    async fn registered_goal_fixture() -> RegisteredGoalFixture {
+        use zeroclaw_goal::accounting::GoalOperationAccountingFactory;
+        let (directory, handle, tracker, factory) = registered_goal_resources();
+        let store = handle.goal_store().unwrap();
+        let identity =
+            zeroclaw_goal::GoalExecutionScope::new("pipeline-goal", "pipeline-session", 1).unwrap();
+        let task = crate::control_plane::TaskRecord {
+            id: identity.task_id().into(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "main".into(),
+            status: zeroclaw_api::task::TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "test-boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix:test-room".into()),
+            originator_chain: Vec::new(),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@test:example.org".into()),
+            session_id: Some(identity.session_id().into()),
+            execution_epoch: 1,
+            started_at: "2026-09-05T00:00:00Z".into(),
+            finished_at: None,
+        };
+        let goal = zeroclaw_goal::GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "finish work".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            zeroclaw_goal::GoalTransitionResult::Applied
+        );
+        let accountant = factory.for_scope(identity.clone());
+        let root = crate::goal_accounting::GoalForegroundContext::new_root(
+            identity.clone(),
+            handle.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(60)),
+        );
+        RegisteredGoalFixture {
+            _directory: directory,
+            root,
+            accountant,
+            tracker,
+            handle,
+            identity,
+        }
+    }
+
+    fn real_delegate_for_server(uri: String) -> Arc<dyn Tool> {
+        use std::collections::HashMap;
+        let agents = HashMap::from([(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                ..Default::default()
+            },
+        )]);
+        let providers = HashMap::from([(
+            "ollama".to_string(),
+            HashMap::from([(
+                "local".to_string(),
+                zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("fixture-model".into()),
+                    ..Default::default()
+                },
+            )]),
+        )]);
+        let options = zeroclaw_providers::ModelProviderRuntimeOptions {
+            provider_api_url: Some(uri),
+            ..Default::default()
+        };
+        Arc::new(
+            crate::tools::DelegateTool::new_with_options(
+                agents,
+                None,
+                Arc::new(SecurityPolicy::default()),
+                options,
+            )
+            .with_providers_models(providers),
+        )
+    }
+
+    #[test]
+    fn real_delegate_arc_wrappers_preserve_argument_sensitive_child_predicate() {
+        let delegate = real_delegate_for_server("http://127.0.0.1:1".into());
+        let direct = tools::ArcToolRef(delegate.clone());
+        let wrapped = tools::boxed_registry_from_arcs(vec![delegate]);
+        for tool in [&direct as &dyn Tool, wrapped[0].as_ref()] {
+            for args in [
+                serde_json::json!({}),
+                serde_json::json!({"action":"delegate"}),
+                serde_json::json!({"action":"{{step[0].result}}"}),
+                serde_json::json!({"action":3}),
+            ] {
+                assert!(tool.may_invoke_agent_child(&args));
+            }
+            for action in [
+                "check_result",
+                "list_results",
+                "cancel_task",
+                "await_sessions",
+            ] {
+                assert!(!tool.may_invoke_agent_child(&serde_json::json!({"action":action})));
+            }
+        }
+    }
+
+    struct GoalPipelineProbe {
+        accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        handle: crate::control_plane::ControlPlaneHandle,
+        deadline: tokio::time::Instant,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct GoalParallelContextProbe {
+        name: &'static str,
+        accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        handle: crate::control_plane::ControlPlaneHandle,
+        deadline: tokio::time::Instant,
+        barrier: Arc<tokio::sync::Barrier>,
+        in_flight: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+        tokens: Arc<std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(GoalParallelContextProbe);
+
+    impl GoalParallelContextProbe {
+        fn observe(&self) -> anyhow::Result<()> {
+            let context =
+                crate::goal_accounting::GoalForegroundContext::current_for_child()?.unwrap();
+            anyhow::ensure!(
+                context.depth() == 0
+                    && context.scope_identity().task_id() == "pipeline-goal"
+                    && context.scope_identity().session_id() == "pipeline-session"
+                    && context.scope_identity().execution_epoch() == 1,
+                "wrong parallel Goal identity"
+            );
+            anyhow::ensure!(
+                Arc::ptr_eq(&context.control_plane().store, &self.handle.store),
+                "wrong parallel Goal store"
+            );
+            anyhow::ensure!(
+                context.deadline() == Some(self.deadline) && !context.token().is_cancelled(),
+                "wrong parallel Goal lifetime"
+            );
+            anyhow::ensure!(
+                zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .try_with(|active| active
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, &self.accountant)))
+                    .unwrap_or(false),
+                "wrong parallel Goal accountant"
+            );
+            let api = zeroclaw_api::tool::ToolExecutionContext::current()
+                .ok_or_else(|| anyhow::Error::msg("missing API context"))?;
+            anyhow::ensure!(api.is_goal_foreground(), "missing API Goal participation");
+            let api_token = api
+                .cancellation_token()
+                .ok_or_else(|| anyhow::Error::msg("missing API cancellation token"))?;
+            let mut tokens = self.tokens.lock().unwrap();
+            tokens.push(context.token().clone());
+            tokens.push(api_token.clone());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Tool for GoalParallelContextProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Observe child-free parallel Goal context."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.observe()?;
+            let active = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            self.barrier.wait().await;
+            self.observe()?;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: self.name.to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_goal_child_free_parallel_steps_overlap_and_keep_real_context() {
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        // Each retained token is tested in a fresh run: cancelling any one
+        // must cancel the root and every other observed token, not merely a child.
+        for token_index in 0..8 {
+            let fixture = registered_goal_fixture().await;
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let active = Arc::new(AtomicUsize::new(0));
+            let maximum = Arc::new(AtomicUsize::new(0));
+            let tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let tools: Vec<Arc<dyn Tool>> = ["parallel_one", "parallel_two"]
+                .into_iter()
+                .map(|name| {
+                    Arc::new(GoalParallelContextProbe {
+                        name,
+                        accountant: fixture.accountant.clone(),
+                        handle: fixture.handle.clone(),
+                        deadline: fixture.root.deadline().unwrap(),
+                        barrier: barrier.clone(),
+                        in_flight: active.clone(),
+                        maximum: maximum.clone(),
+                        tokens: tokens.clone(),
+                    }) as Arc<dyn Tool>
+                })
+                .collect();
+            let assembled =
+                assemble_real_children_pipeline(tools, Arc::new(AtomicUsize::new(0)), &[]).await;
+            let pipeline = assembled
+                .registry
+                .iter()
+                .find(|tool| tool.name() == tools::PipelineTool::NAME)
+                .unwrap();
+            let mode = if token_index % 2 == 0 { "all" } else { "last" };
+            let output = GOAL_OPERATION_ACCOUNTING.scope(Some(fixture.accountant.clone()), fixture.root.scope(async {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), pipeline.execute(serde_json::json!({
+                    "parallel": true, "result": mode, "steps": [
+                        {"tool":"parallel_one","args":{}}, {"tool":"parallel_two","args":{}}
+                    ]
+                }))).await.expect("child-free steps must overlap").unwrap();
+                assert_eq!(crate::goal_accounting::GoalForegroundContext::current().unwrap().depth(), 0);
+                assert!(zeroclaw_api::tool::ToolExecutionContext::current().unwrap().is_goal_foreground());
+                assert!(GOAL_OPERATION_ACCOUNTING.try_with(|active| Arc::ptr_eq(active.as_ref().unwrap(), &fixture.accountant)).unwrap());
+                result
+            })).await;
+            assert!(output.success, "{:?}", output.error);
+            if mode == "all" {
+                let results: serde_json::Value =
+                    serde_json::from_str(output.output.as_str()).unwrap();
+                assert_eq!(results[0]["tool"], "parallel_one");
+                assert_eq!(results[1]["tool"], "parallel_two");
+            } else {
+                assert_eq!(output.output.as_str(), "parallel_two");
+            }
+            assert_eq!(maximum.load(Ordering::SeqCst), 2);
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+            assert!(crate::goal_accounting::GoalForegroundContext::current().is_none());
+            assert!(zeroclaw_api::tool::ToolExecutionContext::current().is_none());
+            assert!(GOAL_OPERATION_ACCOUNTING.try_with(|_| ()).is_err());
+            let goal = fixture
+                .handle
+                .goal_store()
+                .unwrap()
+                .get_goal_task("pipeline-goal")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                goal.accounting_state,
+                zeroclaw_goal::GoalAccountingState::Complete
+            );
+            assert!(goal.pending_call_id.is_none());
+            assert_eq!(
+                fixture
+                    .tracker
+                    .get_strict_usage_totals_for_task_with_pricing("pipeline-goal")
+                    .unwrap()
+                    .0,
+                0
+            );
+            let observed = tokens.lock().unwrap();
+            assert_eq!(observed.len(), 8);
+            observed[token_index].cancel();
+            assert!(fixture.root.token().is_cancelled());
+            assert!(
+                observed
+                    .iter()
+                    .all(tokio_util::sync::CancellationToken::is_cancelled)
+            );
+        }
+    }
+
+    zeroclaw_api::mock_tool_attribution!(GoalPipelineProbe);
+
+    #[async_trait]
+    impl Tool for GoalPipelineProbe {
+        fn name(&self) -> &str {
+            "goal_pipeline_probe"
+        }
+        fn description(&self) -> &str {
+            "Observe an actual child tool's Goal scope."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let context =
+                crate::goal_accounting::GoalForegroundContext::current_for_child()?.unwrap();
+            anyhow::ensure!(
+                context.depth() == 1
+                    && context.scope_identity().task_id() == "pipeline-goal"
+                    && context.scope_identity().session_id() == "pipeline-session"
+                    && context.scope_identity().execution_epoch() == 1,
+                "wrong child Goal identity"
+            );
+            anyhow::ensure!(
+                Arc::ptr_eq(&context.control_plane().store, &self.handle.store),
+                "different Goal store"
+            );
+            anyhow::ensure!(
+                context
+                    .deadline()
+                    .is_some_and(|deadline| deadline <= self.deadline)
+                    && !context.token().is_cancelled(),
+                "wrong child lifetime"
+            );
+            anyhow::ensure!(
+                zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .try_with(|active| active
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, &self.accountant)))
+                    .unwrap_or(false),
+                "different Goal accountant"
+            );
+            anyhow::ensure!(
+                zeroclaw_api::tool::ToolExecutionContext::current()
+                    .is_some_and(|current| current.is_goal_foreground()
+                        && current.cancellation_token().is_some()),
+                "missing Goal tool context"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "context observed".into(),
+                error: None,
+            })
+        }
+    }
+
+    fn real_pipeline_child_config(fixture: &RegisteredGoalFixture, uri: String) -> Config {
+        real_pipeline_child_config_in(fixture._directory.path(), uri)
+    }
+
+    fn real_pipeline_child_config_in(directory: &std::path::Path, uri: String) -> Config {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, DelegateTargetConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+        let mut config = Config {
+            data_dir: directory.join("runtime"),
+            config_path: directory.join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "local".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("fixture-model".into()),
+                    uri: Some(uri),
+                    pricing: [
+                        ("fixture-model.input".into(), 1.0),
+                        ("fixture-model.output".into(), 2.0),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".into(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![
+                    "delegate".into(),
+                    "spawn_subagent".into(),
+                    "goal_pipeline_probe".into(),
+                ],
+                auto_approve: vec!["goal_pipeline_probe".into()],
+                ..Default::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "fixture".into(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..Default::default()
+            },
+        );
+        let common = AliasedAgentConfig {
+            model_provider: "ollama.local".into(),
+            risk_profile: "fixture".into(),
+            runtime_profile: "fixture".into(),
+            ..Default::default()
+        };
+        config.agents.insert(
+            "main".into(),
+            AliasedAgentConfig {
+                delegates: vec![DelegateTargetConfig::bounded("worker")],
+                ..common.clone()
+            },
+        );
+        config.agents.insert("worker".into(), common);
+        config
+    }
+
+    #[tokio::test]
+    async fn registered_goal_pipeline_runs_agentic_delegate_then_real_spawn() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let server = MockServer::start().await;
+        let sequence = Arc::new(AtomicUsize::new(0));
+        let next = Arc::clone(&sequence);
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let index = next.fetch_add(1, Ordering::SeqCst);
+                let message = if index == 0 {
+                    serde_json::json!({"content":null,"tool_calls":[{"id":"probe","type":"function","function":{"name":"goal_pipeline_probe","arguments":"{}"}}]})
+                } else {
+                    serde_json::json!({"role":"assistant","content": if index == 1 { "agentic finished" } else { "spawn finished" }})
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"choices":[{"message":message}],"usage":{"prompt_tokens":8,"completion_tokens":3}}))
+            }).expect(3).mount(&server).await;
+        let fixture = registered_goal_fixture().await;
+        let config = Arc::new(real_pipeline_child_config(&fixture, server.uri()));
+        let security = Arc::new(SecurityPolicy::for_agent(&config, "main").unwrap());
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let probe: Arc<dyn Tool> = Arc::new(GoalPipelineProbe {
+            accountant: fixture.accountant.clone(),
+            handle: fixture.handle.clone(),
+            deadline: fixture.root.deadline().unwrap(),
+            calls: probe_calls.clone(),
+        });
+        let delegate: Arc<dyn Tool> = Arc::new(
+            crate::tools::DelegateTool::new(config.agents.clone(), None, security.clone())
+                .with_root_config(config.clone())
+                .with_caller_alias("main")
+                .with_runtime(Arc::new(crate::platform::NativeRuntime::new()))
+                .with_risk_profiles(config.risk_profiles.clone())
+                .with_runtime_profiles(config.runtime_profiles.clone())
+                .with_parent_tools(Arc::new(parking_lot::RwLock::new(vec![probe]))),
+        );
+        let spawn: Arc<dyn Tool> = Arc::new(crate::tools::SpawnSubagentTool::new(
+            config, "main", security,
+        ));
+        let effects = Arc::new(AtomicUsize::new(0));
+        let assembled =
+            assemble_real_children_pipeline(vec![delegate, spawn], effects.clone(), &[]).await;
+        let pipeline = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == tools::PipelineTool::NAME)
+            .unwrap();
+        let result = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(fixture.accountant.clone()),
+                fixture.root.scope(async {
+                    let result = pipeline
+                        .execute(serde_json::json!({"result":"all","steps":[
+                            {"tool":"delegate","args":{"agent":"worker","prompt":"call probe"}},
+                            {"tool":"spawn_subagent","args":{"prompt":"finish"}},
+                            {"tool":"shell","args":{}}
+                        ]}))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        crate::goal_accounting::GoalForegroundContext::current()
+                            .unwrap()
+                            .depth(),
+                        0
+                    );
+                    let rows = fixture.handle.store.list_by_agent("main").await.unwrap();
+                    let children: Vec<_> = rows
+                        .iter()
+                        .filter(|row| row.kind == crate::control_plane::TaskKind::Subagent)
+                        .collect();
+                    assert_eq!(children.len(), 1);
+                    assert_eq!(children[0].parent_id.as_deref(), Some("pipeline-goal"));
+                    assert_eq!(children[0].depth, 1);
+                    assert_eq!(
+                        children[0].status,
+                        crate::control_plane::TaskStatus::Completed
+                    );
+                    assert_eq!(children[0].owner_pid, std::process::id());
+                    assert_eq!(children[0].owner_boot_id, fixture.handle.boot_id);
+                    result
+                }),
+            )
+            .await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result.output.contains("agentic finished") && result.output.contains("spawn finished")
+        );
+        assert_eq!(probe_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert_eq!(sequence.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            fixture
+                .tracker
+                .get_strict_usage_totals_for_task_with_pricing("pipeline-goal")
+                .unwrap()
+                .0,
+            33
+        );
+        assert!(
+            fixture
+                .handle
+                .goal_store()
+                .unwrap()
+                .get_goal_task("pipeline-goal")
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_call_id
+                .is_none()
+        );
+    }
+
+    async fn registered_goal_pipeline_spawn_cancel_drains(use_alias: bool) {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)).set_body_json(serde_json::json!({
+                "choices":[{"message":{"role":"assistant","content":"must not finish"}}],"usage":{"prompt_tokens":8,"completion_tokens":3}
+            }))).mount(&server).await;
+        let fixture = registered_goal_fixture().await;
+        let settle_entered = Arc::new(tokio::sync::Notify::new());
+        let settle_release = Arc::new(tokio::sync::Notify::new());
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(ScopedHeldSettlement {
+                inner: fixture.accountant.clone(),
+                entered: settle_entered.clone(),
+                release: settle_release.clone(),
+            });
+        let terminal_entered = Arc::new(tokio::sync::Notify::new());
+        let terminal_release = Arc::new(tokio::sync::Notify::new());
+        let mut handle = fixture.handle.clone();
+        handle.store = Arc::new(ScopedHeldTerminal {
+            inner: handle.store.clone(),
+            mode: ScopedTerminalMode::Hold {
+                entered: terminal_entered.clone(),
+                release: terminal_release.clone(),
+            },
+        });
+        let root = crate::goal_accounting::GoalForegroundContext::new_root(
+            fixture.identity.clone(),
+            handle,
+            fixture.root.token().clone(),
+            fixture.root.deadline(),
+        );
+        let config = Arc::new(real_pipeline_child_config(&fixture, server.uri()));
+        let security = Arc::new(SecurityPolicy::for_agent(&config, "main").unwrap());
+        let spawn: Arc<dyn Tool> = Arc::new(crate::tools::SpawnSubagentTool::new(
+            config, "main", security,
+        ));
+        let skill = Skill {
+            name: "ops".into(),
+            description: "pipeline alias".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![SkillTool {
+                name: "chain".into(),
+                description: "pipeline".into(),
+                kind: "builtin".into(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some(tools::PipelineTool::NAME.into()),
+                locked_args: [("result".to_string(), "last".to_string())]
+                    .into_iter()
+                    .collect(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let effects = Arc::new(AtomicUsize::new(0));
+        let assembled =
+            assemble_real_children_pipeline(vec![spawn], effects.clone(), &[skill]).await;
+        let name = if use_alias {
+            "ops__chain"
+        } else {
+            tools::PipelineTool::NAME
+        };
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: Some("main"),
+            turn_id: "pipeline-cancel",
+            channel_name: "test",
+        };
+        let dispatch = crate::agent::tool_execution::ToolDispatchContext {
+            tools_registry: &assembled.registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+        let observer = crate::observability::NoopObserver;
+        GOAL_OPERATION_ACCOUNTING.scope(Some(accountant), root.scope(async {
+            let execution = crate::agent::tool_execution::execute_one_tool(
+                name, serde_json::json!({"result":"all","steps":[
+                    {"tool":"spawn_subagent","args":{"prompt":"wait"}},
+                    {"tool":"shell","args":{}}
+                ]}), None, dispatch, &meta, &observer, Some(root.token()), None, None,
+            );
+            tokio::pin!(execution);
+            tokio::select! {
+                result = &mut execution => panic!(
+                    "pipeline returned before provider started: {}",
+                    match &result {
+                        Ok(outcome) => format!(
+                            "outcome (success={}, error={:?}, output={:?})",
+                            outcome.success,
+                            outcome.error_reason.as_deref(),
+                            outcome.output
+                        ),
+                        Err(error) => format!("execution error: {error:#}"),
+                    }
+                ),
+                () = async {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while server.received_requests().await.unwrap().is_empty() { tokio::task::yield_now().await; }
+                    }).await.expect("spawn provider must start");
+                } => {}
+            }
+            let goal = root.control_plane().goal_store().unwrap().get_goal_task("pipeline-goal").await.unwrap().unwrap();
+            assert!(goal.pending_call_id.is_some());
+            let rows = root.control_plane().store.list_by_agent("main").await.unwrap();
+            let child = rows.iter().find(|row| row.kind == crate::control_plane::TaskKind::Subagent).unwrap();
+            let child_id = child.id.clone();
+            assert_eq!(child.status, crate::control_plane::TaskStatus::Running);
+            root.token().cancel();
+            tokio::select! {
+                result = &mut execution => panic!(
+                    "pipeline returned before settlement release: {}",
+                    match &result {
+                        Ok(outcome) => format!(
+                            "outcome (success={}, error={:?}, output={:?})",
+                            outcome.success,
+                            outcome.error_reason.as_deref(),
+                            outcome.output
+                        ),
+                        Err(error) => format!("execution error: {error:#}"),
+                    }
+                ),
+                result = tokio::time::timeout(std::time::Duration::from_secs(10), settle_entered.notified()) => { result.expect("settlement must start"); }
+            }
+            assert!(root.control_plane().goal_store().unwrap().get_goal_task("pipeline-goal").await.unwrap().unwrap().pending_call_id.is_some());
+            assert_eq!(effects.load(Ordering::SeqCst), 0);
+            settle_release.notify_one();
+            tokio::select! {
+                result = &mut execution => panic!(
+                    "pipeline returned before row cleanup release: {}",
+                    match &result {
+                        Ok(outcome) => format!(
+                            "outcome (success={}, error={:?}, output={:?})",
+                            outcome.success,
+                            outcome.error_reason.as_deref(),
+                            outcome.output
+                        ),
+                        Err(error) => format!("execution error: {error:#}"),
+                    }
+                ),
+                result = tokio::time::timeout(std::time::Duration::from_secs(10), terminal_entered.notified()) => { result.expect("terminal cleanup must start"); }
+            }
+            assert!(root.control_plane().goal_store().unwrap().get_goal_task("pipeline-goal").await.unwrap().unwrap().pending_call_id.is_none());
+            assert_eq!(root.control_plane().store.get_snapshot(&child_id).await.unwrap().unwrap().task.status, crate::control_plane::TaskStatus::Running);
+            assert_eq!(effects.load(Ordering::SeqCst), 0);
+            terminal_release.notify_one();
+            let outcome = execution.await.unwrap();
+            let error = outcome.terminal_error.unwrap();
+            assert!(error.downcast_ref::<zeroclaw_api::tool::GoalChildOperationError>().is_some());
+            assert!(error.downcast_ref::<crate::agent::loop_::ToolLoopCancelled>().is_some());
+            assert_eq!(error.downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>().unwrap().accounting_state(), zeroclaw_goal::GoalAccountingState::OutcomeUnknown);
+            let row = root.control_plane().store.get_snapshot(&child_id).await.unwrap().unwrap();
+            assert_eq!(row.task.status, crate::control_plane::TaskStatus::Cancelled);
+            assert_eq!(row.task.parent_id.as_deref(), Some("pipeline-goal"));
+            assert_eq!(crate::goal_accounting::GoalForegroundContext::current().unwrap().depth(), 0);
+        })).await;
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn registered_goal_pipeline_spawn_cancel_waits_for_settlement_and_row() {
+        registered_goal_pipeline_spawn_cancel_drains(false).await;
+    }
+
+    #[tokio::test]
+    async fn registered_goal_pipeline_skill_alias_spawn_cancel_waits_for_settlement_and_row() {
+        registered_goal_pipeline_spawn_cancel_drains(true).await;
+    }
+
+    #[tokio::test]
+    async fn registered_goal_pipeline_real_delegate_charges_eleven_tokens() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "fixture response"}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 3}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let fixture = registered_goal_fixture().await;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let assembled = assemble_real_delegate_pipeline(
+            real_delegate_for_server(server.uri()),
+            effects.clone(),
+            &[],
+        )
+        .await;
+        let pipeline = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == tools::PipelineTool::NAME)
+            .unwrap();
+        let result =
+            GOAL_OPERATION_ACCOUNTING
+                .scope(
+                    Some(fixture.accountant.clone()),
+                    fixture.root.scope(async {
+                        let result = pipeline.execute(serde_json::json!({"result":"all", "steps":[
+                {"tool":"delegate","args":{"agent":"worker","prompt":"fixture task"}},
+                {"tool":"shell","args":{"text":"{{step[0].result}}"}}
+            ]})).await.unwrap();
+                        assert_eq!(
+                            crate::goal_accounting::GoalForegroundContext::current()
+                                .unwrap()
+                                .depth(),
+                            0
+                        );
+                        result
+                    }),
+                )
+                .await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("fixture response"));
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .tracker
+                .get_strict_usage_totals_for_task_with_pricing(fixture.identity.task_id())
+                .unwrap()
+                .0,
+            11
+        );
+        let reopened = zeroclaw_config::cost::CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            fixture._directory.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .get_strict_usage_totals_for_task_with_pricing(fixture.identity.task_id())
+                .unwrap()
+                .0,
+            11
+        );
+        let goal = fixture
+            .handle
+            .goal_store()
+            .unwrap()
+            .get_goal_task(fixture.identity.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            zeroclaw_goal::GoalAccountingState::Complete
+        );
+        assert!(goal.pending_call_id.is_none());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(request["model"], "fixture-model");
+        assert!(crate::goal_accounting::GoalForegroundContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn registered_goal_pipeline_allows_two_successive_root_children() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "fixture response"}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 3}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let fixture = registered_goal_fixture().await;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let assembled =
+            assemble_real_delegate_pipeline(real_delegate_for_server(server.uri()), effects, &[])
+                .await;
+        let pipeline = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == tools::PipelineTool::NAME)
+            .unwrap();
+        let result = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(fixture.accountant.clone()),
+                fixture.root.scope(async {
+                    let result = pipeline
+                        .execute(serde_json::json!({"steps":[
+                            {"tool":"delegate","args":{"agent":"worker","prompt":"first"}},
+                            {"tool":"delegate","args":{"agent":"worker","prompt":"second"}}
+                        ]}))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        crate::goal_accounting::GoalForegroundContext::current()
+                            .unwrap()
+                            .depth(),
+                        0
+                    );
+                    result
+                }),
+            )
+            .await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            fixture
+                .tracker
+                .get_strict_usage_totals_for_task_with_pricing(fixture.identity.task_id())
+                .unwrap()
+                .0,
+            22
+        );
+        let goal = fixture
+            .handle
+            .goal_store()
+            .unwrap()
+            .get_goal_task(fixture.identity.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            zeroclaw_goal::GoalAccountingState::Complete
+        );
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn registered_goal_parallel_child_refuses_before_any_sibling_effect() {
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let server = wiremock::MockServer::start().await;
+        let fixture = registered_goal_fixture().await;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let assembled = assemble_real_delegate_pipeline(
+            real_delegate_for_server(server.uri()),
+            effects.clone(),
+            &[],
+        )
+        .await;
+        let pipeline = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == tools::PipelineTool::NAME)
+            .unwrap();
+        for (child_args, single) in [
+            (serde_json::json!({"agent":"worker","prompt":"work"}), false),
+            (
+                serde_json::json!({"action":"delegate","agent":"worker","prompt":"work"}),
+                true,
+            ),
+            (serde_json::json!({}), true),
+            (serde_json::json!({"action":"{{step[0].result}}"}), false),
+        ] {
+            let steps = if single {
+                serde_json::json!([{"tool":"delegate","args":child_args}])
+            } else {
+                serde_json::json!([{"tool":"shell","args":{}},{"tool":"delegate","args":child_args}])
+            };
+            let result = GOAL_OPERATION_ACCOUNTING
+                .scope(
+                    Some(fixture.accountant.clone()),
+                    fixture.root.scope(
+                        pipeline.execute(serde_json::json!({"parallel":true,"steps":steps})),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .unwrap()
+                    .contains("Goal Mode permits only synchronous foreground child execution.")
+            );
+        }
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let goal = fixture
+            .handle
+            .goal_store()
+            .unwrap()
+            .get_goal_task(fixture.identity.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(goal.pending_call_id.is_none());
+        assert_eq!(
+            fixture
+                .tracker
+                .get_strict_usage_totals_for_task_with_pricing(fixture.identity.task_id())
+                .unwrap()
+                .0,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_goal_parallel_spawn_and_locked_skill_child_refuse_before_effects() {
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let server = wiremock::MockServer::start().await;
+        let fixture = registered_goal_fixture().await;
+        let config = Arc::new(real_pipeline_child_config(&fixture, server.uri()));
+        let security = Arc::new(SecurityPolicy::for_agent(&config, "main").unwrap());
+        let spawn: Arc<dyn Tool> = Arc::new(crate::tools::SpawnSubagentTool::new(
+            config,
+            "main",
+            security.clone(),
+        ));
+        let locked_child = SkillTool {
+            name: "create".into(),
+            description: "Lock delegate creation rather than caller management arguments".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: Default::default(),
+            target: Some("delegate".into()),
+            locked_args: [("action".to_string(), "delegate".to_string())]
+                .into_iter()
+                .collect(),
+            timeout_secs: None,
+        };
+        // Skill aliases are created after the production pipeline snapshot.
+        // Register this real alias as an explicit input to this fixture's
+        // snapshot; do not add a new self-registration path to production.
+        let alias: Arc<dyn Tool> = Arc::new(crate::tools::skill_tool::SkillBuiltinTool::new(
+            "ops",
+            &locked_child,
+            real_delegate_for_server(server.uri()),
+            locked_child.locked_args.clone(),
+        ));
+        let skill = Skill {
+            name: "ops".into(),
+            description: "Registered pipeline alias".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![SkillTool {
+                name: "chain".into(),
+                description: "Run the same registered pipeline".into(),
+                kind: "builtin".into(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some(tools::PipelineTool::NAME.into()),
+                locked_args: [("result".to_string(), "last".to_string())]
+                    .into_iter()
+                    .collect(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let effects = Arc::new(AtomicUsize::new(0));
+        let assembled =
+            assemble_real_children_pipeline(vec![spawn, alias], effects.clone(), &[skill]).await;
+        for outer in [tools::PipelineTool::NAME, "ops__chain"] {
+            let pipeline = assembled
+                .registry
+                .iter()
+                .find(|tool| tool.name() == outer)
+                .unwrap();
+            for (child, args) in [
+                ("spawn_subagent", serde_json::json!({"prompt":"work"})),
+                (
+                    "ops__create",
+                    serde_json::json!({"action":"list_results","agent":"worker","prompt":"work"}),
+                ),
+            ] {
+                for ordinary_first in [false, true] {
+                    let steps = if ordinary_first {
+                        serde_json::json!([{"tool":"shell","args":{}},{"tool":child,"args":args}])
+                    } else {
+                        serde_json::json!([{"tool":child,"args":args}])
+                    };
+                    let request = serde_json::json!({"parallel":true,"result":"all","steps":steps});
+                    assert!(pipeline.may_invoke_agent_child(&request));
+                    let result = GOAL_OPERATION_ACCOUNTING
+                        .scope(
+                            Some(fixture.accountant.clone()),
+                            fixture.root.scope(pipeline.execute(request)),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(!result.success);
+                    assert_eq!(result.error.as_deref(), Some(format!(
+                        "Step {} ({child}) failed: Goal Mode permits only synchronous foreground child execution.",
+                        usize::from(ordinary_first),
+                    ).as_str()));
+                    assert_eq!(effects.load(Ordering::SeqCst), 0);
+                    assert!(!security.tracker.is_limited_for_current(1));
+                    assert!(server.received_requests().await.unwrap().is_empty());
+                    let rows = fixture.handle.store.list_by_agent("main").await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].id, fixture.identity.task_id());
+                }
+            }
+        }
+        let goal = fixture
+            .handle
+            .goal_store()
+            .unwrap()
+            .get_goal_task(fixture.identity.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            zeroclaw_goal::GoalAccountingState::Complete
+        );
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        assert_eq!(
+            fixture
+                .tracker
+                .get_strict_usage_totals_for_task_with_pricing(fixture.identity.task_id())
+                .unwrap()
+                .0,
+            0
+        );
+        assert!(crate::goal_accounting::GoalForegroundContext::current().is_none());
+        assert!(zeroclaw_api::tool::ToolExecutionContext::current().is_none());
+    }
+
+    #[tokio::test]
+    async fn registered_goal_pipeline_rejects_recursive_delegate_at_child_depth() {
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let server = wiremock::MockServer::start().await;
+        let fixture = registered_goal_fixture().await;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let assembled = assemble_real_delegate_pipeline(
+            real_delegate_for_server(server.uri()),
+            effects.clone(),
+            &[],
+        )
+        .await;
+        let pipeline = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == tools::PipelineTool::NAME)
+            .unwrap();
+        let child = fixture.root.child();
+        let result = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(fixture.accountant.clone()),
+                child.scope(pipeline.execute(serde_json::json!({"steps":[
+                    {"tool":"delegate","args":{"agent":"worker","prompt":"recursive"}},
+                    {"tool":"shell","args":{}}
+                ]}))),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains(&crate::i18n::get_required_cli_string(
+                    "goal-mode-child-recursion-disallowed"
+                ))
+        );
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registered_goal_pipeline_preserves_real_delegate_failure_at_dispatch() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let fixture = registered_goal_fixture().await;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let assembled = assemble_real_delegate_pipeline(
+            real_delegate_for_server(server.uri()),
+            effects.clone(),
+            &[],
+        )
+        .await;
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: Some("main"),
+            turn_id: "pipeline-test",
+            channel_name: "test",
+        };
+        let dispatch = crate::agent::tool_execution::ToolDispatchContext {
+            tools_registry: &assembled.registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+        let outcome = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(fixture.accountant.clone()),
+                fixture
+                    .root
+                    .scope(crate::agent::tool_execution::execute_one_tool(
+                        tools::PipelineTool::NAME,
+                        serde_json::json!({"result":"last","steps":[
+                            {"tool":"delegate","args":{"agent":"worker","prompt":"fixture task"}},
+                            {"tool":"shell","args":{}}
+                        ]}),
+                        None,
+                        dispatch,
+                        &meta,
+                        &crate::observability::NoopObserver,
+                        None,
+                        None,
+                        None,
+                    )),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.success);
+        let error = outcome.terminal_error.unwrap();
+        assert!(error.is::<zeroclaw_api::tool::GoalChildOperationError>());
+        let accounting = error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .unwrap();
+        assert_eq!(
+            accounting.accounting_state(),
+            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+        );
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert!(!server.received_requests().await.unwrap().is_empty());
+        let goal = fixture
+            .handle
+            .goal_store()
+            .unwrap()
+            .get_goal_task(fixture.identity.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn registered_goal_skill_aliases_use_locked_args_and_real_pipeline() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "alias response"}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 3}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let fixture = registered_goal_fixture().await;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let skill_tool = |name: &str, target: &str, key: &str, value: &str| SkillTool {
+            name: name.into(),
+            description: "Goal alias".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: Default::default(),
+            target: Some(target.into()),
+            locked_args: [(key.to_string(), value.to_string())].into_iter().collect(),
+            timeout_secs: None,
+        };
+        let skill = Skill {
+            name: "ops".into(),
+            description: "Goal alias fixture".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                skill_tool("chain", tools::PipelineTool::NAME, "result", "last"),
+                skill_tool("manage", "delegate", "action", "list_results"),
+                skill_tool("create", "delegate", "action", "delegate"),
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let assembled = assemble_real_delegate_pipeline(
+            real_delegate_for_server(server.uri()),
+            effects.clone(),
+            &[skill],
+        )
+        .await;
+        let find = |name: &str| {
+            assembled
+                .registry
+                .iter()
+                .find(|tool| tool.name() == name)
+                .unwrap()
+        };
+        assert!(
+            !find("ops__manage").may_invoke_agent_child(&serde_json::json!({"action":"delegate"}))
+        );
+        assert!(
+            find("ops__create")
+                .may_invoke_agent_child(&serde_json::json!({"action":"list_results"}))
+        );
+        let chain = find("ops__chain");
+        let args = serde_json::json!({"result":"all","steps":[
+            {"tool":"delegate","args":{"agent":"worker","prompt":"fixture task"}},
+            {"tool":"shell","args":{}}
+        ]});
+        assert!(chain.may_invoke_agent_child(&args));
+        let result = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(fixture.accountant.clone()),
+                fixture.root.scope(chain.execute(args)),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output.as_str(), "ran");
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .tracker
+                .get_strict_usage_totals_for_task_with_pricing(fixture.identity.task_id())
+                .unwrap()
+                .0,
+            11
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RegisteredPipelineFailure {
+        Missing,
+        Invalid,
+        TerminalCommit,
+    }
+
+    #[derive(Default)]
+    struct RegisteredPipelineEngineObservations {
+        parent_calls: AtomicUsize,
+        verifier_calls: AtomicUsize,
+        append_calls: AtomicUsize,
+        host_errors: AtomicUsize,
+        hooks: std::sync::Mutex<Vec<String>>,
+        history: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+        native_chain: std::sync::Mutex<Option<String>>,
+        accountant: std::sync::Mutex<
+            Option<std::sync::Weak<dyn zeroclaw_goal::accounting::GoalOperationAccounting>>,
+        >,
+        accounting_contexts: std::sync::Mutex<Vec<(&'static str, u32)>>,
+        root_deadline: std::sync::Mutex<Option<tokio::time::Instant>>,
+    }
+
+    struct RegisteredPipelineAccountingFactory {
+        inner: Arc<crate::goal_accounting::RuntimeGoalOperationAccountingFactory>,
+        handle: crate::control_plane::ControlPlaneHandle,
+        observations: Arc<RegisteredPipelineEngineObservations>,
+    }
+
+    impl zeroclaw_goal::accounting::GoalOperationAccountingFactory
+        for RegisteredPipelineAccountingFactory
+    {
+        fn for_scope(
+            &self,
+            scope: zeroclaw_goal::GoalExecutionScope,
+        ) -> Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> {
+            let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+                Arc::new(RegisteredPipelineAccountant {
+                    inner: zeroclaw_goal::accounting::GoalOperationAccountingFactory::for_scope(
+                        self.inner.as_ref(),
+                        scope.clone(),
+                    ),
+                    scope,
+                    handle: self.handle.clone(),
+                    observations: self.observations.clone(),
+                });
+            *self.observations.accountant.lock().unwrap() = Some(Arc::downgrade(&accountant));
+            accountant
+        }
+    }
+
+    struct RegisteredPipelineAccountant {
+        inner: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+        scope: zeroclaw_goal::GoalExecutionScope,
+        handle: crate::control_plane::ControlPlaneHandle,
+        observations: Arc<RegisteredPipelineEngineObservations>,
+    }
+
+    impl RegisteredPipelineAccountant {
+        fn observe_context(&self, boundary: &'static str) {
+            let root = crate::goal_accounting::GoalForegroundContext::current_for_child()
+                .unwrap()
+                .unwrap();
+            assert_eq!(root.scope_identity().task_id(), self.scope.task_id());
+            assert_eq!(root.scope_identity().session_id(), self.scope.session_id());
+            assert_eq!(
+                root.scope_identity().execution_epoch(),
+                self.scope.execution_epoch()
+            );
+            assert!(root.depth() <= 1);
+            assert!(root.deadline().is_some_and(|deadline| {
+                deadline <= self.observations.root_deadline.lock().unwrap().unwrap()
+            }));
+            assert!(!root.token().is_cancelled());
+            assert!(Arc::ptr_eq(&root.control_plane().store, &self.handle.store));
+            let expected = self
+                .observations
+                .accountant
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .unwrap();
+            assert!(
+                zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .try_with(|active| Arc::ptr_eq(active.as_ref().unwrap(), &expected))
+                    .unwrap()
+            );
+            let api = zeroclaw_api::tool::ToolExecutionContext::current().unwrap();
+            assert!(api.is_goal_foreground());
+            assert!(api.cancellation_token().is_some());
+            self.observations
+                .accounting_contexts
+                .lock()
+                .unwrap()
+                .push((boundary, root.depth()));
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for RegisteredPipelineAccountant {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.observe_context("admit");
+            self.inner.admit(request).await
+        }
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.observe_context("settle");
+            self.inner.settle(settlement).await
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            self.inner.pricing_complete().await
+        }
+    }
+
+    struct RegisteredPipelineHooks(Arc<RegisteredPipelineEngineObservations>);
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for RegisteredPipelineHooks {
+        fn name(&self) -> &str {
+            "registered-pipeline-parent-hooks"
+        }
+
+        async fn before_tool_call_with_context(
+            &self,
+            context: &crate::hooks::ToolCallHookContext,
+            tool: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            self.0
+                .hooks
+                .lock()
+                .unwrap()
+                .push(format!("before:{tool}:{}", context.invocation_id()));
+            crate::hooks::HookResult::Continue((tool, args))
+        }
+
+        async fn on_after_tool_call_with_context(
+            &self,
+            context: &crate::hooks::ToolCallHookContext,
+            tool: &str,
+            result: &ToolResult,
+            _: std::time::Duration,
+        ) {
+            assert!(!result.success, "only the failed outer composite completes");
+            self.0
+                .hooks
+                .lock()
+                .unwrap()
+                .push(format!("after:{tool}:{}", context.invocation_id()));
+        }
+
+        async fn on_tool_call_abandoned(
+            &self,
+            context: &crate::hooks::ToolCallHookContext,
+            tool: &str,
+        ) {
+            self.0
+                .hooks
+                .lock()
+                .unwrap()
+                .push(format!("abandoned:{tool}:{}", context.invocation_id()));
+        }
+    }
+
+    struct RegisteredPipelineParentProvider {
+        observations: Arc<RegisteredPipelineEngineObservations>,
+        outer: &'static str,
+        child: &'static str,
+        root: crate::goal_accounting::GoalForegroundContext,
+        accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RegisteredPipelineParentProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "registered-pipeline-parent"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_providers::ModelProvider for RegisteredPipelineParentProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("registered parent must use the ordinary structured request path")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            anyhow::ensure!(
+                self.observations
+                    .parent_calls
+                    .fetch_add(1, Ordering::SeqCst)
+                    == 0,
+                "no parent model or summary call may follow the failed child"
+            );
+            let root = crate::goal_accounting::GoalForegroundContext::current_for_child()?.unwrap();
+            assert_eq!(root.depth(), 0);
+            assert_eq!(
+                root.scope_identity().task_id(),
+                self.root.scope_identity().task_id()
+            );
+            assert_eq!(
+                root.scope_identity().session_id(),
+                self.root.scope_identity().session_id()
+            );
+            assert_eq!(
+                root.scope_identity().execution_epoch(),
+                self.root.scope_identity().execution_epoch()
+            );
+            assert_eq!(root.deadline(), self.root.deadline());
+            assert!(Arc::ptr_eq(
+                &root.control_plane().store,
+                &self.root.control_plane().store
+            ));
+            assert!(
+                zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                    .try_with(|active| { Arc::ptr_eq(active.as_ref().unwrap(), &self.accountant) })
+                    .unwrap()
+            );
+            assert!(
+                zeroclaw_api::tool::ToolExecutionContext::current()
+                    .unwrap()
+                    .is_goal_foreground()
+            );
+            let child_args = if self.child == "delegate" {
+                serde_json::json!({"agent":"worker","prompt":"return fixture evidence"})
+            } else {
+                serde_json::json!({"prompt":"return fixture evidence"})
+            };
+            Ok(zeroclaw_providers::ChatResponse {
+                text: None,
+                tool_calls: vec![
+                    zeroclaw_providers::ToolCall {
+                        id: "registered-outer".into(),
+                        name: self.outer.into(),
+                        arguments: serde_json::json!({"result":"all","steps":[
+                            {"tool":self.child,"args":child_args},
+                            {"tool":"shell","args":{"text":"internal tail must not run"}}
+                        ]})
+                        .to_string(),
+                        extra_content: None,
+                    },
+                    zeroclaw_providers::ToolCall {
+                        id: "registered-parent-tail".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({"text":"parent sibling must not run"})
+                            .to_string(),
+                        extra_content: None,
+                    },
+                ],
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RegisteredPipelineEngineDriver {
+        key: zeroclaw_goal::GoalSessionKey,
+        handle: crate::control_plane::ControlPlaneHandle,
+        config: Arc<Config>,
+        registry: Arc<ScopedToolRegistry>,
+        observations: Arc<RegisteredPipelineEngineObservations>,
+        outer: &'static str,
+        child: &'static str,
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::GoalSessionDriver for RegisteredPipelineEngineDriver {
+        fn session_key(&self) -> &zeroclaw_goal::GoalSessionKey {
+            &self.key
+        }
+
+        async fn bind(
+            &self,
+            ingress: &zeroclaw_goal::GoalIngressContext,
+        ) -> anyhow::Result<zeroclaw_goal::GoalSessionLease> {
+            assert_eq!(ingress.session_key(), &self.key);
+            Ok(zeroclaw_goal::GoalSessionLease::new(
+                zeroclaw_goal::GoalSessionBinding::new(self.key.clone()),
+                (),
+            ))
+        }
+
+        async fn acquire_execution(
+            &self,
+            ingress: &zeroclaw_goal::GoalIngressContext,
+            scope: &zeroclaw_goal::GoalExecutionScope,
+            _: &zeroclaw_goal::checkpoint::GoalParentTurnCheckpoint,
+        ) -> anyhow::Result<Box<dyn zeroclaw_goal::GoalSessionExecutionLease>> {
+            assert_eq!(ingress.session_key(), &self.key);
+            assert_eq!(scope.session_id(), self.key.durable_id());
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::GoalSessionExecutionLease for RegisteredPipelineEngineDriver {
+        fn session_key(&self) -> &zeroclaw_goal::GoalSessionKey {
+            &self.key
+        }
+        async fn canonical_history(
+            &mut self,
+            _input: &zeroclaw_goal::control::GoalParentTurnInput,
+        ) -> anyhow::Result<Vec<zeroclaw_providers::ChatMessage>> {
+            Ok(vec![zeroclaw_providers::ChatMessage::user(
+                "canonical fixture request",
+            )])
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            operation: &zeroclaw_goal::GoalOperationScope,
+            turn: zeroclaw_goal::GoalParentTurn,
+        ) -> anyhow::Result<zeroclaw_goal::GoalParentTurnResult> {
+            use crate::agent::loop_::{
+                LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+                ResolvedRuntimeKnobs, ToolLoop,
+            };
+            let root = crate::goal_accounting::GoalForegroundContext::new_root(
+                operation.execution().clone(),
+                self.handle.clone(),
+                tokio_util::sync::CancellationToken::new(),
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(60)),
+            );
+            *self.observations.root_deadline.lock().unwrap() = root.deadline();
+            let accountant = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .try_with(|active| active.clone())
+                .unwrap()
+                .unwrap();
+            let provider = RegisteredPipelineParentProvider {
+                observations: self.observations.clone(),
+                outer: self.outer,
+                child: self.child,
+                root: root.clone(),
+                accountant,
+            };
+            let input = zeroclaw_goal::control::goal_parent_turn_input(&turn);
+            let mut history =
+                input.goal_start_transcript("registered parent system", turn.working_history)?;
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(RegisteredPipelineHooks(self.observations.clone())));
+            let approval = crate::approval::ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig {
+                    auto_approve: vec![self.outer.into(), "shell".into()],
+                    ..Default::default()
+                },
+            );
+            let security = SecurityPolicy::for_agent(&self.config, "main").unwrap();
+            let observer = crate::observability::NoopObserver;
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+            let knobs = LoopKnobs::default();
+            let mut breadcrumb = false;
+            let mut injected = None;
+            let future: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>> = Box::pin(
+                crate::agent::loop_::run_tool_call_loop(ToolLoop {
+                    exec: ResolvedAgentExecution::resolve(
+                        ResolvedModelAccess { model_provider: &provider, provider_name: "ollama.local", model: "fixture-model", dispatch_model: "fixture-model", temperature: None },
+                        ResolvedIo { tools_registry: &self.registry, observer: &observer, silent: true, approval: Some(&approval), security: Some(&security), multimodal_config: &multimodal, config: Some(&self.config), hooks: Some(&hooks), activated_tools: None, model_switch_callback: None, receipt_generator: None },
+                        ResolvedRuntimeKnobs { max_tool_iterations: 5, excluded_tools: &[], dedup_exempt_tools: &[], pacing: &pacing, strict_tool_parsing: false, parallel_tools: false, max_tool_result_chars: 0,
+                            context_limits: zeroclaw_config::schema::ResolvedContextLimits { model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK, context_token_budget: 0, model_context_window_source: zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback },
+                            context_limits_resolver: None, knobs: &knobs }),
+                    history: &mut history, history_has_trim_breadcrumb: &mut breadcrumb, injected_memory_preamble: &mut injected,
+                    channel_name: "test", channel_reply_target: None, cancellation_token: None, on_delta: None, shared_budget: None, channel: None, collected_receipts: None,
+                    event_tx: None, steering: None, new_messages_out: None, image_cache: None,
+                    ingress: zeroclaw_api::ingress::IngressContext::sub_turn(), memory: None,
+                    agent_alias: Some("main"), parent_agent_alias: None, turn_id: "registered-parent", served_route_sink: None, sop_reassembly: None,
+                })
+            );
+            let result = root.scope(future).await;
+            *self.observations.history.lock().unwrap() = history.clone();
+            assert!(crate::goal_accounting::GoalForegroundContext::current().is_none());
+            let error = result.expect_err("real child failure must stop the ordinary parent loop");
+            assert!(
+                error.is::<zeroclaw_api::tool::GoalChildOperationError>(),
+                "{error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains(&format!("Pipeline step 0 ({}) failed", self.child)),
+                "{error:#}"
+            );
+            // This fixture records the host-owned native attempt, not G5
+            // transport rendering or successful delivery to a person.
+            self.observations.host_errors.fetch_add(1, Ordering::SeqCst);
+            *self.observations.native_chain.lock().unwrap() = Some(format!("{error:#}"));
+            Err(error)
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _: &zeroclaw_goal::GoalOperationScope,
+            _: zeroclaw_goal::GoalVerifierTurn,
+        ) -> anyhow::Result<zeroclaw_goal::GoalVerifierResult> {
+            self.observations
+                .verifier_calls
+                .fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("verifier must not follow a real pipeline child failure")
+        }
+        async fn append_parent_candidate(&mut self, _: String) -> anyhow::Result<()> {
+            self.observations
+                .append_calls
+                .fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("candidate append must not follow a real pipeline child failure")
+        }
+        async fn publish_goal_notice(
+            &mut self,
+            _: zeroclaw_goal::GoalExecutionNotice,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn registered_goal_engine_fixture(point: RegisteredPipelineFailure, outer: &'static str) {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_goal::{
+            GoalHostSettings, GoalHostSettingsSource, GoalIngressContext, GoalIngressPrincipal,
+            GoalRuntime, GoalSessionKey,
+        };
+        let server = MockServer::start().await;
+        let mut response = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"actual child evidence"}}],"usage":{"prompt_tokens":8,"completion_tokens":3}});
+        match point {
+            RegisteredPipelineFailure::Missing => {
+                response.as_object_mut().unwrap().remove("usage");
+            }
+            RegisteredPipelineFailure::Invalid => {
+                response["usage"]["prompt_tokens_details"] = serde_json::json!({"cached_tokens":9});
+            }
+            RegisteredPipelineFailure::TerminalCommit => {}
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No seeded task: normal admission creates this fixture's sole task
+        // and request. Existing seeded registered-child tests keep their path.
+        let (directory, mut handle, tracker, factory) = registered_goal_resources();
+        let terminal_attempts = Arc::new(AtomicUsize::new(0));
+        if matches!(point, RegisteredPipelineFailure::TerminalCommit) {
+            handle.store = Arc::new(ScopedHeldTerminal {
+                inner: handle.store.clone(),
+                mode: ScopedTerminalMode::Fail {
+                    attempts: terminal_attempts.clone(),
+                },
+            });
+        }
+        let mut config = real_pipeline_child_config_in(directory.path(), server.uri());
+        config.goal.enabled = true;
+        config.goal.default_token_limit = Some(1000);
+        config.goal.default_cost_limit_usd = None;
+        config.goal.verifier.model_provider = "ollama.local".into();
+        config.goal.verifier.model = Some("fixture-model".into());
+        config
+            .risk_profiles
+            .get_mut("fixture")
+            .unwrap()
+            .allowed_tools
+            .extend([outer.into(), "shell".into()]);
+        config.validate_goal_config().unwrap();
+        let config = Arc::new(config);
+        let child = if matches!(point, RegisteredPipelineFailure::TerminalCommit) {
+            "spawn_subagent"
+        } else {
+            "delegate"
+        };
+        let actual_child: Arc<dyn Tool> = if child == "delegate" {
+            real_delegate_for_server(server.uri())
+        } else {
+            Arc::new(crate::tools::SpawnSubagentTool::new(
+                config.clone(),
+                "main",
+                Arc::new(SecurityPolicy::for_agent(&config, "main").unwrap()),
+            ))
+        };
+        let skill = Skill {
+            name: "ops".into(),
+            description: "Actual parent pipeline alias".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![SkillTool {
+                name: "chain".into(),
+                description: "Keep intermediate child evidence private".into(),
+                kind: "builtin".into(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some(tools::PipelineTool::NAME.into()),
+                locked_args: [("result".into(), "last".into())].into_iter().collect(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let effects = Arc::new(AtomicUsize::new(0));
+        let assembled =
+            assemble_real_children_pipeline(vec![actual_child], effects.clone(), &[skill]).await;
+        let observations = Arc::new(RegisteredPipelineEngineObservations::default());
+        let key = GoalSessionKey::matrix("matrix_registered_pipeline_engine").unwrap();
+        let driver = Arc::new(RegisteredPipelineEngineDriver {
+            key: key.clone(),
+            handle: handle.clone(),
+            config: config.clone(),
+            registry: Arc::new(assembled.registry),
+            observations: observations.clone(),
+            outer,
+            child,
+        });
+        let ingress = GoalIngressContext::trusted(
+            key.clone(),
+            "main",
+            "matrix:fixture",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: "@fixture:example.org".into(),
+            },
+        )
+        .unwrap();
+        let runtime = GoalRuntime::new(handle.goal_store().unwrap());
+        let settings =
+            GoalHostSettings::from_config(&config, std::process::id(), handle.boot_id.clone())
+                .unwrap();
+        let source = GoalHostSettingsSource::new(
+            zeroclaw_config::live::LiveConfig::new(config.as_ref().clone()).handle(),
+            std::process::id(),
+            handle.boot_id.clone(),
+        )
+        .unwrap();
+        let request = runtime
+            .submit(
+                &settings,
+                ingress,
+                driver,
+                zeroclaw_commands::goal::GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "exercise the actual registered child failure".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .into_parts()
+            .1
+            .unwrap();
+        let scope = request.scope().clone();
+        let engine = runtime.execution_engine(Arc::new(RegisteredPipelineAccountingFactory {
+            inner: factory,
+            handle: handle.clone(),
+            observations: observations.clone(),
+        }));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.run(
+                &source,
+                request,
+                zeroclaw_goal::checkpoint::GoalParentTurnCheckpoint::new(),
+            ),
+        )
+        .await
+        .expect("real registered child failure must settle")
+        .unwrap_err();
+        assert!(
+            error.is::<zeroclaw_api::tool::GoalChildOperationError>(),
+            "{error:#}"
+        );
+        let native_chain = observations.native_chain.lock().unwrap().clone().unwrap();
+        assert!(
+            native_chain.starts_with(&format!("Pipeline step 0 ({child}) failed: ")),
+            "{native_chain}"
+        );
+        match point {
+            RegisteredPipelineFailure::Missing => {
+                assert!(native_chain.contains("missing usage"), "{native_chain}")
+            }
+            RegisteredPipelineFailure::Invalid => assert!(
+                native_chain.contains("CachedInputExceedsInput"),
+                "{native_chain}"
+            ),
+            RegisteredPipelineFailure::TerminalCommit => assert_eq!(
+                native_chain
+                    .matches("registered pipeline child terminal storage failure")
+                    .count(),
+                1
+            ),
+        }
+        match point {
+            RegisteredPipelineFailure::Missing | RegisteredPipelineFailure::Invalid => {
+                assert_eq!(format!("{error:#}"), native_chain);
+            }
+            RegisteredPipelineFailure::TerminalCommit => assert_eq!(
+                format!("{error:#}"),
+                format!("Goal parent operation failed: {native_chain}")
+            ),
+        }
+        let (state, tokens, rows, reason) = match point {
+            RegisteredPipelineFailure::Missing => (
+                zeroclaw_goal::GoalAccountingState::Missing,
+                7,
+                1,
+                "accounting_missing_or_invalid",
+            ),
+            // The nine cached-input tokens prove a larger input lower bound
+            // than the inconsistent reported eight: retain 9 + 3, unpriced.
+            RegisteredPipelineFailure::Invalid => (
+                zeroclaw_goal::GoalAccountingState::Invalid,
+                19,
+                2,
+                "accounting_missing_or_invalid",
+            ),
+            RegisteredPipelineFailure::TerminalCommit => (
+                zeroclaw_goal::GoalAccountingState::Complete,
+                18,
+                2,
+                "parent_operation_failed",
+            ),
+        };
+        if matches!(point, RegisteredPipelineFailure::TerminalCommit) {
+            assert!(error.is::<ScopedChildTerminalFailure>(), "{error:#}");
+            assert!(!error.is::<zeroclaw_goal::accounting::GoalAccountingFailure>());
+            assert_eq!(terminal_attempts.load(Ordering::SeqCst), 1);
+        } else {
+            let accounting = error
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .unwrap();
+            assert_eq!(accounting.accounting_state(), state);
+            assert!(!accounting.has_pending_operation());
+            assert!(!error.is::<ScopedChildTerminalFailure>());
+            assert_eq!(terminal_attempts.load(Ordering::SeqCst), 0);
+        }
+        let store = handle.goal_store().unwrap();
+        let task = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.id, scope.task_id());
+        assert_eq!(task.status, crate::control_plane::TaskStatus::Failed);
+        assert_eq!(task.execution_epoch, scope.execution_epoch() + 1);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(reason)
+        );
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, state);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        let totals = tracker
+            .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+            .unwrap();
+        assert_eq!(totals.0, tokens);
+        assert_eq!(
+            totals.2,
+            !matches!(point, RegisteredPipelineFailure::Invalid)
+        );
+        assert_eq!(
+            tracker
+                .get_summary_for_task(scope.task_id())
+                .unwrap()
+                .request_count,
+            rows
+        );
+        let ledger: Vec<crate::cost::types::CostRecord> =
+            std::fs::read_to_string(directory.path().join("state/costs.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert_eq!(ledger.len(), rows);
+        assert!(
+            ledger
+                .iter()
+                .all(|row| row.task_id.as_deref() == Some(scope.task_id())
+                    && row.provider_ref.as_deref() == Some("ollama.local")
+                    && row.usage.model == "fixture-model")
+        );
+        assert_eq!(ledger[0].usage.input_tokens, 5);
+        assert_eq!(ledger[0].usage.output_tokens, 2);
+        if matches!(point, RegisteredPipelineFailure::Invalid) {
+            assert_eq!(ledger[1].usage.input_tokens, 9);
+            assert_eq!(ledger[1].usage.output_tokens, 3);
+            assert_eq!(ledger[1].usage.unpriced_tokens, 12);
+            assert!(!ledger[1].usage.pricing_available);
+        }
+        let reopened = zeroclaw_config::cost::CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .get_strict_usage_totals_for_task_with_pricing(scope.task_id())
+                .unwrap()
+                .0,
+            tokens
+        );
+        assert_eq!(
+            reopened
+                .get_summary_for_task(scope.task_id())
+                .unwrap()
+                .request_count,
+            rows
+        );
+        let children = handle.store.list_by_agent("main").await.unwrap();
+        let children: Vec<_> = children
+            .iter()
+            .filter(|row| row.kind == crate::control_plane::TaskKind::Subagent)
+            .collect();
+        if matches!(point, RegisteredPipelineFailure::TerminalCommit) {
+            let [child] = children.as_slice() else {
+                panic!("one actual spawned child must exist");
+            };
+            assert_eq!(child.status, crate::control_plane::TaskStatus::Running);
+            assert_eq!(child.parent_id.as_deref(), Some(scope.task_id()));
+            assert_eq!(child.depth, 1);
+            assert_eq!(child.owner_pid, std::process::id());
+            assert_eq!(child.owner_boot_id, handle.boot_id);
+        } else {
+            assert!(children.is_empty());
+        }
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert_eq!(observations.parent_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.host_errors.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.verifier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(observations.append_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *observations.accounting_contexts.lock().unwrap(),
+            [("admit", 0), ("settle", 0), ("admit", 1), ("settle", 1),]
+        );
+        assert_eq!(
+            *observations.hooks.lock().unwrap(),
+            [
+                format!("before:{outer}:registered-parent:0:0"),
+                "before:shell:registered-parent:0:1".into(),
+                format!("after:{outer}:registered-parent:0:0"),
+                "abandoned:shell:registered-parent:0:1".into(),
+            ]
+        );
+        {
+            let history = observations.history.lock().unwrap();
+            let encoded = serde_json::to_value(&*history).unwrap().to_string();
+            for id in ["registered-outer", "registered-parent-tail"] {
+                assert_eq!(
+                    encoded.matches(id).count(),
+                    2,
+                    "one ordinary call/result pair for {id}"
+                );
+            }
+            let completed = history
+                .iter()
+                .find(|row| row.role == "tool" && row.content.contains("registered-outer"))
+                .unwrap();
+            assert!(
+                completed
+                    .content
+                    .contains(&format!("Pipeline step 0 ({child}) failed"))
+            );
+            assert!(
+                !completed.content.contains("actual child evidence"),
+                "result=last cannot leak successful intermediate text into the error result"
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(crate::goal_accounting::GoalForegroundContext::current().is_none());
+        assert!(zeroclaw_api::tool::ToolExecutionContext::current().is_none());
+        assert!(
+            zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+                .try_with(|_| ())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_goal_pipeline_missing_usage_reaches_parent_hooks_history_and_engine() {
+        for outer in [tools::PipelineTool::NAME, "ops__chain"] {
+            registered_goal_engine_fixture(RegisteredPipelineFailure::Missing, outer).await;
+        }
+    }
+    #[tokio::test]
+    async fn registered_goal_pipeline_invalid_usage_reaches_parent_hooks_history_and_engine() {
+        for outer in [tools::PipelineTool::NAME, "ops__chain"] {
+            registered_goal_engine_fixture(RegisteredPipelineFailure::Invalid, outer).await;
+        }
+    }
+    #[tokio::test]
+    async fn registered_goal_pipeline_real_terminal_failure_reaches_parent_hooks_history_and_engine()
+     {
+        for outer in [tools::PipelineTool::NAME, "ops__chain"] {
+            registered_goal_engine_fixture(RegisteredPipelineFailure::TerminalCommit, outer).await;
+        }
+    }
+
     async fn assemble_pipeline(
         security: Arc<SecurityPolicy>,
         skills: &[Skill],

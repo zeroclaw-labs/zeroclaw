@@ -435,6 +435,11 @@ fn narrow_schema(
 
 #[async_trait]
 impl Tool for SkillBuiltinTool {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        let effective = merge_locked_args(&self.locked_args, args.clone());
+        self.target_tool.may_invoke_agent_child(&effective)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.target_tool.requires_unrestricted_principal()
     }
@@ -504,6 +509,54 @@ mod tests {
     use crate::skills::SkillTool;
     use zeroclaw_api::attribution::{Attributable, ToolProvenance};
     use zeroclaw_config::schema::DockerRuntimeConfig;
+
+    struct AliasChildPredicateProbe;
+    zeroclaw_api::mock_tool_attribution!(AliasChildPredicateProbe);
+
+    #[async_trait]
+    impl Tool for AliasChildPredicateProbe {
+        fn name(&self) -> &str {
+            "actual_target"
+        }
+        fn description(&self) -> &str {
+            "argument-sensitive child predicate"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args.get("action").and_then(|v| v.as_str()) != Some("list_results")
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            panic!("predicate must not execute the target")
+        }
+    }
+
+    #[test]
+    fn skill_child_predicate_uses_target_and_locked_argument_precedence() {
+        let target: Arc<dyn Tool> = Arc::new(AliasChildPredicateProbe);
+        for (locked_action, caller_action, expected) in [
+            (Some("list_results"), "delegate", false),
+            (Some("delegate"), "list_results", true),
+            (None, "list_results", false),
+            (None, "delegate", true),
+        ] {
+            let mut locked = HashMap::new();
+            if let Some(action) = locked_action {
+                locked.insert("action".to_string(), action.to_string());
+            }
+            let skill = elevation_skill_tool("builtin", "actual_target", locked.clone());
+            let alias = SkillBuiltinTool::new("unrelated_alias", &skill, target.clone(), locked);
+            assert_eq!(
+                alias.may_invoke_agent_child(&serde_json::json!({"action": caller_action})),
+                expected
+            );
+        }
+        let locked = HashMap::new();
+        let skill = elevation_skill_tool("builtin", "actual_target", locked.clone());
+        let alias = SkillBuiltinTool::new("unrelated_alias", &skill, target, locked);
+        assert!(alias.may_invoke_agent_child(&serde_json::json!({})));
+    }
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {

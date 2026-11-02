@@ -96,12 +96,43 @@ the operating system:
 | `session/kill` | client -> daemon | Remove the live session and tombstone its ACP durable history |
 | `session/delete` | client -> daemon | Remove the live session and its selected durable history |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
+| `session/goal` | client -> daemon | Submit a typed Goal Mode control command for an existing session |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
 | `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `file/upload/begin`, `file/upload/chunk`, `file/upload/commit` | client -> daemon | Upload one file in ordered chunks; see [Chunked uploads](#chunked-uploads) |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
+
+### Goal controls and parent output
+
+`session/goal` uses the existing authenticated session and the same Goal control
+plane as Matrix. It is available through local IPC and WSS, not through Web
+chat. A TUI identity provides continuity; it is not an authorization grant.
+Session ownership and current permissions are rechecked after admission waits,
+before preparing a parent operation.
+
+Ordinary start, resume, pause and budget mutations acknowledge queued work
+promptly and apply at the current turn boundary. Cancel and `pause now`
+interrupt immediately while already admitted usage and cleanup settle. The
+channel-only `/stop` shortcut uses the same immediate-pause semantics.
+`resume [RESPONSE]` preserves multiline text in the same durable session before
+the next parent prepares its history. Plain resume inserts no user response.
+
+Parent thinking, drafts, text, tool calls, results and errors retain the normal
+`session/update` path. Goal lifecycle notices use `session/goal_update`.
+Started/resumed notices precede execution; an agent's question precedes a
+verifier-blocked pause. The legacy `verified_candidate` update is a successful
+parent's presentation fallback after its ordinary event stream drains. It is
+not a verifier verdict or a persistence acknowledgement. Saving the candidate
+is a separate, once-only durable append; its failure remains visible as an
+original error and the typed `candidate_persistence_failed` lifecycle reason.
+
+The native parent has no additional overall Goal timeout. Existing finite
+tool, child, summary and Matrix turn bounds remain enforced. A daemon restart
+requires explicit authorized resume; an ordinary client disconnect does not
+cancel a durable Goal. Session disposal and daemon-generation shutdown have
+their own fence-and-drain boundaries.
 
 ### Atomic configuration writes
 
@@ -312,6 +343,15 @@ The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 | `upload.rs` | Chunked-upload staging: ordering, per-connection and process-wide bounds |
+
+Long-running `session/prompt` and `session/goal` work belongs to the accepted
+connection generation. The dispatcher retains their task handles through
+connection teardown, and a ZeroCode Goal worker retains the generation's
+liveness token for its full lifetime. This prevents a replacement daemon
+generation from admitting work for the same durable session while old Goal
+work is still unwinding. An ordinary client disconnect still retains the
+session and its Goal; explicit session lifecycle operations remain responsible
+for Goal disposal.
 
 The `RpcTransport` trait is designed so that additional transports (vsock,
 custom IPC) slot in without touching the dispatch or session logic. The

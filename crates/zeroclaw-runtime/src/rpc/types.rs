@@ -294,6 +294,45 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// A transport-neutral Goal control command bound to an existing live
+    /// ZeroCode session. The daemon derives agent, route, and current TUI
+    /// identity from the session; clients cannot submit those authority facts.
+    pub struct SessionGoalParams {
+        pub session_id: String,
+        pub command: String,
+    }
+}
+
+rpc_type! {
+    /// Typed Goal lifecycle result for both local IPC and WSS clients.
+    pub struct SessionGoalResult {
+        pub response: zeroclaw_goal::control::GoalResponse,
+    }
+}
+
+rpc_type! {
+    /// Asynchronous Goal lifecycle update. Ordinary agent events, including
+    /// parent-turn chunks and failures, use the normal `session/update` stream.
+    pub enum SessionGoalUpdate {
+        CommandFailed { session_id: String },
+        /// Successful parent candidate presentation fallback after ordinary
+        /// events drain. The legacy name is not a verifier verdict or proof of
+        /// durable candidate persistence; lifecycle updates carry those outcomes.
+        VerifiedCandidate { session_id: String, candidate: String },
+        Completed { session_id: String },
+        PausedForBlocker { session_id: String },
+        Failed {
+            session_id: String,
+            reason: zeroclaw_goal::control::GoalFailureReason,
+        },
+        Lifecycle {
+            session_id: String,
+            response: zeroclaw_goal::control::GoalResponse,
+        },
+    }
+}
+
+rpc_type! {
     pub struct SessionConfigureParams {
         pub session_id: String,
         #[serde(default)]
@@ -2097,6 +2136,68 @@ mod tests {
             serde_json::from_value::<ChatMode>(json!("acp")).unwrap(),
             ChatMode::Acp
         );
+    }
+
+    #[test]
+    fn session_goal_failure_serializes_stable_client_payload() {
+        let update = SessionGoalUpdate::Failed {
+            session_id: "sess-1".into(),
+            reason: zeroclaw_goal::control::GoalFailureReason::ToolResultsUnpaired,
+        };
+
+        assert_eq!(
+            serde_json::to_value(update).unwrap(),
+            json!({
+                "failed": {
+                    "session_id": "sess-1",
+                    "reason": "tool_results_unpaired"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn session_goal_current_variants_match_the_native_client_fixture() {
+        use zeroclaw_goal::control::{GoalFailureReason, GoalResponse};
+
+        // The RPC-only client consumes this same fixture without linking the
+        // daemon. Exercise both independent serde owners against identical bytes.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/goal_wire_variants.json"
+        )))
+        .unwrap();
+        for value in fixture["failure_reasons"].as_array().unwrap() {
+            let reason: GoalFailureReason = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(reason).unwrap(), *value);
+            let update = SessionGoalUpdate::Failed {
+                session_id: "goal-session".into(),
+                reason,
+            };
+            assert_eq!(
+                serde_json::to_value(update).unwrap()["failed"]["reason"],
+                *value
+            );
+        }
+        let mut values = Vec::new();
+        for kind in fixture["unit_responses"].as_array().unwrap() {
+            values.push(json!({"kind": kind}));
+        }
+        for kind in fixture["status_responses"].as_array().unwrap() {
+            values.push(json!({"kind": kind, "status": fixture["status"]}));
+        }
+        for control in fixture["queued_controls"].as_array().unwrap() {
+            values.push(json!({"kind": "queued", "status": control}));
+        }
+        for action in fixture["pending_actions"].as_array().unwrap() {
+            values.push(json!({"kind": "transition_pending", "status": action}));
+        }
+        for value in values {
+            let response: GoalResponse = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&response).unwrap(), value);
+            let result = SessionGoalResult { response };
+            assert_eq!(serde_json::to_value(result).unwrap()["response"], value);
+        }
     }
 
     #[test]

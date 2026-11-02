@@ -4,9 +4,12 @@
 pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+mod foreground;
+pub(crate) mod goal_execution;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
+mod turn_execution;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -113,6 +116,7 @@ use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_commands::goal::{GoalCommandParseError, parse_goal_command};
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
 #[cfg(test)]
@@ -127,8 +131,7 @@ use zeroclaw_providers::{
 };
 use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
+    LoopKnobs, ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
     scope_session_key, scope_thread_id, scrub_credentials,
 };
@@ -140,6 +143,20 @@ use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy};
 use zeroclaw_runtime::tools::{self, Tool};
 use zeroclaw_runtime::util::truncate_with_ellipsis;
+
+use self::foreground::{
+    ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
+};
+use self::goal_execution::{
+    deliver_matrix_goal_command, deliver_matrix_goal_stop, dispose_matrix_goal_with_command_lease,
+    submit_matrix_goal, submit_matrix_goal_stop_with_command_lease,
+};
+mod goal_control;
+use self::goal_control::{
+    deliver_prepared_matrix_goal_command, matrix_goal_command_snapshot,
+    prepare_matrix_goal_command, should_drop_channel_message,
+};
+use self::turn_execution::resolved_channel_execution;
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
@@ -181,9 +198,20 @@ struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
     tx: Option<tokio::sync::mpsc::Sender<String>>,
     tools_used: AtomicBool,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
+    content_format: OutboundContentFormat,
 }
 
 const NOTIFY_DETAIL_MAX_CHARS: usize = 4096;
+
+#[cfg(test)]
+fn test_live_config(
+    policy: zeroclaw_config::schema::LeakDetectionConfig,
+) -> zeroclaw_config::live::LiveConfigHandle {
+    let mut config = Config::default();
+    config.security.leak_detection = policy;
+    zeroclaw_config::live::LiveConfig::new(config).handle()
+}
 
 impl Observer for ChannelNotifyObserver {
     fn record_event(&self, event: &ObserverEvent) {
@@ -196,29 +224,49 @@ impl Observer for ChannelNotifyObserver {
                 self.inner.record_event(event);
                 return;
             };
+            let policy = self.live_config.read().security.leak_detection.clone();
+            let guard =
+                |value: &str| redact_channel_outbound_leaks(value, &policy, self.content_format);
+            let display_tool = guard(tool);
             let detail = match arguments {
                 Some(args) if !args.is_empty() => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-                        if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-                            format!(": `{}`", truncate_with_ellipsis(cmd, 200))
-                        } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
-                            format!(": {}", truncate_with_ellipsis(q, 200))
-                        } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
-                            format!(": {}", truncate_with_ellipsis(p, NOTIFY_DETAIL_MAX_CHARS))
-                        } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
-                            format!(": {}", truncate_with_ellipsis(u, NOTIFY_DETAIL_MAX_CHARS))
+                        let scrubbed = zeroclaw_runtime::agent::scrub_credentials_value(v.clone());
+                        if let Some(cmd) = scrubbed.get("command").and_then(|c| c.as_str()) {
+                            format!(": `{}`", truncate_with_ellipsis(&guard(cmd), 200))
+                        } else if let Some(q) = scrubbed.get("query").and_then(|c| c.as_str()) {
+                            format!(": {}", truncate_with_ellipsis(&guard(q), 200))
+                        } else if let Some(p) = scrubbed.get("path").and_then(|c| c.as_str()) {
+                            format!(
+                                ": {}",
+                                truncate_with_ellipsis(&guard(p), NOTIFY_DETAIL_MAX_CHARS)
+                            )
+                        } else if let Some(u) = scrubbed.get("url").and_then(|c| c.as_str()) {
+                            format!(
+                                ": {}",
+                                truncate_with_ellipsis(&guard(u), NOTIFY_DETAIL_MAX_CHARS)
+                            )
                         } else {
-                            let s = args.to_string();
-                            format!(": {}", truncate_with_ellipsis(&s, 120))
+                            let s = if scrubbed == v {
+                                args.to_string()
+                            } else {
+                                scrubbed.to_string()
+                            };
+                            let s = if v.is_object() {
+                                s
+                            } else {
+                                scrub_credentials(&s)
+                            };
+                            format!(": {}", truncate_with_ellipsis(&guard(&s), 120))
                         }
                     } else {
-                        let s = args.to_string();
-                        format!(": {}", truncate_with_ellipsis(&s, 120))
+                        let s = scrub_credentials(args);
+                        format!(": {}", truncate_with_ellipsis(&guard(&s), 120))
                     }
                 }
                 _ => String::new(),
             };
-            let _ = tx.try_send(format!("\u{1F527} `{tool}`{detail}"));
+            let _ = tx.try_send(guard(&format!("\u{1F527} `{display_tool}`{detail}")));
         }
         self.inner.record_event(event);
     }
@@ -762,10 +810,10 @@ struct ChannelRuntimeContext {
     show_receipts_in_response: bool,
     last_applied_config_stamp: Arc<Mutex<Option<ConfigFileStamp>>>,
     runtime_defaults_override: Arc<Mutex<Option<Arc<ChannelRuntimeOverride>>>>,
-    /// Per-conversation-history-key locks that serialize persistence mutations
-    /// (append / remove_last / delete_session) for the same sender without
-    /// serializing the full message-processing loop.
-    persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
+    /// Per-conversation-history-key process-local locks. These serialize
+    /// persistence mutations and Matrix foreground model work without creating
+    /// a second session, identity, or authorization store.
+    persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<ConversationLocks>>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
@@ -806,10 +854,37 @@ fn channel_turn_approval(
 /// append/remove_last/delete_session operations for the same sender are
 /// serialized without blocking the full message-processing loop
 fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync::Mutex<()>> {
-    let mut map = ctx.persist_locks.lock().unwrap_or_else(|e| e.into_inner());
-    map.entry(key.to_string())
-        .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
-        .clone()
+    persist_lock(&ctx.persist_locks, key)
+}
+
+async fn acquire_matrix_foreground_lease(
+    ctx: &ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    history_key: &str,
+    cancellation: &CancellationToken,
+) -> Option<MatrixForegroundLease> {
+    if !is_matrix_channel_name(&msg.channel) {
+        return Some(MatrixForegroundLease::NotMatrix);
+    }
+    wait_for_foreground_lease(
+        foreground_lock(&ctx.persist_locks, history_key),
+        cancellation.clone(),
+    )
+    .await
+    .map(|guard| MatrixForegroundLease::Acquired { _guard: guard })
+}
+
+/// Holds the per-conversation foreground lease for an ordinary channel turn.
+///
+/// `None` from [`acquire_matrix_foreground_lease`] is reserved for a cancelled
+/// queued Matrix turn. Keeping the non-Matrix case explicit prevents a caller
+/// from accidentally treating cancellation as an unlocked ordinary turn.
+enum MatrixForegroundLease {
+    NotMatrix,
+    Acquired {
+        // Retaining this guard, rather than inspecting it, is the contract.
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+    },
 }
 
 #[cfg(feature = "channel-telegram")]
@@ -849,6 +924,13 @@ struct PendingTurn {
     /// separate from the execution permit: waiting hooks and queued lanes do
     /// not consume execution capacity, but they still retain bounded memory.
     pending_work: tokio::sync::OwnedSemaphorePermit,
+    /// Reset admission owns this until native reset delivery or any early exit.
+    matrix_goal_reset: Option<MatrixGoalResetReservation>,
+}
+
+struct MatrixGoalResetReservation {
+    guard: foreground::MatrixGoalResetGuard,
+    completion: tokio::sync::oneshot::Receiver<std::result::Result<(), ()>>,
 }
 
 /// A turn waiting for debounce resolution and post-hook routing.
@@ -1509,6 +1591,9 @@ async fn route_inbound_slot(
     }
 
     let ctx = Arc::clone(&turn.ctx);
+    // Preserve admitted control facts across the modifying hook. Hook
+    // cancellation still ends the message before any control admission.
+    let goal_snapshot = matrix_goal_command_snapshot(ctx.as_ref(), &turn.msg);
     // Hooks can execute agent-scoped work, but waiting for debounce or a lane
     // must not pin a lifecycle lease. Revalidate again at model execution.
     let hooked = {
@@ -1528,6 +1613,94 @@ async fn route_inbound_slot(
     // within the source conversation. Waiting here holds neither an execution
     // permit nor a conversation lane, and never waits on another conversation.
     order.wait_admission().await;
+    if let Some((history_key, original, parsed)) = goal_snapshot {
+        let prepared = {
+            let Some(_lease) = lanes.reserve_turn(ctx.agent_alias.as_str(), turn.agent_generation)
+            else {
+                return;
+            };
+            let channel = find_channel_for_message(&ctx.channels_by_name, &turn.msg);
+            if should_drop_channel_message(channel, &turn.msg) {
+                return;
+            }
+            prepare_matrix_goal_command(Arc::clone(&ctx), history_key, original.clone(), parsed)
+                .await
+        };
+        order.finish();
+        busy_notice_tasks.spawn(async move {
+            // Keep the aggregate ingress permit and picker cleanup duty until
+            // acknowledgement, wait, final delivery and launch all finish.
+            let _turn = turn;
+            deliver_prepared_matrix_goal_command(ctx, original, prepared).await;
+        });
+        return;
+    }
+    if is_matrix_channel_name(&turn.msg.channel)
+        && !turn.msg.passive_context
+        && matches!(
+            parse_runtime_command(&turn.msg.channel, &turn.msg.content),
+            Some(ChannelRuntimeCommand::NewSession)
+        )
+        && !should_drop_channel_message(
+            find_channel_for_message(&ctx.channels_by_name, &turn.msg),
+            &turn.msg,
+        )
+    {
+        let Some(_lease) = lanes.reserve_turn(ctx.agent_alias.as_str(), turn.agent_generation)
+        else {
+            return;
+        };
+        let history_key = runtime_conversation_history_key(ctx.as_ref(), &turn.msg);
+        let guard = foreground::reserve_matrix_goal_reset(&ctx.persist_locks, &history_key);
+        let command_lease = foreground::goal_command_lock(&ctx.persist_locks, &history_key)
+            .lock_owned()
+            .await;
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let disposal_context = Arc::clone(&ctx);
+        busy_notice_tasks.spawn(async move {
+            let result = dispose_matrix_goal_with_command_lease(
+                disposal_context.as_ref(),
+                &history_key,
+                &command_lease,
+            )
+            .await;
+            if let Err(error) = &result {
+                goal_control::log_control_error("Matrix Goal disposal failed", error);
+            }
+            #[cfg(test)]
+            if foreground::take_goal_test_drop_reset_completion(
+                &disposal_context.persist_locks,
+                &history_key,
+            ) {
+                // Exercise sender loss after real disposal, before publication.
+                drop(completed);
+                return;
+            }
+            // Publish the outcome before releasing lifecycle serialization.
+            let _ = completed.send(result.map_err(|_| ()));
+            drop(command_lease);
+        });
+        turn.matrix_goal_reset = Some(MatrixGoalResetReservation { guard, completion });
+        #[cfg(test)]
+        if foreground::take_goal_test_drop_reset_admission(
+            &ctx.persist_locks,
+            &runtime_conversation_history_key(ctx.as_ref(), &turn.msg),
+        ) {
+            return;
+        }
+        #[cfg(test)]
+        if foreground::take_goal_test_cancel_reset_admission(
+            &ctx.persist_locks,
+            &runtime_conversation_history_key(ctx.as_ref(), &turn.msg),
+        ) {
+            // Cancel after reservation, so the real enqueue/drop path releases it.
+            turn.registration
+                .as_ref()
+                .expect("reset ingress fixture must have a turn registration")
+                .cancellation
+                .cancel();
+        }
+    }
     // The final cancellation check lives inside `enqueue`, under the registry
     // lock: checked here, a cancellation landing between the check and the
     // append could commit this turn into a lane behind the very successor
@@ -1895,6 +2068,78 @@ fn is_stop_command(content: &str) -> bool {
 
 fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
     SendMessage::reply_to(msg, reply)
+}
+
+fn ordinary_stop_reply(
+    had_registered_turn: bool,
+    cancelled_bucket: bool,
+    folded_into_another_scope: bool,
+) -> String {
+    let key = if had_registered_turn || cancelled_bucket {
+        "channel-runtime-stop-sent"
+    } else if folded_into_another_scope {
+        "channel-runtime-stop-folded-followup"
+    } else {
+        "channel-runtime-stop-no-task"
+    };
+    zeroclaw_runtime::i18n::get_required_cli_string(key)
+}
+
+fn stop_reply_after_goal_error(mut reply: String, error: &anyhow::Error) -> String {
+    use zeroclaw_goal::GoalDiagnosticTextGuard as _;
+    use zeroclaw_runtime::goal_accounting::RuntimeGoalDiagnosticTextGuard;
+
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error": zeroclaw_providers::sanitize_api_error(
+                    &RuntimeGoalDiagnosticTextGuard.guard_diagnostic_text(&format!("{error:#}")),
+                ),
+            })),
+        "Goal /stop pause could not be admitted"
+    );
+    reply.push('\n');
+    reply.push_str(&channel_runtime_cli_string("goal-mode-command-failed"));
+    reply
+}
+
+/// Reserve reply capacity before spawning ordinary notices; Goal stop tasks
+/// already own their separate bounded lock-wait reservation.
+fn prepare_stop_acknowledgement(
+    context: &ChannelRuntimeContext,
+    message: &ChannelMessage,
+    reply: String,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> Option<(
+    Arc<dyn Channel>,
+    SendMessage,
+    tokio::sync::OwnedSemaphorePermit,
+)> {
+    let Some(channel) = find_channel_for_message(&context.channels_by_name, message).cloned()
+    else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "stop command: no registered channel found for reply"
+        );
+        return None;
+    };
+    match Arc::clone(budget).try_acquire_owned() {
+        Ok(permit) => Some((channel, stop_reply_message(message, reply), permit)),
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"sender": message.sender})),
+                "stop executed without acknowledgement: reply budget exhausted"
+            );
+            None
+        }
+    }
 }
 
 /// Every XML-ish element name that opens a tool-CALL envelope, longest first so
@@ -4112,6 +4357,29 @@ fn append_sender_turn(
     sender_key: &str,
     turn: ChatMessage,
 ) -> Option<Vec<ChatMessage>> {
+    append_sender_turn_inner(ctx, sender_key, turn, false)
+}
+
+/// Append a Goal-owned turn only when its canonical session transcript is
+/// durably available and the write succeeds. Goal continuation and resume
+/// must never proceed from memory-only history.
+fn append_sender_turn_durably(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+) -> Option<Vec<ChatMessage>> {
+    append_sender_turn_inner(ctx, sender_key, turn, true)
+}
+
+fn append_sender_turn_inner(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+    require_durable_store: bool,
+) -> Option<Vec<ChatMessage>> {
+    if require_durable_store && ctx.session_store.is_none() {
+        return None;
+    }
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key
     let persist_lock = acquire_persist_lock(ctx, sender_key);
@@ -4132,19 +4400,44 @@ fn append_sender_turn(
                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
             "Failed to persist session turn"
         );
+        if require_durable_store {
+            return None;
+        }
     }
 
     let max_history = channel_history_cap(ctx);
-    let mut histories = ctx
-        .conversation_histories
+    let owned_breadcrumb = ctx
+        .history_crumb_flags
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
-    turns.push(turn);
-    while turns.len() > max_history {
-        turns.remove(0);
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(sender_key)
+        .copied()
+        == Some(true);
+    let (retained, front_evicted) = {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
+        turns.push(turn);
+        let front_evicted = turns.len() > max_history;
+        while turns.len() > max_history {
+            turns.remove(0);
+        }
+        (turns.clone(), front_evicted)
+    };
+    // The durable transcript still owns its breadcrumb; only the capped
+    // cache lost it. Do not infer ownership from a successor's matching text.
+    if owned_breadcrumb && front_evicted {
+        let mut flags = ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(flag) = flags.peek_mut(sender_key) {
+            *flag = false;
+        }
     }
-    Some(turns.clone())
+    Some(retained)
 }
 
 /// The user-configured max_history_messages, falling back to
@@ -6445,13 +6738,16 @@ async fn run_draft_updater(
     rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
     let content_format = outbound_content_format_for_channel(&outbound_channel);
+    let mut config = Config::default();
+    config.security.leak_detection = leak_detection;
+    let live_config = zeroclaw_config::live::LiveConfig::new(config).handle();
     run_draft_updater_with_leak_detection(
         channel,
         reply_target,
         draft_id,
         known_tool_names,
         Arc::new(Mutex::new(String::new())),
-        leak_detection,
+        live_config,
         content_format,
         turn_flush_narration,
         outbound_hooks,
@@ -6470,7 +6766,7 @@ async fn run_draft_updater_with_leak_detection(
     draft_id: String,
     known_tool_names: HashSet<String>,
     streamed_text: Arc<Mutex<String>>,
-    leak_detection: zeroclaw_config::schema::LeakDetectionConfig,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
     content_format: OutboundContentFormat,
     turn_flush_narration: bool,
     outbound_hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
@@ -6518,7 +6814,7 @@ async fn run_draft_updater_with_leak_detection(
                     flush_completed_narration_turn(
                         &channel,
                         outbound_hooks.as_deref(),
-                        &leak_detection,
+                        &live_config,
                         &outbound_channel,
                         &reply_target,
                         &draft_id,
@@ -6529,6 +6825,11 @@ async fn run_draft_updater_with_leak_detection(
                     .await;
                 }
                 let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
+                let visible = redact_channel_outbound_leaks(
+                    &visible,
+                    &live_config.read().security.leak_detection,
+                    content_format,
+                );
                 if let Err(e) = channel
                     .update_draft_progress(&reply_target, &draft_id, &visible)
                     .await
@@ -6548,6 +6849,11 @@ async fn run_draft_updater_with_leak_detection(
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
                 if let Some(text) = event.legacy_status() {
                     let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
+                    let visible = redact_channel_outbound_leaks(
+                        &visible,
+                        &live_config.read().security.leak_detection,
+                        content_format,
+                    );
                     if let Err(e) = channel
                         .update_draft_progress(&reply_target, &draft_id, &visible)
                         .await
@@ -6572,7 +6878,7 @@ async fn run_draft_updater_with_leak_detection(
                 accumulated.push_str(&text);
                 let visible = redact_channel_outbound_leaks(
                     &sanitize_streaming_draft_text(&accumulated, &known_tool_names),
-                    &leak_detection,
+                    &live_config.read().security.leak_detection,
                     content_format,
                 );
                 // Keep the exact visible frame used for MultiMessage offsets;
@@ -6604,7 +6910,7 @@ async fn run_draft_updater_with_leak_detection(
                     flush_completed_narration_turn(
                         &channel,
                         outbound_hooks.as_deref(),
-                        &leak_detection,
+                        &live_config,
                         &outbound_channel,
                         &reply_target,
                         &draft_id,
@@ -6755,7 +7061,7 @@ fn sanitize_channel_response_for_format_with_leak_detection(
 /// hook that cancels/rewrites the send is honored before anything is posted.
 async fn apply_multi_message_narration_policy(
     hooks: Option<&zeroclaw_runtime::hooks::HookRunner>,
-    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    live_config: &zeroclaw_config::live::LiveConfigHandle,
     channel: &str,
     reply_target: &str,
     prior_tail: &str,
@@ -6788,6 +7094,11 @@ async fn apply_multi_message_narration_policy(
                 if hook_channel != channel || hook_recipient != reply_target {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"from_channel": channel, "from_recipient": reply_target, "to_channel": hook_channel, "to_recipient": hook_recipient})), "on_message_sending attempted to rewrite narration routing; only content mutation is applied");
                 }
+                modified_content = redact_channel_outbound_leaks(
+                    &modified_content,
+                    &live_config.read().security.leak_detection,
+                    outbound_content_format_for_channel(channel),
+                );
                 let modified_len = modified_content.chars().count();
                 if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"limit": CHANNEL_HOOK_MAX_OUTBOUND_CHARS, "attempted": modified_len})), "hook-modified narration exceeded limit; truncating");
@@ -6801,7 +7112,7 @@ async fn apply_multi_message_narration_policy(
     Some(redact_channel_outbound_leaks_with_prior_context(
         prior_tail,
         &outbound,
-        leak_detection,
+        &live_config.read().security.leak_detection,
         outbound_content_format_for_channel(channel),
     ))
 }
@@ -6822,7 +7133,7 @@ async fn apply_multi_message_narration_policy(
 async fn flush_completed_narration_turn(
     channel: &Arc<dyn Channel>,
     hooks: Option<&zeroclaw_runtime::hooks::HookRunner>,
-    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    live_config: &zeroclaw_config::live::LiveConfigHandle,
     outbound_channel: &str,
     reply_target: &str,
     draft_id: &str,
@@ -6871,7 +7182,7 @@ async fn flush_completed_narration_turn(
     // split-secret gap across turn boundaries.
     match apply_multi_message_narration_policy(
         hooks,
-        leak_detection,
+        live_config,
         outbound_channel,
         reply_target,
         &prior_tail,
@@ -8287,6 +8598,7 @@ async fn process_channel_message(
         cancellation_token,
         delivery_message_id,
         None,
+        None,
     )
     .await;
 }
@@ -8297,6 +8609,7 @@ async fn process_channel_message_with_delivery_id(
     cancellation_token: CancellationToken,
     delivery_message_id: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
+    matrix_goal_reset: Option<MatrixGoalResetReservation>,
 ) {
     if cancellation_token.is_cancelled() {
         return;
@@ -8324,6 +8637,7 @@ async fn process_channel_message_with_delivery_id(
                 composite_for_body,
                 delivery_message_id,
                 turn_lease,
+                matrix_goal_reset,
             )
             .await;
         }
@@ -8703,10 +9017,25 @@ fn matrix_safe_tool_arguments(tool: &str) -> Option<&'static [&'static str]> {
         .find_map(|(tools, arguments)| tools.contains(&tool).then_some(*arguments))
 }
 
+#[cfg(test)]
 fn matrix_tool_progress(
     event: &zeroclaw_runtime::agent::loop_::StreamDelta,
     config: &Config,
     matrix_alias: &str,
+) -> Option<String> {
+    matrix_tool_progress_guarded(
+        event,
+        config,
+        matrix_alias,
+        &zeroclaw_config::schema::LeakDetectionConfig::default(),
+    )
+}
+
+fn matrix_tool_progress_guarded(
+    event: &zeroclaw_runtime::agent::loop_::StreamDelta,
+    config: &Config,
+    matrix_alias: &str,
+    policy: &zeroclaw_config::schema::LeakDetectionConfig,
 ) -> Option<String> {
     let settings = config
         .channels
@@ -8719,7 +9048,7 @@ fn matrix_tool_progress(
             arguments,
             tool_provenance,
         } => {
-            let subject = matrix_tool_subject(tool, arguments, *tool_provenance, settings);
+            let subject = matrix_tool_subject(tool, arguments, *tool_provenance, settings, policy);
             Some(format!("\u{23f3} {subject}\n"))
         }
         zeroclaw_runtime::agent::loop_::StreamDelta::ToolComplete {
@@ -8730,13 +9059,20 @@ fn matrix_tool_progress(
             success,
             error,
         } => {
-            let subject = matrix_tool_subject(tool, arguments, *tool_provenance, settings);
+            let subject = matrix_tool_subject(tool, arguments, *tool_provenance, settings, policy);
             if *success {
                 Some(format!("\u{2705} {subject} ({secs}s)\n"))
             } else if let Some(error) = error {
                 Some(format!(
                     "\u{274c} {subject} ({secs}s): {}\n",
-                    truncate_with_ellipsis(&matrix_scrub_display(error), 200)
+                    truncate_with_ellipsis(
+                        &redact_channel_outbound_leaks(
+                            &matrix_scrub_display(error),
+                            policy,
+                            OutboundContentFormat::Markdown
+                        ),
+                        200
+                    )
                 ))
             } else {
                 Some(format!("\u{274c} {subject} ({secs}s)\n"))
@@ -8751,23 +9087,46 @@ fn matrix_tool_subject(
     arguments: &serde_json::Value,
     tool_provenance: Option<zeroclaw_api::attribution::ToolProvenance>,
     settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
+    policy: &zeroclaw_config::schema::LeakDetectionConfig,
 ) -> String {
     // Tool lookup can fail, leaving a parser/model-supplied name without a
     // trusted registry identity. Scrub and flatten every name at the Matrix
     // presentation boundary; the draft transport performs Markdown/HTML
     // escaping exactly once when it inserts the complete progress entry.
-    let display_tool = matrix_scrub_display(tool);
-    matrix_tool_argument_hint(tool, arguments, tool_provenance, settings).map_or_else(
-        || display_tool.clone(),
-        |hint| format!("{display_tool}: {hint}"),
-    )
+    let display_tool = redact_channel_outbound_leaks(
+        &matrix_scrub_display(tool),
+        policy,
+        OutboundContentFormat::Markdown,
+    );
+    matrix_tool_argument_hint_guarded(tool, arguments, tool_provenance, settings, policy)
+        .map_or_else(
+            || display_tool.clone(),
+            |hint| format!("{display_tool}: {hint}"),
+        )
 }
 
+#[cfg(test)]
 fn matrix_tool_argument_hint(
     tool: &str,
     arguments: &serde_json::Value,
     tool_provenance: Option<zeroclaw_api::attribution::ToolProvenance>,
     settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
+) -> Option<String> {
+    matrix_tool_argument_hint_guarded(
+        tool,
+        arguments,
+        tool_provenance,
+        settings,
+        &zeroclaw_config::schema::LeakDetectionConfig::default(),
+    )
+}
+
+fn matrix_tool_argument_hint_guarded(
+    tool: &str,
+    arguments: &serde_json::Value,
+    tool_provenance: Option<zeroclaw_api::attribution::ToolProvenance>,
+    settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
+    policy: &zeroclaw_config::schema::LeakDetectionConfig,
 ) -> Option<String> {
     use zeroclaw_config::schema::{
         DEFAULT_STREAM_TOOL_ARGUMENT_CHARS, StreamToolArgumentBase, StreamToolArgumentEntry,
@@ -8845,7 +9204,7 @@ fn matrix_tool_argument_hint(
     let parts: Vec<String> = keys
         .into_iter()
         .filter_map(|(key, explicit)| {
-            matrix_render_argument(key, map.get(key)?, max_chars, explicit)
+            matrix_render_argument(key, map.get(key)?, max_chars, explicit, policy)
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
@@ -8867,6 +9226,7 @@ fn matrix_render_argument(
     value: &serde_json::Value,
     max_chars: usize,
     explicit: bool,
+    policy: &zeroclaw_config::schema::LeakDetectionConfig,
 ) -> Option<String> {
     if value.is_null() || (!explicit && !matrix_is_scalar(value)) {
         return None;
@@ -8888,6 +9248,8 @@ fn matrix_render_argument(
         };
         matrix_scrub_structured_display(&rendered)
     };
+    let rendered =
+        redact_channel_outbound_leaks(&rendered, policy, OutboundContentFormat::Markdown);
     if rendered.is_empty() {
         None
     } else if max_chars == 0 {
@@ -8927,17 +9289,33 @@ fn matrix_scrub_progress_text(value: &str) -> String {
     ))
 }
 
+#[cfg(test)]
 fn matrix_progress_text(
     event: &zeroclaw_runtime::agent::loop_::StreamDelta,
     config: &Config,
     matrix_alias: &str,
+) -> Option<DraftProgress> {
+    matrix_progress_text_guarded(
+        event,
+        config,
+        matrix_alias,
+        &zeroclaw_config::schema::LeakDetectionConfig::default(),
+    )
+}
+
+fn matrix_progress_text_guarded(
+    event: &zeroclaw_runtime::agent::loop_::StreamDelta,
+    config: &Config,
+    matrix_alias: &str,
+    policy: &zeroclaw_config::schema::LeakDetectionConfig,
 ) -> Option<DraftProgress> {
     use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
 
     let progress = match event {
         StreamDelta::Status(text) => Some(DraftProgress::status(matrix_scrub_progress_text(text))),
         StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
-            matrix_tool_progress(event, config, matrix_alias).map(DraftProgress::status)
+            matrix_tool_progress_guarded(event, config, matrix_alias, policy)
+                .map(DraftProgress::status)
         }
         StreamDelta::Reasoning(text) => Some(DraftProgress::reasoning(matrix_scrub_progress_text(
             &format!("{REASONING_FULL_PREFIX}{text}"),
@@ -8953,7 +9331,11 @@ fn matrix_progress_text(
     // the shared authority for serialized tool arguments.
     Some(DraftProgress {
         kind: progress.kind,
-        text: zeroclaw_runtime::security::scrub(&progress.text),
+        text: redact_channel_outbound_leaks(
+            &zeroclaw_runtime::security::scrub(&progress.text),
+            policy,
+            OutboundContentFormat::Markdown,
+        ),
     })
 }
 
@@ -8966,6 +9348,7 @@ async fn run_matrix_single_message_draft_updater(
     stream_draft_lines: usize,
     matrix_config: Arc<Config>,
     matrix_alias: String,
+    live_config: zeroclaw_config::live::LiveConfigHandle,
 ) {
     let interval = Duration::from_millis(interval_ms.max(50));
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
@@ -8979,7 +9362,12 @@ async fn run_matrix_single_message_draft_updater(
 
     macro_rules! queue_progress {
         ($event:expr) => {
-            if let Some(text) = matrix_progress_text(&$event, &matrix_config, &matrix_alias) {
+            if let Some(text) = matrix_progress_text_guarded(
+                &$event,
+                &matrix_config,
+                &matrix_alias,
+                &live_config.read().security.leak_detection,
+            ) {
                 push_matrix_single_message_pending(&mut pending, text, stream_draft_lines);
             }
         };
@@ -9003,7 +9391,15 @@ async fn run_matrix_single_message_draft_updater(
     macro_rules! start_flush {
         () => {
             if !flush_in_flight && !pending.is_empty() {
-                let batch = std::mem::take(&mut pending);
+                let mut batch = std::mem::take(&mut pending);
+                let policy = live_config.read().security.leak_detection.clone();
+                for entry in &mut batch {
+                    entry.text = redact_channel_outbound_leaks(
+                        &entry.text,
+                        &policy,
+                        OutboundContentFormat::Markdown,
+                    );
+                }
                 let channel = Arc::clone(&channel);
                 let reply_target = reply_target.clone();
                 let draft_id = draft_id.clone();
@@ -9285,7 +9681,17 @@ async fn process_channel_message_body(
     channel_composite: String,
     delivery_message_id: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
+    matrix_goal_reset: Option<MatrixGoalResetReservation>,
 ) {
+    // Capture Goal command authority before mutable hooks. A hook can cancel
+    // the message, but it cannot rewrite its principal, session, route, or
+    // command before admission.
+    let goal_snapshot = matrix_goal_command_snapshot(ctx.as_ref(), &msg);
+    let logged_content = if goal_snapshot.is_some() {
+        "<goal command>"
+    } else {
+        msg.content.as_str()
+    };
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
@@ -9294,7 +9700,7 @@ async fn process_channel_message_body(
                 "message_id": msg.id,
                 "reply_target": msg.reply_target,
                 "thread_ts": msg.thread_ts,
-                "content": msg.content,
+                "content": logged_content,
                 "attachments_count": msg.attachments.len(),
                 "passive_context": msg.passive_context,
             })
@@ -9309,29 +9715,16 @@ async fn process_channel_message_body(
     let mut msg = msg;
 
     let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+    if should_drop_channel_message(target_channel.as_ref(), &msg) {
+        return;
+    }
 
-    if let Some(channel) = target_channel.as_ref() {
-        if channel.drop_self_messages(&msg) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "dropping self-authored inbound message (self-loop guard, sdk layer)"
-            );
-            return;
-        }
-        if zeroclaw_runtime::peers::should_drop_self_loop(
-            &msg.sender,
-            channel.self_handle().as_deref(),
-        ) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "dropping self-authored inbound message (self-loop guard, agent-loop fallback)"
-            );
-            return;
-        }
+    if let Some((history_key, original, parsed)) = goal_snapshot {
+        let prepared =
+            prepare_matrix_goal_command(Arc::clone(&ctx), history_key, original.clone(), parsed)
+                .await;
+        deliver_prepared_matrix_goal_command(Arc::clone(&ctx), original, prepared).await;
+        return;
     }
 
     // Dispatch executes steps even though its result is discarded here.
@@ -9361,7 +9754,6 @@ async fn process_channel_message_body(
     }
 
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
-    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
         return;
@@ -9376,6 +9768,81 @@ async fn process_channel_message_body(
     if crate::model_picker_delivery::take_revoked(&delivery_message_id) {
         return;
     }
+
+    // A Matrix session reset must dispose its durable Goal before the ordinary
+    // runtime command clears the conversation history. Otherwise a later
+    // resume could bind a Goal to a history that no longer contains its work.
+    if is_matrix_channel_name(&msg.channel)
+        && matches!(
+            parse_runtime_command(&msg.channel, &msg.content),
+            Some(ChannelRuntimeCommand::NewSession)
+        )
+    {
+        let (reset_guard, command_lease, disposed) = if let Some(reservation) = matrix_goal_reset {
+            let MatrixGoalResetReservation { guard, completion } = reservation;
+            let disposed = match completion.await {
+                Ok(result) => result.is_ok(),
+                Err(error) => {
+                    goal_control::log_control_error(
+                        "Matrix Goal disposal completion was lost",
+                        &error.into(),
+                    );
+                    false
+                }
+            };
+            (Some(guard), None, disposed)
+        } else {
+            // Direct callers have no ingress reservation. Keep serialization
+            // through history reset, not merely through durable disposal.
+            let command_lease = foreground::goal_command_lock(&ctx.persist_locks, &history_key)
+                .lock_owned()
+                .await;
+            let result =
+                dispose_matrix_goal_with_command_lease(ctx.as_ref(), &history_key, &command_lease)
+                    .await;
+            if let Err(error) = &result {
+                goal_control::log_control_error("Matrix Goal disposal failed", error);
+            }
+            (None, Some(command_lease), result.is_ok())
+        };
+        if !disposed {
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(&SendMessage::reply_to(
+                        &msg,
+                        channel_runtime_cli_string("goal-mode-command-failed"),
+                    ))
+                    .await;
+            }
+            return;
+        }
+        let _ = handle_runtime_command_for_delivery(
+            ctx.as_ref(),
+            &msg,
+            target_channel.as_ref(),
+            &delivery_message_id,
+        )
+        .await;
+        drop(command_lease);
+        drop(reset_guard);
+        return;
+    }
+
+    // Matrix ordinary turns and later Goal execution share this canonical
+    // conversation-key foreground domain. Acquire before any session mutation
+    // or observable work: a cancelled queued turn must not proceed unlocked.
+    let _matrix_foreground_lease = match acquire_matrix_foreground_lease(
+        ctx.as_ref(),
+        &msg,
+        &history_key,
+        &cancellation_token,
+    )
+    .await
+    {
+        Some(lease) => lease,
+        None => return,
+    };
+    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
 
     // The early ack is spawned (fire-and-forget) so it lands before the
     // enrichment/model pipeline without blocking it. The join handle is kept so
@@ -10214,6 +10681,7 @@ async fn process_channel_message_body(
                 let stream_draft_lines = matrix_stream_draft_lines(ctx.as_ref(), &msg);
                 let matrix_config = Arc::clone(&ctx.prompt_config);
                 let matrix_alias = msg.channel_alias.clone().unwrap_or_default();
+                let live_config = ctx.live_config.clone();
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
                     run_matrix_single_message_draft_updater(
@@ -10225,6 +10693,7 @@ async fn process_channel_message_body(
                         stream_draft_lines,
                         matrix_config,
                         matrix_alias,
+                        live_config,
                     )
                     .await;
                 }))
@@ -10243,7 +10712,7 @@ async fn process_channel_message_body(
                     .map(|tool| tool.name().to_ascii_lowercase())
                     .collect();
                 let streamed_draft_text = Arc::clone(&streamed_draft_text);
-                let leak_detection = ctx.prompt_config.security.leak_detection.clone();
+                let live_config = ctx.live_config.clone();
                 let content_format = outbound_content_format_for_channel(&msg.channel);
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
@@ -10253,7 +10722,7 @@ async fn process_channel_message_body(
                         draft_id,
                         known_tool_names,
                         streamed_draft_text,
-                        leak_detection,
+                        live_config,
                         content_format,
                         turn_flush_narration,
                         outbound_hooks,
@@ -10337,6 +10806,8 @@ async fn process_channel_message_body(
         let notify_reply_target = msg.reply_target.clone();
         let notify_thread_root = followup_thread_id(&msg);
         let notify_lease = turn_lease.clone();
+        let notify_live_config = ctx.live_config.clone();
+        let notify_format = outbound_content_format_for_channel(&msg.channel);
         let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
             Some(zeroclaw_spawn::spawn!(async move {
                 let _lease = notify_lease;
@@ -10348,6 +10819,11 @@ async fn process_channel_message_body(
                 let thread_ts = notify_thread_root;
                 while let Some(text) = notify_rx.recv().await {
                     if let Some(ref ch) = notify_channel {
+                        let text = redact_channel_outbound_leaks(
+                            &text,
+                            &notify_live_config.read().security.leak_detection,
+                            notify_format,
+                        );
                         let _ = ch
                             .send(
                                 &SendMessage::new(&text, &notify_reply_target)
@@ -10365,6 +10841,8 @@ async fn process_channel_message_body(
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
         tools_used: AtomicBool::new(false),
+        live_config: ctx.live_config.clone(),
+        content_format: outbound_content_format_for_channel(&msg.channel),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
 
@@ -10452,45 +10930,15 @@ async fn process_channel_message_body(
                 };
             loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
-                exec: ResolvedAgentExecution::resolve(
-                    ResolvedModelAccess {
-                        model_provider: active_model_provider.as_ref(),
-                        provider_name: route.model_provider.as_str(),
-                        model: route.model.as_str(),
-                        dispatch_model: route.model.as_str(),
-                        temperature: thinking.effective_temperature,
-                    },
-                    ResolvedIo {
-                        tools_registry: ctx.tools_registry.as_ref(),
-                        observer: notify_observer.as_ref() as &dyn Observer,
-                        silent: true,
-                        approval: Some(&approval_manager),
-                        // The agent's own policy (built at channel start with
-                        // its tools) governs the no-vision marker gate.
-                        security: Some(ctx.security.as_ref()),
-                        multimodal_config: &ctx.multimodal,
-                        // Full config for the vision route to resolve the
-                        // configured `vision_model_provider`'s alias options - the
-                        // same canonical `prompt_config` snapshot this path already
-                        // uses for provider construction.
-                        config: Some(ctx.prompt_config.as_ref()),
-                        hooks: ctx.hooks.as_deref(),
-                        activated_tools: ctx.activated_tools.as_ref(),
-                        model_switch_callback: None,
-                        receipt_generator: ctx.receipt_generator.as_ref(),
-                    },
-                    ResolvedRuntimeKnobs {
-                        max_tool_iterations: ctx.max_tool_iterations,
-                        excluded_tools,
-                        dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
-                        pacing: &ctx.pacing,
-                        strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
-                        parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
-                        max_tool_result_chars: ctx.max_tool_result_chars,
-                        context_limits,
-                        context_limits_resolver: None,
-                        knobs: &loop_knobs,
-                    },
+                exec: resolved_channel_execution(
+                    ctx.as_ref(),
+                    active_model_provider.as_ref(),
+                    &route,
+                    notify_observer.as_ref(),
+                    &approval_manager,
+                    &loop_knobs,
+                    excluded_tools,
+                    thinking.effective_temperature,
                 ),
                 history: &mut history,
                 history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
@@ -11540,6 +11988,122 @@ async fn process_channel_message_body(
     }
 }
 
+/// Retains the Matrix message facts a Goal driver needs after hooks run.
+///
+/// Goal commands bypass the media pipeline, so retaining inbound attachment
+/// bytes here would only duplicate potentially large payloads while the
+/// command waits for its foreground lease.
+fn matrix_goal_message_snapshot(message: &ChannelMessage) -> ChannelMessage {
+    ChannelMessage {
+        id: message.id.clone(),
+        sender: message.sender.clone(),
+        platform_sender_id: message.platform_sender_id.clone(),
+        reply_target: message.reply_target.clone(),
+        content: message.content.clone(),
+        channel: message.channel.clone(),
+        channel_alias: message.channel_alias.clone(),
+        timestamp: message.timestamp,
+        thread_ts: message.thread_ts.clone(),
+        interruption_scope_id: message.interruption_scope_id.clone(),
+        attachments: Vec::new(),
+        subject: message.subject.clone(),
+        internal_sop_event: message.internal_sop_event.clone(),
+        passive_context: message.passive_context,
+        explicitly_addressed: message.explicitly_addressed,
+        conversation_scope: message.conversation_scope,
+        references: message.references.clone(),
+        voice_origin: message.voice_origin,
+    }
+}
+
+fn render_goal_response(response: &zeroclaw_goal::GoalResponse) -> String {
+    use zeroclaw_goal::{GoalPendingAction, GoalQueuedControl, GoalResponse};
+    let key = match response {
+        GoalResponse::Queued(GoalQueuedControl::Start) => "goal-mode-queued-start",
+        GoalResponse::Queued(GoalQueuedControl::Resume) => "goal-mode-queued-resume",
+        GoalResponse::Queued(GoalQueuedControl::Pause) => "goal-mode-queued-pause",
+        GoalResponse::Queued(GoalQueuedControl::Budget) => "goal-mode-queued-budget",
+        GoalResponse::Help => "goal-mode-help",
+        GoalResponse::Disabled => "goal-mode-disabled",
+        GoalResponse::Started(_) => "goal-mode-started",
+        GoalResponse::Status(_) => "goal-mode-status",
+        GoalResponse::Budget(_) => "goal-mode-budget",
+        GoalResponse::BudgetUpdated(_) => "goal-mode-budget-updated",
+        GoalResponse::BudgetRequired => "goal-mode-budget-required",
+        GoalResponse::Paused(_) => "goal-mode-paused",
+        GoalResponse::AlreadyPaused(_) => "goal-mode-already-paused",
+        GoalResponse::TransitionPending(GoalPendingAction::Pause) => "goal-mode-pause-pending",
+        GoalResponse::TransitionPending(GoalPendingAction::Cancel) => "goal-mode-cancel-pending",
+        GoalResponse::Resumed(_) => "goal-mode-resumed",
+        GoalResponse::Cancelled(_) => "goal-mode-cancelled",
+        GoalResponse::AlreadyCancelled(_) => "goal-mode-already-cancelled",
+        GoalResponse::NoCurrentGoal => "goal-mode-no-current",
+        GoalResponse::AlreadyActive => "goal-mode-already-active",
+        GoalResponse::Terminal(_) => "goal-mode-terminal",
+        GoalResponse::Stale => "goal-mode-stale",
+    };
+    channel_runtime_cli_string(key)
+}
+
+#[cfg(test)]
+mod goal_command_message_tests {
+    use super::{channel_runtime_cli_string, render_goal_response};
+    use zeroclaw_goal::{GoalPendingAction, GoalResponse};
+
+    #[test]
+    fn matrix_renders_deferred_pause_and_cancel_acknowledgements() {
+        assert_eq!(
+            render_goal_response(&GoalResponse::TransitionPending(GoalPendingAction::Pause)),
+            "Goal pause accepted; waiting for the active operation to settle."
+        );
+        assert_eq!(
+            render_goal_response(&GoalResponse::TransitionPending(GoalPendingAction::Cancel)),
+            "Goal cancellation accepted; waiting for the active operation to settle."
+        );
+    }
+
+    #[test]
+    fn matrix_renders_budget_required_with_all_supported_controls() {
+        let rendered = render_goal_response(&GoalResponse::BudgetRequired);
+        assert_eq!(
+            rendered,
+            channel_runtime_cli_string("goal-mode-budget-required")
+        );
+        for control in [
+            "--tokens",
+            "--cost-usd",
+            "goal.default_token_limit",
+            "goal.default_cost_limit_usd",
+        ] {
+            assert!(rendered.contains(control), "missing {control}: {rendered}");
+        }
+        assert!(!rendered.contains("--unlimited"));
+    }
+
+    #[test]
+    fn goal_command_errors_are_actionable_without_internal_details() {
+        assert_eq!(
+            channel_runtime_cli_string("goal-mode-command-invalid"),
+            "That is not a valid Goal command. Use `/goal help` to see the supported commands."
+        );
+        assert_eq!(
+            channel_runtime_cli_string("goal-mode-command-failed"),
+            "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs."
+        );
+    }
+}
+
+// Goal controls, including parse errors, use control admission rather than
+// acquiring an ordinary sender slot or becoming part of a debounced prompt.
+fn is_matrix_goal_control(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+    !msg.passive_context
+        && is_matrix_channel_name(&msg.channel)
+        && !matches!(
+            parse_goal_command(&msg.content),
+            Err(GoalCommandParseError::NotGoalCommand)
+        )
+}
+
 /// Claim the sender's interruption slot for a message that is about to be
 /// queued.
 ///
@@ -11554,7 +12118,7 @@ async fn register_inbound_turn(
     task_sequence: &Arc<AtomicU64>,
     generation_cancel: &CancellationToken,
 ) -> Option<TurnRegistration> {
-    if msg.channel == "cli" || msg.passive_context {
+    if msg.channel == "cli" || msg.passive_context || is_matrix_goal_control(msg) {
         return None;
     }
 
@@ -11680,6 +12244,7 @@ async fn run_conversation_turn(
         dispatch_ownership,
         registration,
         pending_work,
+        matrix_goal_reset,
         ..
     } = turn;
     let execution_permit = permit;
@@ -11691,6 +12256,7 @@ async fn run_conversation_turn(
             generation_cancel,
             delivery_message_id,
             Some(Arc::clone(&turn_lease)),
+            matrix_goal_reset,
         )
         .await;
         dispatch_ownership.release();
@@ -11715,6 +12281,7 @@ async fn run_conversation_turn(
         registration.cancellation.clone(),
         delivery_message_id,
         Some(Arc::clone(&turn_lease)),
+        matrix_goal_reset,
     )
     .await;
     drop(registration);
@@ -12518,51 +13085,104 @@ async fn run_message_dispatch_loop_until_cancelled(
                         })
                     });
 
-            let reply = if had_registered_turn || cancelled_bucket {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
-            } else if folded_into_another_scope {
-                zeroclaw_runtime::i18n::get_required_cli_string(
-                    "channel-runtime-stop-folded-followup",
-                )
-            } else {
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
-            };
-            let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-            if let Some(channel) = channel {
-                // `/stop` bypasses every admission budget so cancellation
-                // stays reachable, but its acknowledgement must not: a
-                // sender flooding `/stop` against a slow channel would
-                // otherwise accumulate detached reply tasks without bound.
-                // The cancellation above already ran; only the reply is
-                // skipped when the budget is exhausted.
-                match Arc::clone(&stop_reply_budget).try_acquire_owned() {
-                    Ok(reply_permit) => {
-                        let send_msg = stop_reply_message(&msg, reply);
-                        notice_tasks.spawn(async move {
+            // Goal workers are owned by their durable supervisor rather than
+            // the ordinary inbound-turn registry above. Route Matrix /stop
+            // through the same immediate Goal pause command so it fences the
+            // Goal before any successor operation can be admitted.
+            if is_matrix_channel_name(&msg.channel) {
+                let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+                if let Some(stop_guard) =
+                    foreground::reserve_matrix_goal_stop(&ctx.persist_locks, &history_key)
+                {
+                    let command_lock =
+                        foreground::goal_command_lock(&ctx.persist_locks, &history_key);
+                    let context = Arc::clone(&ctx);
+                    let message = msg.clone();
+                    let reply_budget = Arc::clone(&stop_reply_budget);
+                    let (registered, registration) = tokio::sync::oneshot::channel();
+                    notice_tasks.spawn(async move {
+                        let lock_future = command_lock.lock_owned();
+                        tokio::pin!(lock_future);
+                        // Register in this tracked task's real polling context.
+                        // Keep the same future so later commands cannot overtake
+                        // the stop between registration and lease acquisition.
+                        let first_poll = std::future::poll_fn(|cx| {
+                            std::task::Poll::Ready(std::future::Future::poll(
+                                lock_future.as_mut(),
+                                cx,
+                            ))
+                        })
+                        .await;
+                        let _ = registered.send(());
+                        let command_lease = match first_poll {
+                            std::task::Poll::Ready(lease) => lease,
+                            std::task::Poll::Pending => lock_future.await,
+                        };
+                        drop(stop_guard);
+                        let goal_pause_error = match submit_matrix_goal_stop_with_command_lease(
+                            Arc::clone(&context),
+                            message.clone(),
+                            command_lease,
+                        )
+                        .await
+                        {
+                            Ok(Some(submission)) => {
+                                let channel =
+                                    find_channel_for_message(&context.channels_by_name, &message)
+                                        .cloned();
+                                deliver_matrix_goal_stop(submission, channel, message).await;
+                                return;
+                            }
+                            Ok(None) => None,
+                            Err(error) => Some(error),
+                        };
+                        let mut reply = ordinary_stop_reply(
+                            had_registered_turn,
+                            cancelled_bucket,
+                            folded_into_another_scope,
+                        );
+                        if let Some(error) = goal_pause_error {
+                            reply = stop_reply_after_goal_error(reply, &error);
+                        }
+                        if let Some((channel, send_msg, reply_permit)) =
+                            prepare_stop_acknowledgement(&context, &message, reply, &reply_budget)
+                        {
                             let _reply_permit = reply_permit;
                             send_notice_with_timeout(channel, send_msg, "stop_ack").await;
-                        });
+                        }
+                    });
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => break true,
+                        _ = registration => {}
                     }
-                    Err(_) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                            "stop executed without acknowledgement: reply budget exhausted"
-                        );
-                    }
+                    continue;
                 }
-            } else {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "stop command: no registered channel found for reply"
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Goal /stop pause refused: pending stop budget exhausted"
                 );
+            }
+            let mut reply = ordinary_stop_reply(
+                had_registered_turn,
+                cancelled_bucket,
+                folded_into_another_scope,
+            );
+            // An admitted Matrix task continues above; reaching this branch
+            // means only its Goal part was refused by the waiter budget.
+            if is_matrix_channel_name(&msg.channel) {
+                reply.push('\n');
+                reply.push_str(&channel_runtime_cli_string("goal-mode-command-failed"));
+            }
+            if let Some((channel, send_msg, reply_permit)) =
+                prepare_stop_acknowledgement(&ctx, &msg, reply, &stop_reply_budget)
+            {
+                notice_tasks.spawn(async move {
+                    let _reply_permit = reply_permit;
+                    send_notice_with_timeout(channel, send_msg, "stop_ack").await;
+                });
             }
             continue;
         }
@@ -12598,6 +13218,7 @@ async fn run_message_dispatch_loop_until_cancelled(
         let msg = if msg.channel != "cli"
             && !msg.passive_context
             && parse_runtime_command(&msg.channel, &msg.content).is_none()
+            && !is_matrix_goal_control(&msg)
         {
             let debounce_key =
                 message_debounce_key(runtime_conversation_history_key(ctx.as_ref(), &msg), &msg);
@@ -12695,6 +13316,7 @@ async fn run_message_dispatch_loop_until_cancelled(
                     let source_key = conversation_history_key(&msg);
                     let inbound = InboundTurn {
                         turn: Box::new(PendingTurn {
+                            matrix_goal_reset: None,
                             agent_generation: router
                                 .turn_generations
                                 .get(ctx.agent_alias.as_str())
@@ -12767,6 +13389,7 @@ async fn run_message_dispatch_loop_until_cancelled(
             Arc::clone(&notice_tasks),
             InboundSlot::Ready(InboundTurn {
                 turn: Box::new(PendingTurn {
+                    matrix_goal_reset: None,
                     agent_generation: router
                         .turn_generations
                         .get(ctx.agent_alias.as_str())
@@ -16747,9 +17370,97 @@ struct HydratedSession {
     orphan_closed: bool,
 }
 
-/// Marker for a [`hydrate_session_transcript`] attempt that loaded a durable
-/// transcript but could not reconcile it with the store (cap truncation or
-/// flag correction failed to persist). Distinct from `Ok(None)`, which means
+/// Verified, capped read before ordinary hydration performs any writes.
+struct ReadSessionTranscript {
+    messages: Vec<ChatMessage>,
+    crumb_present: bool,
+    durable_crumb: Option<bool>,
+    truncated: bool,
+    trailing_orphan: bool,
+}
+
+/// Read a coherent canonical prefix and its ordinary owner's provenance.
+fn read_goal_canonical_history(
+    ctx: &ChannelRuntimeContext,
+    session_key: &str,
+) -> Result<(Vec<ChatMessage>, bool)> {
+    let persist_lock = acquire_persist_lock(ctx, session_key);
+    let _lock = persist_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .peek(session_key)
+        .cloned();
+    if let Some(messages) = cached {
+        let owner_flag = ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .peek(session_key)
+            .copied();
+        let crumb_present = match owner_flag {
+            Some(flag) => flag,
+            None => resolve_cold_crumb_provenance_result(
+                ctx.session_store.as_deref(),
+                session_key,
+                &messages,
+            )
+            .map_err(|()| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Goal canonical-history restore failed: breadcrumb provenance is unavailable"
+                );
+                anyhow::Error::msg(
+                    "Goal canonical-history restore failed: breadcrumb provenance is unavailable",
+                )
+            })?,
+        };
+        return Ok((messages, crumb_present));
+    }
+    let Some(store) = ctx.session_store.as_deref() else {
+        return Ok((Vec::new(), false));
+    };
+    let Some(mut read) = read_session_transcript(store, session_key)
+        .map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Goal canonical-history restore failed: transcript or breadcrumb provenance is unavailable"
+            );
+            anyhow::Error::msg("Goal canonical-history restore failed: transcript or breadcrumb provenance is unavailable")
+        })?
+    else {
+        return Ok((Vec::new(), false));
+    };
+    if read.trailing_orphan {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"session_key": session_key})),
+            "Goal canonical-history restore retained a trailing user turn without closing it"
+        );
+    }
+    let configured = ctx.agent_cfg.resolved.max_history_messages;
+    let max_history = if configured > 0 {
+        configured
+    } else {
+        MAX_CHANNEL_HISTORY
+    };
+    if read.messages.len() > max_history {
+        read.messages.drain(..read.messages.len() - max_history);
+        // The owner-flagged first row was removed; correct only this snapshot.
+        read.crumb_present = false;
+    }
+    Ok((read.messages, read.crumb_present))
+}
+
+/// Marker for an unavailable transcript/provenance read or a
+/// [`hydrate_session_transcript`] reconciliation that failed to persist.
+/// Distinct from `Ok(None)`, which means
 /// there is no durable transcript at all: callers must not treat a failed
 /// reconciliation like an empty session, or the next inbound turn would seed
 /// an empty cache over an existing transcript — and, once the cache exists,
@@ -16757,31 +17468,26 @@ struct HydratedSession {
 #[derive(Debug)]
 struct HydrationFailed;
 
-/// Load one session's transcript for startup hydration: apply the
-/// `MAX_CHANNEL_HISTORY` cap, close a trailing orphaned user turn, and
-/// resolve breadcrumb ownership.
+/// Read one session's transcript, apply the `MAX_CHANNEL_HISTORY` cap,
+/// and resolve the ordinary hydration owner's breadcrumb provenance.
 ///
 /// The durable `trim_breadcrumb` flag is authoritative and is never
 /// overridden by comparing message text — an explicit `false` survives even
 /// when a genuine user turn collides with the breadcrumb text. The only
 /// correction applied is structural: if the flag says the marker was
 /// present and the cap actually removed that leading message, ownership
-/// follows it down to `false`, and the truncated transcript is persisted
-/// together with the corrected flag so a later restart does not reload the
-/// untruncated transcript and resurrect the turn this pass already dropped.
+/// follows it down to `false` in the returned snapshot. Persistence of that
+/// correction belongs exclusively to the ordinary hydration wrapper.
 /// Legacy sessions that never recorded a flag (`None`) infer once from
 /// text, matching the per-turn cold-cache fallback in the message path.
 /// Returns `Ok(None)` for an empty/missing session and
-/// `Err(HydrationFailed)` when a transcript was loaded but its
-/// reconciliation write failed — callers must keep those distinct (see
-/// [`HydrationFailed`]). A trailing orphan turn's durable closure append is
-/// part of that reconciliation: publishing a closure that storage never
-/// accepted would leave the live cache ahead of durable storage until the
-/// next authoritative replacement.
-fn hydrate_session_transcript(
+/// `Err(HydrationFailed)` when transcript or provenance is unreadable.
+/// Reports a trailing user turn without closing it; neither the backend nor
+/// the live caches are mutated by this read.
+fn read_session_transcript(
     store: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
-) -> Result<Option<HydratedSession>, HydrationFailed> {
+) -> Result<Option<ReadSessionTranscript>, HydrationFailed> {
     let mut msgs = match store.try_load(session_key) {
         Ok(v) => v,
         Err(e) => {
@@ -16838,27 +17544,6 @@ fn hydrate_session_transcript(
         msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
     }
 
-    let mut orphan_closed = false;
-    if msgs.last().is_some_and(|msg| msg.role == "user") {
-        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
-        if let Err(e) = store.append(session_key, &closure) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                &format!("Failed to persist orphan closure for {session_key}")
-            );
-            // A closure the store never accepted must not be published in
-            // the returned transcript: the live cache would then hold an
-            // assistant row durable storage does not have, diverging until
-            // the next authoritative replacement. Fail closed instead and
-            // leave the session unreconciled for the next turn to retry.
-            return Err(HydrationFailed);
-        }
-        msgs.push(closure);
-        orphan_closed = true;
-    }
-
     // Legacy inference (no recorded flag) must reflect the transcript
     // actually returned to the caller, not the pre-cap snapshot: if the cap
     // drained the marker off the front, the post-cap transcript no longer
@@ -16878,6 +17563,49 @@ fn hydrate_session_transcript(
         Some(false) => false,
         None => marker_present_post_cap,
     };
+    let trailing_orphan = msgs.last().is_some_and(|msg| msg.role == "user");
+    Ok(Some(ReadSessionTranscript {
+        messages: msgs,
+        crumb_present,
+        durable_crumb,
+        truncated,
+        trailing_orphan,
+    }))
+}
+
+/// Restore ordinary channel history and reconcile its durable state.
+/// Only this wrapper closes trailing user turns and persists cap/provenance
+/// corrections; the shared read core never mutates the backend or caches.
+fn hydrate_session_transcript(
+    store: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+) -> Result<Option<HydratedSession>, HydrationFailed> {
+    let Some(ReadSessionTranscript {
+        messages: mut msgs,
+        crumb_present,
+        durable_crumb,
+        truncated,
+        trailing_orphan,
+    }) = read_session_transcript(store, session_key)?
+    else {
+        return Ok(None);
+    };
+    let mut orphan_closed = false;
+    if trailing_orphan {
+        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
+        if let Err(e) = store.append(session_key, &closure) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                &format!("Failed to persist orphan closure for {session_key}")
+            );
+            // Do not publish a closure that durable storage never accepted.
+            return Err(HydrationFailed);
+        }
+        msgs.push(closure);
+        orphan_closed = true;
+    }
     // Truncation itself must trigger persistence even when ownership is
     // unchanged: the in-memory transcript returned to the caller no longer
     // matches the durable one, and skipping the write here means a later
@@ -20292,6 +21020,8 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 pub(crate) mod tests {
     use super::*;
 
+    mod goal_deferred;
+
     #[tokio::test(flavor = "current_thread")]
     async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
         let tracker = IngressTaskTracker::new();
@@ -21379,6 +22109,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn goal_matrix_progress_uses_configured_policy_after_native_scrub() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let token = "aB3xK9mW2pQ7vL4naB3xK9mW2pQ7vL4n";
+        let event = StreamDelta::Status(format!("safe {token}"));
+        let disabled = zeroclaw_config::schema::LeakDetectionConfig {
+            enabled: false,
+            sensitivity: 0.0,
+            high_entropy_tokens: false,
+        };
+        let enabled = zeroclaw_config::schema::LeakDetectionConfig {
+            enabled: true,
+            sensitivity: 0.0,
+            high_entropy_tokens: true,
+        };
+        let clean =
+            matrix_progress_text_guarded(&event, &Config::default(), "missing", &disabled).unwrap();
+        let guarded =
+            matrix_progress_text_guarded(&event, &Config::default(), "missing", &enabled).unwrap();
+        assert!(clean.text.contains(token));
+        assert!(!guarded.text.contains(token));
+        assert_eq!(clean.kind, guarded.kind);
+        assert!(guarded.text.contains("safe"));
+    }
+
+    #[test]
     fn matrix_tool_progress_uses_the_same_subject_for_start_and_completion() {
         use zeroclaw_api::attribution::ToolProvenance;
         use zeroclaw_runtime::agent::loop_::StreamDelta;
@@ -21896,6 +22651,7 @@ pub(crate) mod tests {
             5,
             Arc::new(Config::default()),
             "test".to_string(),
+            test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
         ));
 
         for idx in 0..20 {
@@ -22231,6 +22987,39 @@ temperature = 0.3
             subject: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn goal_snapshot_omits_attachments_but_preserves_matrix_routing_metadata() {
+        let mut message = channel_message("matrix", Some("operator"));
+        message.content = "/goal status".to_owned();
+        message.thread_ts = Some("thread-root".to_owned());
+        message.interruption_scope_id = Some("thread-scope".to_owned());
+        message.subject = Some("subject".to_owned());
+        message.references = vec!["reference".to_owned()];
+        message.attachments = vec![zeroclaw_api::media::MediaAttachment {
+            file_name: "large.bin".to_owned(),
+            data: vec![7; 64 * 1024],
+            mime_type: Some("application/octet-stream".to_owned()),
+            marker: None,
+        }];
+
+        let snapshot = matrix_goal_message_snapshot(&message);
+
+        assert!(snapshot.attachments.is_empty());
+        assert_eq!(snapshot.id, message.id);
+        assert_eq!(snapshot.sender, message.sender);
+        assert_eq!(snapshot.reply_target, message.reply_target);
+        assert_eq!(snapshot.content, message.content);
+        assert_eq!(snapshot.channel, message.channel);
+        assert_eq!(snapshot.channel_alias, message.channel_alias);
+        assert_eq!(snapshot.thread_ts, message.thread_ts);
+        assert_eq!(
+            snapshot.interruption_scope_id,
+            message.interruption_scope_id
+        );
+        assert_eq!(snapshot.subject, message.subject);
+        assert_eq!(snapshot.references, message.references);
     }
 
     #[test]
@@ -24791,6 +25580,525 @@ api_key = "anthropic-key"
 
     fn breadcrumb_text() -> String {
         zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string()
+    }
+
+    fn assert_append_front_cap_preserves_provenance(require_durable_store: bool) {
+        let crumb = ChatMessage::user(breadcrumb_text());
+        let question = ChatMessage::assistant("Please choose an option.");
+        let answer = ChatMessage::user("Choose the first option.");
+        for (label, initial, flag, cap, expected_flag) in [
+            (
+                "owned eviction",
+                vec![crumb.clone(), question.clone()],
+                Some(true),
+                2,
+                Some(false),
+            ),
+            (
+                "owned retention",
+                vec![crumb.clone(), question.clone()],
+                Some(true),
+                3,
+                Some(true),
+            ),
+            (
+                "explicit false collision",
+                vec![crumb.clone(), question.clone()],
+                Some(false),
+                2,
+                Some(false),
+            ),
+            (
+                "identical genuine successor",
+                vec![crumb.clone(), crumb.clone()],
+                Some(true),
+                2,
+                Some(false),
+            ),
+            (
+                "absent provenance",
+                vec![crumb.clone(), question.clone()],
+                None,
+                2,
+                None,
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let store =
+                Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+            let key = "matrix_front_cap_test";
+            for row in &initial {
+                store.append(key, row).unwrap();
+            }
+            if let Some(flag) = flag {
+                store.set_session_trim_breadcrumb(key, flag).unwrap();
+            }
+            let mut ctx = test_channel_ctx_with_backend(store.clone());
+            let mut agent_cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+            agent_cfg.resolved.max_history_messages = cap;
+            Arc::get_mut(&mut ctx).unwrap().agent_cfg = Arc::new(agent_cfg);
+            ctx.conversation_histories
+                .lock()
+                .unwrap()
+                .put(key.to_string(), initial.clone());
+            if let Some(flag) = flag {
+                ctx.history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .put(key.to_string(), flag);
+            }
+
+            let returned = if require_durable_store {
+                append_sender_turn_durably(&ctx, key, answer.clone())
+            } else {
+                append_sender_turn(&ctx, key, answer.clone())
+            }
+            .expect("authorized append must succeed");
+            let mut durable = initial;
+            durable.push(answer.clone());
+            let expected = durable[durable.len().saturating_sub(cap)..].to_vec();
+            assert_eq!(
+                serde_json::to_value(&returned).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "{label}: configured cap/order"
+            );
+            assert_eq!(
+                serde_json::to_value(ctx.conversation_histories.lock().unwrap().peek(key)).unwrap(),
+                serde_json::to_value(Some(&expected)).unwrap(),
+                "{label}: published cache"
+            );
+            assert_eq!(
+                ctx.history_crumb_flags.lock().unwrap().peek(key).copied(),
+                expected_flag,
+                "{label}: ownership must follow eviction, not matching text"
+            );
+            assert_eq!(
+                serde_json::to_value(store.try_load(key).unwrap()).unwrap(),
+                serde_json::to_value(&durable).unwrap(),
+                "{label}: append once"
+            );
+            assert_eq!(
+                store.get_session_trim_breadcrumb(key).unwrap(),
+                flag,
+                "{label}: live eviction must not rewrite durable ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_append_front_cap_preserves_provenance() {
+        assert_append_front_cap_preserves_provenance(false);
+    }
+
+    #[test]
+    fn durable_append_front_cap_preserves_provenance() {
+        assert_append_front_cap_preserves_provenance(true);
+    }
+
+    #[test]
+    fn goal_canonical_read_applies_caps_without_reconciliation() {
+        let marker = ChatMessage::user(breadcrumb_text());
+        let question = ChatMessage::assistant("question");
+        let answer = ChatMessage::user("answer");
+        for (rows, cap, flag, expected_flag) in [
+            (
+                vec![marker.clone(), question.clone(), answer.clone()],
+                3,
+                true,
+                true,
+            ),
+            (
+                vec![marker.clone(), question.clone(), answer.clone()],
+                2,
+                true,
+                false,
+            ),
+            (
+                vec![marker.clone(), question, answer.clone()],
+                2,
+                false,
+                false,
+            ),
+            (
+                {
+                    let mut rows = vec![marker];
+                    rows.extend(vec![answer; MAX_CHANNEL_HISTORY + 2]);
+                    rows
+                },
+                0,
+                true,
+                false,
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let store =
+                Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+            for row in &rows {
+                store.append("fixture", row).unwrap();
+            }
+            store.set_session_trim_breadcrumb("fixture", flag).unwrap();
+            let mut context = test_channel_ctx_with_backend(store.clone());
+            let mut config = zeroclaw_config::schema::AliasedAgentConfig::default();
+            config.resolved.max_history_messages = cap;
+            Arc::get_mut(&mut context).unwrap().agent_cfg = Arc::new(config);
+            let (prefix, owned) = read_goal_canonical_history(&context, "fixture").unwrap();
+            let limit = if cap > 0 {
+                cap.min(MAX_CHANNEL_HISTORY)
+            } else {
+                MAX_CHANNEL_HISTORY
+            };
+            assert_eq!(
+                serde_json::to_value(prefix).unwrap(),
+                serde_json::to_value(&rows[rows.len().saturating_sub(limit)..]).unwrap()
+            );
+            assert_eq!(owned, expected_flag);
+            assert_eq!(
+                serde_json::to_value(store.try_load("fixture").unwrap()).unwrap(),
+                serde_json::to_value(rows).unwrap()
+            );
+            assert_eq!(
+                store.get_session_trim_breadcrumb("fixture").unwrap(),
+                Some(flag)
+            );
+            assert!(
+                context
+                    .conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .is_none()
+            );
+            assert!(
+                context
+                    .history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn goal_canonical_read_keeps_missing_and_storeless_sessions_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let mut context = test_channel_ctx_with_backend(store);
+        for without_store in [false, true] {
+            if without_store {
+                Arc::get_mut(&mut context).unwrap().session_store = None;
+            }
+            let (prefix, owned) = read_goal_canonical_history(&context, "missing").unwrap();
+            assert!(prefix.is_empty());
+            assert!(!owned);
+            assert!(
+                context
+                    .conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek("missing")
+                    .is_none()
+            );
+            assert!(
+                context
+                    .history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .peek("missing")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn goal_canonical_read_fails_closed_on_unreadable_state() {
+        struct UnreadableBackend {
+            fail_transcript: bool,
+        }
+        impl SessionBackend for UnreadableBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                panic!("must use fallible read")
+            }
+            fn try_load(&self, _key: &str) -> std::io::Result<Vec<ChatMessage>> {
+                if self.fail_transcript {
+                    Err(std::io::Error::other("unreadable transcript"))
+                } else {
+                    Ok(vec![ChatMessage::assistant("question")])
+                }
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                Err(std::io::Error::other("unreadable provenance"))
+            }
+            fn append(&self, _key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                panic!("restore cannot write")
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                panic!("restore cannot write")
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn set_session_trim_breadcrumb(&self, _key: &str, _flag: bool) -> std::io::Result<()> {
+                panic!("restore cannot write provenance")
+            }
+        }
+        for (warm, fail_transcript) in [(false, true), (false, false), (true, false)] {
+            let context =
+                test_channel_ctx_with_backend(Arc::new(UnreadableBackend { fail_transcript }));
+            if warm {
+                context
+                    .conversation_histories
+                    .lock()
+                    .unwrap()
+                    .put("fixture".into(), vec![ChatMessage::assistant("question")]);
+            }
+            let error = read_goal_canonical_history(&context, "fixture").unwrap_err();
+            assert!(error.to_string().contains("Goal canonical-history restore"));
+            assert_eq!(
+                context
+                    .conversation_histories
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .is_some(),
+                warm
+            );
+            assert!(
+                context
+                    .history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .is_none()
+            );
+        }
+        for flag in [false, true] {
+            let context = test_channel_ctx_with_backend(Arc::new(UnreadableBackend {
+                fail_transcript: true,
+            }));
+            let rows = vec![
+                ChatMessage::user(breadcrumb_text()),
+                ChatMessage::assistant("question"),
+            ];
+            context
+                .conversation_histories
+                .lock()
+                .unwrap()
+                .put("fixture".into(), rows.clone());
+            context
+                .history_crumb_flags
+                .lock()
+                .unwrap()
+                .put("fixture".into(), flag);
+            let (prefix, owned) = read_goal_canonical_history(&context, "fixture").unwrap();
+            assert_eq!(
+                serde_json::to_value(prefix).unwrap(),
+                serde_json::to_value(rows).unwrap()
+            );
+            assert_eq!(
+                owned, flag,
+                "explicit warm provenance precedes the unreadable backend"
+            );
+            assert_eq!(
+                context
+                    .history_crumb_flags
+                    .lock()
+                    .unwrap()
+                    .peek("fixture")
+                    .copied(),
+                Some(flag)
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_read_core_is_read_only_and_reports_orphans() {
+        struct ReadOnlyBackend {
+            rows: Vec<ChatMessage>,
+            flag: Option<bool>,
+            reads: Mutex<Vec<&'static str>>,
+            fail_load: bool,
+            fail_provenance: bool,
+        }
+        impl SessionBackend for ReadOnlyBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                panic!("must use fallible transcript read")
+            }
+            fn try_load(&self, _key: &str) -> std::io::Result<Vec<ChatMessage>> {
+                self.reads.lock().unwrap().push("transcript");
+                if self.fail_load {
+                    Err(std::io::Error::other("unavailable transcript"))
+                } else {
+                    Ok(self.rows.clone())
+                }
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                self.reads.lock().unwrap().push("provenance");
+                if self.fail_provenance {
+                    Err(std::io::Error::other("unavailable provenance"))
+                } else {
+                    Ok(self.flag)
+                }
+            }
+            fn append(&self, _key: &str, _row: &ChatMessage) -> std::io::Result<()> {
+                panic!("read core must not append an orphan closure")
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                panic!("read core must not mutate history")
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                panic!("read core is bound to exactly one key")
+            }
+            fn set_session_trim_breadcrumb(&self, _key: &str, _flag: bool) -> std::io::Result<()> {
+                panic!("read core must not persist provenance")
+            }
+        }
+        let marker = ChatMessage::user(breadcrumb_text());
+        for (rows, flag, expected_flag, truncated) in [
+            (vec![marker.clone()], Some(false), false, false),
+            (vec![marker.clone()], Some(true), true, false),
+            (vec![marker.clone()], None, true, false),
+            (
+                {
+                    let mut rows = vec![marker];
+                    rows.extend(vec![ChatMessage::user("answer"); MAX_CHANNEL_HISTORY]);
+                    rows
+                },
+                Some(true),
+                false,
+                true,
+            ),
+        ] {
+            let backend = ReadOnlyBackend {
+                rows: rows.clone(),
+                flag,
+                reads: Mutex::new(Vec::new()),
+                fail_load: false,
+                fail_provenance: false,
+            };
+            let read = read_session_transcript(&backend, "fixture")
+                .unwrap()
+                .unwrap();
+            let expected = &rows[rows.len().saturating_sub(MAX_CHANNEL_HISTORY)..];
+            assert_eq!(
+                serde_json::to_value(read.messages).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(read.crumb_present, expected_flag);
+            assert_eq!(read.durable_crumb, flag);
+            assert_eq!(read.truncated, truncated);
+            assert!(read.trailing_orphan);
+            assert_eq!(*backend.reads.lock().unwrap(), ["transcript", "provenance"]);
+        }
+        for (rows, fail_load, fail_provenance, expected_reads) in [
+            (Vec::new(), false, true, vec!["transcript"]),
+            (
+                vec![ChatMessage::user("answer")],
+                true,
+                false,
+                vec!["transcript"],
+            ),
+            (
+                vec![ChatMessage::user(breadcrumb_text())],
+                false,
+                true,
+                vec!["transcript", "provenance"],
+            ),
+        ] {
+            let empty = rows.is_empty();
+            let backend = ReadOnlyBackend {
+                rows,
+                flag: Some(false),
+                reads: Mutex::new(Vec::new()),
+                fail_load,
+                fail_provenance,
+            };
+            let result = read_session_transcript(&backend, "fixture");
+            if empty {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(
+                    result.is_err(),
+                    "unavailable is not legitimate empty history"
+                );
+            }
+            assert_eq!(*backend.reads.lock().unwrap(), expected_reads);
+        }
+    }
+
+    #[test]
+    fn hydration_preserves_exact_read_and_reconciliation_contract() {
+        let marker = ChatMessage::user(breadcrumb_text());
+        let assistant = ChatMessage::assistant("question");
+        let answer = ChatMessage::user("answer");
+        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
+        let capped_tail = vec![assistant.clone(); MAX_CHANNEL_HISTORY];
+        let mut capped = vec![marker.clone()];
+        capped.extend(capped_tail.clone());
+        for (initial, flag, expected, expected_flag, orphan_closed) in [
+            (
+                vec![marker.clone(), assistant.clone()],
+                Some(true),
+                vec![marker.clone(), assistant.clone()],
+                true,
+                false,
+            ),
+            (
+                vec![marker.clone(), assistant.clone()],
+                Some(false),
+                vec![marker.clone(), assistant.clone()],
+                false,
+                false,
+            ),
+            (
+                vec![marker.clone(), assistant.clone()],
+                None,
+                vec![marker.clone(), assistant.clone()],
+                true,
+                false,
+            ),
+            (capped, Some(true), capped_tail, false, false),
+            (
+                vec![assistant.clone(), answer.clone()],
+                Some(false),
+                vec![assistant.clone(), answer, closure],
+                false,
+                true,
+            ),
+            (
+                vec![assistant.clone()],
+                Some(true),
+                vec![assistant],
+                true,
+                false,
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+            for row in &initial {
+                store.append("fixture", row).unwrap();
+            }
+            if let Some(flag) = flag {
+                store.set_session_trim_breadcrumb("fixture", flag).unwrap();
+            }
+            let hydrated = hydrate_session_transcript(&store, "fixture")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(hydrated.messages).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(hydrated.crumb_present, expected_flag);
+            assert_eq!(hydrated.orphan_closed, orphan_closed);
+            assert_eq!(
+                serde_json::to_value(store.try_load("fixture").unwrap()).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(
+                store.get_session_trim_breadcrumb("fixture").unwrap(),
+                Some(expected_flag)
+            );
+        }
     }
 
     #[test]
@@ -31201,7 +32509,7 @@ BTC is currently around $65,000 based on latest tool output."#
         hook_runner.register(Box::new(RecordingSendHook { seen: seen.clone() }));
 
         let channel: Arc<dyn Channel> = Arc::new(NoopFlushChannel);
-        let leak = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let leak = test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default());
         let mut last_flushed = String::new();
         let mut owned_guarded = String::new();
 
@@ -31285,7 +32593,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let channel: Arc<dyn Channel> = Arc::new(NoopFlushChannel);
         // Leak detection is on by default; the AWS deterministic pattern runs.
-        let leak = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let leak = test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default());
         let mut last_flushed = String::new();
         let mut owned_guarded = String::new();
 
@@ -31409,7 +32717,7 @@ BTC is currently around $65,000 based on latest tool output."#
         }));
 
         let channel: Arc<dyn Channel> = Arc::new(NoopFlushChannel);
-        let leak = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let leak = test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default());
         let mut last_flushed = String::new();
         let mut owned_guarded = String::new();
 
@@ -31489,7 +32797,7 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         let channel: Arc<dyn Channel> = Arc::new(NoopFlushChannel);
-        let leak = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let leak = test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default());
         let mut last_flushed = String::new();
         let mut owned_guarded = String::new();
 
@@ -34270,7 +35578,7 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    struct RecallMemory;
+    pub(super) struct RecallMemory;
 
     #[async_trait::async_trait]
     impl Memory for RecallMemory {
@@ -39385,6 +40693,229 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[tokio::test]
+    async fn goal_narration_guards_hook_output_with_live_policy_before_cap() {
+        struct PausingRewriteHook {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            calls: Arc<AtomicUsize>,
+            rewritten: String,
+        }
+        #[async_trait::async_trait]
+        impl zeroclaw_runtime::hooks::HookHandler for PausingRewriteHook {
+            fn name(&self) -> &str {
+                "pausing-rewrite"
+            }
+            async fn on_message_sending(
+                &self,
+                channel: String,
+                recipient: String,
+                _content: String,
+            ) -> zeroclaw_runtime::hooks::HookResult<(String, String, String)> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.notified().await;
+                zeroclaw_runtime::hooks::HookResult::Continue((
+                    channel,
+                    recipient,
+                    self.rewritten.clone(),
+                ))
+            }
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Only five secret-value characters fit before the cap. A post-cap
+        // detector cannot match the original eight-character minimum.
+        let prefix = format!("{} ", "a".repeat(CHANNEL_HOOK_MAX_OUTBOUND_CHARS - 15));
+        let mut runner = zeroclaw_runtime::hooks::HookRunner::new();
+        runner.register(Box::new(PausingRewriteHook {
+            entered: entered.clone(),
+            release: release.clone(),
+            calls: calls.clone(),
+            rewritten: format!("{prefix}password=matrix_outer_neutral_canary"),
+        }));
+        let mut initial = Config::default();
+        initial.security.leak_detection.enabled = false;
+        initial.security.leak_detection.high_entropy_tokens = false;
+        let live = zeroclaw_config::live::LiveConfig::new(initial);
+        let handle = live.handle();
+        let task = zeroclaw_spawn::spawn!(async move {
+            apply_multi_message_narration_policy(
+                Some(&runner),
+                &handle,
+                "matrix",
+                "room",
+                "",
+                "original".into(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let mut updated = live.snapshot();
+        updated.security.leak_detection.enabled = true;
+        updated.security.leak_detection.sensitivity = 0.9;
+        let revision = live.next_revision().unwrap();
+        live.publish(revision, updated).unwrap();
+        release.notify_one();
+        let output = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(output.starts_with(&prefix));
+        assert!(output.contains("[REDACTED"));
+        assert!(!output.contains("password=matri"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn goal_notify_forwards_original_tool_event_to_inner_observer() {
+        let inner = Arc::new(RecordingObserver::default());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let observer = ChannelNotifyObserver {
+            inner: inner.clone(),
+            tx: Some(tx),
+            tools_used: AtomicBool::new(false),
+            live_config: test_live_config(zeroclaw_config::schema::LeakDetectionConfig {
+                enabled: true,
+                sensitivity: 0.9,
+                high_entropy_tokens: false,
+            }),
+            content_format: OutboundContentFormat::Markdown,
+        };
+        let arguments = r#"{ "password": "matrix_outer_neutral_canary", "safe": "ok" }"#;
+        observer.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: Some("parent".into()),
+            tool: "password=matrix_outer_neutral_canary".into(),
+            tool_call_id: Some("call-id".into()),
+            arguments: Some(arguments.into()),
+            channel: Some("matrix".into()),
+            agent_alias: Some("agent".into()),
+            turn_id: Some("turn-id".into()),
+        });
+        let display = rx.try_recv().unwrap();
+        assert!(!display.contains("matrix_outer_neutral_canary"));
+        let events = inner.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ObserverEvent::ToolCallStart {
+                parent_agent_alias,
+                tool,
+                tool_call_id,
+                arguments: observed,
+                channel,
+                agent_alias,
+                turn_id,
+            } => {
+                assert_eq!(parent_agent_alias.as_deref(), Some("parent"));
+                assert_eq!(tool, "password=matrix_outer_neutral_canary");
+                assert_eq!(tool_call_id.as_deref(), Some("call-id"));
+                assert_eq!(observed.as_deref(), Some(arguments));
+                assert_eq!(channel.as_deref(), Some("matrix"));
+                assert_eq!(agent_alias.as_deref(), Some("agent"));
+                assert_eq!(turn_id.as_deref(), Some("turn-id"));
+            }
+            _ => panic!("unexpected inner observer event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_generic_progress_guards_status_and_legacy_names() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let recording = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = recording.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Status(
+            "safe status password=matrix_outer_neutral_canary".into(),
+        ))
+        .await
+        .unwrap();
+        tx.send(StreamDelta::ToolStart {
+            tool: "password=matrix_outer_neutral_canary".into(),
+            arguments: Arc::new(serde_json::json!({})),
+            tool_provenance: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamDelta::ToolComplete {
+            tool: "password=matrix_outer_neutral_canary".into(),
+            arguments: Arc::new(serde_json::json!({})),
+            tool_provenance: None,
+            secs: 1,
+            success: true,
+            error: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        run_draft_updater_with_leak_detection(
+            channel,
+            "room".into(),
+            "draft".into(),
+            HashSet::new(),
+            Arc::new(Mutex::new(String::new())),
+            test_live_config(zeroclaw_config::schema::LeakDetectionConfig {
+                enabled: true,
+                sensitivity: 0.9,
+                high_entropy_tokens: false,
+            }),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            "matrix".into(),
+            rx,
+        )
+        .await;
+        let progress = recording.progress_messages.lock().await;
+        assert_eq!(progress.len(), 3);
+        assert!(progress[0].contains("safe status"));
+        assert!(
+            progress
+                .iter()
+                .all(|line| !line.contains("matrix_outer_neutral_canary"))
+        );
+    }
+
+    #[test]
+    fn goal_notify_guards_full_display_and_preserves_safe_fallback() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let observer = ChannelNotifyObserver {
+            inner: Arc::new(NoopObserver),
+            tx: Some(tx),
+            tools_used: AtomicBool::new(false),
+            live_config: test_live_config(zeroclaw_config::schema::LeakDetectionConfig {
+                enabled: true,
+                sensitivity: 0.9,
+                high_entropy_tokens: false,
+            }),
+            content_format: OutboundContentFormat::Markdown,
+        };
+        let event = |arguments: String| ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
+            tool: "safe_tool".into(),
+            tool_call_id: None,
+            arguments: Some(arguments),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        };
+        let raw = r#"{ "safe": "ok", "nested": [{"password": "matrix_outer_neutral_canary"}] }"#;
+        observer.record_event(&event(raw.into()));
+        let displayed = rx.try_recv().unwrap();
+        assert!(!displayed.contains("matrix_outer_neutral_canary"));
+        assert!(displayed.contains("safe"));
+        let safe = r#"{ "safe": "value" }"#;
+        observer.record_event(&event(safe.into()));
+        assert_eq!(rx.try_recv().unwrap(), format!("🔧 `safe_tool`: {safe}"));
+        let crossing = format!("{} password=matrix_outer_neutral_canary", "x".repeat(189));
+        observer.record_event(&event(serde_json::json!({"command": crossing}).to_string()));
+        let displayed = rx.try_recv().unwrap();
+        assert!(!displayed.contains("matrix_outer_neutral"));
+    }
+
     #[test]
     fn channel_notify_observer_truncates_utf8_arguments_safely() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
@@ -39392,6 +40923,8 @@ BTC is currently around $65,000 based on latest tool output."#
             inner: Arc::new(NoopObserver),
             tx: Some(tx),
             tools_used: AtomicBool::new(false),
+            live_config: test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
+            content_format: OutboundContentFormat::Markdown,
         };
 
         let payload = (0..300)
@@ -39424,6 +40957,8 @@ BTC is currently around $65,000 based on latest tool output."#
             inner: Arc::new(NoopObserver),
             tx: Some(tx),
             tools_used: AtomicBool::new(false),
+            live_config: test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
+            content_format: OutboundContentFormat::Markdown,
         };
 
         // 64 KiB path — 16x the per-message cap.
@@ -39472,6 +41007,8 @@ BTC is currently around $65,000 based on latest tool output."#
             }),
             tx: None,
             tools_used: AtomicBool::new(false),
+            live_config: test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
+            content_format: OutboundContentFormat::Markdown,
         };
 
         observer.record_event(
@@ -39497,6 +41034,8 @@ BTC is currently around $65,000 based on latest tool output."#
             inner: Arc::new(NoopObserver),
             tx: Some(tx),
             tools_used: AtomicBool::new(false),
+            live_config: test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
+            content_format: OutboundContentFormat::Markdown,
         };
 
         let mk_event = || zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
@@ -40777,6 +42316,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let msg = shared_topic_message("alice", "m1", "canceled during admission");
         let delivery_message_id = msg.id.clone();
         let turn = Box::new(PendingTurn {
+            matrix_goal_reset: None,
             ctx,
             agent_generation: 0,
             msg,
@@ -40841,6 +42381,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack
         };
         let turn = Box::new(PendingTurn {
+            matrix_goal_reset: None,
             ctx: Arc::clone(&ctx),
             agent_generation: generation,
             msg,
@@ -45351,6 +46892,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let pending_work = Arc::clone(&pending_budget).acquire_owned().await.unwrap();
         let delivery_message_id = selection.id.clone();
         let turn = Box::new(PendingTurn {
+            matrix_goal_reset: None,
             ctx: Arc::clone(&runtime_ctx),
             agent_generation: 0,
             msg: selection.clone(),
@@ -55822,7 +57364,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             Arc::clone(&streamed_text),
-            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
             OutboundContentFormat::Markdown,
             false,
             None,
@@ -55902,7 +57444,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             Arc::clone(&streamed_text),
-            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
             OutboundContentFormat::Markdown,
             false,
             None,
@@ -55992,7 +57534,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             Arc::clone(&streamed_text),
-            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
             OutboundContentFormat::Markdown,
             false,
             None,
@@ -56063,7 +57605,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             Arc::clone(&streamed_text),
-            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
             OutboundContentFormat::Markdown,
             false,
             None,
@@ -56134,7 +57676,7 @@ Done."#;
                 "draft-1".to_string(),
                 no_tools(),
                 Arc::clone(&streamed),
-                zeroclaw_config::schema::LeakDetectionConfig::default(),
+                test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
                 OutboundContentFormat::Markdown,
                 false,
                 None,
@@ -56246,7 +57788,7 @@ Done."#;
                 "draft-1".to_string(),
                 no_tools(),
                 Arc::clone(&streamed),
-                zeroclaw_config::schema::LeakDetectionConfig::default(),
+                test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
                 OutboundContentFormat::Markdown,
                 false,
                 None,
@@ -56362,7 +57904,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             Arc::clone(&streamed),
-            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
             OutboundContentFormat::Markdown,
             false,
             None,
@@ -56513,7 +58055,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             Arc::clone(&streamed),
-            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
             OutboundContentFormat::Markdown,
             false,
             None,
@@ -56600,7 +58142,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             Arc::clone(&streamed),
-            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            test_live_config(zeroclaw_config::schema::LeakDetectionConfig::default()),
             OutboundContentFormat::Markdown,
             false,
             None,

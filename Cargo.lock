@@ -13993,7 +13993,9 @@ dependencies = [
  "whatsapp-rust-ureq-http-client",
  "wiremock",
  "zeroclaw-api",
+ "zeroclaw-commands",
  "zeroclaw-config",
+ "zeroclaw-goal",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-memory",
@@ -14163,6 +14165,25 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tls",
  "zeroclaw-tools",
+]
+
+[[package]]
+name = "zeroclaw-goal"
+version = "0.8.7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "uuid",
+ "zeroclaw-api",
+ "zeroclaw-commands",
+ "zeroclaw-config",
+ "zeroclaw-log",
+ "zeroclaw-spawn",
 ]
 
 [[package]]
@@ -14472,6 +14493,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-commands",
  "zeroclaw-config",
+ "zeroclaw-goal",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",

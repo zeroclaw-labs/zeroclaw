@@ -67,6 +67,41 @@ async fn emit_summary_attempt_usage(
     }
 }
 
+/// Preserve only an instrumented Goal admission refusal; an enclosing loop
+/// still owns its own tool-phase check. Any inner negative evidence wins.
+fn preserve_goal_summary_spend_refusal(error: &anyhow::Error, timed_out: bool) -> bool {
+    use zeroclaw_goal::accounting::{GoalAccountingFailure, GoalOrdinarySpendRefusal};
+
+    if timed_out
+        || !crate::agent::cost::goal_operation_accounting_is_scoped()
+        || zeroclaw_api::turn_stop::turn_stop(error)
+            .is_none_or(|stop| stop.code != TurnStopCode::BudgetExhausted)
+        || error.downcast_ref::<GoalAccountingFailure>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.is::<GoalAccountingFailure>())
+    {
+        return false;
+    }
+    let mut checked_clean = false;
+    if let Some(refusal) = error.downcast_ref::<GoalOrdinarySpendRefusal>() {
+        if !refusal.clean_tool_phase() {
+            return false;
+        }
+        checked_clean = true;
+    }
+    for refusal in error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<GoalOrdinarySpendRefusal>())
+    {
+        if !refusal.clean_tool_phase() {
+            return false;
+        }
+        checked_clean = true;
+    }
+    checked_clean
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
     injected_memory_preamble: &mut Option<super::MemoryPreamble>,
@@ -182,6 +217,7 @@ pub(crate) async fn finish_after_max_iterations(
     // final-summary billed work. Declared outside the call block so the
     // match arms below can read it after the future completes.
     let mut summary_attempts = Vec::new();
+    let mut goal_summary_timeout = None;
     let summary_call = {
         // Preparation and hooks belong to the same timeout/cancellation scope
         // as dispatch; only a successful summary persists the prompt.
@@ -385,32 +421,93 @@ pub(crate) async fn finish_after_max_iterations(
                 .run_model_query(summary_request, &mut summary_attempts)
                 .await
         };
-        match pacing.step_timeout_secs {
-            Some(step_secs) if step_secs > 0 => {
-                let step_timeout = Duration::from_secs(step_secs);
-                if let Some(token) = cancellation_token {
-                    tokio::select! {
-                        () = token.cancelled() => SummaryCall::Cancelled,
-                        result = tokio::time::timeout(step_timeout, summary_future) => match result {
+        if let Some(parent) = crate::goal_accounting::GoalForegroundContext::current() {
+            // The summary owns its collector. Signal its derived token and keep
+            // polling the same future until settlement finishes instead of
+            // dropping it at the outer timeout/cancellation boundary.
+            let step = pacing
+                .step_timeout_secs
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| {
+                    (
+                        seconds,
+                        tokio::time::Instant::now() + Duration::from_secs(seconds),
+                    )
+                });
+            let derived = parent.with_deadline(step.map(|(_, at)| at));
+            let child_token = derived.token().clone();
+            let future = derived.scope(summary_future);
+            tokio::pin!(future);
+            let external_cancel = async {
+                match cancellation_token {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let step_deadline = async {
+                match step {
+                    Some((_, at)) if parent.deadline().is_none_or(|deadline| at <= deadline) => {
+                        tokio::time::sleep_until(at).await
+                    }
+                    _ => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                result = &mut future => SummaryCall::Done(result),
+                () = external_cancel => {
+                    child_token.cancel();
+                    SummaryCall::Done(match future.await {
+                        Ok(_) => Err(ToolLoopCancelled.into()),
+                        Err(error) => Err(error),
+                    })
+                },
+                () = parent.token().cancelled() => {
+                    child_token.cancel();
+                    SummaryCall::Done(match future.await {
+                        Ok(_) => Err(ToolLoopCancelled.into()),
+                        Err(error) => Err(error),
+                    })
+                },
+                () = step_deadline => {
+                    child_token.cancel();
+                    let seconds = step.map(|(seconds, _)| seconds).unwrap_or_default();
+                    goal_summary_timeout = Some(seconds);
+                    let timeout = || TurnStop::close_out(TurnStopCode::MaxIterations,
+                        format!("Final summary LLM call timed out after {seconds}s (step_timeout_secs)"));
+                    SummaryCall::Done(match future.await {
+                        Ok(_) => Err(timeout().into()),
+                        Err(error) => Err(error.context(timeout())),
+                    })
+                },
+            }
+        } else {
+            match pacing.step_timeout_secs {
+                Some(step_secs) if step_secs > 0 => {
+                    let step_timeout = Duration::from_secs(step_secs);
+                    if let Some(token) = cancellation_token {
+                        tokio::select! {
+                            () = token.cancelled() => SummaryCall::Cancelled,
+                            result = tokio::time::timeout(step_timeout, summary_future) => match result {
+                                Ok(inner) => SummaryCall::Done(inner),
+                                Err(_) => SummaryCall::TimedOut(step_secs),
+                            },
+                        }
+                    } else {
+                        match tokio::time::timeout(step_timeout, summary_future).await {
                             Ok(inner) => SummaryCall::Done(inner),
                             Err(_) => SummaryCall::TimedOut(step_secs),
-                        },
-                    }
-                } else {
-                    match tokio::time::timeout(step_timeout, summary_future).await {
-                        Ok(inner) => SummaryCall::Done(inner),
-                        Err(_) => SummaryCall::TimedOut(step_secs),
+                        }
                     }
                 }
-            }
-            _ => {
-                if let Some(token) = cancellation_token {
-                    tokio::select! {
-                        () = token.cancelled() => SummaryCall::Cancelled,
-                        result = summary_future => SummaryCall::Done(result),
+                _ => {
+                    if let Some(token) = cancellation_token {
+                        tokio::select! {
+                            () = token.cancelled() => SummaryCall::Cancelled,
+                            result = summary_future => SummaryCall::Done(result),
+                        }
+                    } else {
+                        SummaryCall::Done(summary_future.await)
                     }
-                } else {
-                    SummaryCall::Done(summary_future.await)
                 }
             }
         }
@@ -428,6 +525,14 @@ pub(crate) async fn finish_after_max_iterations(
             .into());
         }
         SummaryCall::Done(Err(e)) => {
+            let accounting = e
+                .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                .or_else(|| {
+                    e.chain().find_map(|cause| {
+                        cause.downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+                    })
+                })
+                .map(|failure| (failure.accounting_state(), failure.has_pending_operation()));
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -443,12 +548,33 @@ pub(crate) async fn finish_after_max_iterations(
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
+            // A refused Goal summary made no provider call. Keep its decisive
+            // native budget cause rather than replacing it with the cap tag.
+            if preserve_goal_summary_spend_refusal(&e, goal_summary_timeout.is_some()) {
+                return Err(e.context(exhaustion));
+            }
             // The provider error stays the source; the stop rides alongside
             // it so the exit is typed without losing what actually failed.
-            return Err(zeroclaw_api::turn_stop::tag(
-                e.context(exhaustion),
-                limit.stop(),
-            ));
+            let stop = goal_summary_timeout.map_or_else(
+                || limit.stop(),
+                |seconds| {
+                    TurnStop::close_out(
+                        TurnStopCode::MaxIterations,
+                        format!(
+                            "Final summary LLM call timed out after {seconds}s (step_timeout_secs)"
+                        ),
+                    )
+                },
+            );
+            let tagged = zeroclaw_api::turn_stop::tag(e.context(exhaustion), stop);
+            return Err(if let Some((state, pending)) = accounting {
+                zeroclaw_goal::accounting::GoalAccountingFailure::with_operation_source(
+                    state, pending, tagged,
+                )
+                .into()
+            } else {
+                tagged
+            });
         }
         SummaryCall::Done(Ok(resp)) => {
             // When the provider omitted `input_tokens` on the accepted
@@ -703,6 +829,314 @@ mod graceful_summary_metering_tests {
         run_summary_with_events(provider, String::new(), None, None).await
     }
 
+    struct BlockingSummaryProvider {
+        entered: Arc<tokio::sync::Notify>,
+        verify_goal_context: bool,
+    }
+    #[async_trait]
+    impl ModelProvider for BlockingSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if self.verify_goal_context {
+                let context = crate::goal_accounting::GoalForegroundContext::current_for_child()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(context.scope_identity().task_id(), "goal-summary");
+                assert_eq!(context.scope_identity().session_id(), "session-summary");
+                assert_eq!(context.scope_identity().execution_epoch(), 1);
+                assert_eq!(context.depth(), 0);
+                assert!(context.deadline().is_some());
+                assert!(
+                    zeroclaw_api::tool::ToolExecutionContext::current()
+                        .is_some_and(|context| context.is_goal_foreground())
+                );
+            }
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+    impl Attributable for BlockingSummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "blocking-summary"
+        }
+    }
+
+    struct BlockingSummaryAccounting {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        settlements: Arc<AtomicUsize>,
+        inner: Option<Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting>>,
+    }
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for BlockingSummaryAccounting {
+        async fn admit(
+            &self,
+            request: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            match &self.inner {
+                Some(inner) => inner.admit(request).await,
+                None => Ok(()),
+            }
+        }
+        async fn settle(
+            &self,
+            settlement: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            assert_eq!(
+                settlement.accounting_state,
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+            );
+            self.settlements.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            if let Some(inner) = &self.inner {
+                return inner.settle(settlement).await;
+            }
+            Err(zeroclaw_goal::accounting::GoalAccountingFailure::settled(
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown,
+                &["summary settlement".into()],
+            )
+            .into())
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    async fn run_controlled_goal_summary(
+        provider: &dyn ModelProvider,
+        token: &tokio_util::sync::CancellationToken,
+        step_timeout: Option<u64>,
+    ) -> anyhow::Result<String> {
+        let mut history = vec![ChatMessage::user("do the work")];
+        let pacing = PacingConfig {
+            step_timeout_secs: step_timeout,
+            ..PacingConfig::default()
+        };
+        finish_after_max_iterations(
+            &mut None,
+            provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &pacing,
+            Some(token),
+            CompletionLimit::LocalIterations(2),
+            String::new(),
+            "goal-summary",
+            &LoopKnobs::default(),
+            None,
+            None,
+            None,
+            None,
+            &MultimodalConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            None,
+            &crate::observability::NoopObserver,
+        )
+        .await
+    }
+
+    async fn assert_goal_summary_drain(step_timeout: Option<u64>, unbounded_parent: bool) {
+        use zeroclaw_goal::accounting::{
+            GOAL_OPERATION_ACCOUNTING, GoalOperationAccountingFactory,
+        };
+        let directory = tempfile::TempDir::new().unwrap();
+        let handle = crate::control_plane::ControlPlaneHandle::open(directory.path()).unwrap();
+        let identity =
+            zeroclaw_goal::GoalExecutionScope::new("goal-summary", "session-summary", 1).unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let inner = if unbounded_parent {
+            let store = handle.goal_store().unwrap();
+            let task = crate::control_plane::TaskRecord {
+                id: identity.task_id().into(),
+                kind: crate::control_plane::TaskKind::Goal,
+                agent: "main".into(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: handle.boot_id.clone(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                originator_chain: Vec::new(),
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                session_id: Some(identity.session_id().into()),
+                execution_epoch: identity.execution_epoch(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            };
+            let goal = zeroclaw_goal::GoalTaskRecord {
+                task_id: task.id.clone(),
+                objective: "summary deadline proof".into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                store
+                    .create_or_replace_session_goal(task, goal)
+                    .await
+                    .unwrap(),
+                zeroclaw_goal::GoalTransitionResult::Applied
+            );
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(CostConfig::default(), directory.path()).unwrap(),
+            );
+            let pricer = Arc::new(crate::goal_accounting::ModelProviderGoalUsagePricer::new(
+                Arc::new(HashMap::new()),
+            ));
+            let factory = crate::goal_accounting::RuntimeGoalOperationAccountingFactory::new(
+                store, tracker, "main", pricer,
+            )
+            .unwrap();
+            Some(factory.for_scope(identity.clone()))
+        } else {
+            None
+        };
+        let root = crate::goal_accounting::GoalForegroundContext::new_root(
+            identity,
+            handle,
+            token.clone(),
+            (!unbounded_parent)
+                .then(|| tokio::time::Instant::now() + std::time::Duration::from_secs(30)),
+        );
+        let provider_entered = Arc::new(tokio::sync::Notify::new());
+        let settlement_entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let settlements = Arc::new(AtomicUsize::new(0));
+        let provider = BlockingSummaryProvider {
+            entered: provider_entered.clone(),
+            verify_goal_context: unbounded_parent,
+        };
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(BlockingSummaryAccounting {
+                entered: settlement_entered.clone(),
+                release: release.clone(),
+                settlements: settlements.clone(),
+                inner,
+            });
+        let future = GOAL_OPERATION_ACCOUNTING.scope(
+            Some(accountant),
+            root.scope(run_controlled_goal_summary(&provider, &token, step_timeout)),
+        );
+        let mut future = Box::pin(future);
+        tokio::select! {
+            () = provider_entered.notified() => {},
+            result = &mut future => panic!("summary returned before provider admission: {}", result.is_ok()),
+        }
+        if unbounded_parent {
+            let goal = root
+                .control_plane()
+                .goal_store()
+                .unwrap()
+                .get_goal_task("goal-summary")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(goal.pending_call_id.is_some());
+        }
+        if step_timeout.is_none() {
+            token.cancel();
+        }
+        tokio::select! {
+            () = settlement_entered.notified() => {},
+            result = &mut future => panic!("summary returned before settlement: {}", result.is_ok()),
+        }
+        if unbounded_parent {
+            let goal = root
+                .control_plane()
+                .goal_store()
+                .unwrap()
+                .get_goal_task("goal-summary")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(goal.pending_call_id.is_some());
+            assert!(!token.is_cancelled());
+        }
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.notify_one();
+        let error = future.await.unwrap_err();
+        assert_eq!(settlements.load(Ordering::SeqCst), 1);
+        let failure = error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .unwrap();
+        assert_eq!(
+            failure.accounting_state(),
+            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(!failure.has_pending_operation());
+        if unbounded_parent {
+            let goal = root
+                .control_plane()
+                .goal_store()
+                .unwrap()
+                .get_goal_task("goal-summary")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                goal.accounting_state,
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+            );
+            assert!(goal.pending_call_id.is_none());
+        }
+        let stop = zeroclaw_api::turn_stop::turn_stop(&error).unwrap();
+        assert_eq!(
+            stop.code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+        if step_timeout.is_some() {
+            assert!(
+                stop.to_string()
+                    .contains("Final summary LLM call timed out")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_summary_cancellation_awaits_query_settlement() {
+        assert_goal_summary_drain(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn goal_summary_step_timeout_awaits_query_settlement() {
+        assert_goal_summary_drain(Some(1), false).await;
+    }
+
+    #[tokio::test]
+    async fn goal_unbounded_parent_summary_step_timeout_drains_real_accountant() {
+        assert_goal_summary_drain(Some(1), true).await;
+    }
+
     // The graceful summary now routes through the metered provider seam: under a
     // cost-tracking scope its token usage is recorded (before this change the
     // summary recorded nothing).
@@ -889,6 +1323,443 @@ mod graceful_summary_metering_tests {
         fn alias(&self) -> &str {
             "semantic-empty-summary-provider"
         }
+    }
+
+    struct FailingSummaryAccounting;
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for FailingSummaryAccounting {
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            Err(zeroclaw_goal::accounting::GoalAccountingFailure::settled(
+                zeroclaw_goal::GoalAccountingState::OutcomeUnknown,
+                &["summary secondary detail".into()],
+            )
+            .into())
+        }
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct RefusedSummaryAccounting {
+        admits: Arc<AtomicUsize>,
+        settlements: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_goal::accounting::GoalOperationAccounting for RefusedSummaryAccounting {
+        async fn admit(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.admits.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("refused summary unexpectedly reached admission")
+        }
+
+        async fn settle(
+            &self,
+            _: zeroclaw_goal::accounting::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.settlements.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("refused summary unexpectedly reached settlement")
+        }
+
+        async fn pricing_complete(&self) -> anyhow::Result<bool> {
+            anyhow::bail!("refused summary unexpectedly queried pricing completeness")
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_preserves_only_goal_checked_admission_budget_stop() {
+        use zeroclaw_api::turn_stop::{TurnStopCode, turn_stop};
+        use zeroclaw_goal::accounting::{GOAL_OPERATION_ACCOUNTING, GoalOrdinarySpendRefusal};
+
+        for goal_scoped in [false, true] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(
+                    CostConfig {
+                        enabled: true,
+                        daily_limit_usd: 1.0,
+                        monthly_limit_usd: 100.0,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            );
+            tracker
+                .record_usage(crate::cost::types::TokenUsage::new(
+                    "seed", 1_000_000, 0, 0, 2.0, 0.0, 0.0,
+                ))
+                .unwrap();
+            let ledger_path = directory.path().join("state/costs.jsonl");
+            let before = std::fs::read(&ledger_path).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = CountingUsageProvider {
+                calls: Arc::clone(&calls),
+            };
+            let admits = Arc::new(AtomicUsize::new(0));
+            let settlements = Arc::new(AtomicUsize::new(0));
+            let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+                Arc::new(RefusedSummaryAccounting {
+                    admits: Arc::clone(&admits),
+                    settlements: Arc::clone(&settlements),
+                });
+            let context = ToolLoopCostTrackingContext::new(tracker, Arc::new(HashMap::new()));
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+            let error = GOAL_OPERATION_ACCOUNTING
+                .scope(
+                    goal_scoped.then_some(accountant),
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(context), async {
+                        run_summary_with_events(
+                            &provider,
+                            "completed prefix".into(),
+                            Some(&event_tx),
+                            None,
+                        )
+                        .await
+                        .unwrap_err()
+                    }),
+                )
+                .await;
+
+            assert_eq!(
+                turn_stop(&error).unwrap().code,
+                if goal_scoped {
+                    TurnStopCode::BudgetExhausted
+                } else {
+                    TurnStopCode::MaxIterations
+                }
+            );
+            let marker = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<GoalOrdinarySpendRefusal>());
+            assert_eq!(marker.is_some(), goal_scoped);
+            assert!(marker.is_none_or(GoalOrdinarySpendRefusal::clean_tool_phase));
+            assert!(format!("{error:#}").contains("Agent exceeded maximum tool iterations (2)"));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(admits.load(Ordering::SeqCst), 0);
+            assert_eq!(settlements.load(Ordering::SeqCst), 0);
+            assert!(event_rx.try_recv().is_err());
+            assert_eq!(std::fs::read(ledger_path).unwrap(), before);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ForeignSummarySource(anyhow::Error);
+
+    impl std::fmt::Display for ForeignSummarySource {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("foreign summary source")
+        }
+    }
+
+    impl std::error::Error for ForeignSummarySource {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_refusal_checks_all_native_phase_accounting_and_timeout_evidence() {
+        use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag};
+        use zeroclaw_goal::accounting::{
+            GOAL_OPERATION_ACCOUNTING, GoalAccountingFailure, GoalOrdinarySpendRefusal,
+        };
+
+        let checked = || {
+            anyhow::Error::new(GoalOrdinarySpendRefusal::new(
+                TurnStop::fatal(TurnStopCode::BudgetExhausted, "ordinary budget exhausted").into(),
+                true,
+            ))
+        };
+        assert!(!super::preserve_goal_summary_spend_refusal(
+            &checked(),
+            false
+        ));
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingSummaryAccounting);
+        GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                let positive =
+                    anyhow::Error::new(ForeignSummarySource(checked())).context("summary context");
+                assert!(super::preserve_goal_summary_spend_refusal(&positive, false));
+                assert!(!super::preserve_goal_summary_spend_refusal(&positive, true));
+                let negative = GoalOrdinarySpendRefusal::new(
+                    TurnStop::fatal(TurnStopCode::BudgetExhausted, "ordinary budget exhausted")
+                        .into(),
+                    false,
+                );
+                let nested = anyhow::Error::new(GoalOrdinarySpendRefusal::new(
+                    anyhow::Error::new(ForeignSummarySource(anyhow::Error::new(negative))),
+                    true,
+                ));
+                assert!(!super::preserve_goal_summary_spend_refusal(&nested, false));
+                let accounting = anyhow::Error::new(ForeignSummarySource(
+                    GoalAccountingFailure::with_operation_source(
+                        zeroclaw_goal::GoalAccountingState::Missing,
+                        true,
+                        checked(),
+                    )
+                    .into(),
+                ));
+                assert!(!super::preserve_goal_summary_spend_refusal(
+                    &accounting,
+                    false
+                ));
+                let context_accounting = checked().context(GoalAccountingFailure::incomplete(
+                    zeroclaw_goal::GoalAccountingState::Invalid,
+                    false,
+                ));
+                assert!(!super::preserve_goal_summary_spend_refusal(
+                    &context_accounting,
+                    false
+                ));
+                for code in [
+                    TurnStopCode::TurnTimeout,
+                    TurnStopCode::StepTimeout,
+                    TurnStopCode::MaxIterations,
+                    TurnStopCode::Cancelled,
+                ] {
+                    let terminal = tag(
+                        checked(),
+                        TurnStop::close_out(code, "decisive terminal stop"),
+                    );
+                    assert!(!super::preserve_goal_summary_spend_refusal(
+                        &terminal, false
+                    ));
+                }
+                for error in [
+                    anyhow::Error::new(TurnStop::fatal(
+                        TurnStopCode::BudgetExhausted,
+                        "ordinary budget exhausted",
+                    )),
+                    anyhow::Error::msg("ordinary budget exhausted"),
+                ] {
+                    assert!(!super::preserve_goal_summary_spend_refusal(&error, false));
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_bridges_accounting_metadata_through_stop_wrapper() {
+        let provider = SemanticEmptySummaryProvider;
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingSummaryAccounting);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                run_summary_with_events(&provider, "earlier output".into(), Some(&event_tx), None)
+                    .await
+                    .unwrap_err()
+            })
+            .await;
+        let marker = error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .unwrap();
+        assert_eq!(
+            marker.accounting_state(),
+            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(!marker.has_pending_operation());
+        let stop = zeroclaw_api::turn_stop::turn_stop(&error).unwrap();
+        assert_eq!(
+            stop.code,
+            zeroclaw_api::turn_stop::TurnStopCode::MaxIterations
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+        );
+        let text = format!("{error:#}");
+        assert_eq!(text.matches("summary secondary detail").count(), 1);
+        let mut usage = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                accepted,
+                ..
+            } = event
+            {
+                usage.push((input_tokens, output_tokens, accepted));
+            }
+        }
+        assert_eq!(usage, vec![(Some(100), Some(20), false)]);
+    }
+
+    struct ExhaustedSummaryProvider(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ModelProvider for ExhaustedSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(80),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for ExhaustedSummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "exhausted-summary-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_preserves_exhausted_provider_error_and_rejected_usage() {
+        use zeroclaw_api::turn_stop::{TurnStopClass, TurnStopCode};
+        use zeroclaw_providers::ReliableRejectedCompletionUsage;
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".into(),
+                Box::new(ExhaustedSummaryProvider(calls.clone())) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let accountant: Arc<dyn zeroclaw_goal::accounting::GoalOperationAccounting> =
+            Arc::new(FailingSummaryAccounting);
+        let mut history = vec![
+            ChatMessage::user("do the work"),
+            ChatMessage::assistant("earlier output"),
+        ];
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(8);
+        let error = zeroclaw_goal::accounting::GOAL_OPERATION_ACCOUNTING
+            .scope(Some(accountant), async {
+                finish_after_max_iterations(
+                    &mut None,
+                    &provider,
+                    &mut history,
+                    "reliable",
+                    "test-model",
+                    "test-model",
+                    None,
+                    &PacingConfig::default(),
+                    None,
+                    CompletionLimit::LocalIterations(2),
+                    "earlier output".into(),
+                    "trace-req-test",
+                    &LoopKnobs::default(),
+                    Some(&event_tx),
+                    Some(&delta_tx),
+                    None,
+                    None,
+                    &MultimodalConfig::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    |_, _| ResolvedContextLimits::legacy_fallback(0),
+                    &mut false,
+                    None,
+                    &crate::observability::NoopObserver,
+                )
+                .await
+                .unwrap_err()
+            })
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableRejectedCompletionUsage>())
+        );
+        let marker = error
+            .downcast_ref::<zeroclaw_goal::accounting::GoalAccountingFailure>()
+            .unwrap();
+        assert_eq!(
+            marker.accounting_state(),
+            zeroclaw_goal::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(!marker.has_pending_operation());
+        let stop = zeroclaw_api::turn_stop::turn_stop(&error).unwrap();
+        assert_eq!(
+            (stop.class, stop.code),
+            (TurnStopClass::CloseOut, TurnStopCode::MaxIterations)
+        );
+        assert_eq!(
+            format!("{error:#}")
+                .matches("summary secondary detail")
+                .count(),
+            1
+        );
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            (&*history[0].role, &*history[0].content),
+            ("user", "do the work")
+        );
+        assert_eq!(
+            (&*history[1].role, &*history[1].content),
+            ("assistant", "earlier output")
+        );
+        assert!(delta_rx.try_recv().is_err());
+        let mut usage = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                provider_ref,
+                model,
+                accepted,
+                ..
+            } = event
+            {
+                usage.push((input_tokens, output_tokens, provider_ref, model, accepted));
+            }
+        }
+        assert_eq!(
+            usage,
+            vec![(
+                Some(80),
+                Some(5),
+                "primary".into(),
+                "test-model".into(),
+                false
+            )]
+        );
     }
 
     #[tokio::test]
