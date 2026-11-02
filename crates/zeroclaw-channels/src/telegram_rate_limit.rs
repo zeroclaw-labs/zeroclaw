@@ -57,6 +57,13 @@ pub(crate) enum RateLimitGate {
     Blocked(Duration),
 }
 
+/// One coherent observation of the jittered window and server penalty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RateLimitSnapshot {
+    pub(crate) gate: RateLimitGate,
+    pub(crate) penalty_remaining: Duration,
+}
+
 /// Why a gated Bot API call produced no usable response. Every variant means
 /// "nothing was delivered and the shared window already accounts for it", so
 /// callers must stop their formatting/resume/resend fallbacks - a 429 is not
@@ -102,19 +109,29 @@ impl std::fmt::Display for TelegramGateError {
 
 impl std::error::Error for TelegramGateError {}
 
-/// Shared per-token flood-control window. `Clone` handles (channel fields,
-/// spawned typing loops) all point at the same instant, so a 429 observed by
-/// any call blocks every later call on the token, whatever chat it targets.
+/// Canonical pair of maximum deadlines observed from Telegram responses.
+#[derive(Debug, Default)]
+struct DeadlineState {
+    blocked_until: Option<Instant>,
+    // The greatest unjittered server penalty is independent of which response
+    // established the longest jittered window, but both publish atomically.
+    penalty_until: Option<Instant>,
+}
+
+/// Shared per-token flood-control window. Clones of one channel instance
+/// observe the same deadline pair, whichever chat the request targets.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TelegramRateLimiter {
-    blocked_until: Arc<Mutex<Option<Instant>>>,
-    /// Greatest *unjittered* server penalty deadline seen across every noted
-    /// 429. Tracked independently of the jittered gate deadline so jitter
-    /// attached to one window can never shorten the real penalty another
-    /// window established: [`Self::penalty_remaining`] is measured against
-    /// this deadline. Cleared when the gate window expires (the penalty never
-    /// outlives its own jittered deadline).
-    penalty_until: Arc<Mutex<Option<Instant>>>,
+    deadlines: Arc<Mutex<DeadlineState>>,
+    #[cfg(test)]
+    publication_pause: Arc<Mutex<Option<PublicationPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct PublicationPause {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl TelegramRateLimiter {
@@ -138,7 +155,7 @@ impl TelegramRateLimiter {
     /// The jittered deadline and the unjittered server penalty are tracked
     /// separately: whichever 429 carries the later jittered deadline gates
     /// the sends, while the greatest penalty deadline governs
-    /// [`Self::penalty_remaining`], so a shorter penalty padded with jitter
+    /// [`Self::snapshot`], so a shorter penalty padded with jitter
     /// can advance the gate's deadline without hiding a longer penalty that
     /// is still running.
     pub(crate) fn note_rate_limited(&self, retry_after_secs: u64) {
@@ -155,11 +172,13 @@ impl TelegramRateLimiter {
     /// regressions.
     fn note_rate_limited_with_jitter(&self, retry_after_secs: u64, jitter_secs: u64) {
         let jitter_secs = jitter_secs.min(MAX_WINDOW_JITTER.as_secs());
+        let now = Instant::now();
         let new_deadline = retry_after_secs
             .checked_add(jitter_secs)
             .map(Duration::from_secs)
-            .and_then(|window| Instant::now().checked_add(window));
-        let Some(new_deadline) = new_deadline else {
+            .and_then(|window| now.checked_add(window));
+        let penalty_deadline = now.checked_add(Duration::from_secs(retry_after_secs));
+        let Some((new_deadline, penalty_deadline)) = new_deadline.zip(penalty_deadline) else {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -169,58 +188,62 @@ impl TelegramRateLimiter {
             );
             return;
         };
-        let penalty_deadline = Instant::now().checked_add(Duration::from_secs(retry_after_secs));
-        let mut guard = self.blocked_until.lock();
-        if !guard.is_some_and(|active| active > new_deadline) {
-            *guard = Some(new_deadline);
-        }
-        drop(guard);
-        if let Some(penalty_deadline) = penalty_deadline
-            && let mut penalty_guard = self.penalty_until.lock()
-            && penalty_guard.is_none_or(|active| active < penalty_deadline)
+        let mut guard = self.deadlines.lock();
+        if guard
+            .blocked_until
+            .is_none_or(|active| active < new_deadline)
         {
-            *penalty_guard = Some(penalty_deadline);
+            guard.blocked_until = Some(new_deadline);
+        }
+        #[cfg(test)]
+        self.pause_publication_for_test();
+        if guard
+            .penalty_until
+            .is_none_or(|active| active < penalty_deadline)
+        {
+            guard.penalty_until = Some(penalty_deadline);
         }
     }
 
-    /// Inspect the window, clearing it when it has expired.
+    #[cfg(test)]
+    fn pause_publication_for_test(&self) {
+        let pause = self.publication_pause.lock().take();
+        if let Some(pause) = pause {
+            pause
+                .reached
+                .send(())
+                .expect("publication controller remains live");
+            pause
+                .resume
+                .recv_timeout(Duration::from_secs(10))
+                .expect("publication controller releases the updater");
+        }
+    }
+
+    /// Read or expire both deadlines under one lock and one time sample.
+    /// The server penalty excludes jitter, so a penalty equal to the caller's
+    /// wait budget can still be admitted once only the jitter tail remains.
+    pub(crate) fn snapshot(&self) -> RateLimitSnapshot {
+        let mut guard = self.deadlines.lock();
+        let now = Instant::now();
+        let gate = match guard.blocked_until {
+            Some(until) if until > now => RateLimitGate::Blocked(until.duration_since(now)),
+            _ => {
+                *guard = DeadlineState::default();
+                RateLimitGate::Clear
+            }
+        };
+        let penalty_remaining = guard
+            .penalty_until
+            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
+        RateLimitSnapshot {
+            gate,
+            penalty_remaining,
+        }
+    }
+
     pub(crate) fn check(&self) -> RateLimitGate {
-        let mut guard = self.blocked_until.lock();
-        match *guard {
-            Some(until) => {
-                let now = Instant::now();
-                if until > now {
-                    RateLimitGate::Blocked(until.duration_since(now))
-                } else {
-                    *guard = None;
-                    *self.penalty_until.lock() = None;
-                    RateLimitGate::Clear
-                }
-            }
-            None => RateLimitGate::Clear,
-        }
-    }
-
-    /// Remaining server-side penalty across every noted 429: measured
-    /// against the greatest *unjittered* penalty deadline, never against a
-    /// jittered gate deadline, so a window padded with jitter cannot make a
-    /// still-running longer penalty look spent. Zero once the penalty itself
-    /// has passed, even while the jittered deadline still holds the token
-    /// back. This is the value a caller's wait budget must be compared
-    /// against, so a penalty that merely equals the budget is admitted while
-    /// one that outlives it is refused.
-    pub(crate) fn penalty_remaining(&self) -> Duration {
-        match *self.penalty_until.lock() {
-            Some(until) => {
-                let now = Instant::now();
-                if until > now {
-                    until.duration_since(now)
-                } else {
-                    Duration::ZERO
-                }
-            }
-            None => Duration::ZERO,
-        }
+        self.snapshot().gate
     }
 }
 
@@ -279,14 +302,15 @@ pub(crate) async fn wait_out_window(
     budget: &mut Duration,
 ) -> Result<(), TelegramGateError> {
     loop {
-        match limiter.check() {
+        let snapshot = limiter.snapshot();
+        match snapshot.gate {
             RateLimitGate::Clear => return Ok(()),
             RateLimitGate::Blocked(remaining) => {
                 if budget.is_zero() {
                     // The deadline outruns the server penalty by the jitter
                     // the note added; a spent budget with the penalty itself
                     // already over means the penalty fit the budget exactly.
-                    if limiter.penalty_remaining().is_zero() {
+                    if snapshot.penalty_remaining.is_zero() {
                         return Ok(());
                     }
                     return Err(TelegramGateError::BudgetExhausted { remaining });
@@ -379,6 +403,103 @@ mod tests {
             .expect("expected a TelegramGateError")
     }
 
+    struct PausedPublisher {
+        resume: Option<std::sync::mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl PausedPublisher {
+        fn finish(mut self) {
+            self.resume.take().unwrap().send(()).unwrap();
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    impl Drop for PausedPublisher {
+        fn drop(&mut self) {
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deliver_cannot_observe_half_published_extended_penalty() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 1}})),
+            )
+            .mount(&server)
+            .await;
+
+        let limiter = TelegramRateLimiter::new();
+        // The old penalty is spent, but its jitter still blocks. Pause a real
+        // extending update after the gate field is written and before its
+        // longer server penalty is published.
+        limiter.note_rate_limited_with_jitter(0, 2);
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        *limiter.publication_pause.lock() = Some(PublicationPause {
+            reached,
+            resume: resume_rx,
+        });
+        let publisher = limiter.clone();
+        let paused = PausedPublisher {
+            resume: Some(resume),
+            worker: Some(std::thread::spawn(move || {
+                publisher.note_rate_limited_with_jitter(30, 0);
+            })),
+        };
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the actual updater must reach the publication pause");
+
+        let waiter = limiter.clone();
+        let url = format!("{}/bottoken/sendMessage", server.uri());
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let mut request = zeroclaw_spawn::spawn!(async move {
+            let _ = started.send(());
+            post_bot_api_json(
+                &reqwest::Client::new(),
+                &url,
+                &serde_json::json!({"chat_id": "1", "text": "held reply"}),
+                BotApiClass::Deliver,
+                &waiter,
+                Duration::ZERO,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the real sender must start")
+            .unwrap();
+        let early = tokio::time::timeout(Duration::from_secs(2), &mut request).await;
+        // Release and join even on the negative variant before asserting, so
+        // an observed early POST cannot strand a publisher or held lock.
+        paused.finish();
+        let result = match early {
+            Ok(result) => result.unwrap(),
+            Err(_) => tokio::time::timeout(Duration::from_secs(5), request)
+                .await
+                .expect("sender must finish once the update is published")
+                .unwrap(),
+        };
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "a spent-budget sender must not POST through a half-published extended penalty"
+        );
+        let err = result.expect_err("the extended server penalty must exhaust the zero budget");
+        assert!(matches!(
+            gate_error(&err),
+            TelegramGateError::BudgetExhausted { .. }
+        ));
+    }
+
     #[test]
     fn parse_retry_after_reads_json_envelope() {
         let body = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 5","parameters":{"retry_after":5}}"#;
@@ -433,7 +554,7 @@ mod tests {
     #[test]
     fn gate_clears_expired_window() {
         let limiter = TelegramRateLimiter::new();
-        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_millis(40));
+        limiter.deadlines.lock().blocked_until = Some(Instant::now() + Duration::from_millis(40));
 
         match limiter.check() {
             RateLimitGate::Blocked(remaining) => {
@@ -445,7 +566,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(limiter.check(), RateLimitGate::Clear);
         assert!(
-            limiter.blocked_until.lock().is_none(),
+            limiter.deadlines.lock().blocked_until.is_none(),
             "an expired window must be cleared, not kept"
         );
     }
@@ -527,7 +648,7 @@ mod tests {
             RateLimitGate::Clear => panic!("expected the replaced jittered window to hold"),
         }
         // …but the unjittered penalty still runs for the full 30s.
-        let penalty = limiter.penalty_remaining();
+        let penalty = limiter.snapshot().penalty_remaining;
         assert!(
             penalty > Duration::from_secs(29),
             "a 2s-jittered 29s note must not shorten the 30s penalty: {penalty:?}"
@@ -542,7 +663,7 @@ mod tests {
         // refused as outliving the budget).
         let limiter = TelegramRateLimiter::new();
         limiter.note_rate_limited_with_jitter(30, 2);
-        let penalty = limiter.penalty_remaining();
+        let penalty = limiter.snapshot().penalty_remaining;
         assert!(
             penalty > Duration::from_secs(29),
             "the penalty itself is the full 30s, jitter excluded: {penalty:?}"
@@ -566,7 +687,7 @@ mod tests {
             .await;
 
         let limiter = TelegramRateLimiter::new();
-        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_millis(700));
+        limiter.deadlines.lock().blocked_until = Some(Instant::now() + Duration::from_millis(700));
 
         let started = Instant::now();
         let resp = post_bot_api_json(
@@ -652,7 +773,7 @@ mod tests {
             .await;
 
         let limiter = TelegramRateLimiter::new();
-        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_millis(600));
+        limiter.deadlines.lock().blocked_until = Some(Instant::now() + Duration::from_millis(600));
 
         let extender = limiter.clone();
         let extend = zeroclaw_spawn::spawn!(async move {
@@ -691,7 +812,7 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
 
         let limiter = TelegramRateLimiter::new();
-        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_millis(600));
+        limiter.deadlines.lock().blocked_until = Some(Instant::now() + Duration::from_millis(600));
 
         let extender = limiter.clone();
         let extend = zeroclaw_spawn::spawn!(async move {
@@ -756,7 +877,7 @@ mod tests {
             .await;
 
         let limiter = TelegramRateLimiter::new();
-        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_secs(3));
+        limiter.deadlines.lock().blocked_until = Some(Instant::now() + Duration::from_secs(3));
 
         let started = Instant::now();
         let result = post_bot_api_json(
@@ -800,7 +921,7 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
 
         let limiter = TelegramRateLimiter::new();
-        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_secs(30));
+        limiter.deadlines.lock().blocked_until = Some(Instant::now() + Duration::from_secs(30));
 
         let waiter = limiter.clone();
         let uri = mock_server.uri();

@@ -6415,9 +6415,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // outlives the allowance fails fast. A reachable window is waited
             // out through the shared loop, which re-checks after each sleep,
             // so a window extended mid-wait is honored, never sent into.
-            if let crate::telegram_rate_limit::RateLimitGate::Blocked(remaining) =
-                self.rate_limiter.check()
-                && self.rate_limiter.penalty_remaining() > allowance
+            let snapshot = self.rate_limiter.snapshot();
+            if let crate::telegram_rate_limit::RateLimitGate::Blocked(remaining) = snapshot.gate
+                && snapshot.penalty_remaining > allowance
             {
                 return Ok(SendMessageAttempt::RateLimited {
                     status: reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -7530,10 +7530,7 @@ impl TelegramChannel {
                 "action": "typing"
             });
             let _ = self
-                .http_client()
-                .post(self.api_url("sendChatAction"))
-                .json(&typing_body)
-                .send()
+                .bot_api_post("sendChatAction", &typing_body, BotApiClass::Droppable)
                 .await;
         }
 
@@ -26438,6 +26435,113 @@ mod tests {
     #[tokio::test]
     async fn finalize_draft_multi_message_stops_on_narration_flood_limit_after_accepted_prefix() {
         assert_finalize_stops_on_narration_flood_limit(1).await;
+    }
+
+    #[tokio::test]
+    async fn initial_typing_skips_active_flood_window_without_losing_inbound_message() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&server)
+            .await;
+        let ch = rate_limit_test_channel(server.uri()).with_ack_reactions(false);
+        ch.rate_limiter.note_rate_limited(30);
+        let update = telegram_text_update(1, 2, 123, "test-user", "accepted inbound text");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut transient_retry = Some((1, 1));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            ch.process_update(&update, &tx, &mut transient_retry),
+        )
+        .await
+        .expect("a skipped typing hint must not delay inbound dispatch");
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        let message = rx
+            .try_recv()
+            .expect("the inbound message must reach the shared queue");
+        assert_eq!(message.content, "accepted inbound text");
+        assert_eq!(message.reply_target, "123");
+        assert!(!message.passive_context);
+        assert!(transient_retry.is_none());
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "initial typing must not POST into an already noted flood window"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_typing_429_notes_window_and_still_dispatches_inbound_messages() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(flood_limit_response(30))
+            .mount(&server)
+            .await;
+        let ch = rate_limit_test_channel(server.uri()).with_ack_reactions(false);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut transient_retry = None;
+        for id in [1, 2] {
+            let update =
+                telegram_text_update(id, id + 10, 123, "test-user", "accepted after typing 429");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                ch.process_update(&update, &tx, &mut transient_retry),
+            )
+            .await
+            .expect("typing 429 must not delay inbound dispatch");
+            assert!(matches!(outcome, UpdateOutcome::Advanced));
+            let message = rx
+                .try_recv()
+                .expect("typing 429 must not lose the inbound message");
+            assert_eq!(message.content, "accepted after typing 429");
+            match ch.rate_limiter.check() {
+                crate::telegram_rate_limit::RateLimitGate::Blocked(remaining) => {
+                    assert!(remaining > Duration::from_secs(27));
+                }
+                crate::telegram_rate_limit::RateLimitGate::Clear => {
+                    panic!("the initial typing 429 must publish its shared flood window");
+                }
+            }
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the first typing 429 must suppress the next inbound typing hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_typing_clear_window_posts_once_and_dispatches_inbound_message() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ch = rate_limit_test_channel(server.uri()).with_ack_reactions(false);
+        let update = telegram_text_update(1, 2, 123, "test-user", "clear-window inbound text");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut transient_retry = None;
+        assert!(matches!(
+            ch.process_update(&update, &tx, &mut transient_retry).await,
+            UpdateOutcome::Advanced
+        ));
+        assert_eq!(rx.try_recv().unwrap().content, "clear-window inbound text");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
