@@ -11,6 +11,9 @@ use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_api::model_provider::TokenUsage;
 use zeroclaw_providers::{ChatResponse, ToolCall};
 
+#[path = "safety_net_loop_recovery.rs"]
+mod loop_recovery;
+
 // ── shared fixtures ─────────────────────────────────────────────────────
 
 struct TestAgent {
@@ -870,7 +873,7 @@ async fn safety_net_steering_persistence_includes_tool_round_shapes() {
         })],
     );
     let (tx, _rx) = mpsc::channel(256);
-    let (steer_tx, mut steer_rx) = mpsc::channel::<String>(4);
+    let (steer_tx, mut steer_rx) = mpsc::channel::<crate::agent::SteeringInput>(4);
     steer_tx
         .send("steer-text".into())
         .await

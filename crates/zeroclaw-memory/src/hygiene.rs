@@ -1,8 +1,9 @@
 use crate::budget;
 use crate::policy::PolicyEnforcer;
+use crate::sqlite_permissions::{check_sqlite_storage, prepare_existing_sqlite_storage};
 use anyhow::Result;
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -417,13 +418,16 @@ fn prune_audit_entries(workspace_dir: &Path, retention_days: u32) -> Result<()> 
         return Ok(());
     }
 
-    let db_path = workspace_dir.join("memory").join("audit.db");
-    if !db_path.exists() {
+    let Some(db_path) = prepare_existing_sqlite_storage(workspace_dir, "audit.db")? else {
         return Ok(());
-    }
+    };
 
-    let conn = Connection::open(db_path)?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
+    #[cfg(unix)]
+    let flags = flags | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = Connection::open_with_flags(&db_path, flags)?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    check_sqlite_storage(&db_path)?;
     let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
 
     let affected = conn.execute(
@@ -989,9 +993,12 @@ mod tests {
     }
 
     fn seed_audit_db(workspace: &Path) -> PathBuf {
-        fs::create_dir_all(workspace.join("memory")).unwrap();
-        let db_path = workspace.join("memory").join("audit.db");
-        let conn = Connection::open(&db_path).unwrap();
+        let db_path =
+            crate::sqlite_permissions::prepare_sqlite_storage(workspace, "audit.db").unwrap();
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
+        #[cfg(unix)]
+        let flags = flags | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let conn = Connection::open_with_flags(&db_path, flags).unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS memory_audit (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1074,5 +1081,37 @@ mod tests {
             !audit_db.exists(),
             "default-off audit must not create an audit db just to prune"
         );
+        assert!(
+            !workspace.join("memory").exists(),
+            "audit pruning must not create the memory directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_pruning_rejects_unsafe_sqlite_leaves_without_touching_outside_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for suffix in ["", "-wal", "-shm"] {
+            let root = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let sentinel = outside.path().join("sentinel");
+            fs::write(&sentinel, b"unchanged").unwrap();
+            fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o666)).unwrap();
+
+            let db_path = seed_audit_db(root.path());
+            let unsafe_path = crate::sqlite_permissions::sqlite_sidecar_path(&db_path, suffix);
+            if suffix.is_empty() {
+                fs::remove_file(&db_path).unwrap();
+            }
+            symlink(&sentinel, &unsafe_path).unwrap();
+
+            assert!(prune_audit_entries(root.path(), 30).is_err(), "{suffix}");
+            assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged");
+            assert_eq!(
+                fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+                0o666
+            );
+        }
     }
 }

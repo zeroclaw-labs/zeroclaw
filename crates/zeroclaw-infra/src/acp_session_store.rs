@@ -3149,7 +3149,11 @@ impl ProjectedGroup {
         if !self.has_tool_events {
             if range.start == 0 && range.end > 0 {
                 messages.push(ConversationMessage::Chat(ChatMessage {
-                    role: self.role.clone(),
+                    role: if self.role == SYNTHETIC_INTERRUPTION_ROLE {
+                        "system".to_string()
+                    } else {
+                        self.role.clone()
+                    },
                     content: self.content.clone(),
                 }));
             }
@@ -3987,6 +3991,24 @@ mod tests {
                 && marker.role == "system"
                 && marker.content == "stream interrupted"
         ));
+        // Cursor history must expose the same client-visible role as a full
+        // reload, even when the boundary is the only entry in the newest page.
+        let newest = store
+            .load_message_page("checkpoint-session", 1, None)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&newest.messages).unwrap(),
+            serde_json::to_value(&restored.messages[2..]).unwrap()
+        );
+        let older = store
+            .load_message_page("checkpoint-session", 2, newest.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&older.messages).unwrap(),
+            serde_json::to_value(&restored.messages[..2]).unwrap()
+        );
+        assert!(!older.has_older);
+        assert!(AcpSessionStore::provider_safe_history(&newest.messages).is_empty());
     }
 
     #[test]

@@ -765,8 +765,9 @@ pub struct ModelProviderRuntimeOptions {
     /// instead of silently reverting to defaults and re-trimming history a
     /// configured request had legitimately accepted.
     pub multimodal: zeroclaw_config::schema::MultimodalConfig,
-    /// How compatible chat-completions providers handle image markers in
-    /// native role=`tool` results.
+    /// How compatible chat-completions providers handle images a native
+    /// role=`tool` result declared in its `attachments` array; legacy tool
+    /// results (no array key) pass verbatim under both settings.
     pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
 }
 

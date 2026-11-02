@@ -44,9 +44,17 @@ impl VisionOverrideProvider {
 
 #[async_trait]
 impl ModelProvider for VisionOverrideProvider {
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        self.inner.supports_exact_request_replay(request, model)
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         self.stable_request_identity
             .unwrap_or_else(|| self.inner.has_stable_request_identity(model))
+    }
+
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        self.inner.supports_single_tool_rounds(model)
     }
 
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
@@ -186,9 +194,25 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
-            .chat(request, model, temperature)
+            .chat_with_tool_round_policy(request, model, temperature, policy)
             .await
     }
 
@@ -248,12 +272,32 @@ impl ModelProvider for VisionOverrideProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        stream_as_dispatch_composite(ProviderDispatch::from_ref(&*self.inner).stream_chat(
+        self.stream_chat_with_tool_round_policy(
             request,
             model,
             temperature,
             options,
-        ))
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_tool_round_policy(
+                request,
+                model,
+                temperature,
+                options,
+                policy,
+            ),
+        )
     }
 }
 
@@ -354,6 +398,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ModelAwareCapabilityFake {
+        fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+            model == "routed-model" && request.tools.is_none()
+        }
+
         fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: model == "routed-model",
@@ -406,6 +454,28 @@ mod tests {
             None,
         ));
         assert!(stable.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn exact_replay_preserves_inner_model_and_request_restrictions() {
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        for vision in [None, Some(false), Some(true)] {
+            let wrapped =
+                VisionOverrideProvider::factory_leaf(Box::new(ModelAwareCapabilityFake), vision);
+            assert!(wrapped.supports_exact_request_replay(request, "routed-model"));
+            assert!(!wrapped.supports_exact_request_replay(request, "other-model"));
+            assert!(!wrapped.supports_exact_request_replay(
+                ChatRequest {
+                    tools: Some(&[]),
+                    ..request
+                },
+                "routed-model"
+            ));
+        }
     }
 
     #[test]

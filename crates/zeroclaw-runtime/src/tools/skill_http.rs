@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -10,7 +11,7 @@ use zeroclaw_infra::net_guard::{Nat64Prefix, PrivateNetworkAccess, ResolvedDesti
 /// Maximum response body size (1 MB).
 const MAX_RESPONSE_BYTES: usize = 1_048_576;
 const RESPONSE_TRUNCATION_MARKER: &str = "\n... [response truncated at 1MB]";
-/// HTTP request timeout (seconds).
+/// Total invocation timeout, including DNS and response-body reading (seconds).
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
 /// A tool derived from a skill's `[[tools]]` section that makes HTTP requests.
@@ -81,7 +82,15 @@ impl SkillHttpTool {
         url
     }
 
-    async fn validate_target(&self, raw_url: &str) -> anyhow::Result<ValidatedTarget> {
+    async fn validate_target_with_resolver<R, F>(
+        &self,
+        raw_url: &str,
+        resolver: R,
+    ) -> anyhow::Result<ValidatedTarget>
+    where
+        R: FnOnce(String, u16) -> F,
+        F: Future<Output = anyhow::Result<Vec<SocketAddr>>>,
+    {
         let mut url =
             reqwest::Url::parse(raw_url).map_err(|_| anyhow::Error::msg("Invalid URL"))?;
         if !url.username().is_empty() || url.password().is_some() {
@@ -103,10 +112,9 @@ impl SkillHttpTool {
         let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
             vec![SocketAddr::new(ip, port)]
         } else {
-            tokio::net::lookup_host((host.as_str(), port))
+            resolver(host.clone(), port)
                 .await
                 .map_err(|_| anyhow::Error::msg("Failed to resolve HTTP destination"))?
-                .collect::<Vec<_>>()
         };
         let destination = ResolvedDestination::new(
             &host,
@@ -140,6 +148,100 @@ impl SkillHttpTool {
         builder
             .build()
             .map_err(|_| anyhow::Error::msg("Failed to build HTTP client"))
+    }
+
+    async fn execute_with_resolver_and_dispatch<R, F, D, G>(
+        &self,
+        args: serde_json::Value,
+        resolver: R,
+        dispatcher: D,
+    ) -> ToolResult
+    where
+        R: FnOnce(String, u16) -> F,
+        F: Future<Output = anyhow::Result<Vec<SocketAddr>>>,
+        D: FnOnce(ValidatedTarget) -> G,
+        G: Future<Output = ToolResult>,
+    {
+        // Keep admission and dispatch in one budget. The client timeout alone
+        // starts too late to bound DNS, and must not grant dispatch a fresh budget.
+        tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), async {
+            let raw_url = self.substitute_args(&args);
+            let target = match self.validate_target_with_resolver(&raw_url, resolver).await {
+                Ok(target) => target,
+                Err(error) => {
+                    return ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error.to_string()),
+                    };
+                }
+            };
+            dispatcher(target).await
+        })
+        .await
+        .unwrap_or_else(|_| ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(crate::i18n::get_required_cli_string(
+                "skill-http-request-timeout",
+            )),
+        })
+    }
+
+    async fn dispatch(&self, target: ValidatedTarget) -> ToolResult {
+        let client = match self.build_client(&target) {
+            Ok(client) => client,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "skill_http tool: reqwest client build failed"
+                );
+                return ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("Failed to build HTTP client".to_string()),
+                };
+            }
+        };
+
+        let response = match client.get(target.url).send().await {
+            Ok(resp) => resp,
+            Err(_e) => {
+                return ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("HTTP request failed".to_string()),
+                };
+            }
+        };
+
+        let status = response.status();
+        let body =
+            match zeroclaw_tools::helpers::read_response_text(response, Some(MAX_RESPONSE_BYTES))
+                .await
+            {
+                Ok((text, overflowed)) => finalize_response_text(text, overflowed),
+                Err(_e) => {
+                    return ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some("Failed to read response body".to_string()),
+                    };
+                }
+            };
+
+        ToolResult {
+            success: status.is_success(),
+            output: body.into(),
+            error: if status.is_success() {
+                None
+            } else {
+                Some(format!("HTTP {}", status))
+            },
+        }
     }
 }
 
@@ -188,70 +290,17 @@ impl Tool for SkillHttpTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let raw_url = self.substitute_args(&args);
-        let target = match self.validate_target(&raw_url).await {
-            Ok(target) => target,
-            Err(error) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(error.to_string()),
-                });
-            }
-        };
-        let client = match self.build_client(&target) {
-            Ok(client) => client,
-            Err(error) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                    "skill_http tool: reqwest client build failed"
-                );
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some("Failed to build HTTP client".to_string()),
-                });
-            }
-        };
-
-        let response = match client.get(target.url).send().await {
-            Ok(resp) => resp,
-            Err(_e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some("HTTP request failed".to_string()),
-                });
-            }
-        };
-
-        let status = response.status();
-        let body =
-            match zeroclaw_tools::helpers::read_response_text(response, Some(MAX_RESPONSE_BYTES))
-                .await
-            {
-                Ok((text, overflowed)) => finalize_response_text(text, overflowed),
-                Err(_e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some("Failed to read response body".to_string()),
-                    });
-                }
-            };
-
-        Ok(ToolResult {
-            success: status.is_success(),
-            output: body.into(),
-            error: if status.is_success() {
-                None
-            } else {
-                Some(format!("HTTP {}", status))
-            },
-        })
+        Ok(self
+            .execute_with_resolver_and_dispatch(
+                args,
+                |host, port| async move {
+                    Ok(tokio::net::lookup_host((host.as_str(), port))
+                        .await?
+                        .collect())
+                },
+                |target| self.dispatch(target),
+            )
+            .await)
     }
 }
 
@@ -260,6 +309,7 @@ mod tests {
     use super::*;
     use crate::skills::SkillTool;
     use serde_json::json;
+    use std::cell::Cell;
     use zeroclaw_api::attribution::{Attributable, ToolProvenance};
 
     fn sample_http_tool() -> SkillTool {
@@ -543,6 +593,147 @@ mod tests {
             timeout_secs: None,
         };
         SkillHttpTool::new("test_skill", &st, &[])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_resolution_times_out_and_drops_the_resolver_future() {
+        struct MarkDropped<'a>(&'a Cell<bool>);
+        impl Drop for MarkDropped<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let tool = http_tool_with_command("https://api.example.com/?token={{token}}");
+        let dropped = Cell::new(false);
+        let started = tokio::time::Instant::now();
+        let result = tool
+            .execute_with_resolver_and_dispatch(
+                json!({"token": "private-argument"}),
+                |_, _| async {
+                    let _drop_marker = MarkDropped(&dropped);
+                    std::future::pending::<anyhow::Result<Vec<SocketAddr>>>().await
+                },
+                |_| async { panic!("dispatch must not run before resolution") },
+            )
+            .await;
+
+        assert_eq!(started.elapsed(), Duration::from_secs(HTTP_TIMEOUT_SECS));
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert_eq!(
+            result.error,
+            Some(crate::i18n::get_required_cli_string(
+                "skill-http-request-timeout"
+            ))
+        );
+        assert!(dropped.get());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_uses_only_the_budget_remaining_after_resolution() {
+        let tool = http_tool_with_command("https://api.example.com/weather");
+        let dispatch_started = Cell::new(None);
+        let started = tokio::time::Instant::now();
+        let result = tool
+            .execute_with_resolver_and_dispatch(
+                json!({}),
+                |_, port| async move {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    Ok(vec![SocketAddr::from(([8, 8, 8, 8], port))])
+                },
+                |_| async {
+                    dispatch_started.set(Some(started.elapsed()));
+                    std::future::pending::<ToolResult>().await
+                },
+            )
+            .await;
+
+        assert_eq!(dispatch_started.get(), Some(Duration::from_secs(20)));
+        assert_eq!(started.elapsed(), Duration::from_secs(HTTP_TIMEOUT_SECS));
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert_eq!(
+            result.error,
+            Some(crate::i18n::get_required_cli_string(
+                "skill-http-request-timeout"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_receives_the_canonical_url_and_single_approved_answer_set() {
+        let tool = http_tool_with_command("https://API.Example.COM./weather?city={{city}}");
+        let resolutions = Cell::new(0);
+        let dispatches = Cell::new(0);
+        let approved = vec![
+            SocketAddr::from(([8, 8, 8, 8], 443)),
+            SocketAddr::from(([1, 1, 1, 1], 443)),
+        ];
+        let result = tool
+            .execute_with_resolver_and_dispatch(
+                json!({"city": "London&token=private argument"}),
+                |host, port| {
+                    assert_eq!(host, "api.example.com");
+                    assert_eq!(port, 443);
+                    let prior_calls = resolutions.replace(resolutions.get() + 1);
+                    let addresses = if prior_calls == 0 {
+                        approved.clone()
+                    } else {
+                        vec![SocketAddr::from(([127, 0, 0, 1], port))]
+                    };
+                    std::future::ready(Ok(addresses))
+                },
+                |target| {
+                    dispatches.set(dispatches.get() + 1);
+                    assert_eq!(
+                        target.url.as_str(),
+                        "https://api.example.com/weather?city=London%26token%3Dprivate%20argument"
+                    );
+                    assert_eq!(target.destination.host(), "api.example.com");
+                    assert_eq!(target.destination.addresses(), approved.as_slice());
+                    std::future::ready(ToolResult {
+                        success: true,
+                        output: "recorded dispatch".into(),
+                        error: None,
+                    })
+                },
+            )
+            .await;
+
+        assert_eq!(resolutions.get(), 1);
+        assert_eq!(dispatches.get(), 1);
+        assert!(result.success);
+        assert_eq!(result.output.as_str(), "recorded dispatch");
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn private_mixed_and_empty_answers_are_rejected_before_dispatch() {
+        let tool = http_tool_with_command("https://api.example.com/weather");
+        for addresses in [
+            vec![SocketAddr::from(([10, 0, 0, 1], 443))],
+            vec![
+                SocketAddr::from(([8, 8, 8, 8], 443)),
+                SocketAddr::from(([10, 0, 0, 1], 443)),
+            ],
+            vec![],
+        ] {
+            let result = tool
+                .execute_with_resolver_and_dispatch(
+                    json!({}),
+                    |_, _| std::future::ready(Ok(addresses)),
+                    |_| async { panic!("rejected addresses must not reach dispatch") },
+                )
+                .await;
+
+            assert!(!result.success);
+            assert!(result.output.is_empty());
+            assert_eq!(
+                result.error.as_deref(),
+                Some("HTTP destination rejected by network policy")
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -20,11 +20,20 @@ zerocode spawns an ephemeral one.
 
 ## Session working directories
 
-Fresh **Chat** sessions, and fresh **Code** sessions on a local connection, use
-the selected agent's configured workspace, so file and shell tools operate there
-unless you choose a directory yourself. The daemon resolves that root and
-reports it back; zerocode does not substitute the directory you launched it
-from.
+On a local connection, fresh **Chat** and **Code** sessions start in the
+directory you launched zerocode from, so file and shell tools operate on that
+project. A restarted local session does the same. If zerocode cannot determine that
+directory, or its path is not valid UTF-8, the session is not created and the
+reason is shown, rather than silently starting somewhere else.
+
+Over a remote (WSS) connection, the directory you launched zerocode from is on
+another machine, so it is never sent. Fresh remote **Chat** sessions use the
+selected agent's configured workspace on the daemon.
+
+The daemon resolves the requested root, checks it against the agent's policy,
+and reports back the directory the session actually uses. The agent's identity
+and personality files are still read from its configured workspace, wherever
+the session starts.
 
 Remote (WSS) **Code** always asks first. A fresh or restarted remote Code
 session opens the daemon-side directory picker before the session is created, so
@@ -41,8 +50,10 @@ the daemon rejects, returns you to that session unchanged and reports why.
 
 Resumed Code sessions keep the working directory they were created with, even
 if your launch directory or the agent's configured workspace changes afterwards.
-**Chat** differs here: a reattached Chat session can resolve against the selected
-agent's current workspace.
+**Chat** differs here: a Chat session that is still running on the daemon keeps
+its directory when zerocode reattaches, but the daemon does not save a Chat
+session's directory. A Chat session the daemon has to rebuild, for example
+after the daemon restarts, starts at the selected agent's current workspace.
 
 ## Switching sessions
 
@@ -52,16 +63,19 @@ In the **Chat** and **Code** panes you can load or switch existing sessions with
 - Use the list-navigation keys to move the selection (defaults: Up/Down).
 - **Enter** switches to the highlighted session.
 - **New session** opens the same add-agent picker as the sidebar `[+]` and adds a session for the agent you choose, leaving the focused session tracked (default chord: Ctrl+N; rebindable).
+- **`/load-session [name|id]`** resumes a saved session from the pane's own store without opening the list. It matches, in order: the exact session id, the exact name, the name ignoring case, then a unique id prefix. If several sessions match, the list opens showing only those; with no argument, it opens the full list, like **Switch session**. The command never starts a new session. Code sessions don't have names yet, so in the **Code** pane only id and id-prefix matching work today.
 
 Clicking a session row's body focuses it; clicking its right-edge `✕` closes that specific session without focusing it first.
 Use the Sessions header `[+]` to add a sibling session and `[-]` to close the focused session in the active pane.
 Closing a live session safely stops its current work while preserving durable history.
 
 Switching to an existing **Code** session resumes it at its own saved root,
-while **New session** starts fresh: at the selected agent's workspace over a
-local connection, or in the directory you pick in the daemon-side picker over
-WSS. Neither action changes the root of a session that is already running; use
-`/change-directory` when you want a Code session somewhere else.
+while **New session** starts fresh: a local session in the directory you
+launched zerocode from, a remote Chat session at the selected agent's
+workspace, and a remote Code session in the directory you pick in the
+daemon-side picker. Neither action changes the root of a session that is
+already running; use `/change-directory` when you want a Code session
+somewhere else.
 
 The in-app help overlay shows your live key bindings for these actions.
 

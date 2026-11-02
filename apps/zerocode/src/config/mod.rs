@@ -5,7 +5,7 @@
 pub mod keybindings;
 
 use std::collections::HashMap;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -907,28 +907,6 @@ fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
     crate::secure_file::write_private_atomic(path, body.as_bytes())
 }
 
-fn write_document_atomically(path: &Path, body: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".zerocode-config-")
-        .tempfile_in(parent)
-        .with_context(|| format!("creating temporary config beside {}", path.display()))?;
-    temporary
-        .write_all(body.as_bytes())
-        .with_context(|| format!("writing temporary config beside {}", path.display()))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("flushing temporary config beside {}", path.display()))?;
-    temporary.persist(path).map_err(|error| {
-        anyhow::Error::msg(format!("replacing {}: {}", path.display(), error.error))
-    })?;
-    Ok(())
-}
-
 /// Mutable borrow of `key`'s sub-table, inserting an empty one when absent.
 fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::Table> {
     doc.entry(key)
@@ -996,7 +974,7 @@ fn persist_sidebar_leaf(
     } else {
         sidebar.insert(leaf, replacement);
     }
-    write_document_atomically(&path, &doc.to_string())?;
+    crate::secure_file::write_private_atomic(&path, doc.to_string().as_bytes())?;
     Ok(shadowed)
 }
 
@@ -2267,6 +2245,24 @@ mod tests {
         seed(dir.path(), before);
         assert!(persist_sidebar_width(dir.path(), 28).is_err());
         assert_eq!(read(dir.path()), before);
+    }
+
+    /// Another zerocode can be reading the config while this one saves a
+    /// sidebar change. That must not stop the save, and the reader keeps the
+    /// contents it opened. Windows refuses a plain replace of an open file, so
+    /// this pins the replace itself rather than leaving it to a race.
+    #[test]
+    fn sidebar_leaf_write_replaces_a_config_a_reader_holds_open() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sidebar]\nwidth = 24\n");
+        let mut held = std::fs::File::open(config_path(dir.path())).unwrap();
+
+        persist_sidebar_width(dir.path(), 31).expect("an open reader must not stop the save");
+
+        let held_config = std::io::read_to_string(&mut held).unwrap();
+        assert_eq!(held_config, "[sidebar]\nwidth = 24\n");
+        assert_eq!(load_persisted(dir.path()).unwrap().sidebar.width, 31);
     }
 
     #[test]

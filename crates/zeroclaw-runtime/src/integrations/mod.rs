@@ -149,8 +149,14 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
                 "  {}:",
                 get_required_cli_string("cli-integrations-setup-macos-heading")
             );
-            println!("    Uses AppleScript bridge to send/receive iMessages.");
-            println!("    Requires Full Disk Access in System Settings → Privacy.");
+            println!(
+                "    {}",
+                get_required_cli_string("cli-integrations-chat-imessage-transport")
+            );
+            println!(
+                "    {}",
+                get_required_cli_string("cli-integrations-chat-imessage-permissions")
+            );
         }
         "OpenRouter" => {
             println!(
@@ -218,8 +224,13 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
                 "  {}:",
                 get_required_cli_string("cli-integrations-setup-heading")
             );
-            println!("    Run: zeroclaw config set channels.<name>.<field>=<value>");
-            println!("    (see docs/book/src/channels/overview.md for the per-channel field list)");
+            println!(
+                "    {}",
+                get_required_cli_string_with_args(
+                    "cli-integrations-chat-generic-setup",
+                    &[("command", "zerocode"), ("channel", &entry.name)],
+                )
+            );
         }
         _ => {}
     }
