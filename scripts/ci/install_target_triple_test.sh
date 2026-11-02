@@ -202,6 +202,8 @@ assert_libc_probe() {
         [[ "$loader_present" == 1 ]]
       elif [[ "$#" -eq 3 && "$1" == "-r" && "$2" == /etc/os-release ]]; then
         [[ -n "$os_release" ]]
+      elif [[ "$#" -eq 3 && "$1" == "-d" && "$2" == "/data/data/com.termux" ]]; then
+        [[ "$mock_termux_dir" == "1" ]]
       else
         builtin [ "$@"
       fi
