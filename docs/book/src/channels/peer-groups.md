@@ -28,6 +28,7 @@ A `[peer_groups.<name>]` block carries:
 | `ignore` | Per-group blocklist; travels with the resolved peer set and overrides any grant, including a wildcard. Applied by the channel, under that channel's identity rules. |
 | `output_modality` | Preferred reply modality for the group: `mirror` (input-driven, default), `voice` (always reply and deliver proactive messages as TTS notes on audio-capable channels), or `text` (always text). |
 | `admin_for_agent_scope` | When `true`, the group's `external_peers` are authorized to issue `/model --agent <model>` on the bound agent. Default `false` (deny-by-default). See [Admin agent-scope authorization](#admin-agent-scope-authorization). |
+| `attachments_enabled` | When `true`, the `send_via` tool may attach workspace files to an immediate send addressed to this group's recipient. Default `false`. See [Sending files with send_via](../tools/overview.md#sending-files-with-send_via). |
 
 ## Resolution
 

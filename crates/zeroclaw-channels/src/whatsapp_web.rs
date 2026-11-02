@@ -3029,6 +3029,43 @@ impl WhatsAppMarker {
     }
 }
 
+/// The text to send and the markers to deliver from `message`, after any
+/// leaked tool-call tags are stripped. With inline attachments off, the
+/// content is sent as written and no marker is taken from it.
+#[cfg(feature = "whatsapp-web")]
+fn split_outbound_markers(message: &SendMessage) -> (String, Vec<WhatsAppMarker>) {
+    let content = if message.content.contains("<function_calls")
+        || message.content.contains("</function_calls")
+        || message.content.contains("<tool_call")
+        || message.content.contains("</tool_call")
+        || message.content.contains("<tool_calls")
+        || message.content.contains("</tool_calls")
+    {
+        crate::util::strip_tool_call_tags(&message.content)
+    } else {
+        message.content.clone()
+    };
+    let (text, raw_markers) = if message.inline_attachments
+        && content.contains('[')
+        && content.contains(':')
+        && content.contains(']')
+    {
+        let (cleaned, raw_markers) = super::util::parse_attachment_markers(&content);
+        if raw_markers.is_empty() {
+            (content, raw_markers)
+        } else {
+            (cleaned, raw_markers)
+        }
+    } else {
+        (content, Vec::new())
+    };
+    let markers = raw_markers
+        .into_iter()
+        .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
+        .collect::<Vec<_>>();
+    (text, markers)
+}
+
 #[cfg(feature = "whatsapp-web")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WhatsAppMarkerFailure {
@@ -3551,34 +3588,7 @@ impl Channel for WhatsAppWebChannel {
 
         let deliverable_recipient = Self::resolve_outbound_recipient(&message.recipient);
         let to = self.recipient_to_jid(&deliverable_recipient)?;
-        let raw_content = if message.content.contains("<function_calls")
-            || message.content.contains("</function_calls")
-            || message.content.contains("<tool_call")
-            || message.content.contains("</tool_call")
-            || message.content.contains("<tool_calls")
-            || message.content.contains("</tool_calls")
-        {
-            crate::util::strip_tool_call_tags(&message.content)
-        } else {
-            message.content.clone()
-        };
-        let (mut text_content, raw_markers) = if raw_content.contains('[')
-            && raw_content.contains(':')
-            && raw_content.contains(']')
-        {
-            let (cleaned, raw_markers) = super::util::parse_attachment_markers(&raw_content);
-            if raw_markers.is_empty() {
-                (raw_content, raw_markers)
-            } else {
-                (cleaned, raw_markers)
-            }
-        } else {
-            (raw_content, Vec::new())
-        };
-        let markers = raw_markers
-            .into_iter()
-            .filter_map(|(kind, target)| WhatsAppMarker::from_shared_marker(kind, target))
-            .collect::<Vec<_>>();
+        let (mut text_content, markers) = split_outbound_markers(message);
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Only substantive messages (not tool outputs) are queued.
@@ -4426,7 +4436,7 @@ impl Channel for WhatsAppWebChannel {
         }
 
         if let Err(e) = self
-            .send_approval_prompt(&SendMessage::new(text, recipient))
+            .send_approval_prompt(&crate::util::approval_prompt_message(text, recipient))
             .await
         {
             // Never leave a token pending for a prompt that was never
@@ -4956,6 +4966,41 @@ mod tests {
                 WhatsAppMediaKind::Voice
             ]
         );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn split_outbound_markers_respects_inline_attachments() {
+        let content = "send [IMAGE:photo.png] [LOCATION:40.7,-74.0]";
+
+        let (text, markers) =
+            split_outbound_markers(&SendMessage::new(content, "1@s.whatsapp.net"));
+        assert_eq!(text, "send");
+        assert_eq!(
+            markers,
+            vec![
+                WhatsAppMarker::Media(WhatsAppMediaMarker {
+                    kind: WhatsAppMediaKind::Image,
+                    target: "photo.png".to_string(),
+                }),
+                WhatsAppMarker::Location("40.7,-74.0".to_string()),
+            ]
+        );
+
+        for (content, expected) in [
+            (content, content),
+            (
+                "<tool_call>x</tool_call> [DOCUMENT:/etc/passwd]",
+                "[DOCUMENT:/etc/passwd]",
+            ),
+            ("[FILE:report.pdf]", "[FILE:report.pdf]"),
+        ] {
+            let message =
+                SendMessage::new(content, "1@s.whatsapp.net").with_inline_attachments(false);
+            let (text, markers) = split_outbound_markers(&message);
+            assert!(text.contains(expected), "{content}: {text:?}");
+            assert!(markers.is_empty(), "{content}");
+        }
     }
 
     #[test]
@@ -7706,6 +7751,54 @@ mod tests {
             group.contains("ls -la"),
             "the group prompt must carry the arguments the warning discloses: {group:?}"
         );
+    }
+
+    /// The approval prompt quotes the tool's arguments, so it goes out with
+    /// inline attachments off: a media marker in them stays text, and
+    /// `split_outbound_markers` takes nothing out of the prompt.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn approval_prompt_keeps_media_markers_from_arguments_as_text() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<SendMessage>));
+        let recorder = Arc::clone(&seen);
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "alias-prompt-markers",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        )
+        .with_approval_send_hook(Arc::new(move |message: SendMessage| {
+            let recorder = Arc::clone(&recorder);
+            Box::pin(async move {
+                *recorder.lock().unwrap() = Some(message);
+                Err(anyhow::Error::msg("send refused by the test hook"))
+            })
+        }));
+
+        let marker = "[DOCUMENT:/workspace/secret.txt]";
+        let request = ChannelApprovalRequest {
+            tool_name: "send_via".to_string(),
+            arguments_summary: format!("body: {marker}"),
+            raw_arguments: None,
+            position: None,
+        };
+        channel
+            .request_approval("1@s.whatsapp.net", &request)
+            .await
+            .expect_err("the hook refuses the send, so the call must surface that error");
+
+        let message = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request_approval must send a prompt before it fails");
+        assert!(
+            !message.inline_attachments,
+            "the approval prompt must not upload files named in its arguments"
+        );
+        let (text, markers) = split_outbound_markers(&message);
+        assert!(text.contains(marker), "the marker must stay text: {text:?}");
+        assert!(markers.is_empty());
     }
 
     /// No runtime assertion can catch a prompt that reverts to a hardcoded

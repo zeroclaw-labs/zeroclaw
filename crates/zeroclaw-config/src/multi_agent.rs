@@ -179,6 +179,12 @@ pub struct PeerGroupConfig {
     /// duplicate sender list.
     #[serde(default)]
     pub admin_for_agent_scope: bool,
+    /// When `true`, the `send_via` tool may attach workspace files to an
+    /// immediate send addressed to this group's recipient. Default `false`:
+    /// file attachments to this group are refused. Attachments also need a
+    /// channel that can deliver files, and are capped by `[tools.send_via]`.
+    #[serde(default)]
+    pub attachments_enabled: bool,
 }
 
 /// Inbound A2A discovery server configuration.

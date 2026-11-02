@@ -877,7 +877,8 @@ impl DiscordChannel {
             &request.arguments_summary,
             request.position_counter(),
         );
-        self.send(&SendMessage::new(text, channel_id)).await
+        self.send(&crate::util::approval_prompt_message(text, channel_id))
+            .await
     }
 
     async fn send_buttoned_approval(
@@ -1115,6 +1116,39 @@ fn prepare_outgoing_embeds(
     }
     let truncated = budget_embeds(&mut embeds);
     (content_without_embeds, embeds, embed_failures, truncated)
+}
+
+/// What the REST send path takes out of an outgoing message.
+struct OutgoingParts {
+    text: String,
+    embeds: Vec<DiscordEmbed>,
+    embed_failures: Vec<DiscordMarkerFailure>,
+    embeds_truncated: bool,
+    component_rows: Vec<Vec<ComponentSpec>>,
+    attachments: Vec<DiscordAttachment>,
+}
+
+/// Split `message` into the parts the REST send path delivers. Tool-call
+/// markup is stripped first, then embeds are lifted (their `[EMBED:{json}]`
+/// payload can itself contain `[`/`]`, so they go before the media-marker
+/// scan), then component rows. Attachment markers are taken from what is left
+/// only when the message allows inline attachments.
+fn split_outgoing_message(message: &SendMessage, workspace_dir: Option<&Path>) -> OutgoingParts {
+    let raw_content = crate::util::strip_tool_call_tags(&message.content);
+    let (content_without_embeds, embeds, embed_failures, embeds_truncated) =
+        prepare_outgoing_embeds(&raw_content, workspace_dir);
+    let (content_without_components, component_rows) =
+        parse_component_markers(&content_without_embeds);
+    let (text, attachments) =
+        split_attachment_markers(&content_without_components, message.inline_attachments);
+    OutgoingParts {
+        text,
+        embeds,
+        embed_failures,
+        embeds_truncated,
+        component_rows,
+        attachments,
+    }
 }
 
 async fn deliver_interaction_answer(
@@ -1841,23 +1875,19 @@ impl Channel for DiscordChannel {
             .await;
         }
 
-        let raw_content = crate::util::strip_tool_call_tags(&message.content);
-
-        // Embeds first: their `[EMBED:{json}]` payload can itself contain `[`/`]`,
-        // so they must be lifted out before the media-marker scan runs on the rest.
-        let (content_without_embeds, embeds, embed_failures, embeds_truncated) =
-            prepare_outgoing_embeds(&raw_content, self.workspace_dir.as_deref());
-
-        let (content_without_components, component_rows) =
-            parse_component_markers(&content_without_embeds);
+        let OutgoingParts {
+            text: cleaned_content,
+            embeds,
+            embed_failures,
+            embeds_truncated,
+            component_rows,
+            attachments: parsed_attachments,
+        } = split_outgoing_message(message, self.workspace_dir.as_deref());
         let component_action_rows = if component_rows.is_empty() {
             Vec::new()
         } else {
             self.build_marker_components(&component_rows)
         };
-
-        let (cleaned_content, parsed_attachments) =
-            parse_attachment_markers(&content_without_components);
         let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
 
@@ -4905,6 +4935,7 @@ mod tests {
             references: Vec::new(),
             force_voice: false,
             suppress_voice: false,
+            inline_attachments: true,
         };
         let err = ch.send(&msg).await.unwrap_err();
         assert!(err.to_string().contains("unknown or expired"));
@@ -7353,6 +7384,76 @@ mod tests {
 
         assert_eq!(cleaned, input);
         assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn split_attachment_markers_follows_inline_attachments() {
+        let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";
+
+        let (cleaned, attachments) = split_attachment_markers(input, false);
+        assert_eq!(cleaned, input);
+        assert!(attachments.is_empty());
+
+        assert_eq!(
+            split_attachment_markers(input, true),
+            parse_attachment_markers(input)
+        );
+    }
+
+    /// With inline attachments off, a marker naming a real workspace file
+    /// yields nothing to upload, no failure note and no reaction, and goes
+    /// out as one text chunk holding the marker. Driven through the same
+    /// split `send` uses, so the flag is read where the send reads it.
+    #[test]
+    fn workspace_marker_without_inline_attachments_is_sent_as_text() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("report.pdf");
+        std::fs::write(&file_path, b"fake").expect("write fixture");
+        let body = format!("[DOCUMENT:{}]", file_path.display());
+
+        let inline =
+            split_outgoing_message(&SendMessage::new(body.as_str(), "123"), Some(temp.path()));
+        assert_eq!(
+            inline.attachments.len(),
+            1,
+            "with inline attachments on the marker is an upload"
+        );
+
+        let message = SendMessage::new(body.as_str(), "123").with_inline_attachments(false);
+        let OutgoingParts {
+            text: cleaned,
+            attachments,
+            ..
+        } = split_outgoing_message(&message, Some(temp.path()));
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
+
+        assert!(locals.is_empty());
+        assert!(remotes.is_empty());
+        assert!(failures.is_empty());
+        assert_eq!(delivery_failure_note(&failures), None);
+        assert!(decide_failure_reactions(&failures).is_empty());
+        assert_eq!(
+            chunks_for_send(
+                &cleaned,
+                zeroclaw_config::schema::StreamMode::Off,
+                DISCORD_MAX_MESSAGE_LENGTH,
+                false
+            ),
+            vec![body.clone()]
+        );
+    }
+
+    /// Deleting tool-call markup can join a marker together; with inline
+    /// attachments off, the joined marker is still only text.
+    #[test]
+    fn marker_joined_by_tool_call_strip_is_text_without_inline_attachments() {
+        let joined =
+            crate::util::strip_tool_call_tags("[DOCUMENT:<tool_call>{}</tool_call>/ws/f.txt]");
+        assert_eq!(joined, "[DOCUMENT:/ws/f.txt]");
+
+        assert!(split_attachment_markers(&joined, false).1.is_empty());
+        assert_eq!(split_attachment_markers(&joined, true).1.len(), 1);
     }
 
     #[test]

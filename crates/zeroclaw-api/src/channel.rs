@@ -474,6 +474,12 @@ pub struct SendMessage {
     /// a voice note even if the peer's default modality is text.
     /// Ignored when `suppress_voice` is also `true`.
     pub force_voice: bool,
+    /// When `true` (the default), a channel may derive uploads from
+    /// `content`, such as `[KIND:target]` file markers or a body that is only
+    /// a path. When `false`, the channel sends `content` as text and must not
+    /// derive uploads from it: markers stay literal text and there is no
+    /// bare-path or `file://` fallback. Explicit `attachments` are unaffected.
+    pub inline_attachments: bool,
 }
 
 /// A native poll to post in a chat.
@@ -630,6 +636,7 @@ impl SendMessage {
             references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
+            inline_attachments: true,
         }
     }
 
@@ -662,6 +669,7 @@ impl SendMessage {
             references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
+            inline_attachments: true,
         }
     }
 
@@ -692,6 +700,13 @@ impl SendMessage {
     /// Attach files to this message.
     pub fn with_attachments(mut self, attachments: Vec<MediaAttachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    /// Set whether the channel may derive uploads from `content`; see
+    /// [`SendMessage::inline_attachments`].
+    pub fn with_inline_attachments(mut self, inline_attachments: bool) -> Self {
+        self.inline_attachments = inline_attachments;
         self
     }
 }
@@ -1072,6 +1087,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// without sending anything.
     fn supports_outbound_send(&self) -> bool {
         true
+    }
+
+    /// Whether `send` delivers the files in [`SendMessage::attachments`]. Default
+    /// `false`: a channel that does not override this would drop them silently, so
+    /// a caller that must deliver files (such as the `send_via` tool) refuses
+    /// instead of sending the text alone. A channel that returns `true` must send
+    /// every entry of `SendMessage::attachments` from its `send`, using only the
+    /// bytes in `MediaAttachment::data`.
+    fn supports_outbound_attachments(&self) -> bool {
+        false
     }
 
     /// Self-loop guard for multi-agent runs: the bot's own handle/identity on
@@ -1679,6 +1704,21 @@ mod tests {
             msg.attachments[0].mime_type.as_deref(),
             Some("application/pdf")
         );
+    }
+
+    #[test]
+    fn send_message_allows_inline_attachments_by_default() {
+        let inbound = ChannelMessage::new("c", "alice", "user@example.com", "", "email", 0);
+        assert!(SendMessage::new("content", "recipient").inline_attachments);
+        assert!(SendMessage::with_subject("content", "recipient", "subject").inline_attachments);
+        assert!(SendMessage::reply_to(&inbound, "Got it").inline_attachments);
+    }
+
+    #[test]
+    fn send_message_with_inline_attachments_sets_the_flag() {
+        let msg = SendMessage::new("content", "recipient").with_inline_attachments(false);
+        assert!(!msg.inline_attachments);
+        assert!(msg.with_inline_attachments(true).inline_attachments);
     }
 
     #[test]

@@ -1020,6 +1020,11 @@ impl Channel for EmailChannel {
         "email"
     }
 
+    /// Outbound attachments become MIME parts of the sent message.
+    fn supports_outbound_attachments(&self) -> bool {
+        true
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let email = self.build_email_message(message)?;
         let transport = self.create_smtp_transport()?;

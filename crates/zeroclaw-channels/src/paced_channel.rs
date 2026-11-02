@@ -385,6 +385,13 @@ impl Channel for PacedChannel {
         self.inner.supports_draft_updates()
     }
 
+    /// Must be forwarded explicitly: the trait default is `false`, so without
+    /// this a paced channel would be refused attachments its inner channel can
+    /// deliver. Paced sends carry the whole message, attachments included.
+    fn supports_outbound_attachments(&self) -> bool {
+        self.inner.supports_outbound_attachments()
+    }
+
     fn supports_multi_message_streaming(&self) -> bool {
         self.inner.supports_multi_message_streaming()
     }

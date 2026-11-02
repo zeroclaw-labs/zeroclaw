@@ -10466,6 +10466,55 @@ impl Default for FileUploadBundleConfig {
     }
 }
 
+// ── send_via attachments ────────────────────────────────────────
+
+/// Limits on the workspace files the `send_via` tool attaches to one immediate
+/// send (`[tools.send_via]`).
+///
+/// Attachments are refused unless the recipient's peer group sets
+/// `attachments_enabled = true` and the target channel can deliver files. A call
+/// that exceeds any limit sends nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[prefix = "tools.send_via"]
+pub struct SendViaToolConfig {
+    /// Maximum number of files attached to one `send_via` call. Default: 10.
+    #[serde(default = "default_send_via_max_attachments")]
+    pub max_attachments: u32,
+
+    /// Maximum size in bytes of each attached file. Default: 10 MiB.
+    #[serde(default = "default_send_via_max_attachment_bytes")]
+    pub max_attachment_bytes: u64,
+
+    /// Maximum combined size in bytes of all files attached to one `send_via`
+    /// call. Default: 20 MiB.
+    #[serde(default = "default_send_via_max_total_attachment_bytes")]
+    pub max_total_attachment_bytes: u64,
+}
+
+fn default_send_via_max_attachments() -> u32 {
+    10
+}
+
+fn default_send_via_max_attachment_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+
+fn default_send_via_max_total_attachment_bytes() -> u64 {
+    20 * 1024 * 1024
+}
+
+impl Default for SendViaToolConfig {
+    fn default() -> Self {
+        Self {
+            max_attachments: default_send_via_max_attachments(),
+            max_attachment_bytes: default_send_via_max_attachment_bytes(),
+            max_total_attachment_bytes: default_send_via_max_total_attachment_bytes(),
+        }
+    }
+}
+
 // ── File Download ───────────────────────────────────────────────
 
 /// Standalone file download tool configuration (`[file_download]`).
@@ -44485,6 +44534,22 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         let email = crate::scattered_types::EmailConfig::default().prop_fields();
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
+
+        let send_via = SendViaToolConfig::default().prop_fields();
+        assert_description(&send_via, ".max_attachments", "files attached to one");
+        assert_description(&send_via, ".max_attachment_bytes", "each attached file");
+        assert_description(
+            &send_via,
+            ".max_total_attachment_bytes",
+            "combined size in bytes",
+        );
+
+        let peer_group = crate::multi_agent::PeerGroupConfig::default().prop_fields();
+        assert_description(
+            &peer_group,
+            ".attachments_enabled",
+            "may attach workspace files",
+        );
 
         let model_provider = ModelProviderConfig::default().prop_fields();
         assert_description(
