@@ -5217,6 +5217,15 @@ impl SecurityPolicy {
         }
 
         let windows_path = windows_policy_path(&expanded_path);
+        // Native Path::components does not split Windows separators on Unix.
+        // Keep the traversal refusal above when a lexical drive/share path is
+        // checked on another host, including its local extended spelling.
+        if windows_path
+            .as_deref()
+            .is_some_and(|path| path.split('\\').any(|part| part == ".."))
+        {
+            return false;
+        }
         let windows_absolute = windows_path.as_deref().is_some_and(|path| {
             (has_windows_drive_prefix(path) && !is_windows_drive_relative(path))
                 || path_text_is_unc(path)
@@ -12642,6 +12651,14 @@ mod tests {
                         "root {root}, target {target}, workspace {workspace_grant}"
                     );
                 }
+                for target in [
+                    r"D:\work\..\elsewhere\file",
+                    r"\\?\D:\work\..\elsewhere\file",
+                    "//?/D:/work/../elsewhere/file",
+                ] {
+                    assert!(!policy.is_path_allowed(target), "traversal: {target}");
+                }
+                assert!(policy.is_path_allowed(r"D:\work\..suffix"));
                 assert!(!policy.is_path_allowed(r"D:\elsewhere\file"));
                 assert!(!policy.is_path_allowed(r"D:\workspace\file"));
                 policy.forbidden_paths.push(r"\\?\D:\work\private".into());
@@ -12661,6 +12678,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("project");
         std::fs::create_dir(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
         let child = workspace.join(r"literal\name");
         let sibling = root.path().join(r"project\secret");
         std::fs::write(&child, "inside").unwrap();
