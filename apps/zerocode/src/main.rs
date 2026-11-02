@@ -1217,6 +1217,7 @@ async fn run() -> anyhow::Result<()> {
         &local_config_dir,
         owned_daemon_pid,
         initial_leg,
+        cli.agent.clone(),
         #[cfg(unix)]
         shutdown_signals
             .as_mut()
@@ -1240,13 +1241,17 @@ async fn run_until_exit(
     config_dir: &std::path::Path,
     owned_daemon_pid: Option<u32>,
     initial_leg: ActiveLeg,
+    initial_agent: Option<String>,
     #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
     // the new agent's alias here so the recovering `app::run` loop drops
-    // the user into Chat once the daemon is back up.
+    // the user into Chat once the daemon is back up. `--agent` / `-a` seeds
+    // the same Immediate handoff so startup lands on Chat for that alias.
     let reconnect_state: app::SharedReconnectState =
-        Arc::new(std::sync::Mutex::new(app::CrossReconnectState::default()));
+        Arc::new(std::sync::Mutex::new(app::CrossReconnectState {
+            pending_quickstart_chat: initial_agent.map(app::PendingQuickstartChat::Immediate),
+        }));
 
     let label = target.label();
     let insecure_tls = target.insecure_tls();
@@ -2407,6 +2412,18 @@ mod connection_tests {
         };
         assert_eq!(resolve_direct_url(None, &cfg), None);
         assert!(cfg.relay_url.is_some() && cfg.relay_node.is_some());
+    }
+
+    #[test]
+    fn agent_short_and_long_flags_parse() {
+        let short = Cli::parse_from(["zerocode", "-a", "chiefofstaff"]);
+        assert_eq!(short.agent.as_deref(), Some("chiefofstaff"));
+
+        let long = Cli::parse_from(["zerocode", "--agent", "scout"]);
+        assert_eq!(long.agent.as_deref(), Some("scout"));
+
+        let omitted = Cli::parse_from(["zerocode"]);
+        assert!(omitted.agent.is_none());
     }
 
     #[test]
