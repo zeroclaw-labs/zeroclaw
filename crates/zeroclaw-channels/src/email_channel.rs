@@ -23,6 +23,7 @@ use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -50,6 +51,9 @@ pub struct EmailChannel {
     pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     seen_messages: Arc<Mutex<HashSet<String>>>,
     auth_service: Option<Arc<zeroclaw_providers::auth::AuthService>>,
+    /// Channel workspace root (`Config::channel_workspace_dir("email.<alias>")`)
+    /// under which inbound documents are saved. `None` keeps them in memory only.
+    workspace_dir: Option<PathBuf>,
 }
 
 impl EmailChannel {
@@ -64,7 +68,13 @@ impl EmailChannel {
             peer_resolver,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
             auth_service: None,
+            workspace_dir: None,
         }
+    }
+
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     /// Wire in the auth service so XOAUTH2 token refresh works for
@@ -192,8 +202,10 @@ impl EmailChannel {
             let mime_str =
                 ct.map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")));
 
-            // Skip text parts — already handled by extract_text
-            if let Some(ref m) = mime_str
+            // Without a workspace, text parts are left to extract_text; with
+            // one they are saved like any other document.
+            if self.workspace_dir.is_none()
+                && let Some(ref m) = mime_str
                 && m.starts_with("text/")
             {
                 continue;
@@ -795,6 +807,15 @@ impl EmailChannel {
         if !is_new {
             return Ok(true);
         }
+        let mut content = email.content;
+        let mut attachments = email.attachments;
+        if let Some(workspace_dir) = self.workspace_dir.as_deref() {
+            for line in save_inbound_documents(workspace_dir, &email.msg_id, &mut attachments).await
+            {
+                content.push('\n');
+                content.push_str(&line);
+            }
+        }
         let reply_target = match email.reply_to.as_ref() {
             Some(reply_to) if self.is_sender_allowed(reply_to) => reply_to.clone(),
             Some(_) => {
@@ -812,13 +833,13 @@ impl EmailChannel {
             id: email.msg_id,
             reply_target,
             sender: email.sender,
-            content: email.content,
+            content,
             channel: "email".to_string(),
             channel_alias: Some(self.alias.clone()),
             timestamp: email.timestamp,
             thread_ts: None,
             interruption_scope_id: None,
-            attachments: email.attachments,
+            attachments,
             subject: Some(email.subject),
             references: email.references,
 
@@ -980,6 +1001,192 @@ fn markdown_to_html(md: &str) -> String {
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
     html_output
+}
+
+/// Longest readable message-id prefix kept in a saved file's name.
+const SAVED_STEM_MAX_CHARS: usize = 40;
+
+/// Longest saved file name in bytes, the common filesystem limit.
+const SAVED_NAME_MAX_BYTES: usize = 255;
+
+/// Saves every attachment that is neither image nor audio as
+/// `<workspace>/email_files/<id>_<n>_<name>` and marks it as a document, so
+/// the agent keeps a path to the original after the turn. Returns one
+/// `[Document: <name>] <path>` line per saved file. Images and audio stay
+/// unmarked and go through the media pipeline as before.
+///
+/// Best effort: a file that cannot be written keeps `marker: None`; a text
+/// part that could not be saved is dropped, as it was before files were saved.
+async fn save_inbound_documents(
+    workspace_dir: &Path,
+    msg_id: &str,
+    attachments: &mut Vec<zeroclaw_api::media::MediaAttachment>,
+) -> Vec<String> {
+    use zeroclaw_api::media::{MarkerKind, MediaKind, RenderedMarker};
+
+    let is_document = |a: &zeroclaw_api::media::MediaAttachment| {
+        !matches!(a.kind(), MediaKind::Image | MediaKind::Audio)
+    };
+    let mut lines = Vec::new();
+    if attachments.iter().any(is_document) {
+        match email_files_dir(workspace_dir).await {
+            Ok(save_dir) => {
+                let id = safe_file_stem(msg_id);
+                for (n, attachment) in attachments.iter_mut().enumerate() {
+                    if !is_document(attachment) {
+                        continue;
+                    }
+                    let prefix = format!("{id}_{n}");
+                    let (path, name) = match write_new_file(
+                        &save_dir,
+                        &prefix,
+                        &attachment.file_name,
+                        &attachment.data,
+                    )
+                    .await
+                    {
+                        Ok(saved) => saved,
+                        Err(e) => {
+                            warn_save_failed(&e, "failed to save email attachment");
+                            continue;
+                        }
+                    };
+                    let target = path.display().to_string();
+                    lines.push(format!("[Document: {name}] {target}"));
+                    attachment.marker = Some(RenderedMarker {
+                        target,
+                        kind: MarkerKind::Document,
+                    });
+                }
+            }
+            Err(e) => warn_save_failed(&e, "failed to prepare email_files directory"),
+        }
+    }
+    attachments.retain(|a| {
+        a.marker.is_some()
+            || !a
+                .mime_type
+                .as_deref()
+                .is_some_and(|m| m.starts_with("text/"))
+    });
+    lines
+}
+
+/// Creates `<workspace>/email_files` and returns its canonical path, refusing
+/// one that resolves outside the workspace (e.g. through a symlink).
+async fn email_files_dir(workspace_dir: &Path) -> std::io::Result<PathBuf> {
+    let save_dir = workspace_dir.join("email_files");
+    tokio::fs::create_dir_all(&save_dir).await?;
+    let workspace_root = tokio::fs::canonicalize(workspace_dir).await?;
+    let save_dir = tokio::fs::canonicalize(&save_dir).await?;
+    if !save_dir.starts_with(&workspace_root) {
+        return Err(std::io::Error::other(
+            "email_files directory resolves outside the workspace",
+        ));
+    }
+    Ok(save_dir)
+}
+
+fn warn_save_failed(error: &std::io::Error, what: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error": zeroclaw_runtime::security::scrub(&error.to_string()),
+            })),
+        what
+    );
+}
+
+/// Writes `data` to a new file `<prefix>_<name>` in `dir`, never replacing an
+/// existing file: on a name clash it retries with `-1`, `-2`, ... appended to
+/// the prefix. The whole name fits in [`SAVED_NAME_MAX_BYTES`]. Returns the
+/// path and the sanitized attachment name.
+async fn write_new_file(
+    dir: &Path,
+    prefix: &str,
+    file_name: &str,
+    data: &[u8],
+) -> std::io::Result<(PathBuf, String)> {
+    use tokio::io::AsyncWriteExt;
+
+    for attempt in 0..100u32 {
+        let prefix = if attempt == 0 {
+            prefix.to_string()
+        } else {
+            format!("{prefix}-{attempt}")
+        };
+        let name = safe_file_name(file_name, SAVED_NAME_MAX_BYTES - prefix.len() - 1);
+        let path = dir.join(format!("{prefix}_{name}"));
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = async {
+            file.write_all(data).await?;
+            file.flush().await
+        }
+        .await;
+        if let Err(e) = written {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(e);
+        }
+        return Ok((path, name));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free file name for the email attachment",
+    ))
+}
+
+/// A message id reduced to a short ASCII prefix (letters, digits, `-`, `_`)
+/// plus a hash of the full id, so ids that sanitize alike stay apart.
+fn safe_file_stem(msg_id: &str) -> String {
+    let prefix: String = msg_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(SAVED_STEM_MAX_CHARS)
+        .collect();
+    let prefix = if prefix.is_empty() { "email" } else { &prefix };
+    let digest = Sha256::digest(msg_id.as_bytes());
+    format!("{prefix}-{}", hex::encode(&digest[..8]))
+}
+
+/// A sender-supplied file name with no path separators, control characters
+/// or leading dots, at most `max_bytes` long without splitting a character,
+/// keeping a short extension when it has to be shortened.
+fn safe_file_name(file_name: &str, max_bytes: usize) -> String {
+    let base = file_name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.');
+    if cleaned.is_empty() {
+        return "attachment".to_string();
+    }
+    if cleaned.len() <= max_bytes {
+        return cleaned.to_string();
+    }
+    let ext = Path::new(cleaned)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 10 && e.len() < max_bytes)
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let mut keep = max_bytes - ext.len();
+    while !cleaned.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{ext}", &cleaned[..keep])
 }
 
 fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
@@ -1858,6 +2065,221 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.reply_target, "sender@example.invalid");
         assert!(msg.references.is_empty());
+    }
+
+    // -- inbound document saving tests --
+
+    const DOCUMENTS_EMAIL: &[u8] = b"From: Sender <sender@example.invalid>\r\n\
+          Subject: Documents\r\n\
+          Message-ID: <doc-1@example.invalid>\r\n\
+          MIME-Version: 1.0\r\n\
+          Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+          \r\n\
+          --BOUNDARY\r\n\
+          Content-Type: text/plain\r\n\
+          \r\n\
+          Body text\r\n\
+          --BOUNDARY\r\n\
+          Content-Type: application/pdf\r\n\
+          Content-Disposition: attachment; filename=\"../report.pdf\"\r\n\
+          \r\n\
+          PDF_BINARY_DATA\r\n\
+          --BOUNDARY\r\n\
+          Content-Type: text/csv\r\n\
+          Content-Disposition: attachment; filename=\"rows.csv\"\r\n\
+          \r\n\
+          a,b\r\n\
+          --BOUNDARY\r\n\
+          Content-Type: image/png\r\n\
+          Content-Disposition: attachment; filename=\"photo.png\"\r\n\
+          \r\n\
+          PNG_BINARY_DATA\r\n\
+          --BOUNDARY--\r\n";
+
+    async fn dispatch_documents(workspace: Option<&Path>) -> ChannelMessage {
+        let mut channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(vec!["*".to_string()]),
+        );
+        if let Some(dir) = workspace {
+            channel = channel.with_workspace_dir(dir.to_path_buf());
+        }
+        let parsed = parse_test_email(DOCUMENTS_EMAIL);
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+        let (tx, mut rx) = mpsc::channel(1);
+        channel.dispatch_email(email, &tx).await.unwrap();
+        rx.recv().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_saves_documents_to_workspace_with_marker_lines() {
+        let workspace = tempfile::tempdir().unwrap();
+        let msg = dispatch_documents(Some(workspace.path())).await;
+
+        let save_dir = std::fs::canonicalize(workspace.path().join("email_files")).unwrap();
+        let stem = safe_file_stem("doc-1@example.invalid");
+        assert!(stem.starts_with("doc-1exampleinvalid-"));
+        let pdf = save_dir.join(format!("{stem}_0_report.pdf"));
+        let csv = save_dir.join(format!("{stem}_1_rows.csv"));
+        assert_eq!(std::fs::read(&pdf).unwrap(), b"PDF_BINARY_DATA");
+        // A text attachment is saved even though the email has a body.
+        assert_eq!(std::fs::read(&csv).unwrap(), b"a,b");
+        assert!(
+            msg.content
+                .contains(&format!("[Document: report.pdf] {}", pdf.display()))
+        );
+        assert!(
+            msg.content
+                .contains(&format!("[Document: rows.csv] {}", csv.display()))
+        );
+
+        // The image stays unmarked for the media pipeline.
+        let png = msg
+            .attachments
+            .iter()
+            .find(|a| a.file_name == "photo.png")
+            .unwrap();
+        assert!(png.marker.is_none());
+        assert_eq!(
+            msg.attachments
+                .iter()
+                .filter(|a| a.marker.is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_without_workspace_keeps_documents_in_memory() {
+        let msg = dispatch_documents(None).await;
+
+        assert!(!msg.content.contains("[Document:"));
+        assert!(msg.attachments.iter().all(|a| a.marker.is_none()));
+        // Text parts are still left to extract_text.
+        assert!(!msg.attachments.iter().any(|a| a.file_name == "rows.csv"));
+        assert_eq!(msg.attachments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_saves_nothing_for_a_blocked_sender() {
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(vec!["@allowed.example.invalid".to_string()]),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let parsed = parse_test_email(DOCUMENTS_EMAIL);
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(channel.dispatch_email(email, &tx).await.unwrap());
+        assert!(rx.try_recv().is_err());
+        assert!(!workspace.path().join("email_files").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_email_refuses_email_files_outside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("email_files")).unwrap();
+
+        let msg = dispatch_documents(Some(workspace.path())).await;
+
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+        assert!(!msg.content.contains("[Document:"));
+        assert!(msg.attachments.iter().all(|a| a.marker.is_none()));
+        assert!(!msg.attachments.iter().any(|a| a.file_name == "rows.csv"));
+    }
+
+    #[test]
+    fn safe_file_name_strips_paths_and_leading_dots_and_bounds_length() {
+        assert_eq!(safe_file_name("../../etc/passwd", 255), "passwd");
+        assert_eq!(safe_file_name("C:\\x\\.hidden", 255), "hidden");
+        assert_eq!(safe_file_name("...", 255), "attachment");
+        let long = format!("{}.xlsx", "a".repeat(300));
+        let safe = safe_file_name(&long, 100);
+        assert_eq!(safe.len(), 100);
+        assert!(safe.ends_with(".xlsx"));
+    }
+
+    #[test]
+    fn safe_file_stem_keeps_similar_message_ids_apart() {
+        let a = safe_file_stem("doc.1@example.invalid");
+        let b = safe_file_stem("doc1@example.invalid");
+        assert_ne!(a, b);
+        assert!(a.starts_with("doc1exampleinvalid-"));
+        assert_eq!(a, safe_file_stem("doc.1@example.invalid"));
+        assert!(safe_file_stem(&"x".repeat(1000)).len() <= SAVED_STEM_MAX_CHARS + 17);
+    }
+
+    #[tokio::test]
+    async fn write_new_file_bounds_long_unicode_names_in_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = format!("{}_7", safe_file_stem(&"m".repeat(500)));
+        let long = format!("{}.pdf", "\u{65e5}".repeat(200));
+
+        let (path, name) = write_new_file(dir.path(), &prefix, &long, b"data")
+            .await
+            .unwrap();
+
+        let saved = path.file_name().unwrap().to_str().unwrap();
+        assert!(saved.len() <= SAVED_NAME_MAX_BYTES);
+        assert!(saved.len() > SAVED_NAME_MAX_BYTES - 3);
+        assert!(saved.ends_with(".pdf"));
+        assert!(name.starts_with('\u{65e5}'));
+        assert_eq!(std::fs::read(&path).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn write_new_file_never_replaces_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = write_new_file(dir.path(), "id_0", "a.pdf", b"first")
+            .await
+            .unwrap();
+        let (second, name) = write_new_file(dir.path(), "id_0", "a.pdf", b"second")
+            .await
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(name, "a.pdf");
+        assert_eq!(second.file_name().unwrap(), "id_0-1_a.pdf");
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_keeps_attachments_of_similar_message_ids_apart() {
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(vec!["*".to_string()]),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let (tx, mut rx) = mpsc::channel(2);
+        for (uid, id, body) in [(1, "doc.1", "FIRST"), (2, "doc1", "SECOND")] {
+            let raw = String::from_utf8(DOCUMENTS_EMAIL.to_vec())
+                .unwrap()
+                .replace("<doc-1@", &format!("<{id}@"))
+                .replace("PDF_BINARY_DATA", body);
+            let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
+            let email = channel.build_parsed_email(&parsed, uid, Some(1234));
+            channel.dispatch_email(email, &tx).await.unwrap();
+        }
+
+        for expected in [b"FIRST".as_slice(), b"SECOND".as_slice()] {
+            let msg = rx.recv().await.unwrap();
+            let pdf = msg
+                .attachments
+                .iter()
+                .find(|a| a.file_name.ends_with("report.pdf"))
+                .and_then(|a| a.marker.as_ref())
+                .unwrap();
+            assert_eq!(std::fs::read(&pdf.target).unwrap(), expected);
+        }
     }
 
     #[test]

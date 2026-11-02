@@ -63,7 +63,11 @@ When attachments are present the body alternatives are wrapped in an outer `mult
 
 ## Attachment handling
 
-Inbound attachments are stored under `<workspace>/attachments/<conversation>/`. The agent gets file paths in its context and can read them via the `file_read` tool. Filenames are taken from the `Content-Disposition` header first, falling back to the `Content-Type` `name` parameter.
+Inbound attachments that are neither images nor audio (PDFs, spreadsheets, text files and so on) are saved under the channel's workspace as `<workspace>/email_files/<message-key>_<n>_<filename>`, where the key is a short form of the Message-ID plus a hash of it, the same layout as `telegram_files/` and `matrix_files/`. The message the agent receives carries one `[Document: <filename>] <path>` line per saved file, so the agent can open it later with the `file_read` tool. Text attachments are saved too, even when the email also has a body.
+
+Filenames are taken from the `Content-Disposition` header first, falling back to the `Content-Type` `name` parameter. Any directory part and leading dots are removed, long names are shortened so the whole saved name fits in 255 bytes, and an existing file is never replaced. Only mail from an allowed sender is saved. If `email_files/` resolves outside the workspace (for example through a symlink), nothing is saved and the email reaches the agent as it did before files were saved; a file that fails to write is handled the same way.
+
+Images and audio are not saved; they go through the media pipeline. Saved files are not cleaned up automatically. `max_attachment_bytes` still bounds the total size accepted per email.
 
 Outbound attachments are sent from the bytes supplied with each attachment. The Email channel treats the attachment filename as display metadata, not as a local path. Integrations that intentionally send a local file must validate or constrain the path and load it explicitly with `MediaAttachment::from_file` before sending.
 
