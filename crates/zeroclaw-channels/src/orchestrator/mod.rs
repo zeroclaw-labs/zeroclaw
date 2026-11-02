@@ -2611,6 +2611,17 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 normalized.push(turn);
                 expecting_user = true;
             }
+            // A tool result's content is a structured envelope, so a following
+            // turn must never be merged into it: appending prose makes the
+            // envelope unparseable, and the OpenAI-compatible adapter then emits
+            // `role=tool` with no `tool_call_id`, which strict providers reject
+            // for the entire request. Push it as its own turn instead — every
+            // provider accepts `... assistant(tool_calls) -> tool -> user ...`.
+            (false, "user") if normalized.last().is_some_and(|turn| turn.role == "tool") => {
+                if !turn.content.is_empty() {
+                    normalized.push(turn);
+                }
+            }
             // Interrupted channel turns can produce consecutive user messages
             // (no assistant persisted yet). Merge instead of dropping.
             (false, "user") | (true, "assistant") => {
@@ -24230,6 +24241,41 @@ api_key = "anthropic-key"
         assert_eq!(normalized[0].role, "user");
         assert!(normalized[0].content.contains("forwarded content"));
         assert!(normalized[0].content.contains("summarize this"));
+    }
+
+    // A tool result's content is a structured envelope. A follow-up turn must be
+    // kept as its own turn instead of being appended to it: the appended prose
+    // makes the envelope unparseable, and the OpenAI-compatible adapter then
+    // sends `role=tool` without `tool_call_id`, which strict providers (e.g.
+    // DeepSeek) reject for the whole request.
+    #[test]
+    fn normalize_cached_channel_turns_keeps_tool_envelope_when_user_follows_tool() {
+        let envelope = r#"{"content":"sync output","tool_call_id":"call_1","attachments":[]}"#;
+        let turns = vec![
+            ChatMessage::user("upgrade the host packages"),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(envelope),
+            ChatMessage::user("upgrade the host packages"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+
+        assert_eq!(
+            normalized.len(),
+            4,
+            "the follow-up user turn must survive as its own turn: {normalized:?}"
+        );
+        assert_eq!(normalized[2].role, "tool");
+        assert_eq!(
+            normalized[2].content, envelope,
+            "a tool envelope must never be rewritten by turn normalization"
+        );
+        assert_eq!(normalized[3].role, "user");
+        let parsed: serde_json::Value = serde_json::from_str(&normalized[2].content)
+            .expect("the tool envelope must stay valid JSON");
+        assert_eq!(parsed["tool_call_id"], "call_1");
     }
 
     #[test]
