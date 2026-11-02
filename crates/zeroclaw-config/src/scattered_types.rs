@@ -623,6 +623,13 @@ pub struct EmailConfig {
     /// When true, the daemon observes new mail but never modifies any IMAP flag.
     #[serde(default)]
     pub observer_mode: bool,
+    /// Hosts whose `https` images may appear in the HTML part of outbound
+    /// mail (a listed domain also covers its subdomains). Any other remote
+    /// image is reduced to its alt text, since the reader's mail client would
+    /// fetch it. Inline attachments (`cid:`) are always allowed. Empty by
+    /// default.
+    #[serde(default)]
+    pub html_image_domains: Vec<String>,
 }
 
 impl ChannelConfig for EmailConfig {
@@ -657,6 +664,7 @@ impl Default for EmailConfig {
             html_body: true,
             oauth2: None,
             observer_mode: false,
+            html_image_domains: Vec::new(),
         }
     }
 }
