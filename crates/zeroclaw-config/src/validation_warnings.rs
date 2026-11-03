@@ -37,6 +37,10 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 /// are not checked; see [`crate::opt_in_tools`].
 pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
 
+/// Stable code for a half-configured email outbound pair: the channel loads and
+/// stays inbound-only even though the operator configured sending.
+pub const EMAIL_SMTP_PARTIALLY_CONFIGURED: &str = "email_smtp_partially_configured";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
@@ -65,6 +69,10 @@ pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
 ///   notice about lost capability, not a fail-open alarm. `"all"` admits every
 ///   group before and after, and `"ignore"` rejects every group before and
 ///   after under BOTH modes, so neither is reported.
+/// - `email_smtp_partially_configured`: exactly one of `smtp_host` and
+///   `from_address` is set on an enabled email channel. SMTP needs both, so
+///   the channel loads and reads mail but refuses every outbound send until
+///   the missing half is set, or both are cleared for an inbound-only mailbox.
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
