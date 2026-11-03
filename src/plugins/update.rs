@@ -181,8 +181,8 @@ pub fn is_older_version(candidate: &str, installed: &str) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub enum UpdateSource<'a> {
     /// The registry, pinned to `version` when there is one. `registry` is the
-    /// `--registry` URL the operator passed, which the printed command passes
-    /// again; a registry chosen by the environment is inherited without it.
+    /// exact resolved origin when known, which printed approval/retry commands
+    /// pass explicitly rather than re-resolving a mutable environment selection.
     Registry {
         version: Option<&'a str>,
         registry: Option<&'a str>,

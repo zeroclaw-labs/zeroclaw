@@ -8,7 +8,7 @@ use zeroclaw_config::schema::ExternalRegistryKind;
 
 #[cfg(feature = "plugins-wasm")]
 use zeroclaw_plugins::registry::{
-    install_command as plugin_install_command, read_cached_registry_index,
+    ShellDialect, read_cached_registry_collection, registry_install_command_for,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,7 +264,26 @@ fn load_markdown_skill_package_metadata(
 fn load_cached_installable_plugin_capabilities(
     workspace_dir: &Path,
 ) -> Vec<InstallableSkillCapability> {
-    let index = match read_cached_registry_index(workspace_dir) {
+    let selected = std::env::var(zeroclaw_plugins::registry::REGISTRY_URL_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let sources = match selected
+        .as_deref()
+        .map(zeroclaw_plugins::registry::registry_sources)
+        .transpose()
+    {
+        Ok(sources) => sources,
+        Err(_) => return Vec::new(),
+    };
+    load_cached_installable_plugin_capabilities_for_sources(workspace_dir, sources.as_deref())
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn load_cached_installable_plugin_capabilities_for_sources(
+    workspace_dir: &Path,
+    sources: Option<&[String]>,
+) -> Vec<InstallableSkillCapability> {
+    let index = match read_cached_registry_collection(workspace_dir) {
         Ok(Some(index)) => index,
         Ok(None) => return Vec::new(),
         Err(error) => {
@@ -278,16 +297,26 @@ fn load_cached_installable_plugin_capabilities(
             return Vec::new();
         }
     };
-    let registry_url = index.registry_url.as_deref();
+    if sources
+        .is_some_and(|sources| !zeroclaw_plugins::registry::cache_matches_sources(&index, sources))
+    {
+        return Vec::new();
+    }
 
     index
-        .plugins
+        .entries()
         .into_iter()
         .map(|entry| {
             let description = entry.description.clone().unwrap_or_default();
             InstallableSkillCapability {
                 name: entry.name.clone(),
-                source: plugin_install_command(&entry, registry_url),
+                source: registry_install_command_for(
+                    ShellDialect::host(),
+                    entry.entry,
+                    Some(entry.origin),
+                    None,
+                    false,
+                ),
                 aliases: vec![description],
                 install_kind: InstallKind::Plugin,
             }
@@ -444,6 +473,57 @@ mod tests {
             url: format!("file:///tmp/{name}"),
             kind: kind.to_string().into(),
             enabled,
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn union_cache_suggestions_keep_each_publishers_explicit_install_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog_data: zeroclaw_plugins::registry::RegistryCollection = serde_json::from_value(serde_json::json!({
+            "registries": [
+                {"registry_url":"https://a.invalid/index", "plugins":[{"name":"calendar","version":"1","description":"personal calendar","url":"https://a.invalid/p.zip"}]},
+                {"registry_url":"https://b.invalid/index", "plugins":[{"name":"calendar","version":"2","description":"team scheduling","url":"https://b.invalid/p.zip"}]}
+            ]
+        })).unwrap();
+        zeroclaw_plugins::registry::write_cached_registry_collection(dir.path(), &catalog_data)
+            .unwrap();
+        let catalog = load_cached_installable_plugin_capabilities(dir.path());
+        assert_eq!(catalog.len(), 2);
+        assert!(
+            load_cached_installable_plugin_capabilities_for_sources(
+                dir.path(),
+                Some(&["https://a.invalid/index".to_string()])
+            )
+            .is_empty()
+        );
+        assert!(
+            load_cached_installable_plugin_capabilities_for_sources(
+                dir.path(),
+                Some(&["https://unrelated.invalid/index".to_string()])
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            load_cached_installable_plugin_capabilities_for_sources(
+                dir.path(),
+                Some(&catalog_data.sources())
+            )
+            .len(),
+            2
+        );
+        for (prompt, expected) in [
+            (
+                "use personal calendar",
+                "calendar@1 --registry https://a.invalid/index",
+            ),
+            (
+                "use team scheduling",
+                "calendar@2 --registry https://b.invalid/index",
+            ),
+        ] {
+            let suggestion = suggest_missing_skill_install(prompt, &[], &[], &catalog).unwrap();
+            assert!(suggestion.render_user_message().contains(expected));
         }
     }
 
