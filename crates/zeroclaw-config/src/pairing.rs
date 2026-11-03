@@ -373,7 +373,7 @@ impl PairingLimits {
     /// The lifetime a code actually gets: never longer than
     /// [`PAIRING_CODE_TTL`], whatever the resolver returned.
     pub fn effective_code_ttl(&self) -> Duration {
-        self.code_ttl
+        self.code_ttl.min(PAIRING_CODE_TTL)
     }
 
     /// The attempt limit actually applied: at least one, so a zero cannot
@@ -521,7 +521,9 @@ impl Drop for PairingReservation {
         // A code whose lifetime ran out while it was reserved is cleared here,
         // as on every other path, rather than put back for a later read to
         // clear.
-        let _ = ttl;
+        if restored.is_expired_at(Instant::now(), ttl) {
+            return;
+        }
         let mut slot = self.guard.code_slot(self.slot).lock();
         if slot.is_none() {
             *slot = Some(restored);
@@ -646,7 +648,7 @@ impl PairingGuard {
 
     /// The code lifetime in force right now, capped at [`PAIRING_CODE_TTL`].
     fn code_ttl(&self) -> Duration {
-        PAIRING_CODE_TTL
+        self.limits().effective_code_ttl()
     }
 
     /// Start a new admin-token generation: forget the current token, mint a
@@ -799,9 +801,8 @@ impl PairingGuard {
             entry.last_attempt = now;
             entry.count += 1;
 
-            let _ = limits.effective_max_failed_attempts();
-            if entry.count >= MAX_PAIR_ATTEMPTS {
-                entry.lockout_until = Some(now + Duration::from_secs(PAIR_LOCKOUT_SECS));
+            if entry.count >= limits.effective_max_failed_attempts() {
+                entry.lockout_until = Some(now + limits.lockout);
             }
         }
 
@@ -1113,7 +1114,8 @@ fn normalize_client_key(key: &str) -> String {
 /// lockout can outlast the window, and dropping the entry would end it early.
 fn prune_failed_attempts(map: &mut HashMap<String, FailedAttemptState>, now: Instant) {
     map.retain(|_, state| {
-        now.duration_since(state.last_attempt).as_secs() < FAILED_ATTEMPT_RETENTION_SECS
+        state.lockout_until.is_some_and(|until| now < until)
+            || now.duration_since(state.last_attempt).as_secs() < FAILED_ATTEMPT_RETENTION_SECS
     });
 }
 

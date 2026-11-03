@@ -7,7 +7,10 @@ pub mod v2;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
-use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
+use crate::pairing::{
+    PAIR_ATTEMPTS_RANGE, PAIR_LOCKOUT_SECS_RANGE, PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH,
+    PAIRING_CODE_TTL_MAX_SECS, PAIRING_CODE_TTL_MIN_SECS, PairingCodePolicy,
+};
 use crate::traits::{ApplicationCapability, ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
@@ -7958,7 +7961,8 @@ pub struct GatewayConfig {
     #[nested]
     pub pairing_code: PairingCodePolicy,
 
-    /// Pairing dashboard configuration
+    /// Pairing-code lifetime and brute-force limits for the gateway's
+    /// pairing and enrollment codes (`[gateway.pairing_dashboard]`).
     #[serde(default)]
     #[nested]
     pub pairing_dashboard: PairingDashboardConfig,
@@ -8089,7 +8093,19 @@ impl Default for GatewayConfig {
     }
 }
 
-/// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
+/// Pairing-code lifetime and brute-force limits for the gateway
+/// (`[gateway.pairing_dashboard]`).
+///
+/// They govern the gateway's own pairing guard: its pairing code (`/pair`,
+/// the dashboard pairing flow, `zeroclaw gateway get-paircode`) and the
+/// daemon's certificate-enrollment code. The gateway reads them from live
+/// config on every code check and failed attempt, so an edit applies without
+/// a restart. Channel pairing (Telegram, LINE, WeChat) keeps its own fixed
+/// limits.
+///
+/// The gateway holds one pending pairing code at a time, and issuing a new one
+/// cancels the previous code, so there is no setting for how many codes may be
+/// pending.
 ///
 /// Code length and character family are **not** configured here. The
 /// dashboard pairing flow issues its codes through the same
@@ -8101,38 +8117,36 @@ impl Default for GatewayConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.pairing_dashboard"]
 pub struct PairingDashboardConfig {
-    /// Time-to-live for pending pairing codes in seconds (default: 3600)
+    /// Seconds a pairing code stays redeemable after it is issued: 30 to 600,
+    /// default 600 (10 minutes). 600 is also the cap: a saved value above it
+    /// is lowered to 600 when the config loads, with a notice, so no code
+    /// lives longer than 10 minutes.
     #[serde(default = "default_pairing_ttl")]
     pub code_ttl_secs: u64,
-    /// Maximum concurrent pending pairing codes (default: 3)
-    #[serde(default = "default_max_pending_codes")]
-    pub max_pending_codes: usize,
-    /// Maximum failed pairing attempts before lockout (default: 5)
+    /// Wrong codes one client may try before it is locked out: 1 to 100,
+    /// default 5.
     #[serde(default = "default_max_failed_attempts")]
     pub max_failed_attempts: u32,
-    /// Lockout duration in seconds after max attempts (default: 300)
+    /// Seconds a client stays locked out after too many wrong codes: 1 to
+    /// 86400 (one day), default 300. A change applies to the next lockout.
     #[serde(default = "default_pairing_lockout_secs")]
     pub lockout_secs: u64,
 }
 
 fn default_pairing_ttl() -> u64 {
-    3600
-}
-fn default_max_pending_codes() -> usize {
-    3
+    PAIRING_CODE_TTL_MAX_SECS
 }
 fn default_max_failed_attempts() -> u32 {
-    5
+    crate::pairing::MAX_PAIR_ATTEMPTS
 }
 fn default_pairing_lockout_secs() -> u64 {
-    300
+    crate::pairing::PAIR_LOCKOUT_SECS
 }
 
 impl Default for PairingDashboardConfig {
     fn default() -> Self {
         Self {
             code_ttl_secs: default_pairing_ttl(),
-            max_pending_codes: default_max_pending_codes(),
             max_failed_attempts: default_max_failed_attempts(),
             lockout_secs: default_pairing_lockout_secs(),
         }
@@ -24137,6 +24151,37 @@ impl Config {
             );
         }
 
+        // Pairing limits. A saved code lifetime above the cap was already
+        // lowered on load (`migration::CAPPED_KEYS`), so a value out of range
+        // here was set explicitly, and is refused rather than changed.
+        let dashboard = &self.gateway.pairing_dashboard;
+        for (path, value, range) in [
+            (
+                "gateway.pairing_dashboard.code_ttl_secs",
+                dashboard.code_ttl_secs,
+                PAIRING_CODE_TTL_MIN_SECS..=PAIRING_CODE_TTL_MAX_SECS,
+            ),
+            (
+                "gateway.pairing_dashboard.max_failed_attempts",
+                u64::from(dashboard.max_failed_attempts),
+                u64::from(*PAIR_ATTEMPTS_RANGE.start())..=u64::from(*PAIR_ATTEMPTS_RANGE.end()),
+            ),
+            (
+                "gateway.pairing_dashboard.lockout_secs",
+                dashboard.lockout_secs,
+                PAIR_LOCKOUT_SECS_RANGE,
+            ),
+        ] {
+            if !range.contains(&value) {
+                let (min, max) = (range.start(), range.end());
+                validation_bail!(
+                    InvalidNumericRange,
+                    path,
+                    "{path} = {value} is out of range; must be {min}..={max}"
+                );
+            }
+        }
+
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
@@ -26371,7 +26416,12 @@ impl Config {
             // drop a retired key anyway, since the typed config has no field
             // for it, but silently: one written by another handle after this
             // config loaded would leave without the notice it is owed.
-            let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+            let mut retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+            // Values above a `CAPPED_KEYS` maximum are lowered the same way,
+            // with the notice the load path gives.
+            retired.extend(crate::migration::lower_capped_keys_in_doc(
+                doc.as_table_mut(),
+            ));
             // Then sync onto the spelling the snapshot is written in, keeping
             // the comments of a section spelled another way; a current file
             // still holding two live spellings of one setting is refused. An
@@ -26491,7 +26541,13 @@ impl Config {
         // the file are preserved. It runs first, as on load, so a retired
         // table under one spelling of a section does not count as a second
         // spelling of the live one.
-        let retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+        let mut retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
+        // A value above a `CAPPED_KEYS` maximum is lowered for the same
+        // reason: the load path lowers it, so it is never dirty, and it would
+        // otherwise stay in the file through every incremental save.
+        retired.extend(crate::migration::lower_capped_keys_in_doc(
+            doc.as_table_mut(),
+        ));
         // A setting the file spells another way the schema accepts
         // (`channels_config` for `channels`) is renamed to the spelling the
         // dirty paths use, so an edit lands on it rather than beside it.

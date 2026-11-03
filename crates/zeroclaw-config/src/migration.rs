@@ -286,6 +286,16 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         reason: "identity is set per agent; move it to `[agents.<alias>.identity]`",
         reason_id: "cli-config-retired-reason-identity",
     },
+    // Accepted but never read. The gateway holds one pending pairing code,
+    // and issuing a new one cancels the previous code, so a cap on pending
+    // codes has nothing to limit.
+    RetiredKey {
+        retired_in: 4,
+        path: &["gateway", "pairing_dashboard", "max_pending_codes"],
+        reason: "the gateway keeps one pending pairing code at a time, and issuing a new \
+                 code cancels the previous one",
+        reason_id: "cli-config-retired-reason-pairing-max-pending",
+    },
 ];
 
 /// One key whose stored value the schema honours only up to a maximum.
@@ -2683,8 +2693,7 @@ fn keep_empty_table_rendered(item: &mut toml_edit::Item) {
 /// Lower every [`CAPPED_KEYS`] value above its maximum in a parsed config,
 /// recording a [`MigrationNotice::Lowered`] for each.
 fn lower_capped_keys(value: &mut toml::Value, notices: &mut Vec<MigrationNotice>) {
-    let _ = notices;
-    let Some(root) = value.as_table_mut().filter(|_| false) else {
+    let Some(root) = value.as_table_mut() else {
         return;
     };
     for key in CAPPED_KEYS {
@@ -2722,10 +2731,6 @@ fn lower_capped_keys(value: &mut toml::Value, notices: &mut Vec<MigrationNotice>
 /// Returns what changed, for the caller to report once the file is written.
 pub fn lower_capped_keys_in_doc(root: &mut toml_edit::Table) -> Vec<MigrationNotice> {
     let mut notices = Vec::new();
-    if notices.is_empty() {
-        let _ = root;
-        return notices;
-    }
     for key in CAPPED_KEYS {
         let Ok(max) = i64::try_from(key.max) else {
             continue;
@@ -7620,6 +7625,10 @@ mention_only = false
         ("twitter", "[twitter]\nbearer_token = \"x\"\n"),
         ("reddit", "[reddit]\nclient_id = \"x\"\n"),
         ("channels.notion", "[channels.notion]\ntoken = \"x\"\n"),
+        (
+            "gateway.pairing_dashboard.max_pending_codes",
+            "[gateway.pairing_dashboard]\nmax_pending_codes = 3\n",
+        ),
     ];
 
     /// A key retired at V4, in a file with nothing else to decide by, means
