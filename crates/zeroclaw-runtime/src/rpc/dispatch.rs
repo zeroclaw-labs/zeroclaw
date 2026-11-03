@@ -15593,6 +15593,15 @@ mod tests {
             frames
         }
 
+        /// Hold the log writer's test lock for a test that emits a burst of
+        /// records past the writer's bounded queue. Every record the queue
+        /// cannot take is dropped, whichever test emitted it, and the
+        /// persisted-log tests hold this same lock while they read their own
+        /// records back, so a burst never shares the writer with them.
+        fn hold_writer_for_burst() -> impl Drop {
+            zeroclaw_log::__private_test_writer_lock()
+        }
+
         /// Let spawned work run until `done` holds, without moving a paused
         /// clock.
         async fn settle(mut done: impl FnMut() -> bool) {
@@ -16927,6 +16936,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn in_flight_dispatches_are_capped_per_connection() {
             const CAP: usize = MAX_PLUGIN_WEBHOOK_DISPATCHES_PER_CONNECTION;
+            let _writer = hold_writer_for_burst();
             let ingress = test_ingress();
             let routes = publish(&ingress, &[("held", "p", "a", 2 * CAP, Worker::Unread)]);
             let (mut dispatcher, mut rx) = connection(Some(ingress), 4 * CAP);
@@ -16991,6 +17001,7 @@ mod tests {
         #[tokio::test]
         async fn unread_responses_hold_the_in_flight_cap() {
             const CAP: usize = MAX_PLUGIN_WEBHOOK_DISPATCHES_PER_CONNECTION;
+            let _writer = hold_writer_for_burst();
             let (tx, mut rx) = mpsc::channel(1);
             tx.try_send("unread".to_string())
                 .expect("fill the connection's writer queue");
