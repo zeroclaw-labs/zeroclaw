@@ -534,7 +534,7 @@ export function AgentChatInner({
        t() i18n, so losing browser translation on it is intentional. */
     <div
       translate="no"
-      className="notranslate relative flex flex-col h-full min-h-0 overflow-hidden"
+      className="notranslate relative flex flex-col h-full min-h-0"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}

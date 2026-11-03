@@ -317,7 +317,7 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   }, [tabs]);
 
   return (
-    <div translate="no" className="notranslate flex flex-col h-full min-h-0 overflow-hidden">
+    <div translate="no" className="notranslate flex flex-col h-full min-h-0">
       <ChatTabBar
         tabs={labelledTabs}
         activeKey={activeTab?.key ?? ''}

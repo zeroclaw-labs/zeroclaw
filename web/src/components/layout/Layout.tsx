@@ -33,7 +33,9 @@ export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   // Chat owns its own scroll container (the message list). Letting the page
   // shell scroll too would move the composer and header with the transcript.
-  const isChat = pathname.startsWith('/agent/');
+  // Exclude /agent/:alias/workspace — that route has its own page-level scroll
+  // and is not a chat view.
+  const isChat = pathname.startsWith('/agent/') && !pathname.includes('/workspace');
 
   // Close the mobile drawer on route change.
   useEffect(() => {
