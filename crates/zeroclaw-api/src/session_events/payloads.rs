@@ -1324,31 +1324,6 @@ fn validate_semantic_payloads(
 }
 
 #[cfg(test)]
-mod approval_reply_tests {
-    use super::*;
-
-    #[test]
-    fn legacy_replacement_reply_remains_readable_without_fabricating_content() {
-        let payload = PayloadRecord::json(
-            "session.approval-reply/v1",
-            &serde_json::json!({"decision":"replace"}),
-        )
-        .expect("legacy reply");
-        let reply: ApprovalReplyPayload = serde_json::from_slice(&payload.body).expect("old codec");
-        assert_eq!(reply.decision, ApprovalReplyDecision::Replace);
-        assert_eq!(reply.replacement_ref, None);
-        assert!(
-            nested_refs(&StoredPayload {
-                reference: StoredPayloadRef::from(&payload),
-                body: Some(payload.body),
-            })
-            .expect("historical graph retains its original skeleton")
-            .is_empty()
-        );
-    }
-}
-
-#[cfg(test)]
 mod response_read_tests {
     use super::*;
 

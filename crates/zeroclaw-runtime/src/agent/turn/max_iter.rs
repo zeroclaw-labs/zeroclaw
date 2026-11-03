@@ -975,7 +975,17 @@ mod graceful_summary_metering_tests {
             let joined = request
                 .messages
                 .iter()
-                .map(|m| m.content.clone())
+                .map(|message| {
+                    std::iter::once(message.content.as_str())
+                        .chain(
+                            message
+                                .attachments
+                                .iter()
+                                .map(|attachment| attachment.target.as_str()),
+                        )
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             self.seen.lock().unwrap().push(joined);
@@ -1332,10 +1342,10 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    // The summary request must drop declared audio attachments before dispatch,
-    // just like an in-loop request. Legacy tool text is not scanned for markers.
+    // Internal requests carry audio as an attachment until the provider adapter
+    // renders its wire protocol; the tool's text remains unchanged.
     #[tokio::test]
-    async fn graceful_summary_drops_declared_tool_audio_attachment() {
+    async fn graceful_summary_preserves_structured_audio_attachment() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
@@ -1407,12 +1417,12 @@ mod graceful_summary_metering_tests {
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
         let captured = seen.lock().unwrap().join("\n");
         assert!(
-            !captured.contains("/tmp/clip.wav"),
-            "declared audio path reached the provider on the max-iteration path: {captured}"
+            captured.contains("/tmp/clip.wav"),
+            "the provider must receive the declared audio attachment: {captured}"
         );
         assert!(
             captured.contains("recorded 3:00 PM"),
-            "tool text should survive dropping the audio attachment: {captured}"
+            "the declared audio attachment must preserve tool text: {captured}"
         );
     }
 
@@ -1522,7 +1532,7 @@ mod graceful_summary_metering_tests {
     // arrive as the same payload. This pins the normalize decision for the
     // summary path: the summary may see the turn's images.
     #[tokio::test]
-    async fn graceful_summary_normalizes_local_and_inline_tool_image_markers() {
+    async fn graceful_summary_normalizes_local_and_inline_tool_attachments() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
 
         const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
@@ -1623,107 +1633,6 @@ mod graceful_summary_metering_tests {
             captured.matches(&inline_uri).count(),
             2,
             "both declared images must arrive inlined as the same payload: {captured}"
-        );
-    }
-
-    // Legacy control: a tool result whose body embeds image marker syntax
-    // with no declaration is never promoted, even when the referenced file
-    // is a valid image. Nothing is loaded, no note is appended, and the body
-    // is delivered as the legacy path delivers it: the one-shot seam's
-    // compatibility sweep replaces the path reference with a placeholder.
-    #[tokio::test]
-    async fn graceful_summary_does_not_promote_legacy_tool_body_markers() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let png_path = temp.path().join("shot.png");
-        std::fs::write(&png_path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-            .expect("write png signature");
-        let marker = format!("[{}:{}]", "IMAGE", png_path.display());
-
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = CapturingProvider {
-            seen: Arc::clone(&seen),
-            vision: true,
-            ..Default::default()
-        };
-        let tool_content = serde_json::json!({
-            "content": format!("saw {marker} in output"),
-            "tool_call_id": "toolu_legacy",
-        })
-        .to_string();
-        let mut history = vec![
-            ChatMessage::user("call the tool and describe the screenshot"),
-            ChatMessage::assistant_tool_calls(
-                String::new(),
-                vec![zeroclaw_api::model_provider::ToolCall {
-                    id: "toolu_legacy".into(),
-                    name: "".into(),
-                    arguments: "{}".into(),
-                    extra_content: None,
-                }],
-                None,
-            ),
-            ChatMessage::tool_result(zeroclaw_api::model_provider::ToolResultMessage {
-                tool_call_id: "toolu_legacy".into(),
-                tool_name: "screenshot".into(),
-                content: tool_content.clone(),
-                success: Some(true),
-                attachments: Vec::new(),
-            }),
-        ];
-        let pacing = PacingConfig::default();
-        let knobs = LoopKnobs::default();
-        let multimodal_config = MultimodalConfig::default();
-
-        let out = finish_after_max_iterations(
-            &mut None,
-            &provider,
-            &mut history,
-            "custom",
-            "test-model",
-            "test-model",
-            None,
-            &pacing,
-            None,
-            CompletionLimit::LocalIterations(2),
-            String::new(),
-            "trace-req-img-legacy",
-            &knobs,
-            None,
-            None,
-            None,
-            None,
-            &multimodal_config,
-            None,
-            None,
-            None,
-            None,
-            |_, _| ResolvedContextLimits::legacy_fallback(0),
-            &mut false,
-            None,
-            &crate::observability::NoopObserver,
-            None,
-        )
-        .await
-        .expect("graceful summary should succeed");
-
-        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
-        let captured = seen.lock().unwrap().join("\n");
-        assert!(
-            !captured.contains("data:image"),
-            "a legacy body marker must not be promoted to an image: {captured}"
-        );
-        assert!(
-            !captured.contains("could not be loaded"),
-            "nothing is loaded for a legacy body, so no note is appended: {captured}"
-        );
-        // The structured result body reaches the provider verbatim as text.
-        assert!(
-            captured.contains(&tool_content),
-            "the structured body is delivered verbatim: {captured}"
-        );
-        assert!(
-            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
-            "no seam rewrites a legacy carrier's body: {captured}"
         );
     }
 

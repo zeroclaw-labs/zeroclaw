@@ -1904,6 +1904,16 @@ model = "vision-model"
             }]);
         let history = vec![
             ChatMessage::user("read the multimodal source".to_string()),
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "call-test".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                None,
+            ),
             carrier,
         ];
 
@@ -1927,8 +1937,11 @@ model = "vision-model"
             prepare_messages_for_iteration(&history, &MultimodalConfig::default(), true, None)
                 .await
                 .expect("degrade preparation succeeds");
-        assert!(prepared.messages[1].attachments.is_empty());
-        assert_eq!(prepared.messages[1].content, body);
+        assert!(prepared.messages[2].attachments.is_empty());
+        assert_eq!(
+            prepared.messages[2].content,
+            format!("{body}\n\n(media attachment omitted)")
+        );
 
         // A carrier whose body only LOOKS like it carries images never
         // triggers the vision machinery at all: its count is zero.

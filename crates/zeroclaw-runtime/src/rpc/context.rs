@@ -435,11 +435,6 @@ impl RpcContext {
             data_dir.clone(),
         )
         .ok();
-        #[cfg(any(test, feature = "test-util"))]
-        let session_repository = SessionRepository::legacy_fixture(&data_dir)
-            .ok()
-            .map(Arc::new);
-        #[cfg(not(any(test, feature = "test-util")))]
         let session_repository = SessionRepository::new(&data_dir).ok().map(Arc::new);
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         let authority = LiveConfigAuthority::new(config);

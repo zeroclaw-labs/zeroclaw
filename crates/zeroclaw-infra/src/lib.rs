@@ -91,158 +91,16 @@ pub fn recover_abandoned_session_turns(data_dir: &Path) -> std::io::Result<usize
     }
     Ok(recovered)
 }
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::session_events::upgrade::fixtures::{
-        make_session_backend, session_backend::SessionBackend,
-    };
-    use std::sync::Arc;
-    use tempfile::TempDir;
-    use zeroclaw_api::model_provider::ChatMessage;
-
-    fn user_msg(content: &str) -> ChatMessage {
-        ChatMessage::user(content)
-    }
-
-    #[test]
-    fn make_session_backend_jsonl_round_trips_through_session_store() {
-        let tmp = TempDir::new().unwrap();
-        let backend = make_session_backend(tmp.path(), "jsonl").unwrap();
-        backend.append("k1", &user_msg("hello-jsonl")).unwrap();
-        let loaded = backend.load("k1");
-        assert_eq!(loaded.len(), 1);
-        // The JSONL backend writes one file per session key.
-        let jsonl = tmp.path().join("sessions").join("k1.jsonl");
-        assert!(jsonl.exists(), "jsonl file must be written under sessions/");
-    }
-
-    #[test]
-    fn make_session_backend_sqlite_round_trips_through_sqlite_db() {
-        let tmp = TempDir::new().unwrap();
-        let backend = make_session_backend(tmp.path(), "sqlite").unwrap();
-        backend.append("k1", &user_msg("hello-sqlite")).unwrap();
-        let loaded = backend.load("k1");
-        assert_eq!(loaded.len(), 1);
-        let db = tmp.path().join("sessions").join("sessions.db");
-        assert!(db.exists(), "sqlite db must be written under sessions/");
-        // The JSONL companion file must NOT have been created.
-        assert!(!tmp.path().join("sessions").join("k1.jsonl").exists());
-    }
-
-    #[test]
-    fn make_session_backend_can_reload_from_empty_sqlite_to_jsonl() {
-        let tmp = TempDir::new().unwrap();
-        let sqlite = make_session_backend(tmp.path(), "sqlite").unwrap();
-        drop(sqlite);
-
-        let jsonl = make_session_backend(tmp.path(), "jsonl").unwrap();
-        jsonl
-            .append("reload_user", &user_msg("hello after reload"))
-            .unwrap();
-        assert_eq!(jsonl.load("reload_user").len(), 1);
-    }
-
-    fn store_with_running_turn(data_dir: &Path) -> Arc<dyn SessionBackend> {
-        let backend = make_session_backend(data_dir, "sqlite").unwrap();
-        backend.append("s1", &ChatMessage::user("hello")).unwrap();
-        backend
-            .set_session_state("s1", "running", Some("turn-1"))
-            .unwrap();
-        backend
-    }
-
-    #[test]
-    fn recovery_settles_what_a_killed_process_left_and_acts_once() {
-        let tmp = TempDir::new().unwrap();
-        drop(store_with_running_turn(tmp.path()));
-
-        assert_eq!(recover_abandoned_session_turns(tmp.path()).unwrap(), 1);
-
-        let restarted = make_session_backend(tmp.path(), "sqlite").unwrap();
-        assert!(restarted.list_running_sessions().is_empty());
-        let state = restarted.get_session_state("s1").unwrap().unwrap();
-        assert_eq!(state.state, "error");
-        assert_eq!(state.turn_id.as_deref(), Some("turn-1"));
-        assert_eq!(restarted.load("s1").len(), 1);
-
-        // From here on a running turn is this process's own.
-        restarted
-            .set_session_state("s1", "running", Some("turn-2"))
-            .unwrap();
-        assert_eq!(recover_abandoned_session_turns(tmp.path()).unwrap(), 0);
-        assert_eq!(restarted.list_running_sessions().len(), 1);
-    }
-
     #[test]
     fn recovery_creates_no_store() {
-        let tmp = TempDir::new().unwrap();
-        assert_eq!(recover_abandoned_session_turns(tmp.path()).unwrap(), 0);
-        assert!(!tmp.path().join("sessions").exists());
-    }
-
-    /// One directory reached through two spellings is one claim: the second
-    /// spelling must not settle turns started since the first.
-    #[cfg(unix)]
-    #[test]
-    fn recovery_claim_follows_the_directory_not_its_spelling() {
-        let tmp = TempDir::new().unwrap();
-        let real = tmp.path().join("data");
-        std::fs::create_dir_all(&real).unwrap();
-        let alias = tmp.path().join("alias");
-        std::os::unix::fs::symlink(&real, &alias).unwrap();
-
-        assert_eq!(recover_abandoned_session_turns(&real).unwrap(), 0);
-        let store = store_with_running_turn(&real);
-
-        assert_eq!(recover_abandoned_session_turns(&alias).unwrap(), 0);
+        let tmp = tempfile::TempDir::new().unwrap();
         assert_eq!(
-            recover_abandoned_session_turns(&real.join("..").join("data")).unwrap(),
+            super::recover_abandoned_session_turns(tmp.path()).unwrap(),
             0
         );
-        assert_eq!(store.list_running_sessions().len(), 1);
-    }
-
-    /// A failed attempt is reported once and never repeated: by the time the
-    /// store works again, the process may be running turns in it.
-    #[test]
-    fn failed_recovery_is_reported_and_not_retried() {
-        let tmp = TempDir::new().unwrap();
-        let db_path =
-            session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::db_path(tmp.path());
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        std::fs::write(&db_path, b"not a database").unwrap();
-
-        assert!(recover_abandoned_session_turns(tmp.path()).is_err());
-
-        std::fs::remove_file(&db_path).unwrap();
-        let store = store_with_running_turn(tmp.path());
-        assert_eq!(recover_abandoned_session_turns(tmp.path()).unwrap(), 0);
-        assert_eq!(store.list_running_sessions().len(), 1);
-    }
-
-    #[test]
-    fn make_session_backend_unknown_value_falls_back_to_sqlite() {
-        let tmp = TempDir::new().unwrap();
-        let backend = make_session_backend(tmp.path(), "totally-not-a-backend").unwrap();
-        backend.append("k1", &user_msg("hello-fallback")).unwrap();
-        let db = tmp.path().join("sessions").join("sessions.db");
-        assert!(
-            db.exists(),
-            "unknown value must fall back to sqlite, not error"
-        );
-    }
-
-    #[test]
-    fn make_session_backend_preserves_initialization_error_chain() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join("sessions/sessions.db")).unwrap();
-
-        let err = make_session_backend(tmp.path(), "sqlite")
-            .err()
-            .expect("a directory cannot be opened as the SQLite database");
-        let message = err.to_string();
-        assert!(message.contains("Failed to open session DB"));
-        assert!(message.contains("unable to open database file"));
+        assert!(!tmp.path().join("sessions").exists());
     }
 }

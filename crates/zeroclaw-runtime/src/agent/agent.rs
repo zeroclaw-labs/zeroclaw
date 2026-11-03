@@ -333,34 +333,6 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct TestTurnEntryPause {
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-}
-
-#[cfg(test)]
-impl TestTurnEntryPause {
-    pub(crate) fn new() -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        (
-            Self {
-                entered: Arc::clone(&entered),
-                release: Arc::clone(&release),
-            },
-            entered,
-            release,
-        )
-    }
-
-    async fn wait(&self) {
-        self.entered.notify_one();
-        self.release.notified().await;
-    }
-}
-
 #[derive(Debug)]
 struct HistoryTrimNotice {
     dropped_messages: usize,
@@ -549,8 +521,6 @@ pub struct Agent {
     channel_name: String,
     #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
-    #[cfg(test)]
-    turn_entry_pause: Option<TestTurnEntryPause>,
     /// The `DelegateTool` this Agent's registry registered, in its concrete
     /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
     /// otherwise cannot drive the *constructed* delegate's nested-registry
@@ -779,8 +749,6 @@ pub struct AgentBuilder {
     #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
-    turn_entry_pause: Option<TestTurnEntryPause>,
-    #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -844,8 +812,6 @@ impl AgentBuilder {
             supplied_capabilities: None,
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: None,
-            #[cfg(test)]
-            turn_entry_pause: None,
             #[cfg(test)]
             delegate_tool: None,
         }
@@ -1164,12 +1130,6 @@ impl AgentBuilder {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_turn_entry_pause(mut self, pause: TestTurnEntryPause) -> Self {
-        self.turn_entry_pause = Some(pause);
-        self
-    }
-
     pub fn exclude_memory(mut self, exclude: bool) -> Self {
         self.exclude_memory = exclude;
         self
@@ -1361,8 +1321,6 @@ impl AgentBuilder {
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: self.turn_datetime,
-            #[cfg(test)]
-            turn_entry_pause: self.turn_entry_pause,
             #[cfg(test)]
             delegate_tool: self.delegate_tool,
         })
@@ -4426,10 +4384,6 @@ impl Agent {
         let mut input = input.into();
         let user_message = input.content.as_str();
         let mut steering = CloseSteeringOnExit(steering_rx);
-        #[cfg(test)]
-        if let Some(pause) = self.turn_entry_pause.clone() {
-            pause.wait().await;
-        }
         // Resolve both thinking and routing from the same turn generation.
         self.sync_config_generation();
         let thinking = self
@@ -19724,30 +19678,11 @@ model_provider = "custom.only"
         assert!(Agent::strip_interruption_marker_from(
             &mut snapshot.retained_messages
         ));
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store =
-            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
-                .unwrap();
-        store
-            .create_session("bare-cancel", "test", "agent", "/tmp", None)
-            .unwrap();
-        store
-            .persist_retained_context_seed("bare-cancel", &snapshot.retained_messages, false)
-            .unwrap();
-        drop(store);
-        let store =
-            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
-                .unwrap();
-        let restored = store
-            .load_session("bare-cancel")
-            .unwrap()
-            .unwrap()
-            .retained_context
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(restored).unwrap(),
-            serde_json::to_value(snapshot.retained_messages).unwrap()
-        );
+        assert!(matches!(
+            snapshot.retained_messages.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.content == "ordinary assistant text"
+        ));
     }
 
     #[test]

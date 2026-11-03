@@ -508,7 +508,13 @@ mod tests {
             .insert("victim".to_string(), AliasedAgentConfig::default());
         config.heartbeat.enabled = true;
         config.heartbeat.agent = "victim".to_string();
-        SessionRepository::legacy_fixture(&config.data_dir)
+        zeroclaw_infra::session_events::upgrade::upgrade_installation(
+            &config.data_dir,
+            zeroclaw_infra::session_events::installation::NativeBackend::Sqlite,
+            |_| "victim".into(),
+        )
+        .unwrap();
+        SessionRepository::new(&config.data_dir)
             .unwrap()
             .create_session("live", "test", "victim", "/tmp/victim", None)
             .unwrap();

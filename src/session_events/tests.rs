@@ -1137,17 +1137,15 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
                 .await
                 .is_err()
         );
-        let family = if cli {
-            reopened
-                .sessions()
-                .await
-                .expect("families")
-                .into_iter()
-                .find(|family| family.starts_with("cli:"))
-                .expect("CLI family")
-        } else {
-            "interrupted-family".to_owned()
-        };
+        let family = session
+            .history_reader()
+            .expect("bound history reader")
+            .current()
+            .await
+            .expect("current session")
+            .head
+            .session_id
+            .to_string();
         let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
             directory.path(),
             &family,

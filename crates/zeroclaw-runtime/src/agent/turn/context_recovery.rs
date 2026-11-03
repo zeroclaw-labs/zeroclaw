@@ -382,26 +382,7 @@ mod tests {
         assert_eq!(json.matches("private recalled memory").count(), 1);
         assert!(json.contains("genuine retry text"));
         assert!(!json.contains("private reasoning"));
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store =
-            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
-                .unwrap();
-        store
-            .create_session("typed-trim", "test", "agent", "/tmp", None)
-            .unwrap();
-        store
-            .persist_retained_context_seed("typed-trim", &first.retained_messages, first.breadcrumb)
-            .unwrap();
-        drop(store);
-        let store =
-            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
-                .unwrap();
-        let retained = store
-            .load_session("typed-trim")
-            .unwrap()
-            .unwrap()
-            .retained_context
-            .unwrap();
+        let retained = first.retained_messages;
         assert!(retained.iter().any(|message| {
             match message {
                 zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {

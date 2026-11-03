@@ -1910,16 +1910,17 @@ mod collapse_tests {
         assert_eq!(c.collapsed_turns, 2);
         assert_eq!(c.dropped_messages, 4);
         assert_eq!(count_turns(&c.messages), 3);
-        assert!(
-            !c.messages
-                .iter()
-                .any(|m| m.content == "[Tool results]\nresult 1")
-        );
-        assert!(
-            c.messages
-                .iter()
-                .any(|m| m.content == "[Tool results]\nresult 3")
-        );
+        assert!(!c.messages.iter().any(|m| {
+            m.tool_result
+                .as_ref()
+                .is_some_and(|result| result.tool_call_id == "call_1")
+        }));
+        assert!(c.messages.iter().any(|m| {
+            m.tool_result
+                .as_ref()
+                .is_some_and(|result| result.tool_call_id == "call_3")
+                && m.content == "result 3"
+        }));
         assert_eq!(c.messages[2].content, "answer 1");
     }
 
