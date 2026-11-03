@@ -249,8 +249,9 @@ mod tests {
 
     // ── Shell-free runtime ───────────────────────────────────
     //
-    // Android pins its shell to `/system/bin/sh` and never reports it absent,
-    // so these cases do not apply there.
+    // Android pins its shell to `/system/bin/sh`: it never reports the shell
+    // absent and `validate_shell` accepts any configured value, so these cases
+    // do not apply there.
 
     #[cfg(all(unix, not(target_os = "android")))]
     fn assert_reports_no_shell(rt: &dyn RuntimeAdapter) {
