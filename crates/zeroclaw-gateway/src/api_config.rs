@@ -2912,6 +2912,31 @@ pub async fn handle_patch(
         }
     }
 
+    // Each create above was admitted against the batch as it stood at that
+    // op. A later op can move the knowledge store, so admit the completed
+    // batch's new aliases again against the store it will save.
+    let before = state.config.read().clone();
+    if let Err(retirement) =
+        zeroclaw_config::alias_refs::ensure_created_agents_retired(&before, &working)
+    {
+        // Report on the op that created the alias, in the per-op refusal's shape.
+        let creating_op = ops.iter().enumerate().find_map(|(idx, op)| {
+            let path = json_pointer_to_dotted(&op.path);
+            (matches!(op.op.as_str(), "add" | "replace")
+                && zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path)
+                    == Some(retirement.alias()))
+            .then_some((idx, path))
+        });
+        let fallback_path = format!("agents.{}", retirement.alias());
+        let refusal = alias_create_refusal(zeroclaw_config::alias_refs::CreateError::Retirement(
+            retirement,
+        ));
+        return error_response(match creating_op {
+            Some((idx, path)) => refusal.with_path(path).with_op_index(idx),
+            None => refusal.with_path(fallback_path),
+        });
+    }
+
     // Per-PATCH validation is scoped to the dirty paths. See
     // `scoped_validate` for the contract.
     let scoped_validation_warnings = match scoped_validate(&working) {
@@ -2938,7 +2963,6 @@ pub async fn handle_patch(
     // effect against the configuration being replaced, `remove` pinned to
     // the removal it is. One unauthorized member refuses the whole batch
     // before anything is written.
-    let before = state.config.read().clone();
     let mut writes = ConfigWriteSet::by_effect(
         &before,
         &working,
@@ -4222,6 +4246,98 @@ mod tests {
         let snapshot = graph.export_owner("retired").unwrap();
         graph.purge_archived_owner("retired", &snapshot).unwrap();
         let (status, json) = response_json(put(&state).await).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(state.config.read().agents.contains_key("retired"));
+    }
+
+    /// A patch that creates an agent while the configured store is empty and
+    /// then points `knowledge.db_path` at a store holding that alias's
+    /// retained rows is refused on the creating op, exactly as the reverse
+    /// order is, and saves nothing.
+    #[tokio::test]
+    async fn patch_cannot_recreate_agent_by_moving_the_store_after_creating_it() {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        let retained = tmp.path().join("retained.db");
+        drop(
+            KnowledgeGraph::new(&retained, 100)
+                .unwrap()
+                .add_node(
+                    &KnowledgeScope::for_agent("retired", Vec::<String>::new()),
+                    NodeType::Pattern,
+                    "retained",
+                    "retired agent knowledge",
+                    &[],
+                    None,
+                )
+                .unwrap(),
+        );
+        let empty = tmp.path().join("empty.db");
+        config.knowledge.db_path = empty.to_string_lossy().into_owned();
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let config_path = state.config.read().config_path.clone();
+        let disk_before = std::fs::read(&config_path).unwrap();
+        let patch = |state: &AppState, ops: serde_json::Value| {
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(ops),
+            )
+        };
+        let create = serde_json::json!({
+            "op": "add",
+            "path": "/agents/retired/enabled",
+            "value": true,
+        });
+        let move_store = |path: &std::path::Path| {
+            serde_json::json!({
+                "op": "replace",
+                "path": "/knowledge/db_path",
+                "value": path.to_string_lossy(),
+            })
+        };
+
+        for (ops, creating_op) in [
+            (serde_json::json!([create, move_store(&retained)]), 0),
+            (serde_json::json!([move_store(&retained), create]), 1),
+        ] {
+            let (status, json) = response_json(patch(&state, ops).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert_eq!(json["code"], "validation_failed");
+            assert_eq!(json["path"], "agents.retired.enabled", "{json}");
+            assert_eq!(json["op_index"], creating_op, "{json}");
+            assert!(
+                json["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("still owns knowledge")),
+                "{json}"
+            );
+            assert!(!state.config.read().agents.contains_key("retired"));
+            assert_eq!(
+                state.config.read().knowledge.resolved_db_path(),
+                empty,
+                "a refused batch must not move the store"
+            );
+            assert_eq!(
+                std::fs::read(&config_path).unwrap(),
+                disk_before,
+                "refused batches must not persist"
+            );
+        }
+
+        // Moving to a store without that alias's rows is admitted.
+        let (status, json) = response_json(
+            patch(
+                &state,
+                serde_json::json!([create, move_store(&tmp.path().join("fresh.db"))]),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{json}");
         assert!(state.config.read().agents.contains_key("retired"));
     }
@@ -5847,6 +5963,87 @@ mod tests {
             "an unrelated `gone -> to` with no residue must surface an error, not be silently treated as a resume"
         );
         // Config untouched: no rename happened, `to` still present, `gone` absent.
+        assert!(state.config.read().agents.contains_key("to"));
+        assert!(!state.config.read().agents.contains_key("gone"));
+    }
+
+    /// Rename never re-points control-plane task records, so records left
+    /// under the absent source are not rename residue: a repeated rename is
+    /// not accepted as a resume of an earlier one.
+    #[tokio::test]
+    async fn agent_rename_with_only_task_records_left_is_not_treated_as_resume() {
+        use zeroclaw_runtime::control_plane::{
+            SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.memory.backend = "none".into();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .into_owned();
+        config.agents.insert(
+            "to".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.entry("default".into()).or_default();
+        config.runtime_profiles.entry("default".into()).or_default();
+        SqliteTaskStore::new(&config.data_dir)
+            .unwrap()
+            .create(TaskRecord {
+                id: "renamed-task".into(),
+                kind: TaskKind::Delegate,
+                agent: "gone".into(),
+                status: TaskStatus::Completed,
+                owner_pid: 0,
+                owner_boot_id: String::new(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                originator_chain: Vec::new(),
+                delivered: true,
+                idem_key: None,
+                principal_id: None,
+                started_at: "2026-08-26T00:00:00Z".into(),
+                finished_at: Some("2026-08-26T00:00:01Z".into()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            zeroclaw_runtime::agent_owned_state::committed_delete_residue_exists(
+                &config, None, None, "gone"
+            )
+            .await,
+            "precondition: the task record is still delete residue"
+        );
+
+        let state = crate::api::test_state(config.clone());
+        let body = RenameMapKeyBody {
+            path: "agents".to_string(),
+            from: "gone".to_string(),
+            to: "to".to_string(),
+        };
+        let guard = state.begin_config_commit().await.unwrap();
+        let resp = rename_agent_cascade(
+            &state,
+            &None,
+            config.clone(),
+            &body,
+            guard,
+            test_agent_rename_leases(&state, &body),
+        )
+        .await;
+
+        assert!(
+            !resp.status().is_success(),
+            "a task record alone must not turn `gone -> to` into a resume"
+        );
         assert!(state.config.read().agents.contains_key("to"));
         assert!(!state.config.read().agents.contains_key("gone"));
     }

@@ -9483,6 +9483,33 @@ impl RpcDispatcher {
                 )
             })?;
         }
+        // Each entry above admitted its new alias against the batch as it
+        // stood then. A later entry can move the knowledge store, so admit the
+        // completed batch's new aliases again against the store it will save,
+        // reported on the entry that created the alias.
+        if let Err(retirement) =
+            zeroclaw_config::alias_refs::ensure_created_agents_retired(&old_config, &config)
+        {
+            let alias = retirement.alias().to_owned();
+            let reason = alias_create_refusal_message(
+                &zeroclaw_config::alias_refs::CreateError::Retirement(retirement),
+            );
+            let message = match req.sets.iter().enumerate().find(|(_, entry)| {
+                zeroclaw_config::alias_refs::agent_alias_for_prop_path(&entry.prop)
+                    == Some(alias.as_str())
+            }) {
+                Some((index, entry)) => crate::i18n::get_required_cli_string_with_args(
+                    "rpc-config-set-many-entry-rejected",
+                    &[
+                        ("index", &index.to_string()),
+                        ("prop", &entry.prop),
+                        ("reason", &reason),
+                    ],
+                ),
+                None => reason,
+            };
+            return Err(rpc_err(INVALID_PARAMS, message));
+        }
         // The request paths describe the affected live views; the candidate
         // config remains their canonical source. Prepare all affected sessions
         // before the one commit, including batches that change several routes.
@@ -37661,6 +37688,76 @@ mod tests {
                 .is_none(),
             "a recreated agent must not read the retired agent's rows"
         );
+    }
+
+    /// `config/set-many` admits each new alias against the batch as it stood
+    /// at that entry, then again against the completed batch: creating an
+    /// agent and only afterwards pointing `knowledge.db_path` at a store that
+    /// holds that alias's retained rows is refused on the creating entry, as
+    /// the reverse order is, and nothing is saved.
+    #[tokio::test]
+    async fn config_set_many_readmits_new_agents_against_the_completed_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_delete_test_config(&tmp);
+        let retained = tmp.path().join("retained.db");
+        let mut seeded = config.clone();
+        seeded.knowledge.db_path = retained.to_string_lossy().into_owned();
+        seed_agent_knowledge(&seeded, "retired", "retired-agent-marker");
+        let empty = tmp.path().join("empty.db");
+        config.knowledge.db_path = empty.to_string_lossy().into_owned();
+        config.save().await.unwrap();
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let config_path = dispatcher.ctx.config.read().config_path.clone();
+        let disk_before = std::fs::read(&config_path).unwrap();
+        let create = json!({"prop": "agents.retired.delegate_same_risk_profile", "value": true});
+        let move_store = |path: &std::path::Path| json!({"prop": "knowledge.db_path", "value": path.to_string_lossy()});
+        let reason =
+            alias_create_refusal_message(&zeroclaw_config::alias_refs::CreateError::Retirement(
+                zeroclaw_config::alias_refs::RetiredKnowledgeError::Retained {
+                    alias: "retired".into(),
+                },
+            ));
+
+        for (sets, creating_entry) in [
+            (json!([create.clone(), move_store(&retained)]), 0),
+            (json!([move_store(&retained), create.clone()]), 1),
+        ] {
+            let err = dispatcher
+                .handle_config_set_many(&json!({ "sets": sets }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, INVALID_PARAMS, "{}", err.message);
+            assert_eq!(
+                err.message,
+                crate::i18n::get_required_cli_string_with_args(
+                    "rpc-config-set-many-entry-rejected",
+                    &[
+                        ("index", &creating_entry.to_string()),
+                        ("prop", "agents.retired.delegate_same_risk_profile"),
+                        ("reason", &reason),
+                    ],
+                )
+            );
+            assert!(!dispatcher.ctx.config.read().agents.contains_key("retired"));
+            assert_eq!(
+                dispatcher.ctx.config.read().knowledge.resolved_db_path(),
+                empty
+            );
+            assert_eq!(
+                std::fs::read(&config_path).unwrap(),
+                disk_before,
+                "refused batches must not persist"
+            );
+        }
+
+        // Moving to a store without that alias's rows is admitted.
+        dispatcher
+            .handle_config_set_many(&json!({
+                "sets": [create, move_store(&tmp.path().join("fresh.db"))]
+            }))
+            .await
+            .unwrap();
+        assert!(dispatcher.ctx.config.read().agents.contains_key("retired"));
     }
 
     #[tokio::test]

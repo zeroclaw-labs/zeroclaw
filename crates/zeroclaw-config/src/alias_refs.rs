@@ -618,6 +618,15 @@ impl std::fmt::Display for RetiredKnowledgeError {
 
 impl std::error::Error for RetiredKnowledgeError {}
 
+impl RetiredKnowledgeError {
+    /// The alias whose admission was refused.
+    pub fn alias(&self) -> &str {
+        match self {
+            Self::Retained { alias } | Self::Uninspectable { alias, .. } => alias,
+        }
+    }
+}
+
 /// Admission rule for a new key under `section`, shared by explicit creation
 /// ([`create_map_key_checked`]) and property-path auto-creation
 /// ([`Config::ensure_map_key_for_path`]) so the two paths cannot drift. Only
@@ -708,6 +717,32 @@ pub fn ensure_knowledge_owner_retired(
         }),
         Err(error) => Err(uninspectable(error.to_string())),
     }
+}
+
+/// Re-admit every agent alias that `after` adds to `before`, against the
+/// knowledge store `after` names.
+///
+/// Batch surfaces (gateway patch, RPC `config/set-many`, CLI `config patch`)
+/// admit each new alias against the batch as it stood at that member. A
+/// later member can still point `knowledge.db_path` at another store, so the
+/// completed batch is checked again before it is saved: a batch that leaves a
+/// new alias over that alias's retained rows is refused whatever its order.
+/// An earlier member is still refused against the store configured at that
+/// point. The first refused alias, in sorted order, is returned.
+pub fn ensure_created_agents_retired(
+    before: &Config,
+    after: &Config,
+) -> Result<(), RetiredKnowledgeError> {
+    let mut created: Vec<&str> = after
+        .agents
+        .keys()
+        .filter(|alias| !before.agents.contains_key(*alias))
+        .map(String::as_str)
+        .collect();
+    created.sort_unstable();
+    created
+        .into_iter()
+        .try_for_each(|alias| ensure_knowledge_owner_retired(after, alias))
 }
 
 /// Whether the knowledge store still holds rows with no owner, which startup
@@ -1707,6 +1742,62 @@ mod tests {
         assert!(matches!(
             cfg.ensure_map_key_for_path("agents.default.enabled"),
             Err(CreateError::Reserved(_))
+        ));
+    }
+
+    /// A batch that creates an alias and then moves the store is checked
+    /// against the store it leaves configured. Aliases the batch did not
+    /// add are never probed, since a configured agent owns its own rows.
+    #[test]
+    fn created_agents_are_readmitted_against_the_completed_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let retained = tmp.path().join("retained.db");
+        let conn = rusqlite::Connection::open(&retained).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (owner_agent TEXT); CREATE TABLE edges (owner_agent TEXT); \
+             INSERT INTO nodes VALUES ('retired'); INSERT INTO edges VALUES ('live');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut before = empty_config();
+        before
+            .agents
+            .insert("live".into(), AliasedAgentConfig::default());
+        before.knowledge.db_path = tmp.path().join("empty.db").to_string_lossy().into_owned();
+
+        // Created while the batch still named the empty store, then moved.
+        let mut after = before.clone();
+        assert!(
+            after
+                .ensure_map_key_for_path("agents.retired.enabled")
+                .is_ok()
+        );
+        after.knowledge.db_path = retained.to_string_lossy().into_owned();
+        let refusal = ensure_created_agents_retired(&before, &after).unwrap_err();
+        assert_eq!(
+            refusal,
+            RetiredKnowledgeError::Retained {
+                alias: "retired".into()
+            }
+        );
+        assert_eq!(refusal.alias(), "retired");
+
+        // The same batch against a store with no retained rows is admitted,
+        // and `live`, which the batch did not add, is never refused for its rows.
+        let mut unchanged = after.clone();
+        unchanged.agents.remove("retired");
+        assert!(ensure_created_agents_retired(&before, &unchanged).is_ok());
+        after.knowledge.db_path = tmp.path().join("empty.db").to_string_lossy().into_owned();
+        assert!(ensure_created_agents_retired(&before, &after).is_ok());
+
+        // An unreadable completed store refuses the new alias as well.
+        let blocked = tmp.path().join("blocked.db");
+        std::fs::create_dir(&blocked).unwrap();
+        after.knowledge.db_path = blocked.to_string_lossy().into_owned();
+        assert!(matches!(
+            ensure_created_agents_retired(&before, &after),
+            Err(RetiredKnowledgeError::Uninspectable { ref alias, .. }) if alias == "retired"
         ));
     }
 

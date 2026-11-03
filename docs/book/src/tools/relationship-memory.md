@@ -75,7 +75,13 @@ knowledge is refused, including when that residue cannot be inspected. The
 refusal covers explicit creation and every property write that would create
 the agent: `zeroclaw config set` and `zeroclaw config patch`, the gateway
 property and patch APIs, RPC `config/set` and `config/set-many`, and the
-`model_routing_config` tool's `upsert_agent` action. Retry the delete until it
+`model_routing_config` tool's `upsert_agent` action. A patch or
+`config/set-many` batch is checked again once it is complete, so a batch that
+creates the agent and moves `knowledge.db_path` onto a store that still holds
+that agent's rows is refused in either order. The check reads the store
+configured when the agent is created; pointing
+`knowledge.db_path` at another store later adopts that store's rows for every
+configured agent, as relocating the file does. Retry the delete until it
 converges, then create the agent again. An environment override that names a
 new agent is applied when config loads and is not checked, so do not
 reintroduce a retired alias that way before its delete converges. A stale

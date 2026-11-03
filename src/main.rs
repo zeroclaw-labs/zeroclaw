@@ -13320,6 +13320,7 @@ Add pricing to the active provider profile or supply a catalog entry."
 
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
 
+                let patch_base = config.clone();
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
                 for (idx, op) in ops.iter().enumerate() {
@@ -13576,6 +13577,43 @@ Add pricing to the active provider profile or supply a catalog entry."
                         }
                     };
                     results.push(result_entry);
+                }
+
+                // Each create above was admitted against the patch as it stood
+                // at that op. A later op can move the knowledge store, so admit
+                // the completed patch's new aliases again against the store it
+                // will save, reported on the op that created the alias.
+                if let Err(retirement) =
+                    zeroclaw_config::alias_refs::ensure_created_agents_retired(&patch_base, &config)
+                {
+                    // `results` holds one entry per op, so its index is the op
+                    // index; report in the per-op refusal's shape.
+                    let creating_op = results.iter().enumerate().find_map(|(idx, entry)| {
+                        let op_name = entry.get("op").and_then(|op| op.as_str())?;
+                        let path = entry.get("path").and_then(|path| path.as_str())?;
+                        (matches!(op_name, "add" | "replace")
+                            && zeroclaw_config::alias_refs::agent_alias_for_prop_path(path)
+                                == Some(retirement.alias()))
+                        .then(|| (idx, op_name.to_owned(), path.to_owned()))
+                    });
+                    let fallback_path = format!("agents.{}", retirement.alias());
+                    let error = zeroclaw_config::alias_refs::CreateError::Retirement(retirement);
+                    let refusal =
+                        ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string());
+                    let (err, human) = match creating_op {
+                        Some((idx, op_name, path)) => (
+                            refusal.with_path(&path).with_op_index(idx),
+                            format!(
+                                "op[{idx}] `{op_name}` on `{path}`: {}",
+                                alias_create_refusal_text(&error)
+                            ),
+                        ),
+                        None => (
+                            refusal.with_path(&fallback_path),
+                            format!("`{fallback_path}`: {}", alias_create_refusal_text(&error)),
+                        ),
+                    };
+                    config_patch_fail_json_or_human(json, err, human)?;
                 }
 
                 if let Err(err) = config.validate() {

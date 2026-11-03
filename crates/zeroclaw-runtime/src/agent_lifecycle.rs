@@ -312,6 +312,17 @@ mod tests {
             )
             .await
         );
+        // Rename does not re-point task records, so they are never rename
+        // residue: a repeated rename must not resume forever over them.
+        assert!(
+            !crate::agent_owned_state::committed_rename_residue_exists(
+                &config,
+                Some(&memory),
+                None,
+                "victim"
+            )
+            .await
+        );
         let report =
             cascade_owned_state(&config, Some(&memory), None, "victim", &archive_dir).await;
 

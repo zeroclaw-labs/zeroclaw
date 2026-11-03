@@ -193,11 +193,14 @@ enum CommittedLifecycle {
 /// Does durable owned state still exist for `alias` after its config mutation
 /// is already committed?
 ///
-/// Delete and rename share every physical store probe, but memory deliberately
-/// has distinct canonical predicates: delete recovery only needs rows that
-/// require purging, while rename recovery must also detect the stable agent
-/// identity row moved by `Memory::rename_agent` when it owns zero memories.
-/// Both modes fail toward residue when state cannot be inspected.
+/// Each mode probes exactly the stores its cascade changes. Delete purges
+/// control-plane task records and rename does not re-point them, so only
+/// delete counts them; a renamed agent's old task records would otherwise
+/// read as rename residue forever. Memory deliberately has distinct canonical
+/// predicates: delete recovery only needs rows that require purging, while
+/// rename recovery must also detect the stable agent identity row moved by
+/// `Memory::rename_agent` when it owns zero memories. Both modes fail toward
+/// residue when state cannot be inspected.
 async fn committed_residue_exists(
     config: &Config,
     mem: Option<&Arc<dyn Memory>>,
@@ -217,8 +220,9 @@ async fn committed_residue_exists(
         return true;
     }
 
-    if crate::control_plane::SqliteTaskStore::count_existing_by_agent(&config.data_dir, alias)
-        .map_or(true, |count| count > 0)
+    if matches!(lifecycle, CommittedLifecycle::Delete)
+        && crate::control_plane::SqliteTaskStore::count_existing_by_agent(&config.data_dir, alias)
+            .map_or(true, |count| count > 0)
     {
         return true;
     }
