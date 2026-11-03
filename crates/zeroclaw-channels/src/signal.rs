@@ -17,7 +17,7 @@ use zeroclaw_api::channel::{
     ApprovalPromptOutcome, Channel, ChannelApprovalRequest, ChannelApprovalResponse,
     ChannelMessage, SendMessage, await_approval_prompt_send,
 };
-use zeroclaw_api::media::{MarkerKind, MediaAttachment, RenderedMarker};
+use zeroclaw_api::media::{AttachmentKind, AttachmentReference, MediaAttachment};
 
 const GROUP_TARGET_PREFIX: &str = "group:";
 
@@ -39,12 +39,6 @@ const SIGNAL_RPC_ENVELOPE_BYTES: u64 = 64 * 1024;
 
 /// Workspace subdirectory that inbound attachments are saved into.
 const SIGNAL_ATTACHMENT_SAVE_SUBDIR: &str = "signal_files";
-
-/// Outbound marker kinds sent as signal-cli attachments. `LOCATION` is left
-/// out on purpose: Signal has no location message, so it stays as text.
-const SIGNAL_OUTBOUND_MARKER_KINDS: &[&str] = &[
-    "IMAGE", "PHOTO", "DOCUMENT", "FILE", "VIDEO", "AUDIO", "VOICE",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RecipientTarget {
@@ -723,14 +717,6 @@ impl SignalChannel {
             match fetched {
                 Ok(media) => {
                     remaining = remaining.saturating_sub(media.data.len() as u64);
-                    if let Some(marker) = &media.marker {
-                        if !msg.content.is_empty() {
-                            msg.content.push('\n');
-                        }
-                        let label = marker_label(marker.kind);
-                        msg.content
-                            .push_str(&format!("[{label}:{}]", marker.target));
-                    }
                     msg.attachments.push(media);
                 }
                 Err(e) => {
@@ -805,12 +791,12 @@ impl SignalChannel {
             .unwrap_or("attachment")
             .to_string();
         let content_type = att.content_type.as_deref().filter(|ct| !ct.is_empty());
-        let kind = inbound_marker_kind(content_type.unwrap_or_default(), &file_name, &data);
-        // `file_name` stays as sent for display; the saved copy gets a name
-        // its own marker can carry.
-        let stored_name = marker_safe_file_name(&file_name);
+        let kind = inbound_attachment_kind(content_type.unwrap_or_default(), &file_name, &data);
+        // `file_name` stays as sent for display; the saved copy is referenced
+        // structurally so downstream code never has to parse message text.
+        let stored_name = safe_file_name(&file_name);
 
-        let marker = match self.workspace_dir.as_deref() {
+        let reference = match self.workspace_dir.as_deref() {
             Some(workspace) => save_inbound_attachment(workspace, &stored_name, &data)
                 .await
                 .inspect_err(|e| {
@@ -825,7 +811,7 @@ impl SignalChannel {
                     );
                 })
                 .ok()
-                .map(|path| RenderedMarker {
+                .map(|path| AttachmentReference {
                     target: path.display().to_string(),
                     kind,
                 }),
@@ -836,45 +822,45 @@ impl SignalChannel {
             file_name,
             data,
             mime_type: content_type.map(str::to_owned),
-            marker,
+            reference,
         })
     }
 
-    /// Split outbound media markers out of `content`. Resolved markers become
-    /// signal-cli attachments; unresolved ones are dropped, logged, and
-    /// summarized in a count-only note. Content without markers is returned
-    /// unchanged.
-    async fn prepare_outbound(&self, content: &str) -> (String, Vec<String>) {
-        let (cleaned, markers) =
-            crate::util::parse_attachment_markers_of_kinds(content, SIGNAL_OUTBOUND_MARKER_KINDS);
-        if markers.is_empty() {
-            return (content.to_string(), Vec::new());
-        }
-
-        let mut text = cleaned;
+    /// Encode structured attachments for signal-cli. Body text is never
+    /// parsed as attachment metadata.
+    async fn prepare_outbound(&self, message: &SendMessage) -> (String, Vec<String>) {
+        let mut text = message.content.clone();
         let mut attachments = Vec::new();
         let mut failed = 0usize;
         // Every encoded file is held until `send` serializes the request, so
         // the files together must fit the message's attachment budget.
         let mut remaining = self.attachment_budget;
-        for (kind, target) in &markers {
-            match self.resolve_outbound_marker(target, remaining).await {
+        for media in &message.attachments {
+            let resolved = if media.data.is_empty() {
+                if let Some(reference) = &media.reference {
+                    self.resolve_outbound_attachment(&reference.target, remaining)
+                        .await
+                } else {
+                    Ok((encode_signal_attachment(media), 0))
+                }
+            } else if media.data.len() as u64 > remaining.min(SIGNAL_MAX_ATTACHMENT_BYTES) {
+                Err(SignalAttachmentError::Failed("over_budget"))
+            } else {
+                Ok((encode_signal_attachment(media), media.data.len() as u64))
+            };
+            match resolved {
                 Ok((attachment, file_len)) => {
                     remaining = remaining.saturating_sub(file_len);
                     attachments.push(attachment);
                 }
-                Err(err) => {
+                Err(error) => {
                     failed += 1;
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "kind": kind,
-                                "outcome": err.outcome(),
-                                "reason": err.reason(),
-                            })),
-                        "signal: dropping unresolved outbound attachment marker"
+                            .with_attrs(serde_json::json!({"reason": error.reason()})),
+                        "signal: dropping undeliverable structured attachment"
                     );
                 }
             }
@@ -897,49 +883,49 @@ impl SignalChannel {
     /// share ZeroClaw's filesystem. A file larger than `budget` (what remains
     /// of the message's attachment budget) is never read. Returns the URI and
     /// the file's size.
-    async fn resolve_outbound_marker(
+    async fn resolve_outbound_attachment(
         &self,
         target: &str,
         budget: u64,
-    ) -> Result<(String, u64), SignalMarkerError> {
+    ) -> Result<(String, u64), SignalAttachmentError> {
         use tokio::io::AsyncReadExt as _;
 
         let target = target.trim();
         if target.contains("://") || target.starts_with("data:") || target.starts_with("file:") {
-            return Err(SignalMarkerError::Refused("scheme"));
+            return Err(SignalAttachmentError::Refused("scheme"));
         }
         let workspace = self
             .workspace_dir
             .as_deref()
-            .ok_or(SignalMarkerError::Refused("no_workspace"))?;
+            .ok_or(SignalAttachmentError::Refused("no_workspace"))?;
         let workspace = tokio::fs::canonicalize(workspace)
             .await
-            .map_err(|_| SignalMarkerError::Refused("no_workspace"))?;
+            .map_err(|_| SignalAttachmentError::Refused("no_workspace"))?;
 
         // `join` keeps an absolute target as-is and anchors a relative one in
         // the workspace; canonicalizing then resolves `..` and symlinks.
         let path = match tokio::fs::canonicalize(workspace.join(target)).await {
             Ok(path) => path,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(SignalMarkerError::Failed("not_found"));
+                return Err(SignalAttachmentError::Failed("not_found"));
             }
-            Err(_) => return Err(SignalMarkerError::Failed("read_error")),
+            Err(_) => return Err(SignalAttachmentError::Failed("read_error")),
         };
         if !path.starts_with(&workspace) {
-            return Err(SignalMarkerError::Refused("outside_workspace"));
+            return Err(SignalAttachmentError::Refused("outside_workspace"));
         }
 
         let metadata = tokio::fs::metadata(&path)
             .await
-            .map_err(|_| SignalMarkerError::Failed("read_error"))?;
+            .map_err(|_| SignalAttachmentError::Failed("read_error"))?;
         if !metadata.is_file() {
-            return Err(SignalMarkerError::Failed("not_a_file"));
+            return Err(SignalAttachmentError::Failed("not_a_file"));
         }
         let size_error = |len: u64| {
             if len > SIGNAL_MAX_ATTACHMENT_BYTES {
-                SignalMarkerError::Failed("too_large")
+                SignalAttachmentError::Failed("too_large")
             } else {
-                SignalMarkerError::Failed("over_budget")
+                SignalAttachmentError::Failed("over_budget")
             }
         };
         let limit = budget.min(SIGNAL_MAX_ATTACHMENT_BYTES);
@@ -951,11 +937,11 @@ impl SignalChannel {
         let mut data = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
         tokio::fs::File::open(&path)
             .await
-            .map_err(|_| SignalMarkerError::Failed("read_error"))?
+            .map_err(|_| SignalAttachmentError::Failed("read_error"))?
             .take(limit + 1)
             .read_to_end(&mut data)
             .await
-            .map_err(|_| SignalMarkerError::Failed("read_error"))?;
+            .map_err(|_| SignalAttachmentError::Failed("read_error"))?;
         let file_len = data.len() as u64;
         if file_len > limit {
             return Err(size_error(file_len));
@@ -1005,21 +991,14 @@ impl SignalChannel {
 /// Why an outbound media marker was not attached. Neither variant carries the
 /// target, so logging one cannot leak a local path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SignalMarkerError {
+enum SignalAttachmentError {
     /// Trust-boundary refusal: the target was never read.
     Refused(&'static str),
     /// Allowed, but the file could not be delivered.
     Failed(&'static str),
 }
 
-impl SignalMarkerError {
-    fn outcome(self) -> &'static str {
-        match self {
-            Self::Refused(_) => "refused",
-            Self::Failed(_) => "failed",
-        }
-    }
-
+impl SignalAttachmentError {
     fn reason(self) -> &'static str {
         match self {
             Self::Refused(reason) | Self::Failed(reason) => reason,
@@ -1031,30 +1010,33 @@ impl SignalMarkerError {
 /// payload is only an image when the provider loader accepts it; otherwise it
 /// renders as a document so the shared pipeline never re-inlines bytes the
 /// provider rejects (the same rule as Discord's `marker_kind_for`).
-fn inbound_marker_kind(content_type: &str, file_name: &str, data: &[u8]) -> MarkerKind {
+fn inbound_attachment_kind(content_type: &str, file_name: &str, data: &[u8]) -> AttachmentKind {
     if content_type.starts_with("image/") {
         if zeroclaw_api::media::provider_loadable_image_mime_for(file_name, data).is_some() {
-            MarkerKind::Image
+            AttachmentKind::Image
         } else {
-            MarkerKind::Document
+            AttachmentKind::Document
         }
     } else if content_type.starts_with("audio/") {
-        MarkerKind::Audio
+        AttachmentKind::Audio
     } else if content_type.starts_with("video/") {
-        MarkerKind::Video
+        AttachmentKind::Video
     } else {
-        MarkerKind::Document
+        AttachmentKind::Document
     }
 }
 
-/// The `[KIND:target]` label rendered for a disposition.
-fn marker_label(kind: MarkerKind) -> &'static str {
-    match kind {
-        MarkerKind::Image => "IMAGE",
-        MarkerKind::Audio => "AUDIO",
-        MarkerKind::Video => "VIDEO",
-        MarkerKind::Document => "DOCUMENT",
-    }
+fn encode_signal_attachment(media: &MediaAttachment) -> String {
+    let mime = media
+        .mime_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let mut uri = format!(
+        "data:{mime};filename={};base64,",
+        data_uri_file_name(Path::new(&media.file_name))
+    );
+    base64::engine::general_purpose::STANDARD.encode_string(&media.data, &mut uri);
+    uri
 }
 
 /// Write inbound attachment bytes under the workspace. `file_name` must
@@ -1104,11 +1086,8 @@ async fn read_body_limited(mut resp: reqwest::Response, limit: u64) -> anyhow::R
     Ok(body)
 }
 
-/// Saved-file form of a sender-supplied file name. The shared marker parser
-/// ends a marker at the first `]` and trims its target, so brackets, control
-/// characters, and edge whitespace would leave the saved path unreachable
-/// through its own marker.
-fn marker_safe_file_name(name: &str) -> String {
+/// Sanitize control characters in a sender-supplied saved file name.
+fn safe_file_name(name: &str) -> String {
     let name = name.trim();
     if name.is_empty() {
         return "attachment".to_string();
@@ -1219,7 +1198,7 @@ impl Channel for SignalChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let (text, attachments) = self.prepare_outbound(&message.content).await;
+        let (text, attachments) = self.prepare_outbound(message).await;
         let mut params = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "recipient": [number],
@@ -1398,19 +1377,7 @@ impl Channel for SignalChannel {
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
                                     if let Some(ref envelope) = sse.envelope {
-                                        let mut consumed_as_approval = false;
-                                        let messages = self.process_envelope(envelope);
-                                        for msg in messages {
-                                            if let Some(resolution) =
-                                                self.resolve_approval_reply(&msg).await
-                                                && !matches!(
-                                                    resolution,
-                                                    crate::util::PendingApprovalResolution::NotFound
-                                                )
-                                            {
-                                                consumed_as_approval = true;
-                                                continue;
-                                            }
+                                        for msg in self.process_incoming_envelope(envelope).await? {
                                             let Some(msg) =
                                                 self.attach_inbound_media(msg, envelope).await
                                             else {
@@ -1453,14 +1420,13 @@ impl Channel for SignalChannel {
                     Ok(sse) => {
                         if let Some(ref envelope) = sse.envelope {
                             for msg in self.process_incoming_envelope(envelope).await? {
-                                if tx.send(msg).await.is_err() {
-                                    return Ok(());
-                                }
                                 let Some(msg) = self.attach_inbound_media(msg, envelope).await
                                 else {
                                     continue;
                                 };
-                                let _ = tx.send(msg).await;
+                                if tx.send(msg).await.is_err() {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -3276,6 +3242,21 @@ mod tests {
         ch.attach_inbound_media(msg, env).await
     }
 
+    fn attachment_message(content: &str, recipient: &str, targets: &[&str]) -> SendMessage {
+        let mut message = SendMessage::new(content, recipient);
+        message.attachments = targets
+            .iter()
+            .map(|target| MediaAttachment {
+                reference: Some(AttachmentReference {
+                    target: (*target).to_owned(),
+                    kind: AttachmentKind::Document,
+                }),
+                ..Default::default()
+            })
+            .collect();
+        message
+    }
+
     #[tokio::test]
     async fn send_attaches_workspace_marker_as_data_uri() {
         let server = send_server().await;
@@ -3283,7 +3264,7 @@ mod tests {
         std::fs::write(workspace.path().join("photo.png"), PNG_BYTES).unwrap();
         let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
 
-        let msg = SendMessage::new("Here it is [IMAGE:photo.png]", "+1111111111");
+        let msg = attachment_message("Here it is", "+1111111111", &["photo.png"]);
         let params = send_and_capture(&ch, &server, msg).await;
 
         assert_eq!(params["recipient"], serde_json::json!(["+1111111111"]));
@@ -3303,7 +3284,7 @@ mod tests {
         std::fs::write(&file, b"%PDF-1.4").unwrap();
         let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
 
-        let msg = SendMessage::new(format!("[DOCUMENT:{}]", file.display()), "group:grp123");
+        let msg = attachment_message("", "group:grp123", &[file.to_str().unwrap()]);
         let params = send_and_capture(&ch, &server, msg).await;
 
         assert_eq!(params["groupId"], "grp123");
@@ -3324,10 +3305,12 @@ mod tests {
         let outside_path = outside.path().display().to_string();
         let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
 
-        let content = format!(
-            "Report [DOCUMENT:{outside_path}] [IMAGE:missing.png] [IMAGE:https://example.com/a.png]"
+        let message = attachment_message(
+            "Report",
+            "+1111111111",
+            &[&outside_path, "missing.png", "https://example.com/a.png"],
         );
-        let params = send_and_capture(&ch, &server, SendMessage::new(content, "+1111111111")).await;
+        let params = send_and_capture(&ch, &server, message).await;
 
         let message = params["message"].as_str().expect("message text");
         assert!(message.starts_with("Report"), "{message}");
@@ -3349,7 +3332,7 @@ mod tests {
         let server = send_server().await;
         let ch = media_channel(&server.uri(), false);
 
-        let msg = SendMessage::new("[IMAGE:photo.png]", "+1111111111");
+        let msg = attachment_message("", "+1111111111", &["photo.png"]);
         let params = send_and_capture(&ch, &server, msg).await;
 
         assert_eq!(
@@ -3364,7 +3347,7 @@ mod tests {
         let server = send_server().await;
         let ch = media_channel(&server.uri(), false);
 
-        let text = "  meet here [LOCATION:40.7,-74.0] later  ";
+        let text = "  meet here [IMAGE:photo.png] [LOCATION:40.7,-74.0] later  ";
         let params = send_and_capture(&ch, &server, SendMessage::new(text, "+1111111111")).await;
 
         assert_eq!(params["message"], text);
@@ -3376,9 +3359,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let ch = media_channel("http://127.0.0.1:1", false);
         assert_eq!(
-            ch.resolve_outbound_marker("photo.png", SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+            ch.resolve_outbound_attachment("photo.png", SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
                 .await,
-            Err(SignalMarkerError::Refused("no_workspace"))
+            Err(SignalAttachmentError::Refused("no_workspace"))
         );
 
         let ch = ch.with_workspace_dir(workspace.path().into());
@@ -3389,9 +3372,9 @@ mod tests {
             "file:///etc/hostname",
         ] {
             assert_eq!(
-                ch.resolve_outbound_marker(target, SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+                ch.resolve_outbound_attachment(target, SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
                     .await,
-                Err(SignalMarkerError::Refused("scheme")),
+                Err(SignalAttachmentError::Refused("scheme")),
                 "{target}"
             );
         }
@@ -3413,9 +3396,9 @@ mod tests {
             format!("sub/../../{outside_name}"),
         ] {
             assert_eq!(
-                ch.resolve_outbound_marker(&target, SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+                ch.resolve_outbound_attachment(&target, SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
                     .await,
-                Err(SignalMarkerError::Refused("outside_workspace")),
+                Err(SignalAttachmentError::Refused("outside_workspace")),
                 "{target}"
             );
         }
@@ -3431,9 +3414,9 @@ mod tests {
             media_channel("http://127.0.0.1:1", false).with_workspace_dir(workspace.path().into());
 
         assert_eq!(
-            ch.resolve_outbound_marker("link.txt", SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+            ch.resolve_outbound_attachment("link.txt", SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
                 .await,
-            Err(SignalMarkerError::Refused("outside_workspace"))
+            Err(SignalAttachmentError::Refused("outside_workspace"))
         );
     }
 
@@ -3452,9 +3435,9 @@ mod tests {
             ("big.bin", "too_large"),
         ] {
             assert_eq!(
-                ch.resolve_outbound_marker(target, SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
+                ch.resolve_outbound_attachment(target, SIGNAL_MESSAGE_ATTACHMENT_BUDGET)
                     .await,
-                Err(SignalMarkerError::Failed(reason)),
+                Err(SignalAttachmentError::Failed(reason)),
                 "{target}"
             );
         }
@@ -3493,12 +3476,12 @@ mod tests {
         assert_eq!(msg.attachments.len(), 1);
         let attachment = &msg.attachments[0];
         assert_eq!(attachment.data, PNG_BYTES);
-        let marker = attachment.marker.as_ref().expect("rendered marker");
-        assert_eq!(marker.kind, MarkerKind::Image);
+        let marker = attachment.reference.as_ref().expect("attachment reference");
+        assert_eq!(marker.kind, AttachmentKind::Image);
         let saved = Path::new(&marker.target);
         assert!(saved.starts_with(workspace.path().join(SIGNAL_ATTACHMENT_SAVE_SUBDIR)));
         assert_eq!(std::fs::read(saved).unwrap(), PNG_BYTES);
-        assert_eq!(msg.content, format!("look\n[IMAGE:{}]", marker.target));
+        assert_eq!(msg.content, "look");
 
         let downloads = rpc_params(&server, "getAttachment").await;
         assert_eq!(downloads[0]["id"], "att1");
@@ -3523,9 +3506,12 @@ mod tests {
 
         let msg = receive(&ch, &env).await.expect("delivered");
 
-        let marker = msg.attachments[0].marker.as_ref().expect("rendered marker");
-        assert_eq!(marker.kind, MarkerKind::Document);
-        assert_eq!(msg.content, format!("[DOCUMENT:{}]", marker.target));
+        let marker = msg.attachments[0]
+            .reference
+            .as_ref()
+            .expect("attachment reference");
+        assert_eq!(marker.kind, AttachmentKind::Document);
+        assert_eq!(msg.content, "");
         let saved = Path::new(&marker.target);
         let save_dir = workspace.path().join(SIGNAL_ATTACHMENT_SAVE_SUBDIR);
         assert_eq!(saved.parent(), Some(save_dir.as_path()));
@@ -3569,7 +3555,7 @@ mod tests {
         assert_eq!(msg.content, "hi");
         assert_eq!(msg.attachments.len(), 1);
         assert_eq!(msg.attachments[0].data, PNG_BYTES);
-        assert!(msg.attachments[0].marker.is_none());
+        assert!(msg.attachments[0].reference.is_none());
     }
 
     #[tokio::test]
@@ -3681,23 +3667,13 @@ mod tests {
             })],
         );
         let inbound = receive(&ch, &env).await.expect("delivered");
-        let marker = inbound.attachments[0]
-            .marker
-            .as_ref()
-            .expect("rendered marker");
-        let saved_name = Path::new(&marker.target)
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap();
-
-        // The agent copies the inbound marker verbatim into its reply.
-        let reply = format!("Here it is again {}", inbound.content);
-        let params = send_and_capture(&ch, &server, SendMessage::new(reply, "+1111111111")).await;
+        let mut reply = SendMessage::new("Here it is again", "+1111111111");
+        reply.attachments = inbound.attachments;
+        let params = send_and_capture(&ch, &server, reply).await;
 
         assert_eq!(params["message"], "Here it is again");
         let expected = format!(
-            "data:application/pdf;filename={saved_name};base64,{}",
+            "data:application/pdf;filename=report.pdf;base64,{}",
             b64(b"%PDF-1.4")
         );
         assert_eq!(params["attachments"], serde_json::json!([expected]));
@@ -3726,11 +3702,8 @@ mod tests {
 
         assert_eq!(msg.attachments.len(), 1);
         assert_eq!(msg.attachments[0].data, payload);
-        let marker = msg.attachments[0].marker.as_ref().expect("rendered marker");
-        assert_eq!(
-            msg.content,
-            format!("three files\n[DOCUMENT:{}]", marker.target)
-        );
+        assert!(msg.attachments[0].reference.is_some());
+        assert_eq!(msg.content, "three files");
         let downloads = rpc_params(&server, "getAttachment").await;
         assert_eq!(downloads.len(), 1, "budget spent: no further downloads");
         assert_eq!(downloads[0]["id"], "att1");
@@ -3801,10 +3774,7 @@ mod tests {
             .with_workspace_dir(workspace.path().into())
             .with_attachment_budget(1000);
 
-        let msg = SendMessage::new(
-            "Files [DOCUMENT:a.bin] [DOCUMENT:b.bin] [DOCUMENT:c.bin]",
-            "+1111111111",
-        );
+        let msg = attachment_message("Files", "+1111111111", &["a.bin", "b.bin", "c.bin"]);
         let params = send_and_capture(&ch, &server, msg).await;
 
         let attachments = params["attachments"].as_array().expect("attachments");
@@ -3829,13 +3799,13 @@ mod tests {
         );
 
         assert_eq!(
-            ch.resolve_outbound_marker("b.bin", 400).await,
-            Err(SignalMarkerError::Failed("over_budget"))
+            ch.resolve_outbound_attachment("b.bin", 400).await,
+            Err(SignalAttachmentError::Failed("over_budget"))
         );
     }
 
     #[test]
-    fn marker_safe_file_name_keeps_saved_paths_parseable() {
+    fn safe_file_name_keeps_saved_paths_parseable() {
         for (name, expected) in [
             ("report]v2.pdf", "report_v2.pdf"),
             ("[draft] notes.txt", "_draft_ notes.txt"),
@@ -3844,7 +3814,7 @@ mod tests {
             ("写真.jpg", "写真.jpg"),
             (" \t ", "attachment"),
         ] {
-            assert_eq!(marker_safe_file_name(name), expected, "{name:?}");
+            assert_eq!(safe_file_name(name), expected, "{name:?}");
         }
     }
 
@@ -3870,17 +3840,18 @@ mod tests {
         let inbound = receive(&ch, &env).await.expect("delivered");
         assert_eq!(inbound.attachments[0].file_name, "report]v2.pdf");
         let marker = inbound.attachments[0]
-            .marker
+            .reference
             .as_ref()
-            .expect("rendered marker");
+            .expect("attachment reference");
         assert!(
             marker.target.ends_with("_report_v2.pdf"),
             "{}",
             marker.target
         );
 
-        let reply = format!("Again {}", inbound.content);
-        let params = send_and_capture(&ch, &server, SendMessage::new(reply, "+1111111111")).await;
+        let mut reply = SendMessage::new("Again", "+1111111111");
+        reply.attachments = inbound.attachments;
+        let params = send_and_capture(&ch, &server, reply).await;
 
         assert_eq!(params["message"], "Again");
         let attachment = params["attachments"][0].as_str().expect("one attachment");
