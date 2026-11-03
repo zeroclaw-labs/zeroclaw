@@ -14820,7 +14820,13 @@ pub struct RuntimeProfileConfig {
     pub max_system_prompt_chars: Option<usize>,
     /// Maximum characters for a single tool result. `None` inherits.
     pub max_tool_result_chars: Option<usize>,
-    /// Number of recent turns whose full tool context is preserved. `None` inherits.
+    /// Number of completed turns before the running one whose tool-call and
+    /// tool-result rows are still sent to the model; older turns are sent as
+    /// their user prompt, a tool-exchange summary and the closing assistant
+    /// reply. The running turn is always sent whole, so `0` keeps tool context
+    /// for the running turn only. The stored transcript is not affected. On
+    /// channels, `0` also skips persisting the current turn's tool rows.
+    /// `None` inherits the global default (2).
     pub keep_tool_context_turns: Option<usize>,
     /// Maximum memory entries injected per turn. `None` inherits global default (5).
     /// Set to `0` for unlimited.
@@ -16845,6 +16851,15 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Notice sent to a sender this channel has not authorized. `{identity}`
+    /// expands to the sender's Telegram user ID (or username when no ID is
+    /// available) and `{bind_command}` to the `zeroclaw channel bind-telegram`
+    /// invocation for this alias, so a deployment that authorizes from
+    /// configuration can drop the operator-terminal instruction the built-in
+    /// notice carries. Unset or blank keeps the built-in notice.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub unauthorized_message: Option<String>,
     /// When `true` (default), group-chat sessions key on the sender, so
     /// distinct members of the same group (or forum topic) each get an
     /// isolated conversation context (matches the existing behavior). When
@@ -16928,6 +16943,7 @@ impl Default for TelegramConfig {
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -33869,6 +33885,7 @@ auto_save = true
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
+                        unauthorized_message: None,
                         per_user_session: true,
                         passive_group_context: false,
                         ack_reactions: None,
@@ -35908,6 +35925,7 @@ default_temperature = 0.7
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
+            unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -42672,6 +42690,7 @@ high_entropy_tokens = false
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,

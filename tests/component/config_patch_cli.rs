@@ -558,6 +558,71 @@ fn config_patch_add_materializes_new_map_alias_and_persists() {
     );
 }
 
+/// A patch that creates an agent while the configured store is empty and then
+/// points `knowledge.db_path` at a store holding that alias's retained rows is
+/// refused on the creating op before anything is saved.
+#[test]
+fn config_patch_refuses_to_move_the_store_onto_a_new_agents_retained_knowledge() {
+    use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let retained = config_dir.path().join("retained.db");
+    KnowledgeGraph::new(&retained, 100)
+        .expect("seed knowledge store")
+        .add_node(
+            &KnowledgeScope::for_agent("retired", Vec::<String>::new()),
+            NodeType::Pattern,
+            "retained",
+            "retired agent knowledge",
+            &[],
+            None,
+        )
+        .expect("seed a retired agent's row");
+    let create = serde_json::json!({"op": "add", "path": "/agents/retired/enabled", "value": true});
+    let move_store = serde_json::json!({
+        "op": "replace",
+        "path": "/knowledge/db_path",
+        "value": retained.to_string_lossy(),
+    });
+    let persisted = |dir: &std::path::Path| -> bool {
+        std::fs::read_to_string(dir.join("config.toml"))
+            .ok()
+            .and_then(|saved| toml::from_str::<Config>(&saved).ok())
+            .is_some_and(|parsed| parsed.agents.contains_key("retired"))
+    };
+
+    // Either order is refused on the creating op, in the per-op refusal's shape.
+    for (ops, creating_op) in [
+        (serde_json::json!([create, move_store]), 0),
+        (serde_json::json!([move_store, create]), 1),
+    ] {
+        let patch = serde_json::to_vec(&ops).expect("serialize patch");
+        let envelope = run_cli_patch(config_dir.path(), &patch);
+        assert_eq!(envelope["code"], "validation_failed", "{envelope}");
+        assert_eq!(envelope["path"], "agents.retired.enabled");
+        assert_eq!(envelope["op_index"], creating_op);
+        assert!(
+            envelope["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("still owns knowledge")),
+            "{envelope}"
+        );
+        assert!(
+            !persisted(config_dir.path()),
+            "a refused patch must not persist"
+        );
+
+        let human = run_cli_patch_human(config_dir.path(), &patch);
+        assert!(
+            human.contains(&format!(
+                "op[{creating_op}] `add` on `agents.retired.enabled`"
+            )),
+            "the human error must name the creating op and path: {human}"
+        );
+        assert!(!persisted(config_dir.path()));
+    }
+}
+
 /// `config patch` resolves the default knowledge store under the config
 /// directory. An agent alias whose retired knowledge is still there must not
 /// be recreated by a patch until that knowledge is purged.

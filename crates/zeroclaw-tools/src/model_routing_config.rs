@@ -12,6 +12,7 @@ use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
+const SCENARIO_REQUIRED_STRING_FIELDS: [&str; 3] = ["hint", "model_provider", "model"];
 
 /// Why a model probe failed.
 ///
@@ -89,15 +90,36 @@ impl ModelRoutingConfigTool {
         Self { config, security }
     }
 
-    /// Whether the current environment overrides define `name` as an agent on
-    /// top of the freshly loaded file config. Decided from the file plus the
-    /// environment rather than the tool's construction-time snapshot, which
-    /// can still hold an agent deleted since. If the overrides do not apply,
-    /// the agent is treated as not defined, so the retirement probe runs.
-    fn agent_defined_by_env(file_config: &Config, name: &str) -> bool {
-        let mut runtime_view = file_config.clone();
-        zeroclaw_config::env_overrides::apply_env_overrides(&mut runtime_view).is_ok()
-            && runtime_view.agents.contains_key(name)
+    /// The freshly loaded file config as the runtime reads it, with the
+    /// environment overrides applied. `None` when the overrides do not apply.
+    /// Unlike the tool's construction-time snapshot, it reflects edits made
+    /// since, such as a new `knowledge.db_path` or a deleted agent.
+    fn runtime_view(file_config: &Config) -> Option<Config> {
+        let mut view = file_config.clone();
+        zeroclaw_config::env_overrides::apply_env_overrides(&mut view).ok()?;
+        Some(view)
+    }
+
+    /// Localized refusal for a new agent alias whose retired knowledge remains
+    /// or cannot be inspected.
+    fn retired_knowledge_refusal(
+        error: &zeroclaw_config::alias_refs::RetiredKnowledgeError,
+    ) -> String {
+        use zeroclaw_config::alias_refs::RetiredKnowledgeError;
+        match error {
+            RetiredKnowledgeError::Retained { alias } => {
+                crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-retired-knowledge",
+                    &[("agent", alias)],
+                )
+            }
+            RetiredKnowledgeError::Uninspectable { alias, reason } => {
+                crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-uninspectable-knowledge",
+                    &[("agent", alias), ("reason", reason)],
+                )
+            }
+        }
     }
 
     fn load_config_without_env(&self) -> anyhow::Result<Config> {
@@ -280,6 +302,28 @@ impl ModelRoutingConfigTool {
         }
 
         anyhow::bail!("'{field}' must be a string, string[], or delegate target object[]")
+    }
+
+    fn validate_scenario_required_strings(args: &Value) -> anyhow::Result<()> {
+        let invalid: Vec<&str> = SCENARIO_REQUIRED_STRING_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| {
+                args.get(*field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+            .collect();
+        if !invalid.is_empty() {
+            anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                "tool-model-routing-config-invalid-scenario",
+                &[
+                    ("required", &SCENARIO_REQUIRED_STRING_FIELDS.join(", ")),
+                    ("invalid", &invalid.join(", ")),
+                ],
+            ));
+        }
+        Ok(())
     }
 
     fn parse_non_empty_string(args: &Value, field: &str) -> anyhow::Result<String> {
@@ -961,6 +1005,7 @@ impl ModelRoutingConfigTool {
     }
 
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
+        Self::validate_scenario_required_strings(args)?;
         let hint = Self::parse_non_empty_string(args, "hint")?;
         let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
         let model = Self::parse_non_empty_string(args, "model")?;
@@ -1215,13 +1260,22 @@ impl ModelRoutingConfigTool {
         // A new agent alias must not adopt knowledge that a retired agent of
         // the same name still owns, the admission rule every config creation
         // path applies. Checked before any mutation of the loaded config.
-        // `cfg` is parsed without environment overrides, so probe the store
-        // the runtime opens and the delete purges: the config this tool was
-        // built with. An agent that the environment defines on top of the
-        // file is live, not a recreation, so it is not probed.
-        if existing_agent.is_none() && !Self::agent_defined_by_env(&cfg, &name) {
-            zeroclaw_config::alias_refs::ensure_knowledge_owner_retired(&self.config, &name)
-                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        // `cfg` is parsed without environment overrides, so judge the alias
+        // against the current file as the runtime reads it: an agent the
+        // environment defines on top of the file is live, not a recreation,
+        // and the store to probe is the one a recreated agent would open. If
+        // the overrides do not apply, fall back to the construction-time
+        // config rather than skip the probe.
+        if existing_agent.is_none() {
+            let runtime_view = Self::runtime_view(&cfg);
+            let defined_by_env = runtime_view
+                .as_ref()
+                .is_some_and(|view| view.agents.contains_key(&name));
+            if !defined_by_env {
+                let probe_config = runtime_view.as_ref().unwrap_or(self.config.as_ref());
+                zeroclaw_config::alias_refs::ensure_knowledge_owner_retired(probe_config, &name)
+                    .map_err(|error| anyhow::Error::msg(Self::retired_knowledge_refusal(&error)))?;
+            }
         }
 
         // Validate the provider route before mutating any provider, profile, or agent state.
@@ -1596,6 +1650,16 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn parameters_schema(&self) -> Value {
+        let scenario_string_properties: serde_json::Map<String, Value> =
+            SCENARIO_REQUIRED_STRING_FIELDS
+                .iter()
+                .map(|field| {
+                    (
+                        (*field).to_string(),
+                        json!({"type": "string", "minLength": 1, "pattern": "\\S"}),
+                    )
+                })
+                .collect();
         let delegates_schema = json!({
             "description": "Explicit delegate roster. Accepts a comma-separated string, string array, or objects with {agent, mode}; mode is bounded or independent.",
             "oneOf": [
@@ -1640,15 +1704,15 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "hint": {
                     "type": "string",
-                    "description": "Scenario hint name (for example: conversation, coding, reasoning)"
+                    "description": "Scenario hint name (for example: conversation, coding, reasoning). Required and nonblank for upsert_scenario."
                 },
                 "model_provider": {
                     "type": "string",
-                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent"
+                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent. Required and nonblank for upsert_scenario."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref"
+                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref. Required and nonblank for upsert_scenario."
                 },
                 "temperature": {
                     "type": ["number", "null"],
@@ -1730,7 +1794,16 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "delegates": delegates_schema
             },
-            "additionalProperties": false
+            "additionalProperties": false,
+            // The selector is required so omitted action keeps the read-only get default.
+            "if": {
+                "required": ["action"],
+                "properties": {"action": {"enum": ["upsert_scenario"]}}
+            },
+            "then": {
+                "required": SCENARIO_REQUIRED_STRING_FIELDS,
+                "properties": scenario_string_properties
+            }
         })
     }
 
@@ -1830,6 +1903,121 @@ mod tests {
         let contents = std::fs::read_to_string(cfg_path).ok()?;
         let cfg = zeroclaw_config::migration::migrate_to_current(&contents).ok()?;
         cfg.providers.models.find(family, alias).cloned()
+    }
+
+    #[test]
+    fn scenario_requirements_reach_cleaned_schema_and_tool_prompt() {
+        let tool = ModelRoutingConfigTool::new(Arc::new(Config::default()), test_security());
+        let spec = tool.spec();
+        let openai =
+            zeroclaw_api::schema::SchemaCleanr::clean_for_openai((*spec.parameters).clone());
+        let anthropic =
+            zeroclaw_api::schema::SchemaCleanr::clean_for_anthropic((*spec.parameters).clone());
+
+        for schema in [spec.parameters.as_ref(), &openai, &anthropic] {
+            assert_eq!(schema["type"], "object");
+            assert!(schema.get("required").is_none());
+            for composition in ["allOf", "anyOf", "oneOf"] {
+                assert!(schema.get(composition).is_none());
+            }
+            assert_eq!(schema["if"]["required"], json!(["action"]));
+            assert_eq!(
+                schema["if"]["properties"]["action"]["enum"],
+                json!(["upsert_scenario"])
+            );
+            assert_eq!(
+                schema["then"]["required"],
+                json!(["hint", "model_provider", "model"])
+            );
+            for field in ["hint", "model_provider", "model"] {
+                assert_eq!(
+                    schema["then"]["properties"][field],
+                    json!({"type": "string", "minLength": 1, "pattern": "\\S"})
+                );
+            }
+        }
+
+        let parameters = serde_json::to_string(&spec.parameters).unwrap();
+        let prompt = zeroclaw_api::model_provider::build_tool_instructions_text(&[spec]);
+        assert!(prompt.contains(&format!("Parameters: `{parameters}`")));
+    }
+
+    #[tokio::test]
+    async fn invalid_scenario_reports_all_required_strings_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let original = fs::read(&config.config_path).unwrap();
+        let tool = ModelRoutingConfigTool::new(config.clone(), test_security());
+
+        for (args, invalid) in [
+            (
+                json!({"action": "upsert_scenario"}),
+                "hint, model_provider, model",
+            ),
+            (
+                json!({"action": "upsert_scenario", "hint": null, "model_provider": 42, "model": " \t\n"}),
+                "hint, model_provider, model",
+            ),
+            (
+                json!({"action": "upsert_scenario", "hint": "coding"}),
+                "model_provider, model",
+            ),
+            (
+                json!({"action": "upsert_scenario", "hint": "coding", "model_provider": "openai", "model": "\u{2003}"}),
+                "model",
+            ),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success);
+            let error = result.error.unwrap();
+            assert!(error.contains("Supply nonempty strings for: hint, model_provider, model."));
+            assert!(error.contains(&format!(
+                "Fix missing, non-string, or blank fields: {invalid}."
+            )));
+            assert_eq!(fs::read(&config.config_path).unwrap(), original);
+        }
+
+        // No file exists at this path. Invalid arguments must win over a config-read error.
+        let missing_config = Config {
+            config_path: tmp.path().join("missing.toml"),
+            ..Config::default()
+        };
+        let tool = ModelRoutingConfigTool::new(Arc::new(missing_config), test_security());
+        let result = tool
+            .execute(json!({"action": "upsert_scenario"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("Invalid upsert_scenario arguments.")
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_requirements_do_not_change_read_or_partial_default_calls() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let tool = ModelRoutingConfigTool::new(config.clone(), test_security());
+        let implicit_get = tool.execute(json!({})).await.unwrap();
+        let explicit_get = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(implicit_get.success);
+        assert_eq!(implicit_get.output, explicit_get.output);
+        assert!(
+            tool.execute(json!({"action": "list_hints"}))
+                .await
+                .unwrap()
+                .success
+        );
+
+        let result = tool
+            .execute(json!({"action": "set_default", "temperature": 0.3}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
     }
 
     /// Mount the OpenAI-shaped `404 model_not_found` rejection the composed
@@ -2124,18 +2312,18 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        // The file names a store that does not exist. The runtime's config,
-        // which an environment override can set, names the seeded store; the
-        // probe must follow the runtime, since that is what a recreated agent
-        // would read.
-        config.knowledge.db_path = tmp
-            .path()
-            .join("file-view.db")
-            .to_string_lossy()
-            .into_owned();
+        // The current file names the seeded store, but the tool was built
+        // before `knowledge.db_path` changed and still names an empty one.
+        // The probe must follow the current file, since that is the store an
+        // agent built from the saved config would read.
+        config.knowledge.db_path = graph_path.to_string_lossy().into_owned();
         config.save().await.unwrap();
         config.loaded_from = Some(config.config_path.clone());
-        config.knowledge.db_path = graph_path.to_string_lossy().into_owned();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("construction-time.db")
+            .to_string_lossy()
+            .into_owned();
         let graph = KnowledgeGraph::new(&graph_path, 100).unwrap();
         graph
             .add_node(
@@ -2158,11 +2346,16 @@ mod tests {
 
         let refused = tool.execute(upsert.clone()).await.unwrap();
         assert!(!refused.success, "{refused:?}");
-        assert!(
-            refused
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("still owns knowledge")),
+        assert_eq!(
+            refused.error.as_deref(),
+            Some(
+                ModelRoutingConfigTool::retired_knowledge_refusal(
+                    &zeroclaw_config::alias_refs::RetiredKnowledgeError::Retained {
+                        alias: "retired".to_string(),
+                    }
+                )
+                .as_str()
+            ),
             "{refused:?}"
         );
         assert_eq!(
@@ -2179,6 +2372,59 @@ mod tests {
 
     /// An agent defined only by an environment override is live. It owns its
     /// knowledge, so upserting it is an update, not a recreation.
+    /// The runtime reads the file with environment overrides applied, so an
+    /// override that moves the knowledge store moves the probe with it.
+    #[tokio::test]
+    async fn upsert_agent_probes_the_store_an_environment_override_names() {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+
+        let env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let graph_path = tmp.path().join("env-named.db");
+        KnowledgeGraph::new(&graph_path, 100)
+            .unwrap()
+            .add_node(
+                &KnowledgeScope::for_agent("retired", Vec::<String>::new()),
+                NodeType::Pattern,
+                "retained",
+                "retired agent knowledge",
+                &[],
+                None,
+            )
+            .unwrap();
+        // The file and the tool both name a store that does not exist.
+        let config = Box::pin(test_config(&tmp)).await;
+        let _store = TestEnvVar::set(
+            &env_guard,
+            "ZEROCLAW_knowledge__db_path",
+            &graph_path.to_string_lossy(),
+        );
+        let tool = ModelRoutingConfigTool::new(config, test_security());
+
+        let refused = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "retired",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex"
+            }))
+            .await
+            .unwrap();
+        assert!(!refused.success, "{refused:?}");
+        assert_eq!(
+            refused.error.as_deref(),
+            Some(
+                ModelRoutingConfigTool::retired_knowledge_refusal(
+                    &zeroclaw_config::alias_refs::RetiredKnowledgeError::Retained {
+                        alias: "retired".to_string(),
+                    }
+                )
+                .as_str()
+            ),
+            "{refused:?}"
+        );
+    }
+
     #[tokio::test]
     async fn upsert_agent_admits_env_defined_agent_that_owns_knowledge() {
         use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
@@ -3074,6 +3320,18 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
+
+        let invalid_scenario = tool
+            .execute(json!({"action": "upsert_scenario"}))
+            .await
+            .unwrap();
+        assert!(!invalid_scenario.success);
+        assert!(
+            invalid_scenario
+                .error
+                .unwrap_or_default()
+                .contains("read-only")
+        );
     }
 
     #[tokio::test]

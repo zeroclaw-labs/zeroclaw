@@ -193,11 +193,14 @@ enum CommittedLifecycle {
 /// Does durable owned state still exist for `alias` after its config mutation
 /// is already committed?
 ///
-/// Delete and rename share every physical store probe, but memory deliberately
-/// has distinct canonical predicates: delete recovery only needs rows that
-/// require purging, while rename recovery must also detect the stable agent
-/// identity row moved by `Memory::rename_agent` when it owns zero memories.
-/// Both modes fail toward residue when state cannot be inspected.
+/// Each mode probes exactly the stores its cascade changes. Delete purges
+/// control-plane task records and rename does not re-point them, so only
+/// delete counts them; a renamed agent's old task records would otherwise
+/// read as rename residue forever. Memory deliberately has distinct canonical
+/// predicates: delete recovery only needs rows that require purging, while
+/// rename recovery must also detect the stable agent identity row moved by
+/// `Memory::rename_agent` when it owns zero memories. Both modes fail toward
+/// residue when state cannot be inspected.
 async fn committed_residue_exists(
     config: &Config,
     mem: Option<&Arc<dyn Memory>>,
@@ -217,8 +220,9 @@ async fn committed_residue_exists(
         return true;
     }
 
-    if crate::control_plane::SqliteTaskStore::count_existing_by_agent(&config.data_dir, alias)
-        .map_or(true, |count| count > 0)
+    if matches!(lifecycle, CommittedLifecycle::Delete)
+        && crate::control_plane::SqliteTaskStore::count_existing_by_agent(&config.data_dir, alias)
+            .map_or(true, |count| count > 0)
     {
         return true;
     }
@@ -494,7 +498,7 @@ pub struct OwnedStateReport {
 /// somehow reached the same leaf. `create_new` turns that into a reported
 /// failure, which keeps the purge from running, rather than letting the second
 /// attempt overwrite an export the first one already made durable.
-async fn write_json(path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
+async fn write_json(path: &Path, bytes: Vec<u8>, durable_root: &Path) -> anyhow::Result<()> {
     let mut file = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -509,20 +513,63 @@ async fn write_json(path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
         .with_context(|| format!("sync archive file {}", path.display()))?;
     drop(file);
 
-    // Persist the directory entry as well as the file contents on platforms
+    // Persist the directory entries as well as the file contents on platforms
     // that support syncing directories. A successful return is the deletion
-    // gate for knowledge rows, so it must mean the recovery path is durable.
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        let parent_dir = tokio::fs::File::open(parent)
+    // gate for owned rows, so it must mean the recovery path is durable: the
+    // file's entry, and the entry of every directory this deletion may have
+    // created on the way to it (the cascade directory, the archive leaf, and
+    // a first `_deleted` or `agents` directory).
+    sync_archive_dirs(&archive_sync_chain(path, durable_root)).await
+}
+
+/// The topmost directory whose entries an agent-deletion archive may have
+/// created: the data directory for the canonical `<data_dir>/agents/_deleted`
+/// layout, otherwise the archive leaf's parent.
+fn archive_sync_root(config: &Config, archive_dir: &Path) -> PathBuf {
+    if archive_dir.starts_with(&config.data_dir) {
+        config.data_dir.clone()
+    } else {
+        archive_dir
+            .parent()
+            .map_or_else(|| archive_dir.to_path_buf(), Path::to_path_buf)
+    }
+}
+
+/// Directories to sync after writing `file`, nearest first: its parent and
+/// each ancestor up to and including `root`. When `root` is not an ancestor,
+/// only the parent, which is all the writer can vouch for.
+fn archive_sync_chain(file: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    for dir in file.ancestors().skip(1) {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        chain.push(dir.to_path_buf());
+        if dir == root {
+            return chain;
+        }
+    }
+    chain.truncate(1);
+    chain
+}
+
+#[cfg(unix)]
+async fn sync_archive_dirs(dirs: &[PathBuf]) -> anyhow::Result<()> {
+    for dir in dirs {
+        tokio::fs::File::open(dir)
             .await
-            .with_context(|| format!("open archive directory {}", parent.display()))?;
-        parent_dir
+            .with_context(|| format!("open archive directory {}", dir.display()))?
             .sync_all()
             .await
-            .with_context(|| format!("sync archive directory {}", parent.display()))?;
+            .with_context(|| format!("sync archive directory {}", dir.display()))?;
     }
+    Ok(())
+}
 
+/// Windows offers no directory sync; its directory entries are durable with
+/// the file system's metadata journal.
+#[cfg(not(unix))]
+async fn sync_archive_dirs(_dirs: &[PathBuf]) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -633,6 +680,7 @@ pub async fn cascade_owned_state_with_retirement(
     retirement: Result<Option<serde_json::Value>, String>,
 ) -> OwnedStateReport {
     let cascade_dir = archive_dir.join("cascade");
+    let durable_root = archive_sync_root(config, archive_dir);
     let mut warnings: Vec<String> = Vec::new();
     if let Err(err) = tokio::fs::create_dir_all(&cascade_dir).await {
         ::zeroclaw_log::record!(
@@ -666,19 +714,21 @@ pub async fn cascade_owned_state_with_retirement(
             .context("export owned memory")
             .and_then(|rows| serde_json::to_vec_pretty(&rows).context("serialize memory export"))
         {
-            Ok(bytes) => match write_json(&cascade_dir.join("memory.json"), bytes).await {
-                Ok(()) => match mem.purge_agent(alias).await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        warnings.push(format!("memory purge: {e}"));
+            Ok(bytes) => {
+                match write_json(&cascade_dir.join("memory.json"), bytes, &durable_root).await {
+                    Ok(()) => match mem.purge_agent(alias).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warnings.push(format!("memory purge: {e}"));
+                            0
+                        }
+                    },
+                    Err(err) => {
+                        warnings.push(archive_warning("memory", &err));
                         0
                     }
-                },
-                Err(err) => {
-                    warnings.push(archive_warning("memory", &err));
-                    0
                 }
-            },
+            }
             Err(err) => {
                 warnings.push(archive_warning("memory", &err));
                 0
@@ -702,24 +752,27 @@ pub async fn cascade_owned_state_with_retirement(
                 Ok(Some(snapshot)) => match serde_json::to_vec_pretty(&snapshot)
                     .context("serialize owned knowledge export")
                 {
-                    Ok(bytes) => match write_json(&cascade_dir.join("knowledge.json"), bytes).await
-                    {
-                        Ok(()) => {
-                            #[cfg(test)]
-                            wait_at_knowledge_archive(&cascade_dir).await;
-                            match graph.purge_archived_owner(alias, &snapshot) {
-                                Ok(report) => report,
-                                Err(error) => {
-                                    warnings.push(knowledge_purge_skipped_warning(&error));
-                                    Default::default()
+                    Ok(bytes) => {
+                        match write_json(&cascade_dir.join("knowledge.json"), bytes, &durable_root)
+                            .await
+                        {
+                            Ok(()) => {
+                                #[cfg(test)]
+                                wait_at_knowledge_archive(&cascade_dir).await;
+                                match graph.purge_archived_owner(alias, &snapshot) {
+                                    Ok(report) => report,
+                                    Err(error) => {
+                                        warnings.push(knowledge_purge_skipped_warning(&error));
+                                        Default::default()
+                                    }
                                 }
                             }
+                            Err(error) => {
+                                warnings.push(knowledge_purge_skipped_warning(&error));
+                                Default::default()
+                            }
                         }
-                        Err(error) => {
-                            warnings.push(knowledge_purge_skipped_warning(&error));
-                            Default::default()
-                        }
-                    },
+                    }
                     Err(error) => {
                         warnings.push(knowledge_purge_skipped_warning(&error));
                         Default::default()
@@ -749,19 +802,21 @@ pub async fn cascade_owned_state_with_retirement(
     // ── cron: list → archive → remove (cron_runs cascade off job_id) ─────────
     let cron_removed = match crate::cron::list_jobs_by_agent(config, alias) {
         Ok(jobs) => match serde_json::to_vec_pretty(&jobs).context("serialize cron export") {
-            Ok(bytes) => match write_json(&cascade_dir.join("cron.json"), bytes).await {
-                Ok(()) => match crate::cron::remove_jobs_by_agent(config, alias) {
-                    Ok(n) => n,
+            Ok(bytes) => {
+                match write_json(&cascade_dir.join("cron.json"), bytes, &durable_root).await {
+                    Ok(()) => match crate::cron::remove_jobs_by_agent(config, alias) {
+                        Ok(n) => n,
+                        Err(error) => {
+                            warnings.push(format!("cron remove: {error}"));
+                            0
+                        }
+                    },
                     Err(error) => {
-                        warnings.push(format!("cron remove: {error}"));
+                        warnings.push(archive_warning("cron", &error));
                         0
                     }
-                },
-                Err(error) => {
-                    warnings.push(archive_warning("cron", &error));
-                    0
                 }
-            },
+            }
             Err(error) => {
                 warnings.push(archive_warning("cron", &error));
                 0
@@ -794,13 +849,16 @@ pub async fn cascade_owned_state_with_retirement(
                     })
                     .collect();
                 match serde_json::to_vec_pretty(&json).context("serialize ACP export") {
-                    Ok(bytes) => match write_json(&cascade_dir.join("acp.json"), bytes).await {
-                        Ok(()) => match store.delete_sessions_by_agent(alias) {
-                            Ok(n) => acp_removed = n,
-                            Err(error) => warnings.push(format!("acp delete: {error}")),
-                        },
-                        Err(error) => warnings.push(archive_warning("ACP", &error)),
-                    },
+                    Ok(bytes) => {
+                        match write_json(&cascade_dir.join("acp.json"), bytes, &durable_root).await
+                        {
+                            Ok(()) => match store.delete_sessions_by_agent(alias) {
+                                Ok(n) => acp_removed = n,
+                                Err(error) => warnings.push(format!("acp delete: {error}")),
+                            },
+                            Err(error) => warnings.push(archive_warning("ACP", &error)),
+                        }
+                    }
                     Err(error) => warnings.push(archive_warning("ACP", &error)),
                 }
             }
@@ -889,7 +947,9 @@ pub async fn cascade_owned_state_with_retirement(
     });
     match serde_json::to_vec_pretty(&manifest).context("serialize cascade manifest") {
         Ok(bytes) => {
-            if let Err(err) = write_json(&archive_dir.join("manifest.json"), bytes).await {
+            if let Err(err) =
+                write_json(&archive_dir.join("manifest.json"), bytes, &durable_root).await
+            {
                 report.warnings.push(archive_warning("manifest", &err));
             }
         }
@@ -1390,6 +1450,83 @@ mod tests {
             .into();
         std::fs::create_dir_all(config.install_root_dir()).unwrap();
         config
+    }
+
+    /// A successful archive write gates the purge, so it must sync the entry of
+    /// every directory the deletion may have created, not only the file's own
+    /// directory.
+    #[test]
+    fn archive_writes_sync_every_directory_up_to_the_data_dir() {
+        let config = Config {
+            data_dir: PathBuf::from("/srv/zc/data"),
+            ..Default::default()
+        };
+        let leaf = config
+            .data_dir
+            .join("agents/_deleted/retired-20261024T000000Z");
+        let root = archive_sync_root(&config, &leaf);
+        assert_eq!(root, config.data_dir);
+        assert_eq!(
+            archive_sync_chain(&leaf.join("cascade/knowledge.json"), &root),
+            vec![
+                leaf.join("cascade"),
+                leaf.clone(),
+                config.data_dir.join("agents/_deleted"),
+                config.data_dir.join("agents"),
+                config.data_dir.clone(),
+            ]
+        );
+        assert_eq!(
+            archive_sync_chain(&leaf.join("manifest.json"), &root),
+            vec![
+                leaf.clone(),
+                config.data_dir.join("agents/_deleted"),
+                config.data_dir.join("agents"),
+                config.data_dir.clone(),
+            ]
+        );
+        // An archive outside the data directory syncs up to its parent only.
+        let elsewhere = PathBuf::from("/tmp/archive/leaf");
+        let root = archive_sync_root(&config, &elsewhere);
+        assert_eq!(root, PathBuf::from("/tmp/archive"));
+        assert_eq!(
+            archive_sync_chain(&elsewhere.join("cascade/cron.json"), &root),
+            vec![elsewhere.join("cascade"), elsewhere.clone(), root.clone()]
+        );
+        // A root that is not an ancestor keeps only the file's own directory.
+        assert_eq!(
+            archive_sync_chain(
+                &elsewhere.join("cascade/cron.json"),
+                Path::new("/unrelated")
+            ),
+            vec![elsewhere.join("cascade")]
+        );
+    }
+
+    /// Real cascades run the directory sync on this host's file system.
+    #[tokio::test]
+    async fn archive_write_syncs_its_directory_chain_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        let cascade = config.data_dir.join("agents/_deleted/leaf/cascade");
+        std::fs::create_dir_all(&cascade).unwrap();
+        let root = archive_sync_root(&config, &config.data_dir.join("agents/_deleted/leaf"));
+        write_json(&cascade.join("knowledge.json"), b"{}".to_vec(), &root)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(cascade.join("knowledge.json")).unwrap(),
+            b"{}"
+        );
+        // The writer refuses to replace an export, before any directory sync.
+        assert!(
+            write_json(&cascade.join("knowledge.json"), b"[]".to_vec(), &root)
+                .await
+                .is_err()
+        );
     }
 
     async fn blocked_knowledge_cascade_preserves_then_recovers(rename: bool) {

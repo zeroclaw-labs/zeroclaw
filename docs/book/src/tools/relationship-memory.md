@@ -59,7 +59,12 @@ runtime logs a warning with the selected alias and row count. After a successful
 multi-agent migration, remove `knowledge.legacy_owner_agent`; leaving it set
 means any future unowned row introduced by an older restore, import, or rollback
 is assigned to that alias on the next startup. Assigned rows obey the same
-directional `read_knowledge_from` rules as newly captured knowledge.
+directional `read_knowledge_from` rules as newly captured knowledge. Deleting
+the agent that `knowledge.legacy_owner_agent` names is refused while unowned
+rows remain or the store cannot be inspected, so the sole-enabled-agent
+fallback can never hand those rows to another agent. Let the knowledge tool
+assign them, which it does whenever it is registered, or change the setting
+before deleting the agent.
 
 Agent rename moves knowledge ownership, while delete archives and purges it.
 Deletion captures its row and affected-edge set before asynchronous archive work.
@@ -70,7 +75,13 @@ knowledge is refused, including when that residue cannot be inspected. The
 refusal covers explicit creation and every property write that would create
 the agent: `zeroclaw config set` and `zeroclaw config patch`, the gateway
 property and patch APIs, RPC `config/set` and `config/set-many`, and the
-`model_routing_config` tool's `upsert_agent` action. Retry the delete until it
+`model_routing_config` tool's `upsert_agent` action. A patch or
+`config/set-many` batch is checked again once it is complete, so a batch that
+creates the agent and moves `knowledge.db_path` onto a store that still holds
+that agent's rows is refused in either order. The check reads the store
+configured when the agent is created; pointing
+`knowledge.db_path` at another store later adopts that store's rows for every
+configured agent, as relocating the file does. Retry the delete until it
 converges, then create the agent again. An environment override that names an
 agent defines it again at the next config load, over any knowledge a failed
 delete left behind; load cannot tell that from an env-defined agent reading

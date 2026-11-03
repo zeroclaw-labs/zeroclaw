@@ -618,6 +618,15 @@ impl std::fmt::Display for RetiredKnowledgeError {
 
 impl std::error::Error for RetiredKnowledgeError {}
 
+impl RetiredKnowledgeError {
+    /// The alias whose admission was refused.
+    pub fn alias(&self) -> &str {
+        match self {
+            Self::Retained { alias } | Self::Uninspectable { alias, .. } => alias,
+        }
+    }
+}
+
 /// Admission rule for a new key under `section`, shared by explicit creation
 /// ([`create_map_key_checked`]) and property-path auto-creation
 /// ([`Config::ensure_map_key_for_path`]) so the two paths cannot drift. Only
@@ -708,6 +717,77 @@ pub fn ensure_knowledge_owner_retired(
         }),
         Err(error) => Err(uninspectable(error.to_string())),
     }
+}
+
+/// Re-admit every agent alias that `after` adds to `before`, against the
+/// knowledge store `after` names.
+///
+/// Batch surfaces (gateway patch, RPC `config/set-many`, CLI `config patch`)
+/// admit each new alias against the batch as it stood at that member. A
+/// later member can still point `knowledge.db_path` at another store, so the
+/// completed batch is checked again before it is saved: a batch that leaves a
+/// new alias over that alias's retained rows is refused whatever its order.
+/// An earlier member is still refused against the store configured at that
+/// point. The first refused alias, in sorted order, is returned.
+pub fn ensure_created_agents_retired(
+    before: &Config,
+    after: &Config,
+) -> Result<(), RetiredKnowledgeError> {
+    let mut created: Vec<&str> = after
+        .agents
+        .keys()
+        .filter(|alias| !before.agents.contains_key(*alias))
+        .map(String::as_str)
+        .collect();
+    created.sort_unstable();
+    created
+        .into_iter()
+        .try_for_each(|alias| ensure_knowledge_owner_retired(after, alias))
+}
+
+/// Whether the knowledge store still holds rows with no owner, which startup
+/// assigns to `knowledge.legacy_owner_agent` (or the sole enabled agent). Read
+/// without creating the store or waiting for its writer; a store that cannot
+/// be inspected counts as pending, so the decision fails closed.
+fn legacy_knowledge_awaits_owner(cfg: &Config) -> bool {
+    let path = cfg.knowledge.resolved_db_path();
+    match std::fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return obstructing_store_ancestor(&path).is_some();
+        }
+        Err(_) => return true,
+        Ok(_) => {}
+    }
+    let inspect = || -> rusqlite::Result<bool> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        let has_nodes: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'nodes')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_nodes {
+            return Ok(false);
+        }
+        let attributed: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name = 'owner_agent')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !attributed {
+            // A pre-attribution store: every row is still unowned.
+            return conn.query_row("SELECT EXISTS(SELECT 1 FROM nodes)", [], |row| row.get(0));
+        }
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nodes WHERE owner_agent IS NULL) OR EXISTS(SELECT 1 FROM edges WHERE owner_agent IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+    };
+    inspect().unwrap_or(true)
 }
 
 /// The first ancestor of a store reported as missing that proves the store is
@@ -1405,11 +1485,23 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
     if let Some(owner) = cfg.knowledge.legacy_owner_agent.as_ref()
         && owner.as_str() == alias
     {
-        sites.push(RefSite::soft(
-            "knowledge.legacy_owner_agent".to_string(),
-            ScrubAction::ClearOptional,
-            owner.as_str(),
-        ));
+        // Deleting the configured legacy owner before startup assigns the
+        // unowned rows would archive none of them and clear the setting, and
+        // the sole-enabled-agent fallback would then hand them to a different
+        // agent. Keep the migration blocked until no unowned row remains.
+        if legacy_knowledge_awaits_owner(cfg) {
+            sites.push(RefSite::hard(
+                "knowledge.legacy_owner_agent".to_string(),
+                ScrubAction::Refuse,
+                owner.as_str(),
+            ));
+        } else {
+            sites.push(RefSite::soft(
+                "knowledge.legacy_owner_agent".to_string(),
+                ScrubAction::ClearOptional,
+                owner.as_str(),
+            ));
+        }
     }
     for (name, agent) in sorted_agents(cfg) {
         // delegates[].agent — validate() trims.
@@ -1519,6 +1611,12 @@ mod tests {
         c.heartbeat.enabled = false;
         c.heartbeat.agent.clear();
         c.acp.default_agent = None;
+        // A store path that never exists keeps knowledge probes off the real
+        // home directory.
+        c.knowledge.db_path = std::env::temp_dir()
+            .join("zeroclaw-alias-refs-tests-absent-store/knowledge.db")
+            .to_string_lossy()
+            .into_owned();
         c
     }
 
@@ -1647,6 +1745,62 @@ mod tests {
         ));
     }
 
+    /// A batch that creates an alias and then moves the store is checked
+    /// against the store it leaves configured. Aliases the batch did not
+    /// add are never probed, since a configured agent owns its own rows.
+    #[test]
+    fn created_agents_are_readmitted_against_the_completed_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let retained = tmp.path().join("retained.db");
+        let conn = rusqlite::Connection::open(&retained).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (owner_agent TEXT); CREATE TABLE edges (owner_agent TEXT); \
+             INSERT INTO nodes VALUES ('retired'); INSERT INTO edges VALUES ('live');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut before = empty_config();
+        before
+            .agents
+            .insert("live".into(), AliasedAgentConfig::default());
+        before.knowledge.db_path = tmp.path().join("empty.db").to_string_lossy().into_owned();
+
+        // Created while the batch still named the empty store, then moved.
+        let mut after = before.clone();
+        assert!(
+            after
+                .ensure_map_key_for_path("agents.retired.enabled")
+                .is_ok()
+        );
+        after.knowledge.db_path = retained.to_string_lossy().into_owned();
+        let refusal = ensure_created_agents_retired(&before, &after).unwrap_err();
+        assert_eq!(
+            refusal,
+            RetiredKnowledgeError::Retained {
+                alias: "retired".into()
+            }
+        );
+        assert_eq!(refusal.alias(), "retired");
+
+        // The same batch against a store with no retained rows is admitted,
+        // and `live`, which the batch did not add, is never refused for its rows.
+        let mut unchanged = after.clone();
+        unchanged.agents.remove("retired");
+        assert!(ensure_created_agents_retired(&before, &unchanged).is_ok());
+        after.knowledge.db_path = tmp.path().join("empty.db").to_string_lossy().into_owned();
+        assert!(ensure_created_agents_retired(&before, &after).is_ok());
+
+        // An unreadable completed store refuses the new alias as well.
+        let blocked = tmp.path().join("blocked.db");
+        std::fs::create_dir(&blocked).unwrap();
+        after.knowledge.db_path = blocked.to_string_lossy().into_owned();
+        assert!(matches!(
+            ensure_created_agents_retired(&before, &after),
+            Err(RetiredKnowledgeError::Uninspectable { ref alias, .. }) if alias == "retired"
+        ));
+    }
+
     /// The not-found branch is what Windows reports for a store whose parent
     /// is a regular file; Unix reports ENOTDIR instead. Drive the ancestor
     /// walk directly so both shapes are covered on any host.
@@ -1663,6 +1817,72 @@ mod tests {
             obstructing_store_ancestor(&tmp.path().join("missing/nested/knowledge.db")).is_none(),
             "a store under absent directories is absent"
         );
+    }
+
+    /// Deleting the configured legacy owner before its unowned rows are
+    /// assigned would let the sole-enabled-agent fallback hand them to another
+    /// agent, so the delete stays blocked until no unowned row remains.
+    #[test]
+    fn legacy_owner_is_a_hard_reference_while_unowned_knowledge_remains() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("graph.db");
+        let mut cfg = empty_config();
+        cfg.knowledge.db_path = path.to_string_lossy().into_owned();
+        cfg.knowledge.legacy_owner_agent = Some(AgentAlias::new("bot"));
+        cfg.agents
+            .insert("bot".into(), AliasedAgentConfig::default());
+        let legacy_site = |cfg: &Config| {
+            plan_delete(cfg, &AliasKind::Agent, "bot")
+                .blockers
+                .iter()
+                .any(|site| site.path == "knowledge.legacy_owner_agent")
+        };
+
+        // No store yet: nothing awaits an owner, so the setting is scrubbed.
+        assert!(!legacy_site(&cfg));
+        assert!(plan_delete(&cfg, &AliasKind::Agent, "bot").allowed);
+
+        // A pre-attribution store with rows: all of them are unowned.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE nodes (id TEXT); INSERT INTO nodes VALUES ('n1');")
+            .unwrap();
+        assert!(legacy_site(&cfg));
+        assert!(!plan_delete(&cfg, &AliasKind::Agent, "bot").allowed);
+
+        // An attributed store with an unowned edge still blocks; assigning
+        // every row releases the setting to the ordinary scrub.
+        conn.execute_batch(
+            "DROP TABLE nodes; \
+             CREATE TABLE nodes (id TEXT, owner_agent TEXT); \
+             CREATE TABLE edges (owner_agent TEXT); \
+             INSERT INTO nodes VALUES ('n1', 'bot'); INSERT INTO edges VALUES (NULL);",
+        )
+        .unwrap();
+        assert!(legacy_site(&cfg));
+        conn.execute("UPDATE edges SET owner_agent = 'bot'", [])
+            .unwrap();
+        assert!(!legacy_site(&cfg));
+        assert!(
+            plan_delete(&cfg, &AliasKind::Agent, "bot")
+                .scrubs
+                .iter()
+                .any(|site| site.path == "knowledge.legacy_owner_agent")
+        );
+
+        // A busy writer or an unreadable store fails closed.
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        assert!(legacy_site(&cfg));
+        blocker.execute_batch("ROLLBACK;").unwrap();
+        drop((conn, blocker));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(legacy_site(&cfg));
+
+        // Another agent's delete never consults the legacy store.
+        cfg.agents
+            .insert("other".into(), AliasedAgentConfig::default());
+        assert!(plan_delete(&cfg, &AliasKind::Agent, "other").allowed);
     }
 
     #[test]
