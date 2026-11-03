@@ -1122,6 +1122,7 @@ pub async fn run_with_authority(
             cost_tracker: crate::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),
                 &config.data_dir,
+                &config.channels.session_backend,
             ),
             event_tx: Some(event_tx.clone()),
             event_history: Some(std::sync::Arc::clone(event_bus.history())),

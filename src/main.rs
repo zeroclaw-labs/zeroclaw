@@ -11870,7 +11870,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 )
             );
             if config.cost.enabled {
-                match cost::CostTracker::new(config.cost.clone(), &config.data_dir) {
+                match cost::CostTracker::new(
+                    config.cost.clone(),
+                    &config.data_dir,
+                    &config.channels.session_backend,
+                ) {
                     Ok(tracker) => match tracker.get_summary() {
                         Ok(summary) => {
                             let spent_today = format!("{:.4}", summary.daily_cost_usd);

@@ -1299,6 +1299,7 @@ impl DelegateTool {
                 let tracker = crate::cost::CostTracker::get_or_init_global(
                     config.cost.clone(),
                     &config.data_dir,
+                    &config.channels.session_backend,
                 )?;
                 let flags = tracker.enforcement_flags();
                 (tracker, flags)
@@ -21617,6 +21618,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: cost_tracking_enabled,
             track_per_agent,
@@ -21714,6 +21716,7 @@ command = "rm independent-delegate-marker"
                 ..CostConfig::default()
             },
             data_dir,
+            "jsonl",
         )
         .expect("reader tracker over the fixture ledger");
         tracker
@@ -21743,9 +21746,12 @@ command = "rm independent-delegate-marker"
     fn record_seed_spend(fixture: &DelegateCostFixture, usd: f64) {
         use crate::cost::CostTracker;
 
-        let tracker =
-            CostTracker::get_or_init_global(fixture.config.cost.clone(), &fixture.data_dir)
-                .expect("global cost tracker over the fixture ledger");
+        let tracker = CostTracker::get_or_init_global(
+            fixture.config.cost.clone(),
+            &fixture.data_dir,
+            &fixture.config.channels.session_backend,
+        )
+        .expect("global cost tracker over the fixture ledger");
         tracker
             .record_usage(crate::cost::TokenUsage::new(
                 "seed-model",
@@ -21765,9 +21771,12 @@ command = "rm independent-delegate-marker"
     fn record_agent_seed_spend(fixture: &DelegateCostFixture, alias: &str, usd: f64) {
         use crate::cost::CostTracker;
 
-        let tracker =
-            CostTracker::get_or_init_global(fixture.config.cost.clone(), &fixture.data_dir)
-                .expect("global cost tracker over the fixture ledger");
+        let tracker = CostTracker::get_or_init_global(
+            fixture.config.cost.clone(),
+            &fixture.data_dir,
+            &fixture.config.channels.session_backend,
+        )
+        .expect("global cost tracker over the fixture ledger");
         tracker
             .record_usage_with_agent(
                 crate::cost::TokenUsage::new(
@@ -21900,6 +21909,7 @@ command = "rm independent-delegate-marker"
                     ..zeroclaw_config::schema::CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("cost tracker should initialize"),
         );
@@ -22192,6 +22202,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -22302,6 +22313,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -22745,6 +22757,7 @@ command = "rm independent-delegate-marker"
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        root_config.channels.session_backend = "jsonl".into();
         root_config.cost = CostConfig {
             enabled: true,
             track_per_agent: true,
@@ -23465,6 +23478,7 @@ command = "rm independent-delegate-marker"
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("base tracker"),
         );
@@ -23570,6 +23584,7 @@ command = "rm independent-delegate-marker"
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("base tracker"),
         );
@@ -23683,6 +23698,7 @@ command = "rm independent-delegate-marker"
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("base tracker"),
         );

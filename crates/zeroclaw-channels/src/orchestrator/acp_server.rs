@@ -2201,6 +2201,7 @@ impl AcpServer {
         let cost_tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global(
             config.cost.clone(),
             &config.data_dir,
+            &config.channels.session_backend,
         );
         let cost_pricing = std::sync::Arc::new(
             zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config),

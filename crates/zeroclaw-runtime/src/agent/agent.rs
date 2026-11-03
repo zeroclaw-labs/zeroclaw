@@ -11545,7 +11545,14 @@ mod tests {
         let agent = Agent::from_config(&config, "test-agent").await.unwrap();
         assert_eq!(agent.model_provider_name, "openai.fast");
 
-        let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
+        let tracker = Arc::new(
+            CostTracker::new(
+                config.cost.clone(),
+                &config.data_dir,
+                &config.channels.session_backend,
+            )
+            .unwrap(),
+        );
         let context = ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),
             Arc::new(build_model_provider_pricing(&config)),
@@ -17836,6 +17843,7 @@ mod tests {
                     ..zeroclaw_config::schema::CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("cost tracker should initialize"),
         );
@@ -17939,6 +17947,7 @@ mod tests {
                     ..zeroclaw_config::schema::CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("cost tracker should initialize"),
         );

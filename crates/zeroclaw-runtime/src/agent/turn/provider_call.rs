@@ -4147,6 +4147,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
         // 1M input tokens at `spent_usd` per million = `spent_usd`.

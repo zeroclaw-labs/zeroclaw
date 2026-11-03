@@ -1705,6 +1705,7 @@ mod tests {
                     ..zeroclaw_config::schema::CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("cost tracker should initialize"),
         );

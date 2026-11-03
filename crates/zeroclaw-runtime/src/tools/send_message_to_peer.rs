@@ -1441,6 +1441,7 @@ mod tests {
                     ..CostConfig::default()
                 },
                 workspace.path(),
+                "jsonl",
             )
             .expect("cost tracker should initialize"),
         );
@@ -1534,6 +1535,7 @@ mod tests {
                     ..CostConfig::default()
                 },
                 capped_workspace.path(),
+                "jsonl",
             )
             .expect("capped cost tracker should initialize"),
         );
@@ -1821,8 +1823,14 @@ mod tests {
         // Fetch the SAME Arc: same data_dir means same ledger path, so
         // `CostTracker::resolve_global` reuses it rather than building a
         // second one, to observe what the detached turn records.
-        let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-            .expect("execute() must have resolved a process-global cost tracker for an enabled cost config");
+        let tracker = CostTracker::get_or_init_global(
+            config.cost.clone(),
+            &config.data_dir,
+            &config.channels.session_backend,
+        )
+        .expect(
+            "execute() must have resolved a process-global cost tracker for an enabled cost config",
+        );
 
         // The recipient's turn runs inside a detached `zeroclaw_spawn::spawn!`
         // task that `execute()` does not join. Poll for its completion with a

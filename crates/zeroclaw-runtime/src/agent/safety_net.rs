@@ -111,6 +111,7 @@ pub(super) fn build_cost_context(
         CostTracker::new(
             zeroclaw_config::schema::CostConfig::default(),
             tmpdir.path(),
+            "jsonl",
         )
         .expect("CostTracker::new"),
     );
@@ -3528,6 +3529,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
         crate::cost::CostTracker::new(
             zeroclaw_config::schema::CostConfig::default(),
             tmpdir.path(),
+            "jsonl",
         )
         .expect("CostTracker::new"),
     );

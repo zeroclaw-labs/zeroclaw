@@ -1998,7 +1998,11 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Cost tracker — initialize after the session installation has selected
     // and published its native backend, so the ledger follows that backend.
-    let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
+    let cost_tracker = CostTracker::get_or_init_global(
+        config.cost.clone(),
+        &config.data_dir,
+        &config.channels.session_backend,
+    );
 
     // ── Pairing guard ──────────────────────────────────────
     // Supervised runs share the daemon's live authority so pairing and
@@ -10407,8 +10411,12 @@ path = "{trigger_path}"
         );
 
         let tracker = Arc::new(
-            CostTracker::new(config.cost.clone(), &config.data_dir)
-                .expect("production fixture cost tracker"),
+            CostTracker::new(
+                config.cost.clone(),
+                &config.data_dir,
+                &config.channels.session_backend,
+            )
+            .expect("production fixture cost tracker"),
         );
         let mut state = crate::api::tests::test_state(config);
         state.cost_tracker = Some(Arc::clone(&tracker));

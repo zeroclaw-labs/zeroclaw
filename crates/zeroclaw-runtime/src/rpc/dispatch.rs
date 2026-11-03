@@ -18949,6 +18949,7 @@ mod tests {
                     ..Default::default()
                 },
                 tmp.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -23169,6 +23170,7 @@ mod tests {
                     ..Default::default()
                 },
                 data_dir,
+                "jsonl",
             )
             .unwrap(),
         );
@@ -33469,8 +33471,9 @@ mod tests {
             ..Default::default()
         };
         config.save().await.expect("seed config.toml");
-        let tracker =
-            Arc::new(zeroclaw_config::cost::tracker::CostTracker::new(cost, tmp.path()).unwrap());
+        let tracker = Arc::new(
+            zeroclaw_config::cost::tracker::CostTracker::new(cost, tmp.path(), "jsonl").unwrap(),
+        );
         // $3.00 recorded today against a $1.00 daily limit.
         tracker
             .record_usage(TokenUsage::new(
@@ -33536,8 +33539,9 @@ mod tests {
             ..Default::default()
         };
         config.save().await.expect("seed config.toml");
-        let tracker =
-            Arc::new(zeroclaw_config::cost::tracker::CostTracker::new(cost, tmp.path()).unwrap());
+        let tracker = Arc::new(
+            zeroclaw_config::cost::tracker::CostTracker::new(cost, tmp.path(), "jsonl").unwrap(),
+        );
         // $3.00 recorded today against a $10.00 daily limit.
         tracker
             .record_usage(TokenUsage::new(

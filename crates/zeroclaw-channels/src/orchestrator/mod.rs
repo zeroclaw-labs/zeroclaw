@@ -17637,6 +17637,7 @@ pub async fn start_channels_with_history(
             cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),
                 &config.data_dir,
+                &config.channels.session_backend,
             )
             .map(|tracker| {
                 let by_type =

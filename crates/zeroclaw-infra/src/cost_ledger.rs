@@ -19,7 +19,7 @@ pub enum Backend {
     Jsonl,
 }
 
-pub fn resolve_path(workspace_dir: &Path) -> Result<PathBuf> {
+pub fn resolve_path(workspace_dir: &Path, session_backend: &str) -> Result<PathBuf> {
     let sessions = workspace_dir.join("sessions");
     let manifest = sessions.join("session-format.json");
     let backend = if manifest.exists() {
@@ -36,9 +36,13 @@ pub fn resolve_path(workspace_dir: &Path) -> Result<PathBuf> {
             None => bail!("session format manifest has no phase"),
         }
     } else {
-        // Test and first-boot fallback. Production session-host initializes the
-        // installation manifest before opening the tracker.
-        Backend::Jsonl
+        // A tracker can precede lazy session-host initialization. Select the
+        // configured backend immediately so its live handles keep the same
+        // ledger when the installation manifest is published.
+        match crate::session_events::installation::NativeBackend::parse(session_backend)? {
+            crate::session_events::installation::NativeBackend::Sqlite => Backend::Sqlite,
+            crate::session_events::installation::NativeBackend::Jsonl => Backend::Jsonl,
+        }
     };
     Ok(match backend {
         Backend::Sqlite => sessions.join("session-events.db"),

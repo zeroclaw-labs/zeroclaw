@@ -659,6 +659,7 @@ mod run_model_query_tests {
             crate::cost::CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 workspace.path(),
+                "jsonl",
             )
             .unwrap(),
         );
@@ -720,7 +721,8 @@ mod run_model_query_tests {
         assert_eq!(summaries[0].output_tokens, Some(200));
         let projected = summaries[0].cost_usd.expect("rejected cost is priced");
         let stored = std::fs::read_to_string(
-            zeroclaw_infra::cost_ledger::resolve_path(workspace.path()).expect("cost ledger path"),
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path(), "jsonl")
+                .expect("cost ledger path"),
         )
         .expect("cost ledger should be written");
         let record: zeroclaw_config::cost::types::CostRecord =

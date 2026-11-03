@@ -19350,7 +19350,8 @@ Let me check the result."#;
             enabled: true,
             ..zeroclaw_config::schema::CostConfig::default()
         };
-        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        let tracker =
+            Arc::new(CostTracker::new(cost_config.clone(), workspace.path(), "jsonl").unwrap());
         let mut model_pricing: HashMap<String, f64> = HashMap::new();
         model_pricing.insert("mock-model.input".to_string(), 3.0);
         model_pricing.insert("mock-model.output".to_string(), 15.0);
@@ -19929,7 +19930,8 @@ Let me check the result."#;
             daily_limit_usd: 0.001, // very low limit
             ..zeroclaw_config::schema::CostConfig::default()
         };
-        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        let tracker =
+            Arc::new(CostTracker::new(cost_config.clone(), workspace.path(), "jsonl").unwrap());
         // Record a usage that already exceeds the limit
         tracker
             .record_usage(crate::cost::types::TokenUsage::new(
@@ -21060,7 +21062,7 @@ Let me check the result."#;
             enabled: true,
             ..zeroclaw_config::schema::CostConfig::default()
         };
-        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path(), "jsonl").unwrap());
         let ctx =
             ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
 
@@ -21136,7 +21138,7 @@ Let me check the result."#;
             daily_limit_usd: 0.001, // very low limit
             ..zeroclaw_config::schema::CostConfig::default()
         };
-        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path(), "jsonl").unwrap());
         // Record usage that already exceeds the daily limit.
         tracker
             .record_usage(crate::cost::types::TokenUsage::new(
@@ -21357,7 +21359,7 @@ Let me check the result."#;
             enabled: true,
             ..zeroclaw_config::schema::CostConfig::default()
         };
-        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path(), "jsonl").unwrap());
         let ctx =
             ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
 

@@ -1366,7 +1366,7 @@ tags = ["auto-generated"]
             daily_limit_usd: 0.001, // very low limit
             ..zeroclaw_config::schema::CostConfig::default()
         };
-        let tracker = Arc::new(CostTracker::new(cost_config, cost_dir.path()).unwrap());
+        let tracker = Arc::new(CostTracker::new(cost_config, cost_dir.path(), "jsonl").unwrap());
         // Pre-record usage that already exceeds the daily limit.
         tracker
             .record_usage(crate::cost::types::TokenUsage::new(

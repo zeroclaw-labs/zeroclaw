@@ -207,8 +207,9 @@ struct AgentTotals {
 
 impl CostTracker {
     /// Create a new cost tracker.
-    pub fn new(config: CostConfig, workspace_dir: &Path) -> Result<Self> {
-        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(workspace_dir)?;
+    pub fn new(config: CostConfig, workspace_dir: &Path, session_backend: &str) -> Result<Self> {
+        let storage_path =
+            zeroclaw_infra::cost_ledger::resolve_path(workspace_dir, session_backend)?;
         let storage = CostStorage::new(&storage_path).with_context(|| {
             format!(
                 "Failed to open cost storage at {}",
@@ -917,29 +918,35 @@ impl CostTracker {
     /// calls and reusing the same `Arc`. Returns `None` while cost tracking is
     /// disabled and no tracker exists for that ledger yet; a later reload
     /// flipping `enabled` to `true` constructs it on demand.
-    pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
+    pub fn get_or_init_global(
+        config: CostConfig,
+        workspace_dir: &Path,
+        session_backend: &str,
+    ) -> Option<Arc<Self>> {
         let trackers = GLOBAL_COST_TRACKERS.get_or_init(|| RwLock::new(HashMap::new()));
-        Self::resolve_global(trackers, config, workspace_dir)
+        Self::resolve_global(trackers, config, workspace_dir, session_backend)
     }
 
     fn resolve_global(
         trackers: &RwLock<HashMap<PathBuf, Arc<CostTracker>>>,
         config: CostConfig,
         workspace_dir: &Path,
+        session_backend: &str,
     ) -> Option<Arc<Self>> {
-        let storage_path = match zeroclaw_infra::cost_ledger::resolve_path(workspace_dir) {
-            Ok(path) => path,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Failed to resolve global cost tracker storage path"
-                );
-                return None;
-            }
-        };
+        let storage_path =
+            match zeroclaw_infra::cost_ledger::resolve_path(workspace_dir, session_backend) {
+                Ok(path) => path,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Failed to resolve global cost tracker storage path"
+                    );
+                    return None;
+                }
+            };
 
         if let Some(ct) = trackers.read().get(&storage_path).cloned() {
             ct.update_config(config);
@@ -956,7 +963,7 @@ impl CostTracker {
             return Some(ct);
         }
 
-        match Self::new(config, workspace_dir) {
+        match Self::new(config, workspace_dir, session_backend) {
             Ok(ct) => {
                 let ct = Arc::new(ct);
                 guard.insert(storage_path, ct.clone());
@@ -1565,7 +1572,7 @@ mod tests {
     fn recovers_concatenated_records_from_legacy_ledger() {
         let tmp = TempDir::new().unwrap();
         // Write two real, valid records through the normal (now-atomic) path.
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         tracker
             .record_usage(TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0))
             .unwrap();
@@ -1575,7 +1582,7 @@ mod tests {
 
         // Simulate the legacy interleaved-write artifact: collapse the two
         // newline-separated records into one concatenated `{..}{..}` line.
-        let path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
+        let path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path(), "jsonl").unwrap();
         let joined: String = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
@@ -1647,7 +1654,7 @@ mod tests {
         }
 
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         let usage = TokenUsage {
             model: "test/model".to_string(),
             input_tokens: 10,
@@ -1689,7 +1696,7 @@ mod tests {
     #[test]
     fn cost_tracker_initialization() {
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         assert_eq!(tracker.get_summary().unwrap().request_count, 0);
     }
 
@@ -1701,7 +1708,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tracker = CostTracker::new(config, tmp.path()).unwrap();
+        let tracker = CostTracker::new(config, tmp.path(), "jsonl").unwrap();
         let check = tracker.check_budget(1000.0).unwrap();
         assert!(matches!(check, BudgetCheck::Allowed));
     }
@@ -1709,7 +1716,7 @@ mod tests {
     #[test]
     fn record_usage_and_get_summary() {
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
 
         let usage = TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0);
         tracker.record_usage(usage).unwrap();
@@ -1723,7 +1730,7 @@ mod tests {
     #[test]
     fn model_summary_counts_only_explicitly_unpriced_tokens() {
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         let configured_free = TokenUsage::new("test/model", 100, 50, 0, 0.0, 0.0, 0.0);
         let mut unpriced = TokenUsage::new("test/model", 200, 75, 0, 0.0, 0.0, 0.0);
         unpriced.pricing_available = false;
@@ -1741,7 +1748,7 @@ mod tests {
     #[test]
     fn model_summary_prefers_dimension_level_unpriced_count() {
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         let mut partial = TokenUsage::new("test/model", 100, 20, 0, 2.0, 0.0, 0.0);
         partial.unpriced_tokens = 20;
         partial.pricing_available = false;
@@ -1757,7 +1764,7 @@ mod tests {
     #[test]
     fn first_record_after_lazy_init_is_counted_once() {
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
 
         let usage = TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0);
         let expected_cost = usage.cost_usd;
@@ -1773,7 +1780,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut config = enabled_config();
         config.track_per_agent = true;
-        let tracker = CostTracker::new(config, tmp.path()).unwrap();
+        let tracker = CostTracker::new(config, tmp.path(), "jsonl").unwrap();
 
         tracker
             .record_usage_with_task_attribution(
@@ -1807,7 +1814,7 @@ mod tests {
     #[test]
     fn task_usage_totals_report_pricing_reliability_from_ledger() {
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         let mut unpriced = TokenUsage::new("test/unpriced", 1000, 500, 0, 0.0, 0.0, 0.0);
         unpriced.pricing_available = false;
 
@@ -1834,7 +1841,7 @@ mod tests {
     #[test]
     fn task_usage_totals_include_appended_records() {
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
 
         let empty = tracker.get_summary_for_task("goal-a").unwrap();
         assert_eq!(empty.request_count, 0);
@@ -1882,7 +1889,7 @@ mod tests {
     #[test]
     fn task_usage_totals_read_legacy_recovered_records() {
         let tmp = TempDir::new().unwrap();
-        let path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
+        let path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path(), "jsonl").unwrap();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -1906,7 +1913,7 @@ mod tests {
         );
         std::fs::write(&path, joined).unwrap();
 
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         let summary = tracker.get_summary_for_task("goal-a").unwrap();
         assert_eq!(summary.request_count, 2);
         assert_eq!(summary.total_tokens, 3_750);
@@ -1929,7 +1936,7 @@ mod tests {
             ..Default::default()
         };
 
-        let tracker = CostTracker::new(config, tmp.path()).unwrap();
+        let tracker = CostTracker::new(config, tmp.path(), "jsonl").unwrap();
 
         // Record a usage that exceeds the limit
         let usage = TokenUsage::new("test/model", 10000, 5000, 0, 1.0, 2.0, 0.0); // ~0.02 USD
@@ -1942,7 +1949,7 @@ mod tests {
     #[test]
     fn summary_by_model_is_daily_scoped() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path(), "jsonl").unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -1959,7 +1966,7 @@ mod tests {
         writeln!(file, "{}", serde_json::to_string(&prior_today).unwrap()).unwrap();
         file.sync_all().unwrap();
 
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         tracker
             .record_usage(TokenUsage::new(
                 "session/model",
@@ -1986,7 +1993,7 @@ mod tests {
     #[test]
     fn summaries_use_one_cached_period_for_task_and_model_rollups() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path(), "jsonl").unwrap();
         let period = ReportingPeriod {
             day: NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
             year: 2025,
@@ -2021,7 +2028,7 @@ mod tests {
 
         let mut config = enabled_config();
         config.track_per_agent = true;
-        let tracker = CostTracker::new(config, tmp.path()).unwrap();
+        let tracker = CostTracker::new(config, tmp.path(), "jsonl").unwrap();
 
         let task = tracker
             .get_summary_for_task_at_period("task-periods", period)
@@ -2062,7 +2069,7 @@ mod tests {
     #[test]
     fn current_month_model_stats_keep_earlier_month_unpriced_usage_visible() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path(), "jsonl").unwrap();
         let period = ReportingPeriod {
             day: NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
             year: 2025,
@@ -2094,7 +2101,7 @@ mod tests {
 
         // A fresh tracker reloads the ledger from disk the same way the
         // status command does after a restart.
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
 
         let summary = tracker
             .get_summary_filtered_at_period(None, period)
@@ -2126,7 +2133,7 @@ mod tests {
     #[test]
     fn malformed_lines_are_ignored_while_loading() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path(), "jsonl").unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -2144,7 +2151,7 @@ mod tests {
         writeln!(file).unwrap();
         file.sync_all().unwrap();
 
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         let today_cost = tracker.get_daily_cost(Utc::now().date_naive()).unwrap();
         assert!((today_cost - valid_usage.cost_usd).abs() < f64::EPSILON);
     }
@@ -2152,7 +2159,7 @@ mod tests {
     #[test]
     fn per_agent_aggregation_buckets_by_alias() {
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
 
         tracker
             .record_usage_with_agent(
@@ -2202,7 +2209,7 @@ mod tests {
             track_per_agent: false,
             ..Default::default()
         };
-        let tracker = CostTracker::new(config, tmp.path()).unwrap();
+        let tracker = CostTracker::new(config, tmp.path(), "jsonl").unwrap();
 
         tracker
             .record_usage_with_agent(
@@ -2222,7 +2229,7 @@ mod tests {
     #[test]
     fn invalid_budget_estimate_is_rejected() {
         let tmp = TempDir::new().unwrap();
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
 
         let err = tracker.check_budget(f64::NAN).unwrap_err();
         assert!(
@@ -2242,6 +2249,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .expect("boot tracker");
 
@@ -2269,6 +2277,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .expect("boot tracker");
 
@@ -2315,7 +2324,7 @@ mod tests {
             daily_limit_usd: 10.0,
             ..Default::default()
         };
-        let tracker = CostTracker::new(boot, tmp.path()).expect("boot tracker");
+        let tracker = CostTracker::new(boot, tmp.path(), "jsonl").expect("boot tracker");
         assert_eq!(tracker.config().daily_limit_usd, 10.0);
 
         tracker.update_config(CostConfig {
@@ -2341,7 +2350,7 @@ mod tests {
             daily_limit_usd: 10.0,
             ..Default::default()
         };
-        let first = CostTracker::resolve_global(&trackers, boot, tmp.path())
+        let first = CostTracker::resolve_global(&trackers, boot, tmp.path(), "jsonl")
             .expect("first init yields a tracker");
 
         let reloaded = CostConfig {
@@ -2349,7 +2358,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&trackers, reloaded, tmp.path())
+        let after = CostTracker::resolve_global(&trackers, reloaded, tmp.path(), "jsonl")
             .expect("reload yields a tracker");
 
         assert_eq!(
@@ -2364,15 +2373,69 @@ mod tests {
     }
 
     #[test]
+    fn cost_tracker_before_session_initialization_keeps_configured_backend_and_owner() {
+        use zeroclaw_infra::session_events::{installation::NativeBackend, upgrade};
+
+        for backend in std::iter::once(NativeBackend::Sqlite)
+            .chain(cfg!(unix).then_some(NativeBackend::Jsonl))
+        {
+            let tmp = TempDir::new().unwrap();
+            let trackers = RwLock::new(HashMap::new());
+            let first = CostTracker::resolve_global(
+                &trackers,
+                enabled_config(),
+                tmp.path(),
+                backend.name(),
+            )
+            .unwrap();
+            first
+                .record_usage(TokenUsage::new("test/model", 10, 5, 0, 1.0, 2.0, 0.0))
+                .unwrap();
+            assert!(!tmp.path().join("sessions/session-format.json").exists());
+            let expected = match backend {
+                NativeBackend::Sqlite => tmp.path().join("sessions/session-events.db"),
+                NativeBackend::Jsonl => {
+                    tmp.path().join("sessions/session-events-jsonl/costs.jsonl")
+                }
+            };
+            assert_eq!(first.lock_storage().ledger.path(), expected);
+
+            upgrade::upgrade_installation(tmp.path(), backend, |_| "test-agent".into()).unwrap();
+            let after = CostTracker::resolve_global(
+                &trackers,
+                enabled_config(),
+                tmp.path(),
+                backend.name(),
+            )
+            .unwrap();
+            assert!(Arc::ptr_eq(&first, &after));
+            after
+                .record_usage(TokenUsage::new("test/model", 20, 10, 0, 1.0, 2.0, 0.0))
+                .unwrap();
+            assert_eq!(after.get_summary().unwrap().request_count, 2);
+            assert_eq!(after.lock_storage().ledger.read_records().unwrap().len(), 2);
+            let unexpected = match backend {
+                NativeBackend::Sqlite => {
+                    tmp.path().join("sessions/session-events-jsonl/costs.jsonl")
+                }
+                NativeBackend::Jsonl => tmp.path().join("sessions/session-events.db"),
+            };
+            assert!(!unexpected.exists(), "must not open a second backend");
+        }
+    }
+
+    #[test]
     fn get_or_init_global_replaces_tracker_when_data_dir_changes() {
         let first_tmp = TempDir::new().unwrap();
         let second_tmp = TempDir::new().unwrap();
         let trackers = RwLock::new(HashMap::new());
 
-        let first = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
-            .expect("first init yields a tracker");
-        let after = CostTracker::resolve_global(&trackers, enabled_config(), second_tmp.path())
-            .expect("data-dir change yields a tracker");
+        let first =
+            CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path(), "jsonl")
+                .expect("first init yields a tracker");
+        let after =
+            CostTracker::resolve_global(&trackers, enabled_config(), second_tmp.path(), "jsonl")
+                .expect("data-dir change yields a tracker");
 
         assert!(
             !Arc::ptr_eq(&first, &after),
@@ -2383,7 +2446,7 @@ mod tests {
             .record_usage(TokenUsage::new("test/model", 10, 5, 0, 1.0, 2.0, 0.0))
             .unwrap();
         assert!(
-            zeroclaw_infra::cost_ledger::resolve_path(second_tmp.path())
+            zeroclaw_infra::cost_ledger::resolve_path(second_tmp.path(), "jsonl")
                 .unwrap()
                 .exists(),
             "usage after data-dir change must land in the new canonical ledger"
@@ -2401,7 +2464,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            CostTracker::resolve_global(&trackers, disabled_boot, tmp.path()).is_none(),
+            CostTracker::resolve_global(&trackers, disabled_boot, tmp.path(), "jsonl").is_none(),
             "disabled boot must not construct a tracker"
         );
 
@@ -2410,7 +2473,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let constructed = CostTracker::resolve_global(&trackers, enable, tmp.path())
+        let constructed = CostTracker::resolve_global(&trackers, enable, tmp.path(), "jsonl")
             .expect("reload enabling cost tracking must construct the tracker");
         assert_eq!(
             constructed.config().daily_limit_usd,
@@ -2426,6 +2489,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .expect("subsequent call yields a tracker");
         assert!(
@@ -2444,7 +2508,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let tracker = CostTracker::resolve_global(&trackers, enabled_boot, tmp.path())
+        let tracker = CostTracker::resolve_global(&trackers, enabled_boot, tmp.path(), "jsonl")
             .expect("enabled boot yields a tracker");
 
         let disable = CostConfig {
@@ -2452,7 +2516,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&trackers, disable, tmp.path())
+        let after = CostTracker::resolve_global(&trackers, disable, tmp.path(), "jsonl")
             .expect("disable reload leaves the tracker resident");
         assert!(
             Arc::ptr_eq(&tracker, &after),
@@ -2478,16 +2542,18 @@ mod tests {
         let second_tmp = TempDir::new().unwrap();
         let trackers = RwLock::new(HashMap::new());
 
-        let first = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
-            .expect("first ledger yields a tracker");
+        let first =
+            CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path(), "jsonl")
+                .expect("first ledger yields a tracker");
         first
             .record_usage(TokenUsage::new("test/model", 10, 5, 0, 1.0, 2.0, 0.0))
             .unwrap();
-        CostTracker::resolve_global(&trackers, enabled_config(), second_tmp.path())
+        CostTracker::resolve_global(&trackers, enabled_config(), second_tmp.path(), "jsonl")
             .expect("second ledger yields a tracker");
 
-        let again = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
-            .expect("first ledger still yields a tracker");
+        let again =
+            CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path(), "jsonl")
+                .expect("first ledger still yields a tracker");
         assert!(
             Arc::ptr_eq(&first, &again),
             "resolving another ledger must not replace this ledger's tracker"
@@ -2506,14 +2572,15 @@ mod tests {
         let second_tmp = TempDir::new().unwrap();
         let trackers = RwLock::new(HashMap::new());
 
-        let first = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
-            .expect("first ledger yields a tracker");
+        let first =
+            CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path(), "jsonl")
+                .expect("first ledger yields a tracker");
         let disabled = CostConfig {
             enabled: false,
             ..Default::default()
         };
         assert!(
-            CostTracker::resolve_global(&trackers, disabled, second_tmp.path()).is_none(),
+            CostTracker::resolve_global(&trackers, disabled, second_tmp.path(), "jsonl").is_none(),
             "a disabled ledger without a tracker must not construct one or borrow another's"
         );
         assert!(
@@ -2542,6 +2609,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
 
@@ -2616,6 +2684,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
         let derived = base.derived_for_agent("opus", 5.0);
@@ -2669,6 +2738,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
         base.record_usage(TokenUsage::new("test/model", 800_000, 0, 0, 1.0, 1.0, 0.0))
@@ -2717,6 +2787,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
         let derived = base.derived_for_agent("target", 5.0);
@@ -2788,6 +2859,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
         let derived_a = base.derived_for_agent("parent", 5.0);
@@ -2833,6 +2905,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
         base.record_usage_with_agent(
@@ -2919,6 +2992,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
         let derived = base.derived_shared_capped(2.0);
@@ -2980,6 +3054,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
 
@@ -3064,6 +3139,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
 
@@ -3116,6 +3192,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
 
@@ -3201,6 +3278,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
 
@@ -3274,6 +3352,7 @@ mod tests {
                 ..Default::default()
             },
             tmp2.path(),
+            "jsonl",
         )
         .unwrap();
         base2
@@ -3311,6 +3390,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
 
@@ -3412,6 +3492,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
 
@@ -3485,6 +3566,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            "jsonl",
         )
         .unwrap();
 
@@ -3557,7 +3639,7 @@ mod tests {
     #[test]
     fn torn_trailing_line_is_reported_as_rejected() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path(), "jsonl").unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -3579,7 +3661,7 @@ mod tests {
         .unwrap();
         file.sync_all().unwrap();
 
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         let summary = tracker.get_summary_in_bounds(None, None).unwrap();
 
         assert_eq!(summary.request_count, 1, "the intact record still counts");
@@ -3597,7 +3679,7 @@ mod tests {
     #[test]
     fn torn_tail_after_a_complete_record_is_reported_as_rejected() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path(), "jsonl").unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -3618,7 +3700,7 @@ mod tests {
         writeln!(file, "{line}").unwrap();
         file.sync_all().unwrap();
 
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         let summary = tracker.get_summary_in_bounds(None, None).unwrap();
 
         assert_eq!(summary.request_count, 1, "recovery keeps the prefix");
@@ -3629,7 +3711,7 @@ mod tests {
     #[test]
     fn fully_recovered_concatenated_records_are_not_rejected() {
         let tmp = TempDir::new().unwrap();
-        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path()).unwrap();
+        let storage_path = zeroclaw_infra::cost_ledger::resolve_path(tmp.path(), "jsonl").unwrap();
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -3654,7 +3736,7 @@ mod tests {
         writeln!(file, "{line}").unwrap();
         file.sync_all().unwrap();
 
-        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path(), "jsonl").unwrap();
         let summary = tracker.get_summary_in_bounds(None, None).unwrap();
 
         assert_eq!(summary.request_count, 2, "both complete records count");

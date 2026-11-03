@@ -837,7 +837,7 @@ mod graceful_summary_metering_tests {
             monthly_limit_usd: -1.0,
             ..CostConfig::default()
         };
-        let tracker = Arc::new(crate::cost::CostTracker::new(cfg, tmp.path()).unwrap());
+        let tracker = Arc::new(crate::cost::CostTracker::new(cfg, tmp.path(), "jsonl").unwrap());
         let ctx = ToolLoopCostTrackingContext::new(tracker, Arc::new(HashMap::new()));
 
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT

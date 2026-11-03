@@ -4656,7 +4656,7 @@ mod tests {
                 tool_call_id: "call-browser".into(),
                 tool_name: "browser".into(),
                 success: Some(true),
-                content: text,
+                content: text.to_owned(),
                 attachments: Vec::new(),
             },
         );
@@ -4735,7 +4735,7 @@ mod tests {
                 tool_call_id: "call-browser".into(),
                 tool_name: "browser".into(),
                 success: Some(true),
-                content: text,
+                content: text.to_owned(),
                 attachments: attachments.to_vec(),
             },
         );

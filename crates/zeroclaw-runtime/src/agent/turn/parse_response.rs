@@ -928,6 +928,7 @@ mod cost_usd_regression_tests {
             crate::cost::CostTracker::new(
                 zeroclaw_config::schema::CostConfig::default(),
                 tmpdir.path(),
+                "jsonl",
             )
             .unwrap(),
         );
