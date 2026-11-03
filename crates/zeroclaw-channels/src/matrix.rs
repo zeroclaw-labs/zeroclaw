@@ -430,11 +430,13 @@ mod approval {
     }
 
     pub(super) const APPROVAL_EMOJI_APPROVE: &str = "✅";
+    pub(super) const APPROVAL_EMOJI_ALWAYS: &str = "🔁";
     pub(super) const APPROVAL_EMOJI_DENY: &str = "❌";
 
     pub(super) fn approval_response_for_emoji(emoji: &str) -> Option<ChannelApprovalResponse> {
         match emoji {
             "✅" | "✅\u{fe0f}" => Some(ChannelApprovalResponse::Approve),
+            "🔁" | "🔁\u{fe0f}" => Some(ChannelApprovalResponse::AlwaysApprove),
             "❌" | "❌\u{fe0f}" => Some(ChannelApprovalResponse::Deny),
             _ => None,
         }
@@ -445,21 +447,33 @@ mod approval {
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
         bot_user_id: Option<&matrix_sdk::ruma::UserId>,
     ) -> String {
-        let mut prompt = crate::util::build_approve_deny_approval_prompt(
+        if bot_user_id.is_none() {
+            return crate::util::build_approve_deny_approval_prompt(
+                token,
+                &request.tool_name,
+                &request.arguments_summary,
+                request.position_counter(),
+            );
+        }
+
+        let header = crate::util::build_approval_prompt_header(
             token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
         );
-
-        if bot_user_id.is_some() {
-            prompt.push('\n');
-            prompt.push_str(&zeroclaw_runtime::i18n::get_required_cli_string(
-                "channel-approval-react-instruction",
-            ));
-        }
-
-        prompt
+        let react =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-react-instruction");
+        let approve_command = format!("{token} {}", crate::util::APPROVAL_REPLY_APPROVE);
+        let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "channel-approval-reply-fallback-instruction",
+            &[
+                ("approve_command", approve_command.as_str()),
+                ("always_word", crate::util::APPROVAL_REPLY_ALWAYS),
+                ("deny_word", crate::util::APPROVAL_REPLY_DENY),
+            ],
+        );
+        format!("{header}\n\n{react}\n{reply}")
     }
 
     pub(super) struct ReactionPolicy<'a> {
@@ -4094,6 +4108,7 @@ mod outbound {
     pub(super) async fn seed_approval_reactions(room: &Room, event_id: &OwnedEventId) {
         for emoji in [
             super::approval::APPROVAL_EMOJI_APPROVE,
+            super::approval::APPROVAL_EMOJI_ALWAYS,
             super::approval::APPROVAL_EMOJI_DENY,
         ] {
             let content =
@@ -8611,6 +8626,8 @@ mod tests {
             for (key, response) in [
                 ("✅", ChannelApprovalResponse::Approve),
                 ("✅\u{fe0f}", ChannelApprovalResponse::Approve),
+                ("🔁", ChannelApprovalResponse::AlwaysApprove),
+                ("🔁\u{fe0f}", ChannelApprovalResponse::AlwaysApprove),
                 ("❌", ChannelApprovalResponse::Deny),
                 ("❌\u{fe0f}", ChannelApprovalResponse::Deny),
             ] {
@@ -8626,6 +8643,9 @@ mod tests {
                 " ✅",
                 "✅✅",
                 "✅\u{fe0e}",
+                "🔂",
+                "🔄",
+                "🔁🔁",
                 "❌\u{fe0f}\u{fe0f}",
             ] {
                 assert_eq!(approval_response_for_emoji(key), None, "{key:?}");
@@ -8642,6 +8662,7 @@ mod tests {
             let rooms = vec![room.to_string(), "!other:example.invalid".to_string()];
             for (key, expected) in [
                 ("✅", ChannelApprovalResponse::Approve),
+                ("🔁", ChannelApprovalResponse::AlwaysApprove),
                 ("❌️", ChannelApprovalResponse::Deny),
             ] {
                 let pending = tokio::sync::Mutex::new(crate::matrix::approval::State::default());
@@ -8982,6 +9003,38 @@ mod tests {
             ));
         }
 
+        #[test]
+        fn reaction_prompt_keeps_a_compact_typed_fallback_that_parses() {
+            use super::super::approval::{build_approval_prompt, parse_reply};
+            let bot = matrix_sdk::ruma::user_id!("@bot:example.invalid");
+            let prompt = build_approval_prompt("APPROVAL", &approval_request(), Some(bot));
+            assert!(
+                prompt.contains(&zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-approval-react-instruction"
+                ))
+            );
+            assert!(prompt.contains("`APPROVAL approve`"), "{prompt:?}");
+            assert!(
+                prompt.contains("`always`") && prompt.contains("`deny`"),
+                "{prompt:?}"
+            );
+            assert!(!prompt.contains("APPROVAL deny"), "{prompt:?}");
+            for (word, expected) in [
+                ("approve", ChannelApprovalResponse::Approve),
+                ("always", ChannelApprovalResponse::AlwaysApprove),
+                ("deny", ChannelApprovalResponse::Deny),
+            ] {
+                assert_eq!(
+                    parse_reply(&format!("APPROVAL {word}")),
+                    Some(("APPROVAL".to_string(), expected))
+                );
+            }
+            assert_eq!(
+                build_approval_prompt("APPROVAL", &approval_request(), None),
+                crate::util::build_approve_deny_approval_prompt("APPROVAL", "shell", "pwd", None)
+            );
+        }
+
         #[tokio::test]
         async fn unknown_bot_identity_omits_react_instruction_seed_and_decision() {
             use matrix_sdk::{
@@ -9183,7 +9236,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(403).set_body_json(
                     serde_json::json!({"errcode":"M_FORBIDDEN","error":"forbidden"}),
                 ))
-                .expect(2)
+                .expect(3)
                 .mount(matrix.server())
                 .await;
             let workspace = tempfile::tempdir().unwrap();
@@ -9220,7 +9273,7 @@ mod tests {
                                 .iter()
                                 .filter(|req| req.url.path().contains("/send/m.reaction/"))
                                 .count()
-                                == 2;
+                                == 3;
                             if seeded {
                                 break;
                             }
@@ -9269,8 +9322,8 @@ mod tests {
                 .filter(|req| req.url.path().contains("/send/m.reaction/"))
                 .map(|req| req.body_json::<serde_json::Value>().unwrap()["m.relates_to"].clone())
                 .collect();
-            assert_eq!(annotations.len(), 2);
-            for (annotation, key) in annotations.iter().zip(["✅", "❌"]) {
+            assert_eq!(annotations.len(), 3);
+            for (annotation, key) in annotations.iter().zip(["✅", "🔁", "❌"]) {
                 assert_eq!(
                     annotation,
                     &serde_json::json!({"rel_type":"m.annotation","event_id":"$prompt:localhost","key":key})

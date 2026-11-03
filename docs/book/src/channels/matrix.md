@@ -478,13 +478,15 @@ If `password` + `user_id` aren't configured, auto-recovery can't run: the channe
 ## Tool approval over chat (`approval_timeout_secs`)
 
 When a tool requires approval, the bot posts its name, argument summary, and an
-8-character token into the requesting room. It adds ✅ and ❌ reactions to the
-prompt. Tap ✅ to approve that call once or ❌ to deny it. The Matrix sync
+8-character token into the requesting room. It adds ✅, 🔁 and ❌ reactions to
+the prompt. Tap ✅ to approve that call once, 🔁 to approve it and allow the tool
+for the rest of the session, or ❌ to deny it. The Matrix sync
 listener handles reactions in plain and encrypted rooms, provided the bot can
 decrypt the event. If its own identity is unavailable, it refuses reaction
 decisions and offers only the typed path.
 
-You can also reply with the token, for example:
+When reactions are available, the prompt lists the typed replies on one line.
+You can reply with the token, for example:
 
 ```text
 ABCD2345 approve
@@ -492,15 +494,15 @@ ABCD2345 deny
 ABCD2345 always
 ```
 
-`always` remains a typed decision because it grants a session-scoped allowance
-rather than permission for one call. A tap never grants that allowance.
+`always` and 🔁 grant a session-scoped allowance rather than permission for one
+call.
 
 Both paths require the sender to belong to the alias's peer group and the answer
 to arrive in the prompt's room, which must pass `allowed_rooms`. The token is a
 correlator, not a secret. Everyone in the room can read the tool arguments, so
 choose room membership accordingly. The bot ignores its own seeded reactions.
 
-A reaction added before the bot's own ✅/❌ appear also counts. After binding the
+A reaction added before the bot's own reactions appear also counts. After binding the
 prompt's event ID, the bot checks its existing annotation relations using the
 same authorization rules as live reactions. This catch-up is best-effort; a
 homeserver failure logs a warning, and typed replies remain available.
@@ -510,7 +512,7 @@ Resolution, timeout, and cancellation remove the prompt binding, so late taps do
 nothing. `approval_timeout_secs` defaults to 300 seconds; values below 1 use a
 one-second timeout. A timeout denies the request on the runtime's authority.
 
-If placing either reaction fails, the bot logs `matrix: failed to seed approval
+If placing a reaction fails, the bot logs `matrix: failed to seed approval
 reaction` at `WARN`; typed replies continue to work. This feature needs no new
 configuration. To roll back, run the previous build; typed approvals retain the
 same commands.
