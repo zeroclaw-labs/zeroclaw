@@ -455,24 +455,15 @@ mod approval {
                 request.position_counter(),
             );
         }
-
         let header = crate::util::build_approval_prompt_header(
             token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
         );
+        let reply = crate::util::approve_deny_reply_instruction(token);
         let react =
             zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-react-instruction");
-        let approve_command = format!("{token} {}", crate::util::APPROVAL_REPLY_APPROVE);
-        let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-            "channel-approval-reply-fallback-instruction",
-            &[
-                ("approve_command", approve_command.as_str()),
-                ("always_word", crate::util::APPROVAL_REPLY_ALWAYS),
-                ("deny_word", crate::util::APPROVAL_REPLY_DENY),
-            ],
-        );
         format!("{header}\n\n{react}\n{reply}")
     }
 
@@ -9004,28 +8995,24 @@ mod tests {
         }
 
         #[test]
-        fn reaction_prompt_keeps_a_compact_typed_fallback_that_parses() {
+        fn reaction_prompt_leads_with_reactions_and_keeps_full_typed_replies() {
             use super::super::approval::{build_approval_prompt, parse_reply};
             let bot = matrix_sdk::ruma::user_id!("@bot:example.invalid");
             let prompt = build_approval_prompt("APPROVAL", &approval_request(), Some(bot));
-            assert!(
-                prompt.contains(&zeroclaw_runtime::i18n::get_required_cli_string(
-                    "channel-approval-react-instruction"
-                ))
+            let react = zeroclaw_runtime::i18n::get_required_cli_string(
+                "channel-approval-react-instruction",
             );
-            assert!(prompt.contains("`APPROVAL approve`"), "{prompt:?}");
-            assert!(
-                prompt.contains("`always`") && prompt.contains("`deny`"),
-                "{prompt:?}"
-            );
-            assert!(!prompt.contains("APPROVAL deny"), "{prompt:?}");
+            let react_at = prompt.find(&react).expect("react instruction");
             for (word, expected) in [
                 ("approve", ChannelApprovalResponse::Approve),
                 ("always", ChannelApprovalResponse::AlwaysApprove),
                 ("deny", ChannelApprovalResponse::Deny),
             ] {
+                let reply = format!("APPROVAL {word}");
+                let reply_at = prompt.find(&format!("`{reply}`")).expect(&reply);
+                assert!(react_at < reply_at, "{prompt:?}");
                 assert_eq!(
-                    parse_reply(&format!("APPROVAL {word}")),
+                    parse_reply(&reply),
                     Some(("APPROVAL".to_string(), expected))
                 );
             }

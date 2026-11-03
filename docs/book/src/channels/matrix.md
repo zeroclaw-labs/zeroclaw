@@ -485,8 +485,7 @@ listener handles reactions in plain and encrypted rooms, provided the bot can
 decrypt the event. If its own identity is unavailable, it refuses reaction
 decisions and offers only the typed path.
 
-When reactions are available, the prompt lists the typed replies on one line.
-You can reply with the token, for example:
+You can also reply with the token, for example:
 
 ```text
 ABCD2345 approve
