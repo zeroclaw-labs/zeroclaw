@@ -615,10 +615,13 @@ mod native_effort {
                 })
                 .await;
             let bodies = server.bodies();
+            assert_eq!(bodies.len(), 3);
             assert_eq!(bodies[0], bodies[2]);
             let effort = if wire == zeroclaw_config::schema::WireApi::Responses {
+                assert_eq!(bodies[0]["reasoning"]["effort"], "medium");
                 &bodies[1]["reasoning"]["effort"]
             } else {
+                assert!(bodies[0].get("reasoning_effort").is_none());
                 &bodies[1]["reasoning_effort"]
             };
             assert_eq!(effort, "low");
