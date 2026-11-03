@@ -10426,7 +10426,6 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             // scripts/automation can tell that no code was obtained.
                             // Exit here (instead of `return Err(e)`) so anyhow does not
                             // reprint the same error after the human-readable guidance.
-                            let _ = e;
                             std::process::exit(1);
                         }
                     }
