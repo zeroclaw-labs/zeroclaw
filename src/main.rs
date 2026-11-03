@@ -1574,12 +1574,15 @@ and smoke test. Automatic rollback on failure.
 Use --check to only check for updates without installing.
 Use --force to skip the confirmation prompt.
 Use --version to target a specific release instead of latest.
+Use --standard in a CLI-only build to switch it to the standard build, \
+which adds the dashboard and web gateway.
 
 Examples:
   zeroclaw update                      # download and install latest
   zeroclaw update --check              # check only, don't install
   zeroclaw update --force              # install without confirmation
-  zeroclaw update --version 0.6.0      # install specific version")]
+  zeroclaw update --version 0.6.0      # install specific version
+  zeroclaw update --standard           # CLI-only build: switch to the standard build")]
     Update {
         /// Only check for updates, don't install
         #[arg(long)]
@@ -1593,6 +1596,10 @@ Examples:
         /// With --check, emit machine-readable JSON instead of human text
         #[arg(long)]
         json: bool,
+        /// In a CLI-only build, install the standard build, which adds the
+        /// dashboard and web gateway. No effect in a standard build
+        #[arg(long)]
+        standard: bool,
     },
 
     /// Run diagnostic self-tests
@@ -11263,12 +11270,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         // One-time pairing code gates enrollment. Print it AND the
                         // CA-bound short-auth-string so the operator reads both to
                         // the client out of band (no blind trust-on-first-use).
-                        let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
-                            true,
-                            &[],
-                            startup_pairing_code_policy,
-                        ));
-                        if let Some(code) = pairing.pairing_code() {
+                        // The code lives in the enrollment slot of the daemon's
+                        // canonical pairing authority: it enrolls but never
+                        // pairs a bearer, and it leaves the gateway's pending
+                        // code alone. Enrollment always requires a code, even
+                        // with gateway pairing disabled.
+                        let pairing = std::sync::Arc::clone(ctx.auth.pairing());
+                        {
+                            let code = pairing.enrollment_code(startup_pairing_code_policy);
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
                             let enroll_bind = enroll_cfg.bind.to_string();
                             let enroll_port = enroll_cfg.port.to_string();
@@ -12553,9 +12562,10 @@ Add pricing to the active provider profile or supply a catalog entry."
             force,
             version,
             json,
+            standard,
         } => {
             if check {
-                let info = commands::update::check(version.as_deref()).await?;
+                let info = commands::update::check(version.as_deref(), standard).await?;
                 if json {
                     // Machine-readable shape consumed by the gateway's
                     // `GET /api/version/check`. Keep field names stable.
@@ -12594,7 +12604,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref(), force).await
+                commands::update::run(version.as_deref(), force, standard).await
             }
         }
 
@@ -18348,6 +18358,29 @@ mod tests {
                     json: true,
                 }
             } if run_id == "run-123-0001"
+        ));
+    }
+
+    #[test]
+    fn update_cli_parses_standard_with_version_and_force() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "update",
+            "--standard",
+            "--version",
+            "0.9.0",
+            "--force",
+        ])
+        .expect("update --standard should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Update {
+                check: false,
+                force: true,
+                version: Some(version),
+                json: false,
+                standard: true,
+            } if version == "0.9.0"
         ));
     }
 
