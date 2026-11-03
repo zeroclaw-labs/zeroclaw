@@ -196,31 +196,40 @@ fn map_agy_output(
     let denied_actions = parsed.denied_actions.unwrap_or_default();
     let status = parsed.status.as_deref().unwrap_or("");
 
+    // Text agy supplies (status, error detail, denied labels) is bounded by
+    // the same limit as stderr before it is placed in a message.
     if status != AGY_STATUS_SUCCESS {
         let detail = parsed
             .error
             .as_deref()
             .map(str::trim)
             .filter(|e| !e.is_empty())
-            .map(|e| format!(": {e}"))
+            .map(|e| format!(": {}", truncate_output(e, max_output_bytes)))
             .unwrap_or_default();
-        let status = if status.is_empty() { "missing" } else { status };
+        let status = if status.is_empty() {
+            "missing".to_string()
+        } else {
+            truncate_output(status, max_output_bytes)
+        };
         return ToolResult {
             success: false,
             output: response.into(),
             error: Some(with_stderr(tool_msg_with_args(
                 "tool-agy-cli-error-status",
-                &[("status", status), ("detail", &detail)],
+                &[("status", &status), ("detail", &detail)],
             ))),
         };
     }
 
     if !denied_actions.is_empty() {
-        let denied = denied_actions
-            .iter()
-            .map(AgyDeniedAction::label)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let denied = truncate_output(
+            &denied_actions
+                .iter()
+                .map(AgyDeniedAction::label)
+                .collect::<Vec<_>>()
+                .join(", "),
+            max_output_bytes,
+        );
         return ToolResult {
             success: false,
             output: response.into(),
@@ -744,6 +753,40 @@ mod tests {
         assert_eq!(
             result.error.as_deref(),
             Some("eeeeeeee\n... [output truncated]")
+        );
+    }
+
+    #[test]
+    fn map_caps_agy_status_error_and_denied_labels() {
+        let status = "S".repeat(64);
+        let detail = "d".repeat(64);
+        let json = format!(r#"{{"status":"{status}","response":"","error":"{detail}"}}"#);
+        let result = map_agy_output(true, &json, "", 8);
+        assert!(!result.success);
+        let error = result.error.expect("status error");
+        assert!(!error.contains(&status), "uncapped status in {error}");
+        assert!(!error.contains(&detail), "uncapped error detail in {error}");
+        assert!(
+            error.contains("SSSSSSSS\n... [output truncated]"),
+            "{error}"
+        );
+        assert!(
+            error.contains("dddddddd\n... [output truncated]"),
+            "{error}"
+        );
+
+        let denied = vec![r#"{"display_name":"RunCommand"}"#; 16].join(",");
+        let json = format!(r#"{{"status":"SUCCESS","response":"","denied_actions":[{denied}]}}"#);
+        let result = map_agy_output(true, &json, "", 8);
+        assert!(!result.success);
+        let error = result.error.expect("denied error");
+        assert!(
+            !error.contains("RunCommand, RunCommand"),
+            "uncapped denied labels in {error}"
+        );
+        assert!(
+            error.contains("RunComma\n... [output truncated]"),
+            "{error}"
         );
     }
 
