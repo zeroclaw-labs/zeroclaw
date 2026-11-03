@@ -1602,9 +1602,12 @@ impl RpcDispatcher {
             .iter()
             .find(|path| !grants.may_write_config(path))
         {
-            return Err(refuse(AuthDenied::forbidden(format!(
-                "Principal is not granted config write access to {path:?}, which this change also rewrites"
-            ))));
+            return Err(refuse(AuthDenied::forbidden(
+                crate::i18n::get_required_cli_string_with_args(
+                    "rpc-auth-config-cascade-write-denied",
+                    &[("path", path)],
+                ),
+            )));
         }
         Ok(())
     }

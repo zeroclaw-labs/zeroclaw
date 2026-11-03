@@ -1711,6 +1711,7 @@ rpc-auth-local-roster-required = A local user roster is configured: connect from
 rpc-auth-remote-token-required = Remote connections must present auth_token in initialize
 rpc-auth-first-call-initialize = First call must be 'initialize'
 rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
+rpc-auth-config-cascade-write-denied = Principal is not granted config write access to "{ $path }", which this change also rewrites
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 rpc-plugin-webhook-local-ipc-only = { $method } is served only on the local IPC endpoint
 rpc-plugin-webhook-channel-not-granted = Principal is not granted the channel that owns this webhook path (required by plugin-webhook/dispatch)
