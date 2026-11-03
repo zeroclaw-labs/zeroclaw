@@ -964,6 +964,67 @@ mod payload_capture_tests {
         zeroclaw_log::clear_broadcast_hook();
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn llm_request_payload_masks_replayed_private_tool_results() {
+        use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher};
+        use crate::agent::prompt::SESSION_PROMPT_HISTORY_RESULT_KEY;
+
+        // Match the capture tests' lock order across the awaited broadcast.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        struct ResetCapture;
+        impl Drop for ResetCapture {
+            fn drop(&mut self) {
+                install_writer("off");
+                zeroclaw_log::clear_broadcast_hook();
+            }
+        }
+        let _reset = ResetCapture;
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        let cfg = LogConfig {
+            log_llm_request_payload: "redacted".into(),
+            log_tool_io_truncate_bytes: 65_536,
+            log_persistence: "none".into(),
+            ..LogConfig::default()
+        };
+        zeroclaw_log::init_from_config(&cfg, std::path::Path::new("/"));
+        let private_body = "synthetic-private-replayed-log-result";
+        let flat =
+            vec![
+            ChatMessage::user("public-replay-log-control"),
+            ChatMessage::assistant(serde_json::json!({
+                "tool_calls": [{"id": "rewritten", "name": "ordinary_tool", "arguments": "{}"}],
+            }).to_string()),
+            ChatMessage::tool(serde_json::json!({
+                "tool_call_id": "rewritten", "content": private_body,
+                "attachments": [], SESSION_PROMPT_HISTORY_RESULT_KEY: true,
+            }).to_string()),
+        ];
+        let replayed = crate::agent::Agent::replay_loop_messages_for_retention(&flat);
+        let request = NativeToolDispatcher.to_provider_messages(&replayed);
+        assert!(request.iter().any(|msg| msg.content.contains(private_body)));
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            turn_id: "trace-replayed-private-result",
+            ..test_ctx(&observer, &pacing)
+        };
+        let _ = announce_llm_request(&ctx, &request, None, &StubProvider, "stub", "stub-model", 0)
+            .await;
+        let record = next_llm_request(&mut rx, ctx.turn_id).await;
+        let payload = record["attributes"]["request_messages"].as_str().unwrap();
+        assert!(payload.contains("public-replay-log-control"));
+        assert!(payload.contains("Session-prompt tool exchange omitted"));
+        assert!(!payload.contains(private_body));
+        assert!(
+            record["attributes"]
+                .get("request_messages_truncated")
+                .is_none()
+        );
+    }
+
     fn test_tool_spec(name: &str) -> ToolSpec {
         ToolSpec::new(name, "test tool", serde_json::json!({}))
     }

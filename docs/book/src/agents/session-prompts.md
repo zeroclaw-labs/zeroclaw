@@ -274,6 +274,10 @@ loading a retained transcript, the model does not recover the hidden tool
 exchange from history, but the attached prompt collection itself remains
 available through the session metadata and the next injected system prompt.
 
+Private-result provenance survives the agent's typed history and later native
+or text requests, including when a tool hook changed an ordinary call into a
+prompt-tool call. The original call name does not make that result public.
+
 Modifying `before_llm_call` hooks are not called for requests carrying attached
 prompt text or session-prompt tool exchanges, including programmatically
 registered handlers. Such requests dispatch as prepared: hook transformations,

@@ -13990,6 +13990,7 @@ fn checkpoint_fragment_for_event(event: &TurnEvent) -> Option<ConversationMessag
             let content =
                 zeroclaw_infra::acp_session_store::AcpSessionStore::bounded_tool_output(output);
             Some(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: id.clone(),
                 content,
                 tool_name: name.clone(),
@@ -31317,11 +31318,13 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "shared".into(),
                     content: "/tmp".into(),
                     tool_name: "shell".into(),
                 },
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "shared".into(),
                     content: "duplicate result".into(),
                     tool_name: "shell".into(),
@@ -31344,16 +31347,19 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "solo".into(),
                     content: "contents".into(),
                     tool_name: "read".into(),
                 },
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "shared".into(),
                     content: "second fold".into(),
                     tool_name: "shell".into(),
                 },
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "orphan".into(),
                     content: "late result".into(),
                     tool_name: "shell".into(),
@@ -32649,6 +32655,7 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "call-1".into(),
                 tool_name: "shell".into(),
                 content: "/tmp".into(),
@@ -33576,16 +33583,19 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "call-2".into(),
                     content: "contents".into(),
                     tool_name: "read".into(),
                 },
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "call-1".into(),
                     content: "/tmp".into(),
                     tool_name: "shell".into(),
                 },
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "orphan".into(),
                     content: "late result".into(),
                     tool_name: "shell".into(),
@@ -33647,11 +33657,13 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "duplicate".into(),
                     content: "first result".into(),
                     tool_name: "first".into(),
                 },
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "duplicate".into(),
                     content: "second result".into(),
                     tool_name: "second".into(),
@@ -33683,6 +33695,7 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "old-call".into(),
                 content: "/tmp".into(),
                 tool_name: "shell".into(),
@@ -33769,6 +33782,7 @@ mod tests {
                         reasoning_content: None,
                     },
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        session_prompt_tool_result: false,
                         tool_call_id: "tc-1".into(),
                         content: "log contents".into(),
                         tool_name: String::new(),
@@ -33784,6 +33798,7 @@ mod tests {
                         reasoning_content: None,
                     },
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        session_prompt_tool_result: false,
                         tool_call_id: "tc-2".into(),
                         content: "no errors".into(),
                         tool_name: String::new(),
@@ -34330,16 +34345,19 @@ mod tests {
                     },
                     ConversationMessage::ToolResults(vec![
                         ToolResultMessage {
+                            session_prompt_tool_result: false,
                             tool_call_id: "duplicate".into(),
                             content: "first result".into(),
                             tool_name: "first".into(),
                         },
                         ToolResultMessage {
+                            session_prompt_tool_result: false,
                             tool_call_id: "orphan".into(),
                             content: "orphan result".into(),
                             tool_name: "shell".into(),
                         },
                         ToolResultMessage {
+                            session_prompt_tool_result: false,
                             tool_call_id: "duplicate".into(),
                             content: "second result".into(),
                             tool_name: "second".into(),

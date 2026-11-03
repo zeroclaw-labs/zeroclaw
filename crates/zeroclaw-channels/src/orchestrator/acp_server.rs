@@ -7431,6 +7431,7 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "toolu_read_1".to_string(),
                 content: "port = 8080".to_string(),
                 tool_name: "read_file".to_string(),
@@ -7519,6 +7520,7 @@ mod tests {
                 reasoning_content: None,
             }),
             seed_row(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "toolu_ok".to_string(),
                 content: "done".to_string(),
                 tool_name: "shell".to_string(),
@@ -7536,6 +7538,7 @@ mod tests {
         })];
         partial.push(seed_row(ConversationMessage::ToolResults(vec![
             ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "toolu_ok".to_string(),
                 content: "done".to_string(),
                 tool_name: "shell".to_string(),

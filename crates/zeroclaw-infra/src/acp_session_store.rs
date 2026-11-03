@@ -1421,6 +1421,7 @@ impl AcpSessionStore {
                         extra_content: None,
                     }),
                     "out" => outs.push(ToolResultMessage {
+                        session_prompt_tool_result: false,
                         tool_call_id,
                         content: payload,
                         // Carry the producing tool name (looked up from the
@@ -3239,6 +3240,7 @@ impl ProjectedGroup {
                 });
                 if let Some(content) = output {
                     messages.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        session_prompt_tool_result: false,
                         tool_call_id,
                         content,
                         tool_name: output_name.unwrap_or_default(),
@@ -3293,6 +3295,7 @@ impl ProjectedGroup {
                 let (tool_call_id, tool_name, content) = row?;
                 selected_ids.insert(tool_call_id.clone());
                 messages.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id,
                     content,
                     tool_name,
@@ -3525,6 +3528,7 @@ mod tests {
                 "turn",
                 &[
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        session_prompt_tool_result: false,
                         tool_call_id: "retained-call".into(),
                         tool_name: "read".into(),
                         content: "result".into(),
@@ -4033,6 +4037,7 @@ mod tests {
             reasoning_content: None,
         };
         let result = ConversationMessage::ToolResults(vec![ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: "call-1".to_string(),
             tool_name: "shell".to_string(),
             content: "/tmp/workspace".to_string(),
@@ -4232,6 +4237,7 @@ mod tests {
             .unwrap();
 
         let invalid_terminal = vec![ConversationMessage::ToolResults(vec![ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: "missing".to_string(),
             tool_name: "shell".to_string(),
             content: "orphan".to_string(),
@@ -4315,11 +4321,13 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "paired".to_string(),
                 tool_name: "shell".to_string(),
                 content: "first".to_string(),
             }]),
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "orphan".to_string(),
                 tool_name: "shell".to_string(),
                 content: "misplaced".to_string(),
@@ -4353,6 +4361,7 @@ mod tests {
             extra_content: None,
         };
         let result = |id: &str| ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: id.into(),
             tool_name: "shell".into(),
             content: format!("output for {id}"),
@@ -4425,6 +4434,7 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "call-1".to_string(),
                 tool_name: "shell".to_string(),
                 content: "x".repeat(MAX_PERSISTED_TOOL_OUTPUT_BYTES + 10),
@@ -4475,6 +4485,7 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 zeroclaw_api::model_provider::ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "call-1".into(),
                     content: "old result".into(),
                     tool_name: "old_tool".into(),
@@ -4531,6 +4542,7 @@ mod tests {
                     },
                     ConversationMessage::ToolResults(vec![
                         zeroclaw_api::model_provider::ToolResultMessage {
+                            session_prompt_tool_result: false,
                             tool_call_id: "call-2".into(),
                             content: "new result".into(),
                             tool_name: "new_tool".into(),
@@ -4575,11 +4587,13 @@ mod tests {
             },
             ConversationMessage::ToolResults(vec![
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "c1".into(),
                     content: "ok".into(),
                     tool_name: "shell".into(),
                 },
                 ToolResultMessage {
+                    session_prompt_tool_result: false,
                     tool_call_id: "c2".into(),
                     content: "ok".into(),
                     tool_name: "read".into(),
@@ -4775,6 +4789,7 @@ mod tests {
                 reasoning_content: Some("think think".into()),
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "tc-1".into(),
                 content: "file.txt\n".into(),
                 tool_name: String::new(),
@@ -5110,16 +5125,19 @@ mod tests {
                     },
                     ConversationMessage::ToolResults(vec![
                         ToolResultMessage {
+                            session_prompt_tool_result: false,
                             tool_call_id: "two".into(),
                             content: "two-result".into(),
                             tool_name: "shell".into(),
                         },
                         ToolResultMessage {
+                            session_prompt_tool_result: false,
                             tool_call_id: "orphan".into(),
                             content: "orphan-result".into(),
                             tool_name: "shell".into(),
                         },
                         ToolResultMessage {
+                            session_prompt_tool_result: false,
                             tool_call_id: "one".into(),
                             content: "one-result".into(),
                             tool_name: "shell".into(),
@@ -5245,6 +5263,7 @@ mod tests {
         };
         let result = |id: &str| {
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: id.into(),
                 content: "ok".into(),
                 tool_name: "shell".into(),
@@ -5453,6 +5472,7 @@ mod tests {
                         reasoning_content: None,
                     },
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        session_prompt_tool_result: false,
                         tool_call_id: "tc-1".into(),
                         content: "ok".into(),
                         tool_name: String::new(),
@@ -5863,6 +5883,7 @@ mod tests {
 
     fn tool_result(id: &str) -> ToolResultMessage {
         ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: id.to_string(),
             content: "out".into(),
             tool_name: "shell".into(),
@@ -6850,6 +6871,7 @@ mod tests {
                         reasoning_content: Some("thinking".into()),
                     },
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        session_prompt_tool_result: false,
                         tool_call_id: "tc-1".into(),
                         content: "done".into(),
                         tool_name: String::new(),

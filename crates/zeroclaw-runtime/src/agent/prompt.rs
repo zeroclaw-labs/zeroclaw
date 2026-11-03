@@ -104,7 +104,7 @@ const SESSION_PROMPTS_EXPORT_MARKER: &str = "\n\n[Persistent session prompts omi
 const SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER: &str =
     "[Session-prompt tool exchange omitted from export]";
 /// Reserved host result-envelope metadata, derived from the executed identity.
-pub(crate) const SESSION_PROMPT_HISTORY_RESULT_KEY: &str = "session_prompt_tool_result";
+pub(crate) use zeroclaw_api::model_provider::SESSION_PROMPT_HISTORY_RESULT_KEY;
 /// Reserved metadata inside the existing host-authored text-result carrier.
 pub(crate) const SESSION_PROMPT_TEXT_RESULT_MARKER: &str = "\n[Session-prompt tool result]\n";
 

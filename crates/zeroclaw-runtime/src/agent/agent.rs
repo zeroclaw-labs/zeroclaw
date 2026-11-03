@@ -4295,6 +4295,10 @@ impl Agent {
                         .into_iter()
                         .filter_map(|v| {
                             Some(ToolResultMessage {
+                                session_prompt_tool_result: v
+                                    .get(crate::agent::prompt::SESSION_PROMPT_HISTORY_RESULT_KEY)
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false),
                                 tool_call_id: v.get("tool_call_id")?.as_str()?.to_string(),
                                 content: v
                                     .get("content")
@@ -4315,6 +4319,10 @@ impl Agent {
                 }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.content) {
                     let result = ToolResultMessage {
+                        session_prompt_tool_result: v
+                            .get(crate::agent::prompt::SESSION_PROMPT_HISTORY_RESULT_KEY)
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
                         tool_call_id: v
                             .get("tool_call_id")
                             .and_then(|id| id.as_str())
@@ -5889,6 +5897,10 @@ mod safety_net;
 #[cfg(test)]
 #[path = "parity.rs"]
 mod parity;
+
+#[cfg(test)]
+#[path = "session_prompt_replay_tests.rs"]
+mod session_prompt_replay_tests;
 
 // Live-config plugin regression (child module so it can read the constructed
 // Agent's tool registry the same way `mod tests` does). Needs a WASM compiler
@@ -12937,6 +12949,7 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "tc-1".into(),
                 content: "ok".into(),
                 tool_name: String::new(),
@@ -13022,6 +13035,7 @@ mod tests {
                 reasoning_content: None,
             },
             ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id: "seed-call".into(),
                 content: "result".into(),
                 tool_name: "echo".into(),
@@ -14126,6 +14140,7 @@ mod tests {
         agent
             .history
             .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                session_prompt_tool_result: false,
                 tool_call_id,
                 content: format!("result {index}"),
                 tool_name: "mock".into(),
