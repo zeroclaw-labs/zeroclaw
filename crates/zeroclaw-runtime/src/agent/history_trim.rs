@@ -1836,15 +1836,6 @@ mod collapse_tests {
         ]
     }
 
-    /// user → assistant(call) → user([Tool results]) → assistant(final)
-    fn prompt_mode_turn(n: usize) -> Vec<ChatMessage> {
-        vec![
-            user(&format!("request {n}")),
-            carrier(&[&format!("call_{n}")]),
-            tool(&format!("call_{n}"), &format!("result {n}")),
-            asst(&format!("answer {n}")),
-        ]
-    }
 
     fn rows(history: &[ChatMessage]) -> Vec<(String, String)> {
         history
@@ -1911,10 +1902,10 @@ mod collapse_tests {
     }
 
     #[test]
-    fn prompt_mode_results_carrier_is_not_a_turn_boundary() {
+    fn structured_tool_results_are_not_turn_boundaries() {
         let mut h = vec![sys("s")];
         for n in 1..=3 {
-            h.extend(prompt_mode_turn(n));
+            h.extend(native_turn(n));
         }
         let c = collapse_tool_context_older_than(&h, 0, false, &known());
         assert_eq!(c.collapsed_turns, 2);
