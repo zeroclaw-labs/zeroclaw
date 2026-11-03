@@ -270,13 +270,7 @@ pub(crate) fn merge_external_peer(
 /// callers may invoke this on every connect/reconnect. `persist = None`
 /// (no handle wired) warns and succeeds without persisting. `match_fn` is the
 /// channel's own admission comparison; see [`merge_external_peer`].
-#[cfg(any(
-    feature = "channel-telegram",
-    feature = "channel-line",
-    feature = "channel-wechat",
-    feature = "whatsapp-web",
-    test
-))]
+#[cfg(any(feature = "channel-wechat", test))]
 pub(crate) async fn persist_external_peer(
     persist: Option<&LiveConfigAuthority>,
     channel_type: &str,
@@ -291,7 +285,6 @@ pub(crate) async fn persist_external_peer(
 /// Fence detached pairing callbacks with their listener's lifetime. Once a
 /// write owns the config lock, finish save and publication without cancellation.
 #[cfg(any(
-    feature = "channel-telegram",
     feature = "channel-line",
     feature = "channel-wechat",
     feature = "whatsapp-web",
@@ -304,6 +297,36 @@ pub(crate) async fn persist_external_peer_with_cancellation(
     identity: &str,
     match_fn: impl Fn(&str, &str) -> bool,
     cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> anyhow::Result<()> {
+    persist_external_peer_checked(
+        persist,
+        channel_type,
+        alias,
+        identity,
+        match_fn,
+        cancellation,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// Revalidate channel-owned pairing policy against the refreshed config while
+/// holding writer serialization, before mutation or retained persistence.
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "channel-line",
+    feature = "channel-wechat",
+    feature = "whatsapp-web",
+    test
+))]
+pub(crate) async fn persist_external_peer_checked(
+    persist: Option<&LiveConfigAuthority>,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+    match_fn: impl Fn(&str, &str) -> bool,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    precondition: impl FnOnce(&Config) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
 
@@ -349,6 +372,7 @@ pub(crate) async fn persist_external_peer_with_cancellation(
     {
         snapshot.peer_groups = persisted;
     }
+    precondition(&snapshot)?;
     if merge_external_peer(&mut snapshot, channel_type, alias, identity, &match_fn)?.is_none() {
         return Ok(());
     }

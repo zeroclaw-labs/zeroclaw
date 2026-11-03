@@ -613,7 +613,7 @@ fn immutable_stable_release_recipe_has_real_command_and_failure_baselines() {
     let outside = format!("{}{}", &release[..start], &release[end..]);
     assert_eq!(
         format!("{:x}", Sha256::digest(outside.as_bytes())),
-        "a48e3f774aabe4de73e866a76eab4c748696e4901b739a54f6f33575e71cd2e6"
+        "188c8f6bef4d2eb7bbeb3a8885607a09ed363e7b2cbdb57c1265251d19528899"
     );
     let matrix = yaml_block(build, "      matrix:\n");
     for context in RELEASE_RECIPE_CONTEXTS {
@@ -2519,6 +2519,37 @@ ${archive_args[@]+\"${archive_args[@]}\"} \\\n            \
     assert!(
         !docker.lines().any(|line| line.starts_with("    if:")),
         "the container images must keep the implicit success() gate over the smoke"
+    );
+}
+
+/// GitHub retires the macOS 14 runner image on 2026-11-02 and fails jobs on it
+/// during scheduled brownouts until then. The plugin smoke runs a macOS leg and
+/// blocks both the GitHub Release and the container images, so one leg on that
+/// image stops a release. No workflow may name it.
+#[test]
+fn workflows_never_name_the_retired_macos_14_runner() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut scanned = 0;
+    let mut offenders = Vec::new();
+    for entry in fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("failed to list {}: {error}", directory.display()))
+    {
+        let entry = entry.expect("readable workflow directory entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let text = fs::read_to_string(entry.path())
+            .unwrap_or_else(|error| panic!("failed to read {name}: {error}"));
+        scanned += 1;
+        offenders.extend(
+            text.lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains("macos-14"))
+                .map(|(index, _)| format!("{name}:{}", index + 1)),
+        );
+    }
+    assert!(scanned > 0, "no workflow files in {}", directory.display());
+    assert!(
+        offenders.is_empty(),
+        "macos-14 is a retired runner image; use macos-15: {offenders:?}"
     );
 }
 

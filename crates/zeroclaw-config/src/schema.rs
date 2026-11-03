@@ -8,6 +8,7 @@ use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
 use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
+use crate::scattered_types::OutboundSmtp;
 use crate::traits::{ApplicationCapability, ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
@@ -950,7 +951,7 @@ pub enum CacheTtl {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models"]
 pub struct ModelProviderConfig {
-    /// Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
+    /// Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored encrypted in config.toml, with the key in `.secret_key` beside it (plaintext if `secrets.encrypt = false`). Set it with `zeroclaw config set` rather than pasting it into the file, and keep `.secret_key` out of version control.
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
@@ -13122,6 +13123,45 @@ pub fn validate_memory_semantics(
         .collect()
 }
 
+/// Warn when only one half of the outbound SMTP pair is configured.
+///
+/// `smtp_host` and `from_address` are each optional so an IMAP-only mailbox can
+/// be read without granting send access. That makes a half-configured pair — a
+/// relay host with no From identity, or the reverse — look like a working
+/// channel that silently never sends: the channel loads, reads mail, and
+/// refuses every send. Surface the cause once per alias instead of leaving the
+/// operator to discover it from a reply that never leaves.
+///
+/// The classification is shared with the runtime gate rather than restated
+/// here, so `config validate` and `EmailChannel` cannot drift into disagreeing
+/// about which aliases can send.
+///
+/// Called from `Config::collect_warnings`, so this reaches the CLI and the
+/// gateway dashboard on the same path as the other warnings.
+pub fn validate_email_smtp_semantics(
+    alias: &str,
+    em: &crate::scattered_types::EmailConfig,
+) -> Vec<crate::validation_warnings::ValidationWarning> {
+    if !em.enabled {
+        return Vec::new();
+    }
+    // Only a half-configured pair is diagnosable; the classifier names the
+    // missing half. A fully configured pair and the supported inbound-only
+    // mode both stay quiet.
+    let OutboundSmtp::Partial { set, missing } = em.outbound_smtp() else {
+        return Vec::new();
+    };
+    vec![crate::validation_warnings::ValidationWarning::new(
+        crate::validation_warnings::EMAIL_SMTP_PARTIALLY_CONFIGURED,
+        format!(
+            "channels.email.{alias}.{set} is set but {missing} is not, so outbound \
+             sending stays disabled. Set both to enable SMTP, or neither for an \
+             inbound-only mailbox."
+        ),
+        format!("channels.email.{alias}.{missing}"),
+    )]
+}
+
 /// Surface WhatsApp chat-policy keys that are accepted but never consulted.
 ///
 /// `self_chat_mode` is read only by the Web transport inside its
@@ -14814,7 +14854,13 @@ pub struct RuntimeProfileConfig {
     pub max_system_prompt_chars: Option<usize>,
     /// Maximum characters for a single tool result. `None` inherits.
     pub max_tool_result_chars: Option<usize>,
-    /// Number of recent turns whose full tool context is preserved. `None` inherits.
+    /// Number of completed turns before the running one whose tool-call and
+    /// tool-result rows are still sent to the model; older turns are sent as
+    /// their user prompt, a tool-exchange summary and the closing assistant
+    /// reply. The running turn is always sent whole, so `0` keeps tool context
+    /// for the running turn only. The stored transcript is not affected. On
+    /// channels, `0` also skips persisting the current turn's tool rows.
+    /// `None` inherits the global default (2).
     pub keep_tool_context_turns: Option<usize>,
     /// Maximum memory entries injected per turn. `None` inherits global default (5).
     /// Set to `0` for unlimited.
@@ -16839,6 +16885,15 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Notice sent to a sender this channel has not authorized. `{identity}`
+    /// expands to the sender's Telegram user ID (or username when no ID is
+    /// available) and `{bind_command}` to the `zeroclaw channel bind-telegram`
+    /// invocation for this alias, so a deployment that authorizes from
+    /// configuration can drop the operator-terminal instruction the built-in
+    /// notice carries. Unset or blank keeps the built-in notice.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub unauthorized_message: Option<String>,
     /// When `true` (default), group-chat sessions key on the sender, so
     /// distinct members of the same group (or forum topic) each get an
     /// isolated conversation context (matches the existing behavior). When
@@ -16922,6 +16977,7 @@ impl Default for TelegramConfig {
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -21309,6 +21365,44 @@ pub(crate) fn install_data_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("data")
 }
 
+/// Create a directory owner-only (mode `0o700` on Unix) unless it already
+/// exists. Group and other access stay closed whatever the process umask.
+/// ACL entries inherited on macOS or NFSv4 are outside the mode bits.
+///
+/// `Config::load_or_init` and `ConfigOwnershipGuard` create the install data
+/// directory through here, and the guard also creates its `.lifecycle`
+/// subdirectory, so a umask such as `0002` no longer leaves either `0775`.
+/// Missing parents keep the default mode, and an existing directory is left
+/// as it is: this helper does not change the permissions of a directory it
+/// did not just create.
+///
+/// `Ok` does not mean the path is an owner-only real directory: it also
+/// covers an existing directory of any owner or mode, and a symlink to a
+/// directory. Callers that rely on that must lstat the path, as
+/// `ConfigOwnershipGuard` does.
+pub fn create_owner_only_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        // mkdir(2) masks the requested mode with the umask, which can only
+        // clear bits, so group and other bits stay clear for any umask.
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
 fn default_config_dir() -> Result<PathBuf> {
     if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let custom = custom.trim();
@@ -22960,7 +23054,7 @@ impl Config {
         // and markdown (MEMORY.md, IDENTITY.md, SOUL.md) lives at
         // `Config::agent_workspace_dir(alias)` instead.
         let data_dir = install_data_dir(&zeroclaw_dir);
-        fs::create_dir_all(&data_dir).await.with_context(|| {
+        create_owner_only_dir(&data_dir).with_context(|| {
             format!(
                 "Failed to create data directory: {}",
                 data_dir.display().to_string()
@@ -23419,6 +23513,9 @@ impl Config {
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
+        }
+        for (alias, em) in &self.channels.email {
+            warnings.extend(validate_email_smtp_semantics(alias, em));
         }
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
@@ -33746,6 +33843,7 @@ auto_save = true
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
+                        unauthorized_message: None,
                         per_user_session: true,
                         passive_group_context: false,
                         ack_reactions: None,
@@ -35785,6 +35883,7 @@ default_temperature = 0.7
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
+            unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -38060,8 +38159,8 @@ wire_api = "ws"
         );
     }
 
-    /// Startup creates and locks `config-lifecycle.lock` in the resolved data
-    /// directory before it loads the config. A V2-to-V3 filesystem migration
+    /// Startup creates and locks `.lifecycle/config-lifecycle.lock` in the
+    /// resolved data directory before it loads the config. A V2-to-V3 filesystem migration
     /// interrupted after moving an identity file, with the device database
     /// still in the legacy workspace, must still resume on that load: the
     /// database ends up readable in the loaded `data_dir`, and the legacy
@@ -38111,13 +38210,13 @@ wire_api = "ws"
             // The pre-load lock step: create the lifecycle lock where the
             // daemon would, and hold an advisory lock on it across the load.
             let (_, locked_data) = resolve_runtime_dirs().await.unwrap();
-            std::fs::create_dir_all(&locked_data).unwrap();
+            std::fs::create_dir_all(locked_data.join(".lifecycle")).unwrap();
             let lock = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(locked_data.join("config-lifecycle.lock"))
+                .open(locked_data.join(".lifecycle/config-lifecycle.lock"))
                 .unwrap();
             lock.try_lock().unwrap();
 
@@ -38309,6 +38408,74 @@ scope = "zeroclaw"
         );
 
         set_runtime_proxy_config(ProxyConfig::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn load_or_init_creates_an_owner_only_data_dir_under_umask_0002() {
+        const CHILD_ENV: &str = "ZEROCLAW_DATA_DIR_UMASK_TEST_CHILD";
+        const TEST_NAME: &str =
+            "schema::tests::load_or_init_creates_an_owner_only_data_dir_under_umask_0002";
+
+        // The umask and the config-dir variables are process-global. Run the
+        // behavioral part in a dedicated test subprocess so unrelated tests in
+        // the parent harness cannot observe them.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _env_guard = env_override_lock().await;
+            let temp = TempDir::new().unwrap();
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable must be available"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("HOME", temp.path().join("home"))
+            .env("ZEROCLAW_CONFIG_DIR", temp.path().join("install"))
+            .env_remove("ZEROCLAW_DATA_DIR")
+            .env_remove("ZEROCLAW_WORKSPACE")
+            .output()
+            .expect("spawn umask test subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "umask test subprocess failed with status {}:\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // SAFETY: umask has no memory-safety preconditions, and this
+        // subprocess runs only the current test.
+        unsafe { libc::umask(0o002) };
+        let install = PathBuf::from(std::env::var_os("ZEROCLAW_CONFIG_DIR").unwrap());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert_eq!(config.data_dir, install.join("data"));
+        assert_eq!(mode(&config.data_dir), 0o700);
+        assert_eq!(mode(&install), 0o775, "parents keep the default mode");
+        assert!(
+            !config.data_dir.join(".lifecycle").exists(),
+            "only the ownership guard creates .lifecycle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[::core::prelude::v1::test]
+    fn create_owner_only_dir_leaves_an_existing_directory_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        create_owner_only_dir(&shared).unwrap();
+
+        let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o775);
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(create_owner_only_dir(&file).is_err());
     }
 
     #[test]
@@ -42481,6 +42648,7 @@ high_entropy_tokens = false
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
@@ -44366,6 +44534,13 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         let email = crate::scattered_types::EmailConfig::default().prop_fields();
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
+
+        let model_provider = ModelProviderConfig::default().prop_fields();
+        assert_description(
+            &model_provider,
+            ".api_key",
+            "stored encrypted in config.toml",
+        );
     }
 
     #[test]
@@ -50005,6 +50180,58 @@ group_policy = "all"
 
     fn owned_codex_args(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    async fn email_half_configured_smtp_warns_while_inbound_only_and_full_outbound_stay_quiet() {
+        let code = crate::validation_warnings::EMAIL_SMTP_PARTIALLY_CONFIGURED;
+        let email_config = |enabled: bool, extra: &str| -> Config {
+            toml::from_str(&format!(
+                "[channels.email.mail]\nenabled = {enabled}\nimap_host = \"imap.example.com\"\n\
+                 username = \"u\"\npassword = \"p\"\n{extra}"
+            ))
+            .unwrap()
+        };
+
+        for (extra, missing) in [
+            ("smtp_host = \"smtp.example.com\"\n", "from_address"),
+            ("from_address = \"bot@example.com\"\n", "smtp_host"),
+        ] {
+            let warnings = warnings_with_code(&email_config(true, extra), code);
+            assert_eq!(warnings.len(), 1, "one warning for a half pair: {extra}");
+            assert_eq!(
+                warnings[0].path,
+                format!("channels.email.mail.{missing}"),
+                "the warning must point at the missing half"
+            );
+            assert!(
+                warnings[0].message.contains(missing),
+                "the message must name the missing field: {}",
+                warnings[0].message
+            );
+        }
+
+        for quiet in [
+            // Inbound-only: the supported read-write, never-send mode.
+            "",
+            // Fully configured outbound.
+            "smtp_host = \"smtp.example.com\"\nfrom_address = \"bot@example.com\"\n",
+        ] {
+            assert!(
+                warnings_with_code(&email_config(true, quiet), code).is_empty(),
+                "no half-pair warning expected for: {quiet:?}"
+            );
+        }
+
+        // A disabled channel is inert, so it is not diagnosed.
+        assert!(
+            warnings_with_code(
+                &email_config(false, "smtp_host = \"smtp.example.com\"\n"),
+                code
+            )
+            .is_empty(),
+            "a disabled channel must not be diagnosed as a half-configured sender"
+        );
     }
 
     #[::core::prelude::v1::test]
