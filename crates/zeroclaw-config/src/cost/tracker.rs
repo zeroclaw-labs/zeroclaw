@@ -2376,8 +2376,8 @@ mod tests {
     fn cost_tracker_before_session_initialization_keeps_configured_backend_and_owner() {
         use zeroclaw_infra::session_events::{installation::NativeBackend, upgrade};
 
-        for backend in std::iter::once(NativeBackend::Sqlite)
-            .chain(cfg!(unix).then_some(NativeBackend::Jsonl))
+        for backend in
+            std::iter::once(NativeBackend::Sqlite).chain(cfg!(unix).then_some(NativeBackend::Jsonl))
         {
             let tmp = TempDir::new().unwrap();
             let trackers = RwLock::new(HashMap::new());
