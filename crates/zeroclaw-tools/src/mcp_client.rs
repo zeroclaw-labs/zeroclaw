@@ -876,6 +876,12 @@ impl McpServer {
 
 // ── McpRegistry ───────────────────────────────────────────────────────────
 
+/// Joins an MCP server's name to one of its tools' names in the callable name
+/// the registry exposes: `<server>__<tool>`. MCP tools join a tool registry
+/// after plugin tools, so the plugin host refuses any plugin tool name that
+/// contains this separator.
+pub const MCP_TOOL_NAME_SEPARATOR: &str = "__";
+
 /// Registry of all connected MCP servers, with a flat tool index.
 pub struct McpRegistry {
     servers: Vec<McpServer>,
@@ -901,7 +907,8 @@ impl McpRegistry {
                     let tools = server.tools().await;
                     for tool in &tools {
                         // Prefix prevents name collisions across servers
-                        let prefixed = format!("{}__{}", config.name, tool.name);
+                        let prefixed =
+                            format!("{}{MCP_TOOL_NAME_SEPARATOR}{}", config.name, tool.name);
                         tool_index.insert(prefixed, (server_idx, tool.name.clone()));
                     }
                     servers.push(server);
@@ -1047,7 +1054,7 @@ impl McpRegistry {
             let name = server.name().await;
             let tools = server.tools().await;
             for tool in &tools {
-                let prefixed = format!("{}__{}", name, tool.name);
+                let prefixed = format!("{name}{MCP_TOOL_NAME_SEPARATOR}{}", tool.name);
                 tool_index.insert(prefixed, (idx, tool.name.clone()));
             }
             server_index.insert(name, idx);
@@ -1140,6 +1147,79 @@ impl McpRegistry {
             epoch_gate: Arc::new(RwLock::new(0)),
             serial_gate: None,
             recovery: Arc::new(RecoveryBarrier::new()),
+        }
+    }
+
+    /// Test-only: a registry whose single server answers every JSON-RPC
+    /// request with the same canned `result` and advertises `tool`, so
+    /// `call_tool` routes through the production path. Sibling unit-test
+    /// modules (e.g. `mcp_tool`) use this to drive production `execute`
+    /// end to end without spawning a live MCP child.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_tool_server(
+        server_name: &str,
+        tool: &str,
+        result: serde_json::Value,
+    ) -> Self {
+        use crate::mcp_protocol::{JsonRpcRequest, JsonRpcResponse};
+        use async_trait::async_trait;
+
+        struct CannedTransport {
+            result: serde_json::Value,
+        }
+
+        #[async_trait]
+        impl SharedMcpTransportConn for CannedTransport {
+            async fn send_and_recv(
+                &self,
+                request: &JsonRpcRequest,
+                _lifecycle: &McpRequestLifecycle,
+            ) -> Result<JsonRpcResponse> {
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: Some(self.result.clone()),
+                    error: None,
+                })
+            }
+
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(CannedTransport { result });
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: server_name.to_string(),
+                ..McpServerConfig::default()
+            },
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![McpToolDef {
+                name: tool.to_string(),
+                description: Some("fake tool".into()),
+                input_schema: serde_json::json!({}),
+            }],
+            capabilities: McpServerCapabilities::default(),
+        };
+        let server = McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
+        };
+        let mut tool_index = HashMap::new();
+        tool_index.insert(format!("{server_name}__{tool}"), (0usize, tool.to_string()));
+        let mut server_index = HashMap::new();
+        server_index.insert(server_name.to_string(), 0usize);
+        Self {
+            servers: vec![server],
+            tool_index,
+            server_index,
         }
     }
 
@@ -1263,7 +1343,7 @@ impl McpRegistry {
     /// Split a `<server>__<rest>` prefixed name. Returns None if no prefix.
     pub fn split_prefixed(prefixed: &str) -> Option<(String, String)> {
         prefixed
-            .split_once("__")
+            .split_once(MCP_TOOL_NAME_SEPARATOR)
             .map(|(s, r)| (s.to_string(), r.to_string()))
     }
 
@@ -1409,18 +1489,8 @@ mod tests {
     use zeroclaw_config::schema::McpTransport;
 
     #[cfg(unix)]
-    fn write_executable_script(path: &std::path::Path, body: &[u8]) {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut script = std::fs::File::create(path).expect("create script");
-        script.write_all(body).expect("write script");
-        drop(script);
-        let mut permissions = std::fs::metadata(path)
-            .expect("script metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("chmod script");
+    fn write_script(path: &std::path::Path, body: &[u8]) {
+        std::fs::write(path, body).expect("write script");
     }
 
     #[cfg(unix)]
@@ -1455,12 +1525,14 @@ mod tests {
     fn stdio_test_config(
         name: &str,
         script: &std::path::Path,
-        args: Vec<String>,
+        mut args: Vec<String>,
         timeout_secs: u64,
     ) -> McpServerConfig {
+        // Execute the stable interpreter, not a freshly written executable inode.
+        args.insert(0, script.display().to_string());
         McpServerConfig {
             name: name.to_string(),
-            command: script.display().to_string(),
+            command: "/bin/sh".to_string(),
             args,
             tool_timeout_secs: Some(timeout_secs),
             transport: McpTransport::Stdio,
@@ -2534,8 +2606,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_stdio_registry_reaps_child_process() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
         use std::path::Path;
         use tokio::time::{Duration, sleep};
 
@@ -2554,10 +2624,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let server_path = temp.path().join("echo-mcp.sh");
         let pid_path = temp.path().join("echo-mcp.pid");
-        let mut script = std::fs::File::create(&server_path).expect("script");
-        script
-            .write_all(
-                br#"#!/bin/sh
+        write_script(
+            &server_path,
+            br#"#!/bin/sh
 echo "$$" > "$1"
 while IFS= read -r line; do
   case "$line" in
@@ -2571,20 +2640,16 @@ while IFS= read -r line; do
   esac
 done
 "#,
-            )
-            .expect("write script");
-        drop(script);
-        let mut perms = std::fs::metadata(&server_path)
-            .expect("metadata")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&server_path, perms).expect("chmod");
+        );
 
         let config = McpServerConfig {
             pinned_resources: Vec::new(),
             name: "echo".to_string(),
-            command: server_path.display().to_string(),
-            args: vec![pid_path.display().to_string()],
+            command: "/bin/sh".to_string(),
+            args: vec![
+                server_path.display().to_string(),
+                pid_path.display().to_string(),
+            ],
             env: std::collections::HashMap::default(),
             tool_timeout_secs: None,
             transport: McpTransport::Stdio,
@@ -2623,7 +2688,7 @@ done
         let script_path = temp.path().join("multiplex-mcp.sh");
         let first_received = temp.path().join("first-received.fifo");
         make_fifo(&first_received);
-        write_executable_script(
+        write_script(
             &script_path,
             br#"#!/bin/sh
 first_id=
@@ -2695,7 +2760,7 @@ done
         let effects = temp.path().join("effects.log");
         make_fifo(&effect_ready);
         make_fifo(&recovered);
-        write_executable_script(
+        write_script(
             &script_path,
             br#"#!/bin/sh
 printf '%s\n' "$$" >> "$3"
@@ -2790,7 +2855,7 @@ done
         let script_path = temp.path().join("queued-writer-mcp.sh");
         let requests = temp.path().join("requests.log");
         let generations = temp.path().join("generations.log");
-        write_executable_script(
+        write_script(
             &script_path,
             br#"#!/bin/sh
 printf '%s\n' "$$" >> "$2"

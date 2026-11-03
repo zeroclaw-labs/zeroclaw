@@ -8,14 +8,19 @@ instructions, prompts, and workflows rather than code, and you want plugin
 distribution semantics (signing, registry install, versioning) instead of
 loose files in a skills directory.
 
-> **Check your binary first.** Skill bundles ride the plugin machinery, and
-> the prebuilt release binaries the installer ships are built without the
-> `plugins-wasm` feature: on a stock binary `zeroclaw plugin ...` is an
-> unrecognized subcommand and plugin-shipped skills do not load. To use the
-> bundles on this page, build from source with a plugin execution backend,
-> e.g. `cargo build --release --features plugins-wasm-cranelift`. If you
-> just want a shared directory of skills on a stock binary, use the native
-> bundles described in [Skills](../tools/skills.md) instead:
+> **Check your binary first.** Skill bundles ride the plugin machinery. The
+> release archives for the 64-bit desktop and server targets carry the plugin
+> host; the two 32-bit ARM archives, the experimental Android archive, and
+> source builds with Cargo defaults (`cargo install zeroclaw`,
+> `install.sh --source`) do not: there
+> `zeroclaw plugin ...` is an unrecognized subcommand and plugin-shipped
+> skills do not load. Every release executes a plugin from each archive that
+> carries the host; the
+> [per-artifact table](../developing/plugin-protocol.md#plugin-support-per-release-artifact)
+> lists them all. On a binary without the host, either build from source with a
+> plugin execution backend, e.g.
+> `cargo build --release --features plugins-wasm-cranelift`, or use the
+> native bundles described in [Skills](../tools/skills.md) instead:
 > `zeroclaw skills bundle add <alias>` creates one and
 > `zeroclaw skills install <source> --bundle <alias>` installs into it,
 > giving you the same skills without plugin distribution semantics.

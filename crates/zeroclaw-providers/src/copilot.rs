@@ -348,7 +348,7 @@ impl CopilotModelProvider {
             return Some(ApiContent::Text(content.to_string()));
         }
 
-        let (cleaned_text, image_refs) = crate::multimodal::parse_image_markers(content);
+        let (cleaned_text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
         if image_refs.is_empty() {
             return Some(ApiContent::Text(content.to_string()));
         }

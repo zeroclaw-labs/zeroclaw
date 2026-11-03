@@ -59,6 +59,23 @@ pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
     None
 }
 
+/// Return the agent alias targeted by a dotted property path.
+///
+/// Only property paths below `agents.<alias>` qualify; the map root and entry
+/// root are handled by the explicit map-key lifecycle operations.
+#[must_use]
+pub fn agent_alias_for_prop_path(path: &str) -> Option<&str> {
+    let mut segments = path.split('.');
+    if segments.next()? != "agents" {
+        return None;
+    }
+    let alias = segments.next()?;
+    if alias.is_empty() || segments.next().is_none() {
+        return None;
+    }
+    Some(alias)
+}
+
 /// HARD = mandatory referrer; deleting the target invalidates config, so the
 /// delete must refuse. SOFT = removable; the delete scrubs the referrer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1268,6 +1285,21 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_property_paths_identify_only_nested_agent_fields() {
+        assert_eq!(
+            agent_alias_for_prop_path("agents.researcher.workspace.path"),
+            Some("researcher")
+        );
+        assert_eq!(agent_alias_for_prop_path("agents.researcher"), None);
+        assert_eq!(agent_alias_for_prop_path("agents"), None);
+        assert_eq!(agent_alias_for_prop_path("agents..enabled"), None);
+        assert_eq!(
+            agent_alias_for_prop_path("channels.telegram.bot.agent"),
+            None
+        );
+    }
     use crate::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
     use crate::schema::{
         AliasedAgentConfig, Config, DelegateTargetConfig, EmbeddingRouteConfig, ModelRouteConfig,

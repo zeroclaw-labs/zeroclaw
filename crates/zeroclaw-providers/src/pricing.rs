@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
+use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -87,7 +88,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 static LIVE_PRICES: LazyLock<RwLock<Arc<PriceSnapshot>>> =
     LazyLock::new(|| RwLock::new(Arc::new(HashMap::new())));
 
-static CONFIG_HANDLE: LazyLock<RwLock<Option<Arc<RwLock<Config>>>>> =
+static CONFIG_HANDLE: LazyLock<RwLock<Option<LiveConfigHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
 /// Guards against spawning more than one refresher when both the channels
@@ -162,22 +163,23 @@ pub fn refresher_running() -> bool {
 ///
 /// Every call re-binds `CONFIG_HANDLE` before anything else, and the running
 /// task re-resolves it each cycle, so a daemon reload (which re-instantiates
-/// the config `Arc` and re-runs both call sites) re-points the refresher at
-/// the current config, and toggling `live_pricing` on a provider (or changing
-/// its model/endpoint) is honored on the next refresh without a restart. Each
-/// cycle rebuilds the per-gateway poll set via the normal factory path
-/// (reusing each provider's configured `base_url`, credentials, and options),
-/// fetches one `/models` per gateway, and fills only the flagged models,
-/// falling back to the models.dev catalog for models a gateway doesn't price
-/// (or providers with no HTTP listing, e.g. the `kilocli` subprocess gateway).
-/// A fetch error for one source keeps the previous snapshot rather than
-/// regressing good prices to empty; disabling `live_pricing` on the last
-/// flagged provider instead clears the snapshot on the next cycle, so stale
-/// prices stop filling after an opt-out.
-pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
+/// the authority — and its read-only handle — and re-runs both call sites)
+/// re-points the refresher at the current published config, and toggling
+/// `live_pricing` on a provider (or changing its model/endpoint) is honored
+/// on the next refresh without a restart. Each cycle rebuilds the
+/// per-gateway poll set via the normal factory path (reusing each
+/// provider's configured `base_url`, credentials, and options), fetches one
+/// `/models` per gateway, and fills only the flagged models, falling back to
+/// the models.dev catalog for models a gateway doesn't price (or providers
+/// with no HTTP listing, e.g. the `kilocli` subprocess gateway). A fetch
+/// error for one source keeps the previous snapshot rather than regressing
+/// good prices to empty; disabling `live_pricing` on the last flagged
+/// provider instead clears the snapshot on the next cycle, so stale prices
+/// stop filling after an opt-out.
+pub fn spawn_refresher(config: LiveConfigHandle) {
     // Re-bind before the enabled pre-check so even a "nothing enabled yet"
     // call leaves the freshest handle for a refresher started later.
-    bind_config(Arc::clone(&config));
+    bind_config(config.clone());
     if !any_live_pricing(&config.read()) {
         return;
     }
@@ -201,7 +203,7 @@ pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
 /// handle, one its config API writes in place, binds that handle here so the
 /// next cycle sees an operator's change (an opt-out, a new endpoint or model)
 /// without waiting for a reload. The gateway does this at startup.
-pub fn bind_config(config: Arc<RwLock<Config>>) {
+pub fn bind_config(config: LiveConfigHandle) {
     *CONFIG_HANDLE.write() = Some(config);
 }
 
@@ -214,8 +216,7 @@ pub fn live_pricing_enabled() -> bool {
 /// A copy of the bound config, read under its lock at the moment of the call.
 fn bound_config() -> Option<Config> {
     let handle = CONFIG_HANDLE.read().clone()?;
-    let cfg = handle.read().clone();
-    Some(cfg)
+    Some(handle.snapshot())
 }
 
 /// One refresh cycle. Re-resolves the bound handle (re-bound across daemon
@@ -594,8 +595,8 @@ mod tests {
     #[tokio::test]
     async fn a_live_opt_out_on_the_bound_handle_clears_prices_on_the_next_cycle() {
         let _guard = GLOBAL_STATE.lock();
-        let live = Arc::new(RwLock::new(opted_in_config()));
-        bind_config(Arc::clone(&live));
+        let live = zeroclaw_config::live::LiveConfig::new(opted_in_config());
+        bind_config(live.handle());
         assert!(live_pricing_enabled());
 
         let mut stale = PriceSnapshot::new();
@@ -606,7 +607,9 @@ mod tests {
         store_snapshot(stale);
         assert!(!current_snapshot().is_empty());
 
-        opt_out(&mut live.write());
+        let mut config = live.snapshot();
+        opt_out(&mut config);
+        live.publish(live.next_revision().unwrap(), config).unwrap();
         assert!(
             !live_pricing_enabled(),
             "the refresher reads the live handle, so the opt-out is visible at once"
@@ -624,15 +627,17 @@ mod tests {
     #[test]
     fn a_copy_of_the_config_does_not_see_later_live_writes() {
         let _guard = GLOBAL_STATE.lock();
-        let live = Arc::new(RwLock::new(opted_in_config()));
-        let copy = Arc::new(RwLock::new(live.read().clone()));
-        bind_config(copy);
-        opt_out(&mut live.write());
+        let live = zeroclaw_config::live::LiveConfig::new(opted_in_config());
+        let copy = zeroclaw_config::live::LiveConfig::new(live.snapshot());
+        bind_config(copy.handle());
+        let mut config = live.snapshot();
+        opt_out(&mut config);
+        live.publish(live.next_revision().unwrap(), config).unwrap();
         assert!(
             live_pricing_enabled(),
             "a copy keeps the stale opt-in, which is why a surface binds its live handle"
         );
-        bind_config(Arc::clone(&live));
+        bind_config(live.handle());
         assert!(!live_pricing_enabled());
     }
 

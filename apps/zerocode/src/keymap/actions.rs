@@ -165,6 +165,14 @@ keyactions! {
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
         ReloadDaemon [Chord::primary('r'), Chord::ctrl('r')]            => "reload daemon",
         ToggleSidebar [Chord::ctrl('b')]                                => "toggle sidebar",
+        FocusSession1 [Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL)] => "focus session 1",
+        FocusSession2 [Chord::with_primary(KeyCode::Char('2'), KeyModifiers::CONTROL)] => "focus session 2",
+        FocusSession3 [Chord::with_primary(KeyCode::Char('3'), KeyModifiers::CONTROL)] => "focus session 3",
+        FocusSession4 [Chord::with_primary(KeyCode::Char('4'), KeyModifiers::CONTROL)] => "focus session 4",
+        FocusSession5 [Chord::with_primary(KeyCode::Char('5'), KeyModifiers::CONTROL)] => "focus session 5",
+        FocusSession6 [Chord::with_primary(KeyCode::Char('6'), KeyModifiers::CONTROL)] => "focus session 6",
+        FocusSession7 [Chord::with_primary(KeyCode::Char('7'), KeyModifiers::CONTROL)] => "focus session 7",
+        FocusSession8 [Chord::with_primary(KeyCode::Char('8'), KeyModifiers::CONTROL)] => "focus session 8",
         ConfirmYes   []                                                 => "confirm",
         ConfirmNo    []                                                 => "cancel",
     }
@@ -297,7 +305,13 @@ keyactions! {
         BeginSearch   [Chord::char('/')] => "search",
         ToggleSecret  [Chord::char('x')] => "toggle secret",
         DeleteRow     [Chord::char('d')] => "delete row",
+        RenameAlias   [Chord::char('e')] => "rename provider alias",
         ApplyTemplate [Chord::char('t')] => "apply template",
+        ApplicationStatus [Chord::char('s')] => "application status",
+        PageUp [Chord::key(KeyCode::PageUp)] => "page up",
+        PageDown [Chord::key(KeyCode::PageDown)] => "page down",
+        JumpStart [Chord::key(KeyCode::Home)] => "jump to start",
+        JumpEnd [Chord::key(KeyCode::End)] => "jump to end",
     }
 }
 
@@ -575,6 +589,40 @@ mod tests {
                 KeyModifiers::NONE,
                 InputBarAction::from_chord,
                 expected,
+            );
+        }
+    }
+
+    #[test]
+    fn session_shortcut_primary_digits_resolve_to_ordinals() {
+        let actions = [
+            GlobalAction::FocusSession1,
+            GlobalAction::FocusSession2,
+            GlobalAction::FocusSession3,
+            GlobalAction::FocusSession4,
+            GlobalAction::FocusSession5,
+            GlobalAction::FocusSession6,
+            GlobalAction::FocusSession7,
+            GlobalAction::FocusSession8,
+        ];
+        for (index, action) in actions.into_iter().enumerate() {
+            let digit = char::from_digit((index + 1) as u32, 10).unwrap();
+            let modifiers = if cfg!(target_os = "macos") {
+                KeyModifiers::CONTROL.union(KeyModifiers::SUPER)
+            } else {
+                KeyModifiers::CONTROL
+            };
+            assert_eq!(
+                GlobalAction::from_chord(&KeyEvent::new(KeyCode::Char(digit), modifiers)),
+                Some(action)
+            );
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                GlobalAction::from_chord(
+                    &KeyEvent::new(KeyCode::Char(digit), KeyModifiers::SUPER,)
+                ),
+                None,
+                "bare Command+{digit} remains available to the terminal host"
             );
         }
     }

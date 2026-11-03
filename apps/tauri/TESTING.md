@@ -104,6 +104,15 @@ open /Applications/ZeroClaw.app
   normal dashboard, not the Quickstart.
 - Quit from the tray → relaunch → splash → dashboard again (tray icon persists
   in the menu bar).
+- Close the dashboard window: the app keeps running in the tray. Clicking the
+  tray icon, choosing **Show Dashboard** or **Agent Chat**, or launching the
+  app again brings the same window back, restored if it was minimized and
+  without reloading the page.
+- Close the splash before the dashboard opens: the same routes reopen the
+  splash, which shows any startup error again (such as a missing `zeroclaw`
+  binary) and hands off to the dashboard once the gateway is healthy.
+- **Quit ZeroClaw** in the tray menu ends the app and removes the tray icon. A
+  daemon the app started keeps running, and the next launch reuses it.
 - Inspect `<config-dir>/logs/zeroclaw-desktop-daemon.log` after startup to verify combined stdout/stderr capture; the file stays at or below 8 MiB and keeps the newest tail during continuous output.
 
 ### Native command boundary
@@ -117,6 +126,8 @@ ACL design.
 
 The app builds and runs the same splash → gateway → Quickstart flow. Bundle
 targets are unchanged (`.deb`/`.AppImage` on Linux, `.exe`/`.msi` on Windows).
+The window checks above apply on both. Linux tray icons report no clicks, so
+use the tray menu there.
 Screen capture and AppleScript capabilities remain macOS-only; the other
 platforms register stubs that return an unsupported-platform error.
 

@@ -609,3 +609,247 @@ fn base_image_pin_guard_reads_args_flags_and_stage_references() {
         "only digest-backed ARGs and earlier stages may pass the guard"
     );
 }
+
+// A deliberately bounded source guard for the existing Dockerfile primer forms,
+// not a Dockerfile or shell interpreter. Real source-image builds remain required.
+fn sign_manifest_is_staged_for_prefetch(builder: &str, target: &str) -> bool {
+    let directory = Path::new(target)
+        .parent()
+        .and_then(Path::to_str)
+        .expect("the declared example must have a parent directory");
+    let mut directory_staged = false;
+    let mut target_staged = false;
+    for raw in builder.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let line = line.trim_end_matches('\\').trim();
+        let command = line.strip_prefix("RUN ").unwrap_or(line);
+        let command = command.strip_prefix("&& ").unwrap_or(command);
+        if command.starts_with("cargo build ") || command.starts_with("cargo zigbuild ") {
+            return target_staged;
+        }
+        if command == "COPY . ."
+            || command == "COPY crates/ crates/"
+            || command == format!("COPY --parents {target} ./")
+            || command == format!("COPY {target} {target}")
+        {
+            directory_staged = true;
+            target_staged = true;
+        }
+        if let Some(paths) = command.strip_prefix("mkdir -p ")
+            && paths.split_whitespace().any(|path| path == directory)
+        {
+            directory_staged = true;
+        }
+        if let Some((producer, destination)) = command.rsplit_once(" > ")
+            && directory_staged
+            && destination == target
+            && matches!(producer, "echo \"fn main() {}\"" | "printf 'fn main() {}'")
+        {
+            target_staged = true;
+        }
+        if let Some(paths) = command.strip_prefix("rm -rf ")
+            && paths
+                .split_whitespace()
+                .any(|path| path == "crates" || path == directory || path == target)
+        {
+            directory_staged = false;
+            target_staged = false;
+        }
+    }
+    false
+}
+
+#[test]
+fn source_containerfiles_stage_sign_manifest_example_during_prefetch() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest: toml::Value =
+        toml::from_str(&repository_file("crates/zeroclaw-plugins/Cargo.toml"))
+            .expect("the plugin manifest must be valid TOML");
+    let examples: Vec<_> = manifest["example"]
+        .as_array()
+        .expect("the plugin manifest must declare its signer example")
+        .iter()
+        .filter(|example| example["name"].as_str() == Some("sign_manifest"))
+        .collect();
+    assert_eq!(
+        examples.len(),
+        1,
+        "the signer target must remain declared once"
+    );
+    let relative = examples[0]
+        .get("path")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("examples/sign_manifest.rs");
+    let target = format!("crates/zeroclaw-plugins/{relative}");
+    assert!(
+        root.join(&target).is_file(),
+        "the real signer source must exist"
+    );
+
+    for name in ["Dockerfile", "Dockerfile.debian", "Dockerfile.alpine"] {
+        let baseline = repository_file(name).replace("\r\n", "\n");
+        for variant in [baseline.clone(), baseline.replace("\n", "\r\n")] {
+            let text = variant.replace("\r\n", "\n");
+            let builder = builder_stage(&text, name);
+            assert!(
+                sign_manifest_is_staged_for_prefetch(builder, &target),
+                "{name} must stage declared signer target {target} before its dependency build"
+            );
+            let cleanup = builder
+                .find("RUN rm -rf src benches crates xtask tools/fill-translations\n")
+                .unwrap_or_else(|| panic!("{name} must remove its dummy crate sources"));
+            let real_copy = builder[cleanup..]
+                .find("\nCOPY crates/ crates/\n")
+                .map(|offset| cleanup + offset)
+                .unwrap_or_else(|| panic!("{name} must restore real crate sources after cleanup"));
+            assert!(
+                sign_manifest_is_staged_for_prefetch(&builder[real_copy..], &target),
+                "{name} must keep the real signer source through its actual source build"
+            );
+            assert!(
+                !builder[real_copy..].lines().any(|line| {
+                    line.trim()
+                        .trim_end_matches('\\')
+                        .trim()
+                        .rsplit_once(" > ")
+                        .is_some_and(|(_, destination)| destination == target)
+                }),
+                "{name} must not overwrite the real signer source with a dummy target"
+            );
+        }
+    }
+}
+
+#[test]
+fn sign_manifest_prefetch_guard_checks_order_stage_and_exact_target() {
+    let target = "crates/zeroclaw-plugins/examples/sign_manifest.rs";
+    let directory = "crates/zeroclaw-plugins/examples";
+    let stub = format!("RUN mkdir -p {directory} \\\n    && echo \"fn main() {{}}\" > {target}\n");
+    let build = "RUN cargo build --release --locked -p zeroclaw\n";
+    assert!(sign_manifest_is_staged_for_prefetch(
+        &format!("{stub}{build}"),
+        target
+    ));
+    for invalid in [
+        format!("{build}{stub}"),
+        format!(
+            "{}{build}",
+            stub.replace(target, &format!("{target}.disabled"))
+        ),
+        format!(
+            "{}{build}",
+            stub.lines()
+                .map(|line| format!("# {line}\n"))
+                .collect::<String>()
+        ),
+        format!("RUN echo \"fn main() {{}}\" > {target}\n{build}"),
+        format!("{stub}RUN rm -rf crates\n{build}"),
+    ] {
+        assert!(!sign_manifest_is_staged_for_prefetch(&invalid, target));
+    }
+    let wrong_stage = format!("FROM rust AS other\n{stub}FROM rust AS builder\n{build}");
+    assert!(!sign_manifest_is_staged_for_prefetch(
+        builder_stage(&wrong_stage, "fixture"),
+        target
+    ));
+    for copy in [
+        "COPY . .".to_string(),
+        "COPY crates/ crates/".to_string(),
+        format!("COPY --parents {target} ./"),
+    ] {
+        assert!(sign_manifest_is_staged_for_prefetch(
+            &format!("{copy}\n{build}"),
+            target
+        ));
+    }
+}
+
+// Bounded to the current builder's standalone COPY and Cargo lines.
+fn vendor_patch_is_staged_for_prefetch(builder: &str) -> bool {
+    let mut staged = false;
+    for raw in builder.lines() {
+        let line = raw.trim().trim_end_matches('\\').trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let command = line.strip_prefix("RUN ").unwrap_or(line);
+        let command = command.strip_prefix("&& ").unwrap_or(command);
+        if command.starts_with("cargo build ") || command.starts_with("cargo zigbuild ") {
+            return staged;
+        }
+        if command == "COPY vendor/ vendor/" {
+            staged = true;
+        }
+        if command.starts_with("rm -rf ") && command.split_whitespace().any(|word| word == "vendor")
+        {
+            staged = false;
+        }
+    }
+    false
+}
+
+#[test]
+fn source_containerfiles_stage_canonical_path_patches_during_prefetch() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest: toml::Value =
+        toml::from_str(&repository_file("Cargo.toml")).expect("root manifest must be valid TOML");
+    let patches = manifest["patch"]["crates-io"]
+        .as_table()
+        .expect("root manifest must declare its path patch");
+    let paths: Vec<_> = patches
+        .values()
+        .filter_map(|patch| patch.get("path").and_then(toml::Value::as_str))
+        .collect();
+    assert!(
+        !paths.is_empty(),
+        "fixture must exercise a local path patch"
+    );
+    for path in paths {
+        assert!(root.join(path).join("Cargo.toml").is_file());
+        assert!(path.starts_with("vendor/"));
+        for name in ["Dockerfile", "Dockerfile.debian", "Dockerfile.alpine"] {
+            let baseline = repository_file(name).replace("\r\n", "\n");
+            for variant in [baseline.clone(), baseline.replace('\n', "\r\n")] {
+                let text = variant.replace("\r\n", "\n");
+                let builder = builder_stage(&text, name);
+                assert!(
+                    vendor_patch_is_staged_for_prefetch(builder),
+                    "{name} must stage the canonical path-patch source before Cargo"
+                );
+                assert!(
+                    !builder.lines().any(|line| {
+                        line.trim().starts_with("RUN rm -rf ")
+                            && line.split_whitespace().any(|word| word == "vendor")
+                    }),
+                    "{name} must retain the real patch source for the final build"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn vendor_patch_prefetch_guard_rejects_missing_late_and_removed_inputs() {
+    let copy = "COPY vendor/ vendor/\n";
+    let build = "RUN cargo build --release --locked -p zeroclaw\n";
+    assert!(vendor_patch_is_staged_for_prefetch(&format!(
+        "{copy}{build}"
+    )));
+    for invalid in [
+        build.to_string(),
+        format!("{build}{copy}"),
+        format!("# {copy}{build}"),
+        format!("COPY vendor/ elsewhere/\n{build}"),
+        format!("{copy}RUN rm -rf vendor\n{build}"),
+    ] {
+        assert!(!vendor_patch_is_staged_for_prefetch(&invalid));
+    }
+    let wrong_stage = format!("FROM rust AS other\n{copy}FROM rust AS builder\n{build}");
+    assert!(!vendor_patch_is_staged_for_prefetch(builder_stage(
+        &wrong_stage,
+        "fixture"
+    )));
+}

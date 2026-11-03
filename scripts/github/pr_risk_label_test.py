@@ -132,6 +132,33 @@ class FakeAPI:
         }
 
 
+class RelabelingAPI(FakeAPI):
+    """Returns the PR with `added` labels applied and `removed` labels dropped
+    from the second read on, the way a sibling labeler workflow's labels land
+    (or get swapped) while the report is running."""
+
+    def __init__(
+        self,
+        pr: dict[str, object],
+        files: list[dict[str, object]],
+        added: list[str],
+        removed: list[str] | None = None,
+    ) -> None:
+        super().__init__(pr, files)
+        self.added = added
+        self.removed = set(removed or [])
+        self.pull_reads = 0
+
+    def get_pull(self, number: int) -> dict[str, object]:
+        self.pull_reads += 1
+        if self.pull_reads == 1:
+            return self.pr
+        relabeled = dict(self.pr)
+        kept = [label for label in self.pr["labels"] if label["name"] not in self.removed]
+        relabeled["labels"] = [*kept, *({"name": name} for name in self.added)]
+        return relabeled
+
+
 class PaginatedAPI(classifier.GitHubAPI):
     def __init__(self, pages: list[list[dict[str, object]]]) -> None:
         super().__init__("zeroclaw-labs/zeroclaw", "token")
@@ -839,6 +866,44 @@ pub fn allowed() -> bool {
         api.add_source(path, HEAD, TEST_SOURCE.replace("assert_eq!(1, 1)", "assert_eq!(1, 2)"))
         report = evaluate(api)
         self.assertEqual(report["proposed_risk"], "risk:high")
+
+    def test_unread_label_landing_mid_evaluation_does_not_fail_closed(self) -> None:
+        api = RelabelingAPI(pull(), [changed_file("docs/book/src/guide.md")], ["size:S", "config"])
+        report = evaluate(api)
+        self.assertEqual(api.pull_reads, 2)
+        self.assertEqual(report["proposed_risk"], "risk:low")
+
+    def test_unread_label_swapped_mid_evaluation_does_not_fail_closed(self) -> None:
+        api = RelabelingAPI(
+            pull(["size:S", "config"]),
+            [changed_file("docs/book/src/guide.md")],
+            ["size:L"],
+            removed=["size:S", "config"],
+        )
+        report = evaluate(api)
+        self.assertEqual(api.pull_reads, 2)
+        self.assertEqual(report["proposed_risk"], "risk:low")
+
+    def test_report_label_removed_mid_evaluation_fails_closed(self) -> None:
+        api = RelabelingAPI(
+            pull(["risk:high"]),
+            [changed_file("docs/book/src/guide.md")],
+            [],
+            removed=["risk:high"],
+        )
+        with self.assertRaisesRegex(
+            classifier.RiskReportError, "PR metadata changed during evaluation"
+        ):
+            evaluate(api)
+
+    def test_report_label_landing_mid_evaluation_fails_closed(self) -> None:
+        for label in ("risk:high", "risk:manual", "domain:security"):
+            with self.subTest(label=label):
+                api = RelabelingAPI(pull(), [changed_file("docs/book/src/guide.md")], [label])
+                with self.assertRaisesRegex(
+                    classifier.RiskReportError, "PR metadata changed during evaluation"
+                ):
+                    evaluate(api)
 
     def test_malformed_metadata_and_incomplete_files_fail_closed(self) -> None:
         with self.assertRaises(classifier.RiskReportError):

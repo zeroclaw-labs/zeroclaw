@@ -894,6 +894,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_context_cancels_stalled_http_request_after_server_receives_headers() {
+        use tokio::io::AsyncReadExt;
+        use zeroclaw_api::tool::{ToolExecutionCancelled, ToolExecutionContext};
+
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_received, received) = tokio::sync::oneshot::channel();
+        let mut server = scopeguard::guard(
+            zeroclaw_spawn::spawn!(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut buffer = [0_u8; 1024];
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0, "request ended before its headers arrived");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                request_received.send(()).unwrap();
+                // Keep the response pending until dropping the request closes
+                // its connection. The guard aborts this task on every exit.
+                let mut buffer = [0_u8; 1];
+                assert_eq!(stream.read(&mut buffer).await.unwrap(), 0);
+            }),
+            |server| server.abort(),
+        );
+        let tool = test_tool_with_private_allowlist(vec!["127.0.0.1"], false, vec!["127.0.0.1"]);
+        let token = tokio_util::sync::CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+        let mut call = Box::pin(tool.execute_with_context(
+            json!({"url": format!("http://{addr}/"), "method": "GET"}),
+            &context,
+        ));
+        tokio::select! {
+            result = &mut call => panic!("request completed before cancellation: {result:?}"),
+            request = received => request.unwrap(),
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("server did not receive the request")
+        }
+        token.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("cancellation should interrupt the stalled request")
+            .unwrap_err();
+        assert!(error.is::<ToolExecutionCancelled>(), "{error:?}");
+        tokio::time::timeout(Duration::from_secs(5), &mut *server)
+            .await
+            .expect("cancelled request should close its connection")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn response_limit_truncates_a_chunked_body_during_streaming() {
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),

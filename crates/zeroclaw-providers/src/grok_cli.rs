@@ -849,8 +849,13 @@ impl GrokCliModelProvider {
         xai_api_key_available
     }
 
-    async fn invoke_acp(&self, message: &str, model: &str) -> anyhow::Result<String> {
-        let prompt = self.acp_prompt_content(message);
+    async fn invoke_acp(
+        &self,
+        system: Option<&str>,
+        message: &str,
+        model: &str,
+    ) -> anyhow::Result<String> {
+        let prompt = self.acp_prompt_content(system, message);
         let args = Self::build_cli_args(model, &self.extra_args);
         let permission_policy = Self::acp_permission_policy(&self.extra_args);
         let mut cmd = Command::new(&self.binary_path);
@@ -954,9 +959,17 @@ impl GrokCliModelProvider {
         }
     }
 
-    fn acp_prompt_content(&self, message: &str) -> Vec<acp::AcpPromptContent> {
+    fn acp_prompt_content(
+        &self,
+        system: Option<&str>,
+        message: &str,
+    ) -> Vec<acp::AcpPromptContent> {
+        let system_text = system.filter(|system| !system.is_empty());
         if !self.vision_enabled {
-            return vec![acp::AcpPromptContent::Text(message.to_string())];
+            return vec![acp::AcpPromptContent::Text(joined_prompt_text(
+                system_text,
+                message,
+            ))];
         }
 
         // TODO(grok-cli-vision): Grok Build through 0.2.118 still advertises
@@ -966,9 +979,19 @@ impl GrokCliModelProvider {
         // the image content. Keep this path experimental until advertise is
         // true *and* a live recognition smoke passes; then prefer following
         // the advertise bit instead of a local override.
-        let (text, image_refs) = crate::multimodal::parse_image_markers(message);
+        //
+        // The user content is parsed BEFORE the system prompt is prepended: a
+        // prompt-mode carrier is only recognizable while the string still
+        // starts with the carrier prefix. Flattening first destroyed that
+        // prefix and dropped the helper onto its whole-string marker-scan
+        // fallback, which lifted a data URI quoted in a carrier body as an
+        // image block and removed it from the text.
+        let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(message);
         if image_refs.is_empty() {
-            return vec![acp::AcpPromptContent::Text(message.to_string())];
+            return vec![acp::AcpPromptContent::Text(joined_prompt_text(
+                system_text,
+                message,
+            ))];
         }
 
         let Some(images) = image_refs
@@ -979,15 +1002,38 @@ impl GrokCliModelProvider {
             // The runtime normally normalizes all provider-bound images into
             // data URIs. Preserve the original text on atypical direct calls
             // rather than silently dropping an image reference we cannot send.
-            return vec![acp::AcpPromptContent::Text(message.to_string())];
+            return vec![acp::AcpPromptContent::Text(joined_prompt_text(
+                system_text,
+                message,
+            ))];
         };
 
-        let mut prompt = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
+        let mut text_part = String::new();
+        if let Some(system) = system_text {
+            text_part.push_str(system);
+        }
         if !text.is_empty() {
-            prompt.push(acp::AcpPromptContent::Text(text));
+            if !text_part.is_empty() {
+                text_part.push_str("\n\n");
+            }
+            text_part.push_str(&text);
+        }
+        let mut prompt = Vec::with_capacity(images.len() + usize::from(!text_part.is_empty()));
+        if !text_part.is_empty() {
+            prompt.push(acp::AcpPromptContent::Text(text_part));
         }
         prompt.extend(images);
         prompt
+    }
+}
+
+/// `{system}\n\n{message}`, or `message` alone when there is no system text:
+/// the exact shape the flattened path always sent, kept for the vision-off
+/// and no-image branches so only the carrier path changes behavior.
+fn joined_prompt_text(system: Option<&str>, message: &str) -> String {
+    match system {
+        Some(system) => format!("{system}\n\n{message}"),
+        None => message.to_string(),
     }
 }
 
@@ -1116,11 +1162,9 @@ impl ModelProvider for GrokCliModelProvider {
             Self::validate_temperature(temperature)?;
         }
 
-        let full_message = match system_prompt {
-            Some(system) if !system.is_empty() => format!("{system}\n\n{message}"),
-            _ => message.to_string(),
-        };
-        self.invoke_acp(&full_message, model).await
+        // The system prompt rides separately: `acp_prompt_content` must parse
+        // the user content before any prefix flattens it (see its comment).
+        self.invoke_acp(system_prompt, message, model).await
     }
 
     async fn chat(
@@ -1450,7 +1494,7 @@ mod tests {
 
         assert!(model_provider.capabilities().vision);
         assert_eq!(
-            model_provider.acp_prompt_content("Describe [IMAGE:data:image/png;base64,cG5n]"),
+            model_provider.acp_prompt_content(None, "Describe [IMAGE:data:image/png;base64,cG5n]"),
             vec![
                 acp::AcpPromptContent::Text("Describe".to_string()),
                 acp::AcpPromptContent::Image {
@@ -1468,7 +1512,7 @@ mod tests {
         let message = "Describe [IMAGE:data:image/png;base64,cG5n]";
 
         assert_eq!(
-            model_provider.acp_prompt_content(message),
+            model_provider.acp_prompt_content(None, message),
             vec![acp::AcpPromptContent::Text(message.to_string())]
         );
     }
@@ -1942,7 +1986,7 @@ mod tests {
             let temp = TempDir::new().expect("live Grok cwd");
             let model_provider = provider(None, temp.path(), vec![], Some(120));
             let reply = model_provider
-                .invoke_acp(&prompt, DEFAULT_MODEL_MARKER)
+                .invoke_acp(None, &prompt, DEFAULT_MODEL_MARKER)
                 .await
                 .expect("live Grok ACP response");
             eprintln!("{label}: {reply}");
@@ -1981,6 +2025,7 @@ mod tests {
         );
         let reply = model_provider
             .invoke_acp(
+                None,
                 "Use the shell tool to run `printf ACP_TOOL_EXEC_OK`. After the tool succeeds, output the token ACP_TOOL_FINAL_OK.",
                 DEFAULT_MODEL_MARKER,
             )
@@ -2008,6 +2053,7 @@ mod tests {
         );
         let reply = model_provider
             .invoke_acp(
+                None,
                 "Use the shell tool to run exactly this multiline command:\n```\n# OpenClaw style memory in agent home\nprintf ACP_PERMISSION_EXEC_OK > permission-marker\n```\nAfter the marker is written, output the token ACP_PERMISSION_FINAL_OK.",
                 DEFAULT_MODEL_MARKER,
             )
@@ -2037,6 +2083,7 @@ mod tests {
         );
         let error = model_provider
             .invoke_acp(
+                None,
                 "Attempt to use the shell tool to run exactly `printf ACP_DENY_EXEC_BAD > denied-marker`. Whether the tool is denied or succeeds, output the token ACP_DENY_FINAL_OK.",
                 DEFAULT_MODEL_MARKER,
             )
@@ -2108,14 +2155,40 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
 while IFS= read -r line; do :; done
 "#;
 
+        /// Every fixture starts here. The provider never passes `--warm-up`.
+        const FAKE_GROK_PROLOGUE: &str = r#"#!/bin/sh
+set -eu
+if [ "${1-}" = --warm-up ]; then exit 0; fi
+"#;
+
         fn fake_grok(temp: &TempDir, body: &str) -> PathBuf {
             let path = temp.path().join("fake-grok");
-            std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}")).expect("write fake Grok");
+            // Under `cargo test` these tests are threads of one process, and a sibling thread
+            // that forks while this process holds the script open for writing gives its child a
+            // copy of that descriptor until the child execs. On Linux, exec of a file that is
+            // open for writing fails with ETXTBSY. Writing from a child process means this
+            // process never holds the descriptor, so no fork can copy it.
+            let written = std::process::Command::new("/bin/sh")
+                .args(["-c", r#"printf '%s' "$1" > "$2""#, "sh"])
+                .arg(format!("{FAKE_GROK_PROLOGUE}{body}"))
+                .arg(&path)
+                .status()
+                .expect("write fake Grok");
+            assert!(written.success(), "writing fake Grok failed: {written}");
             let mut permissions = std::fs::metadata(&path)
                 .expect("fake Grok metadata")
                 .permissions();
             permissions.set_mode(0o700);
             std::fs::set_permissions(&path, permissions).expect("chmod fake Grok");
+            // On macOS the first exec of a newly written file can wait for a malware scan, and
+            // those scans queue, so in a parallel suite a new fixture can take seconds to start.
+            // Provider timeouts count from spawn, so run the fixture once before any of them
+            // starts; later execs of the unchanged file skip the scan.
+            let warm_up = std::process::Command::new(&path)
+                .arg("--warm-up")
+                .status()
+                .expect("run fake Grok warm-up");
+            assert!(warm_up.success(), "fake Grok warm-up failed: {warm_up}");
             path
         }
 
@@ -2182,6 +2255,17 @@ while IFS= read -r line; do :; done
             }
         }
 
+        /// Reads a PID file once the request has returned, when nothing can still write it.
+        fn recorded_pid(path: &Path) -> i32 {
+            let value = std::fs::read_to_string(path).unwrap_or_else(|error| {
+                panic!("fixture must record {path:?} before the provider kills it: {error}")
+            });
+            value
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{path:?} must hold a PID, found {value:?}"))
+        }
+
         fn process_exists(pid: i32) -> bool {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
         }
@@ -2203,7 +2287,7 @@ while IFS= read -r line; do :; done
                 let temp = TempDir::new().expect("tempdir");
                 let model_provider = fake_provider(&temp, SUCCESS_BODY, 5);
                 let reply = model_provider
-                    .invoke_acp(&prompt, "default")
+                    .invoke_acp(None, &prompt, "default")
                     .await
                     .expect("fake ACP reply");
                 assert_eq!(reply, "FAKE_ACP_OK");
@@ -2229,7 +2313,11 @@ while IFS= read -r line; do :; done
             let temp = TempDir::new().expect("tempdir");
             let model_provider = fake_provider_with_vision(&temp, SUCCESS_BODY, 5);
             let reply = model_provider
-                .invoke_acp("Describe [IMAGE:data:image/png;base64,cG5n]", "default")
+                .invoke_acp(
+                    None,
+                    "Describe [IMAGE:data:image/png;base64,cG5n]",
+                    "default",
+                )
                 .await
                 .expect("fake ACP reply");
             assert_eq!(reply, "FAKE_ACP_OK");
@@ -2257,11 +2345,70 @@ while IFS= read -r line; do :; done
         }
 
         #[tokio::test]
+        async fn fake_child_chat_parses_carrier_before_system_prefix() {
+            // B3: `chat` -> `chat_with_history` -> `chat_with_system` used to
+            // flatten "{system}\n\n{message}" before ACP prompt assembly, so
+            // a prompt carrier lost its prefix and the carrier-aware helper
+            // fell back to whole-string marker scanning. With vision enabled
+            // and a nonempty system prompt, a count-zero carrier whose body
+            // quotes a structurally valid data URI must be delivered as one
+            // text block, byte for byte, with zero image parts.
+            let temp = TempDir::new().expect("tempdir");
+            let model_provider = fake_provider_with_vision(&temp, SUCCESS_BODY, 5);
+            let marker =
+                zeroclaw_api::tool_carrier::marker_line(&zeroclaw_api::media::RenderedMarker {
+                    target: "data:image/png;base64,QUJD".to_string(),
+                    kind: zeroclaw_api::media::MarkerKind::Image,
+                });
+            let body = format!("source example: {marker} quoted in prose");
+            let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+            let messages = vec![
+                zeroclaw_api::model_provider::ChatMessage::system("You are terse."),
+                zeroclaw_api::model_provider::ChatMessage::user(carrier.clone()),
+            ];
+            let request = ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            };
+            let reply = model_provider
+                .chat(request, "default", None)
+                .await
+                .expect("fake ACP reply");
+            assert_eq!(reply.text.as_deref(), Some("FAKE_ACP_OK"));
+
+            let requests = std::fs::read_to_string(temp.path().join("requests.ndjson"))
+                .expect("captured requests");
+            let prompt_request: serde_json::Value = serde_json::from_str(
+                requests
+                    .lines()
+                    .nth(3)
+                    .expect("session/prompt request must be captured"),
+            )
+            .expect("session/prompt request is JSON");
+            assert_eq!(prompt_request["method"], "session/prompt");
+            let blocks = prompt_request["params"]["prompt"]
+                .as_array()
+                .expect("session prompt carries blocks");
+            assert_eq!(
+                blocks.len(),
+                1,
+                "zero image parts and one text part: {blocks:?}"
+            );
+            assert_eq!(blocks[0]["type"], "text");
+            assert_eq!(
+                blocks[0]["text"].as_str(),
+                Some(format!("You are terse.\n\n{carrier}").as_str()),
+                "system plus carrier body, byte for byte"
+            );
+        }
+
+        #[tokio::test]
         async fn fake_child_discards_progress_before_tool_result() {
             let temp = TempDir::new().expect("tempdir");
             let model_provider = fake_provider(&temp, PROGRESS_THEN_TOOL_BODY, 5);
             let reply = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect("fake ACP reply");
             assert_eq!(reply, "FAKE_PROGRESS_BOUNDARY_OK");
@@ -2281,7 +2428,7 @@ while IFS= read -r line; do :; done
                 let model_provider =
                     fake_provider_with_extra_args(&temp, PERMISSION_REQUEST_BODY, 5, extra_args);
                 let reply = model_provider
-                    .invoke_acp("hello", "default")
+                    .invoke_acp(None, "hello", "default")
                     .await
                     .expect("fake ACP reply");
                 assert_eq!(reply, "FAKE_PERMISSION_OK");
@@ -2311,7 +2458,7 @@ while IFS= read -r line; do :; done
             );
             let model_provider = fake_provider(&temp, &body, 5);
             let reply = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect("stderr must be drained concurrently");
             assert_eq!(reply, "FAKE_ACP_OK");
@@ -2326,7 +2473,7 @@ while IFS= read -r line; do :; done
                 format!("printf '%s\\n' '{secret}' >&2\nprintf '%s\\n' 'not-json'\nsleep 30");
             let model_provider = fake_provider(&temp, &body, 5);
             let error = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect_err("invalid ACP response must fail");
             assert!(!error.to_string().contains(secret));
@@ -2344,7 +2491,7 @@ sleep 30
 "#;
             let model_provider = fake_provider(&temp, body, 5);
             let error = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect_err("oversized frame must fail");
             assert!(error.to_string().contains("stdout frame exceeded"));
@@ -2367,7 +2514,7 @@ sleep 30
             let model_provider =
                 fake_provider_with_stdout_limit(&temp, body, 5, acp::MIN_ACP_STDOUT_LIMIT_BYTES);
             let error = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect_err("configured aggregate stdout limit must fail");
             assert!(error.to_string().contains(&format!(
@@ -2392,7 +2539,7 @@ sleep 30
             let prompt = "x".repeat(512 * 1024);
             let started = Instant::now();
             let error = model_provider
-                .invoke_acp(&prompt, "default")
+                .invoke_acp(None, &prompt, "default")
                 .await
                 .expect_err("blocked prompt write must time out");
             assert!(error.to_string().contains("timed out after 1s"));
@@ -2410,7 +2557,7 @@ sleep 30
 "#;
             let model_provider = fake_provider(&temp, body, 60);
             let task = ::zeroclaw_spawn::spawn!(async move {
-                model_provider.invoke_acp("hello", "default").await
+                model_provider.invoke_acp(None, "hello", "default").await
             });
             let leader = wait_for_pid(&temp.path().join("leader.pid")).await;
             let descendant = wait_for_pid(&temp.path().join("descendant.pid")).await;
@@ -2428,7 +2575,7 @@ sleep 30
                 format!("sleep 30 &\nprintf '%s\\n' \"$!\" > descendant.pid\n{SUCCESS_BODY}");
             let model_provider = fake_provider(&temp, &body, 5);
             let reply = model_provider
-                .invoke_acp("hello", "default")
+                .invoke_acp(None, "hello", "default")
                 .await
                 .expect("fake ACP reply");
             assert_eq!(reply, "FAKE_ACP_OK");
@@ -2447,20 +2594,15 @@ printf '%s\n' "$!" > descendant.pid
 sleep 30
 "#;
             let model_provider = fake_provider(&temp, body, 1);
-            let leader_path = temp.path().join("leader.pid");
-            let descendant_path = temp.path().join("descendant.pid");
-            let task = ::zeroclaw_spawn::spawn!(async move {
-                model_provider.invoke_acp("hello", "default").await
-            });
-            let leader = wait_for_pid(&leader_path).await;
-            let descendant = wait_for_pid(&descendant_path).await;
-            let result = task.await.expect("provider task");
-            assert!(
-                result
-                    .expect_err("timeout expected")
-                    .to_string()
-                    .contains("timed out")
-            );
+            let error = model_provider
+                .invoke_acp(None, "hello", "default")
+                .await
+                .expect_err("timeout expected");
+            assert!(error.to_string().contains("timed out"), "error: {error}");
+
+            // invoke_acp kills the process group before it returns, so the PID files are final.
+            let leader = recorded_pid(&temp.path().join("leader.pid"));
+            let descendant = recorded_pid(&temp.path().join("descendant.pid"));
             assert_process_exits(leader).await;
             assert_process_exits(descendant).await;
         }
