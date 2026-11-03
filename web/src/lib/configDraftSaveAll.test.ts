@@ -59,6 +59,7 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
   let listCalls = 0;
   const patches: unknown[][] = [];
   let delayNextList = false;
+  let delayListPrefix: string | undefined;
   let releasePendingList: (() => void) | undefined;
   let delayNextPatch = false;
   let failNextPatch = false;
@@ -102,14 +103,17 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
     const url = new URL(rawUrl, "http://localhost");
     if (url.pathname === "/api/config/list") {
       listCalls += 1;
-      if (delayNextList) {
+      const prefix = url.searchParams.get("prefix") ?? "";
+      const valueAtRequest = savedValue;
+      if (delayNextList || delayListPrefix === prefix) {
         delayNextList = false;
+        delayListPrefix = undefined;
         await new Promise<void>((resolve) => {
           releasePendingList = resolve;
         });
       }
       const entries =
-        url.searchParams.get("prefix") === "other"
+        prefix === "other"
           ? []
           : [
               {
@@ -117,7 +121,7 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
                 category: "channels",
                 kind: "bool",
                 type_hint: "bool",
-                value: savedValue,
+                value: valueAtRequest,
                 populated: true,
                 is_secret: false,
               },
@@ -557,6 +561,104 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
     assert.ok(
       domWindow.document.querySelector('button[role="switch"]'),
       "the form should render after the overlapping save refresh completes",
+    );
+
+    // A list request started before Save all must not become the post-save
+    // baseline just because both requests target the same prefix.
+    await act(async () => {
+      domWindow.document.querySelector<HappyHTMLButtonElement>(
+        'button[role="switch"]',
+      )?.click();
+    });
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /1 unsaved change/,
+    );
+
+    delayNextPatch = true;
+    await act(async () => {
+      findButton(domWindow.document, "Save all").click();
+      await flushEffects();
+    });
+    assert.equal(patches.length, 8);
+    assert.ok(releasePendingPatch, "expected the final delayed Save all patch");
+
+    await act(async () => {
+      domWindow.document.querySelector<HappyHTMLButtonElement>(
+        'button[role="switch"]',
+      )?.click();
+    });
+    assert.equal(
+      domWindow.document
+        .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
+        ?.getAttribute("aria-checked"),
+      "true",
+      "the newer edit should return to the value that was saved before this patch",
+    );
+
+    await act(async () => {
+      findButton(domWindow.document, "Toggle section").click();
+      await flushEffects();
+    });
+    delayListPrefix = "channels";
+    const callsBeforePreSaveList = listCalls;
+    await act(async () => {
+      findButton(domWindow.document, "Toggle section").click();
+      await flushEffects();
+    });
+    assert.equal(
+      listCalls,
+      callsBeforePreSaveList + 1,
+      "expected a channels GET to remain in flight before PATCH completes",
+    );
+    assert.ok(releasePendingList, "expected the pre-save channels GET to be pending");
+
+    const finishFinalPatch: (() => void) | undefined =
+      releasePendingPatch as (() => void) | undefined;
+    releasePendingPatch = undefined;
+    assert.ok(finishFinalPatch, "expected the delayed Save all patch");
+    await act(async () => {
+      finishFinalPatch();
+      await flushEffects();
+    });
+    assert.equal(savedValue, false);
+    assert.equal(
+      listCalls,
+      callsBeforePreSaveList + 2,
+      "the post-save refresh must start a fresh GET while the older GET is pending",
+    );
+    assert.equal(
+      domWindow.document
+        .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
+        ?.getAttribute("aria-checked"),
+      "true",
+      "the latest edit should survive the fresh post-save baseline",
+    );
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /1 unsaved change/,
+      "the latest edit must remain staged after Save all",
+    );
+
+    const finishPreSaveList: (() => void) | undefined =
+      releasePendingList as (() => void) | undefined;
+    releasePendingList = undefined;
+    assert.ok(finishPreSaveList, "expected the delayed pre-save list request");
+    await act(async () => {
+      finishPreSaveList();
+      await flushEffects();
+    });
+    assert.equal(
+      domWindow.document
+        .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
+        ?.getAttribute("aria-checked"),
+      "true",
+      "the stale pre-save response must not replace the fresh baseline",
+    );
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /1 unsaved change/,
+      "the stale pre-save response must not clear the staged edit",
     );
   } finally {
     if (root) {
