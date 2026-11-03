@@ -461,10 +461,9 @@ mod approval {
             &request.arguments_summary,
             request.position_counter(),
         );
-        let reply = crate::util::approve_deny_reply_instruction(token);
         let react =
             zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-react-instruction");
-        format!("{header}\n\n{react}\n{reply}")
+        format!("{header}\n\n{react}")
     }
 
     pub(super) struct ReactionPolicy<'a> {
@@ -8995,27 +8994,19 @@ mod tests {
         }
 
         #[test]
-        fn reaction_prompt_leads_with_reactions_and_keeps_full_typed_replies() {
-            use super::super::approval::{build_approval_prompt, parse_reply};
+        fn reaction_prompt_replaces_the_typed_reply_instruction() {
+            use super::super::approval::build_approval_prompt;
             let bot = matrix_sdk::ruma::user_id!("@bot:example.invalid");
             let prompt = build_approval_prompt("APPROVAL", &approval_request(), Some(bot));
             let react = zeroclaw_runtime::i18n::get_required_cli_string(
                 "channel-approval-react-instruction",
             );
-            let react_at = prompt.find(&react).expect("react instruction");
-            for (word, expected) in [
-                ("approve", ChannelApprovalResponse::Approve),
-                ("always", ChannelApprovalResponse::AlwaysApprove),
-                ("deny", ChannelApprovalResponse::Deny),
-            ] {
-                let reply = format!("APPROVAL {word}");
-                let reply_at = prompt.find(&format!("`{reply}`")).expect(&reply);
-                assert!(react_at < reply_at, "{prompt:?}");
-                assert_eq!(
-                    parse_reply(&reply),
-                    Some(("APPROVAL".to_string(), expected))
-                );
-            }
+            assert!(
+                prompt.starts_with("APPROVAL REQUIRED [APPROVAL]\n"),
+                "{prompt:?}"
+            );
+            assert!(prompt.ends_with(&format!("\n\n{react}")), "{prompt:?}");
+            assert!(!prompt.contains("APPROVAL approve"), "{prompt:?}");
             assert_eq!(
                 build_approval_prompt("APPROVAL", &approval_request(), None),
                 crate::util::build_approve_deny_approval_prompt("APPROVAL", "shell", "pwd", None)
