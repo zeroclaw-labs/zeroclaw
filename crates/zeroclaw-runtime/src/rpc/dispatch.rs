@@ -9298,9 +9298,9 @@ impl RpcDispatcher {
     async fn handle_session_rename(&self, params: &Value) -> RpcResult {
         const MAX_SESSION_NAME_CHARS: usize = 200;
         let req: SessionRenameParams = parse_params(params)?;
-        let name = req.name.trim();
+        let name = req.title.trim();
         if name.is_empty() {
-            return Err(rpc_err(INVALID_PARAMS, "session/rename requires a `name`"));
+            return Err(rpc_err(INVALID_PARAMS, "session/rename requires a `title`"));
         }
         if name.chars().count() > MAX_SESSION_NAME_CHARS {
             return Err(rpc_err(
@@ -9327,7 +9327,7 @@ impl RpcDispatcher {
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
             return to_result(SessionRenameResult {
                 session_id: req.session_id.clone(),
-                name: name.into(),
+                title: name.into(),
             });
         }
         #[cfg(not(test))]
@@ -9347,7 +9347,7 @@ impl RpcDispatcher {
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to rename session: {e}")))?;
             to_result(SessionRenameResult {
                 session_id: req.session_id.clone(),
-                name: name.to_string(),
+                title: name.to_string(),
             })
         }
     }
@@ -9550,13 +9550,14 @@ impl RpcDispatcher {
                 }
                 Some(SessionEntry {
                     session_id,
-                    session_key: meta.key,
+
                     created_at: meta.created_at.to_rfc3339(),
                     last_activity: meta.last_activity.to_rfc3339(),
                     message_count: meta.message_count,
                     agent_alias,
                     channel_id: meta.channel_id,
-                    name: meta.title,
+                    title: meta.title,
+                    creation_source: Some("rpc".to_owned()),
                 })
             })
             .collect();
@@ -9564,7 +9565,7 @@ impl RpcDispatcher {
             right
                 .last_activity
                 .cmp(&left.last_activity)
-                .then_with(|| left.session_key.cmp(&right.session_key))
+                .then_with(|| left.session_id.cmp(&right.session_id))
         });
         if let Some(limit) = req.limit {
             sessions.truncate(limit);
@@ -9677,20 +9678,21 @@ impl RpcDispatcher {
             };
             sessions.push(SessionEntry {
                 session_id,
-                session_key: family,
+
                 created_at: date(summary.created_at)?,
                 last_activity: date(summary.last_activity)?,
                 message_count: summary.message_count,
                 agent_alias: Some(descriptor.owning_agent),
                 channel_id: summary.channel_id().map(str::to_owned),
-                name: summary.title().map(str::to_owned),
+                title: summary.title().map(str::to_owned),
+                creation_source: summary.creation_source().map(str::to_owned),
             });
         }
         sessions.sort_by(|left, right| {
             right
                 .last_activity
                 .cmp(&left.last_activity)
-                .then_with(|| left.session_key.cmp(&right.session_key))
+                .then_with(|| left.session_id.cmp(&right.session_id))
         });
         if let Some(limit) = req.limit {
             sessions.truncate(limit);
@@ -9766,13 +9768,14 @@ impl RpcDispatcher {
             };
             sessions.push(SessionEntry {
                 session_id: summary.session_uuid.clone(),
-                session_key: summary.session_uuid,
+
                 created_at,
                 last_activity,
                 message_count,
                 agent_alias: Some(summary.agent_alias),
                 channel_id: None,
-                name,
+                title: name,
+                creation_source: Some("acp".to_owned()),
             });
         }
 
@@ -29993,11 +29996,11 @@ mod tests {
             assert_eq!(append["message_count"], 1);
             let rename = dispatcher
                 .handle_session_rename(&json!({
-                    "session_id":"native-commands", "name":"Renamed native session",
+                    "session_id":"native-commands", "title":"Renamed native session",
                 }))
                 .await
                 .expect("rename without legacy backend");
-            assert_eq!(rename["name"], "Renamed native session");
+            assert_eq!(rename["title"], "Renamed native session");
             let status = dispatcher.handle_agents_status().await.expect("status");
             let agent = status["agents"]
                 .as_array()
@@ -30014,7 +30017,7 @@ mod tests {
                 .await
                 .expect("search standard history after eviction");
             assert_eq!(listed["sessions"][0]["session_id"], "native-commands");
-            assert_eq!(listed["sessions"][0]["name"], "Renamed native session");
+            assert_eq!(listed["sessions"][0]["title"], "Renamed native session");
             let messages = dispatcher
                 .handle_session_messages(&json!({"session_id":"native-commands"}))
                 .await
@@ -45056,7 +45059,7 @@ mod tests {
                     "session_id": &session_id,
                     "prompt": "must not run",
                     "content": "must not append or steer",
-                    "name": "must not rename",
+                    "title": "must not rename",
                     "request_id": "owner-request",
                     "decision": "allow_once",
                 },
@@ -49988,10 +49991,14 @@ mod tests {
             &mut rx,
             2,
             "session/rename",
-            json!({"session_id": sid, "name": "  Nightly run  "}),
+            json!({"session_id": sid, "title": "  Nightly run  "}),
         )
         .await;
-        assert_eq!(renamed["result"]["name"], json!("Nightly run"), "{renamed}");
+        assert_eq!(
+            renamed["result"]["title"],
+            json!("Nightly run"),
+            "{renamed}"
+        );
         let listed = rpc(&mut operator, &mut rx, 3, "session/list", json!({})).await;
         let entry = listed["result"]["sessions"]
             .as_array()
@@ -50000,13 +50007,13 @@ mod tests {
             .find(|entry| entry["session_id"] == sid)
             .unwrap_or_else(|| panic!("{listed}"))
             .clone();
-        assert_eq!(entry["name"], json!("Nightly run"), "{entry}");
+        assert_eq!(entry["title"], json!("Nightly run"), "{entry}");
 
         for (id, method, params) in [
             (
                 4,
                 "session/rename",
-                json!({"session_id": sid, "name": "   "}),
+                json!({"session_id": sid, "title": "   "}),
             ),
             (
                 5,
@@ -50026,7 +50033,7 @@ mod tests {
             &mut rx,
             6,
             "session/rename",
-            json!({"session_id": "nope", "name": "x"}),
+            json!({"session_id": "nope", "title": "x"}),
         )
         .await;
         assert_eq!(
@@ -50083,7 +50090,11 @@ mod tests {
                 "session/append",
                 json!({"session_id": sid, "content": "x"}),
             ),
-            (2, "session/rename", json!({"session_id": sid, "name": "x"})),
+            (
+                2,
+                "session/rename",
+                json!({"session_id": sid, "title": "x"}),
+            ),
             (3, "session/abort", json!({"session_id": sid})),
             (
                 4,

@@ -734,7 +734,7 @@ pub(crate) async fn list(
         }
         let timestamp =
             |millis| chrono::DateTime::from_timestamp_millis(millis).map(|time| time.to_rfc3339());
-        sessions.push(serde_json::json!({"session_id":session_id,"name":summary.title().map(str::to_owned),"agent_alias":summary.owning_agent,"channel_id":summary.channel_id().map(str::to_owned),"message_count":summary.message_count,"created_at":timestamp(summary.created_at),"last_activity":timestamp(summary.last_activity),"source_cursor":summary.head}));
+        sessions.push(serde_json::json!({"session_id":session_id,"title":summary.title().map(str::to_owned),"creation_source":summary.creation_source(),"agent_alias":summary.owning_agent,"channel_id":summary.channel_id().map(str::to_owned),"message_count":summary.message_count,"created_at":timestamp(summary.created_at),"last_activity":timestamp(summary.last_activity),"source_cursor":summary.head}));
     }
     verify_history_subject(&state.pairing, subject)?;
     Ok(serde_json::json!({"sessions":sessions}))
@@ -1095,7 +1095,7 @@ pub(crate) mod tests {
             assert!(value["messages"][0]["message_id"].is_string());
             assert!(value["messages"][0]["created_at"].is_string());
             assert_eq!(
-                list(&state, None, false).await.expect("list")["sessions"][0]["name"],
+                list(&state, None, false).await.expect("list")["sessions"][0]["title"],
                 "native title"
             );
             let policy = Arc::new(UnrestrictedFixture);
@@ -1286,7 +1286,7 @@ pub(crate) mod tests {
                         State(state.clone()),
                         HeaderMap::new(),
                         Path(id.into()),
-                        Json(serde_json::json!({"name":"renamed"})),
+                        Json(serde_json::json!({"title":"renamed"})),
                     )
                     .await
                     .into_response();

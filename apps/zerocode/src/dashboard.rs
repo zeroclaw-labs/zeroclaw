@@ -808,7 +808,7 @@ impl Dashboard {
                 let s = &self.sessions[i];
                 let agent = s.agent_alias.as_deref().unwrap_or("?");
                 let name = s
-                    .name
+                    .title
                     .as_deref()
                     .unwrap_or(&s.session_id[..8.min(s.session_id.len())]);
                 ListItem::new(Line::from(vec![
@@ -859,7 +859,6 @@ impl Dashboard {
         let s = &self.sessions[idx];
         let mut lines = vec![
             detail_line("ID", &s.session_id),
-            detail_line(&crate::i18n::t("zc-dashboard-detail-key"), &s.session_key),
             detail_line(
                 &crate::i18n::t("zc-dashboard-detail-agent"),
                 s.agent_alias.as_deref().unwrap_or("\u{2014}"),
@@ -870,7 +869,7 @@ impl Dashboard {
             ),
             detail_line(
                 &crate::i18n::t("zc-dashboard-detail-name"),
-                s.name.as_deref().unwrap_or("\u{2014}"),
+                s.title.as_deref().unwrap_or("\u{2014}"),
             ),
             detail_line(
                 &crate::i18n::t("zc-dashboard-detail-messages"),
@@ -3695,13 +3694,12 @@ mod tests {
         let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
         dashboard.sessions.push(SessionEntry {
             session_id: "session-1".to_string(),
-            session_key: "key-1".to_string(),
             created_at: String::new(),
             last_activity: String::new(),
             message_count: 1,
             agent_alias: None,
             channel_id: None,
-            name: None,
+            title: None,
         });
         dashboard.agents.push(AgentStatusEntry {
             alias: "default".to_string(),

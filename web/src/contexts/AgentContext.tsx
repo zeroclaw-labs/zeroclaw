@@ -202,7 +202,7 @@ export interface AgentSessionRuntime {
   createSocket(options: { agentAlias: string; sessionId: string }): SessionSocket;
   getMessages(sessionId: string): Promise<SessionMessagesResponse>;
   delete(sessionId: string): Promise<{ deleted: boolean }>;
-  rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
+  rename(sessionId: string, name: string): Promise<{ session_id: string; title: string }>;
   mintId(): string;
 }
 

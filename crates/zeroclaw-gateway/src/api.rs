@@ -1912,11 +1912,11 @@ pub async fn handle_api_session_rename(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let name = body["name"].as_str().unwrap_or("").trim();
+    let name = body["title"].as_str().unwrap_or("").trim();
     if name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":"name is required"})),
+            Json(serde_json::json!({"error":"title is required"})),
         )
             .into_response();
     }
@@ -1929,7 +1929,7 @@ pub async fn handle_api_session_rename(
                     .await?
                     .rename(name)
                     .await?;
-                Ok(serde_json::json!({"session_id":id,"name":name}))
+                Ok(serde_json::json!({"session_id":id,"title":name}))
             }
             .await,
         );

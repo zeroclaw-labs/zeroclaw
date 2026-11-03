@@ -351,14 +351,14 @@ rpc_type! {
 rpc_type! {
     pub struct SessionRenameParams {
         pub session_id: String,
-        pub name: String,
+        pub title: String,
     }
 }
 
 rpc_type! {
     pub struct SessionRenameResult {
         pub session_id: String,
-        pub name: String,
+        pub title: String,
     }
 }
 
@@ -427,7 +427,6 @@ rpc_type! {
 rpc_type! {
     pub struct SessionEntry {
         pub session_id: String,
-        pub session_key: String,
         pub created_at: String,
         pub last_activity: String,
         pub message_count: usize,
@@ -436,7 +435,9 @@ rpc_type! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub channel_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub name: Option<String>,
+        pub title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_source: Option<String>,
     }
 }
 

@@ -1026,8 +1026,7 @@ function SessionsTab() {
       if (needle) {
         const haystack = [
           s.session_id,
-          s.session_key,
-          s.name ?? "",
+          s.title ?? "",
           s.agent_alias ?? "",
           s.channel_id ?? "",
         ]
@@ -1060,17 +1059,17 @@ function SessionsTab() {
 
   const openInspect = (session: Session) => {
     setInspect({ session, messages: null, error: null });
-    getSessionMessages(session.session_key)
+    getSessionMessages(session.session_id)
       .then((resp) =>
         setInspect((curr) =>
-          curr && curr.session.session_key === session.session_key
+          curr && curr.session.session_id === session.session_id
             ? { ...curr, messages: resp.messages }
             : curr,
         ),
       )
       .catch((err) =>
         setInspect((curr) =>
-          curr && curr.session.session_key === session.session_key
+          curr && curr.session.session_id === session.session_id
             ? { ...curr, error: err.message }
             : curr,
         ),
@@ -1082,13 +1081,13 @@ function SessionsTab() {
   const handleDelete = async (session: Session) => {
     if (deleting) return;
     setPendingDelete(null);
-    setDeleting(session.session_key);
+    setDeleting(session.session_id);
     try {
-      await deleteSession(session.session_key);
+      await deleteSession(session.session_id);
       setSessions((prev) =>
-        prev.filter((s) => s.session_key !== session.session_key),
+        prev.filter((s) => s.session_id !== session.session_id),
       );
-      if (inspect?.session.session_key === session.session_key)
+      if (inspect?.session.session_id === session.session_id)
         setInspect(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1241,7 +1240,7 @@ function SessionsTab() {
         <div className="space-y-2 overflow-y-auto max-h-[32rem]">
           {visible.map((session) => (
             <div
-              key={session.session_key}
+              key={session.session_id}
               className="flex items-center justify-between py-3 px-4 rounded-xl"
               style={{
                 background: "var(--pc-bg-elevated)",
@@ -1309,7 +1308,7 @@ function SessionsTab() {
                 <button
                   type="button"
                   onClick={() => setPendingDelete(session)}
-                  disabled={deleting === session.session_key}
+                  disabled={deleting === session.session_id}
                   className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
                   title={t("dashboard.delete_session")}
                   style={{ color: "var(--color-status-error)" }}

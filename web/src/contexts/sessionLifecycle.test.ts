@@ -180,7 +180,7 @@ class FakeSessionRuntime implements AgentSessionRuntime {
   readonly messageCalls: string[] = [];
   readonly messagePlans = new Map<string, MessageFactory[]>();
   readonly deletePlans = new Map<string, DeleteFactory[]>();
-  readonly renameDeferred = new Map<string, Deferred<{ session_id: string; name: string }>>();
+  readonly renameDeferred = new Map<string, Deferred<{ session_id: string; title: string }>>();
   mintedIds: string[] = [];
 
   createSocket({ agentAlias, sessionId }: { agentAlias: string; sessionId: string }): FakeSocket {
@@ -201,10 +201,10 @@ class FakeSessionRuntime implements AgentSessionRuntime {
     return plan ? plan() : Promise.resolve({ deleted: true });
   }
 
-  rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }> {
+  rename(sessionId: string, name: string): Promise<{ session_id: string; title: string }> {
     this.renameCalls.push({ id: sessionId, name });
     return this.renameDeferred.get(sessionId)?.promise
-      ?? Promise.resolve({ session_id: sessionId, name });
+      ?? Promise.resolve({ session_id: sessionId, title: name });
   }
 
   mintId(): string {
@@ -363,12 +363,12 @@ beforeEach(() => {
   storage.setItem('zeroclaw_active_session.ops', 'A');
   listedSessions = [
     {
-      session_id: 'A', session_key: 'gw_A', name: 'First', message_count: 0,
+      session_id: 'A', creation_source: 'gateway', title: 'First', message_count: 0,
       last_activity: '2026-08-05T00:00:00Z', created_at: '2026-08-05T00:00:00Z',
       agent_alias: 'ops', channel_id: null,
     },
     {
-      session_id: 'B', session_key: 'gw_B', name: 'Second', message_count: 0,
+      session_id: 'B', creation_source: 'gateway', title: 'Second', message_count: 0,
       last_activity: '2026-08-04T00:00:00Z', created_at: '2026-08-04T00:00:00Z',
       agent_alias: 'ops', channel_id: null,
     },
@@ -587,7 +587,7 @@ test('a deferred model PUT rebuilds the latest selected session socket', async (
 
 test('manual rename is the only name write when the first message is sent', async () => {
   const runtime = new FakeSessionRuntime();
-  const rename = new Deferred<{ session_id: string; name: string }>();
+  const rename = new Deferred<{ session_id: string; title: string }>();
   runtime.renameDeferred.set('A', rename);
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
   const mounted = await mountChat(runtime);
@@ -600,7 +600,7 @@ test('manual rename is the only name write when the first message is sent', asyn
   assert.deepEqual(runtime.sockets[0]?.sent, ['Draft the rollout']);
 
   await act(async () => {
-    rename.resolve({ session_id: 'A', name: 'Release planning' });
+    rename.resolve({ session_id: 'A', title: 'Release planning' });
     await pendingRename;
   });
   assert.equal(runtime.renameCalls.length, 1);

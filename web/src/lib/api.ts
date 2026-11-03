@@ -2161,18 +2161,16 @@ export function getSessionMessages(
 /**
  * Give a persisted session a display name.
  *
- * Takes the bare session id (the `gw_`-stripped `session_id`, not
- * `session_key`) because the handler prefixes `gw_` itself. Answers 404 when
- * the gateway has no metadata row for the session — notably when session
- * persistence is disabled.
+ * Takes the canonical session id. Answers 404 when the gateway has no
+ * persisted session — notably when session persistence is disabled.
  */
 export function renameSession(
   id: string,
-  name: string,
-): Promise<{ session_id: string; name: string }> {
-  return apiFetch<{ session_id: string; name: string }>(
+  title: string,
+): Promise<{ session_id: string; title: string }> {
+  return apiFetch<{ session_id: string; title: string }>(
     `/api/sessions/${encodeURIComponent(id)}`,
-    { method: "PUT", body: JSON.stringify({ name }) },
+    { method: "PUT", body: JSON.stringify({ title }) },
   ).finally(() => invalidateInFlightGet("/api/sessions"));
 }
 
