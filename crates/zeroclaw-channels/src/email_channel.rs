@@ -2431,6 +2431,7 @@ mod tests {
             attachments: Vec::new(),
             in_reply_to: None,
             references: Vec::new(),
+            locations: Vec::new(),
             suppress_voice: false,
             force_voice: false,
         }
