@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(NativeRuntime::new().name(), "native");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn shell_absence_is_only_reported_for_a_missing_shell() {
         use std::os::unix::fs::PermissionsExt;
@@ -692,7 +692,7 @@ mod tests {
         assert!(!shell_is_absent_on_host(&dir.path().to_string_lossy()));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn shell_absence_ignores_unusable_path_entries() {
         use std::os::unix::fs::PermissionsExt;

@@ -5238,7 +5238,7 @@ mod prompt_callable_name_tests {
         assert!(!names.contains(&"ops__fetch"));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn runtime_without_shell_omits_shell_and_script_skill_tools() {
         let skill = Skill {

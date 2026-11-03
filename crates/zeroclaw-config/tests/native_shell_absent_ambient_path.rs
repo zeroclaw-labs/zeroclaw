@@ -1,12 +1,13 @@
 //! A native runtime built from the process `PATH` (no injected PATH) reports
 //! no shell when the shell is absent, even if some `PATH` entries are unusable
 //! and would make the executable resolver report an error other than
-//! `NotFound` (issue #9859).
+//! `NotFound`.
 //!
 //! This is the only test in this binary because it replaces the process-wide
-//! `PATH`.
+//! `PATH`. Android pins its shell to `/system/bin/sh` and never reports it
+//! absent, so the test does not apply there.
 
-#![cfg(unix)]
+#![cfg(all(unix, not(target_os = "android")))]
 
 use std::ffi::OsString;
 use zeroclaw_config::platform::{RuntimeAdapter, ShellDialect, create_runtime};

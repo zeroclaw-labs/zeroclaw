@@ -247,9 +247,12 @@ mod tests {
         );
     }
 
-    // ── Shell-free runtime (issue #9859) ─────────────────────
+    // ── Shell-free runtime ───────────────────────────────────
+    //
+    // Android pins its shell to `/system/bin/sh` and never reports it absent,
+    // so these cases do not apply there.
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     fn assert_reports_no_shell(rt: &dyn RuntimeAdapter) {
         use crate::platform::ShellDialect;
 
@@ -277,7 +280,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn factory_native_without_shell_on_ambient_path_reports_no_shell() {
         for shell in [
@@ -294,7 +297,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn factory_native_without_shell_in_injected_path_reports_no_shell() {
         let empty = tempfile::tempdir().unwrap();
@@ -310,7 +313,7 @@ mod tests {
         assert_reports_no_shell(rt.as_ref());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn factory_native_unusable_shell_is_not_reported_as_missing() {
         use std::os::unix::fs::PermissionsExt;
@@ -336,7 +339,7 @@ mod tests {
         assert!(create_runtime_with_path(&cfg, Some(dir.path().as_os_str())).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn factory_native_absent_shell_with_unusable_path_entries_reports_no_shell() {
         // The resolver reports the error of an unusable entry (here a regular
@@ -360,7 +363,7 @@ mod tests {
         assert_reports_no_shell(rt.as_ref());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn factory_native_broken_symlink_shell_is_present_but_unusable() {
         // A dangling symlink is a filesystem entry, so the shell is not
@@ -396,7 +399,7 @@ mod tests {
         assert!(create_runtime_with_path(&bare, Some(dir.path().as_os_str())).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn factory_native_still_rejects_malformed_shell() {
         for bad in ["", "./sh"] {

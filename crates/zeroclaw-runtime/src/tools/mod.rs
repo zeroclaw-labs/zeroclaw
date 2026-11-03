@@ -3876,7 +3876,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn all_tools_runtime_has_no_shell_for_empty_or_relative_only_tui_path() {
         use std::ffi::OsString;
@@ -5744,9 +5744,10 @@ permissions = ["http_client"]
         );
     }
 
-    /// Issue #9859: a native runtime whose shell cannot be resolved (the
-    /// shell-free release image) builds, but exposes no `shell` tool.
-    #[cfg(unix)]
+    /// A native runtime whose shell is absent (the shell-free release image)
+    /// builds, but exposes no `shell` tool. Android pins its shell and never
+    /// reports it absent, so the case does not apply there.
+    #[cfg(all(unix, not(target_os = "android")))]
     #[tokio::test]
     async fn native_runtime_without_shell_does_not_register_shell_tool() {
         let tmp = TempDir::new().unwrap();
