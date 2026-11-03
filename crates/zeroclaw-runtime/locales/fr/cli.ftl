@@ -1122,6 +1122,13 @@ history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = limite de tours de l’historique dépassée
 history-trim-reason-recovery = récupération après dépassement de la fenêtre de contexte
+# Context compaction: a model-written summary replaces the older turns.
+history-compaction-summary-header = [RÉSUMÉ DU CONTEXTE — { $turns } tours précédents ({ $messages } messages) condensés dans le résumé ci-dessous]
+history-compaction-reason = contexte compacté par résumé
+history-compaction-done = Contexte compacté : { $turns } tours précédents résumés ({ $before } → { $after } tokens).
+history-compaction-failed = Échec de la compaction du contexte : { $error }
+history-compaction-disabled = La compaction du contexte est désactivée dans le profil d'exécution de cet agent.
+history-compaction-nothing-to-do = Rien à compacter pour l'instant : la conversation est encore courte.
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = Cette requête n'a pas été traitée : { $reason }
 turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que cet outil ne produise un résultat]

@@ -1333,6 +1333,13 @@ history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = history turn limit exceeded
 history-trim-reason-recovery = context window overflow recovery
+# Context compaction: a model-written summary replaces the older turns.
+history-compaction-summary-header = [CONTEXT SUMMARY — { $turns } earlier turns ({ $messages } messages) compacted into the summary below]
+history-compaction-reason = context compacted by summary
+history-compaction-done = Context compacted: { $turns } earlier turns summarized ({ $before } → { $after } tokens).
+history-compaction-failed = Context compaction failed: { $error }
+history-compaction-disabled = Context compaction is disabled in this agent's runtime profile.
+history-compaction-nothing-to-do = Nothing to compact yet: the conversation is still short.
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).

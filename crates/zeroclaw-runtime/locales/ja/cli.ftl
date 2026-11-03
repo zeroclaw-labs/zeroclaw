@@ -1117,6 +1117,13 @@ history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = 履歴ターン数の上限を超えました
 history-trim-reason-recovery = コンテキストウィンドウのオーバーフロー復旧
+# Context compaction: a model-written summary replaces the older turns.
+history-compaction-summary-header = [コンテキスト要約 — 以前の { $turns } ターン（{ $messages } メッセージ）を以下の要約に圧縮しました]
+history-compaction-reason = 要約によるコンテキスト圧縮
+history-compaction-done = コンテキストを圧縮しました: 以前の { $turns } ターンを要約（{ $before } → { $after } トークン）。
+history-compaction-failed = コンテキストの圧縮に失敗しました: { $error }
+history-compaction-disabled = このエージェントのランタイムプロファイルではコンテキスト圧縮が無効です。
+history-compaction-nothing-to-do = まだ圧縮する対象はありません: 会話はまだ短いです。
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
 turn-tool-interrupted-before-result = [このツールが結果を生成する前にユーザーによって中断されました]
