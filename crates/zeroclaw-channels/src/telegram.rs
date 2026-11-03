@@ -985,7 +985,7 @@ pub struct TelegramChannel {
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
     mention_only: bool,
     /// When `true` in a `mention_only` group, voice notes from allowlisted
-    /// senders are transcribed without requiring an explicit `@mention` —
+    /// senders are transcribed without requiring an explicit `@mention`:
     /// voice notes carry no caption, so the mention gate would otherwise
     /// silence them entirely. The sender allowlist still applies.
     voice_without_mention: bool,

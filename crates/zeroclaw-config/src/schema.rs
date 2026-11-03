@@ -16840,7 +16840,7 @@ pub struct TelegramConfig {
     #[serde(default)]
     pub mention_only: bool,
     /// When true in a `mention_only` group, voice notes from allowlisted users
-    /// are transcribed without requiring an explicit `@mention` — voice notes
+    /// are transcribed without requiring an explicit `@mention`: voice notes
     /// carry no caption, so the mention gate would otherwise silence them
     /// entirely. The sender allowlist still applies. Default: `false`.
     #[tab(Behavior)]
