@@ -4,6 +4,36 @@ use super::*;
 
 pub(super) use zeroclaw_providers::factory::SessionModelProvider;
 
+pub fn build_session_model_provider_with_capabilities(
+    capabilities: &crate::composition::RuntimeCapabilities,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    provider_ref: &str,
+    model_override: Option<&str>,
+    principal: Option<&zeroclaw_api::principal::PrincipalId>,
+) -> Result<SessionModelProvider> {
+    let model = zeroclaw_providers::factory::resolve_session_model_name(
+        config,
+        provider_ref,
+        model_override,
+    )?;
+    let provider = capabilities.model_provider(&crate::composition::ProviderRequest {
+        config,
+        agent_alias,
+        provider_ref: Some(provider_ref),
+        model: Some(&model),
+        principal,
+    })?;
+    let route_resolver =
+        zeroclaw_providers::model_route_resolver(provider_ref, &config.model_routes, &model);
+    Ok(SessionModelProvider {
+        provider,
+        provider_ref: provider_ref.into(),
+        model,
+        route_resolver,
+    })
+}
+
 /// Retain the actual base route only while a turn temporarily replaces it.
 /// Restoring on drop also covers a cancelled or dropped turn future.
 pub(super) struct RestoreTurnModel<'a> {
@@ -146,6 +176,27 @@ impl Agent {
             .and_then(|config| config.config.as_ref())
             .ok_or_else(|| anyhow::Error::msg(
                 "model_switch requested but agent has no provider_switch_config; cannot rebuild provider safely"))?;
+        if let Some(bound) = &self.supplied_capabilities {
+            let provider = bound.capabilities.providers.switched_model_provider(
+                &crate::composition::ProviderRequest {
+                    config,
+                    agent_alias: &self.agent_alias,
+                    provider_ref: Some(new_model_provider),
+                    model: Some(new_model),
+                    principal: bound.principal.as_ref(),
+                },
+            )?;
+            return Ok(Some(SessionModelProvider {
+                provider: Box::new(provider),
+                provider_ref: new_model_provider.into(),
+                model: new_model.into(),
+                route_resolver: zeroclaw_providers::model_route_resolver(
+                    new_model_provider,
+                    &config.model_routes,
+                    new_model,
+                ),
+            }));
+        }
         zeroclaw_providers::factory::build_switched_model_provider(
             config,
             &self.agent_alias,

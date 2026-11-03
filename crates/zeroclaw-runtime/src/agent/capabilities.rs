@@ -38,12 +38,16 @@ impl Agent {
             config,
             agent_alias,
             provider_ref: Some(&provider_ref),
+            model: None,
             principal: Some(principal),
         })?;
-        let memory = capabilities.memory.memory(&MemoryRequest {
-            config,
-            agent_alias,
-        })?;
+        let memory = capabilities
+            .memory
+            .memory(&MemoryRequest {
+                config,
+                agent_alias,
+            })
+            .await?;
         let tools = capabilities.tools.tools(&ToolRequest {
             config,
             agent_alias,
@@ -118,6 +122,10 @@ impl Agent {
                 config: Some(Arc::clone(config)),
                 live_config: Some(live_config.clone()),
                 live: None,
+            })
+            .supplied_capabilities(crate::composition::BoundCapabilities {
+                capabilities: capabilities.clone(),
+                principal: Some(principal.clone()),
             })
             .build()?;
         // Resolve only the explicit approval route. ChannelSource is outbound,

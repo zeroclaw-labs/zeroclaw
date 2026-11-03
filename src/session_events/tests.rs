@@ -434,7 +434,7 @@ async fn existing_agent_executes_through_coordinator_and_does_not_replay_effects
             tool_calls: Arc::clone(&tool_calls),
             resolutions: std::sync::Mutex::new(Vec::new()),
         });
-        let capabilities = zeroclaw_kernel::composition::RuntimeCapabilities {
+        let capabilities = zeroclaw_runtime::composition::RuntimeCapabilities {
             providers: sources.clone(),
             memory: sources.clone(),
             tools: sources.clone(),
@@ -594,10 +594,10 @@ struct Sources {
     tool_calls: Arc<AtomicUsize>,
     resolutions: std::sync::Mutex<Vec<&'static str>>,
 }
-impl zeroclaw_kernel::composition::ProviderSource for Sources {
+impl zeroclaw_runtime::composition::ProviderSource for Sources {
     fn model_provider(
         &self,
-        request: &zeroclaw_kernel::composition::ProviderRequest<'_>,
+        request: &zeroclaw_runtime::composition::ProviderRequest<'_>,
     ) -> anyhow::Result<Arc<dyn ModelProvider>> {
         assert_eq!(request.agent_alias, "fixture");
         assert_eq!(request.provider_ref, Some("openai.fixture"));
@@ -614,19 +614,20 @@ impl zeroclaw_kernel::composition::ProviderSource for Sources {
         }))
     }
 }
-impl zeroclaw_kernel::composition::MemorySource for Sources {
-    fn memory(
+#[async_trait::async_trait]
+impl zeroclaw_runtime::composition::MemorySource for Sources {
+    async fn memory(
         &self,
-        _: &zeroclaw_kernel::composition::MemoryRequest<'_>,
+        _: &zeroclaw_runtime::composition::MemoryRequest<'_>,
     ) -> anyhow::Result<Arc<dyn zeroclaw_api::memory_traits::Memory>> {
         self.resolutions.lock().expect("resolutions").push("memory");
         Ok(Arc::new(zeroclaw_memory::NoneMemory::new("fixture")))
     }
 }
-impl zeroclaw_kernel::composition::ToolSource for Sources {
+impl zeroclaw_runtime::composition::ToolSource for Sources {
     fn tools(
         &self,
-        request: &zeroclaw_kernel::composition::ToolRequest<'_>,
+        request: &zeroclaw_runtime::composition::ToolRequest<'_>,
     ) -> anyhow::Result<Vec<Box<dyn zeroclaw_api::tool::Tool>>> {
         assert_eq!(request.agent_alias, "fixture");
         self.resolutions.lock().expect("resolutions").push("tools");
@@ -635,7 +636,7 @@ impl zeroclaw_kernel::composition::ToolSource for Sources {
         })])
     }
 }
-impl zeroclaw_kernel::composition::ChannelSource for Sources {
+impl zeroclaw_runtime::composition::ChannelSource for Sources {
     fn channel(&self, _: &str) -> Option<Arc<dyn zeroclaw_api::channel::Channel>> {
         self.resolutions
             .lock()

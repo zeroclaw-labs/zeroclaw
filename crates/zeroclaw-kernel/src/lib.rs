@@ -4,5 +4,3 @@ pub mod session;
 pub mod approval;
 pub mod approval_gate;
 pub mod tool_execution;
-
-pub mod composition;

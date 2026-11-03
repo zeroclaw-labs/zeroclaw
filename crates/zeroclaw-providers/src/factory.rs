@@ -36,11 +36,12 @@ pub struct SessionModelProvider {
     pub route_resolver: std::sync::Arc<crate::router::ModelRouteResolver>,
 }
 
-pub fn build_session_model_provider(
+/// Resolve a session model without constructing a provider or using credentials.
+pub fn resolve_session_model_name(
     config: &zeroclaw_config::schema::Config,
     model_provider_ref: &str,
     model_override: Option<&str>,
-) -> Result<SessionModelProvider> {
+) -> Result<String> {
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
@@ -72,10 +73,26 @@ pub fn build_session_model_provider(
             ))
         })?;
 
+    Ok(model_name)
+}
+
+pub fn build_session_model_provider(
+    config: &zeroclaw_config::schema::Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<SessionModelProvider> {
+    let model_name = resolve_session_model_name(config, model_provider_ref, model_override)?;
+    let (model_provider_name, model_provider_alias) = model_provider_ref
+        .split_once('.')
+        .ok_or_else(|| anyhow::Error::msg("validated provider reference missing alias"))?;
+    let entry = config
+        .providers
+        .models
+        .find(model_provider_name, model_provider_alias);
     let model_provider_runtime_options = crate::provider_runtime_options_for_alias(
         config,
-        &model_provider_name,
-        &model_provider_alias,
+        model_provider_name,
+        model_provider_alias,
     );
 
     let (model_provider, model_route_resolver) =

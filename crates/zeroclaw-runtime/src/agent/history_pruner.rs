@@ -23,7 +23,7 @@ fn extract_tool_call_id(message: &ChatMessage) -> Option<String> {
         .map(|result| result.tool_call_id.clone())
 }
 
-fn extract_assistant_tool_call_ids(message: &ChatMessage) -> Option<Vec<String>> {
+pub(crate) fn extract_assistant_tool_call_ids(message: &ChatMessage) -> Option<Vec<String>> {
     (!message.tool_calls.is_empty()).then(|| {
         message
             .tool_calls
