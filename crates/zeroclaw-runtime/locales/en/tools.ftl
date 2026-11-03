@@ -203,6 +203,7 @@ tool-sessions-native-empty = No active sessions found.
 tool-sessions-native-reader-unavailable = Native session history is unavailable in this execution context.
 tool-sessions-native-mutation-unsupported = { $tool } cannot mutate native event history. Use an authorized session command.
 tool-sessions-native-history = Session '{ $session_id }': recent messages
+tool-sessions-not-found = Session '{ $session_id }' not found. Use sessions_list or sessions_current to choose an existing session.
 tool-sessions-native-summary = { $session_id }: channel={ $channel }, messages={ $messages }, last_activity={ $last_activity }
 
 tool-screenshot = Capture a screenshot of the current screen. Returns the saved file path.

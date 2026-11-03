@@ -2175,19 +2175,17 @@ export function renameSession(
 }
 
 /**
- * Delete a persisted session. Accepts either the full DB key or a bare gateway
- * session id — the handler prefixes `gw_` only when the id carries no
- * underscore. Unlike {@link renameSession}, which needs the bare id.
+ * Delete a persisted session using the canonical id returned by the listing.
  */
 export function deleteSession(
-  sessionKey: string,
+  sessionId: string,
 ): Promise<{ deleted: boolean }> {
   // A listing fetched before this delete settled must not be what a
   // post-delete refresh reports: it would list the row just removed. Also on
   // failure — a 404 means another client already deleted it, so an in-flight
   // listing may be stale in exactly the same way.
   return apiFetch<{ deleted: boolean }>(
-    `/api/sessions/${encodeURIComponent(sessionKey)}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
     { method: "DELETE" },
   ).finally(() => invalidateInFlightGet("/api/sessions"));
 }

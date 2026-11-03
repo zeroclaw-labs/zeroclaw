@@ -81,8 +81,9 @@ fn session_not_found(session_id: &str) -> ToolResult {
     ToolResult {
         success: false,
         output: ToolOutput::default(),
-        error: Some(format!(
-            "Session '{session_id}' not found. Use sessions_list or sessions_current to choose an existing session. Gateway dashboard sessions are stored as 'gw_<session_id>'."
+        error: Some(tool_msg_with_args(
+            "tool-sessions-not-found",
+            &[("session_id", session_id)],
         )),
     }
 }

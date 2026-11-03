@@ -24687,7 +24687,7 @@ mod tests {
             &rpc,
             &request,
             serde_json::json!({"sessions": [{
-                "session_id": "sess-b", "session_key": "sess-b", "agent_alias": "beta",
+                "session_id": "sess-b", "agent_alias": "beta",
                 "created_at": "2026-09-05T00:00:00Z", "last_activity": "2026-09-05T00:00:00Z", "message_count": 0
             }]}),
         );

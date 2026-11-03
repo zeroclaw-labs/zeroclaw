@@ -3,7 +3,7 @@ import { generateUUID } from './uuid';
 /**
  * Pointer to the chat session an agent alias is currently showing.
  *
- * The gateway keys every conversation by `session_id` (`gw_<id>` on the wire),
+ * The gateway keys every conversation by its canonical `session_id`,
  * so several independent conversations can coexist for one agent. The web UI
  * needs to remember which one the operator was last looking at; that pointer is
  * the only session state the browser owns. Transcripts live on the gateway

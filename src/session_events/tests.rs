@@ -1153,9 +1153,7 @@ async fn interrupted_child_is_recovered_without_replay(cli: bool) {
             &family,
         )
         .expect("store");
-        let root = EngineSessionSource::session_id(&reopened, &family)
-            .await
-            .expect("root");
+        let root = SessionId::parse(family.clone()).expect("root");
         let parent = store
             .read_page(&root, &EventCursor::beginning(root.clone()), None, 256)
             .expect("parent")

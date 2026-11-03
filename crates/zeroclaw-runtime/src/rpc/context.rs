@@ -318,9 +318,8 @@ pub struct RpcContext {
     /// **Source of truth** for "which TUIs are connected right now."
     pub tui_registry: Arc<TuiRegistry>,
 
-    /// Standard session repository bound to the ACP family namespace. `None`
-    /// when the repository could not be opened; callers treat persistence as
-    /// unavailable and fail closed for operations that require it.
+    /// Metadata view over the standard session catalog, shared by entrances.
+    /// `None` when unavailable; required metadata operations fail closed.
     pub session_repository: Option<Arc<SessionRepository>>,
 
     /// Shared SOP engine from the daemon (for RPC/TUI agent sessions).

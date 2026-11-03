@@ -4730,7 +4730,7 @@ impl RpcDispatcher {
 
     #[cfg(test)]
     pub async fn handle_session_list_acp_for_test(&self) -> RpcResult {
-        self.handle_session_list_acp(&Value::Null).await
+        self.handle_session_list_acp(&serde_json::json!({})).await
     }
 
     #[cfg(test)]
@@ -7596,13 +7596,7 @@ impl RpcDispatcher {
                 Some(DurableSession::Acp) => Some(sid.to_owned()),
                 _ => None,
             })
-            .unwrap_or_else(|| {
-                if self.ctx.native_sessions.is_some() {
-                    sid.to_owned()
-                } else {
-                    format!("rpc_{sid}")
-                }
-            });
+            .unwrap_or_else(|| sid.to_owned());
         let turn_id = uuid::Uuid::new_v4().to_string();
         let native_session = if let Some(source) = &self.ctx.native_sessions {
             let principal = self
@@ -9568,6 +9562,10 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_list(&self, params: &Value) -> RpcResult {
+        self.list_sessions(params, Method::SessionList).await
+    }
+
+    async fn list_sessions(&self, params: &Value, method: Method) -> RpcResult {
         #[cfg(test)]
         if self.ctx.native_sessions.is_none() {
             return self.legacy_session_list_fixture(params).await;
@@ -9579,50 +9577,40 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
         let req: SessionListParams = parse_params(params)?;
         let visible_ids = self.owner_visible_session_ids().await;
-        let native_families = source
+        let session_ids = source
             .sessions()
             .await
             .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let scope = self.scoped_principal_id();
         let mut sessions: Vec<SessionEntry> = Vec::new();
-        for family in native_families {
-            let session_id = family.to_owned();
+        for session_id in session_ids {
             if visible_ids
                 .as_ref()
                 .is_some_and(|ids| !ids.contains(&session_id))
             {
                 continue;
             }
-            let source = self
-                .ctx
-                .native_sessions
-                .as_ref()
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Native source missing"))?;
             let descriptor = source
-                .describe(family.clone())
+                .describe(session_id.clone())
                 .await
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Native family disappeared"))?;
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Native session disappeared"))?;
             if scope
                 .as_deref()
                 .is_some_and(|mine| descriptor.owner.as_deref() != Some(mine))
             {
                 continue;
             }
-            let grants = self.recheck_authority_after_admission(Method::SessionList)?;
+            let grants = self.recheck_authority_after_admission(method)?;
             if let Some(grants) = grants.as_ref()
                 && self
-                    .selector_session_agent_with_grants(
-                        Method::SessionList,
-                        grants,
-                        &descriptor.owning_agent,
-                    )
+                    .selector_session_agent_with_grants(method, grants, &descriptor.owning_agent)
                     .is_err()
             {
                 continue;
             }
             let durable = DurableSession::Chat {
-                key: family.clone(),
+                key: session_id.clone(),
             };
             let record = crate::rpc::session::SessionRecord {
                 live_generation: None,
@@ -9630,7 +9618,7 @@ impl RpcDispatcher {
                 owner: descriptor.owner,
             };
             let native = self
-                .native_history_query(&family, Some(&record), Method::SessionList)
+                .native_history_query(&session_id, Some(&record), method)
                 .await?
                 .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Native history missing"))?;
             let summary = native
@@ -9694,11 +9682,29 @@ impl RpcDispatcher {
         to_result(SessionListResult { sessions })
     }
 
-    /// List the ACP family namespace from the standard session repository. The Code (ACP)
-    /// pane in the TUI calls this instead of `session/list` so its picker only
-    /// shows sessions in that namespace; chat-pane sessions live in the
-    /// unified native session store and must not appear here.
-    async fn handle_session_list_acp(&self, _params: &Value) -> RpcResult {
+    /// Both panes enumerate the canonical session catalog. The entrance does
+    /// not define another namespace or rewrite the recorded creation source.
+    async fn handle_session_list_acp(&self, params: &Value) -> RpcResult {
+        if self.ctx.native_sessions.is_some() {
+            if params.is_null() {
+                return self
+                    .list_sessions(&serde_json::json!({}), Method::SessionListAcp)
+                    .await;
+            }
+            return self.list_sessions(params, Method::SessionListAcp).await;
+        }
+        #[cfg(test)]
+        {
+            self.legacy_acp_session_list_fixture().await
+        }
+        #[cfg(not(test))]
+        {
+            Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))
+        }
+    }
+
+    #[cfg(test)]
+    async fn legacy_acp_session_list_fixture(&self) -> RpcResult {
         let store = self
             .ctx
             .session_repository
@@ -9722,53 +9728,17 @@ impl RpcDispatcher {
             {
                 continue;
             }
-            let record = self
-                .resolve_session_record_for_mode(&summary.session_uuid, Some(&ChatMode::Acp))
+            self.resolve_session_record_for_mode(&summary.session_uuid, Some(&ChatMode::Acp))
                 .await?;
-            let native = self
-                .native_history_query(
-                    &summary.session_uuid.clone(),
-                    record.as_ref(),
-                    Method::SessionListAcp,
-                )
-                .await?;
-            let (created_at, last_activity, message_count, name) = if let Some(native) = native {
-                let projection = native
-                    .query
-                    .summary(native.stream)
-                    .await
-                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-                if projection.closed {
-                    continue;
-                }
-                let date = |millis| {
-                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
-                        .map(|date| date.to_rfc3339())
-                        .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Invalid event timestamp"))
-                };
-                (
-                    date(projection.created_at)?,
-                    date(projection.last_activity)?,
-                    projection.message_count,
-                    projection.title().map(str::to_owned),
-                )
-            } else {
-                (
-                    summary.created_at.to_rfc3339(),
-                    summary.last_activity.to_rfc3339(),
-                    summary.message_count,
-                    None,
-                )
-            };
             sessions.push(SessionEntry {
                 session_id: summary.session_uuid.clone(),
 
-                created_at,
-                last_activity,
-                message_count,
+                created_at: summary.created_at.to_rfc3339(),
+                last_activity: summary.last_activity.to_rfc3339(),
+                message_count: summary.message_count,
                 agent_alias: Some(summary.agent_alias),
                 channel_id: None,
-                title: name,
+                title: None,
                 creation_source: Some("acp".to_owned()),
             });
         }
@@ -29969,6 +29939,10 @@ mod tests {
                 4, 10, 60,
             ));
             let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let repository = Arc::new(
+                zeroclaw_infra::session_repository::SessionRepository::new(&config.data_dir)
+                    .expect("repository"),
+            );
             let mut ctx = RpcContext::minimal(config, sessions);
             let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
                 ctx.config.clone(),
@@ -29976,6 +29950,7 @@ mod tests {
             let context = Arc::get_mut(&mut ctx).expect("context");
             context.native_sessions = Some(source);
             context.session_backend = None;
+            context.session_repository = Some(repository);
             let (tx, _rx) = tokio::sync::mpsc::channel(64);
             let mut dispatcher = RpcDispatcher::new(ctx, tx, "native-commands-fixture".into());
             dispatcher.set_authenticated_for_test();
@@ -30016,6 +29991,14 @@ mod tests {
                 .expect("search standard history after eviction");
             assert_eq!(listed["sessions"][0]["session_id"], "native-commands");
             assert_eq!(listed["sessions"][0]["title"], "Renamed native session");
+            assert_eq!(listed["sessions"][0]["creation_source"], "rpc");
+            let acp_listed = dispatcher
+                .handle_session_list_acp(&json!({}))
+                .await
+                .expect("ACP view reads the same canonical session metadata");
+            assert_eq!(acp_listed["sessions"][0]["session_id"], "native-commands");
+            assert_eq!(acp_listed["sessions"][0]["title"], "Renamed native session");
+            assert_eq!(acp_listed["sessions"][0]["creation_source"], "rpc");
             let messages = dispatcher
                 .handle_session_messages(&json!({"session_id":"native-commands"}))
                 .await
@@ -33335,20 +33318,10 @@ mod tests {
             .authorize_session_owner(current_session_id, Method::SessionPrompt)
             .await
             .expect("owner");
-        let prefix = match dispatcher
-            .ctx
-            .sessions
-            .chat_mode(current_session_id)
-            .await
-            .expect("mode")
-        {
-            ChatMode::Acp => "acp_",
-            ChatMode::Chat => "rpc_",
-        };
         let port = dispatcher
             .native_session_command(
                 current_session_id,
-                &format!("{prefix}{current_session_id}"),
+                current_session_id,
                 record.as_ref(),
                 Method::SessionPrompt,
             )
@@ -33509,10 +33482,10 @@ mod tests {
             &dispatcher,
             current,
             "sessions_history",
-            json!({"session_id": format!("acp_{current}")}),
+            json!({"session_id": current}),
         )
         .await;
-        assert!(history.success);
+        assert!(history.success, "{:?}", history.error);
         assert!(history.output.contains("current RPC answer"));
 
         let foreign_history = execute_session_tool_as(
@@ -33565,7 +33538,7 @@ mod tests {
             &dispatcher,
             current,
             "sessions_history",
-            json!({"session_id": format!("acp_{current}")}),
+            json!({"session_id": current}),
         )
         .await;
         assert!(rehydrated_history.success);
