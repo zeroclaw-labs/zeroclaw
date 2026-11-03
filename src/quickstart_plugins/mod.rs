@@ -333,11 +333,11 @@ async fn open_row_with<P: QuickstartPrompter>(
         Ok(Some(picked)) => {
             let mut names = std::collections::HashSet::new();
             for index in &picked {
-                if let Some(choice) = choices.get(*index) {
-                    if !names.insert(choice.name.as_str()) {
-                        prompter.say(&qta("cli-plugin-registry-selection-conflict", &[]));
-                        return Ok(RowExit::Done);
-                    }
+                if let Some(choice) = choices.get(*index)
+                    && !names.insert(choice.name.as_str())
+                {
+                    prompter.say(&qta("cli-plugin-registry-selection-conflict", &[]));
+                    return Ok(RowExit::Done);
                 }
             }
             row.selected = picked

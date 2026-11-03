@@ -263,9 +263,9 @@ pub fn resolve_registry_entry<'a>(
             spec.name
         );
     }
-    let index = *origins
-        .first()
-        .ok_or_else(|| anyhow::Error::msg(format!("plugin '{}' not found in registry", spec.name)))?;
+    let index = *origins.first().ok_or_else(|| {
+        anyhow::Error::msg(format!("plugin '{}' not found in registry", spec.name))
+    })?;
     Ok(RegistryEntryView {
         origin: index
             .registry_url

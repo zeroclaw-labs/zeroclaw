@@ -10,9 +10,7 @@ use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_wi
 pub(crate) fn print(config: &crate::config::schema::Config, host: &PluginHost) {
     let installed = host.list_plugins();
     let cached_registry = match read_cached_registry_collection(&config.data_dir) {
-        Ok(index) => {
-            index.filter(|index| zeroclaw::plugins::registry::cache_matches_environment(index))
-        }
+        Ok(index) => index.filter(zeroclaw::plugins::registry::cache_matches_environment),
         Err(error) => {
             let error = error.to_string();
             eprintln!(

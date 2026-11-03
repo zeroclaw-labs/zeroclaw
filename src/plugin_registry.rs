@@ -1017,7 +1017,7 @@ capabilities = ["tool"]
     async fn registry_plugin_download_resolves_caches_and_unpacks_the_entry() {
         let server = MockServer::start().await;
         let archive = sample_archive();
-        let mut entry = sample_entry(&server, Some(hex::encode(Sha256::digest(&archive))));
+        let entry = sample_entry(&server, Some(hex::encode(Sha256::digest(&archive))));
         Mock::given(method("GET"))
             .and(path("/registry.json"))
             .respond_with(
