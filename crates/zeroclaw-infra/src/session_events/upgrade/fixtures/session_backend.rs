@@ -60,14 +60,7 @@ pub struct SessionQuery {
     pub limit: Option<usize>,
 }
 
-/// One persisted message with the optional `created_at` the backend
-/// stamped on it. JSONL / in-memory backends return `None`; SQLite
-/// returns the row's `created_at` column.
-#[derive(Debug, Clone)]
-pub struct TimestampedMessage {
-    pub message: ChatMessage,
-    pub created_at: Option<DateTime<Utc>>,
-}
+pub use crate::session_events::import::TimestampedMessage;
 
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.

@@ -597,11 +597,11 @@ async fn waiting_for_one_family_does_not_block_another_family() {
 
 #[tokio::test]
 async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_activity() {
-    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend;
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
         let legacy =
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 directory.path(),
             )
             .expect("legacy");
@@ -750,11 +750,11 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
 
 #[tokio::test]
 async fn imported_message_identities_survive_first_context_replacement_and_reader_revocation() {
-    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend;
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::tempdir().expect("directory");
         let legacy =
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 directory.path(),
             )
             .expect("legacy");

@@ -1,12 +1,13 @@
 use super::*;
+use crate::session_events::upgrade::fixtures::session_backend::SessionBackend;
 
 #[test]
 fn sqlite_publication_supports_fresh_reopen_and_legacy_upgrade() {
-    use crate::session_backend::SessionBackend;
+    use crate::session_events::upgrade::fixtures::session_backend::SessionBackend;
     for legacy in [false, true] {
         let directory = tempfile::tempdir().expect("directory");
         if legacy {
-            let old = crate::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            let old = crate::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 directory.path(),
             )
             .expect("legacy");
@@ -44,7 +45,8 @@ fn sqlite_publication_supports_fresh_reopen_and_legacy_upgrade() {
     }
 }
 use crate::{
-    session_events::upgrade::legacy_sqlite::SqliteSessionBackend, session_store::SessionStore,
+    session_events::upgrade::fixtures::session_store::SessionStore,
+    session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
 };
 use zeroclaw_api::{
     model_provider::ChatMessage,

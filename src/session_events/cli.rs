@@ -258,7 +258,7 @@ pub async fn open_cli_session(
                     state.history.iter().find(|message| message.role != "system")
                         .map(|message| zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&message.content))
                 };
-                Ok(LegacySnapshot {messages:state.history.into_iter().map(|message| zeroclaw_infra::session_backend::TimestampedMessage { message, created_at: None }).collect(), history_has_trim_breadcrumb:crumb, metadata:vec![]})
+                Ok(LegacySnapshot {messages:state.history.into_iter().map(|message| zeroclaw_infra::session_events::import::TimestampedMessage { message, created_at: None }).collect(), history_has_trim_breadcrumb:crumb, metadata:vec![]})
             })?;
             anyhow::ensure!(imported == stream, "CLI import identity differs from path binding");
         } else if !published {

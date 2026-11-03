@@ -676,7 +676,10 @@ async fn native_family_source_restores_context_fences_legacy_and_excludes_anothe
     for backend in ["sqlite", "jsonl"] {
         let directory = tempfile::TempDir::new().expect("directory");
         let legacy = Arc::new(
-            zeroclaw_infra::session_store::SessionStore::new(directory.path()).expect("legacy"),
+            zeroclaw_infra::session_events::upgrade::fixtures::session_store::SessionStore::new(
+                directory.path(),
+            )
+            .expect("legacy"),
         );
         legacy
             .append(

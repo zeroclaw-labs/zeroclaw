@@ -534,8 +534,8 @@ mod tests {
 
     #[test]
     fn legacy_import_indexes_first_user_message_on_each_backend() {
-        use crate::session_backend::SessionBackend;
-        use crate::session_events::upgrade::legacy_sqlite::SqliteSessionBackend;
+        use crate::session_events::upgrade::fixtures::session_backend::SessionBackend;
+        use crate::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend;
         use zeroclaw_api::model_provider::ChatMessage;
 
         for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {

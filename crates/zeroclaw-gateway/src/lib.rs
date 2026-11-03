@@ -11586,13 +11586,14 @@ data: [DONE]\n\n";
         let (mut state, _) =
             production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
         let session_directory = state.config.read().data_dir.clone();
-        let backend: std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
-            std::sync::Arc::new(
-                zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
-                    &session_directory,
-                )
-                .expect("sqlite session backend"),
-            );
+        let backend: std::sync::Arc<
+            dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend,
+        > = std::sync::Arc::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
+                &session_directory,
+            )
+            .expect("sqlite session backend"),
+        );
         // Seed the transcript under the legacy raw gateway key: dot-bearing
         // display ids persisted this exact key before cancellation keys were
         // normalized, so a reconnect must resume it unchanged.

@@ -2156,7 +2156,7 @@ mod accept_error_tests {
         .unwrap();
 
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 tmp.path(),
             )
             .unwrap(),
@@ -2187,7 +2187,7 @@ mod accept_error_tests {
         let mut ctx1 = RpcContext::for_persistence_tests(
             config1,
             sessions1,
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             None,
         );
 
@@ -2381,7 +2381,7 @@ mod accept_error_tests {
             let mut ctx2 = RpcContext::for_persistence_tests(
                 config2,
                 sessions2,
-                Some(chat_backend2 as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                Some(chat_backend2 as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
                 None,
             );
 

@@ -12,7 +12,7 @@ use zeroclaw_config::cost::tracker::CostTracker;
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 #[cfg(test)]
-use zeroclaw_infra::session_backend::SessionBackend;
+use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend;
 use zeroclaw_infra::session_repository::SessionRepository;
 
 use super::session::SessionStore;

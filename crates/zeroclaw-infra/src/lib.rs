@@ -5,11 +5,9 @@ pub mod conversation_owners;
 pub mod cost_ledger;
 pub mod debounce;
 pub mod net_guard;
-pub mod session_backend;
 pub mod session_events;
 pub mod session_queue;
 pub mod session_repository;
-pub mod session_store;
 pub mod stall_watchdog;
 
 /// Explicit bridge for pre-event-store protocol test harnesses. Shipped
@@ -32,11 +30,6 @@ macro_rules! legacy_fixture_call {
 
 use std::net::SocketAddr;
 use std::path::Path;
-#[cfg(any(test, feature = "test-util"))]
-use std::sync::Arc;
-
-#[cfg(any(test, feature = "test-util"))]
-use crate::session_backend::SessionBackend;
 
 pub fn effective_gateway_bind_socket_addr(host: &str, port: u16) -> SocketAddr {
     parse_gateway_bind_socket_addr(host, port)
@@ -52,50 +45,6 @@ pub fn parse_gateway_bind_socket_addr(
 
 pub fn fallback_gateway_bind_socket_addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
-}
-
-/// Constructs pre-upgrade fixtures only. Production opens the installation's native event store.
-#[cfg(any(test, feature = "test-util"))]
-pub fn make_session_backend(
-    workspace_dir: &Path,
-    backend: &str,
-) -> std::io::Result<Arc<dyn SessionBackend>> {
-    let guard =
-        session_events::installation::InstallationGuard::acquire(&workspace_dir.join("sessions"))
-            .map_err(std::io::Error::other)?;
-    if let Err(error) = guard.require_legacy() {
-        if error.kind() != std::io::ErrorKind::PermissionDenied {
-            return Err(error);
-        }
-        // Compatibility-only consumers cannot recreate an old SQLite file.
-        // The directory reader shares the durable native writer fence; native
-        // entrances and tools read through their authorized event query port.
-        return Ok(Arc::new(session_store::SessionStore::new(workspace_dir)?));
-    }
-    match backend {
-        "jsonl" => {
-            let store = session_store::SessionStore::new(workspace_dir)?;
-            Ok(Arc::new(store))
-        }
-        "sqlite" => Ok(Arc::new(open_sqlite_with_jsonl_import(
-            workspace_dir,
-            guard,
-        )?)),
-        other => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"other": other})),
-                "Unknown session_backend ''; falling back to sqlite. \
-                 Valid values: 'sqlite' (default), 'jsonl'."
-            );
-            Ok(Arc::new(open_sqlite_with_jsonl_import(
-                workspace_dir,
-                guard,
-            )?))
-        }
-    }
 }
 
 /// Data directories whose startup recovery this process has already claimed,
@@ -130,10 +79,7 @@ pub fn recover_abandoned_session_turns(data_dir: &Path) -> std::io::Result<usize
     {
         return Ok(0);
     }
-    let recovered =
-        session_events::upgrade::legacy_sqlite::SqliteSessionBackend::recover_abandoned_turns_at(
-            data_dir,
-        )?;
+    let recovered = session_events::upgrade::readers::recover_abandoned_turns_at(data_dir)?;
     if recovered > 0 {
         ::zeroclaw_log::record!(
             WARN,
@@ -145,35 +91,13 @@ pub fn recover_abandoned_session_turns(data_dir: &Path) -> std::io::Result<usize
     }
     Ok(recovered)
 }
-#[cfg(any(test, feature = "test-util"))]
-fn open_sqlite_with_jsonl_import(
-    workspace_dir: &Path,
-    guard: session_events::installation::InstallationGuard,
-) -> std::io::Result<session_events::upgrade::legacy_sqlite::SqliteSessionBackend> {
-    let backend = session_events::upgrade::legacy_sqlite::SqliteSessionBackend::open_locked(&guard)
-        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-    drop(guard);
-    match backend
-        .migrate_from_jsonl(workspace_dir)
-        .map_err(|e| std::io::Error::other(format!("{e:#}")))?
-    {
-        0 => {}
-        n => ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!(
-                "session_backend=sqlite: completed {n} legacy JSONL session migration \
-             handoff(s) from {}/sessions to *.jsonl.migrated.",
-                workspace_dir.display()
-            )
-        ),
-    }
-    Ok(backend)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_events::upgrade::fixtures::{
+        make_session_backend, session_backend::SessionBackend,
+    };
+    use std::sync::Arc;
     use tempfile::TempDir;
     use zeroclaw_api::model_provider::ChatMessage;
 
@@ -285,7 +209,7 @@ mod tests {
     fn failed_recovery_is_reported_and_not_retried() {
         let tmp = TempDir::new().unwrap();
         let db_path =
-            session_events::upgrade::legacy_sqlite::SqliteSessionBackend::db_path(tmp.path());
+            session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::db_path(tmp.path());
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         std::fs::write(&db_path, b"not a database").unwrap();
 
@@ -307,56 +231,6 @@ mod tests {
             db.exists(),
             "unknown value must fall back to sqlite, not error"
         );
-    }
-
-    #[test]
-    fn make_session_backend_sqlite_imports_legacy_jsonl_on_first_open() {
-        // Seed JSONL session files, then open SQLite — the .jsonl files must
-        // be migrated and the imported sessions must be visible via the new
-        // backend. The .jsonl files get renamed to .jsonl.migrated so the
-        // operator can roll back.
-        let tmp = TempDir::new().unwrap();
-        {
-            let jsonl = make_session_backend(tmp.path(), "jsonl").unwrap();
-            jsonl.append("legacy", &user_msg("from-jsonl")).unwrap();
-        }
-        let sqlite = make_session_backend(tmp.path(), "sqlite").unwrap();
-        let loaded = sqlite.load("legacy");
-        assert_eq!(
-            loaded.len(),
-            1,
-            "legacy JSONL session must hydrate via SQLite"
-        );
-        // .jsonl renamed to .jsonl.migrated; original gone.
-        let jsonl_orig = tmp.path().join("sessions").join("legacy.jsonl");
-        let jsonl_migrated = tmp.path().join("sessions").join("legacy.jsonl.migrated");
-        assert!(!jsonl_orig.exists(), "original .jsonl should be renamed");
-        assert!(
-            jsonl_migrated.exists(),
-            ".jsonl.migrated rollback file should remain"
-        );
-    }
-
-    #[test]
-    fn make_session_backend_sqlite_fails_closed_on_import_collision() {
-        let tmp = TempDir::new().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-        std::fs::write(
-            sessions_dir.join("legacy.jsonl"),
-            "{\"role\":\"user\",\"content\":\"from-jsonl\"}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            sessions_dir.join("legacy.jsonl.migrated"),
-            "existing archive",
-        )
-        .unwrap();
-
-        let err = make_session_backend(tmp.path(), "sqlite")
-            .err()
-            .expect("migration collision must prevent SQLite startup");
-        assert!(err.to_string().contains("Refusing to replace"));
     }
 
     #[test]

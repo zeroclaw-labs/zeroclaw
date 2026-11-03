@@ -489,7 +489,12 @@ share the installation publication lock and are fenced before import starts.
 Stable import identities and bounded batches allow restart at
 the last committed receipt. Only after every import completes are old history
 files renamed with a `.backup` suffix and the ready state published. Sources
-are not deleted or reopened for writes. Conflicting source histories fail
+are not deleted or reopened for writes. SQLite/JSONL import reads the master
+format directly without initializing a legacy backend, adding schema columns,
+or maintaining its FTS indexes. Old-schema writers exist only in the explicit
+test fixtures under `session_events::upgrade::fixtures`; the old root backend
+APIs and the JSONL-to-legacy-SQLite migration path have been removed.
+Conflicting source histories fail
 explicitly. Migration preserves original payload content without credential
 filtering. Configuration credentials retain their existing encryption.
 SQLite message timestamps are retained in imported context entries; native

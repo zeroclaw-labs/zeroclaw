@@ -9480,7 +9480,7 @@ impl RpcDispatcher {
                 if keyword.trim().is_empty() {
                     backend.list_sessions_with_metadata()
                 } else {
-                    use zeroclaw_infra::session_backend::SessionQuery;
+                    use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionQuery;
                     backend.search(&SessionQuery {
                         keyword: Some(keyword.clone()),
                         limit: req.limit,
@@ -16121,7 +16121,7 @@ pub(super) async fn forward_turn_event(
 /// untrimmed prefix.
 #[cfg(test)]
 fn replace_rpc_chat_conversation_state(
-    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    backend: &dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend,
     session_id: &str,
     session_key: &str,
     durable: &[zeroclaw_providers::ChatMessage],
@@ -17241,7 +17241,9 @@ mod tests {
     /// boundary.
     struct FailingReplaceBackend;
 
-    impl zeroclaw_infra::session_backend::SessionBackend for FailingReplaceBackend {
+    impl zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend
+        for FailingReplaceBackend
+    {
         fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
             Vec::new()
         }
@@ -17298,7 +17300,9 @@ mod tests {
         struct DeletedBackend {
             rewrites: std::sync::Mutex<usize>,
         }
-        impl zeroclaw_infra::session_backend::SessionBackend for DeletedBackend {
+        impl zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend
+            for DeletedBackend
+        {
             fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
                 Vec::new()
             }
@@ -18715,7 +18719,7 @@ mod tests {
         config: zeroclaw_config::schema::Config,
     ) -> (
         Arc<RpcContext>,
-        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend>,
         Arc<zeroclaw_infra::session_repository::SessionRepository>,
     ) {
         use zeroclaw_infra::session_queue::SessionActorQueue;
@@ -18724,7 +18728,7 @@ mod tests {
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 &data_dir,
             )
             .unwrap(),
@@ -18736,7 +18740,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             config,
             sessions,
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             Some(Arc::clone(&acp_store)),
         );
         (ctx, chat_backend, acp_store)
@@ -19887,7 +19891,7 @@ mod tests {
     ) -> (
         Arc<RpcContext>,
         std::path::PathBuf,
-        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend>,
     ) {
         let mut config = session_cwd_config(tmp, 4242, None);
         config
@@ -19911,7 +19915,7 @@ mod tests {
     async fn install_upload_session(
         ctx: &Arc<RpcContext>,
         chat_backend: &Arc<
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
         >,
         sid: &str,
         owner: Option<&str>,
@@ -24386,7 +24390,7 @@ mod tests {
     /// caller authorize against one and read another.
     #[tokio::test]
     async fn colliding_session_records_with_different_owners_are_refused_not_read() {
-        use zeroclaw_infra::session_backend::SessionBackend as _;
+        use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend as _;
         let tmp = tempfile::TempDir::new().unwrap();
         let config = two_user_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -24667,7 +24671,7 @@ mod tests {
     #[tokio::test]
     async fn session_new_restoration_by_admin_preserves_the_durable_owner() {
         use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
-        use zeroclaw_infra::session_backend::SessionBackend as _;
+        use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend as _;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = two_user_config(&tmp);
         config.permission_profiles.insert(
@@ -24818,7 +24822,7 @@ mod tests {
     /// the row intact.
     #[tokio::test]
     async fn delete_destroys_exactly_the_authorized_durable_record() {
-        use zeroclaw_infra::session_backend::SessionBackend as _;
+        use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend as _;
         let tmp = tempfile::TempDir::new().unwrap();
         let config = two_user_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -24904,7 +24908,9 @@ mod tests {
     /// A chat backend that keeps transcripts but cannot record an owner.
     struct OwnerlessChatBackend;
 
-    impl zeroclaw_infra::session_backend::SessionBackend for OwnerlessChatBackend {
+    impl zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend
+        for OwnerlessChatBackend
+    {
         fn load(&self, _key: &str) -> Vec<zeroclaw_api::model_provider::ChatMessage> {
             Vec::new()
         }
@@ -24938,7 +24944,7 @@ mod tests {
             config,
             Arc::clone(&sessions),
             Some(Arc::new(OwnerlessChatBackend)
-                as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             None,
         );
         let alice = scoped_dispatcher(&ctx, 4242).await;
@@ -25202,7 +25208,7 @@ mod tests {
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 &data_dir,
             )
             .unwrap(),
@@ -25214,7 +25220,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             config,
             Arc::clone(&sessions),
-            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             Some(acp_store),
         );
         let mut ctx = Arc::try_unwrap(ctx)
@@ -32865,7 +32871,7 @@ mod tests {
                 ));
                 let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
                 let legacy = Arc::new(
-                    zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(&config.data_dir)
+                    zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(&config.data_dir)
                         .expect("legacy"),
                 );
                 let acp = Arc::new(
@@ -33231,7 +33237,7 @@ mod tests {
     // chat_mode persistence routing: ACP vs Chat must not cross stores
     // -----------------------------------------------------------------------
 
-    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend;
 
     fn make_persistence_test_dispatcher(
         config: zeroclaw_config::schema::Config,
@@ -33239,14 +33245,14 @@ mod tests {
     ) -> (
         RpcDispatcher,
         Arc<crate::rpc::session::SessionStore>,
-        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend>,
         Arc<zeroclaw_infra::session_repository::SessionRepository>,
     ) {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 data_dir,
             )
             .unwrap(),
@@ -33258,7 +33264,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             config,
             Arc::clone(&sessions),
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             Some(Arc::clone(&acp_store)),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -33289,7 +33295,7 @@ mod tests {
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 data_dir,
             )
             .unwrap(),
@@ -33301,7 +33307,7 @@ mod tests {
         let mut ctx_inner = Arc::try_unwrap(RpcContext::for_persistence_tests(
             config,
             Arc::clone(&sessions),
-            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             Some(Arc::clone(&acp_store)),
         ))
         .unwrap_or_else(|_| panic!("freshly constructed ctx must be uniquely owned"));
@@ -33596,7 +33602,7 @@ mod tests {
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 &data_dir,
             )
             .unwrap(),
@@ -33608,7 +33614,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             config,
             sessions,
-            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             Some(acp_store),
         );
         let (mut owner, mut owner_rx) = make_remote_dispatcher(Arc::clone(&ctx), "tui-owner");
@@ -34195,7 +34201,7 @@ mod tests {
             )),
         ));
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 tmp.path(),
             )
             .unwrap(),
@@ -37708,7 +37714,7 @@ mod tests {
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 &data_dir,
             )
             .unwrap(),
@@ -37720,7 +37726,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             config,
             Arc::clone(&sessions),
-            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             Some(Arc::clone(&acp_store)),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -46914,7 +46920,7 @@ mod tests {
     async fn install_state_test_session(
         sessions: &Arc<crate::rpc::session::SessionStore>,
         chat_backend: &Arc<
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
         >,
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
@@ -46925,7 +46931,7 @@ mod tests {
     async fn install_state_test_session_with_owner(
         sessions: &Arc<crate::rpc::session::SessionStore>,
         chat_backend: &Arc<
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
         >,
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
@@ -46961,7 +46967,7 @@ mod tests {
     async fn install_state_test_session_owned_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
         chat_backend: &Arc<
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
         >,
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
@@ -47011,7 +47017,7 @@ mod tests {
     async fn install_state_test_session_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
         chat_backend: &Arc<
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend,
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
         >,
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
@@ -47034,7 +47040,7 @@ mod tests {
     async fn owner_cancelled_rpc_prompt_returns_durable_chat_state_to_idle() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 tmp.path(),
             )
             .unwrap(),
@@ -47062,7 +47068,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             zeroclaw_config::schema::Config::default(),
             Arc::clone(&sessions),
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             None,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -47122,7 +47128,7 @@ mod tests {
     async fn dispatcher_shutdown_cancels_and_joins_inflight_prompt() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 tmp.path(),
             )
             .unwrap(),
@@ -47149,7 +47155,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             zeroclaw_config::schema::Config::default(),
             sessions,
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             None,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -47196,7 +47202,7 @@ mod tests {
     async fn session_prompt_reports_running_during_turn_and_idle_after() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 tmp.path(),
             )
             .unwrap(),
@@ -47219,7 +47225,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             zeroclaw_config::schema::Config::default(),
             Arc::clone(&sessions),
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             None,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -47284,7 +47290,7 @@ mod tests {
     async fn session_prompt_reports_error_state_on_provider_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 tmp.path(),
             )
             .unwrap(),
@@ -47301,7 +47307,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             zeroclaw_config::schema::Config::default(),
             Arc::clone(&sessions),
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             None,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -47340,7 +47346,7 @@ mod tests {
     async fn acp_mode_session_prompt_leaves_chat_backend_state_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 tmp.path(),
             )
             .unwrap(),
@@ -47390,7 +47396,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             zeroclaw_config::schema::Config::default(),
             Arc::clone(&sessions),
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             Some(acp_store),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -47443,7 +47449,7 @@ mod tests {
     async fn acp_prompt_does_not_mutate_a_retained_chat_row_with_the_same_id() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 tmp.path(),
             )
             .unwrap(),
@@ -47502,7 +47508,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             zeroclaw_config::schema::Config::default(),
             Arc::clone(&sessions),
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             Some(acp_store),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -48050,7 +48056,7 @@ mod tests {
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 &data_dir,
             )
             .unwrap(),
@@ -48062,7 +48068,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             config,
             Arc::clone(&sessions),
-            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             Some(Arc::clone(&acp_store)),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -48139,7 +48145,7 @@ mod tests {
         for removal in [Removal::Close, Removal::Kill, Removal::Delete] {
             let tmp = tempfile::TempDir::new().unwrap();
             let chat_backend = Arc::new(
-                zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                     tmp.path(),
                 )
                 .unwrap(),
@@ -48167,7 +48173,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
                 Arc::clone(&sessions),
                 Some(chat_backend.clone()
-                    as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                    as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
                 None,
             );
             let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -48250,7 +48256,7 @@ mod tests {
     async fn prompt_setup_failure_unregisters_its_cancel_token() {
         let tmp = tempfile::TempDir::new().unwrap();
         let chat_backend = Arc::new(
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                 tmp.path(),
             )
             .unwrap(),
@@ -48264,7 +48270,7 @@ mod tests {
         let ctx = RpcContext::for_persistence_tests(
             zeroclaw_config::schema::Config::default(),
             Arc::clone(&sessions),
-            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>),
             None,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
@@ -49729,7 +49735,7 @@ mod tests {
         owner_tui_id: Option<&str>,
     ) -> (
         Arc<RpcContext>,
-        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend>,
         ScriptedTurnHandles,
     ) {
         let config = session_cwd_config(tmp, 4242, None);
@@ -49966,7 +49972,7 @@ mod tests {
         )
         .await;
         assert_eq!(appended["result"]["message_count"], json!(1), "{appended}");
-        let durable = zeroclaw_infra::session_backend::SessionBackend::load(
+        let durable = zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend::load(
             backend.as_ref(),
             &format!("rpc_{sid}"),
         );
@@ -50226,7 +50232,7 @@ mod tests {
             "run-once closes its transient session"
         );
         assert!(
-            !zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), "rpc_s-once")
+            !zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend::load(backend.as_ref(), "rpc_s-once")
                 .is_empty(),
             "the transcript stays in the durable store after the close"
         );
@@ -50253,10 +50259,12 @@ mod tests {
     }
 
     fn durable_turn_state(
-        backend: &Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        backend: &Arc<
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
+        >,
         sid: &str,
     ) -> Option<String> {
-        zeroclaw_infra::session_backend::SessionBackend::get_session_state(
+        zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend::get_session_state(
             backend.as_ref(),
             &format!("rpc_{sid}"),
         )
@@ -50495,7 +50503,7 @@ mod tests {
         admin: bool,
     ) -> (
         Arc<RpcContext>,
-        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend>,
         String,
     ) {
         use zeroclaw_api::grants::{Resource, Verb};
@@ -50543,13 +50551,18 @@ mod tests {
     }
 
     fn durable_holds(
-        backend: &Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        backend: &Arc<
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
+        >,
         key: &str,
         text: &str,
     ) -> bool {
-        zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), key)
-            .iter()
-            .any(|message| message.content.contains(text))
+        zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend::load(
+            backend.as_ref(),
+            key,
+        )
+        .iter()
+        .any(|message| message.content.contains(text))
     }
 
     async fn live_holds(ctx: &Arc<RpcContext>, sid: &str, text: &str) -> bool {
@@ -50676,7 +50689,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, backend, _handles) = turn_parity_fixture(&tmp, "s-unrelated", None).await;
         let gateway_key = "gw_web-chat";
-        zeroclaw_infra::session_backend::SessionBackend::set_session_agent_alias(
+        zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend::set_session_agent_alias(
             backend.as_ref(),
             gateway_key,
             "test-agent",
@@ -51020,7 +51033,9 @@ mod tests {
     /// `tools`, on the canonical `workspace` a scoped prompt requires.
     async fn install_recording_session(
         ctx: &Arc<RpcContext>,
-        backend: &Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        backend: &Arc<
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
+        >,
         sid: &str,
         owner: &str,
         workspace: &std::path::Path,
@@ -51055,7 +51070,9 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     async fn install_recording_session_with(
         ctx: &Arc<RpcContext>,
-        backend: &Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        backend: &Arc<
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend,
+        >,
         sid: &str,
         owner: &str,
         workspace: &std::path::Path,
@@ -51115,13 +51132,13 @@ mod tests {
         }
         ctx.sessions.insert(sid.to_string(), session).await.unwrap();
         let key = format!("rpc_{sid}");
-        zeroclaw_infra::session_backend::SessionBackend::set_session_agent_alias(
+        zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend::set_session_agent_alias(
             backend.as_ref(),
             &key,
             "test-agent",
         )
         .unwrap();
-        zeroclaw_infra::session_backend::SessionBackend::set_session_principal(
+        zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend::set_session_principal(
             backend.as_ref(),
             &key,
             owner,
@@ -51137,7 +51154,7 @@ mod tests {
         edit: impl FnOnce(&mut zeroclaw_config::schema::PermissionProfileConfig),
     ) -> (
         Arc<RpcContext>,
-        Arc<zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend>,
         std::path::PathBuf,
     ) {
         let mut config = session_cwd_config(tmp, 4242, None);

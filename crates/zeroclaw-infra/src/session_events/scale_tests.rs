@@ -164,7 +164,7 @@ fn million_event_append_read_and_index_reconstruction() {
 #[test]
 #[ignore = "legacy storage baseline measurement"]
 fn legacy_append_read_and_reopen_baseline() {
-    use crate::session_backend::SessionBackend;
+    use crate::session_events::upgrade::fixtures::session_backend::SessionBackend;
     use std::time::Instant;
     let count = std::env::var("ZEROCLAW_SESSION_SCALE_EVENTS")
         .ok()
@@ -175,13 +175,16 @@ fn legacy_append_read_and_reopen_baseline() {
         let open = || -> Box<dyn SessionBackend> {
             match backend {
                 "sqlite" => Box::new(
-                    crate::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::new(
+                    crate::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::new(
                         directory.path(),
                     )
                     .expect("SQLite"),
                 ),
                 _ => Box::new(
-                    crate::session_store::SessionStore::new(directory.path()).expect("JSONL"),
+                    crate::session_events::upgrade::fixtures::session_store::SessionStore::new(
+                        directory.path(),
+                    )
+                    .expect("JSONL"),
                 ),
             }
         };

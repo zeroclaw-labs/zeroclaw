@@ -1,15 +1,18 @@
 //! Installation-wide upgrade. All legacy writers share the publication fence;
 //! source files remain intact until every imported family has a final receipt.
-use super::import::{LegacyImport, LegacySnapshot, import_snapshot};
+use self::readers::{LegacySqliteReader, read_jsonl, read_trim_breadcrumb};
+use super::import::{LegacyImport, LegacySnapshot, TimestampedMessage, import_snapshot};
 use super::installation::{FormatPhase, InstallationGuard, NativeBackend};
 use super::*;
-use crate::session_backend::SessionBackend;
 use std::collections::BTreeSet;
 use zeroclaw_api::session_events::{BranchId, SessionId};
 mod acp;
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub mod fixtures;
 pub(crate) mod legacy_acp;
 pub(super) mod legacy_media;
-pub mod legacy_sqlite;
+pub(crate) mod readers;
 
 pub fn upgrade_installation(
     data_dir: &Path,
@@ -43,11 +46,7 @@ pub fn upgrade_installation(
     {
         let _source_file =
             filesystem::reader(&directory.join("sessions.db")).map_err(jsonl::storage)?;
-        let source =
-            crate::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::open_locked(
-                &guard,
-            )
-            .map_err(storage)?;
+        let source = LegacySqliteReader::open(&directory).map_err(storage)?;
         for family in source.upgrade_keys().map_err(storage)? {
             sqlite_keys.insert(family.clone());
             if existing.contains_key(&family) && !import_pending(store.as_ref(), &family)? {
@@ -105,7 +104,6 @@ pub fn upgrade_installation(
     }
     // Inspect disk directly: listing a corrupt source must never become an
     // empty migration followed by archiving unread history.
-    let jsonl_source = crate::session_store::SessionStore::new(data_dir).map_err(storage)?;
     let mut backups = Vec::new();
     for entry in fs::read_dir(&directory).map_err(jsonl::storage)? {
         let entry = entry.map_err(jsonl::storage)?;
@@ -161,15 +159,16 @@ pub fn upgrade_installation(
                 "legacy filename does not match its canonical session key".into(),
             ));
         }
-        let messages = jsonl_source.try_load(family).map_err(storage)?;
+        let messages = read_jsonl(source_file).map_err(storage)?;
         if sqlite_keys.contains(family) {
-            let source =
-                crate::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::open_locked(
-                    &guard,
-                )
-                .map_err(storage)?;
+            let source = LegacySqliteReader::open(&directory).map_err(storage)?;
             if zeroclaw_api::session_events::canonical_json(
-                &source.try_load(family).map_err(storage)?,
+                &source
+                    .upgrade_messages(family)
+                    .map_err(storage)?
+                    .into_iter()
+                    .map(|record| record.message)
+                    .collect::<Vec<_>>(),
             )? != zeroclaw_api::session_events::canonical_json(&messages)?
             {
                 return Err(AppendError::Corrupt(
@@ -186,14 +185,15 @@ pub fn upgrade_installation(
                 LegacySnapshot {
                     messages: messages
                         .into_iter()
-                        .map(|message| crate::session_backend::TimestampedMessage {
+                        .map(|message| TimestampedMessage {
                             message,
                             created_at: None,
                         })
                         .collect(),
-                    history_has_trim_breadcrumb: jsonl_source
-                        .get_trim_breadcrumb(family)
-                        .map_err(storage)?,
+                    history_has_trim_breadcrumb: read_trim_breadcrumb(
+                        &path.with_extension("trim_breadcrumb"),
+                    )
+                    .map_err(storage)?,
                     metadata: vec![("last_activity".into(), serde_json::json!(modified_at))],
                 },
             )?;

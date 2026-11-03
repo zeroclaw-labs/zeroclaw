@@ -137,7 +137,8 @@ the instance.
 
 - Config, install-root, and data-dir resolution: `crates/zeroclaw-config/src/schema.rs`
 - Native session stores: `crates/zeroclaw-infra/src/session_events.rs`, `crates/zeroclaw-infra/src/session_events/jsonl.rs`
-- Legacy SQLite migration reader and fixtures: `crates/zeroclaw-infra/src/session_events/upgrade/legacy_sqlite.rs`
+- Read-only legacy SQLite/JSONL migration inputs: `crates/zeroclaw-infra/src/session_events/upgrade/readers.rs`
+- Old-schema test fixtures (test builds only): `crates/zeroclaw-infra/src/session_events/upgrade/fixtures/`
 - Standard session repository: `crates/zeroclaw-infra/src/session_repository.rs`
 - Installation upgrades: `crates/zeroclaw-infra/src/session_events/upgrade.rs`
 - RPC live sessions: `crates/zeroclaw-runtime/src/rpc/session.rs`

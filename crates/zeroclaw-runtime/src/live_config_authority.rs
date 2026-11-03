@@ -3201,9 +3201,13 @@ mod tests {
 
     fn store_with_running_turn(
         data_dir: &Path,
-    ) -> Arc<dyn zeroclaw_infra::session_backend::SessionBackend> {
+    ) -> Arc<dyn zeroclaw_infra::session_events::upgrade::fixtures::session_backend::SessionBackend>
+    {
         use zeroclaw_api::model_provider::ChatMessage;
-        let backend = zeroclaw_infra::make_session_backend(data_dir, "sqlite").unwrap();
+        let backend = zeroclaw_infra::session_events::upgrade::fixtures::make_session_backend(
+            data_dir, "sqlite",
+        )
+        .unwrap();
         backend.append("s1", &ChatMessage::user("hello")).unwrap();
         backend
             .set_session_state("s1", "running", Some("turn-1"))
@@ -3226,7 +3230,11 @@ mod tests {
 
         let authority = LiveConfigAuthority::new_owned(owned_config(temp.path())).unwrap();
 
-        let store = zeroclaw_infra::make_session_backend(temp.path(), "sqlite").unwrap();
+        let store = zeroclaw_infra::session_events::upgrade::fixtures::make_session_backend(
+            temp.path(),
+            "sqlite",
+        )
+        .unwrap();
         assert!(store.list_running_sessions().is_empty());
         let state = store.get_session_state("s1").unwrap().unwrap();
         assert_eq!(state.state, "error");
@@ -3307,7 +3315,11 @@ mod tests {
 
         let authority = LiveConfigAuthority::new_owned(config).unwrap();
 
-        let store = zeroclaw_infra::make_session_backend(temp.path(), "sqlite").unwrap();
+        let store = zeroclaw_infra::session_events::upgrade::fixtures::make_session_backend(
+            temp.path(),
+            "sqlite",
+        )
+        .unwrap();
         assert!(store.list_running_sessions().is_empty());
         drop(authority);
     }
@@ -3316,7 +3328,7 @@ mod tests {
     fn unreadable_store_does_not_stop_startup_and_the_error_is_returned() {
         let temp = tempfile::TempDir::new().unwrap();
         let db_path =
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::db_path(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::db_path(
                 temp.path(),
             );
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
@@ -3328,7 +3340,7 @@ mod tests {
 
         let other = tempfile::TempDir::new().unwrap();
         let db_path =
-            zeroclaw_infra::session_events::upgrade::legacy_sqlite::SqliteSessionBackend::db_path(
+            zeroclaw_infra::session_events::upgrade::fixtures::sqlite::SqliteSessionBackend::db_path(
                 other.path(),
             );
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();

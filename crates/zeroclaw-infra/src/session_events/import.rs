@@ -2,8 +2,14 @@
 //! The caller holds the installation or CLI source lease until publication.
 use super::installation::{NativeBackend, creation_source};
 use super::*;
-use crate::session_backend::TimestampedMessage;
 use zeroclaw_api::session_events::*;
+
+/// A master-format message and its original SQLite clock, when available.
+#[derive(Debug, Clone)]
+pub struct TimestampedMessage {
+    pub message: zeroclaw_api::model_provider::ChatMessage,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
 
 pub struct LegacyImport<'a> {
     pub family: &'a str,
