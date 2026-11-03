@@ -1836,7 +1836,6 @@ mod collapse_tests {
         ]
     }
 
-
     fn rows(history: &[ChatMessage]) -> Vec<(String, String)> {
         history
             .iter()
