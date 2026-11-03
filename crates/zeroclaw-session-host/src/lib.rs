@@ -36,7 +36,7 @@ fn owner_is_idle(slot: &SessionOwner) -> bool {
         })
 }
 
-/// Missing historical ownership is not permission to assign every family to
+/// Missing historical ownership is not permission to assign every session_id to
 /// the first caller. Preserve uncertainty when configuration cannot resolve it.
 pub fn legacy_session_owner(
     config: &zeroclaw_config::schema::Config,
@@ -107,9 +107,10 @@ impl NativeSessionHub {
         }
         Ok((directory, backend))
     }
+
     async fn open_session(
         &self,
-        family: String,
+        session_id: String,
         creation_source: &str,
         alias: String,
         subject: EventActor,
@@ -117,7 +118,7 @@ impl NativeSessionHub {
         initial: ContextSnapshot,
     ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
         let (directory, backend) = self.prepare().await?;
-        let owner_key = (directory.clone(), family.clone());
+        let owner_key = (directory.clone(), session_id.clone());
         let slot = self
             .owners
             .lock()
@@ -125,8 +126,8 @@ impl NativeSessionHub {
             .entry(owner_key)
             .or_default()
             .clone();
-        let mut family_owner = slot.lock().await;
-        let stream = self.session_id(&family).await?;
+        let mut session_owner = slot.lock().await;
+        let stream = zeroclaw_api::session_events::SessionId::parse(session_id.to_owned())?;
         let branch = BranchId::parse(format!("branch-{stream}"))?;
         // The identity is bound before physical initialization and every later
         // read/command rechecks the host's current authority.
@@ -136,7 +137,7 @@ impl NativeSessionHub {
             &stream,
             zeroclaw_kernel::session::query::SessionAccess::Write,
         )?;
-        if let Some(owner) = family_owner.as_ref().cloned() {
+        if let Some(owner) = session_owner.as_ref().cloned() {
             let record = catalog_record(directory.clone(), stream.clone(), self.stores.clone())
                 .await?
                 .ok_or_else(|| anyhow::Error::msg("native source missing"))?;
@@ -152,7 +153,7 @@ impl NativeSessionHub {
             ));
         }
         let stores = self.stores.clone();
-        let initialize_family = family.clone();
+        let initialize_session_id = session_id.clone();
         let creation_source = creation_source.to_owned();
         let initialize_stream = stream.clone();
         let actor = match &subject {
@@ -171,7 +172,7 @@ impl NativeSessionHub {
                 let lease = Arc::new(
                     zeroclaw_infra::session_events::ownership::SessionExecutionLease::acquire(
                         &directory,
-                        &initialize_family,
+                        &initialize_session_id,
                     )?,
                 );
                 {
@@ -189,8 +190,11 @@ impl NativeSessionHub {
                     }
                     .publish(store.as_ref(), &initialize_stream)?;
                 }
-                let store: Arc<dyn SessionEventStore> =
-                    Arc::new(stores.open_session(&directory, &initialize_family, Some(lease))?);
+                let store: Arc<dyn SessionEventStore> = Arc::new(stores.open_session(
+                    &directory,
+                    &initialize_session_id,
+                    Some(lease),
+                )?);
                 let catalog = zeroclaw_infra::session_events::catalog::SessionCatalog::open(
                     &directory, &stores,
                 )?
@@ -214,27 +218,23 @@ impl NativeSessionHub {
         owner
             .recover_session(stream.clone(), Arc::new(ExclusiveSessionRecovery))
             .await?;
-        *family_owner = Some(Arc::clone(&owner));
+        *session_owner = Some(Arc::clone(&owner));
         Ok(Arc::new(
             EngineSession::with_actor(owner, stream, branch, subject, authority)
                 .with_source(Arc::new(self.clone())),
         ))
     }
-    pub fn session_id(session_id: &str) -> Result<SessionId, ContractError> {
-        SessionId::parse(session_id.to_owned())
-            .map_err(|error| ContractError::InvalidRequest(error.to_string()))
-    }
 
     async fn read_owner(
         &self,
         directory: std::path::PathBuf,
-        family: String,
+        session_id: String,
     ) -> anyhow::Result<Option<Arc<SessionCoordinator>>> {
         let slot = self
             .owners
             .lock()
             .await
-            .get(&(directory.clone(), family.clone()))
+            .get(&(directory.clone(), session_id.clone()))
             .cloned();
         if let Some(slot) = slot
             && let Some(owner) = slot.lock().await.as_ref().cloned()
@@ -248,7 +248,8 @@ impl NativeSessionHub {
                     let Some(catalog) = SessionCatalog::open(&directory, &stores)? else {
                         return Ok(None);
                     };
-                    let stream = Self::session_id(&family)?;
+                    let stream =
+                        zeroclaw_api::session_events::SessionId::parse(session_id.clone())?;
                     catalog
                         .query()
                         .summary(&stream)?
@@ -257,9 +258,11 @@ impl NativeSessionHub {
                 if !exists {
                     return Ok(None);
                 }
-                Ok(Some(Arc::new(
-                    stores.open_session(&directory, &family, None)?,
-                )))
+                Ok(Some(Arc::new(stores.open_session(
+                    &directory,
+                    &session_id,
+                    None,
+                )?)))
             },
         )
         .await??;
@@ -285,20 +288,6 @@ pub fn open_repository(
 }
 #[async_trait::async_trait]
 impl EngineSessionSource for NativeSessionHub {
-    async fn session_id(&self, family: &str) -> Result<SessionId, ContractError> {
-        let directory = self.config.read().data_dir.clone();
-        let key = family.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<SessionId, ContractError> {
-            // Stream identity is deterministic and does not consult the
-            // session catalog, but opening it still waits for an installation
-            // transition to finish before exposing the coordinate.
-            let _guard = InstallationGuard::acquire(&directory.join("sessions"))
-                .map_err(|error| ContractError::InvalidRequest(error.to_string()))?;
-            Self::session_id(&key)
-        })
-        .await
-        .map_err(|error| ContractError::InvalidRequest(error.to_string()))?
-    }
     async fn sessions(&self) -> anyhow::Result<Vec<String>> {
         let (directory, _) = self.prepare().await?;
         let stores = self.stores.clone();
@@ -336,21 +325,21 @@ impl EngineSessionSource for NativeSessionHub {
                 .collect())
         })
         .await??;
-        for family in sessions {
+        for session_id in sessions {
             {
                 let mut owners = self.owners.lock().await;
-                let key = (directory.clone(), family.clone());
+                let key = (directory.clone(), session_id.clone());
                 if owners.get(&key).is_some_and(|owner| !owner_is_idle(owner)) {
                     continue;
                 }
                 owners.remove(&key);
             }
             let lease_directory = directory.clone();
-            let lease_family = family.clone();
+            let lease_session_id = session_id.clone();
             let lease = tokio::task::spawn_blocking(move || {
                 zeroclaw_infra::session_events::ownership::SessionExecutionLease::try_acquire(
                     &lease_directory,
-                    &lease_family,
+                    &lease_session_id,
                 )
             })
             .await??;
@@ -360,7 +349,7 @@ impl EngineSessionSource for NativeSessionHub {
             let stores = self.stores.clone();
             let store_directory = directory.clone();
             let store = tokio::task::spawn_blocking(move || {
-                stores.open_session(&store_directory, &family, Some(Arc::new(lease)))
+                stores.open_session(&store_directory, &session_id, Some(Arc::new(lease)))
             })
             .await??;
             let stream = store.session_id().clone();
@@ -404,10 +393,10 @@ impl EngineSessionSource for NativeSessionHub {
     }
     async fn describe(
         &self,
-        family: String,
+        session_id: String,
     ) -> anyhow::Result<Option<zeroclaw_kernel::session::engine::SessionDescriptor>> {
         let (directory, _) = self.prepare().await?;
-        let stream = self.session_id(&family).await?;
+        let stream = zeroclaw_api::session_events::SessionId::parse(session_id.to_owned())?;
         let Some(record) = catalog_record(directory, stream, self.stores.clone()).await? else {
             return Ok(None);
         };
@@ -429,18 +418,18 @@ impl EngineSessionSource for NativeSessionHub {
     }
     async fn query(
         &self,
-        family: String,
+        session_id: String,
         principal: PrincipalId,
         policy: Arc<dyn zeroclaw_kernel::session::query::SessionAccessPolicy>,
     ) -> anyhow::Result<Option<zeroclaw_kernel::session::engine::SessionReadHandle>> {
         let (directory, _) = self.prepare().await?;
-        let stream = self.session_id(&family).await?;
+        let stream = zeroclaw_api::session_events::SessionId::parse(session_id.to_owned())?;
         policy.authorize(
             &principal,
             &stream,
             zeroclaw_kernel::session::query::SessionAccess::Read,
         )?;
-        let Some(owner) = self.read_owner(directory, family).await? else {
+        let Some(owner) = self.read_owner(directory, session_id).await? else {
             return Ok(None);
         };
         let query = owner.query(principal, policy);
@@ -451,7 +440,7 @@ impl EngineSessionSource for NativeSessionHub {
     }
     async fn open_system(
         &self,
-        family: String,
+        session_id: String,
         creation_source: &str,
         alias: String,
         component: String,
@@ -460,7 +449,7 @@ impl EngineSessionSource for NativeSessionHub {
     ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
         anyhow::ensure!(!component.is_empty(), "system session component missing");
         self.open_session(
-            family,
+            session_id,
             creation_source,
             alias,
             EventActor::System { component },
@@ -472,7 +461,7 @@ impl EngineSessionSource for NativeSessionHub {
 
     async fn open(
         &self,
-        family: String,
+        session_id: String,
         creation_source: &str,
         alias: String,
         principal: PrincipalId,
@@ -480,7 +469,7 @@ impl EngineSessionSource for NativeSessionHub {
         initial: ContextSnapshot,
     ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
         self.open_session(
-            family,
+            session_id,
             creation_source,
             alias,
             EventActor::Principal {
@@ -503,7 +492,7 @@ impl zeroclaw_kernel::session::recovery::StreamExecutionLossVerifier for Exclusi
         PayloadRecord::json(
             "session.evidence/v1",
             &serde_json::json!({
-                "source":"exclusive_family_execution_lease","stream":stream,"through":through,
+                "source":"exclusive_session_id_execution_lease","stream":stream,"through":through,
                 "reason_key":"prior_source_writer_handles_released","owner_exit_cause":"unknown",
             }),
         )

@@ -1398,7 +1398,7 @@ async fn run_agent_job_for_occurrence(
                 let authority = Arc::new(crate::live_config_authority::AgentHistoryAuthority {
                     admission: admission.clone().into(),
                     actor,
-                    stream: source.session_id(&family).await?,
+                    stream: zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
                     origin: zeroclaw_api::ingress::TurnOrigin::Cron,
                     parent_alias: None,
                 });
@@ -3242,7 +3242,6 @@ mod tests {
         use zeroclaw_api::session_events::capture::{
             ContextSnapshot, EngineTurnFuture, EngineTurnInput, SessionExecutionPort,
         };
-        use zeroclaw_api::session_events::{ContractError, SessionId};
         use zeroclaw_kernel::session::engine::{
             EngineSessionAuthority, EngineSessionSource, SessionDescriptor, SessionReadHandle,
         };
@@ -3301,12 +3300,6 @@ mod tests {
         struct Source(Arc<Port>);
         #[async_trait::async_trait]
         impl EngineSessionSource for Source {
-            async fn session_id(
-                &self,
-                family: &str,
-            ) -> std::result::Result<SessionId, ContractError> {
-                zeroclaw_session_host::NativeSessionHub::session_id(family)
-            }
             async fn describe(&self, _family: String) -> Result<Option<SessionDescriptor>> {
                 Ok(None)
             }
@@ -3486,7 +3479,6 @@ mod tests {
         use axum::{Router, http::StatusCode, routing::post};
         use zeroclaw_api::session_events::{EventCursor, EventKind, SessionEventStore};
         use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
-        use zeroclaw_kernel::session::engine::EngineSessionSource;
         for backend in ["sqlite", "jsonl"] {
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let count = calls.clone();
@@ -3565,7 +3557,8 @@ mod tests {
                 "{backend}"
             );
             let family = format!("main-{TEST_AGENT}");
-            let stream = source.session_id(&family).await.expect("stream");
+            let stream =
+                zeroclaw_api::session_events::SessionId::parse(family.to_owned()).expect("stream");
             let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 &config.data_dir,
                 &family,

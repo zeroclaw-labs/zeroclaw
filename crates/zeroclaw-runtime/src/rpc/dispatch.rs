@@ -5508,9 +5508,7 @@ impl RpcDispatcher {
                     _ => None,
                 })
                 .unwrap_or_else(|| session_id.to_owned());
-            let stream = source
-                .session_id(&family)
-                .await
+            let stream = zeroclaw_api::session_events::SessionId::parse(family.to_owned())
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
             let authority = Arc::new(RpcHistoryAuthority {
                 admission: PromptAdmission {
@@ -6786,9 +6784,7 @@ impl RpcDispatcher {
                 method: Method::SessionPrompt,
                 target_agent: None,
                 principal: principal.clone(),
-                stream: source
-                    .session_id(&family)
-                    .await
+                stream: zeroclaw_api::session_events::SessionId::parse(family.to_owned())
                     .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?,
             });
             Some(
@@ -7619,9 +7615,7 @@ impl RpcDispatcher {
                         "Native history requires authenticated admission",
                     )
                 })?;
-            let stream = source
-                .session_id(&session_key)
-                .await
+            let stream = zeroclaw_api::session_events::SessionId::parse(session_key.to_owned())
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
             let authority = Arc::new(RpcHistoryAuthority {
                 admission: admission.duplicate(),
@@ -9888,9 +9882,7 @@ impl RpcDispatcher {
             method,
             target_agent: None,
             principal: principal.clone(),
-            stream: source
-                .session_id(key)
-                .await
+            stream: zeroclaw_api::session_events::SessionId::parse(key.to_owned())
                 .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?,
         });
         let initial = zeroclaw_api::session_events::capture::ContextSnapshot {
@@ -32596,7 +32588,8 @@ mod tests {
             let source =
                 zeroclaw_session_host::NativeSessionHub::new(dispatcher.ctx.config.clone());
             let family = "rpc_authority-revisions";
-            let stream = source.session_id(family).await.expect("stream");
+            let stream = zeroclaw_api::session_events::SessionId::parse(family.to_owned())
+                .expect("canonical session id");
             let authority = Arc::new(RpcHistoryAuthority {
                 admission: PromptAdmission {
                     dispatcher: dispatcher.spawn_handle(),
@@ -33017,8 +33010,12 @@ mod tests {
                 assert!(compacted.get("error").is_none(), "{compacted}");
                 let compact_events = store
                     .read_page(
-                        &source.session_id(&family).await.expect("stream"),
-                        &EventCursor::beginning(source.session_id(&family).await.expect("stream")),
+                        &zeroclaw_api::session_events::SessionId::parse(family.to_owned())
+                            .expect("canonical session id"),
+                        &EventCursor::beginning(
+                            zeroclaw_api::session_events::SessionId::parse(family.to_owned())
+                                .expect("canonical session id"),
+                        ),
                         None,
                         256,
                     )
@@ -33146,7 +33143,8 @@ mod tests {
                 actor: EventActor::Principal {
                     principal_id: principal.0.clone(),
                 },
-                stream: source.session_id(family).await.expect("stream"),
+                stream: zeroclaw_api::session_events::SessionId::parse(family.to_owned())
+                    .expect("canonical session id"),
                 origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
                 parent_alias: None,
             });
@@ -33182,7 +33180,8 @@ mod tests {
                     .len(),
                 1
             );
-            let stream = source.session_id(family).await.expect("stream");
+            let stream = zeroclaw_api::session_events::SessionId::parse(family.to_owned())
+                .expect("canonical session id");
             let foreign = EventCursor::beginning(zeroclaw_api::session_events::SessionId::new());
             dispatcher.process_line(&json!({"jsonrpc":"2.0","id":2,"method":"session/events-subscribe","params":{"session_id":"wire-fixture","after":foreign}}).to_string()).await;
             let response: Value =
@@ -43221,7 +43220,8 @@ mod tests {
                     .expect("reader");
                 assert_eq!(
                     query.stream,
-                    source.session_id(&family).await.expect("family stream")
+                    zeroclaw_api::session_events::SessionId::parse(family.to_owned())
+                        .expect("canonical session id")
                 );
                 let page = query
                     .query

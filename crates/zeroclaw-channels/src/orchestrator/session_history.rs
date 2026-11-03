@@ -220,7 +220,7 @@ pub(super) async fn open(
     let authority = Arc::new(ChannelAuthority {
         ctx: ctx.clone(),
         message: msg.clone(),
-        stream: source.session_id(family).await?,
+        stream: zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
         agent: ctx.agent_alias.to_string(),
         child: false,
     });

@@ -28,10 +28,9 @@ pub trait EngineSessionAuthority: SessionAccessPolicy + PermissionResolver {
 /// current authority; kernel never constructs a physical backend.
 #[async_trait::async_trait]
 pub trait EngineSessionSource: Send + Sync {
-    async fn session_id(&self, family: &str) -> Result<SessionId, ContractError>;
     /// Routing metadata for the trusted authorization resolver. A transport
     /// must authorize before disclosing this descriptor to a caller.
-    async fn describe(&self, family: String) -> anyhow::Result<Option<SessionDescriptor>>;
+    async fn describe(&self, session_id: String) -> anyhow::Result<Option<SessionDescriptor>>;
     async fn sessions(&self) -> anyhow::Result<Vec<String>>;
     /// Trusted host retention command. Closing retains the append-only audit
     /// trail; it never erases payloads or expires a running execution.
@@ -44,10 +43,10 @@ pub trait EngineSessionSource: Send + Sync {
     }
     /// `creation_source` records the initial entrance protocol when creating
     /// a session. Reopening preserves that value; identity and routing use
-    /// only the session key supplied in `family`.
+    /// only the supplied canonical `session_id`.
     async fn open(
         &self,
-        family: String,
+        session_id: String,
         creation_source: &str,
         alias: String,
         principal: PrincipalId,
@@ -58,7 +57,7 @@ pub trait EngineSessionSource: Send + Sync {
     /// authorizes this component; the default never grants execution.
     async fn open_system(
         &self,
-        _family: String,
+        _session_id: String,
         _creation_source: &str,
         _alias: String,
         _component: String,
@@ -71,7 +70,7 @@ pub trait EngineSessionSource: Send + Sync {
     /// ownership. Read-only callers cannot create a session by querying it.
     async fn query(
         &self,
-        family: String,
+        session_id: String,
         principal: PrincipalId,
         policy: Arc<dyn SessionAccessPolicy>,
     ) -> anyhow::Result<Option<SessionReadHandle>>;
@@ -119,11 +118,11 @@ impl views::SessionHistoryReadPort for EngineSession {
         }
         if let (Some(source), EventActor::Principal { principal_id }) = (&self.source, &self.actor)
         {
-            for family in visible.into_iter().flatten() {
-                if family == current_id {
+            for session_id in visible.into_iter().flatten() {
+                if session_id == current_id {
                     continue;
                 }
-                let stream = source.session_id(&family).await?;
+                let stream = zeroclaw_api::session_events::SessionId::parse(session_id.to_owned())?;
                 match SessionAccessPolicy::authorize_actor(
                     self.authority.as_ref(),
                     &self.actor,
@@ -136,7 +135,7 @@ impl views::SessionHistoryReadPort for EngineSession {
                 }
                 if let Some(native) = source
                     .query(
-                        family,
+                        session_id,
                         PrincipalId(principal_id.clone()),
                         self.authority.clone(),
                     )
@@ -162,10 +161,10 @@ impl views::SessionHistoryReadPort for EngineSession {
 
     async fn history(
         &self,
-        family: &str,
+        session_id: &str,
         limit: usize,
     ) -> anyhow::Result<Option<views::HistoricalMessagePage>> {
-        if family == self.stream.as_str() {
+        if session_id == self.stream.as_str() {
             return Ok(Some(
                 self.query()
                     .message_page(self.stream.clone(), None, limit)
@@ -174,7 +173,7 @@ impl views::SessionHistoryReadPort for EngineSession {
         }
         if let (Some(source), EventActor::Principal { principal_id }) = (&self.source, &self.actor)
         {
-            let stream = source.session_id(family).await?;
+            let stream = zeroclaw_api::session_events::SessionId::parse(session_id.to_owned())?;
             match SessionAccessPolicy::authorize_actor(
                 self.authority.as_ref(),
                 &self.actor,
@@ -187,7 +186,7 @@ impl views::SessionHistoryReadPort for EngineSession {
             }
             if let Some(native) = source
                 .query(
-                    family.into(),
+                    session_id.into(),
                     PrincipalId(principal_id.clone()),
                     self.authority.clone(),
                 )

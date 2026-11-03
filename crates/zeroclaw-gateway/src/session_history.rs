@@ -414,7 +414,7 @@ pub(crate) async fn open_ingress(
             actor: EventActor::System {
                 component: component.into(),
             },
-            stream: source.session_id(family).await?,
+            stream: zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
             origin,
             parent_alias: None,
         }),
@@ -603,7 +603,12 @@ pub(crate) async fn open(
     let Some(source) = &state.native_sessions else {
         return Ok(None);
     };
-    let authority = authority(state, source.session_id(family).await?, alias, subject)?;
+    let authority = authority(
+        state,
+        zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
+        alias,
+        subject,
+    )?;
     Ok(Some(
         source
             .open(
@@ -909,7 +914,7 @@ pub(crate) mod tests {
                 zeroclaw_infra::session_events::open_event_store(directory, backend)
                     .expect("store"),
             ));
-            let stream = SessionId::new();
+            let stream = SessionId::parse(family.to_owned()).expect("canonical session id");
             let branch = BranchId::new();
             let mut root = SessionEvent::typed(
                 stream.clone(),
@@ -964,10 +969,6 @@ pub(crate) mod tests {
     }
     #[async_trait::async_trait]
     impl EngineSessionSource for Source {
-        async fn session_id(&self, family: &str) -> Result<SessionId, ContractError> {
-            assert_eq!(family, self.family);
-            Ok(self.stream.clone())
-        }
         async fn sessions(&self) -> anyhow::Result<Vec<String>> {
             Ok(vec![self.family.clone()])
         }

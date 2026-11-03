@@ -2113,7 +2113,10 @@ impl AcpServer {
                 }
             };
             let admitted = async {
-                let authority = factory(&agent_alias, source.session_id(&family).await?)?;
+                let authority = factory(
+                    &agent_alias,
+                    zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
+                )?;
                 source
                     .open(
                         family,
@@ -7545,7 +7548,6 @@ mod tests {
             ContentPayload, EventActor, EventCursor, EventData, EventKind, PayloadRead,
             RecordedContentPart, SessionEventStore,
         };
-        use zeroclaw_kernel::session::engine::EngineSessionSource;
         async fn response(rx: &mut mpsc::Receiver<String>, id: i64) -> Value {
             tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 loop {
@@ -7643,7 +7645,8 @@ mod tests {
             let result = response(&mut rx, 2).await;
             assert!(result.get("error").is_none(), "{backend}: {result}");
             let family = sid.to_owned();
-            let stream = source.session_id(&family).await.expect("stream");
+            let stream =
+                zeroclaw_api::session_events::SessionId::parse(family.to_owned()).expect("stream");
             let native = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 directory.path(),
                 &family,

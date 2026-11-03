@@ -31055,7 +31055,6 @@ BTC is currently around $65,000 based on latest tool output."#
             EventCursor, EventData, ModelResolution, SessionEventStore,
         };
         use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
-        use zeroclaw_kernel::session::engine::EngineSessionSource;
 
         struct RejectReset {
             inner: Arc<dyn SessionExecutionPort>,
@@ -31251,7 +31250,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &family,
             )
             .expect("store");
-            let stream = source.session_id(&family).await.expect("stream");
+            let stream =
+                zeroclaw_api::session_events::SessionId::parse(family.to_owned()).expect("stream");
             let events = store
                 .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                 .expect("events")
@@ -31386,7 +31386,6 @@ BTC is currently around $65,000 based on latest tool output."#
         use zeroclaw_api::session_events::{
             EventCursor, EventData, ModelResolution, SessionEventStore,
         };
-        use zeroclaw_kernel::session::engine::EngineSessionSource;
 
         for backend in ["sqlite", "jsonl"] {
             for reject_switch in [false, true] {
@@ -31533,7 +31532,8 @@ BTC is currently around $65,000 based on latest tool output."#
                         &family,
                     )
                     .unwrap();
-                    let stream = source.session_id(&family).await.unwrap();
+                    let stream =
+                        zeroclaw_api::session_events::SessionId::parse(family.to_owned()).unwrap();
                     let events = store
                         .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                         .unwrap()
@@ -36145,7 +36145,7 @@ BTC is currently around $65,000 based on latest tool output."#
         use zeroclaw_api::session_events::capture::{
             ContextSnapshot, EngineTurnFuture, EngineTurnInput, SessionExecutionPort,
         };
-        use zeroclaw_api::session_events::{BranchId, ContractError, SessionId};
+        use zeroclaw_api::session_events::BranchId;
         use zeroclaw_kernel::session::engine::{
             EngineSessionAuthority, EngineSessionSource, SessionDescriptor, SessionReadHandle,
         };
@@ -36187,9 +36187,6 @@ BTC is currently around $65,000 based on latest tool output."#
         }
         #[async_trait::async_trait]
         impl EngineSessionSource for PendingSource {
-            async fn session_id(&self, _: &str) -> Result<SessionId, ContractError> {
-                SessionId::parse("channel-recovery-fixture")
-            }
             async fn describe(&self, _: String) -> anyhow::Result<Option<SessionDescriptor>> {
                 Ok(None)
             }
@@ -36225,7 +36222,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 _: ContextSnapshot,
             ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
                 authority.authorize_context(
-                    &self.session_id(&family).await?,
+                    &zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
                     &BranchId::parse("fixture-branch")?,
                 )?;
                 Ok(Arc::new(PendingPort {
@@ -36417,7 +36414,6 @@ BTC is currently around $65,000 based on latest tool output."#
     #[tokio::test]
     async fn native_channel_precheck_retry_and_timeout_preserve_durable_outcomes() {
         use zeroclaw_api::session_events::{EventCursor, EventKind, SessionEventStore};
-        use zeroclaw_kernel::session::engine::EngineSessionSource;
         for backend in ["sqlite", "jsonl"] {
             for times_out in [false, true] {
                 let directory = tempfile::TempDir::new().expect("directory");
@@ -36480,7 +36476,8 @@ BTC is currently around $65,000 based on latest tool output."#
                     &family,
                 )
                 .expect("published family");
-                let stream = source.session_id(&family).await.expect("stream");
+                let stream = zeroclaw_api::session_events::SessionId::parse(family.to_owned())
+                    .expect("stream");
                 let events = store
                     .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                     .expect("events")
@@ -36512,7 +36509,6 @@ BTC is currently around $65,000 based on latest tool output."#
     #[tokio::test]
     async fn native_channel_draft_final_and_failed_delivery_are_distinct() {
         use zeroclaw_api::session_events::{EventCursor, EventKind, SessionEventStore};
-        use zeroclaw_kernel::session::engine::EngineSessionSource;
         for backend in ["sqlite", "jsonl"] {
             for (finalize_fails, undelivered) in [(false, false), (true, false), (true, true)] {
                 let directory = tempfile::tempdir().expect("directory");
@@ -36565,7 +36561,8 @@ BTC is currently around $65,000 based on latest tool output."#
                     &family,
                 )
                 .expect("family");
-                let stream = source.session_id(&family).await.expect("stream");
+                let stream = zeroclaw_api::session_events::SessionId::parse(family.to_owned())
+                    .expect("stream");
                 let events = store
                     .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
                     .expect("events")

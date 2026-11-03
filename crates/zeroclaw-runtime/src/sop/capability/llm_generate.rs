@@ -333,7 +333,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
                     actor: EventActor::System {
                         component: component.into(),
                     },
-                    stream: source.session_id(&family).await?,
+                    stream: zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
                     origin: zeroclaw_api::ingress::TurnOrigin::Daemon,
                     parent_alias: None,
                 });

@@ -1852,13 +1852,9 @@ mod tests {
                 "revocation never causes provider replay"
             );
             let family = task_id.clone();
-            let source = source.expect("native source");
-            let stream = zeroclaw_kernel::session::engine::EngineSessionSource::session_id(
-                source.as_ref(),
-                &family,
-            )
-            .await
-            .expect("stream");
+            assert!(source.is_some(), "native source");
+            let stream =
+                zeroclaw_api::session_events::SessionId::parse(family.clone()).expect("stream");
             let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 workspace.path(),
                 &family,
@@ -1945,14 +1941,10 @@ mod tests {
         .await
         .expect("peer task should reach a terminal state");
         assert_eq!(terminal_snapshot.task.status, TaskStatus::Completed);
-        if let Some(source) = &source {
+        if source.is_some() {
             let family = task_id.clone();
-            let stream = zeroclaw_kernel::session::engine::EngineSessionSource::session_id(
-                source.as_ref(),
-                &family,
-            )
-            .await
-            .expect("stream");
+            let stream =
+                zeroclaw_api::session_events::SessionId::parse(family.clone()).expect("stream");
             let store = zeroclaw_infra::session_events::scoped::ScopedEventStore::open(
                 workspace.path(),
                 &family,

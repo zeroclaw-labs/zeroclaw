@@ -20332,7 +20332,7 @@ Let me check the result."#;
             let live = LiveConfigAuthority::new(config);
             let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
             let family = "native-post-turn-skills";
-            let stream = source.session_id(family).await.unwrap();
+            let stream = zeroclaw_api::session_events::SessionId::parse(family.to_owned()).unwrap();
             let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
             let authority = Arc::new(AgentHistoryAuthority {
                 admission: live
@@ -20731,7 +20731,8 @@ Let me check the result."#;
                 let live = LiveConfigAuthority::new(config);
                 let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
                 let family = "native-skill-child-interruption";
-                let stream = source.session_id(family).await.unwrap();
+                let stream =
+                    zeroclaw_api::session_events::SessionId::parse(family.to_owned()).unwrap();
                 let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
                 let authority = Arc::new(AgentHistoryAuthority {
                     admission: live

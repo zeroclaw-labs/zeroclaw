@@ -302,7 +302,7 @@ async fn creation_source_is_preserved_on_reopen() {
             )
             .await
             .expect("create without protocol prefix");
-        let stream = hub.session_id(key).await.expect("stream");
+        let stream = SessionId::parse(key.to_owned()).expect("stream");
         drop(port);
         drop(hub);
 
@@ -321,7 +321,10 @@ async fn creation_source_is_preserved_on_reopen() {
             )
             .await
             .expect("reopen through another entrance");
-        assert_eq!(hub.session_id(key).await.expect("same stream"), stream);
+        assert_eq!(
+            SessionId::parse(key.to_owned()).expect("same stream"),
+            stream
+        );
         assert_eq!(
             hub.sessions().await.expect("sessions"),
             vec![stream.to_string()]
@@ -503,7 +506,7 @@ fn historical_owner_resolution_uses_routing_and_preserves_ambiguity() {
 }
 
 #[tokio::test]
-async fn stream_resolution_waits_for_installation_without_blocking_reactor() {
+async fn session_listing_waits_for_installation_without_blocking_reactor() {
     let directory = tempfile::tempdir().expect("directory");
     let config = zeroclaw_config::schema::Config {
         data_dir: directory.path().into(),
@@ -524,7 +527,7 @@ async fn stream_resolution_waits_for_installation_without_blocking_reactor() {
     locked_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("lock acquired");
-    let resolution = hub.session_id("pending");
+    let resolution = hub.sessions();
     tokio::pin!(resolution);
     let started = std::time::Instant::now();
     tokio::select! {
@@ -534,10 +537,7 @@ async fn stream_resolution_waits_for_installation_without_blocking_reactor() {
     let reactor_delay = started.elapsed();
     let _ = release_tx.send(());
     holder.join().expect("lock holder");
-    assert_eq!(
-        resolution.await.expect("resolved stream"),
-        NativeSessionHub::session_id("pending").expect("new identity")
-    );
+    assert!(resolution.await.expect("session listing").is_empty());
     assert!(
         reactor_delay < std::time::Duration::from_secs(1),
         "installation wait blocked the reactor for {reactor_delay:?}"
@@ -937,7 +937,8 @@ async fn drained_family_migration_preserves_derived_streams_and_receipts_in_both
         .expect("turn");
         drop(port);
         drop(hub);
-        let stream = NativeSessionHub::session_id("child-fixture").expect("root");
+        let stream = zeroclaw_api::session_events::SessionId::parse(("child-fixture").to_owned())
+            .expect("root");
         let source = ScopedEventStore::open(directory.path(), "child-fixture").expect("source");
         let parent = source
             .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 256)
@@ -1096,7 +1097,8 @@ async fn family_startup_resumes_root_and_derived_erasure_without_reexecuting_wor
         drop(hub);
         let store: Arc<dyn SessionEventStore> =
             Arc::new(ScopedEventStore::open(directory.path(), family).expect("family store"));
-        let root = NativeSessionHub::session_id(family).expect("root stream");
+        let root = zeroclaw_api::session_events::SessionId::parse((family).to_owned())
+            .expect("root stream");
         let before = store
             .read_page(&root, &EventCursor::beginning(root.clone()), None, 256)
             .expect("parent history");

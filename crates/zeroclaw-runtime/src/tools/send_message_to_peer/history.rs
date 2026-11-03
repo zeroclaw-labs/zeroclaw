@@ -133,7 +133,7 @@ pub(super) async fn open(
         actor: EventActor::System {
             component: "peer_inbox".into(),
         },
-        stream: source.session_id(&family).await?,
+        stream: zeroclaw_api::session_events::SessionId::parse(family.to_owned())?,
         origin: zeroclaw_api::ingress::TurnOrigin::AgentDirect,
         parent_alias: None,
     });

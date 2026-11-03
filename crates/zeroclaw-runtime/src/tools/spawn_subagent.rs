@@ -676,7 +676,8 @@ mod tests {
                     let source =
                         zeroclaw_session_host::NativeSessionHub::new(authority.live_handle());
                     let family = "subagent-capture-failure";
-                    let stream = source.session_id(family).await.unwrap();
+                    let stream =
+                        zeroclaw_api::session_events::SessionId::parse(family.to_owned()).unwrap();
                     let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
                     let port = source
                         .open(
