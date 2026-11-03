@@ -10487,6 +10487,7 @@ async fn process_channel_message_body(
                         strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
                         parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
                         max_tool_result_chars: ctx.max_tool_result_chars,
+                        keep_tool_context_turns: ctx.agent_cfg.resolved.keep_tool_context_turns,
                         context_limits,
                         context_limits_resolver: None,
                         knobs: &loop_knobs,
@@ -10536,8 +10537,13 @@ async fn process_channel_message_body(
                 // with that agent's own gated tools/policy/MCP scope rather than
                 // this turn's.
                 served_route_sink: None,
+                // The channels orchestrator builds its turns from config.
+                capability_binding: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
+                    // The channels orchestrator builds its turns from config;
+                    // it binds capabilities once it moves onto the contract.
+                    capabilities: None,
                     live_config: Some(ctx.live_config.clone()),
                 }),
             }));
@@ -10913,7 +10919,10 @@ async fn process_channel_message_body(
 
             // Persist intermediate tool-call/result messages from this turn
             // so the model retains concrete "I used tools" examples in
-            // context, preventing drift toward tool-less responses.
+            // context, preventing drift toward tool-less responses. How many
+            // turns keep those rows on the provider-facing history is decided
+            // per request by the tool loop (`keep_tool_context_turns` counts
+            // turns there); here the key only gates whether they are stored.
             //
             // Skipped when the pre-trim resync above could not confirm the
             // cache matches what's durable: appending onto an evicted cache
@@ -25726,7 +25735,7 @@ api_key = "anthropic-key"
     fn email_wire(message: &SendMessage) -> String {
         let channel = EmailChannel::new(
             crate::email_channel::EmailConfig {
-                from_address: "bot@example.invalid".to_string(),
+                from_address: Some("bot@example.invalid".to_string()),
                 ..crate::email_channel::EmailConfig::default()
             },
             "test",
