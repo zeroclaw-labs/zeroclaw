@@ -127,8 +127,7 @@ impl CostLedger {
                 conn.execute_batch(
                     "CREATE TABLE IF NOT EXISTS session_cost_records(
                        record_id TEXT PRIMARY KEY,
-                       tracker_session_id TEXT,
-                       conversation_id TEXT,
+                       session_id TEXT,
                        agent_alias TEXT,
                        task_id TEXT,
                        model TEXT,
@@ -144,7 +143,7 @@ impl CostLedger {
                        record_json BLOB NOT NULL
                      );
                      CREATE INDEX IF NOT EXISTS session_cost_records_session
-                       ON session_cost_records(conversation_id);
+                       ON session_cost_records(session_id);
                      CREATE INDEX IF NOT EXISTS session_cost_records_timestamp
                        ON session_cost_records(usage_timestamp);",
                 )?;
@@ -170,19 +169,21 @@ impl CostLedger {
                 .with_context(|| format!("read legacy cost ledger {}", source.display()))?;
             for line in bytes.split(|byte| *byte == b'\n') {
                 if !line.iter().all(u8::is_ascii_whitespace) {
-                    if self.backend == Backend::Sqlite {
-                        for value in serde_json::Deserializer::from_slice(line)
-                            .into_iter::<serde_json::Value>()
-                        {
-                            let value = value?;
-                            let raw = serde_json::to_vec(&value)?;
-                            match self.append(&raw, File::sync_all)? {
-                                AppendOutcome::Synced => {}
-                                AppendOutcome::AppendedButSyncFailed(error) => return Err(error),
-                            }
+                    for value in
+                        serde_json::Deserializer::from_slice(line).into_iter::<serde_json::Value>()
+                    {
+                        let mut value = value?;
+                        // Master's session_id is a tracker UUID. Only its
+                        // conversation_id can establish actual session ownership.
+                        let fields = value
+                            .as_object_mut()
+                            .context("legacy cost record is not an object")?;
+                        fields.remove("session_id");
+                        if let Some(session) = fields.remove("conversation_id") {
+                            fields.insert("session_id".into(), session);
                         }
-                    } else {
-                        match self.append(line, File::sync_all)? {
+                        let raw = serde_json::to_vec(&value)?;
+                        match self.append(&raw, File::sync_all)? {
                             AppendOutcome::Synced => {}
                             AppendOutcome::AppendedButSyncFailed(error) => return Err(error),
                         }
@@ -301,15 +302,14 @@ impl CostLedger {
                 let conn = Connection::open(&self.path)?;
                 conn.execute(
                     "INSERT OR IGNORE INTO session_cost_records(
-                       record_id, tracker_session_id, conversation_id, agent_alias, task_id,
+                       record_id, session_id, agent_alias, task_id,
                        model, usage_timestamp, input_tokens, output_tokens,
                        cached_input_tokens, cache_creation_input_tokens, total_tokens,
                        unpriced_tokens, cost_usd, pricing_available, record_json
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                     params![
                         record_id,
                         text(&value, "session_id"),
-                        text(&value, "conversation_id"),
                         text(&value, "agent_alias"),
                         text(&value, "task_id"),
                         text(&usage, "model"),
@@ -380,11 +380,19 @@ mod tests {
                 "unpriced_tokens": 0,
                 "timestamp": "2026-11-03T00:00:00Z"
             },
-            "session_id": "tracker",
-            "conversation_id": "session"
+            "session_id": "session"
         })
         .to_string()
         .into_bytes()
+    }
+
+    fn legacy_record(id: &str, session_id: Option<&str>) -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(&record(id)).unwrap();
+        value["session_id"] = "old-tracker".into();
+        if let Some(session) = session_id {
+            value["conversation_id"] = session.into();
+        }
+        serde_json::to_vec(&value).unwrap()
     }
 
     #[test]
@@ -392,14 +400,36 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let legacy = dir.path().join("state/costs.jsonl");
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, [record("a"), record("b")].join(&b'\n')).unwrap();
+        let original = [
+            legacy_record("a", None),
+            legacy_record("b", Some("session")),
+        ]
+        .join(&b'\n');
+        fs::write(&legacy, &original).unwrap();
         let path = dir.path().join("sessions/session-events-jsonl/costs.jsonl");
         let ledger = CostLedger::open(&path).unwrap();
-        assert_eq!(ledger.read_records().unwrap().len(), 2);
+        let records = ledger.read_records().unwrap();
+        assert_eq!(records.len(), 2);
+        for (index, record) in records.iter().enumerate() {
+            let value: serde_json::Value = serde_json::from_slice(record).unwrap();
+            if index == 0 {
+                assert!(value.get("session_id").is_none());
+            } else {
+                assert_eq!(value["session_id"], "session");
+            }
+            assert!(value.get("conversation_id").is_none());
+            assert_eq!(value["usage"]["cost_usd"], 0.1);
+        }
         assert!(!legacy.exists());
-        assert!(dir.path().join("state/costs.jsonl.backup").exists());
+        assert_eq!(
+            fs::read(dir.path().join("state/costs.jsonl.backup")).unwrap(),
+            original
+        );
         ledger.append(&record("c"), File::sync_all).unwrap();
-        assert_eq!(ledger.read_records().unwrap().len(), 3);
+        let records = ledger.read_records().unwrap();
+        assert_eq!(records.len(), 3);
+        let value: serde_json::Value = serde_json::from_slice(&records[2]).unwrap();
+        assert_eq!(value["session_id"], "session");
     }
 
     #[test]
@@ -418,6 +448,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table, "session_cost_records");
+        let session: String = conn
+            .query_row("SELECT session_id FROM session_cost_records", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(session, "session");
+        let mut statement = conn
+            .prepare("PRAGMA table_info(session_cost_records)")
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|name| name.ends_with("session_id"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -437,7 +488,7 @@ mod tests {
         let records = source.read_records().unwrap();
         target.import_records(&records).unwrap();
         target.import_records(&records).unwrap();
-        assert_eq!(target.read_records().unwrap().len(), 1);
+        assert_eq!(target.read_records().unwrap(), records);
     }
 
     #[test]
@@ -445,13 +496,46 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let legacy = dir.path().join("state/costs.jsonl");
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, record("legacy")).unwrap();
+        fs::write(
+            &legacy,
+            [
+                legacy_record("legacy", None),
+                legacy_record("attributed", Some("session")),
+            ]
+            .join(&b'\n'),
+        )
+        .unwrap();
         let ledger = CostLedger::open_for_backend(
             dir.path(),
             crate::session_events::installation::NativeBackend::Sqlite,
         )
         .unwrap();
-        assert_eq!(ledger.read_records().unwrap().len(), 1);
+        let records = ledger.read_records().unwrap();
+        assert_eq!(records.len(), 2);
+        let value: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();
+        assert!(value.get("session_id").is_none());
+        assert_eq!(value["id"], "legacy");
+        assert_eq!(value["usage"]["cost_usd"], 0.1);
+        let value: serde_json::Value = serde_json::from_slice(&records[1]).unwrap();
+        assert_eq!(value["session_id"], "session");
+        assert!(value.get("conversation_id").is_none());
+        let conn = Connection::open(ledger.path()).unwrap();
+        let session: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM session_cost_records WHERE record_id='legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(session.is_none());
+        let session: String = conn
+            .query_row(
+                "SELECT session_id FROM session_cost_records WHERE record_id='attributed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session, "session");
         assert!(!legacy.exists());
         assert!(dir.path().join("state/costs.jsonl.backup").exists());
     }

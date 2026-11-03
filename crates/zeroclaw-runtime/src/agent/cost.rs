@@ -568,9 +568,8 @@ fn record_tool_loop_cost_usage_inner_with_live(
         }
     }
 
-    // The session key scoped around this turn is the chat conversation the
-    // spend belongs to; the tracker's own id is daemon-lifetime scoped.
-    let conversation_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+    // Resolve the actual session from the current turn scope.
+    let session_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
         .try_with(Clone::clone)
         .ok()
         .flatten();
@@ -579,7 +578,7 @@ fn record_tool_loop_cost_usage_inner_with_live(
             cost_usage.clone(),
             ctx.agent_alias.as_deref(),
             None,
-            conversation_id,
+            session_id,
         )
     {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
@@ -1706,16 +1705,15 @@ mod tests {
             zeroclaw_infra::cost_ledger::resolve_path(workspace.path()).expect("cost ledger path"),
         )
         .expect("cost ledger should be written");
-        let mut conversation_ids = Vec::new();
+        let mut session_ids = Vec::new();
         for line in stored.lines() {
             let record: zeroclaw_config::cost::types::CostRecord =
                 serde_json::from_str(line).unwrap();
-            assert_eq!(record.session_id, tracker.session_id());
-            conversation_ids.push(record.conversation_id.expect("conversation id"));
+            session_ids.push(record.session_id.expect("session id"));
         }
-        conversation_ids.sort();
+        session_ids.sort();
         assert_eq!(
-            conversation_ids,
+            session_ids,
             vec!["chat-session-a".to_string(), "chat-session-b".to_string()],
             "two chat sessions on one daemon must stay separable in the ledger"
         );
@@ -2130,10 +2128,11 @@ mod tests {
             )
             .unwrap(),
         );
-        std::fs::create_dir_all(
-            zeroclaw_infra::cost_ledger::resolve_path(workspace.path()).expect("cost ledger path"),
-        )
-        .expect("make cost ledger path unwritable as a directory");
+        let ledger_path =
+            zeroclaw_infra::cost_ledger::resolve_path(workspace.path()).expect("cost ledger path");
+        std::fs::remove_file(&ledger_path).expect("remove initialized cost ledger file");
+        std::fs::create_dir_all(&ledger_path)
+            .expect("make cost ledger path unwritable as a directory");
         let ctx = ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),
             Arc::new(HashMap::from([(

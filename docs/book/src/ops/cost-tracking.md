@@ -157,6 +157,14 @@ token-bearing response to the selected session backend. SQLite stores rows in
 dashboard's current-month
 per-agent rollup survives restarts.
 
+The optional `session_id` identifies the actual session that incurred the
+usage, resolved from the runtime turn scope. Unscoped usage has no session ID;
+the tracker does not generate a substitute identity. Migrating the master
+ledger maps its `conversation_id` to `session_id` and discards the old
+process-local tracker ID while preserving usage, costs, record IDs, and
+the original file as a backup. Historical records
+without actual session attribution remain unassigned.
+
 Each `TokenUsage` record carries two pricing-provenance fields:
 
 - `unpriced_tokens`: the input, cached-input, or output token subset whose

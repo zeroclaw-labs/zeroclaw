@@ -174,9 +174,6 @@ pub struct CostTracker {
     config: Arc<RwLock<CostConfig>>,
     /// Backend-native durable ledger plus cached day/month aggregates.
     storage: Arc<Mutex<CostStorage>>,
-    /// Process-local tracker session id used to group records emitted by this
-    /// daemon lifetime.
-    session_id: String,
     /// Per-daemon-lifetime aggregates keyed by `Option<agent_alias>`,
     /// replacing the unbounded per-turn `Vec<CostRecord>`.
     session_totals: Arc<Mutex<HashMap<Option<String>, AgentTotals>>>,
@@ -222,7 +219,6 @@ impl CostTracker {
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
             storage: Arc::new(Mutex::new(storage)),
-            session_id: uuid::Uuid::new_v4().to_string(),
             session_totals: Arc::new(Mutex::new(HashMap::new())),
             budget_scope: BudgetScope::Shared,
             enforcement_mode: EnforcementMode::Live,
@@ -384,7 +380,6 @@ impl CostTracker {
         Self {
             config: Arc::clone(&self.config),
             storage: Arc::clone(&self.storage),
-            session_id: self.session_id.clone(),
             session_totals: Arc::clone(&self.session_totals),
             budget_scope,
             enforcement_mode,
@@ -409,11 +404,6 @@ impl CostTracker {
                 track_per_agent,
             } => (*enabled, *track_per_agent),
         }
-    }
-
-    /// Get the session ID.
-    pub fn session_id(&self) -> &str {
-        &self.session_id
     }
 
     fn lock_storage(&self) -> MutexGuard<'_, CostStorage> {
@@ -586,21 +576,20 @@ impl CostTracker {
     }
 
     /// Record a usage event attributed to an agent, a durable task, and the
-    /// chat session that incurred it. `conversation_id` is the runtime
-    /// session key scoped around the turn; `None` keeps the record
-    /// attributable only to the daemon-lifetime tracker id.
+    /// session that incurred it. `session_id` is resolved from the runtime turn
+    /// scope; `None` records usage without inventing a session identity.
     pub fn record_usage_attributed(
         &self,
         usage: TokenUsage,
         agent_alias: Option<&str>,
         task_id: Option<String>,
-        conversation_id: Option<String>,
+        session_id: Option<String>,
     ) -> Result<()> {
         self.record_usage_with_owned_task_attribution_inner_with_sync(
             usage,
             agent_alias,
             task_id,
-            conversation_id,
+            session_id,
             true,
             File::sync_all,
         )
@@ -637,7 +626,7 @@ impl CostTracker {
         usage: TokenUsage,
         agent_alias: Option<&str>,
         task_id: Option<String>,
-        conversation_id: Option<String>,
+        session_id: Option<String>,
         honor_enabled: bool,
         sync_file: fn(&File) -> std::io::Result<()>,
     ) -> Result<()> {
@@ -668,8 +657,7 @@ impl CostTracker {
         // accumulator loop compares it against each ancestor's alias.
         let recorded_alias = effective_alias.clone();
         let record =
-            CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage)
-                .with_conversation_id(conversation_id);
+            CostRecord::with_attribution(session_id, effective_alias.clone(), task_id, usage);
         // The UTC day this record belongs to. The ledger's rebuild folds
         // the row into this day's aggregates and no other day's, so the
         // descendant accumulator keys on the same day and the two agree
@@ -1515,7 +1503,7 @@ mod tests {
             timestamp,
         };
         CostRecord::with_attribution(
-            "fixture-session",
+            Some("fixture-session".into()),
             Some("fixture-agent".to_string()),
             task_id.map(str::to_string),
             usage,
@@ -1540,7 +1528,7 @@ mod tests {
             timestamp,
         };
         CostRecord::with_attribution(
-            "fixture-session",
+            Some("fixture-session".into()),
             Some("fixture-agent".to_string()),
             None,
             usage,
@@ -1702,7 +1690,7 @@ mod tests {
     fn cost_tracker_initialization() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
-        assert!(!tracker.session_id().is_empty());
+        assert_eq!(tracker.get_summary().unwrap().request_count, 0);
     }
 
     #[test]
@@ -1900,13 +1888,13 @@ mod tests {
         }
 
         let first = CostRecord::with_attribution(
-            "legacy-session",
+            Some("legacy-session".into()),
             Some("agent-a".into()),
             Some("goal-a".into()),
             TokenUsage::new("test/model-a", 1000, 500, 0, 1.0, 2.0, 0.0),
         );
         let second = CostRecord::with_attribution(
-            "legacy-session",
+            Some("legacy-session".into()),
             Some("agent-a".into()),
             Some("goal-a".into()),
             TokenUsage::new("test/model-b", 2000, 250, 0, 1.0, 2.0, 0.0),
@@ -2561,7 +2549,6 @@ mod tests {
         // limits stay the base's) and tightens only the shared daily check
         // to the $0.50 per-hop cap.
         let derived = base.derived_shared_capped(0.5);
-        assert_eq!(derived.session_id(), base.session_id());
         assert!(
             matches!(derived.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
             "an empty ledger must pass the capped shared check"

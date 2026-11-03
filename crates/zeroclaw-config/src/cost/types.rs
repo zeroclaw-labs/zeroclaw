@@ -195,16 +195,11 @@ pub struct CostRecord {
     pub id: String,
     /// Token usage details
     pub usage: TokenUsage,
-    /// Tracker identifier: one random UUID per daemon process, grouping every
-    /// record this daemon emits. This is NOT the chat session — attribute
-    /// per-conversation spend through `conversation_id`.
-    pub session_id: String,
-    /// Chat-session identifier (the runtime session key scoped around the
-    /// turn), so per-conversation spend can be separated across the sessions
-    /// one daemon serves. `None` for records persisted before the field
-    /// existed or turns without a chat-session scope.
+    /// Actual session that incurred this cost, resolved from the runtime turn
+    /// scope. Unscoped usage and migrated records without session attribution
+    /// leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<String>,
+    pub session_id: Option<String>,
     /// Alias of the agent that incurred this cost (HashMap key in
     /// `config.agents`). `None` for records persisted before per-agent
     /// attribution, or when `[cost].track_per_agent = false`.
@@ -225,8 +220,7 @@ impl CostRecord {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
-            session_id: session_id.into(),
-            conversation_id: None,
+            session_id: Some(session_id.into()),
             agent_alias: None,
             task_id: None,
         }
@@ -234,15 +228,14 @@ impl CostRecord {
 
     /// Create a new cost record attributed to an agent.
     pub fn with_agent(
-        session_id: impl Into<String>,
+        session_id: Option<String>,
         agent_alias: Option<String>,
         usage: TokenUsage,
     ) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
-            session_id: session_id.into(),
-            conversation_id: None,
+            session_id,
             agent_alias,
             task_id: None,
         }
@@ -250,7 +243,7 @@ impl CostRecord {
 
     /// Create a new cost record attributed to an agent and/or durable task.
     pub fn with_attribution(
-        session_id: impl Into<String>,
+        session_id: Option<String>,
         agent_alias: Option<String>,
         task_id: Option<String>,
         usage: TokenUsage,
@@ -258,19 +251,10 @@ impl CostRecord {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
-            session_id: session_id.into(),
-            conversation_id: None,
+            session_id,
             agent_alias,
             task_id,
         }
-    }
-
-    /// Attach the chat-session identifier this spend belongs to. The ledger
-    /// is append-only JSONL, so the field is additive and older rows read
-    /// back as `None`.
-    pub fn with_conversation_id(mut self, conversation_id: Option<String>) -> Self {
-        self.conversation_id = conversation_id;
-        self
     }
 }
 
@@ -468,7 +452,7 @@ mod tests {
         let usage = TokenUsage::new("test/model", 100, 50, 0, 1.0, 2.0, 0.0);
         let record = CostRecord::new("session-123", usage);
 
-        assert_eq!(record.session_id, "session-123");
+        assert_eq!(record.session_id.as_deref(), Some("session-123"));
         assert!(record.task_id.is_none());
         assert!(!record.id.is_empty());
         assert_eq!(record.usage.model, "test/model");
@@ -478,7 +462,7 @@ mod tests {
     fn cost_record_task_attribution_roundtrips_existing_field() {
         let usage = TokenUsage::new("test/model", 100, 50, 0, 1.0, 2.0, 0.0);
         let record = CostRecord::with_attribution(
-            "session-123",
+            Some("session-123".into()),
             Some("agent-a".into()),
             Some("goal-123".into()),
             usage,
@@ -582,19 +566,26 @@ mod tests {
         assert_eq!(parsed.task_id.as_deref(), Some("task-123"));
         assert!(parsed.usage.pricing_available);
         assert_eq!(parsed.usage.unpriced_tokens, 0);
-        // Rows persisted before conversation attribution existed read as None.
-        assert!(parsed.conversation_id.is_none());
+        assert_eq!(parsed.session_id.as_deref(), Some("session-123"));
     }
 
     #[test]
-    fn cost_record_conversation_attribution_roundtrips() {
+    fn cost_record_session_attribution_roundtrips() {
         let usage = TokenUsage::new("test/model", 100, 50, 0, 1.0, 2.0, 0.0);
-        let record =
-            CostRecord::new("tracker-1", usage).with_conversation_id(Some("chat-session-9".into()));
+        let record = CostRecord::new("chat-session-9", usage);
         let json = serde_json::to_string(&record).unwrap();
-        assert!(json.contains("conversation_id"));
+        assert!(json.contains("session_id"));
         let parsed: CostRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.session_id, "tracker-1");
-        assert_eq!(parsed.conversation_id.as_deref(), Some("chat-session-9"));
+        assert_eq!(parsed.session_id.as_deref(), Some("chat-session-9"));
+    }
+
+    #[test]
+    fn unscoped_cost_record_has_no_session_identity() {
+        let usage = TokenUsage::new("test/model", 100, 50, 0, 1.0, 2.0, 0.0);
+        let record = CostRecord::with_attribution(None, None, None, usage);
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json.get("session_id").is_none());
+        let parsed: CostRecord = serde_json::from_value(json).unwrap();
+        assert!(parsed.session_id.is_none());
     }
 }
