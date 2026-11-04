@@ -618,6 +618,18 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
     Some(grants.allowed_tools.clone())
 }
 
+/// Whether the principal bound to `binding`, holding `grants`, is the shared
+/// operator: the install's own principal, whose authority no grant
+/// publication narrows. A named administrator is not. Prompts and steering
+/// both decide the nested and scheduling tools with this, so a steer cannot
+/// keep tools that a prompt from the same sender would lose.
+fn principal_is_shared_operator(
+    binding: Option<&crate::rpc::auth::ConnectionAuth>,
+    grants: &zeroclaw_api::grants::ResolvedGrants,
+) -> bool {
+    grants.admin && binding.is_some_and(|auth| !auth.principal.is_authenticated())
+}
+
 fn not_yet_implemented(method: Method) -> RpcResult {
     Err(rpc_err(
         INTERNAL_ERROR,
@@ -2472,11 +2484,7 @@ impl RpcDispatcher {
     /// operator: the install's own principal, whose authority no grant
     /// publication narrows. A named administrator is not.
     fn is_shared_operator(&self, grants: &zeroclaw_api::grants::ResolvedGrants) -> bool {
-        grants.admin
-            && self
-                .auth
-                .as_ref()
-                .is_some_and(|auth| !auth.principal.is_authenticated())
+        principal_is_shared_operator(self.auth.as_ref(), grants)
     }
 
     /// Queued prompts must not execute with the transport-time grants clone.
@@ -8471,13 +8479,14 @@ impl RpcDispatcher {
             ) {
                 return refuse(denied.message);
             }
+            // The same rule a prompt applies (`apply_principal_grants_to_agent`):
+            // only the shared operator keeps the nested and scheduling tools.
             SteeringAdmission::Admitted(SteeringPosture {
                 tool_ceiling: principal_tool_ceiling(&grants),
-                disable_principal_unaware_nested_tools: !grants.admin
-                    && !grants
-                        .allowed_agents
-                        .iter()
-                        .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD),
+                disable_principal_unaware_nested_tools: !principal_is_shared_operator(
+                    Some(binding),
+                    &grants,
+                ),
             })
         })))
     }
@@ -50816,6 +50825,87 @@ mod tests {
         assert!(
             !calls[1].1.iter().any(|tool| tool == "probe"),
             "the steered round runs without the tool its sender no longer holds: {calls:?}"
+        );
+    }
+
+    /// A tool that starts work its caller's grants cannot follow, as
+    /// `cron_add` and `delegate` do.
+    struct HeadlessProbeTool;
+
+    #[async_trait]
+    impl zeroclaw_api::tool::Tool for HeadlessProbeTool {
+        fn requires_unrestricted_principal(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "headless_probe"
+        }
+        fn description(&self) -> &str {
+            "a principal-unaware tool the tests look for in a model request"
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _args: Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "probed".into(),
+                error: None,
+            })
+        }
+    }
+
+    zeroclaw_api::mock_tool_attribution!(HeadlessProbeTool);
+
+    /// The shared operator's turn keeps the nested and scheduling tools. A
+    /// named administrator may steer it, and a prompt of theirs would lose
+    /// those tools, so the round their steer starts must lose them too.
+    #[tokio::test]
+    async fn a_named_administrators_steer_withholds_the_tools_only_the_shared_operator_keeps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-steered-by-admin";
+        let (ctx, backend, workspace) = steering_ctx(&tmp, |profile| profile.admin = true);
+        let mut handles = install_recording_session(
+            &ctx,
+            &backend,
+            sid,
+            "user:alice",
+            &workspace,
+            vec![Box::new(HeadlessProbeTool)],
+            true,
+        )
+        .await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
+
+        send_prompt(&mut operator, 1, sid, 1).await;
+        handles.await_start().await;
+        let steer = rpc(
+            &mut alice,
+            &mut alice_rx,
+            2,
+            "session/steer",
+            json!({"session_id": sid, "content": STEER_TEXT}),
+        )
+        .await;
+        handles.release();
+        let (response, _) = response_and_notifications(&mut operator_rx, 1).await;
+        assert!(
+            response.get("error").is_none(),
+            "the turn itself completes: {response}"
+        );
+        assert_eq!(steer["result"]["accepted"], json!(true), "{steer}");
+
+        let calls = handles.calls().await;
+        assert_eq!(calls.len(), 2, "the steer starts a round: {calls:?}");
+        assert!(
+            calls[0].1.iter().any(|tool| tool == "headless_probe"),
+            "the shared operator's round is offered the tool: {calls:?}"
+        );
+        assert!(steered(&calls[1..]));
+        assert!(
+            !calls[1].1.iter().any(|tool| tool == "headless_probe"),
+            "the named administrator's steered round runs without it: {calls:?}"
         );
     }
 
