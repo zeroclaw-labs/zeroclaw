@@ -39357,6 +39357,10 @@ runtime_profile = "default"
     async fn google_workspace_allowlist_is_checked_only_where_the_tool_is_compiled() {
         use crate::opt_in_tools::OptInTool;
         let mut config = Config::default();
+        // `[web_search]` defaults to enabled and stands outside this test's
+        // focus; it reports compiled out in any build without
+        // `tools-external`, which the assertion below is not about.
+        config.web_search.enabled = false;
         config.google_workspace.enabled = true;
         config.google_workspace.allowed_services = vec!["drive".into()];
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -39384,15 +39388,7 @@ runtime_profile = "default"
             assert!(compiled_out.is_empty(), "{compiled_out:?}");
         } else {
             result.expect("a build without the tool does not check its allowlist");
-            // `[web_search]` defaults to enabled and stands outside this
-            // test's focus; it reports compiled out in the same lean builds
-            // that lack google_workspace.
-            let expected: &[&str] = if OptInTool::WebSearch.compiled() {
-                &["google_workspace.enabled"]
-            } else {
-                &["google_workspace.enabled", "web_search.enabled"]
-            };
-            assert_eq!(compiled_out, expected);
+            assert_eq!(compiled_out, ["google_workspace.enabled"]);
         }
     }
 
@@ -39440,6 +39436,10 @@ runtime_profile = "default"
         ];
         for (field, enable) in cases {
             let mut config = Config::default();
+            // `[web_search]` defaults to enabled and stands outside this
+            // test's focus; in a build without `tools-external` it would
+            // report compiled out and trip the assertion below.
+            config.web_search.enabled = false;
             enable(&mut config);
             let err = config
                 .validate()
