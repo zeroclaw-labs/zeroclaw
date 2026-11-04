@@ -6143,9 +6143,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         let body = message
                             .get("text")
                             .and_then(serde_json::Value::as_str)
-                            .or_else(|| {
-                                message.get("caption").and_then(serde_json::Value::as_str)
-                            });
+                            .or_else(|| message.get("caption").and_then(serde_json::Value::as_str));
                         let mentioned =
                             body.is_some_and(|b| Self::contains_bot_mention(b, username));
                         let reply_to_bot = {
@@ -6236,6 +6234,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
         let path_str = local_path.to_string_lossy().into_owned();
 
+        // Cache the saved path before awaiting transcription. The prep future
+        // runs under a deadline in `process_update`; if transcription exceeds
+        // the remaining budget the future is dropped, and without this entry
+        // every later reply would re-download and re-transcribe the same
+        // recording. On transcription success the path entry is removed so
+        // the transcript remains the single cached artifact.
+        {
+            let mut cache = self.voice_file_paths.lock();
+            if cache.len() >= 100 {
+                cache.clear();
+            }
+            cache.insert(key.clone(), path_str);
+        }
+
         // Prefer built-in transcription when configured.
         if let (Some(config), Some(manager)) = (
             self.transcription.as_ref(),
@@ -6250,6 +6262,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             if let Ok(text) = manager.transcribe(&audio_data, &file_name).await
                 && !text.trim().is_empty()
             {
+                self.voice_file_paths.lock().remove(&key);
                 let mut cache = self.voice_transcriptions.lock();
                 if cache.len() >= 100 {
                     cache.clear();
@@ -6257,15 +6270,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 cache.insert(key, text);
                 return;
             }
-        }
-
-        // Fall back to caching the local path so the agent can transcribe itself.
-        {
-            let mut cache = self.voice_file_paths.lock();
-            if cache.len() >= 100 {
-                cache.clear();
-            }
-            cache.insert(key, path_str);
         }
     }
 
@@ -19506,6 +19510,131 @@ mod tests {
         assert!(
             ch.voice_file_paths.lock().is_empty(),
             "stalled prep must not leave a partial cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_update_keeps_saved_audio_path_when_transcription_stalls() {
+        use super::super::transcription::{TranscriptionManager, TranscriptionProvider};
+        use async_trait::async_trait;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct StallingTranscriptionProvider;
+
+        #[async_trait]
+        impl TranscriptionProvider for StallingTranscriptionProvider {
+            fn name(&self) -> &str {
+                "stall"
+            }
+
+            async fn transcribe(
+                &self,
+                _audio_data: &[u8],
+                _file_name: &str,
+            ) -> anyhow::Result<String> {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok("late transcript".to_string())
+            }
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for StallingTranscriptionProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Transcription(
+                        ::zeroclaw_api::attribution::TranscriptionProviderKind::Groq,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "stall"
+            }
+        }
+
+        // getFile and the file download answer immediately; only the
+        // transcription exceeds the prep deadline. The saved file must stay
+        // cached so later replies quote its path instead of re-downloading
+        // and re-transcribing the same recording.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_1.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_1\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            max_duration_secs: 300,
+            ..Default::default()
+        };
+        let manager = TranscriptionManager::empty()
+            .with_test_provider("stall", Box::new(StallingTranscriptionProvider));
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_transcription_manager(tc, Some(Arc::new(manager)))
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_voice_reply_prep_timeout(Duration::from_millis(250));
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "update_id": 8,
+            "message": {
+                "message_id": 23,
+                "text": "@mybot привет",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut transient_retry = None;
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        let msg = rx
+            .recv()
+            .await
+            .expect("addressed message must dispatch even when transcription stalls");
+        assert!(
+            msg.content.contains("привет"),
+            "message should carry the sender text, got: {}",
+            msg.content
+        );
+        let saved = ch
+            .voice_file_paths
+            .lock()
+            .get("-100200300:42")
+            .expect("saved audio path must survive a transcription-timeout drop")
+            .clone();
+        assert!(
+            saved.ends_with("voice_-100200300_42.ogg"),
+            "cached path should point at the saved recording, got: {saved}"
+        );
+        assert!(
+            ch.voice_transcriptions.lock().is_empty(),
+            "no transcript may be cached when transcription never finished"
         );
     }
 
