@@ -5,10 +5,11 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use wasmtime::component::{Component, ResourceTable};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
+use crate::component_limits::PluginResourceLimiter;
 use crate::config::ResolvedPluginConfig;
 use crate::egress::{AuthorizedEgress, EgressError, EgressHostService, build_tls_client_config};
 use crate::error::PluginError;
@@ -72,7 +73,7 @@ impl InboundQueue {
     }
 }
 
-/// Resolved per-call execution limits applied to a plugin store. The host
+/// Resolved execution and allocation limits applied to a plugin store. The host
 /// builds this from `[plugins.limits]` config and hands it to `new_store`.
 /// There is deliberately no `Default`: limits always come from the config
 /// registry so no code path can construct an unsandboxed store by accident.
@@ -220,7 +221,7 @@ pub struct PluginState {
     /// `None` is deny-by-default, exactly as for `wasi:http`.
     egress: Option<EgressHostService>,
     inbound: InboundQueue,
-    limits: StoreLimits,
+    limits: PluginResourceLimiter,
     fuel_per_call: u64,
     call_timeout: Duration,
 }
@@ -294,11 +295,7 @@ impl PluginState {
             http,
             egress: spec.egress,
             inbound: spec.inbound,
-            limits: StoreLimitsBuilder::new()
-                .memory_size(spec.limits.max_memory_bytes)
-                .table_elements(spec.limits.max_table_elements)
-                .instances(spec.limits.max_instances)
-                .build(),
+            limits: PluginResourceLimiter::new(spec.limits),
             fuel_per_call: spec.limits.call_fuel,
             call_timeout: spec.limits.call_timeout,
         }
@@ -1011,6 +1008,151 @@ mod tests {
             test_limits(call_fuel),
         )
         .with_granted_http()
+    }
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    const RESOURCE_COMPONENT: &str = r#"
+        (component
+          (core module $m
+            (memory 1 4) (memory 1 4)
+            (table 2 8 funcref) (table 2 8 funcref)
+            (func (export "memory-first") (param i32) (result i32)
+              local.get 0 memory.grow 0)
+            (func (export "memory-second") (param i32) (result i32)
+              local.get 0 memory.grow 1)
+            (func (export "table-first") (param i32) (result i32)
+              ref.null func local.get 0 table.grow 0)
+            (func (export "table-second") (param i32) (result i32)
+              ref.null func local.get 0 table.grow 1))
+          (core instance $i (instantiate $m))
+          (func (export "memory-first") (param "delta" u32) (result s32)
+            (canon lift (core func $i "memory-first")))
+          (func (export "memory-second") (param "delta" u32) (result s32)
+            (canon lift (core func $i "memory-second")))
+          (func (export "table-first") (param "delta" u32) (result s32)
+            (canon lift (core func $i "table-first")))
+          (func (export "table-second") (param "delta" u32) (result s32)
+            (canon lift (core func $i "table-second"))))
+    "#;
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    fn resource_store() -> Store<PluginState> {
+        let mut spec = spec([], 1_000_000);
+        spec.limits.max_memory_bytes = 3 * 65536;
+        spec.limits.max_table_elements = 6;
+        new_store(spec)
+    }
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn store_resource_budget_spans_memories() {
+        let component =
+            Component::new(engine(), wat::parse_str(RESOURCE_COMPONENT).unwrap()).unwrap();
+        let linker = wasmtime::component::Linker::new(engine());
+        let mut store = resource_store();
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .unwrap();
+        for (name, delta, expected) in [
+            ("memory-first", 1, 1),
+            ("memory-second", 1, -1),
+            ("memory-second", 0, 1),
+        ] {
+            set_call_fuel(&mut store, 1_000_000);
+            let func = instance
+                .get_typed_func::<(u32,), (i32,)>(&mut store, name)
+                .unwrap();
+            assert_eq!(
+                func.call_async(&mut store, (delta,)).await.unwrap(),
+                (expected,),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn store_resource_budget_spans_tables() {
+        let component =
+            Component::new(engine(), wat::parse_str(RESOURCE_COMPONENT).unwrap()).unwrap();
+        let linker = wasmtime::component::Linker::new(engine());
+        let mut store = resource_store();
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .unwrap();
+        for (name, delta, expected) in [
+            ("table-first", 2, 2),
+            ("table-second", 1, -1),
+            ("table-second", 0, 2),
+        ] {
+            set_call_fuel(&mut store, 1_000_000);
+            let func = instance
+                .get_typed_func::<(u32,), (i32,)>(&mut store, name)
+                .unwrap();
+            assert_eq!(
+                func.call_async(&mut store, (delta,)).await.unwrap(),
+                (expected,),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn store_resource_budget_includes_initial_allocations() {
+        let component =
+            Component::new(engine(), wat::parse_str(RESOURCE_COMPONENT).unwrap()).unwrap();
+        let linker = wasmtime::component::Linker::new(engine());
+        for memory_budget in [true, false] {
+            let mut spec = spec([], 1_000_000);
+            if memory_budget {
+                spec.limits.max_memory_bytes = 65536;
+            } else {
+                spec.limits.max_table_elements = 3;
+            }
+            let mut store = new_store(spec);
+            assert!(
+                linker
+                    .instantiate_async(&mut store, &component)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn store_resource_budget_spans_instances_but_not_stores() {
+        let component =
+            Component::new(engine(), wat::parse_str(RESOURCE_COMPONENT).unwrap()).unwrap();
+        let linker = wasmtime::component::Linker::new(engine());
+        for (bytes, elements, instances) in [
+            (3 * 65536, 100, 10),
+            (1024 * 1024, 6, 10),
+            (1024 * 1024, 100, 1),
+        ] {
+            // Each store admits one instance, then reaches exactly one of the
+            // aggregate memory, aggregate table, or configured instance limits.
+            for _ in 0..2 {
+                let mut spec = spec([], 1_000_000);
+                spec.limits.max_memory_bytes = bytes;
+                spec.limits.max_table_elements = elements;
+                spec.limits.max_instances = instances;
+                let mut store = new_store(spec);
+                linker
+                    .instantiate_async(&mut store, &component)
+                    .await
+                    .unwrap();
+                assert!(
+                    linker
+                        .instantiate_async(&mut store, &component)
+                        .await
+                        .is_err()
+                );
+            }
+        }
     }
 
     fn secret_manifest(capability: PluginCapability) -> PluginManifest {
