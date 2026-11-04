@@ -1922,7 +1922,7 @@ impl RpcDispatcher {
     }
 
     /// Re-establish the caller's authority over `agent`'s cron rows once the
-    /// config writer gate is held, and return the freshly resolved grants.
+    /// config writer gate is held.
     ///
     /// The cron store writes synchronously and can wait out SQLite's busy
     /// timeout, so the grants stamped at the gate may be stale by the time
@@ -1939,12 +1939,11 @@ impl RpcDispatcher {
         agent: &str,
         require_configured: bool,
         _config_writer: &tokio::sync::OwnedMutexGuard<()>,
-    ) -> Result<zeroclaw_api::grants::ResolvedGrants, JsonRpcError> {
+    ) -> Result<(), JsonRpcError> {
         let Some(grants) = self.recheck_authority_after_admission(method)? else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        self.check_agent_selector_with_grants(method, &grants, agent, require_configured)?;
-        Ok(grants)
+        self.check_agent_selector_with_grants(method, &grants, agent, require_configured)
     }
 
     /// Confine a session workspace to a directory the agent's own policy lets
@@ -2244,40 +2243,6 @@ impl RpcDispatcher {
         let target = policy.resolve_policy_target(std::path::Path::new(path))?;
         let root = policy.approved_read_root(&target);
         Some(super::attachments::AttachmentSource { root, target })
-    }
-
-    /// Admit a change to an agent cron job, or a run of one on demand. The
-    /// job keeps its stored tool list and runs under the agent's authority,
-    /// with no connection left to re-resolve whoever last changed or started
-    /// it, so a prompt from a principal narrower than that tool list would
-    /// run with more than the principal holds. Only the shared operator,
-    /// whose authority no grant publication narrows, may change or run one. A scoped principal, or a named
-    /// administrator whose admin grant can later be removed, is refused until
-    /// the runtime can carry and re-check an editor's delegated authority at
-    /// run time. `grants` are the caller's grants as rechecked at the write.
-    fn admit_agent_job_change(
-        &self,
-        method: Method,
-        grants: &zeroclaw_api::grants::ResolvedGrants,
-    ) -> Result<(), JsonRpcError> {
-        if self.auth.is_none() {
-            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
-        }
-        if grants.admin {
-            return Ok(());
-        }
-        let denied = rpc_err(
-            FORBIDDEN,
-            crate::i18n::get_required_cli_string("rpc-cron-agent-principal-required"),
-        );
-        self.audit_auth_denial(
-            method,
-            &crate::rpc::auth::AuthDenied {
-                code: denied.code,
-                message: denied.message.clone(),
-            },
-        );
-        Err(denied)
     }
 
     /// Whether this connection holds operator-level (admin) grants. An
@@ -9857,13 +9822,10 @@ impl RpcDispatcher {
             name: req.name,
             ..Default::default()
         };
-        // The ownership test rides in the `UPDATE` itself for a scoped
-        // principal, so an agent rename landing between the check and the
-        // write cannot open a window. An operator-level principal patches
-        // any row, including the ownerless legacy ones. The config snapshot
-        // is dropped before the lock is awaited: held across it, a whole
-        // `Config` would live in this future and in the dispatch future
-        // that embeds it.
+        // Keep the opaque initial ownership refusal. The config snapshot is
+        // dropped before the gate is awaited: held across it, a whole
+        // `Config` would live in this future and in the dispatch future that
+        // embeds it.
         let owner = {
             let config = self.ctx.config.read().clone();
             self.authorize_cron_job(Method::CronPatch, &config, &req.id)?
@@ -9872,15 +9834,13 @@ impl RpcDispatcher {
         // config is read again under it, so the command is validated against
         // the policy the write commits under.
         let config_writer_guard = self.ctx.config_authority.lock_config_writer().await;
-        let grants = self.recheck_cron_write_authority(
+        self.recheck_cron_write_authority(
             Method::CronPatch,
             &owner.agent_alias,
             false,
             &config_writer_guard,
         )?;
-        if matches!(owner.job_type, crate::cron::JobType::Agent) {
-            self.admit_agent_job_change(Method::CronPatch, &grants)?;
-        }
+        self.authorize_cron_agent_execution(Method::CronPatch, &owner)?;
         let config = self.ctx.config.read().clone();
         // Repeat the authority and row checks under the SQLite writer, so a
         // change to the stored row's owner or type cannot land between them.
