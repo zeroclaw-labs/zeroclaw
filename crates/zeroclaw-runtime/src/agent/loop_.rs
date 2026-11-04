@@ -3544,6 +3544,7 @@ pub fn process_message_with_capabilities<'a>(
         origin,
         None,
         internal_principal,
+        false,
     )
 }
 
@@ -3573,6 +3574,7 @@ pub(crate) fn process_message_shared_with_capabilities<'a>(
         origin,
         execution_admission,
         internal_principal,
+        false,
     )
 }
 
