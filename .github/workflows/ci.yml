@@ -228,8 +228,6 @@ jobs:
       run: ${{ steps.changed.outputs.run }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Detect relay container smoke changes
         id: changed
         shell: bash
@@ -240,6 +238,8 @@ jobs:
 
           case "${{ github.event_name }}" in
             pull_request)
+              # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
               ;;
             push|merge_group)
@@ -353,8 +353,6 @@ jobs:
       run: ${{ steps.changed.outputs.run }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Detect targeted Windows Clippy changes
         id: changed
         shell: bash
@@ -365,6 +363,8 @@ jobs:
 
           case "${{ github.event_name }}" in
             pull_request)
+              # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
               ;;
             push|merge_group)
@@ -426,8 +426,6 @@ jobs:
       windows_service: ${{ steps.select.outputs.windows_service }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Test Windows scope contracts
         run: |
           bash scripts/ci/windows_recovery_change_filter.test.sh
@@ -447,7 +445,9 @@ jobs:
           changed_files="$(mktemp)"
           metadata_file="$(mktemp)"
           if [[ "$EVENT_NAME" == pull_request ]]; then
-            if ! git diff --name-only "$BASE_SHA" HEAD > "$changed_files"; then
+            # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+            if ! git fetch --no-tags --depth=1 origin "$BASE_SHA" \
+              || ! git diff --name-only "$BASE_SHA" HEAD > "$changed_files"; then
               # Discard partial evidence so it cannot authorize a skip.
               : > "$changed_files"
             fi
@@ -1814,8 +1814,6 @@ jobs:
       scope: ${{ steps.changed.outputs.scope }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Test parallel runtime scope classifier
         run: bash scripts/ci/parallel_runtime_test_scope.test.sh
       - name: Detect parallel runtime test changes
@@ -1827,6 +1825,8 @@ jobs:
           case "${{ github.event_name }}" in
             pull_request)
               changed_files="$(mktemp)"
+              # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
               if scope="$(bash scripts/ci/parallel_runtime_test_scope.sh < "$changed_files")"; then
                 echo "run=true" >> "$GITHUB_OUTPUT"
@@ -1978,8 +1978,6 @@ jobs:
       web: ${{ steps.filter.outputs.web }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Classify changed paths
         id: filter
         shell: bash
@@ -2002,6 +2000,8 @@ jobs:
           esac
 
           changed="$(mktemp)"
+          # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
           git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed"
 
           emit() {
@@ -2181,6 +2181,9 @@ jobs:
       - name: Run SOP editor regressions
         working-directory: web
         run: npm run test:sop-editor
+      - name: Run dashboard sign-in regressions
+        working-directory: web
+        run: npm run test:auth
 
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure

@@ -779,12 +779,8 @@ pub struct AllToolsResult {
     pub capability_slots: Vec<crate::composition::CapabilitySlot>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
-    /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
-    /// `dyn Tool`, so a regression cannot otherwise drive the *production*
-    /// delegate instance's nested-registry construction - it can only
-    /// re-derive the wiring by hand, which is exactly the thing that must not
-    /// be trusted. `None` when no agents are configured.
-    #[cfg(test)]
+    /// Retained so an owned session can bind its principal to the exact
+    /// registered delegate before any child memory tools are built.
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
@@ -815,7 +811,6 @@ impl AllToolsResult {
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
             capability_slots: Vec::new(),
-            #[cfg(test)]
             delegate_tool: None,
         }
     }
@@ -2097,6 +2092,7 @@ pub(crate) fn all_tools_with_runtime_context(
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
+    let owner = memory.principal_scope();
     #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
     let late_trace = late_tool_search_observer::capture();
     let builder = move || {
@@ -2146,13 +2142,20 @@ pub(crate) fn all_tools_with_runtime_context(
                     "failed to spawn tool-registry builder thread: {error}"
                 ))
             })?;
-        match handle.join() {
+        let result = match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
+        }?;
+        // Child runs and cross-agent SOP steps arrive with already-private
+        // memory and never pass through Agent's later session routing. Bind
+        // the same delegate instance its canonical name and aliases retain.
+        if let (Some(owner), Some(delegate)) = (owner, result.delegate_tool.as_ref()) {
+            delegate.bind_principal_scope(owner)?;
         }
+        Ok(result)
     })
 }
 
@@ -3674,7 +3677,6 @@ fn all_tools_with_runtime_on_thread(
                     reserved_host_names,
                     delegate_handle: None,
                     capability_slots,
-                    #[cfg(test)]
                     delegate_tool: None,
                     ask_user_handle,
                     channel_room_handle,
@@ -3754,7 +3756,6 @@ fn all_tools_with_runtime_on_thread(
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
-    #[cfg(test)]
     let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
     let delegate_handle: Option<DelegateParentToolsHandle> =
         if agents.is_empty() || !select_tool!("delegate") {
@@ -3819,10 +3820,7 @@ fn all_tools_with_runtime_on_thread(
                 late_tool_search_observer::arc_id(&delegate_tool),
                 0,
             );
-            #[cfg(test)]
-            {
-                built_delegate_tool = Some(Arc::clone(&delegate_tool));
-            }
+            built_delegate_tool = Some(Arc::clone(&delegate_tool));
             tool_arcs.push(delegate_tool as Arc<dyn Tool>);
             Some(parent_tools)
         };
@@ -3921,7 +3919,6 @@ fn all_tools_with_runtime_on_thread(
         reaction_handle,
         poll_handle: root_config.tools.is_enabled("poll").then_some(poll_handle),
         escalate_handle,
-        #[cfg(test)]
         delegate_tool: built_delegate_tool,
     })
 }
