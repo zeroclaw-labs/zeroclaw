@@ -1183,6 +1183,16 @@ impl TranscriptionManager {
         self
     }
 
+    /// Set the fallback alias from `[transcription].default_provider`.
+    /// Assembly paths that compose a manager from parts — the media
+    /// pipeline's typed-only fallback starts from `empty()`, which cannot
+    /// carry config — use this to preserve the configured default.
+    #[must_use]
+    pub fn with_default_provider(mut self, default_provider: Option<String>) -> Self {
+        self.default_provider = default_provider;
+        self
+    }
+
     /// The provider alias `transcribe` will dispatch to: the owning agent's
     /// `transcription_provider` when non-empty, otherwise the configured
     /// `[transcription].default_provider`, otherwise an empty string.
@@ -1285,12 +1295,18 @@ impl TranscriptionManager {
 ///    and an agent that was written against typed aliases — binds the type
 ///    key. This is the compatibility fallback one channel used to apply on
 ///    its own; it now applies everywhere, and only when needed.
-/// 3. No preference and exactly one registered provider: bind it. A lone
-///    provider is unambiguous, and the alternative is a hard failure for every
-///    single-provider deployment.
-/// 4. Otherwise leave the choice unbound: with several providers a silent
-///    pick would route audio to an arbitrary vendor, and `transcribe` fails
-///    loud instead.
+/// 3. No preference: a configured `[transcription].default_provider` wins
+///    over the lone-provider convenience binding. It binds the registered
+///    name the default resolves to (exact key, else family). A default that
+///    names an unavailable provider stays unbound, so `transcribe` resolves
+///    the default and fails loud on the selected provider instead of
+///    silently routing audio to another vendor.
+/// 4. No preference and no default and exactly one registered provider: bind
+///    it. A lone provider is unambiguous, and the alternative is a hard
+///    failure for every single-provider deployment.
+/// 5. Otherwise leave the choice unbound: with several providers and no
+///    default a silent pick would route audio to an arbitrary vendor, and
+///    `transcribe` fails loud instead.
 #[cfg(any(
     feature = "channel-telegram",
     feature = "channel-discord",
@@ -1324,7 +1340,20 @@ fn bind_channel_provider(
         return manager.with_agent_transcription_provider(agent_provider);
     }
     match registered.as_slice() {
-        [only] => manager.with_agent_transcription_provider(only.clone()),
+        [only] => match manager.default_provider.clone() {
+            None => manager.with_agent_transcription_provider(only.clone()),
+            Some(default) => {
+                if registered.iter().any(|name| name == &default) {
+                    manager.with_agent_transcription_provider(default)
+                } else if let Some((family, _alias)) = default.split_once('.')
+                    && registered.iter().any(|name| name == family)
+                {
+                    manager.with_agent_transcription_provider(family.to_string())
+                } else {
+                    manager
+                }
+            }
+        },
         _ => manager,
     }
 }
@@ -1859,6 +1888,128 @@ mod tests {
 
         assert_eq!(manager.agent_transcription_provider, "groq.default");
         assert!(manager.available_providers().contains(&"groq.default"));
+    }
+
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "channel-discord",
+        feature = "channel-slack",
+        feature = "channel-mattermost",
+        feature = "whatsapp-web",
+        feature = "channel-lark",
+        feature = "channel-line",
+        feature = "channel-qq",
+        feature = "channel-matrix",
+        feature = "voice-wake"
+    ))]
+    #[test]
+    fn bind_binds_lone_provider_only_when_no_default_is_configured() {
+        let (manager, _calls) = manager_with_static_provider(None);
+        let bound = bind_channel_provider(manager, "");
+        assert_eq!(bound.agent_transcription_provider, "static");
+    }
+
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "channel-discord",
+        feature = "channel-slack",
+        feature = "channel-mattermost",
+        feature = "whatsapp-web",
+        feature = "channel-lark",
+        feature = "channel-line",
+        feature = "channel-qq",
+        feature = "channel-matrix",
+        feature = "voice-wake"
+    ))]
+    #[test]
+    fn bind_preserves_unavailable_default_over_lone_provider() {
+        let (mut manager, _calls) = manager_with_static_provider(None);
+        manager.default_provider = Some("groq.missing".to_string());
+
+        let bound = bind_channel_provider(manager, "");
+        // The lone provider must not silently override the operator's
+        // selected default: the binding stays empty and resolution falls
+        // back to the default, which fails loud because it is unavailable.
+        assert!(bound.agent_transcription_provider.is_empty());
+        assert_eq!(bound.resolved_agent_alias(), "groq.missing");
+    }
+
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "channel-discord",
+        feature = "channel-slack",
+        feature = "channel-mattermost",
+        feature = "whatsapp-web",
+        feature = "channel-lark",
+        feature = "channel-line",
+        feature = "channel-qq",
+        feature = "channel-matrix",
+        feature = "voice-wake"
+    ))]
+    #[tokio::test]
+    async fn transcribe_with_unavailable_default_fails_loud_not_the_other_vendor() {
+        let (mut manager, calls) = manager_with_static_provider(None);
+        manager.default_provider = Some("groq.missing".to_string());
+        let bound = bind_channel_provider(manager, "");
+
+        let err = bound.transcribe(b"audio", "voice.ogg").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("groq.missing") && msg.contains("not configured"),
+            "error must name the selected default, got: {msg}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the other vendor must not receive the audio"
+        );
+    }
+
+    #[test]
+    fn typed_only_media_pipeline_preserves_the_configured_default() {
+        // Mirror the media pipeline's production composition: transcription
+        // enabled, no legacy provider keys (so the seed constructor bails and
+        // the typed-only fallback shell is used), typed providers registered,
+        // and `[transcription].default_provider` set. The default must
+        // survive the empty-shell fallback.
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
+
+        let mut typed = TranscriptionProviders::default();
+        typed.groq.insert(
+            "main".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("test-groq-key".to_string()),
+                    ..zeroclaw_config::schema::TranscriptionProviderConfig::default()
+                },
+                ..zeroclaw_config::schema::GroqTranscriptionProviderConfig::default()
+            },
+        );
+        let transcription_config = TranscriptionConfig {
+            enabled: true,
+            default_provider: Some("groq.main".to_string()),
+            ..TranscriptionConfig::default()
+        };
+
+        let manager = TranscriptionManager::new(
+            &transcription_config,
+            transcription_config.default_provider.clone(),
+        )
+        .unwrap_or_else(|_| TranscriptionManager::empty())
+        .with_typed_providers(&typed)
+        .with_default_provider(transcription_config.default_provider.clone())
+        .with_agent_transcription_provider(String::new());
+
+        assert!(
+            manager.available_providers().contains(&"groq.main"),
+            "typed-only construction must register the typed provider"
+        );
+        assert_eq!(
+            manager.resolved_agent_alias(),
+            "groq.main",
+            "typed-only construction must preserve the configured default"
+        );
     }
 
     #[test]

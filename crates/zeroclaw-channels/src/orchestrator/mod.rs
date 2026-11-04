@@ -9462,6 +9462,10 @@ async fn process_channel_message_body(
             .unwrap_or_else(|_| crate::transcription::TranscriptionManager::empty());
             let m = base
                 .with_typed_providers(&ctx.prompt_config.providers.transcription)
+                // The empty-shell fallback above cannot carry config, so put
+                // the configured default back explicitly; on the non-fallback
+                // path this is the value `new` already set.
+                .with_default_provider(ctx.transcription_config.default_provider.clone())
                 .with_agent_transcription_provider(ctx.agent_transcription_provider.clone());
             if m.available_providers().is_empty() {
                 None
