@@ -4595,6 +4595,117 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
+    fn signed_in_chat_preserves_approved_prompts_when_sign_out_refuses_a_replacement() {
+        run_ws_regression(
+            "ws-signin-session-prompts",
+            signed_in_chat_preserves_approved_prompts_when_sign_out_refuses_a_replacement_inner,
+        );
+    }
+
+    /// Dashboard sign-out ends approval authority, not durable Chat ownership.
+    /// Exercise both an approved next-turn prompt and a later refused replacement
+    /// through the signed-in socket, then reconnect to the same durable session.
+    async fn signed_in_chat_preserves_approved_prompts_when_sign_out_refuses_a_replacement_inner() {
+        const APPROVED: &str = "retain the synthetic inventory task";
+        const UNAPPROVED: &str = "replace with an unapproved synthetic task";
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in_with(&idp.uri(), |config| {
+            config.channels.session_prompts_enabled = true;
+            config.gateway.session_persistence = true;
+        })
+        .await;
+        fixture.script_tool_call(
+            1,
+            "session_prompt_set",
+            serde_json::json!({"id": "task", "content": APPROVED}),
+        );
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let session_id = "signin-session-prompts";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        let first = fixture
+            .start_parked_turn(&mut client, "keep this session focused")
+            .await;
+        assert!(!first["system"].to_string().contains(APPROVED));
+        fixture.release_next();
+        let approval = next_frame_of(&mut client, "approval_request").await;
+        assert_eq!(approval["tool"], "session_prompt_set");
+        assert_eq!(approval["allow_always"], false);
+        assert!(approval.to_string().contains(APPROVED));
+        send_raw(
+            &mut client,
+            serde_json::json!({
+                "type": "approval_response",
+                "request_id": approval["request_id"],
+                "decision": "approve"
+            }),
+        )
+        .await;
+        fixture.next_provider_request().await;
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let prompts = fixture.backend.list_session_prompts(&session_key).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].content, APPROVED);
+
+        fixture.script_tool_call(
+            3,
+            "session_prompt_set",
+            serde_json::json!({"id": "task", "content": UNAPPROVED}),
+        );
+        let next = fixture
+            .start_parked_turn(&mut client, "review the current task")
+            .await;
+        assert!(next["system"].to_string().contains(APPROVED));
+        fixture.release_next();
+        let replacement = next_frame_of(&mut client, "approval_request").await;
+        assert_eq!(replacement["allow_always"], false);
+        assert!(replacement.to_string().contains(UNAPPROVED));
+        assert_eq!(
+            crate::dashboard_session::test_support::sign_out_over_http(
+                fixture.gateway_addr,
+                &cookie,
+                &csrf,
+            )
+            .await,
+            204,
+        );
+        send_raw(
+            &mut client,
+            serde_json::json!({
+                "type": "approval_response",
+                "request_id": replacement["request_id"],
+                "decision": "approve"
+            }),
+        )
+        .await;
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(code, Some(4401));
+        fixture.next_provider_request().await;
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let prompts = fixture.backend.list_session_prompts(&session_key).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].content, APPROVED);
+
+        let (new_cookie, _) = fixture.sign_in(3600).await;
+        let (mut reconnected, _) = fixture.connect_signed_in(session_id, &new_cookie).await;
+        let restored = fixture
+            .start_parked_turn(&mut reconnected, "continue the approved task")
+            .await;
+        let system = restored["system"].to_string();
+        assert!(system.contains(APPROVED));
+        assert!(!system.contains(UNAPPROVED));
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        fixture.shutdown();
+    }
+
+    #[test]
     fn a_message_waiting_for_the_session_permit_starts_no_turn_after_sign_out() {
         run_ws_regression(
             "ws-signin-permit-wait-after-signout",
