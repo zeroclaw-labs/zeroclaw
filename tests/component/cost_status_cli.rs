@@ -8,6 +8,9 @@ fn write_config(config_dir: &Path) {
         config_dir.join("config.toml"),
         r#"locale = "en"
 
+[channels]
+session_backend = "jsonl"
+
 [cost]
 enabled = true
 daily_limit_usd = 10.0
