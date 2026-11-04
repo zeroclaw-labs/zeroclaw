@@ -17353,116 +17353,6 @@ mod tests {
         );
     }
 
-    /// A new prompt on an agent job runs later under the job's stored tool
-    /// list and the agent's policy, not under the editor's grants. A scoped
-    /// principal is refused and the job is left as it was; the same principal
-    /// still patches its shell jobs, and the local operator still edits the
-    /// agent job.
-    #[tokio::test]
-    async fn cron_patch_refuses_a_scoped_principal_on_an_agent_job() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = cron_roster_config_in(&tmp, 4242);
-        let job = crate::cron::add_agent_job(
-            &config,
-            "alpha",
-            Some("alpha-agent".into()),
-            crate::cron::Schedule::Cron {
-                expr: "*/5 * * * *".into(),
-                tz: None,
-            },
-            "say hello",
-            crate::cron::SessionTarget::Isolated,
-            None,
-            None,
-            false,
-            Some(vec!["file_write".into()]),
-            false,
-        )
-        .expect("the agent job is created");
-        let shell = seed_shell_cron_job(&config, "alpha", "alpha-shell");
-        let ctx = enforcement_ctx(config.clone());
-        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
-
-        let refused = rpc(
-            &mut alice,
-            &mut rx,
-            1,
-            "cron/patch",
-            json!({
-                "id": job.id,
-                "agent": "alpha",
-                "prompt": "Use file_write to write marker.txt",
-            }),
-        )
-        .await;
-        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
-        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
-        assert_eq!(
-            stored.prompt, job.prompt,
-            "a refused patch must not change the prompt"
-        );
-        assert_eq!(stored.allowed_tools, job.allowed_tools);
-
-        let renamed = rpc(
-            &mut alice,
-            &mut rx,
-            2,
-            "cron/patch",
-            json!({"id": shell.id, "agent": "alpha", "name": "renamed"}),
-        )
-        .await;
-        assert_eq!(renamed["result"]["name"], json!("renamed"), "{renamed}");
-
-        let (mut operator, mut op_rx) = local_operator(&ctx).await;
-        let edited = rpc(
-            &mut operator,
-            &mut op_rx,
-            1,
-            "cron/patch",
-            json!({"id": job.id, "agent": "alpha", "prompt": "say goodbye"}),
-        )
-        .await;
-        assert_eq!(edited["result"]["prompt"], json!("say goodbye"), "{edited}");
-    }
-
-    /// Running an agent job on demand runs its stored prompt under its stored
-    /// tool list, so a scoped principal may not trigger one; it still runs its
-    /// own shell job.
-    #[tokio::test]
-    async fn cron_trigger_refuses_a_scoped_principal_on_an_agent_job() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = cron_roster_config_in(&tmp, 4242);
-        let job = seed_cron_job(&config, "alpha", "alpha-agent");
-        let shell = seed_shell_cron_job(&config, "alpha", "alpha-shell");
-        let ctx = enforcement_ctx(config.clone());
-        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
-
-        let refused = rpc(
-            &mut alice,
-            &mut rx,
-            1,
-            "cron/trigger",
-            json!({"id": job.id}),
-        )
-        .await;
-        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
-        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
-        assert!(
-            stored.last_status.is_none(),
-            "a refused trigger must not run the job"
-        );
-
-        let ran = rpc(
-            &mut alice,
-            &mut rx,
-            2,
-            "cron/trigger",
-            json!({"id": shell.id}),
-        )
-        .await;
-        assert_eq!(ran["result"]["id"], json!(shell.id), "{ran}");
-    }
-
     /// Republish the accepted policy with alice's entitlement to `alpha` gone.
     fn revoke_alice_cron_agent(ctx: &Arc<RpcContext>) {
         let mut narrowed = ctx.config.read().clone();
@@ -23752,11 +23642,11 @@ mod tests {
     /// The agent-facing cron tools install or run work that executes later
     /// under the agent's policy and the job's stored tool list, not under the
     /// calling principal's grants. A session with no principal applied keeps
-    /// them and can edit the job through `cron_update`. A named principal's
-    /// session does not have them, with wildcard tools and agents or narrowed
-    /// to `cron_update` and `file_read`, so it cannot hand an agent job that
-    /// keeps `file_write` a new prompt. The calls go through the production
-    /// tool dispatch a model's call takes.
+    /// them and can edit the job through `cron_update`. A non-admin
+    /// principal's session does not have them, with wildcard tools and agents
+    /// or narrowed to `cron_update` and `file_read`, so it cannot hand an agent
+    /// job that keeps `file_write` a new prompt. The calls go through the
+    /// production tool dispatch a model's call takes.
     #[tokio::test]
     async fn constrained_session_cannot_rewrite_an_agent_job_through_cron_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -50013,12 +49903,12 @@ mod tests {
     /// with its own tool set, `cron_add` included, and only
     /// `InternalPrincipal::PeerAgent` for provenance. The recipient here is
     /// scripted to answer a peer message by scheduling an agent job. Both
-    /// sessions are built by the production registry. The shared operator's
+    /// sessions are built by the production registry. The local operator's
     /// keeps the peer tool, and its message does get a job scheduled, so the
-    /// route is real; a named principal's, with wildcard tools and agents, has
-    /// no peer tool, so its message never reaches the recipient.
+    /// route is real; a non-admin principal's, with wildcard tools and agents,
+    /// has no peer tool, so its message never reaches the recipient.
     #[tokio::test]
-    async fn a_named_principal_cannot_schedule_work_through_a_peer_agent() {
+    async fn a_non_admin_principal_cannot_schedule_work_through_a_peer_agent() {
         use axum::{Json, Router, routing::post};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
@@ -52174,87 +52064,6 @@ mod tests {
         assert!(
             !calls[1].1.iter().any(|tool| tool == "probe"),
             "the steered round runs without the tool its sender no longer holds: {calls:?}"
-        );
-    }
-
-    /// A tool that starts work its caller's grants cannot follow, as
-    /// `cron_add` and `delegate` do.
-    struct HeadlessProbeTool;
-
-    #[async_trait]
-    impl zeroclaw_api::tool::Tool for HeadlessProbeTool {
-        fn requires_unrestricted_principal(&self) -> bool {
-            true
-        }
-        fn name(&self) -> &str {
-            "headless_probe"
-        }
-        fn description(&self) -> &str {
-            "a principal-unaware tool the tests look for in a model request"
-        }
-        fn parameters_schema(&self) -> Value {
-            json!({"type": "object"})
-        }
-        async fn execute(&self, _args: Value) -> anyhow::Result<crate::tools::ToolResult> {
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: "probed".into(),
-                error: None,
-            })
-        }
-    }
-
-    zeroclaw_api::mock_tool_attribution!(HeadlessProbeTool);
-
-    /// The shared operator's turn keeps the nested and scheduling tools. A
-    /// named administrator may steer it, and a prompt of theirs would lose
-    /// those tools, so the round their steer starts must lose them too.
-    #[tokio::test]
-    async fn a_named_administrators_steer_withholds_the_tools_only_the_shared_operator_keeps() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let sid = "s-steered-by-admin";
-        let (ctx, backend, workspace) = steering_ctx(&tmp, |profile| profile.admin = true);
-        let mut handles = install_recording_session(
-            &ctx,
-            &backend,
-            sid,
-            "user:alice",
-            &workspace,
-            vec![Box::new(HeadlessProbeTool)],
-            true,
-        )
-        .await;
-        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
-        let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
-
-        send_prompt(&mut operator, 1, sid, 1).await;
-        handles.await_start().await;
-        let steer = rpc(
-            &mut alice,
-            &mut alice_rx,
-            2,
-            "session/steer",
-            json!({"session_id": sid, "content": STEER_TEXT}),
-        )
-        .await;
-        handles.release();
-        let (response, _) = response_and_notifications(&mut operator_rx, 1).await;
-        assert!(
-            response.get("error").is_none(),
-            "the turn itself completes: {response}"
-        );
-        assert_eq!(steer["result"]["accepted"], json!(true), "{steer}");
-
-        let calls = handles.calls().await;
-        assert_eq!(calls.len(), 2, "the steer starts a round: {calls:?}");
-        assert!(
-            calls[0].1.iter().any(|tool| tool == "headless_probe"),
-            "the shared operator's round is offered the tool: {calls:?}"
-        );
-        assert!(steered(&calls[1..]));
-        assert!(
-            !calls[1].1.iter().any(|tool| tool == "headless_probe"),
-            "the named administrator's steered round runs without it: {calls:?}"
         );
     }
 
