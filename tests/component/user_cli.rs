@@ -174,6 +174,30 @@ fn a_crlf_line_is_one_password() {
     assert!(matches(dir.path(), "zeroclaw_user", PASSWORD));
 }
 
+/// A password longer than the limit is refused even when carriage returns
+/// fall where the read stops, rather than hashed shortened.
+#[test]
+fn a_password_cut_at_the_read_limit_is_refused_not_shortened() {
+    let dir = tempfile::tempdir().expect("temporary config directory");
+    let input = format!("{}\r\r\rtail\n", "a".repeat(1024));
+    let output = zeroclaw(
+        dir.path(),
+        &["user", "hash-password", "--password-stdin"],
+        Some(&input),
+    );
+    assert!(
+        !output.status.success(),
+        "a password longer than the limit must be refused: {}",
+        stderr(&output)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no hash may be printed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(stderr(&output).contains("1024"), "{}", stderr(&output));
+}
+
 #[test]
 fn disable_password_keeps_the_uid() {
     let dir = tempfile::tempdir().expect("temporary config directory");

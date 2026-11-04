@@ -16221,11 +16221,17 @@ fn read_new_password(from_stdin: bool) -> Result<zeroize::Zeroizing<String>> {
         let cap = u64::try_from(limit).unwrap_or(u64::MAX);
         let mut line = Zeroizing::new(Vec::with_capacity(limit));
         stdin.lock().take(cap).read_until(b'\n', &mut line)?;
-        let end = line
-            .iter()
-            .rposition(|byte| *byte != b'\n' && *byte != b'\r')
-            .map_or(0, |last| last + 1);
-        line.truncate(end);
+        // Strip the line ending only: a final LF and one CR before it. Any
+        // other carriage return is part of the password, and a read that
+        // stopped at the cap without a line ending holds more bytes than the
+        // longest password, so the check below refuses it rather than hashing
+        // a shortened password.
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
         if line.len() > MAX_PASSWORD_BYTES {
             let max = MAX_PASSWORD_BYTES.to_string();
             bail!(ta(
