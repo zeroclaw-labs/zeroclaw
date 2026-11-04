@@ -14502,7 +14502,11 @@ mod tests {
             .find(|message| message.role == "user")
             .expect("provider request must contain a user message");
         assert!(provider_user.content.starts_with("[CURRENT DATE & TIME: "));
-        assert!(provider_user.content.ends_with("\n\nhook-only provider request"));
+        assert!(
+            provider_user
+                .content
+                .ends_with("\n\nhook-only provider request")
+        );
         assert_eq!(seen_models.lock().as_slice(), ["hook-selected-model"]);
         let hook_inputs = hook_inputs.lock();
         let hook_user = hook_inputs[0]

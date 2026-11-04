@@ -698,10 +698,11 @@ async fn native_family_source_restores_context_fences_legacy_and_excludes_anothe
             history_has_trim_breadcrumb: Some(false),
         };
         let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
+        // Migration removes the transcript's rpc_ wrapper from the public ID.
         let session = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             source.open(
-                "rpc_fixture".into(),
+                "fixture".into(),
                 "test",
                 "fixture".into(),
                 principal.clone(),
@@ -715,7 +716,7 @@ async fn native_family_source_restores_context_fences_legacy_and_excludes_anothe
         assert!(
             source
                 .open(
-                    "rpc_fixture".into(),
+                    "fixture".into(),
                     "test",
                     "another-agent".into(),
                     principal.clone(),
@@ -748,7 +749,7 @@ async fn native_family_source_restores_context_fences_legacy_and_excludes_anothe
         assert!(
             other
                 .open(
-                    "rpc_fixture".into(),
+                    "fixture".into(),
                     "test",
                     "fixture".into(),
                     principal.clone(),
@@ -785,7 +786,7 @@ async fn native_family_source_restores_context_fences_legacy_and_excludes_anothe
         drop(session);
         let reopened = other
             .open(
-                "rpc_fixture".into(),
+                "fixture".into(),
                 "test",
                 "fixture".into(),
                 principal,
