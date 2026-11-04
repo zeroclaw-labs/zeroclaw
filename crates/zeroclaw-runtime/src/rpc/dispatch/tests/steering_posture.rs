@@ -254,7 +254,7 @@ async fn session_tools_after_steering(demotion: Demotion, wildcard: bool) {
                 .delegate_tool
                 .as_ref()
                 .unwrap()
-                .withholds_session_data_tools()
+                .withholds_unrestricted_tools()
         );
         if wildcard {
             assert!(guard.tool_names().contains(&"delegate"));
@@ -274,7 +274,7 @@ async fn session_tools_after_steering(demotion: Demotion, wildcard: bool) {
                 .delegate_tool
                 .as_ref()
                 .unwrap()
-                .withholds_session_data_tools()
+                .withholds_unrestricted_tools()
         );
     }
 }

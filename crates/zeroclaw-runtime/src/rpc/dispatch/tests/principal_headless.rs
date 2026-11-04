@@ -406,3 +406,120 @@ async fn principal_sessions_refuse_headless_tools_and_captured_aliases() {
         }
     }
 }
+
+/// One rule covers every tool that requires an unrestricted principal: a
+/// non-admin with wildcard tool and agent selectors holds none of them at
+/// session creation or after rehydration, except a retained delegate whose
+/// children withhold them as well. An administrator on the same fixture
+/// holds them, so the assertion is not vacuous.
+#[tokio::test]
+async fn wildcard_non_admin_sessions_hold_no_unrestricted_tools() {
+    for admin in [true, false] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        config.tools.optional.extend(TARGETS.map(str::to_owned));
+        let profile = config.risk_profiles.get_mut("test-profile").unwrap();
+        profile.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+        profile.allowed_tools = TARGETS
+            .iter()
+            .map(|n| n.to_string())
+            .chain(["calculator".into()])
+            .collect();
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = admin;
+        let data_dir = config.data_dir.clone();
+        let (operator, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+        let (mut caller, mut rx) = roster_peer(&operator.ctx, 4242).await;
+        let response = rpc(
+            &mut caller,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias":"test-agent", "session_id":"marked-probe", "chat_mode":"acp"}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+        let agent = sessions.get_agent("marked-probe").await.unwrap();
+        {
+            let guard = agent.lock().await;
+            let names = guard.tool_names();
+            let unrestricted = guard.unrestricted_tool_names_for_test();
+            if admin {
+                for name in TARGETS {
+                    assert!(names.contains(&name), "admin control holds {name}: {names:?}");
+                    assert!(
+                        unrestricted.contains(&name),
+                        "{name} requires an unrestricted principal"
+                    );
+                }
+                continue;
+            }
+            assert!(
+                unrestricted
+                    .iter()
+                    .all(|name| *name == crate::tools::DelegateTool::NAME),
+                "a wildcard non-admin holds {unrestricted:?}"
+            );
+            assert!(names.contains(&"calculator"), "{names:?}");
+        }
+        assert!(sessions.remove("marked-probe").await);
+        let current = caller.current_prompt_authority().unwrap();
+        let restored = current
+            .rehydrate_reaped_session("marked-probe", current.stamped_grants())
+            .await
+            .unwrap()
+            .unwrap();
+        let guard = restored.lock().await;
+        let unrestricted = guard.unrestricted_tool_names_for_test();
+        assert!(
+            unrestricted
+                .iter()
+                .all(|name| *name == crate::tools::DelegateTool::NAME),
+            "rehydration restores {unrestricted:?}"
+        );
+    }
+}
+
+/// A session's delegate resolves its credential's current authority each time
+/// it builds a child. An administrator demoted mid-session therefore gets
+/// children that withhold the unrestricted tools before the session's next
+/// prompt applies the narrower posture to the parent.
+#[tokio::test]
+async fn demoted_administrator_delegate_withholds_before_the_next_prompt() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = two_user_config_with_administrator_alice(&tmp);
+    let data_dir = config.data_dir.clone();
+    let (operator, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+    let ctx = Arc::clone(&operator.ctx);
+    let alice = scoped_dispatcher(&ctx, 4242).await;
+    alice
+        .handle_session_new_for_test(&json!({
+            "agent_alias": "test-agent",
+            "session_id": "alice-admin",
+            "chat_mode": "acp",
+        }))
+        .await
+        .expect("alice creates her session");
+    let agent = sessions
+        .get_agent("alice-admin")
+        .await
+        .expect("alice's session is live");
+    let delegate = agent
+        .lock()
+        .await
+        .delegate_tool
+        .clone()
+        .expect("the registry built a delegate");
+    assert!(
+        !delegate.withholds_unrestricted_tools(),
+        "an administrator's children keep the tools"
+    );
+    set_alice_administrator(&ctx, false);
+    assert!(
+        delegate.withholds_unrestricted_tools(),
+        "children built after the demotion withhold the tools"
+    );
+}

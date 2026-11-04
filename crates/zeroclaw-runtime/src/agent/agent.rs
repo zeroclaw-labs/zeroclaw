@@ -2219,8 +2219,8 @@ impl Agent {
         if posture.disable_principal_unaware_nested_tools {
             self.disable_principal_unaware_nested_tools();
         }
-        if posture.withhold_principal_unaware_session_tools {
-            self.withhold_principal_unaware_session_tools();
+        if posture.withhold_unrestricted_tools {
+            self.withhold_unrestricted_tools();
         }
     }
 
@@ -2337,46 +2337,27 @@ impl Agent {
         self.refresh_system_prompt();
     }
 
-    /// SOP tools cannot enforce a principal ceiling. Withhold them and their
-    /// wrappers for non-admins, including nested builders that would restore
-    /// them. The retained delegate resolves the original caller's current
-    /// authority whenever it builds a child registry.
-    pub(crate) fn apply_sop_tool_admission(
-        &mut self,
-        admin: bool,
-        admission: Arc<dyn Fn() -> bool + Send + Sync>,
-    ) {
-        let carries_admission = if let Some(delegate) = &self.delegate_tool {
-            delegate.set_sop_tool_admission(admission);
-            true
-        } else {
-            false
-        };
-        if admin {
-            return;
-        }
-        let held = self.tools.len();
-        self.tools.retain(|tool| {
-            (carries_admission && tool.name() == crate::tools::DelegateTool::NAME)
-                || !tool.requires_unrestricted_principal()
-        });
-        if self.tools.len() != held {
-            self.refresh_system_prompt();
+    /// Bind the retained delegate's child registries to the originating RPC
+    /// credential's live authority, so a child built after that credential
+    /// loses administrator authority withholds what this Agent withholds.
+    pub(crate) fn bind_principal_admission(&self, admission: Arc<dyn Fn() -> bool + Send + Sync>) {
+        if let Some(delegate) = &self.delegate_tool {
+            delegate.set_principal_admission(admission);
         }
     }
 
-    /// The session-data tools list, read, and append to other sessions with
-    /// no principal-ownership check, so a principal without operator reach
-    /// holds none of them, whatever its selectors admit. Skill aliases of
-    /// them go too, and so do nested executors that cannot carry this
-    /// withholding. The delegate stays when this Agent holds its handle: the
-    /// handle makes every registry it builds withhold them as well. Like the
+    /// A tool that requires an unrestricted principal does work the caller's
+    /// principal does not carry: it starts headless or scheduled runs, turns
+    /// on other agents, SOP steps, or reads and writes other principals'
+    /// sessions. A principal without operator reach holds none of them,
+    /// whatever its selectors admit. Skill aliases forward the marker and go
+    /// too. The delegate stays when this Agent holds its handle: the handle
+    /// makes every registry it builds withhold them as well. Like the
     /// selector narrowing, this never restores a tool.
-    pub(crate) fn withhold_principal_unaware_session_tools(&mut self) {
-        let withheld = crate::tools::DelegateTool::withheld_session_data_tool_names(&self.skills);
+    pub(crate) fn withhold_unrestricted_tools(&mut self) {
         let delegate_withholds = match &self.delegate_tool {
             Some(delegate) => {
-                delegate.withhold_session_data_tools();
+                delegate.withhold_unrestricted_tools();
                 true
             }
             None => false,
@@ -2384,10 +2365,7 @@ impl Agent {
         let held = self.tools.len();
         self.tools.retain(|tool| {
             (delegate_withholds && tool.name() == crate::tools::DelegateTool::NAME)
-                || crate::tools::DelegateTool::keeps_with_session_data_withheld(
-                    tool.as_ref(),
-                    &withheld,
-                )
+                || !tool.requires_unrestricted_principal()
         });
         // This runs at prompt and steering admission; rebuild only when the
         // tool set it lists actually changed.
@@ -2399,6 +2377,15 @@ impl Agent {
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unrestricted_tool_names_for_test(&self) -> Vec<&str> {
+        self.tools
+            .iter()
+            .filter(|t| t.requires_unrestricted_principal())
+            .map(|t| t.name())
+            .collect()
     }
 
     #[cfg(test)]
@@ -10086,6 +10073,11 @@ mod tests {
 
     #[async_trait]
     impl Tool for SessionHistoryProbe {
+        // Like the real `sessions_history`, which reads other sessions.
+        fn requires_unrestricted_principal(&self) -> bool {
+            true
+        }
+
         fn name(&self) -> &str {
             "sessions_history"
         }
@@ -10445,11 +10437,15 @@ mod tests {
 
     /// A skill alias of a session-data tool and a nested executor that runs
     /// its own tool set would each reach what the withholding removes, so
-    /// both go with the tools. `sessions_current` stays. The delegate stays
+    /// both go with the tools. The real `sessions_list` and `sessions_send`
+    /// go by their own marker; `sessions_current` stays. The delegate stays
     /// only when the Agent holds its handle and can make its children
     /// withhold the tools too; without the handle it goes as well.
     #[tokio::test]
     async fn withholding_session_data_tools_removes_aliases_and_nested_executors() {
+        let session_dir = tempfile::TempDir::new().unwrap();
+        let sessions: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(session_dir.path()).unwrap());
         let history_calls = Arc::new(AtomicUsize::new(0));
         let history: Arc<dyn Tool> = Arc::new(SessionHistoryProbe {
             calls: Arc::clone(&history_calls),
@@ -10458,6 +10454,7 @@ mod tests {
         skill.tools[0].kind = "builtin".to_string();
         skill.tools[0].target = Some("sessions_history".to_string());
         let security = Arc::new(crate::security::SecurityPolicy::default());
+        let send_security = Arc::clone(&security);
         let build = |delegate: Option<Arc<crate::tools::DelegateTool>>,
                      registered: Arc<dyn Tool>| {
             let alias = crate::tools::skill_tool::SkillBuiltinTool::new(
@@ -10477,9 +10474,16 @@ mod tests {
             );
             let tools: Vec<Box<dyn Tool>> = vec![
                 Box::new(crate::tools::ArcToolRef(Arc::clone(&history))),
-                Box::new(NamedMockTool::new("sessions_list")),
-                Box::new(NamedMockTool::new("sessions_send")),
-                Box::new(NamedMockTool::new("sessions_current")),
+                Box::new(zeroclaw_tools::sessions::SessionsListTool::new(Arc::clone(
+                    &sessions,
+                ))),
+                Box::new(zeroclaw_tools::sessions::SessionsSendTool::new(
+                    Arc::clone(&sessions),
+                    Arc::clone(&send_security),
+                )),
+                Box::new(zeroclaw_tools::sessions::SessionsCurrentTool::new(
+                    Arc::clone(&sessions),
+                )),
                 Box::new(alias),
                 Box::new(pipeline),
                 Box::new(crate::tools::ArcToolRef(registered)),
@@ -10524,11 +10528,11 @@ mod tests {
         }
         assert_eq!(history_calls.load(Ordering::SeqCst), entry_points.len());
 
-        agent.withhold_principal_unaware_session_tools();
+        agent.withhold_unrestricted_tools();
         let mut names = agent.tool_names();
         names.sort_unstable();
         assert_eq!(names, vec!["delegate", "sessions_current"]);
-        assert!(delegate.withholds_session_data_tools());
+        assert!(delegate.withholds_unrestricted_tools());
         for name in entry_points {
             let outcome = agent.dispatch_tool_for_test(name, steps.clone()).await;
             assert!(!outcome.success, "{name}: {}", outcome.output);
@@ -10541,7 +10545,7 @@ mod tests {
             security,
         ));
         let mut agent = build(None, unbound);
-        agent.withhold_principal_unaware_session_tools();
+        agent.withhold_unrestricted_tools();
         assert_eq!(agent.tool_names(), vec!["sessions_current"]);
     }
 
@@ -16649,7 +16653,7 @@ mod tests {
                         crate::agent::SteeringAdmission::Admitted(crate::agent::SteeringPosture {
                             tool_ceiling: Some(Vec::new()),
                             disable_principal_unaware_nested_tools: false,
-                            withhold_principal_unaware_session_tools: false,
+                            withhold_unrestricted_tools: false,
                         })
                     }),
                 )

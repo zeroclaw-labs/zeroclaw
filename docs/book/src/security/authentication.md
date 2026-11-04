@@ -387,25 +387,43 @@ If either the principal's tool selector or agent selector is constrained,
 `delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
 are unavailable, including skill aliases wrapping those tools. These nested
 paths do not yet carry both current principal ceilings; the ordinary parent
-turn remains usable. Admin principals keep their agent's configured nested
-capabilities. Principals with both selectors set to `"*"` keep `delegate`
-itself, but lose its skill aliases, `spawn_subagent`, and `execute_pipeline`
-with the session-data tools below.
+turn remains usable.
 
-The session-data tools `sessions_list`, `sessions_history`, and
-`sessions_send` list, read, and append to other sessions without checking
-who owns them, so no principal without `admin` holds them in its sessions,
-whatever its selectors name, `"*"` included. Skill aliases of those tools go
-with them, and so do `spawn_subagent` and `execute_pipeline` (with their
-skill aliases), whose nested runs would hold them again. A retained
-`delegate` withholds the same tools from every bounded, independent,
-background, and parallel child it builds. `sessions_current`, which reports
-only the caller's own session, stays. The withholding is applied at session
-creation, at rehydration, before every prompt, and when accepted steering is
-consumed, including its recheck after memory writes. An administrator demoted
-mid-session loses the tools at the next prompt or accepted steering. Like selector
-narrowing, it never gives them back to a live session. Admin principals and
-the shared operator keep them.
+Some tools do work that does not carry the caller's principal, so no
+principal without `admin` holds them in its sessions, whatever its selectors
+name, `"*"` included:
+
+- `sessions_list`, `sessions_history`, and `sessions_send` list, read, and
+  append to other sessions without checking who owns them, and so would
+  `sessions_reset` and `sessions_delete` if an agent registered them.
+  `sessions_current`, which reports only the caller's own session, stays.
+- `cron_add`, `cron_update`, `cron_run`, `cron_list`, `cron_runs`,
+  `cron_remove`, and `schedule`: scheduled turns do not carry the caller's
+  restrictions, and cron rows and run output are shared by agent rather than
+  owned by the calling principal.
+- `send_message_to_peer`, whose turns run on another agent.
+- `sop_execute`, `sop_advance`, `sop_approve`, and `sop_workshop`: SOP steps
+  run headlessly as the procedure's agents, and an applied workshop proposal
+  becomes a shared procedure that later runs the same way. Read-only SOP
+  tools follow the ordinary tool selector.
+- `spawn_subagent` and `execute_pipeline`, whose nested runs would hold the
+  tools above again.
+
+Each of these tools reports `requires_unrestricted_principal`, so a skill
+alias of one goes with it. The direct `delegate` tool stays when both
+selectors are `"*"`, because the session holds its handle: every bounded,
+independent, background, parallel, and nested child it builds withholds the
+same tools. It also resolves the originating credential's current authority
+when it builds each child, so a child built after that credential loses
+`admin` withholds them too. Its skill aliases are withheld, because their
+captured targets cannot be identified as the bound handle.
+
+The withholding is applied at session creation, at rehydration, before every
+prompt, and when accepted steering is consumed, including its recheck after
+memory writes. An administrator demoted mid-session loses the tools at the
+next prompt or accepted steering. Like selector narrowing, it never gives
+them back to a live session. Admin principals and the shared operator keep
+their agent's configured tools, and existing cron jobs keep running.
 
 A queued prompt resolves authority again on the exact Agent that will execute
 the turn, after provider reconciliation and Agent/task waits. The same admission
@@ -414,39 +432,11 @@ after storage contention. A refused admission does not call the provider or
 persist a terminal turn. This is a turn-admission boundary, not continuous
 revocation of a turn that is already running.
 
-The model-facing tools `cron_add`, `cron_update`, `cron_run`, `cron_list`,
-`cron_runs`, `cron_remove`, `schedule`, and `send_message_to_peer` are also
-withheld from every non-admin principal, including their skill aliases and
-copies in delegated registries. Scheduled and peer turns do not carry the
-calling principal's restrictions, and cron rows and run output are shared by
-agent rather than owned by the calling principal. The same creation,
-rehydration, prompt-admission, and steering-consumption checks apply; administrator and shared
-operator sessions keep their configured tools. Existing jobs keep running.
-
 RPC `cron/patch` and `cron/trigger` also refuse agent jobs for non-admins,
 including wildcard selectors. These jobs cannot carry the caller's session
 restrictions; the check uses current authority after looking up the job.
 Shell jobs retain their existing grant and command-policy checks. Cron reads,
 deletion, and jobs already scheduled by an operator are unchanged.
-
-Non-admin RPC sessions cannot use `sop_execute`, `sop_approve`,
-`sop_advance`, or `sop_workshop`, including skill aliases. They also cannot
-use `spawn_subagent` or `execute_pipeline`: those builders can restore SOP
-entry points without carrying the caller's authority. Read-only SOP tools
-remain available according to the ordinary tool selector.
-
-The direct `delegate` tool remains available when both principal selectors
-are `"*"`; its aliases are withheld because their captured targets cannot
-be identified as the controlled delegate handle.
-Bounded, independent, background, parallel, and nested delegates inherit a
-resolver for the originating credential and read its current authority when
-building each child registry; they withhold the same unsafe tools for a
-non-admin or a revoked credential. Constrained selectors still disable
-`delegate` and its aliases because delegation does not carry both selector
-ceilings. Administrators and the shared operator keep configured tools.
-As with other session tool narrowing, demotion removes parent tools at the
-next prompt admission and a later promotion does not restore removed tools
-in an existing session.
 
 RPC `sops/run` and `sops/decide` require administrator grants, including
 when a non-admin has wildcard tool and agent selectors. Headless steps do
@@ -457,6 +447,14 @@ refuses the request immediately; retry once contention clears. Background
 SOP processing keeps its normal storage timeout. SOP authoring retains its
 separate agent-selector checks.
 
+Until the session-data tools check ownership, scheduled agent jobs, SOP runs,
+and peer turns started by an administrator or a trigger can still call them.
+To remove them from those runs too, list `sessions_list`, `sessions_history`,
+and `sessions_send`, plus any skill tool that targets them, in
+`excluded_tools` of the risk profile of each agent those runs use. That
+removes them from every run of those agents, administrators' sessions
+included.
+
 The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
 constructor remains available. RPC uses the additive
 `from_live_config_with_tui_env_and_principal_tools` constructor and reapplies
@@ -464,10 +462,10 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, or give an
-existing agent job a new prompt and trigger it, and one holding SOP create
-or update grants can save a procedure whose trigger runs it later. Treat
-cron and SOP authoring grants as grants of the agent's tools.
+holding cron grants can create a shell job for its agent, though agent jobs
+are refused to it as described above, and one holding SOP create or update
+grants can save a procedure whose trigger runs it later. Treat cron and SOP
+authoring grants as grants of the agent's tools.
 
 Principal-owned sessions may use synchronous and parallel delegation when
 their grants allow it. Background delegation and its `check_result`,

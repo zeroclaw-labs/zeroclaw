@@ -137,15 +137,6 @@ pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_purge",
 ];
 
-/// Session-data tools that list, read, or append to sessions other than the
-/// caller's own with no principal-ownership check. A principal without
-/// operator reach must not hold them until they take a principal-aware view.
-/// `sessions_current` reports only the caller's own session and is not listed.
-/// `sessions_reset` and `sessions_delete` also act on another session by id.
-/// Neither is registered today; each must join this list if it ever is.
-pub const PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES: &[&str] =
-    &["sessions_list", "sessions_history", "sessions_send"];
-
 /// Shared test-only isolation for the process-global runtime proxy state that
 /// production `Tool::execute` paths read (`http_request`, `web_fetch`) and
 /// `proxy_config` tests mutate through the real setters.
@@ -225,41 +216,50 @@ mod memory_tool_names_guard {
 }
 
 #[cfg(test)]
-mod session_tool_names_guard {
-    use super::*;
-    use std::collections::BTreeSet;
+mod session_tool_marker_guard {
     use std::sync::Arc;
     use zeroclaw_api::tool::Tool;
     use zeroclaw_config::policy::SecurityPolicy;
     use zeroclaw_infra::session_backend::SessionBackend;
     use zeroclaw_infra::session_store::SessionStore;
 
+    /// Every session tool that addresses a session other than the caller's
+    /// own has no ownership check, so it must require an unrestricted
+    /// principal. `sessions_current` reports only the caller's own session.
     #[test]
-    fn principal_unaware_session_tool_names_match_tools() {
+    fn cross_session_tools_require_an_unrestricted_principal() {
         let tmp = tempfile::TempDir::new().unwrap();
         let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
-        let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(sessions::SessionsListTool::new(backend.clone())),
-            Box::new(sessions::SessionsHistoryTool::new(
+        let cross_session: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::sessions::SessionsListTool::new(backend.clone())),
+            Box::new(crate::sessions::SessionsHistoryTool::new(
                 backend.clone(),
                 security.clone(),
             )),
-            Box::new(sessions::SessionsSendTool::new(backend.clone(), security)),
+            Box::new(crate::sessions::SessionsSendTool::new(
+                backend.clone(),
+                security.clone(),
+            )),
+            Box::new(crate::sessions::SessionResetTool::new(
+                backend.clone(),
+                security.clone(),
+            )),
+            Box::new(crate::sessions::SessionDeleteTool::new(
+                backend.clone(),
+                security,
+            )),
         ];
-        let actual: BTreeSet<&str> = tools.iter().map(|t| t.name()).collect();
-        let listed: BTreeSet<&str> = PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
-            .iter()
-            .copied()
-            .collect();
-        assert_eq!(
-            actual, listed,
-            "PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES is out of sync with the constructed \
-             session-data tools; update the const in zeroclaw-tools/src/lib.rs"
-        );
-        let current = sessions::SessionsCurrentTool::new(backend);
+        for tool in &cross_session {
+            assert!(
+                tool.requires_unrestricted_principal(),
+                "{} must require an unrestricted principal",
+                tool.name()
+            );
+        }
+        let current = crate::sessions::SessionsCurrentTool::new(backend);
         assert!(
-            !PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES.contains(&current.name()),
+            !current.requires_unrestricted_principal(),
             "sessions_current addresses only the caller's own session"
         );
     }

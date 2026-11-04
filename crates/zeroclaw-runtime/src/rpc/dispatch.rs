@@ -619,8 +619,9 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 }
 
 /// Project freshly resolved grants into the complete posture used by both
-/// prompts and steering. A wildcard tool selector does not grant ownership
-/// of other sessions or authority to start principal-unaware headless turns.
+/// prompts and steering. A wildcard tool or agent selector does not grant
+/// ownership of other sessions, or authority for work that runs later, on
+/// another agent or as SOP steps without the caller's principal.
 fn principal_tool_posture(
     grants: &zeroclaw_api::grants::ResolvedGrants,
 ) -> crate::agent::SteeringPosture {
@@ -631,7 +632,7 @@ fn principal_tool_posture(
                 .allowed_agents
                 .iter()
                 .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD),
-        withhold_principal_unaware_session_tools: !grants.admin,
+        withhold_unrestricted_tools: !grants.admin,
     }
 }
 
@@ -2398,18 +2399,15 @@ impl RpcDispatcher {
         grants: &zeroclaw_api::grants::ResolvedGrants,
         agent: &mut crate::agent::agent::Agent,
     ) {
-        agent.apply_principal_tool_posture(principal_tool_posture(grants));
         if let Some(auth) = self.auth.clone() {
             let inbound = Arc::clone(&self.ctx.auth);
-            agent.apply_sop_tool_admission(
-                grants.admin,
-                Arc::new(move || {
-                    inbound
-                        .current_grants(&auth)
-                        .is_ok_and(|grants| grants.admin)
-                }),
-            );
+            agent.bind_principal_admission(Arc::new(move || {
+                inbound
+                    .current_grants(&auth)
+                    .is_ok_and(|grants| grants.admin)
+            }));
         }
+        agent.apply_principal_tool_posture(principal_tool_posture(grants));
     }
 
     /// Queued prompts must not execute with the transport-time grants clone.
@@ -33104,7 +33102,7 @@ mod tests {
         foreign_session_key: &str,
     ) {
         let agent = agent.lock().await;
-        for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES {
+        for name in crate::tools::SESSION_DATA_TOOL_NAMES {
             assert!(
                 agent.execute_tool_for_test(name, json!({})).await.is_none(),
                 "{name} must be withheld"
@@ -33135,7 +33133,7 @@ mod tests {
                 .delegate_tool
                 .as_ref()
                 .expect("the registry built a delegate")
-                .withholds_session_data_tools(),
+                .withholds_unrestricted_tools(),
             "the retained delegate must withhold the tools from its children"
         );
     }
@@ -33220,7 +33218,7 @@ mod tests {
         let operator_agent = sessions.get_agent("operator-acp").await.unwrap();
         let operator_agent = operator_agent.lock().await;
         let names = operator_agent.tool_names();
-        for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+        for name in crate::tools::SESSION_DATA_TOOL_NAMES
             .iter()
             .chain(&["sessions_current", "spawn_subagent"])
         {
@@ -33231,7 +33229,7 @@ mod tests {
                 .delegate_tool
                 .as_ref()
                 .expect("the registry built a delegate")
-                .withholds_session_data_tools()
+                .withholds_unrestricted_tools()
         );
     }
 
@@ -33251,7 +33249,7 @@ mod tests {
             .unwrap()
             .allowed_tools
             .extend(
-                zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+                crate::tools::SESSION_DATA_TOOL_NAMES
                     .iter()
                     .chain(&["sessions_current"])
                     .map(|name| (*name).to_string()),
@@ -33273,7 +33271,7 @@ mod tests {
         {
             let agent = handle.lock().await;
             let names = agent.tool_names();
-            for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+            for name in crate::tools::SESSION_DATA_TOOL_NAMES
                 .iter()
                 .chain(&["spawn_subagent"])
             {
@@ -33301,7 +33299,7 @@ mod tests {
         let mut agent = handle.lock().await;
         current.apply_principal_grants_to_agent(&grants, &mut agent);
         let names = agent.tool_names();
-        for name in zeroclaw_tools::PRINCIPAL_UNAWARE_SESSION_TOOL_NAMES
+        for name in crate::tools::SESSION_DATA_TOOL_NAMES
             .iter()
             .chain(&["spawn_subagent"])
         {
@@ -33318,7 +33316,7 @@ mod tests {
                 .delegate_tool
                 .as_ref()
                 .expect("the registry built a delegate")
-                .withholds_session_data_tools()
+                .withholds_unrestricted_tools()
         );
     }
 

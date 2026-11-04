@@ -517,6 +517,13 @@ pub fn default_tools_with_runtime(
     ]
 }
 
+/// The registered session-data tools that address other sessions. Each
+/// requires an unrestricted principal; tests use the names to check that a
+/// non-admin registry holds none of them.
+#[cfg(test)]
+pub(crate) const SESSION_DATA_TOOL_NAMES: &[&str] =
+    &["sessions_list", "sessions_history", "sessions_send"];
+
 #[cfg(test)]
 pub(crate) fn register_skill_tools(
     tools_registry: &mut Vec<Box<dyn Tool>>,
