@@ -217,13 +217,13 @@ impl Drop for GatewayDeletionCancellation {
     }
 }
 
-/// Cancel an active gateway turn or atomically latch DELETE for an admitted
-/// turn that has not registered its token yet.
+/// Cancel matching active turns and retain a deletion claim for the generation.
 ///
 /// Gateway session IDs are reusable after deletion. The cancellation registry
-/// carries the same incarnation boundary as the session queue. The pending
-/// latch and token registration share one mutex, so either DELETE cancels the
-/// exact active token or later registration observes the outstanding signal.
+/// carries the same incarnation boundary as the session queue. Every DELETE
+/// retains a claim until its guard drops; only the last guard releases it.
+/// Claims and token registration share one mutex, so late or replacement
+/// registration observes the claim even when DELETE already cancelled a token.
 pub fn signal_deletion_at_generation(
     registry: &Arc<Mutex<GatewayCancellationRegistry>>,
     session_key: &str,
@@ -330,7 +330,7 @@ mod tests {
         );
         assert!(
             underscored.is_cancelled(),
-            "late registration must consume its latch"
+            "late registration must observe its outstanding deletion claim"
         );
         assert!(!dotted.is_cancelled());
         drop(deletion);

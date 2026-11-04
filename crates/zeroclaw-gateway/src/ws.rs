@@ -5040,7 +5040,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
         assert!(
             registration.token().is_cancelled(),
-            "registration must atomically consume the pending DELETE signal"
+            "registration must atomically observe the retained DELETE claim"
         );
         assert!(
             state
