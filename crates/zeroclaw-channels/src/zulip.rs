@@ -701,6 +701,9 @@ pub struct ZulipChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     stream_ids: Vec<u64>,
     mention_only: bool,
+    /// Whether this alias answers direct messages. Several aliases can share
+    /// one bot (one per stream): only one of them, or none, should take DMs.
+    dm_enabled: bool,
     proxy_url: Option<String>,
     tls_ca_cert: Option<reqwest::Certificate>,
     gate_key: [u8; 32],
@@ -734,6 +737,7 @@ impl ZulipChannel {
             peer_resolver,
             stream_ids: Vec::new(),
             mention_only,
+            dm_enabled: true,
             proxy_url: None,
             tls_ca_cert: None,
             // From the config type, so the Rust default cannot drift from the serde one
@@ -744,6 +748,23 @@ impl ZulipChannel {
             approvals: Arc::new(Mutex::new(ApprovalState::default())),
             cancel: Mutex::new(None),
             health: Mutex::new(HealthState::default()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_dm_enabled(mut self, enabled: bool) -> Self {
+        self.dm_enabled = enabled;
+        self
+    }
+
+    /// Whether a conversation belongs to this alias: one of its streams (or any
+    /// stream when none is configured), or a DM when DMs are enabled.
+    fn owns_target(&self, target: &Target) -> bool {
+        match target {
+            Target::Stream { stream_id, .. } => {
+                self.stream_ids.is_empty() || self.stream_ids.contains(stream_id)
+            }
+            Target::Direct { .. } => self.dm_enabled,
         }
     }
 
@@ -1123,10 +1144,10 @@ impl ZulipChannel {
         // "wildcard_mentioned" (@all) is deliberately ignored
         let mentioned = ev.flags.iter().any(|f| f == "mentioned");
 
-        if let Target::Stream { stream_id, .. } = &target {
-            if !self.stream_ids.is_empty() && !self.stream_ids.contains(stream_id) {
-                return None;
-            }
+        if !self.owns_target(&target) {
+            return None;
+        }
+        if let Target::Stream { .. } = &target {
             // DMs always bypass mention_only, as in Mattermost. A text answer to
             // a gate posted here passes too: whoever replies
             // `approve <reference>` need not mention the bot.
@@ -1216,6 +1237,11 @@ impl ZulipChannel {
                         self.remember_not_gate(message_id);
                         return false;
                     };
+                    // Another alias of the same bot owns prompts posted elsewhere
+                    if !self.owns_target(&target) {
+                        self.remember_not_gate(message_id);
+                        return false;
+                    }
                     let target = target.encode();
                     if !verify_gate(&self.gate_key, &reference, &target, &signature) {
                         self.remember_not_gate(message_id);
@@ -2105,6 +2131,36 @@ mod tests {
         let _b = register_pending(&ch, "def456", "stream:3:ops", 701);
         assert_eq!(ch.pending_tokens_for("dm:10"), vec!["abc123".to_string()]);
         assert!(ch.pending_tokens_for("dm:42").is_empty());
+    }
+
+    #[test]
+    fn dm_is_ignored_when_disabled_for_this_alias() {
+        let ch = channel(false).with_dm_enabled(false);
+        assert!(ch.parse_message(&dm_msg(OPERATOR, "ciao"), &me()).is_none());
+        assert!(
+            channel(false)
+                .parse_message(&dm_msg(OPERATOR, "ciao"), &me())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn alias_owns_only_its_streams() {
+        let ch = channel(false)
+            .with_stream_ids(&["3".to_string()])
+            .unwrap()
+            .with_dm_enabled(false);
+        let mine = Target::Stream {
+            stream_id: 3,
+            topic: "t".into(),
+        };
+        let other = Target::Stream {
+            stream_id: 4,
+            topic: "t".into(),
+        };
+        assert!(ch.owns_target(&mine));
+        assert!(!ch.owns_target(&other));
+        assert!(!ch.owns_target(&Target::direct(vec![OPERATOR])));
     }
 
     #[test]

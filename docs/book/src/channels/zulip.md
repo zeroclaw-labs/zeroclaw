@@ -153,10 +153,28 @@ Limits:
 
 ## Several bots
 
-Each `[channels.zulip.<alias>]` is an independent bot with its own event queue,
-credentials and marker key. Use one bot per agent and bind each alias to its
+Each `[channels.zulip.<alias>]` has its own event queue and is bound to one
 agent; peer groups and approval routes can target a single alias
-(`zulip.<alias>`).
+(`zulip.<alias>`). Two layouts work:
+
+- **One bot per agent**: every alias has its own bot credentials.
+- **One bot for several agents**: aliases share the same bot credentials, each
+  with its own `stream_ids`, so the stream decides which agent answers. Set
+  `dm_enabled = false` on these aliases, otherwise every alias of the bot would
+  answer the same direct message. Each alias also accepts gate reactions only on
+  prompts posted in its own streams.
+
+```toml
+[channels.zulip.prj_a]
+email = "projects-bot@zulip.example.com"
+stream_ids = ["11"]
+dm_enabled = false
+
+[channels.zulip.prj_b]
+email = "projects-bot@zulip.example.com"
+stream_ids = ["12"]
+dm_enabled = false
+```
 
 ## Operational notes
 

@@ -17796,6 +17796,11 @@ pub struct ZulipConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: Option<bool>,
+    /// Whether this alias answers direct messages (default true). Set false when
+    /// several aliases share one bot, each bound to its own streams.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub dm_enabled: Option<bool>,
     /// Per-channel proxy URL; overrides the global `[proxy]` setting.
     #[tab(Advanced)]
     #[serde(default)]
@@ -17826,6 +17831,7 @@ impl Default for ZulipConfig {
             tls_ca_cert_path: None,
             stream_ids: Vec::new(),
             mention_only: None,
+            dm_enabled: None,
             proxy_url: None,
             excluded_tools: Vec::new(),
             reply_min_interval_secs: 0,

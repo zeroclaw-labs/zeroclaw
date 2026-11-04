@@ -13401,6 +13401,7 @@ fn build_channel_by_id(
                 )
                 .with_stream_ids(&zc.stream_ids)?
                 .with_proxy_url(zc.proxy_url.clone())
+                .with_dm_enabled(zc.dm_enabled.unwrap_or(true))
                 .with_tls_ca_cert_path(zc.tls_ca_cert_path.as_deref())?
                 .with_approval_timeout_secs(zc.approval_timeout_secs),
             ))
@@ -15076,7 +15077,10 @@ fn collect_configured_channels_with_authority(
             zc.mention_only.unwrap_or(false),
         )
         .with_stream_ids(&zc.stream_ids)
-        .map(|c| c.with_proxy_url(zc.proxy_url.clone()))
+        .map(|c| {
+            c.with_proxy_url(zc.proxy_url.clone())
+                .with_dm_enabled(zc.dm_enabled.unwrap_or(true))
+        })
         .and_then(|c| c.with_tls_ca_cert_path(zc.tls_ca_cert_path.as_deref()));
         let channel = match built {
             Ok(channel) => channel.with_approval_timeout_secs(zc.approval_timeout_secs),
