@@ -129,6 +129,9 @@ const TARGETS: [&str; 8] = [
     "send_message_to_peer",
 ];
 
+/// Tools that save daemon config, which RPC gates behind `config:update`.
+const CONFIG_WRITERS: [&str; 2] = ["model_routing_config", "proxy_config"];
+
 struct HeadlessToolProbe {
     job: String,
     observed: Arc<std::sync::Mutex<Vec<String>>>,
@@ -414,13 +417,17 @@ async fn principal_sessions_refuse_headless_tools_and_captured_aliases() {
 /// holds them, so the assertion is not vacuous.
 #[tokio::test]
 async fn wildcard_non_admin_sessions_hold_no_unrestricted_tools() {
+    let marked: Vec<&str> = TARGETS.iter().chain(&CONFIG_WRITERS).copied().collect();
     for admin in [true, false] {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = principal_test_config(&tmp, &["*"], &["*"]);
-        config.tools.optional.extend(TARGETS.map(str::to_owned));
+        config
+            .tools
+            .optional
+            .extend(marked.iter().map(|n| n.to_string()));
         let profile = config.risk_profiles.get_mut("test-profile").unwrap();
         profile.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
-        profile.allowed_tools = TARGETS
+        profile.allowed_tools = marked
             .iter()
             .map(|n| n.to_string())
             .chain(["calculator".into()])
@@ -448,10 +455,13 @@ async fn wildcard_non_admin_sessions_hold_no_unrestricted_tools() {
             let names = guard.tool_names();
             let unrestricted = guard.unrestricted_tool_names_for_test();
             if admin {
-                for name in TARGETS {
-                    assert!(names.contains(&name), "admin control holds {name}: {names:?}");
+                for name in &marked {
                     assert!(
-                        unrestricted.contains(&name),
+                        names.contains(name),
+                        "admin control holds {name}: {names:?}"
+                    );
+                    assert!(
+                        unrestricted.contains(name),
                         "{name} requires an unrestricted principal"
                     );
                 }

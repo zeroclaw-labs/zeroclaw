@@ -406,6 +406,9 @@ name, `"*"` included:
   run headlessly as the procedure's agents, and an applied workshop proposal
   becomes a shared procedure that later runs the same way. Read-only SOP
   tools follow the ordinary tool selector.
+- `model_routing_config` and `proxy_config`, which save daemon config that
+  every agent's later runs use. Over RPC the same change needs
+  `config:update`.
 - `spawn_subagent` and `execute_pipeline`, whose nested runs would hold the
   tools above again.
 
