@@ -112,7 +112,7 @@ fn session_targeting_rpc_methods_authorize_ownership() {
     let (reader_start, reader_end) = fn_body_span_from(&src, "fn session_event_reader", 0);
     let reader = &src[reader_start..reader_end];
     assert!(reader.contains("authorize_session_owner(sid, method).await?"));
-    assert!(reader.contains("native_history_query(&key, record.as_ref(), method)"));
+    assert!(reader.contains("native_history_query(sid, record.as_ref(), method)"));
 
     let mut ungated = Vec::new();
     let mut checked = 0usize;

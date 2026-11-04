@@ -1504,6 +1504,12 @@ fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error 
     anyhow::Error::msg(user_message)
 }
 
+// Only ordinary provider-turn failures leave the interactive CLI running.
+// Setup, model-selection and persistence errors must still reach its caller.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct RecoverableCliTurnError(anyhow::Error);
+
 // The native owner spans route changes and retries, so a model switch does
 // not terminalize the turn and cause the next loop entry to replay a receipt.
 async fn execute_cli_turn(
@@ -3638,7 +3644,9 @@ async fn run_inner(
                     {
                         Ok(resp) => break Ok(resp),
                         Err(e) => {
-                            if is_tool_loop_cancelled(&e) {
+                            if is_tool_loop_cancelled(&e)
+                                || zeroclaw_api::session_events::capture::is_capture_stopped(&e)
+                            {
                                 break Err(e);
                             }
                             if let Some((new_model_provider, new_model)) =
@@ -3803,12 +3811,12 @@ async fn run_inner(
                                             recovery_budget,
                                         )
                                     );
-                                    break Err(e);
+                                    break Err(RecoverableCliTurnError(e).into());
                                 }
                             }
 
                             let error = project_cli_terminal_completion_error(e);
-                            break Err(error);
+                            break Err(RecoverableCliTurnError(error).into());
                         }
                     }
                         }
@@ -3824,14 +3832,27 @@ async fn run_inner(
 
                 let response = match response_result {
                     Ok(response) => response,
-                    Err(error) if is_tool_loop_cancelled(&error) => {
+                    Err(error)
+                        if is_tool_loop_cancelled(&error)
+                            && !zeroclaw_api::session_events::capture::is_capture_stopped(
+                                &error,
+                            ) =>
+                    {
                         eprintln!("\n\x1b[2m(cancelled)\x1b[0m");
                         String::new()
                     }
-                    Err(error) => {
+                    Err(error)
+                        if error
+                            .chain()
+                            .any(|cause| cause.is::<RecoverableCliTurnError>())
+                            && !zeroclaw_api::session_events::capture::is_capture_stopped(
+                                &error,
+                            ) =>
+                    {
                         eprintln!("\nError: {error}\n");
                         String::new()
                     }
+                    Err(error) => return Err(error),
                 };
                 final_output = response;
                 if content_was_streamed.load(std::sync::atomic::Ordering::Relaxed) {
