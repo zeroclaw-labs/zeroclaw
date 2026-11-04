@@ -1,5 +1,5 @@
-//! Gateway history bridge. Pairing remains live transport authority, never a
-//! persisted credential or an invented user identity.
+//! Gateway history bridge. Pairing and administrator sign-in remain live
+//! transport authority, never persisted credentials or invented user identities.
 use crate::AppState;
 use std::sync::Arc;
 use zeroclaw_api::principal::PrincipalId;
@@ -242,13 +242,18 @@ struct IngressAuthority {
     live: zeroclaw_config::live::LiveConfigHandle,
     pairing: Arc<zeroclaw_config::pairing::PairingGuard>,
     root_alias: String,
+    dashboard: Option<crate::dashboard_session::HistoryAdmission>,
 }
 impl IngressAuthority {
     fn current(&self) -> Result<(), SessionError> {
         let config = self.live.read();
         match &self.proof {
             IngressProof::Paired { subject } => {
-                if self.pairing.require_pairing()
+                if let Some(admission) = &self.dashboard {
+                    admission
+                        .current(&config)
+                        .map_err(|error| SessionError::PermissionDenied(error.to_string()))?;
+                } else if self.pairing.require_pairing()
                     && !subject
                         .as_deref()
                         .is_some_and(|hash| self.pairing.token_hash_is_paired(hash))
@@ -262,10 +267,12 @@ impl IngressAuthority {
                 subject,
                 secret_hash,
             } => {
-                if (self.pairing.require_pairing()
-                    && !subject
-                        .as_deref()
-                        .is_some_and(|hash| self.pairing.token_hash_is_paired(hash)))
+                let authenticated = if let Some(admission) = &self.dashboard {
+                    admission.current(&config).is_ok()
+                } else {
+                    verify_history_subject(&self.pairing, subject.as_deref()).is_ok()
+                };
+                if !authenticated
                     || config
                         .gateway
                         .webhook_secret
@@ -368,6 +375,7 @@ impl PermissionResolver for IngressAuthority {
             live: self.live.clone(),
             pairing: self.pairing.clone(),
             root_alias: self.root_alias.clone(),
+            dashboard: self.dashboard.clone(),
         }))
     }
 }
@@ -422,6 +430,7 @@ pub(crate) async fn open_ingress(
         live: state.config.clone(),
         pairing: state.pairing.clone(),
         root_alias: alias.into(),
+        dashboard: crate::dashboard_session::history_admission(),
     });
     authority.current()?;
     source
@@ -443,9 +452,16 @@ struct GatewayAuthority {
     base: Arc<dyn EngineSessionAuthority>,
     pairing: Arc<zeroclaw_config::pairing::PairingGuard>,
     subject: Option<String>,
+    dashboard: Option<crate::dashboard_session::HistoryAdmission>,
+    live: zeroclaw_config::live::LiveConfigHandle,
 }
 impl GatewayAuthority {
     fn current(&self) -> Result<(), SessionError> {
+        if let Some(admission) = &self.dashboard {
+            return admission
+                .current(&self.live.read())
+                .map_err(|error| SessionError::PermissionDenied(error.to_string()));
+        }
         verify_history_subject(&self.pairing, self.subject.as_deref())
     }
 }
@@ -461,6 +477,18 @@ fn verify_history_subject(
         ));
     }
     Ok(())
+}
+
+fn verify_request_history_subject(
+    state: &AppState,
+    subject: Option<&str>,
+) -> Result<(), SessionError> {
+    if let Some(admission) = crate::dashboard_session::history_admission() {
+        return admission
+            .current(&state.config.read())
+            .map_err(|error| SessionError::PermissionDenied(error.to_string()));
+    }
+    verify_history_subject(&state.pairing, subject)
 }
 
 fn history_access_denied(error: &anyhow::Error) -> bool {
@@ -538,6 +566,8 @@ impl PermissionResolver for GatewayAuthority {
             base: self.base.child_authority(target, stream)?,
             pairing: self.pairing.clone(),
             subject: self.subject.clone(),
+            dashboard: self.dashboard.clone(),
+            live: self.live.clone(),
         }))
     }
 }
@@ -577,6 +607,8 @@ pub(crate) fn authority(
         }),
         pairing: state.pairing.clone(),
         subject: subject.map(str::to_owned),
+        dashboard: crate::dashboard_session::history_admission(),
+        live: state.config.clone(),
     });
     authority.current()?;
     Ok(authority)
@@ -585,6 +617,12 @@ pub(crate) fn header_subject(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> anyhow::Result<Option<String>> {
+    if let Some(admission) = crate::dashboard_session::history_admission() {
+        admission
+            .current(&state.config.read())
+            .map_err(|error| SessionError::PermissionDenied(error.to_string()))?;
+        return Ok(None);
+    }
     if !state.pairing.require_pairing() {
         return Ok(None);
     }
@@ -720,7 +758,7 @@ pub(crate) async fn list(
     subject: Option<&str>,
     running_only: bool,
 ) -> anyhow::Result<serde_json::Value> {
-    verify_history_subject(&state.pairing, subject)?;
+    verify_request_history_subject(state, subject)?;
     let source = state
         .native_sessions
         .as_ref()
@@ -741,7 +779,7 @@ pub(crate) async fn list(
             |millis| chrono::DateTime::from_timestamp_millis(millis).map(|time| time.to_rfc3339());
         sessions.push(serde_json::json!({"session_id":session_id,"title":summary.title().map(str::to_owned),"creation_source":summary.creation_source(),"agent_alias":summary.owning_agent,"channel_id":summary.channel_id().map(str::to_owned),"message_count":summary.message_count,"created_at":timestamp(summary.created_at),"last_activity":timestamp(summary.last_activity),"source_cursor":summary.head}));
     }
-    verify_history_subject(&state.pairing, subject)?;
+    verify_request_history_subject(state, subject)?;
     Ok(serde_json::json!({"sessions":sessions}))
 }
 pub(crate) fn response(result: anyhow::Result<serde_json::Value>) -> axum::response::Response {
@@ -804,6 +842,7 @@ pub(crate) mod tests {
             live: state.config.clone(),
             pairing: state.pairing.clone(),
             root_alias: "web".into(),
+            dashboard: None,
         };
         let evidence = gateway
             .tool_authority_evidence(&stream, "shell")

@@ -22186,13 +22186,15 @@ mod tests {
                         let mut config = two_user_config(&tmp);
                         config.channels.session_backend = backend.into();
                         config.memory.backend = "none".into();
+                        config.memory.auto_save = false;
                         config.reliability.provider_retries = 0;
-                        config
+                        let provider = config
                             .providers
                             .models
                             .ensure("openai", "test-provider")
-                            .unwrap()
-                            .uri = Some(server.uri());
+                            .unwrap();
+                        provider.uri = Some(server.uri());
+                        provider.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
                         config.permission_profiles.insert(
                             "administrator".into(),
                             zeroclaw_config::schema::PermissionProfileConfig {
@@ -22227,12 +22229,29 @@ mod tests {
                         let (owner, _owner_rx) =
                             roster_peer(&ctx, if own { 4242 } else { 4343 }).await;
                         owner.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"queued", "keep_siblings":true, "chat_mode":chat_mode})).await.unwrap();
-                        owner
-                            .handle_session_append(
-                                &json!({"session_id":"queued", "content":"retained history"}),
-                            )
+                        let record = owner
+                            .authorize_session_owner("queued", Method::SessionPrompt)
                             .await
                             .unwrap();
+                        let port = owner
+                            .native_session_command(
+                                "queued",
+                                "queued",
+                                record.as_ref(),
+                                Method::SessionPrompt,
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        port.append_assistant("retained history").await.unwrap();
+                        let context = port.restore_context().await.unwrap().unwrap();
+                        ctx.sessions
+                            .get_agent("queued")
+                            .await
+                            .unwrap()
+                            .lock()
+                            .await
+                            .seed_conversation_history(context.messages);
                         let (mut caller, mut frames) = roster_peer(&ctx, 4242).await;
                         let (arrived, release) = ctx.sessions.set_test_effect_pause(boundary);
                         let request = zeroclaw_spawn::spawn!(async move {
