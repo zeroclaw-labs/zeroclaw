@@ -22963,6 +22963,11 @@ mod tests {
     async fn constrained_session_cannot_rewrite_an_agent_job_through_cron_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        // The fixture selects a minimal built-in set; build the scheduling tools.
+        config
+            .tools
+            .optional
+            .extend(["cron_add", "cron_update", "cron_run", "schedule"].map(String::from));
         config
             .risk_profiles
             .get_mut("test-profile")
@@ -48803,6 +48808,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // uid 4242 is a named principal with wildcard tools and agents.
         let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        // The fixture selects a minimal built-in set; build the peer tool for
+        // the sender and `cron_add` for the recipient.
+        config
+            .tools
+            .optional
+            .extend(["send_message_to_peer", "cron_add"].map(String::from));
         {
             let provider = config
                 .providers
