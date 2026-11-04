@@ -2796,7 +2796,7 @@ mod tests {
                 "/gw",
                 Router::new()
                     .merge(crate::config_admin_router(
-                        crate::principal_gate::ConfigRouteAuth::new(&inbound_auth, false),
+                        crate::principal_gate::ConfigRouteAuth::new(&inbound_auth, &state.config),
                     ))
                     .merge(routes())
                     .with_state(state)

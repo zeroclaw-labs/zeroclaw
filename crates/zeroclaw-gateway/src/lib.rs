@@ -2456,7 +2456,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     let inner = Router::new()
         .merge(config_admin_router(principal_gate::ConfigRouteAuth::new(
             &inbound_auth,
-            state.trust_forwarded_headers,
+            &state.config,
         )))
         .merge(api_oidc::routes())
         // ── Admin routes (for CLI management) ──

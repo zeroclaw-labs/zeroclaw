@@ -500,7 +500,10 @@ credential counts against a per-client ledger with the same thresholds
 as a bad pairing token (10 in a minute, then a 5-minute lockout, with
 loopback exempt), kept on its own ledger, so a client replaying a token
 past its expiry never locks its operator out of pairing, and a pairing
-lockout never blocks a bearer. A transport failure on the gateway's own
+lockout never blocks a bearer. The bearer ledger reads
+`gateway.trust_forwarded_headers` from the live configuration for each
+request, so a saved proxy-trust change applies without rebuilding the
+router. A transport failure on the gateway's own
 leg to the identity provider, and a verified identity the policy grants
 nothing, say nothing about the caller and are not billed to it. At most
 16 bearer verifications are in flight at once across all clients,

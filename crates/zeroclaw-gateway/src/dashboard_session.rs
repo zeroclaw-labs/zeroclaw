@@ -2040,8 +2040,7 @@ mod tests {
         };
         let auth =
             Arc::new(DashboardAuth::new(sessions, Arc::clone(&inbound)).for_generation(&state));
-        let route_auth =
-            crate::principal_gate::ConfigRouteAuth::new(&inbound, state.trust_forwarded_headers);
+        let route_auth = crate::principal_gate::ConfigRouteAuth::new(&inbound, &state.config);
         let route_limits = Arc::clone(&route_auth.limits);
         let router = Router::new()
             .merge(crate::config_admin_router(route_auth))

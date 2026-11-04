@@ -68,6 +68,7 @@ use axum::{
 use tokio::sync::Semaphore;
 use zeroclaw_api::grants::{ResolvedGrants, Resource, Verb, WILDCARD};
 use zeroclaw_api::jsonrpc::error_codes::{AUTH_REQUIRED, FORBIDDEN};
+use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::pairing::PairingGuard;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::rpc::auth::{AuthDenied, ConnectionAuth, RpcInboundAuth};
@@ -124,16 +125,17 @@ impl Default for BearerVerificationLimits {
 pub struct ConfigRouteAuth {
     pub inbound: Arc<GatewayInboundAuth>,
     pub limits: Arc<BearerVerificationLimits>,
-    pub trust_forwarded_headers: bool,
+    /// Shared canonical configuration, read when deriving each bearer key.
+    pub config: LiveConfigHandle,
 }
 
 impl ConfigRouteAuth {
     /// The route state over `inbound` with fresh limits.
-    pub fn new(inbound: &Arc<GatewayInboundAuth>, trust_forwarded_headers: bool) -> Self {
+    pub fn new(inbound: &Arc<GatewayInboundAuth>, config: &LiveConfigHandle) -> Self {
         Self {
             inbound: Arc::clone(inbound),
             limits: Arc::new(BearerVerificationLimits::default()),
-            trust_forwarded_headers,
+            config: config.clone(),
         }
     }
 }
@@ -311,7 +313,11 @@ fn bearer_client_key(route: &ConfigRouteAuth, request: &Request) -> String {
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0);
-    crate::client_key_from_request(peer, request.headers(), route.trust_forwarded_headers)
+    crate::client_key_from_request(
+        peer,
+        request.headers(),
+        route.config.read().gateway.trust_forwarded_headers,
+    )
 }
 
 fn denied_response(denied: &AuthDenied) -> Response {
@@ -851,13 +857,14 @@ mod tests {
     /// the outbound cap or read the ledger, and with the forwarded-header
     /// trust the gateway would take from `[gateway] trust_forwarded_headers`.
     fn router_authority_and_limits_for(
-        config: Config,
+        mut config: Config,
         trust_forwarded_headers: bool,
     ) -> (
         Router,
         Arc<GatewayInboundAuth>,
         Arc<BearerVerificationLimits>,
     ) {
+        config.gateway.trust_forwarded_headers = trust_forwarded_headers;
         let state = AppState {
             pairing: Arc::new(PairingGuard::new(
                 config.gateway.require_pairing,
@@ -871,7 +878,7 @@ mod tests {
             GatewayInboundAuth::from_config(&config, Arc::clone(&state.pairing))
                 .expect("inbound auth builds from a valid config"),
         );
-        let route_auth = ConfigRouteAuth::new(&auth, trust_forwarded_headers);
+        let route_auth = ConfigRouteAuth::new(&auth, &state.config);
         let limits = Arc::clone(&route_auth.limits);
         (
             crate::config_admin_router(route_auth).with_state(state),
@@ -907,7 +914,8 @@ mod tests {
         let authority = state.config_authority.clone();
         let auth = Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc_auth)));
         (
-            crate::config_admin_router(ConfigRouteAuth::new(&auth, false)).with_state(state),
+            crate::config_admin_router(ConfigRouteAuth::new(&auth, &state.config))
+                .with_state(state),
             rpc_auth,
             authority,
         )
@@ -1845,7 +1853,7 @@ mod tests {
         );
     }
 
-    // ── Bearer verification limits (#12047) ──
+    // ── Bearer verification limits ──
 
     fn remote() -> SocketAddr {
         "203.0.113.7:51000".parse().unwrap()
@@ -2032,22 +2040,32 @@ mod tests {
     #[tokio::test]
     async fn the_permit_is_held_only_for_the_verification() {
         let idp = introspection_idp(&["ops"]).await;
-        let (_, auth, limits) =
-            router_authority_and_limits_for(oidc_config_with_reader_profile(&idp.uri()), false);
-        // The real middleware over a handler that is slow on purpose: if a
-        // permit were held across the handler, sixteen slow requests would
-        // leave none for the seventeenth.
+        let config = oidc_config_with_reader_profile(&idp.uri());
+        let (_, auth, limits) = router_authority_and_limits_for(config.clone(), false);
+        let config = crate::api::tests::test_state(config).config;
+        // Park each request after verification until explicitly released:
+        // a permit held across the handler would leave none for request 17.
         let route_auth = ConfigRouteAuth {
             inbound: auth,
             limits: Arc::clone(&limits),
-            trust_forwarded_headers: false,
+            config,
         };
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(OUTBOUND_BEARER_CAP + 1);
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
         let router = Router::new()
             .route(
                 "/slow",
-                axum::routing::get(|| async {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    StatusCode::OK
+                axum::routing::get(move || {
+                    let entered = entered_tx.clone();
+                    let mut release = release_rx.clone();
+                    async move {
+                        entered.send(()).await.expect("test awaits handler entry");
+                        release
+                            .wait_for(|released| *released)
+                            .await
+                            .expect("test releases handlers");
+                        StatusCode::OK
+                    }
                 }),
             )
             .route_layer(axum::middleware::from_fn_with_state(
@@ -2055,11 +2073,11 @@ mod tests {
                 config_route_auth,
             ));
 
-        let mut sleeping = Vec::new();
+        let mut parked = Vec::new();
         for n in 0..OUTBOUND_BEARER_CAP {
             let router = router.clone();
             let peer: SocketAddr = format!("198.51.100.{}:4000", n + 1).parse().unwrap();
-            sleeping.push(zeroclaw_spawn::spawn!(async move {
+            parked.push(zeroclaw_spawn::spawn!(async move {
                 send_from(
                     &router,
                     Some(peer),
@@ -2074,26 +2092,38 @@ mod tests {
                 .0
             }));
         }
-        // Let all sixteen pass verification and enter the handler.
-        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for _ in 0..OUTBOUND_BEARER_CAP {
+                entered_rx.recv().await.expect("handler signals entry");
+            }
+        })
+        .await
+        .expect("all sixteen requests enter their handlers");
         assert_eq!(
             limits.outbound.available_permits(),
             OUTBOUND_BEARER_CAP,
             "every permit was released before its handler ran"
         );
-        let (status, _, _) = send_from(
-            &router,
-            Some(remote()),
-            &[],
-            "GET",
-            "/slow",
-            Some("opaque-token"),
-            Some("oidc.test"),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        for task in sleeping {
+        parked.push(zeroclaw_spawn::spawn!(async move {
+            send_from(
+                &router,
+                Some(remote()),
+                &[],
+                "GET",
+                "/slow",
+                Some("opaque-token"),
+                Some("oidc.test"),
+                None,
+            )
+            .await
+            .0
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx.recv())
+            .await
+            .expect("the seventeenth request also enters its handler")
+            .expect("handler signals entry");
+        release_tx.send(true).expect("handlers await release");
+        for task in parked {
             assert_eq!(task.await.unwrap(), StatusCode::OK);
         }
     }
@@ -2180,6 +2210,88 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn bearer_client_keys_follow_persisted_forwarded_header_trust() {
+        for (initial_trust, updated_trust, peer, forwarded) in [
+            (true, false, remote(), "127.0.0.1"),
+            (false, true, loopback(), "203.0.113.7"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let idp = introspection_idp_answering(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "active": false })),
+            )
+            .await;
+            let config = editor_config(&tmp, &idp.uri(), &[Verb::Read], &[]);
+            let config_path = config.config_path.clone();
+            let (router, _, limits) = router_authority_and_limits_for(config, initial_trust);
+            let headers = [("x-forwarded-for", forwarded)];
+
+            // At startup each case resolves to loopback. Persisting the
+            // opposite policy must make this same router bill the remote
+            // address, without rebuilding either its routes or its ledger.
+            let (status, _, _) = send_from(
+                &router,
+                Some(peer),
+                &headers,
+                "GET",
+                "/api/quickstart/state",
+                Some("opaque-token"),
+                Some("oidc.test"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+            let (status, body) = send(
+                &router,
+                "PUT",
+                "/api/config/prop",
+                OPERATOR.0,
+                OPERATOR.1,
+                Some(serde_json::json!({
+                    "path": "gateway.trust_forwarded_headers",
+                    "value": updated_trust,
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let persisted = zeroclaw_config::migration::migrate_to_current(
+                &std::fs::read_to_string(config_path).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(persisted.gateway.trust_forwarded_headers, updated_trust);
+
+            for attempt in 0..=crate::auth_rate_limit::MAX_ATTEMPTS {
+                let (status, _, _) = send_from(
+                    &router,
+                    Some(peer),
+                    &headers,
+                    "GET",
+                    "/api/quickstart/state",
+                    Some("opaque-token"),
+                    Some("oidc.test"),
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    if attempt < crate::auth_rate_limit::MAX_ATTEMPTS {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::TOO_MANY_REQUESTS
+                    },
+                    "trust {initial_trust} -> {updated_trust}, attempt {attempt}"
+                );
+            }
+            assert!(limits.attempts.is_locked_out("203.0.113.7"));
+            assert_eq!(
+                introspections(&idp).await,
+                1 + crate::auth_rate_limit::MAX_ATTEMPTS as usize,
+                "the locked-out request must not reach the provider"
+            );
         }
     }
 
