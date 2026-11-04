@@ -32768,7 +32768,7 @@ mod tests {
                     .unwrap()
                     .pending_deletions()
                     .get(&gw_key)
-                    .is_some_and(|set| set.contains(&generation))
+                    .is_some_and(|generations| generations.contains_key(&generation))
             );
             register_cancel_token(
                 coordination.cancellations(),

@@ -1,6 +1,6 @@
 //! Gateway session lifecycle coordination shared by the gateway and RPC.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
@@ -91,7 +91,7 @@ pub fn gateway_cancel_key(session_id: &str) -> String {
 #[derive(Default)]
 pub struct GatewayCancellationRegistry {
     tokens: HashMap<String, GatewayCancellationEntry>,
-    pending_deletions: HashMap<String, HashSet<u64>>,
+    pending_deletions: HashMap<String, HashMap<u64, usize>>,
 }
 
 /// The queue incarnation bound to one registered gateway turn.
@@ -126,8 +126,8 @@ impl DerefMut for GatewayCancellationRegistry {
 }
 
 impl GatewayCancellationRegistry {
-    /// Pending deletion generations, for lifecycle diagnostics and tests.
-    pub fn pending_deletions(&self) -> &HashMap<String, HashSet<u64>> {
+    /// Outstanding deletion guard counts per session and generation.
+    pub fn pending_deletions(&self) -> &HashMap<String, HashMap<u64, usize>> {
         &self.pending_deletions
     }
 }
@@ -147,7 +147,7 @@ pub fn register_cancel_token(
         let pending_delete = registry
             .pending_deletions
             .get(session_key)
-            .is_some_and(|generations| generations.contains(&session_generation));
+            .is_some_and(|generations| generations.contains_key(&session_generation));
         let previous = registry.insert(
             cancel_key.to_owned(),
             GatewayCancellationEntry {
@@ -185,29 +185,31 @@ pub fn remove_cancel_token_if_current(
 
 /// Lifecycle signal owned by one DELETE request.
 ///
-/// An unconsumed pre-registration signal is removed when DELETE fails, so a
-/// later turn cannot inherit a cancellation from a request that made no
-/// durable lifecycle change.
+/// Each request retains its generation's signal until its guard is dropped.
+/// Overlapping requests release only their own claim, so an early failure
+/// cannot clear another request's cancellation boundary. Once all requests
+/// finish, later turns cannot inherit an abandoned signal.
 pub struct GatewayDeletionCancellation {
     cancellations: Arc<Mutex<GatewayCancellationRegistry>>,
     session_key: String,
     session_generation: u64,
-    pending: bool,
     /// Whether this signal cancelled an already registered turn.
     pub cancelled_active_turn: bool,
 }
 
 impl Drop for GatewayDeletionCancellation {
     fn drop(&mut self) {
-        if !self.pending {
-            return;
-        }
         let mut cancellations = self
             .cancellations
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(generations) = cancellations.pending_deletions.get_mut(&self.session_key) {
-            generations.remove(&self.session_generation);
+            if let Some(outstanding) = generations.get_mut(&self.session_generation) {
+                *outstanding -= 1;
+                if *outstanding == 0 {
+                    generations.remove(&self.session_generation);
+                }
+            }
             if generations.is_empty() {
                 cancellations.pending_deletions.remove(&self.session_key);
             }
@@ -220,8 +222,8 @@ impl Drop for GatewayDeletionCancellation {
 ///
 /// Gateway session IDs are reusable after deletion. The cancellation registry
 /// carries the same incarnation boundary as the session queue. The pending
-/// latch and token registration share one mutex, so either DELETE observes and
-/// cancels the exact active token or the later registration consumes the latch.
+/// latch and token registration share one mutex, so either DELETE cancels the
+/// exact active token or later registration observes the outstanding signal.
 pub fn signal_deletion_at_generation(
     registry: &Arc<Mutex<GatewayCancellationRegistry>>,
     session_key: &str,
@@ -235,29 +237,20 @@ pub fn signal_deletion_at_generation(
             cancelled_active_turn = true;
         }
     }
-    if cancelled_active_turn {
-        return GatewayDeletionCancellation {
-            cancellations: Arc::clone(registry),
-            session_key: session_key.to_owned(),
-            session_generation: expected_generation,
-            pending: false,
-            cancelled_active_turn: true,
-        };
-    };
-    // Retain each generation separately. A stale DELETE may arrive after a
-    // successor DELETE has latched, and replacing the successor generation
-    // would let the stale guard erase the successor's cancellation boundary.
-    let pending = cancellations
+    // Every DELETE owns a claim, including one that cancelled an active turn:
+    // a replacement can register while that request still waits for the queue.
+    // Counts are generation-specific so a stale guard cannot clear a successor.
+    *cancellations
         .pending_deletions
         .entry(session_key.to_string())
         .or_default()
-        .insert(expected_generation);
+        .entry(expected_generation)
+        .or_default() += 1;
     GatewayDeletionCancellation {
         cancellations: Arc::clone(registry),
         session_key: session_key.to_owned(),
         session_generation: expected_generation,
-        pending,
-        cancelled_active_turn: false,
+        cancelled_active_turn,
     }
 }
 
@@ -349,6 +342,85 @@ mod tests {
                 .pending_deletions()
                 .is_empty()
         );
+    }
+
+    fn assert_overlapping_delete_lifetime(register_before_delete: bool) {
+        for drop_first in [false, true] {
+            let coordination = GatewaySessionCoordination::for_gateway();
+            let key = "gw_overlapping_delete";
+            let generation = 7;
+            if register_before_delete {
+                register_cancel_token(
+                    coordination.cancellations(),
+                    "current",
+                    key,
+                    generation,
+                    Arc::new(tokio_util::sync::CancellationToken::new()),
+                );
+            }
+            let first = coordination.signal_deletion_at_generation(key, generation);
+            let second = coordination.signal_deletion_at_generation(key, generation);
+            let remaining = if drop_first {
+                drop(first);
+                second
+            } else {
+                drop(second);
+                first
+            };
+            let admitted = Arc::new(tokio_util::sync::CancellationToken::new());
+            register_cancel_token(
+                coordination.cancellations(),
+                "current",
+                key,
+                generation,
+                Arc::clone(&admitted),
+            );
+            assert!(
+                admitted.is_cancelled(),
+                "the remaining DELETE must cancel late registration: active={register_before_delete}, first_dropped={drop_first}"
+            );
+            let successor = Arc::new(tokio_util::sync::CancellationToken::new());
+            register_cancel_token(
+                coordination.cancellations(),
+                "successor",
+                key,
+                generation + 1,
+                Arc::clone(&successor),
+            );
+            assert!(!successor.is_cancelled());
+            drop(remaining);
+            let later = Arc::new(tokio_util::sync::CancellationToken::new());
+            register_cancel_token(
+                coordination.cancellations(),
+                "current",
+                key,
+                generation,
+                Arc::clone(&later),
+            );
+            assert!(
+                !later.is_cancelled(),
+                "all failed DELETE claims were released"
+            );
+            assert!(!successor.is_cancelled());
+            assert!(
+                coordination
+                    .cancellations()
+                    .lock()
+                    .unwrap()
+                    .pending_deletions()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_deletions_retain_pre_registration_cancellation() {
+        assert_overlapping_delete_lifetime(false);
+    }
+
+    #[test]
+    fn overlapping_deletions_retain_active_turn_cancellation() {
+        assert_overlapping_delete_lifetime(true);
     }
 
     #[tokio::test]

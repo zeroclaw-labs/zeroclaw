@@ -3988,7 +3988,7 @@ pub(crate) mod tests {
                 .expect("cancel_tokens lock")
                 .pending_deletions()
                 .get(session_key)
-                .is_some_and(|generations| generations.contains(&predecessor_generation))
+                .is_some_and(|generations| generations.contains_key(&predecessor_generation))
         );
 
         let successor =
@@ -4001,8 +4001,8 @@ pub(crate) mod tests {
                 .pending_deletions()
                 .get(session_key)
                 .is_some_and(|generations| {
-                    generations.contains(&predecessor_generation)
-                        && generations.contains(&successor_generation)
+                    generations.contains_key(&predecessor_generation)
+                        && generations.contains_key(&successor_generation)
                 }),
             "a successor DELETE must retain a stale predecessor latch"
         );
@@ -4015,7 +4015,7 @@ pub(crate) mod tests {
                 .expect("cancel_tokens lock")
                 .pending_deletions()
                 .get(session_key)
-                .is_some_and(|generations| generations.contains(&successor_generation)),
+                .is_some_and(|generations| generations.contains_key(&successor_generation)),
             "the predecessor guard must not clear the successor latch"
         );
 
@@ -4029,8 +4029,8 @@ pub(crate) mod tests {
                 .pending_deletions()
                 .get(session_key)
                 .is_some_and(|generations| {
-                    generations.contains(&predecessor_generation)
-                        && generations.contains(&successor_generation)
+                    generations.contains_key(&predecessor_generation)
+                        && generations.contains_key(&successor_generation)
                 }),
             "an out-of-order stale DELETE must not overwrite the successor latch"
         );
