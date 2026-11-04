@@ -198,6 +198,7 @@ channels-full = [
   "channel-line",
   "channel-linq",
   "channel-mattermost",
+  "channel-zulip",
   "channel-mochat",
   "channel-mqtt",
   "channel-amqp",
@@ -255,6 +256,7 @@ channel-discord = ["ws-transport"]
 channel-slack = ["ws-transport"]
 channel-signal = ["dep:mime_guess"]
 channel-mattermost = ["ws-transport"]
+channel-zulip = []
 channel-irc = ["tls-client"]
 channel-twitch = ["channel-irc"]
 channel-imessage = ["dep:rusqlite"]

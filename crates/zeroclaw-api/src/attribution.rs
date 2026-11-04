@@ -130,6 +130,7 @@ pub enum ChannelKind {
     Wechat,
     WhatsappBusiness,
     WhatsappWeb,
+    Zulip,
     Plugin,
 }
 
