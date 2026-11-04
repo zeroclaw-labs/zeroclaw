@@ -88,6 +88,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const CONFIG_LIST: &str = "config/list";
     pub const CONFIG_SET: &str = "config/set";
+    pub const CONFIG_STATUS: &str = "config/status";
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
@@ -244,9 +245,12 @@ pub struct RpcInboundRequest {
 ///
 /// Sized for N concurrent sessions streaming at once (the agent sidebar keeps
 /// background sessions live): chunk volume multiplies between draw-loop
-/// drains, and a `Lagged`-dropped `TurnComplete` would strand a background
-/// session's status dot in "running" forever.
-pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
+/// drains, and a `Lagged` receiver forces a durable transcript reload of
+/// every tracked session, during which their live stream is gated. The draw
+/// loop wakes early to drain pending notifications; this capacity is the
+/// headroom for draw stalls (resize storms, full transcript rebuilds, the
+/// process being descheduled) on top of that.
+pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 4096;
 
 // ── Typed session updates ────────────────────────────────────────
 
@@ -325,6 +329,15 @@ pub enum SessionUpdate {
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
     },
+    /// Recorded spend reached `cost.warn_at_percent` of the daily or monthly
+    /// limit. The turn continues; this is a heads-up only.
+    BudgetWarning {
+        session_id: String,
+        current_usd: f64,
+        limit_usd: f64,
+        /// `"day"` or `"month"`.
+        period: String,
+    },
     /// The agent published or updated its execution plan (TodoWrite).
     /// Whole-list replacement; `entries` is the complete authoritative
     /// list. An empty vec clears the tracker.
@@ -347,7 +360,8 @@ impl SessionUpdate {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id,
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::BudgetWarning { session_id, .. } => session_id,
         }
     }
 }
@@ -429,6 +443,12 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             unsatisfiable_floor: params.get("unsatisfiable_floor").and_then(|v| v.as_bool()),
+        }),
+        "budget_warning" => Some(SessionUpdate::BudgetWarning {
+            session_id: sid,
+            current_usd: params.get("current_usd")?.as_f64()?,
+            limit_usd: params.get("limit_usd")?.as_f64()?,
+            period: params.get("period")?.as_str()?.to_string(),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -2213,7 +2233,10 @@ impl RpcClient {
                     timeout,
                 })
             })?
-            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+            .map_err(|e| {
+                let message = format!("RPC {method}: {} ({})", e.message, e.code);
+                anyhow::Error::new(e).context(message)
+            })?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -2348,21 +2371,37 @@ impl RpcClient {
         Ok(result.entries)
     }
 
-    pub async fn config_set(&self, prop: &str, value: Value) -> Result<()> {
-        let _: ConfigSetResult = self
+    pub async fn config_set(
+        &self,
+        prop: &str,
+        value: Value,
+    ) -> Result<Option<crate::wire::PublishedConfigRevision>> {
+        let result: ConfigSetResult = self
             .call(
                 method::CONFIG_SET,
                 serde_json::json!({ "prop": prop, "value": value }),
             )
             .await?;
-        Ok(())
+        Ok(result.revision)
     }
 
-    pub async fn config_delete(&self, prop: &str) -> Result<()> {
-        let _: ConfigDeleteResult = self
+    pub async fn config_delete(
+        &self,
+        prop: &str,
+    ) -> Result<Option<crate::wire::PublishedConfigRevision>> {
+        let result: ConfigDeleteResult = self
             .call(method::CONFIG_DELETE, serde_json::json!({ "prop": prop }))
             .await?;
-        Ok(())
+        Ok(result.revision)
+    }
+
+    pub async fn config_status(&self) -> Result<crate::wire::ConfigStatusResult> {
+        self.call_with_timeout(
+            method::CONFIG_STATUS,
+            serde_json::json!({}),
+            std::time::Duration::from_secs(3),
+        )
+        .await
     }
 
     /// Signal the daemon to reload in place. Mirrors `POST /admin/reload`.
@@ -2421,24 +2460,32 @@ impl RpcClient {
         Ok(result.values)
     }
 
-    pub async fn config_map_key_create(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
+    pub async fn config_map_key_create(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyMutationResult> {
+        let result: ConfigMapKeyMutationResult = self
             .call(
                 method::CONFIG_MAP_KEY_CREATE,
                 serde_json::json!({ "path": path, "key": key }),
             )
             .await?;
-        Ok(())
+        Ok(result)
     }
 
-    pub async fn config_map_key_delete(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
+    pub async fn config_map_key_delete(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyMutationResult> {
+        let result: ConfigMapKeyMutationResult = self
             .call(
                 method::CONFIG_MAP_KEY_DELETE,
                 serde_json::json!({ "path": path, "key": key }),
             )
             .await?;
-        Ok(())
+        Ok(result)
     }
 
     pub async fn config_map_key_rename(
@@ -3197,7 +3244,18 @@ pub struct ConfigListResult {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigSetResult {}
+pub struct ConfigSetResult {
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigMapKeyMutationResult {
+    #[serde(default, alias = "created", alias = "deleted")]
+    pub changed: bool,
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
 
 #[cfg(test)]
 mod initialize_version_tests {
@@ -3315,7 +3373,10 @@ mod initialize_timeout_tests {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigDeleteResult {}
+pub struct ConfigDeleteResult {
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4572,6 +4633,9 @@ pub struct SessionListResult {
 pub struct AgentStatusEntry {
     pub alias: String,
     pub enabled: bool,
+    /// Daemon-configured profile, not in-flight session telemetry.
+    #[serde(default)]
+    pub runtime_profile: Option<String>,
     #[serde(default)]
     pub live_sessions: usize,
     #[serde(default)]
@@ -4584,6 +4648,26 @@ pub struct AgentStatusEntry {
 #[serde(rename_all = "snake_case")]
 pub struct AgentsStatusResult {
     pub agents: Vec<AgentStatusEntry>,
+}
+
+#[cfg(test)]
+mod runtime_profile_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_profile_accepts_legacy_and_current_agent_status() {
+        let legacy: AgentStatusEntry = serde_json::from_value(serde_json::json!({
+            "alias": "coder", "enabled": true
+        }))
+        .unwrap();
+        assert!(legacy.runtime_profile.is_none());
+
+        let current: AgentStatusEntry = serde_json::from_value(serde_json::json!({
+            "alias": "coder", "enabled": true, "runtime_profile": "coding"
+        }))
+        .unwrap();
+        assert_eq!(current.runtime_profile.as_deref(), Some("coding"));
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -6609,6 +6693,31 @@ mod plan_parse_tests {
         match parse_session_update(&params).expect("empty plan parses") {
             SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
             _ => panic!("expected SessionUpdate::Plan"),
+        }
+    }
+
+    #[test]
+    fn parses_budget_warning_update() {
+        let params = serde_json::json!({
+            "type": "budget_warning",
+            "session_id": "s1",
+            "current_usd": 8.25,
+            "limit_usd": 10.0,
+            "period": "day",
+        });
+        match parse_session_update(&params) {
+            Some(SessionUpdate::BudgetWarning {
+                session_id,
+                current_usd,
+                limit_usd,
+                period,
+            }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(current_usd, 8.25);
+                assert_eq!(limit_usd, 10.0);
+                assert_eq!(period, "day");
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
         }
     }
 

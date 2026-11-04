@@ -78,7 +78,7 @@ pub use subscriber::{
 };
 pub use tool_io::{ToolIoCapture, capture_llm_request, capture_tool_input, capture_tool_output};
 pub use writer::{
-    active_log_path, active_log_query_scope, flush_for_test, init_from_config,
+    active_log_path, active_log_query_scope, flush, flush_for_test, init_from_config,
     llm_request_payload_policy, record_event, runtime_trace_path,
 };
 
