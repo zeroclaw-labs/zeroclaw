@@ -2132,8 +2132,9 @@ impl Agent {
     /// Idempotent: a second call with the same owner is a no-op, and a call
     /// with a different owner is refused. Routing after a native memory tool
     /// has run is refused and leaves the agent unchanged. A registry that
-    /// cannot carry the owner (a memory-starting tool and no session route) is
-    /// refused and leaves the agent unchanged.
+    /// cannot carry the owner (a memory-starting tool and no session route),
+    /// or a delegate already bound to another owner, is refused and leaves the
+    /// agent unchanged.
     pub fn route_memory_to_principal(
         &mut self,
         scope: zeroclaw_api::memory_traits::PrincipalScope,
@@ -2164,12 +2165,17 @@ impl Agent {
         // through a shared route. Refuse before anything moves when the
         // registry cannot carry the owner or its route holds another plane.
         self.tools.check_session_memory_pin(&routed)?;
+        // The delegate carries the owner into the runs it starts. Refuse
+        // before anything binds when it already carries another owner.
+        if let Some(delegate) = &self.delegate_tool {
+            delegate.check_principal_scope(&scope)?;
+        }
         self.tools
             .rebind_memory_tools(&self.memory, Arc::clone(&routed), &self.memory_security)?;
         // Pin the route and bind the delegate only after the native binding
         // accepted `routed`, so a routing the memory binding refuses leaves
-        // both unbound. The check above and `&mut self` mean nothing pinned
-        // the route to another plane since.
+        // both unbound. The checks above and `&mut self` mean nothing pinned
+        // the route or bound the delegate to another owner since.
         self.tools
             .pin_session_memory(Arc::clone(&routed), Arc::clone(&self.memory_security))?;
         if let Some(delegate) = &self.delegate_tool {
@@ -6857,6 +6863,53 @@ mod tests {
                 .is_ok(),
             "a refused routing must leave the delegate unbound"
         );
+    }
+
+    /// A delegate already bound to another owner refuses the routing before
+    /// the memory tools or the session route bind, so nothing moves: the
+    /// session can still be routed to the delegate's own owner afterwards.
+    #[tokio::test]
+    async fn a_delegate_bound_to_another_owner_refuses_routing_before_anything_binds() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("prebound", tmp.path()).unwrap());
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let delegate = Arc::new(crate::tools::DelegateTool::new(
+            std::collections::HashMap::new(),
+            None,
+            Arc::clone(&security),
+        ));
+        delegate
+            .bind_principal_scope(PrincipalScope::new("owner:other"))
+            .unwrap();
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(native_memory_registry(Arc::clone(&shared), Arc::clone(&security), &[]).await)
+            .delegate_tool(Some(Arc::clone(&delegate)))
+            .memory(Arc::clone(&shared))
+            .memory_security(Arc::clone(&security))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+
+        let error = agent
+            .route_memory_to_principal(PrincipalScope::new("user:alice"))
+            .expect_err("a delegate bound to another owner must refuse the routing");
+        assert!(
+            error.to_string().contains("different principal scope"),
+            "{error}"
+        );
+        assert!(agent.memory_principal().is_none());
+        agent
+            .route_memory_to_principal(PrincipalScope::new("owner:other"))
+            .expect("nothing bound, so the delegate's own owner can still route the session");
+        assert_eq!(agent.memory_principal(), Some("owner:other"));
     }
 
     /// A session's memory in production is the per-agent stack from
