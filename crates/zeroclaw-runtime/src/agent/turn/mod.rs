@@ -5937,6 +5937,109 @@ mod native_tool_fallback_tests {
         assert!(warning_text.contains("custom.<name>"));
     }
 
+    /// A TCP endpoint that answers every request with a 500, standing in for a
+    /// native primary that is down.
+    fn spawn_failing_endpoint() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind failing endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking failing endpoint");
+        let addr = listener.local_addr().expect("failing endpoint address");
+        let listener = TcpListener::from_std(listener).expect("tokio failing endpoint");
+        let app = Router::new().fallback(|| async {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": {"message": "primary down"}})),
+            )
+        });
+        let _server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve failing endpoint");
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn custom_fallback_entry_that_rejects_tools_still_completes_the_turn() {
+        // A native primary that fails, with a custom alias as its `fallback`
+        // entry. The runtime only recovers when the ACTIVE provider is custom, so
+        // the custom fallback entry must stay prompt-guided: no native request
+        // may reach the endpoint that rejects `tools`.
+        let warning_text = run_native_tools_rejection_turn(
+            |addr| {
+                let primary = spawn_failing_endpoint();
+                let config: zeroclaw_config::schema::Config = toml::from_str(&format!(
+                    r#"
+schema_version = 3
+[providers.models.vllm.primary]
+uri = "http://{primary}/v1"
+fallback = ["custom.gw"]
+[providers.models.custom.gw]
+uri = "http://{addr}"
+api_key = "test-key"
+"#
+                ))
+                .expect("config parses");
+                let reliability = zeroclaw_config::schema::ReliabilityConfig {
+                    provider_retries: 0,
+                    provider_backoff_ms: 0,
+                    ..Default::default()
+                };
+                let options = zeroclaw_providers::provider_runtime_options_for_alias(
+                    &config, "vllm", "primary",
+                );
+                let provider = zeroclaw_providers::create_resilient_model_provider_for_alias(
+                    &config,
+                    "vllm",
+                    "primary",
+                    None,
+                    None,
+                    &reliability,
+                    &options,
+                )
+                .expect("chain builds");
+                (provider, "vllm.primary".to_string())
+            },
+            0,
+        )
+        .await;
+        assert!(
+            !warning_text.contains("native_tools = false"),
+            "no runtime fallback should have been needed: {warning_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_fallback_entry_with_explicit_native_tools_keeps_native_requests() {
+        let config: zeroclaw_config::schema::Config = toml::from_str(
+            r#"
+schema_version = 3
+[providers.models.vllm.primary]
+uri = "http://127.0.0.1:9/v1"
+fallback = ["custom.gw"]
+[providers.models.custom.gw]
+uri = "http://127.0.0.1:9"
+api_key = "test-key"
+native_tools = true
+"#,
+        )
+        .expect("config parses");
+        let options =
+            zeroclaw_providers::provider_runtime_options_for_alias(&config, "vllm", "primary");
+        let provider = zeroclaw_providers::create_resilient_model_provider_for_alias(
+            &config,
+            "vllm",
+            "primary",
+            None,
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &options,
+        )
+        .expect("chain builds");
+        assert!(provider.supports_native_tools());
+    }
+
     #[test]
     fn bare_custom_url_credentials_never_reach_warnings_or_logs() {
         // (provider name, secrets that must not appear, expected safe identifier)

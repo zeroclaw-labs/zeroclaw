@@ -1899,7 +1899,15 @@ fn append_fallback_chain(
             continue;
         }
 
-        let opts = provider_runtime_options_for_alias(config, family, &alias);
+        let mut opts = provider_runtime_options_for_alias(config, family, &alias);
+        // A custom endpoint defaults to native tool calling, with the turn
+        // runtime recovering when the ACTIVE provider rejects tool specs. A
+        // fallback entry is never the active provider, so that recovery cannot
+        // see it, and one native entry makes the whole chain native. Keep it
+        // prompt-guided unless the alias opts in with `native_tools = true`.
+        if family == "custom" && opts.native_tools.is_none() {
+            opts.native_tools = Some(false);
+        }
         if !factory::fallback_auth_ready_for_alias(
             config,
             family,
