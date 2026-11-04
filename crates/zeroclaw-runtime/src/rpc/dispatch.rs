@@ -2392,6 +2392,17 @@ impl RpcDispatcher {
         // rehydration, and subsequent prompts.
         let narrowing = principal_tool_ceiling(grants);
         agent.narrow_to_principal_tools(narrowing.as_deref());
+        if let Some(auth) = self.auth.clone() {
+            let inbound = Arc::clone(&self.ctx.auth);
+            agent.apply_sop_tool_admission(
+                grants.admin,
+                Arc::new(move || {
+                    inbound
+                        .current_grants(&auth)
+                        .is_ok_and(|grants| grants.admin)
+                }),
+            );
+        }
         if !grants.admin
             && !grants
                 .allowed_agents
@@ -12665,7 +12676,7 @@ impl RpcDispatcher {
             return Ok(());
         };
         if executes {
-            self.refuse_constrained_tool_selector_for_sop(method)?;
+            self.refuse_constrained_principal_for_sop(method, grants)?;
         }
         let agents = {
             let config = self.ctx.config.read();
@@ -12681,37 +12692,21 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    /// Refuse a procedure run by a principal whose tool selector names a
-    /// subset of the tools rather than the wildcard.
-    ///
-    /// A session composes [`Self::principal_tool_narrowing`] into the agent it
-    /// assembles, so a principal with a named tool list gets a narrowed
-    /// session rather than a refusal. A procedure is dispatched through the
-    /// SOP engine, which builds its own agents from the procedure's own policy
-    /// and never sees that narrowing, so the same principal would run with the
-    /// agent's full tool set. Until the narrowing is plumbed through the
-    /// engine, this path keeps the fail-closed posture the session selector
-    /// used to carry.
-    ///
-    /// A wildcard selector passes: the principal may already name any tool, so
-    /// the engine assembling the agent's own set is not an escalation past it.
-    fn refuse_constrained_tool_selector_for_sop(&self, method: Method) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
-            return Ok(());
-        };
-        if auth.grants.admin
-            || auth
-                .grants
-                .allowed_tools
-                .iter()
-                .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
-        {
+    /// Headless steps do not carry the caller's principal or session-data
+    /// restrictions. Until they do, only administrators may start or resume
+    /// them, including when a non-admin has wildcard tool and agent selectors.
+    /// Authoring retains its separate agent checks.
+    fn refuse_constrained_principal_for_sop(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        if grants.admin {
             return Ok(());
         }
         let denied = rpc_err(
             FORBIDDEN,
-            "Principal has a constrained tool selector; procedures run outside per-session tool \
-             narrowing and are refused to it",
+            crate::i18n::get_required_cli_string("sop-rpc-principal-ceiling-required"),
         );
         self.audit_auth_denial(
             method,
@@ -12721,6 +12716,45 @@ impl RpcDispatcher {
             },
         );
         Err(denied)
+    }
+
+    /// Resolve live authority at RPC admission and again at the effect boundary.
+    /// When a procedure is supplied, the caller holds the engine lock so its
+    /// definition cannot change before start/resume.
+    fn authorize_sop_execution(
+        &self,
+        method: Method,
+        sop: Option<&crate::sop::Sop>,
+    ) -> Result<(), JsonRpcError> {
+        // Resolve aliases before authority so a wait on live config cannot
+        // leave us using grants resolved before that wait.
+        let agents = sop.map(|sop| Self::sop_executing_agents(sop, &self.ctx.config.read()));
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Ok(());
+        };
+        self.refuse_constrained_principal_for_sop(method, &grants)?;
+        if let Some(agents) = agents {
+            for alias in agents {
+                self.selector_session_agent_with_grants(method, &grants, &alias)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sop_execution_lease<'a>(
+        &'a self,
+        method: Method,
+    ) -> Result<Box<dyn crate::sop::dispatch::SopEffectGuard + 'a>, JsonRpcError> {
+        // Match publication's config -> accepted authority -> pairing order.
+        // Callers use a nonblocking store and drop this before any await.
+        let config = self.ctx.config.read();
+        let lease = self.ctx.auth.hold_authority();
+        if let Some(auth) = self.auth.as_ref() {
+            let grants = current_authority_under(&lease, auth, method)
+                .map_err(|denied| rpc_err(denied.code, denied.message))?;
+            self.refuse_constrained_principal_for_sop(method, &grants)?;
+        }
+        Ok(Box::new((lease, config)))
     }
 
     /// The procedure as the engine will load it once `save_sop` has written it.
@@ -12831,6 +12865,7 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        self.authorize_sop_execution(Method::SopsRun, None)?;
         // The run executes as the procedure's agents, so the principal must be
         // entitled to every one of them before anything is dispatched.
         if self.stamped_grants().is_some() {
@@ -12878,14 +12913,23 @@ impl RpcDispatcher {
             timestamp: crate::sop::engine::now_iso8601(),
         };
 
-        let results = if let Some(dedup_key) = dedup_key {
-            crate::sop::dispatch::dispatch_sop_event_to_deduplicated(
-                engine, audit, event, &req.name, dedup_key,
-            )
-            .await
-        } else {
-            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await
+        let denied = parking_lot::Mutex::new(None);
+        let authorize = |sop: &crate::sop::Sop| {
+            self.authorize_sop_execution(Method::SopsRun, Some(sop))
+                .and_then(|()| self.sop_execution_lease(Method::SopsRun))
+                .map_err(|error| {
+                    let reason = error.message.clone();
+                    *denied.lock() = Some(error);
+                    reason
+                })
         };
+        let results = crate::sop::dispatch::dispatch_sop_event_to_authorized(
+            engine, audit, event, &req.name, dedup_key, &authorize,
+        )
+        .await;
+        if let Some(error) = denied.into_inner() {
+            return Err(error);
+        }
         crate::sop::dispatch::process_headless_results(&results);
 
         for result in &results {
@@ -13067,30 +13111,21 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
-        // Approving resumes the run headlessly as its procedure's agents, so
-        // the principal must be entitled to every one of them before its
-        // decision reaches the broker. The loaded run's procedure is what
-        // executes, whatever is on disk.
-        if self.stamped_grants().is_some() {
-            let run_sop = {
-                let guard = engine
-                    .lock()
-                    .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
-                guard
-                    .get_run(&req.run_id)
-                    .and_then(|run| guard.get_sop(&run.sop_name))
-                    .cloned()
-            };
-            if let Some(run_sop) = run_sop {
-                self.authorize_sop_agents(Method::SopsDecide, &run_sop, true)?;
-            }
+        if let Some(grants) = self.stamped_grants() {
+            self.refuse_constrained_principal_for_sop(Method::SopsDecide, grants)?;
         }
 
         let mut resolved_outcome = None;
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("sop-decision-admission")
+            .await;
         {
             let mut guard = engine
                 .lock()
                 .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            self.authorize_sop_execution(Method::SopsDecide, guard.get_sop(&req.name))?;
+            let _authority = self.sop_execution_lease(Method::SopsDecide)?;
             let run_sop_name = guard
                 .get_run(&req.run_id)
                 .map(|run| run.sop_name.clone())
@@ -13108,10 +13143,10 @@ impl RpcDispatcher {
             }
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
-            match guard
-                .resolve_via_broker_deferred(&req.run_id, decision, principal)
-                .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
-            {
+            let outcome = guard.with_nonblocking_store(|engine| {
+                engine.resolve_via_broker_deferred(&req.run_id, decision, principal)
+            });
+            match outcome.map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))? {
                 outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
                     resolved_outcome = Some(outcome);
                 }
@@ -13178,7 +13213,15 @@ impl RpcDispatcher {
             );
         }
 
-        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("sop-decision-result")
+            .await;
+        let result = crate::sop::run_overlay_for(&sop, &engine, &req.run_id);
+        // The effect lease ended before driving the resumed work. The final
+        // read can wait again; authorize its success and error projections.
+        let _authority = self.sop_execution_lease(Method::SopsDecide)?;
+        let overlay = result.map_err(|e| {
             let msg = e.to_string();
             let code = if msg.contains("not found") {
                 INVALID_PARAMS
@@ -14717,6 +14760,8 @@ pub(crate) mod connection_test_support {
 
 #[cfg(test)]
 mod tests {
+    mod sop_principal;
+
     use zeroclaw_api::model_provider::ChatMessage;
 
     struct SessionFactoryStubChannel;
@@ -19648,6 +19693,7 @@ mod tests {
             .get_mut("cron-alpha")
             .expect("the fixture profile exists");
         profile.allowed_tools = vec![zeroclaw_api::grants::WILDCARD.into()];
+        profile.grants.insert(Resource::Tools, vec![Verb::Execute]);
         profile.grants.insert(
             Resource::Sops,
             vec![
@@ -19670,6 +19716,28 @@ mod tests {
         (ctx, engine, sops_dir)
     }
 
+    fn allow_all_sop_agents(ctx: &RpcContext) {
+        let mut config = ctx.config_authority.snapshot_config();
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .allowed_agents = vec!["*".into()];
+        ctx.auth.refresh_from_config(&config).unwrap();
+        ctx.config_authority.publish_for_test(config);
+    }
+
+    fn grant_sop_admin(ctx: &RpcContext) {
+        let mut config = ctx.config_authority.snapshot_config();
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .admin = true;
+        ctx.auth.refresh_from_config(&config).unwrap();
+        ctx.config_authority.publish_for_test(config);
+    }
+
     fn park_sop_run(engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>, name: &str) -> String {
         let action = engine
             .lock()
@@ -19690,11 +19758,26 @@ mod tests {
         run_id
     }
 
+    /// `sops/run` got past authorization. This context has no SOP audit log,
+    /// and that check follows authorization, so an admitted run stops there.
+    fn assert_sop_run_admitted(response: &Value) {
+        assert_eq!(
+            response["error"]["code"],
+            json!(INTERNAL_ERROR),
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["message"],
+            json!("SOP subsystem not enabled"),
+            "{response}"
+        );
+    }
+
     #[tokio::test]
-    async fn sop_run_and_decide_refuse_a_procedure_run_as_an_agent_outside_the_selector() {
+    async fn sop_run_and_decide_refuse_agent_scoped_execution() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
-        let beta_run = park_sop_run(&engine, "beta-sop");
+        let alpha_run = park_sop_run(&engine, "alpha-sop");
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
         let run = rpc(
@@ -19702,7 +19785,7 @@ mod tests {
             &mut rx,
             1,
             "sops/run",
-            json!({"name": "beta-sop"}),
+            json!({"name": "alpha-sop"}),
         )
         .await;
         assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
@@ -19712,7 +19795,7 @@ mod tests {
             &mut rx,
             2,
             "sops/decide",
-            json!({"name": "beta-sop", "run_id": beta_run, "decision": "approve"}),
+            json!({"name": "alpha-sop", "run_id": alpha_run, "decision": "approve"}),
         )
         .await;
         assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
@@ -19720,14 +19803,13 @@ mod tests {
             engine
                 .lock()
                 .expect("engine lock")
-                .get_run(&beta_run)
+                .get_run(&alpha_run)
                 .map(|run| run.status),
             Some(crate::sop::SopRunStatus::WaitingApproval),
             "a refused approval must leave the run parked"
         );
 
-        // alpha's procedure passes the selector. This context has no SOP audit
-        // log, so the run then fails as unavailable rather than as refused.
+        allow_all_sop_agents(&ctx);
         let admitted = rpc(
             &mut alice,
             &mut rx,
@@ -19736,13 +19818,31 @@ mod tests {
             json!({"name": "alpha-sop"}),
         )
         .await;
-        assert_ne!(admitted["error"]["code"], json!(FORBIDDEN), "{admitted}");
+        assert_eq!(
+            admitted["error"]["code"],
+            json!(FORBIDDEN),
+            "wildcards do not grant session-data authority: {admitted}"
+        );
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            4,
+            "sops/decide",
+            json!({"name":"alpha-sop", "run_id":alpha_run, "decision":"approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+        assert_eq!(
+            engine.lock().unwrap().get_run(&alpha_run).unwrap().status,
+            crate::sop::SopRunStatus::WaitingApproval
+        );
     }
 
     #[tokio::test]
     async fn sop_run_refuses_a_constrained_tool_selector_like_a_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (ctx, _engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
         let mut narrowed = ctx.config.read().clone();
         narrowed
@@ -19763,6 +19863,568 @@ mod tests {
         )
         .await;
         assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+    }
+
+    #[tokio::test]
+    async fn sop_run_and_decide_refuse_a_wildcard_selector_without_tools_execute() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        let alpha_run = park_sop_run(&engine, "alpha-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let mut without_tools = ctx.config.read().clone();
+        without_tools
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth
+            .refresh_from_config(&without_tools)
+            .expect("the policy without tools:execute compiles");
+
+        let run = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "alpha-sop", "run_id": alpha_run, "decision": "approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .get_run(&alpha_run)
+                .map(|run| run.status),
+            Some(crate::sop::SopRunStatus::WaitingApproval),
+            "a refused approval must leave the run parked"
+        );
+
+        // The trusted local operator holds admin grants and is never narrowed,
+        // so the same procedure is admitted for it.
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let admitted = rpc(
+            &mut operator,
+            &mut op_rx,
+            3,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_sop_run_admitted(&admitted);
+    }
+
+    #[tokio::test]
+    async fn sop_missing_definition_cannot_bypass_the_tool_ceiling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let mut revoked = ctx.config.read().clone();
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth.refresh_from_config(&revoked).unwrap();
+        engine.lock().unwrap().set_sops_for_test(vec![]);
+        let run = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "alpha-sop", "run_id": "absent", "decision": "approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+    }
+
+    /// The actual RPC must finish its refusal while the external writer is still
+    /// holding SQLite, rather than waiting with an already accepted authority.
+    #[tokio::test]
+    async fn sop_rpc_refuses_sqlite_contention_before_start_or_resume_effects() {
+        use crate::sop::{SopRunStatus, SopRunStore};
+        for resume in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (base, engine, _) = sop_scoped_ctx(&tmp, 4242);
+            grant_sop_admin(&base);
+            let path = tmp.path().join("sop-contention.db");
+            let store = Arc::new(crate::sop::SqliteRunStore::open(&path).unwrap());
+            let mut replacement = crate::sop::SopEngine::new(base.config.read().sop.clone())
+                .with_store(store.clone());
+            replacement.set_sops_for_test(vec![gated_sop("alpha-sop", "alpha")]);
+            *engine.lock().unwrap() = replacement;
+            let run_id = resume.then(|| park_sop_run(&engine, "alpha-sop"));
+            let before = run_id.as_ref().map(|id| {
+                serde_json::to_value(engine.lock().unwrap().get_run(id).unwrap()).unwrap()
+            });
+            let shared: Arc<dyn zeroclaw_memory::traits::Memory> =
+                Arc::new(zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).unwrap());
+            let ctx = RpcContext::minimal_with_sop_engine_and_audit(
+                base.config.read().clone(),
+                Arc::clone(&base.sessions),
+                engine.clone(),
+                Arc::new(crate::sop::SopAuditLogger::new(shared)),
+                None,
+            );
+            let (mut peer, mut rx) = roster_peer(&ctx, 4242).await;
+            let method = if resume { "sops/decide" } else { "sops/run" };
+            let params = if let Some(id) = &run_id {
+                json!({"name":"alpha-sop","run_id":id,"decision":"approve"})
+            } else {
+                json!({"name":"alpha-sop"})
+            };
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (done, completed) = std::sync::mpsc::channel();
+            let call = std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let response = runtime.block_on(rpc(&mut peer, &mut rx, 1, method, params));
+                    done.send(response).unwrap();
+                    (peer, rx)
+                })
+                .unwrap();
+            let result = completed.recv_timeout(std::time::Duration::from_secs(2));
+            // Always release/join, even on the old implementation, so a failed
+            // regression does not leave a worker running behind the fixture.
+            writer.execute_batch("ROLLBACK").unwrap();
+            let (mut peer, mut rx) = call.join().unwrap();
+            let response = result.expect("RPC must refuse without waiting for SQLite's writer");
+            assert!(response.get("error").is_some(), "{response}");
+            // Start admission reports storage failures as INVALID_PARAMS, whereas
+            // resume uses INTERNAL_ERROR. Pin the actual SQLite cause below so
+            // a parser/permission refusal cannot satisfy this regression.
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("locked"),
+                "the external SQLite writer must cause the refusal: {response}"
+            );
+            assert_eq!(store.claim_counts("alpha-sop").unwrap(), (0, 0));
+            if let Some(id) = &run_id {
+                assert_eq!(
+                    serde_json::to_value(engine.lock().unwrap().get_run(id).unwrap()).unwrap(),
+                    before.unwrap()
+                );
+                assert_eq!(
+                    store.load_run(id).unwrap().unwrap().run.status,
+                    SopRunStatus::WaitingApproval
+                );
+                let denied = rpc(
+                    &mut peer,
+                    &mut rx,
+                    2,
+                    "sops/decide",
+                    json!({"name":"alpha-sop","run_id":id,"decision":{"deny":{}}}),
+                )
+                .await;
+                assert!(
+                    denied.get("error").is_none(),
+                    "uncontended operator decision: {denied}"
+                );
+            } else {
+                assert!(engine.lock().unwrap().active_runs().is_empty());
+                assert!(store.load_active_runs().unwrap().is_empty());
+                let admitted = rpc(
+                    &mut peer,
+                    &mut rx,
+                    2,
+                    "sops/run",
+                    json!({"name":"alpha-sop"}),
+                )
+                .await;
+                assert!(
+                    admitted.get("error").is_none(),
+                    "uncontended administrator start: {admitted}"
+                );
+                assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+            }
+        }
+    }
+
+    struct PausedSopDecision {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::sop::DecisionModel for PausedSopDecision {
+        fn id(&self) -> &str {
+            "paused"
+        }
+
+        async fn ask(
+            &self,
+            _state: Value,
+            _questions: std::collections::BTreeMap<String, crate::sop::decision::Question>,
+        ) -> anyhow::Result<crate::sop::decision::Answers> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            // RunStrict admits this synthetic outage, so only authorization
+            // can stop admission after the suspended decision returns.
+            anyhow::bail!("synthetic decision outage")
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_run_rechecks_live_authority_and_loaded_agents_after_decision_wait() {
+        for deduplicated in [false, true] {
+            for change in [
+                "tools",
+                "agents",
+                "definition",
+                "identity",
+                "expiry",
+                "control",
+            ] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+                allow_all_sop_agents(&ctx);
+                grant_sop_admin(&ctx);
+                let model = Arc::new(PausedSopDecision {
+                    entered: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                });
+                let mut sop = gated_sop("alpha-sop", "alpha");
+                sop.decision = Some(
+                    serde_json::from_value(json!({
+                        "model": "paused", "gate": "Start?"
+                    }))
+                    .unwrap(),
+                );
+                let store: Arc<dyn crate::sop::SopRunStore> =
+                    Arc::new(crate::sop::store::InMemoryRunStore::new());
+                let mut replacement = crate::sop::SopEngine::new(ctx.config.read().sop.clone())
+                    .with_store(Arc::clone(&store))
+                    .with_decision_models(std::collections::HashMap::from([(
+                        "paused".into(),
+                        model.clone() as Arc<dyn crate::sop::DecisionModel>,
+                    )]));
+                replacement.set_sops_for_test(vec![sop.clone()]);
+                *engine.lock().unwrap() = replacement;
+                let memory = zeroclaw_memory::create_memory(
+                    &zeroclaw_config::schema::MemoryConfig {
+                        backend: "sqlite".into(),
+                        ..Default::default()
+                    },
+                    tmp.path(),
+                    None,
+                )
+                .unwrap();
+                let ctx = RpcContext::minimal_with_sop_engine_and_audit(
+                    ctx.config.read().clone(),
+                    Arc::clone(&ctx.sessions),
+                    Arc::clone(&engine),
+                    Arc::new(crate::sop::SopAuditLogger::new(Arc::from(memory))),
+                    None,
+                );
+                let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+                if change == "expiry" {
+                    alice.auth.as_mut().unwrap().principal.expires_at = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                            + 2,
+                    );
+                }
+                let params = if deduplicated {
+                    json!({"name": "alpha-sop", "dedup_key": "synthetic-work"})
+                } else {
+                    json!({"name": "alpha-sop"})
+                };
+                let request = async { rpc(&mut alice, &mut rx, 1, "sops/run", params).await };
+                let mutate = async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        model.entered.notified(),
+                    )
+                    .await
+                    .expect("the authorized request reaches its decision wait");
+                    match change {
+                        "tools" | "agents" => {
+                            let mut revoked = ctx.config.read().clone();
+                            revoked
+                                .permission_profiles
+                                .get_mut("cron-alpha")
+                                .unwrap()
+                                .admin = false;
+                            let profile =
+                                revoked.permission_profiles.get_mut("cron-alpha").unwrap();
+                            if change == "tools" {
+                                profile
+                                    .grants
+                                    .remove(&zeroclaw_api::grants::Resource::Tools);
+                            } else {
+                                profile.allowed_agents = vec!["alpha".into()];
+                            }
+                            ctx.auth.refresh_from_config(&revoked).unwrap();
+                        }
+                        "definition" => {
+                            sop.agent = Some("beta".into());
+                            engine.lock().unwrap().set_sops_for_test(vec![sop]);
+                        }
+                        // Removing the roster identity revokes the credential's
+                        // live resolution, independently of the tool selector.
+                        "identity" => {
+                            let mut revoked = ctx.config.read().clone();
+                            revoked
+                                .permission_profiles
+                                .get_mut("cron-alpha")
+                                .unwrap()
+                                .admin = false;
+                            revoked.users.clear();
+                            ctx.auth.refresh_from_config(&revoked).unwrap();
+                        }
+                        "expiry" => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                        "control" => {}
+                        _ => unreachable!(),
+                    }
+                    model.release.notify_one();
+                };
+                let (response, ()) = tokio::join!(request, mutate);
+                if matches!(change, "control" | "definition") {
+                    assert!(response.get("error").is_none(), "{response}");
+                    assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+                } else {
+                    assert!(
+                        matches!(response["error"]["code"].as_i64(),
+                        Some(code) if code == i64::from(FORBIDDEN) || code == i64::from(AUTH_REQUIRED)),
+                        "{change}, dedup={deduplicated}: {response}"
+                    );
+                    assert!(engine.lock().unwrap().active_runs().is_empty());
+                    assert!(store.load_active_runs().unwrap().is_empty());
+                    assert!(store.load_terminal_runs(0).unwrap().is_empty());
+                    assert_eq!(store.claim_counts("alpha-sop").unwrap(), (0, 0));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_decide_rechecks_live_authority_after_engine_lock_with_a_stale_stamp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        grant_sop_admin(&ctx);
+        let run_id = park_sop_run(&engine, "alpha-sop");
+        let (alice, _) = roster_peer(&ctx, 4242).await;
+        let engine_guard = engine.lock().unwrap();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let requested_run = run_id.clone();
+        let task = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                entered.send(()).unwrap();
+                // The admitted stamp stays permissive throughout this call, so
+                // only resolution after acquiring the held engine lock can deny.
+                runtime
+                    .block_on(alice.handle_sops_decide(&json!({
+                        "name": "alpha-sop", "run_id": requested_run, "decision": "approve"
+                    })))
+                    .unwrap_err()
+            })
+            .unwrap();
+        waiting.recv().unwrap();
+        let mut revoked = ctx.config.read().clone();
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .admin = false;
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth.refresh_from_config(&revoked).unwrap();
+        drop(engine_guard);
+        let denied = task.join().unwrap();
+        assert_eq!(denied.code, FORBIDDEN);
+        assert_eq!(
+            engine.lock().unwrap().get_run(&run_id).unwrap().status,
+            crate::sop::SopRunStatus::WaitingApproval
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_decide_rechecks_before_lookup_and_final_projection() {
+        for (boundary, target) in [
+            ("sop-decision-admission", "valid"),
+            ("sop-decision-admission", "missing"),
+            ("sop-decision-admission", "mismatched"),
+            ("sop-decision-result", "valid"),
+        ] {
+            for revoke in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (ctx, engine, _) = sop_scoped_ctx(&tmp, 4242);
+                allow_all_sop_agents(&ctx);
+                grant_sop_admin(&ctx);
+                let run_id = park_sop_run(&engine, "alpha-sop");
+                let requested = match target {
+                    "missing" => "missing".to_string(),
+                    "mismatched" => park_sop_run(&engine, "beta-sop"),
+                    _ => run_id.clone(),
+                };
+                let (alice, _) = roster_peer(&ctx, 4242).await;
+                let (operator, _) = local_operator(&ctx).await;
+                let (entered, release) = ctx.sessions.set_test_effect_pause(boundary);
+                let params = json!({
+                    "name":"alpha-sop", "run_id":requested, "decision":{"deny":{}}
+                });
+                let request = alice.handle_sops_decide(&params);
+                let change = async {
+                    entered.notified().await;
+                    if revoke {
+                        let commit = ctx.config_authority.begin_config_commit().await.unwrap();
+                        let mut changed = ctx.config.read().clone();
+                        changed
+                            .permission_profiles
+                            .get_mut("cron-alpha")
+                            .unwrap()
+                            .admin = false;
+                        changed.mark_dirty("permission_profiles.cron-alpha");
+                        operator
+                            .save_and_publish_config(
+                                commit,
+                                changed,
+                                RpcConfigCommitEffects::default(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, change)
+                })
+                .await
+                .expect("decision reaches and leaves the effect boundary");
+                if revoke {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code, FORBIDDEN, "{boundary}, {target}");
+                    assert_eq!(
+                        error.message,
+                        crate::i18n::get_required_cli_string("sop-rpc-principal-ceiling-required")
+                    );
+                } else if target == "valid" {
+                    assert!(result.is_ok(), "{result:?}");
+                } else {
+                    assert_eq!(result.unwrap_err().code, INVALID_PARAMS);
+                }
+                let status = engine.lock().unwrap().get_run(&run_id).unwrap().status;
+                let changed = target == "valid" && (!revoke || boundary == "sop-decision-result");
+                assert_eq!(
+                    status,
+                    if changed {
+                        crate::sop::SopRunStatus::Cancelled
+                    } else {
+                        crate::sop::SopRunStatus::WaitingApproval
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sop_run_and_decide_are_refused_after_admin_demotion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        allow_all_sop_agents(&ctx);
+        grant_sop_admin(&ctx);
+        let alpha_run = park_sop_run(&engine, "alpha-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Admitted on both methods while tools:execute is held. The decision
+        // is a denial so that it does not resume the run into a headless driver.
+        let admitted = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_sop_run_admitted(&admitted);
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "alpha-sop", "run_id": alpha_run, "decision": {"deny": {}}}),
+        )
+        .await;
+        assert!(decided.get("error").is_none(), "{decided}");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .get_run(&alpha_run)
+                .map(|run| run.status),
+            Some(crate::sop::SopRunStatus::Cancelled),
+            "an admitted denial must reach the run"
+        );
+
+        // Revoke only tools:execute; the wildcard selector and the SOP grants
+        // stay, and the same connection is refused on its next run.
+        let mut revoked = ctx.config.read().clone();
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .unwrap()
+            .admin = false;
+        revoked
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&zeroclaw_api::grants::Resource::Tools);
+        ctx.auth
+            .refresh_from_config(&revoked)
+            .expect("the revoked policy compiles");
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            3,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
     }
 
     #[tokio::test]

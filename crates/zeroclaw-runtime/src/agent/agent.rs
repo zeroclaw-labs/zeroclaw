@@ -677,7 +677,10 @@ pub struct Agent {
     #[cfg(test)]
     turn_entry_pause: Option<TestTurnEntryPause>,
     /// Concrete delegate registered in this Agent's tool set. Owned sessions
-    /// bind their principal to it before delegation can construct child tools.
+    /// bind their principal to it before delegation can construct child tools,
+    /// and RPC admission binds its child builders to the caller's live
+    /// admission resolver without reconstructing a second tool or copying
+    /// authorization policy.
     pub(crate) delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -1259,7 +1262,8 @@ impl AgentBuilder {
         self
     }
 
-    /// Retain the concrete delegate for principal binding at session routing.
+    /// Retain the concrete delegate for principal binding at session routing
+    /// and for binding its child builders to live RPC admission.
     fn delegate_tool(mut self, delegate_tool: Option<Arc<crate::tools::DelegateTool>>) -> Self {
         self.delegate_tool = delegate_tool;
         self
@@ -2326,6 +2330,34 @@ impl Agent {
         self.refresh_system_prompt();
     }
 
+    /// SOP tools cannot enforce a principal ceiling. Withhold them and their
+    /// wrappers for non-admins, including nested builders that would restore
+    /// them. The retained delegate resolves the original caller's current
+    /// authority whenever it builds a child registry.
+    pub(crate) fn apply_sop_tool_admission(
+        &mut self,
+        admin: bool,
+        admission: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) {
+        let carries_admission = if let Some(delegate) = &self.delegate_tool {
+            delegate.set_sop_tool_admission(admission);
+            true
+        } else {
+            false
+        };
+        if admin {
+            return;
+        }
+        let held = self.tools.len();
+        self.tools.retain(|tool| {
+            (carries_admission && tool.name() == crate::tools::DelegateTool::NAME)
+                || !tool.requires_unrestricted_principal()
+        });
+        if self.tools.len() != held {
+            self.refresh_system_prompt();
+        }
+    }
+
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
@@ -3345,8 +3377,9 @@ impl Agent {
         };
         // Captured before `assemble` consumes the result: the concrete delegate
         // instance this registry built. `route_memory_to_principal` binds the
-        // session owner to it, and live-config regressions drive its
-        // nested-registry construction through it.
+        // session owner to it, RPC admission binds its child registries to the
+        // originating credential's live authority, and live-config regressions
+        // drive its nested-registry construction through it.
         let built_delegate_tool = all_tools_result.delegate_tool.clone();
         // Capture before `runtime` is moved into `ScopedAssembly`.
         let shell_profile = runtime.shell_profile();

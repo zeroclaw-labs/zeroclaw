@@ -774,7 +774,9 @@ pub struct AllToolsResult {
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
     /// Retained so an owned session can bind its principal to the exact
-    /// registered delegate before any child memory tools are built.
+    /// registered delegate before any child memory tools are built, and so
+    /// callers can bind its child registries to their live RPC authority
+    /// resolver.
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
