@@ -462,19 +462,25 @@ pub(crate) struct LaunchSpec {
     pub(crate) args: Vec<String>,
 }
 
+/// A path-open refusal in the user's language (it is shown inside the
+/// translated `zc-chat-open-path-failed` notice).
+fn refusal(key: &str) -> anyhow::Error {
+    anyhow::Error::msg(crate::i18n::t(key))
+}
+
 fn validate(path: &str) -> anyhow::Result<PathBuf> {
     if cfg!(target_os = "windows") {
-        anyhow::bail!("opening transcript paths is unsupported on Windows");
+        return Err(refusal("zc-chat-path-open-unsupported"));
     }
     if !is_path_target(path) {
-        anyhow::bail!("only absolute paths can be opened");
+        return Err(refusal("zc-chat-path-not-absolute"));
     }
     if path.chars().any(char::is_control) {
-        anyhow::bail!("path contains control characters");
+        return Err(refusal("zc-chat-path-control-characters"));
     }
     let canonical = std::fs::canonicalize(path)?;
     if canonical.to_str().is_none() || canonical.to_string_lossy().chars().any(char::is_control) {
-        anyhow::bail!("canonical path is not valid display text");
+        return Err(refusal("zc-chat-path-not-display-text"));
     }
     Ok(canonical)
 }
@@ -529,7 +535,7 @@ fn platform_program() -> anyhow::Result<&'static str> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        anyhow::bail!("opening files is unsupported on this platform")
+        Err(refusal("zc-chat-path-open-unsupported"))
     }
 }
 
@@ -546,17 +552,28 @@ async fn spawn(spec: LaunchSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run a launch check on the blocking pool. `canonicalize`, `metadata` and
+/// the bundle probe can stall on a slow or disconnected mount; the checked
+/// canonical path they return is still what the opener receives.
+async fn checked_off_loop<T: Send + 'static>(
+    path: &str,
+    check: fn(&str) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let owned = path.to_string();
+    tokio::task::spawn_blocking(move || check(&owned)).await?
+}
+
 /// Open a path with the platform default app, or reveal it when opening
 /// could run code.
 pub(crate) async fn open(path: &str) -> anyhow::Result<OpenOutcome> {
-    let (spec, outcome) = open_spec(path)?;
+    let (spec, outcome) = checked_off_loop(path, open_spec).await?;
     spawn(spec).await?;
     Ok(outcome)
 }
 
 /// Show a path in the platform file manager.
 pub(crate) async fn reveal(path: &str) -> anyhow::Result<()> {
-    spawn(reveal_spec(path)?).await
+    spawn(checked_off_loop(path, reveal_spec).await?).await
 }
 
 #[cfg(test)]
@@ -855,6 +872,36 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn path_refusals_use_the_fluent_catalogue() {
+        let refused = |path: &str| validate(path).unwrap_err().to_string();
+        assert_eq!(
+            refused("relative/file.md"),
+            crate::i18n::t("zc-chat-path-not-absolute")
+        );
+        assert_eq!(
+            refused("/tmp/bad\u{7}name"),
+            crate::i18n::t("zc-chat-path-control-characters")
+        );
+        for key in [
+            "zc-chat-path-open-unsupported",
+            "zc-chat-path-not-absolute",
+            "zc-chat-path-control-characters",
+            "zc-chat-path-not-display-text",
+        ] {
+            assert_ne!(crate::i18n::t(key), key, "{key} must be in the catalogue");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn open_and_reveal_report_missing_paths_from_the_blocking_pool() {
+        let missing = "/definitely/not/a/real/zc-path-open";
+        assert!(open(missing).await.is_err());
+        assert!(reveal(missing).await.is_err());
     }
 
     #[test]

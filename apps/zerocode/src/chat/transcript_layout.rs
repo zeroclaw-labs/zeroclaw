@@ -21,6 +21,10 @@ pub(super) enum LinesDirty {
     TailChanged(usize),
     /// Entry mutation, presentation change, width change, or reset requires all indexes.
     Full,
+    /// Same entries and text; only which paths are links changed. Rebuilds
+    /// like `Full`, but the rendered geometry is unchanged, so the draw keeps
+    /// the transcript selection and pointer state.
+    Restyle,
 }
 
 /// Borrowed canonical entry and its presentation for this rebuild only.
@@ -101,7 +105,9 @@ impl TranscriptLayoutCache {
     pub(super) fn invalidate_append(&mut self) {
         match self.layout.dirty {
             LinesDirty::Clean => self.layout.dirty = LinesDirty::Appended,
-            LinesDirty::TailChanged(_) => self.layout.dirty = LinesDirty::Full,
+            LinesDirty::TailChanged(_) | LinesDirty::Restyle => {
+                self.layout.dirty = LinesDirty::Full;
+            }
             LinesDirty::Appended | LinesDirty::Full => {}
         }
         // Full invalidation is sticky.
@@ -123,12 +129,23 @@ impl TranscriptLayoutCache {
                     self.invalidate_full();
                 }
             }
-            LinesDirty::TailChanged(_) | LinesDirty::Full => self.invalidate_full(),
+            LinesDirty::TailChanged(_) | LinesDirty::Full | LinesDirty::Restyle => {
+                self.invalidate_full();
+            }
         }
     }
 
     pub(super) fn invalidate_full(&mut self) {
         self.layout.dirty = LinesDirty::Full;
+    }
+
+    /// Link targets changed but the text did not. Any pending content change
+    /// already forces a full rebuild with the usual selection reset, so this
+    /// only marks a clean layout.
+    pub(super) fn invalidate_restyle(&mut self) {
+        if self.layout.dirty == LinesDirty::Clean {
+            self.layout.dirty = LinesDirty::Restyle;
+        }
     }
 
     pub(super) fn reset(&mut self) {
