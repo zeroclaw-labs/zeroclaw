@@ -3570,6 +3570,9 @@ const WEBP_ANIMATED_SCRATCH_MODEL: AnimationScratchModel = AnimationScratchModel
 /// charged against the budget; the same payload would fail the decode anyway.
 fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<u64> {
     let format = image_format_for_mime(source, mime)?;
+    if format == image::ImageFormat::WebP {
+        ensure_vp8_matches_enclosing_canvas(source, mime, bytes)?;
+    }
 
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
@@ -3830,6 +3833,118 @@ fn per_image_cap_refusal(
         consumed_allocation: 0,
         kind: ImageValidationFailureKind::RefusedBeforeDecode,
     })
+}
+
+/// Reads a little-endian 24-bit integer, the width of a `VP8X`/`ANMF` dimension.
+fn le_u24(bytes: &[u8]) -> u32 {
+    u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
+}
+
+/// Splits RIFF-style chunk data into `(fourcc, payload)` pairs.
+///
+/// A payload that runs past the end of `data` is returned truncated, and a
+/// trailing fragment too short for a chunk header ends the walk, so the caller
+/// sees exactly the bytes a decoder reading the same buffer could reach.
+fn riff_chunks(data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
+    let mut offset = 0usize;
+    std::iter::from_fn(move || {
+        let header = data.get(offset..offset.checked_add(8)?)?;
+        let fourcc = [header[0], header[1], header[2], header[3]];
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let start = offset + 8;
+        let end = start.saturating_add(size).min(data.len());
+        offset = start.saturating_add(size).saturating_add(size & 1);
+        Some((fourcc, &data[start..end]))
+    })
+}
+
+/// Refuses a lossy `VP8` bitstream whose own header declares dimensions other
+/// than the `VP8X` canvas or `ANMF` frame rectangle that encloses it.
+///
+/// [`projected_allocation`] charges the canvas the container declares, but
+/// `image-webp` 0.2.4 sizes the VP8 frame planes from the bitstream header
+/// (`vp8.rs`, `read_frame_header`: `ybuf`/`ubuf`/`vbuf`) and compares that
+/// header with the canvas only after decoding the frame (`decoder.rs`,
+/// `read_image` and `read_frame`). A small canvas around a 16383x16383 header
+/// therefore passes the projection and still asks the decoder for roughly
+/// 384 MiB of planes. The decoder rejects such a file once it has allocated;
+/// this rejects it before any decoder is constructed.
+///
+/// `VP8L` needs no such check: `LosslessDecoder::decode_frame` compares its
+/// header with the expected size before it allocates anything of its own. A
+/// bare `VP8` or `VP8L` file has no enclosing canvas to disagree with, and any
+/// other first chunk is rejected by the decoder before it allocates.
+///
+/// Every `VP8` chunk found is checked, not only the one the decoder would use.
+/// A structure this walk cannot read, such as a canvas chunk too short to hold
+/// its dimensions, is refused rather than admitted.
+fn ensure_vp8_matches_enclosing_canvas(
+    source: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let refuse = |reason: String| -> anyhow::Result<()> {
+        Err(MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.to_string(),
+            reason,
+        }
+        .into())
+    };
+    // `VP8` payload: 3-byte frame tag, 3-byte start code, then 14-bit width
+    // and height each in the low bits of a little-endian u16.
+    let vp8_dimensions = |payload: &[u8]| -> Option<(u32, u32)> {
+        let header = payload.get(6..10)?;
+        Some((
+            u32::from(u16::from_le_bytes([header[0], header[1]]) & 0x3FFF),
+            u32::from(u16::from_le_bytes([header[2], header[3]]) & 0x3FFF),
+        ))
+    };
+    let check = |what: &str, payload: &[u8], expected: (u32, u32)| -> anyhow::Result<()> {
+        match vp8_dimensions(payload) {
+            Some(actual) if actual == expected => Ok(()),
+            Some((width, height)) => refuse(format!(
+                "VP8 bitstream declares {width}x{height} inside a {}x{} {what}",
+                expected.0, expected.1
+            )),
+            None => refuse(format!("VP8 bitstream header is truncated inside a {what}")),
+        }
+    };
+
+    let Some(body) = bytes
+        .get(12..)
+        .filter(|_| bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP")
+    else {
+        return refuse("not a RIFF/WEBP container".to_string());
+    };
+    let mut chunks = riff_chunks(body).peekable();
+    let Some((b"VP8X", vp8x)) = chunks.peek().map(|(fourcc, payload)| (fourcc, *payload)) else {
+        return Ok(());
+    };
+    let Some(canvas) = vp8x.get(4..10) else {
+        return refuse("VP8X chunk is too short to hold the canvas size".to_string());
+    };
+    let canvas = (le_u24(&canvas[..3]) + 1, le_u24(&canvas[3..]) + 1);
+
+    for (fourcc, payload) in chunks {
+        match &fourcc {
+            b"VP8 " => check("VP8X canvas", payload, canvas)?,
+            b"ANMF" => {
+                let Some(rect) = payload.get(6..12) else {
+                    return refuse("ANMF chunk is too short to hold the frame size".to_string());
+                };
+                let frame = (le_u24(&rect[..3]) + 1, le_u24(&rect[3..]) + 1);
+                for (sub_fourcc, sub_payload) in riff_chunks(payload.get(16..).unwrap_or_default())
+                {
+                    if &sub_fourcc == b"VP8 " {
+                        check("ANMF frame", sub_payload, frame)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Header-only per-image gate for callers that decode untrusted image bytes
@@ -8769,6 +8884,150 @@ mod tests {
             .expect_err("an unreadable header is refused, not admitted");
         ensure_decode_within_per_image_cap("x.bin", "application/pdf", &readable)
             .expect_err("an unsupported MIME is refused");
+    }
+
+    /// A `VP8` chunk payload carrying only the frame header the decoder reads
+    /// before it allocates: the 3-byte tag (bit 0 clear = key frame), the
+    /// start code `9d 01 2a`, then 14-bit width and height as little-endian
+    /// u16s. Layout taken from `image-webp` 0.2.4 `vp8.rs` `read_frame_header`
+    /// (which reads exactly these bytes and sizes `ybuf`/`ubuf`/`vbuf` from
+    /// them) and `decoder.rs` `read_data` (the same offsets for the still path).
+    fn vp8_header_payload(width: u16, height: u16) -> Vec<u8> {
+        let mut payload = vec![0x10, 0x00, 0x00, 0x9d, 0x01, 0x2a];
+        payload.extend_from_slice(&width.to_le_bytes());
+        payload.extend_from_slice(&height.to_le_bytes());
+        payload
+    }
+
+    fn riff_webp(body: Vec<u8>) -> Vec<u8> {
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WEBP");
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    fn vp8x_payload(animated: bool, canvas: (u32, u32)) -> Vec<u8> {
+        let mut payload = vec![if animated { 0x02 } else { 0x00 }, 0, 0, 0];
+        payload.extend_from_slice(&(canvas.0 - 1).to_le_bytes()[..3]);
+        payload.extend_from_slice(&(canvas.1 - 1).to_le_bytes()[..3]);
+        payload
+    }
+
+    /// A still lossy WebP: `VP8X` canvas around a `VP8` chunk whose own
+    /// header declares `vp8`.
+    fn still_lossy_webp(canvas: (u32, u32), vp8: (u16, u16)) -> Vec<u8> {
+        let mut body = Vec::new();
+        append_webp_chunk(&mut body, b"VP8X", &vp8x_payload(false, canvas));
+        append_webp_chunk(&mut body, b"VP8 ", &vp8_header_payload(vp8.0, vp8.1));
+        riff_webp(body)
+    }
+
+    /// An animated WebP with one `ANMF` frame of `rect` size holding a `VP8`
+    /// chunk whose own header declares `vp8`; `with_alpha` puts an `ALPH`
+    /// chunk before it, the order the decoder's lossy-with-alpha frame uses.
+    fn animated_lossy_webp(
+        canvas: (u32, u32),
+        rect: (u32, u32),
+        vp8: (u16, u16),
+        with_alpha: bool,
+    ) -> Vec<u8> {
+        let mut frame = vec![0u8; 16];
+        frame[6..9].copy_from_slice(&(rect.0 - 1).to_le_bytes()[..3]);
+        frame[9..12].copy_from_slice(&(rect.1 - 1).to_le_bytes()[..3]);
+        if with_alpha {
+            append_webp_chunk(&mut frame, b"ALPH", &[0]);
+        }
+        append_webp_chunk(&mut frame, b"VP8 ", &vp8_header_payload(vp8.0, vp8.1));
+
+        let mut body = Vec::new();
+        append_webp_chunk(&mut body, b"VP8X", &vp8x_payload(true, canvas));
+        append_webp_chunk(&mut body, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+        append_webp_chunk(&mut body, b"ANMF", &frame);
+        riff_webp(body)
+    }
+
+    #[tokio::test]
+    async fn vp8_header_larger_than_the_enclosing_canvas_is_refused_before_decode() {
+        // 16383x16383 is the largest size the 14-bit VP8 header can declare:
+        // 1024 x 1024 macroblocks, 16384 * 16384 * 1.5 = 402_653_184 bytes of
+        // frame planes, allocated by `read_frame_header` before the decoder
+        // compares the header with the canvas. The canvas here is 16x16, so
+        // the projection alone charges almost nothing.
+        let fixtures = [
+            ("still", still_lossy_webp((16, 16), (16383, 16383))),
+            (
+                "animated",
+                animated_lossy_webp((16, 16), (16, 16), (16383, 16383), false),
+            ),
+            (
+                "animated with ALPH",
+                animated_lossy_webp((16, 16), (16, 16), (16383, 16383), true),
+            ),
+            // Smaller than the canvas is a mismatch too: the decoder rejects
+            // it as `InconsistentImageSizes`, so refusing it early costs nothing.
+            (
+                "still, smaller header",
+                still_lossy_webp((64, 64), (16, 16)),
+            ),
+        ];
+        for (name, webp) in fixtures {
+            let gate = ensure_decode_within_per_image_cap("vp8.webp", "image/webp", &webp)
+                .expect_err(name);
+            assert!(
+                gate.to_string().contains("VP8 bitstream declares"),
+                "{name}: the refusal must come from the dimension check: {gate}"
+            );
+
+            let validator = validate_image_content("vp8.webp", "image/webp", &webp, u64::MAX).await;
+            let error = validator.expect_err(name);
+            assert!(
+                error.to_string().contains("VP8 bitstream declares"),
+                "{name}: the validator must refuse it before decoding: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn vp8_header_matching_the_enclosing_canvas_is_admitted_by_the_gate() {
+        // Same shapes as the refused fixtures with consistent sizes: the new
+        // check must not turn a well-formed lossy layout into a refusal.
+        let fixtures = [
+            ("still", still_lossy_webp((16, 16), (16, 16))),
+            (
+                "animated",
+                animated_lossy_webp((16, 16), (16, 16), (16, 16), false),
+            ),
+            (
+                "animated with ALPH",
+                animated_lossy_webp((16, 16), (16, 16), (16, 16), true),
+            ),
+            // A frame smaller than the canvas is legal: the rectangle, not the
+            // canvas, is what the frame's VP8 header must equal.
+            (
+                "animated sub-rectangle",
+                animated_lossy_webp((64, 64), (16, 16), (16, 16), false),
+            ),
+        ];
+        for (name, webp) in fixtures {
+            ensure_decode_within_per_image_cap("vp8.webp", "image/webp", &webp)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn vp8_dimension_check_refuses_structures_it_cannot_read() {
+        let mut short_vp8x = Vec::new();
+        append_webp_chunk(&mut short_vp8x, b"VP8X", &[0; 6]);
+        let mut short_vp8 = Vec::new();
+        append_webp_chunk(&mut short_vp8, b"VP8X", &vp8x_payload(false, (16, 16)));
+        append_webp_chunk(&mut short_vp8, b"VP8 ", &[0x10, 0, 0, 0x9d, 0x01]);
+        for (name, webp) in [
+            ("VP8X too short for the canvas", riff_webp(short_vp8x)),
+            ("VP8 too short for its header", riff_webp(short_vp8)),
+        ] {
+            ensure_vp8_matches_enclosing_canvas("x.webp", "image/webp", &webp).expect_err(name);
+        }
     }
 
     #[tokio::test]

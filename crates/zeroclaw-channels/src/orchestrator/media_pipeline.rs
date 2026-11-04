@@ -752,6 +752,65 @@ mod tests {
         assert!(png.starts_with(b"\x89PNG"), "output must be a PNG");
     }
 
+    /// A lossy WebP with a 16x16 `VP8X` canvas around a `VP8` chunk whose own
+    /// header declares 16383x16383 (the layout `image-webp` reads in
+    /// `decoder.rs` `read_data` and `vp8.rs` `read_frame_header`: 3-byte tag,
+    /// start code `9d 01 2a`, 14-bit width and height).
+    #[cfg(feature = "image-normalization")]
+    fn lossy_webp_declaring_a_far_larger_bitstream() -> MediaAttachment {
+        let chunk = |name: &[u8; 4], payload: &[u8]| {
+            let mut out = name.to_vec();
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(payload);
+            out
+        };
+        let mut body = b"WEBP".to_vec();
+        body.extend(chunk(b"VP8X", &[0, 0, 0, 0, 15, 0, 0, 15, 0, 0]));
+        let mut vp8 = vec![0x10, 0x00, 0x00, 0x9d, 0x01, 0x2a];
+        vp8.extend_from_slice(&16383u16.to_le_bytes());
+        vp8.extend_from_slice(&16383u16.to_le_bytes());
+        body.extend(chunk(b"VP8 ", &vp8));
+        let mut data = b"RIFF".to_vec();
+        data.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        data.extend(body);
+        MediaAttachment {
+            file_name: "sticker.webp".to_string(),
+            data,
+            mime_type: Some("image/webp".to_string()),
+            marker: None,
+        }
+    }
+
+    #[cfg(feature = "image-normalization")]
+    #[tokio::test]
+    async fn webp_whose_bitstream_outgrows_its_canvas_is_dropped_before_decode() {
+        let sticker = lossy_webp_declaring_a_far_larger_bitstream();
+        assert!(
+            sticker.data.len() < 100,
+            "the file is tiny; only its header claims a large frame"
+        );
+
+        // The refusal must come from the dimension check, not from the decoder
+        // failing after it has already allocated the frame planes.
+        let error = webp_to_png(&sticker.data).expect_err("a mismatched bitstream is refused");
+        assert!(
+            error.to_string().contains("VP8 bitstream declares"),
+            "refusal must name the dimension mismatch: {error}"
+        );
+
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+        let result = pipeline.process("what is this?", &[sticker]).await;
+        assert!(
+            !result.contains("[IMAGE:data:"),
+            "a mismatched WebP must not be inlined: {result}"
+        );
+        assert!(
+            result.contains("could not be read") && result.contains("what is this?"),
+            "the image is dropped and the user's text survives: {result}"
+        );
+    }
+
     #[cfg(feature = "image-normalization")]
     #[tokio::test]
     async fn corrupt_webp_is_dropped_rather_than_inlined() {
