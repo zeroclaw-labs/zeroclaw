@@ -5,7 +5,7 @@ import type {
   SessionMessagesResponse,
   WsMessage,
 } from '@/types/api';
-import { WebSocketClient } from '@/lib/ws';
+import { WS_CLOSE_ACCESS_LOST, WS_CLOSE_SESSION_ENDED, WebSocketClient } from '@/lib/ws';
 import { getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
@@ -251,6 +251,10 @@ export function AgentProvider({
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
+  // Bumped to reload the transcript after a socket that closed mid-turn opens
+  // again: the turn may have finished on the server while no socket listened.
+  const [transcriptVersion, setTranscriptVersion] = useState(0);
+  const resyncOnOpenRef = useRef(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextLimits, setContextLimits] = useState(EMPTY_CONTEXT_LIMITS);
@@ -354,7 +358,7 @@ export function AgentProvider({
     return () => {
       cancelled = true;
     };
-  }, [sessionId, sessionRuntime]);
+  }, [sessionId, sessionRuntime, transcriptVersion]);
 
   // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
   useEffect(() => {
@@ -687,6 +691,10 @@ export function AgentProvider({
       if (version !== wsVersionRef.current) return;
       setConnected(true);
       setError(null);
+      if (resyncOnOpenRef.current) {
+        resyncOnOpenRef.current = false;
+        setTranscriptVersion((v) => v + 1);
+      }
 
       // If we just reconnected after a committed model switch, apply the
       // pending model now. A session socket can open while the config write is
@@ -725,6 +733,18 @@ export function AgentProvider({
       if (version !== wsVersionRef.current) return;
       setConnected(false);
 
+      // Closed in the middle of a turn (the session ended, the gateway
+      // reloaded, the network dropped). The turn can still finish on the
+      // server, but not on this socket: stop showing it as running, and
+      // reload the transcript once a socket opens again.
+      if (typingRef.current) {
+        setTyping(false);
+        setStreamingContent('');
+        setStreamingThinking('');
+        foldTurnStream({ type: 'reset' });
+        resyncOnOpenRef.current = true;
+      }
+
       if (
         pendingModelSwitchRef.current
         && modelSwitchConfigCommittedRef.current
@@ -745,7 +765,13 @@ export function AgentProvider({
         return;
       }
 
-      if (ev.code !== 1000 && ev.code !== 1001) {
+      // A signed-in session's close codes are the auth layer's to explain.
+      if (
+        ev.code !== 1000 &&
+        ev.code !== 1001 &&
+        ev.code !== WS_CLOSE_SESSION_ENDED &&
+        ev.code !== WS_CLOSE_ACCESS_LOST
+      ) {
         setError(`${t('agent.connection_closed')} (code: ${ev.code}). ${t('agent.check_configuration')}.`);
       }
     };
@@ -771,7 +797,7 @@ export function AgentProvider({
       }
       handleWsMessage(msg);
     };
-  }, [handleWsMessage]);
+  }, [handleWsMessage, foldTurnStream]);
 
   // WebSocket bound to the configured agent and the active conversation.
   // Re-keys (via the outer <AgentProvider key={alias}>) when the alias changes,
