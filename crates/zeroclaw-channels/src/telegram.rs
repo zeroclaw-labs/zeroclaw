@@ -19568,8 +19568,7 @@ mod tests {
         });
 
         // Enabled: the unmentioned voice note transcribes.
-        let UpdateDisposition::Parsed(message) = ch.try_parse_voice_message(&update).await
-        else {
+        let UpdateDisposition::Parsed(message) = ch.try_parse_voice_message(&update).await else {
             panic!("bypassed voice note should parse while the policy is enabled");
         };
         assert_eq!(message.content, "[Voice] hello there");
