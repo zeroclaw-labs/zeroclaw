@@ -219,9 +219,7 @@ impl SessionStore {
 
     /// Replace the last message without exposing an intermediate truncated session.
     pub fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
-        self.update_last_with(session_key, message, |temp, path| {
-            temp.persist(path).map(|_| ()).map_err(|error| error.error)
-        })
+        self.update_last_with(session_key, message, publish_staged_rewrite)
     }
 
     fn update_last_with<F>(
@@ -252,9 +250,7 @@ impl SessionStore {
     }
 
     fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
-        self.rewrite_with(session_key, messages, |temp, path| {
-            temp.persist(path).map(|_| ()).map_err(|error| error.error)
-        })
+        self.rewrite_with(session_key, messages, publish_staged_rewrite)
     }
 
     /// Transcript+sidecar replacement assuming the caller already holds the
@@ -300,7 +296,7 @@ impl SessionStore {
         F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
     {
         let path = self.session_path(session_key);
-        let mut temp = tempfile::NamedTempFile::new_in(&self.sessions_dir)?;
+        let mut temp = tempfile::Builder::new().make_in(&self.sessions_dir, create_staging_file)?;
         for msg in messages {
             serde_json::to_writer(&mut temp, msg)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -341,6 +337,10 @@ impl SessionStore {
     /// the same key.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
+        self.delete_session_unlocked(session_key)
+    }
+
+    fn delete_session_unlocked(&self, session_key: &str) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
         let crumb_path = self.trim_breadcrumb_path(session_key);
         if !is_regular_jsonl_session_file(&path) {
@@ -382,6 +382,37 @@ impl SessionStore {
             })
             .collect()
     }
+}
+
+/// Rename a staged rewrite over the live session file.
+///
+/// Readers take no lock, so one may hold the session file open at this
+/// moment, and that must not stop the replace on any platform. On Windows
+/// `persist` is a bare `MoveFileExW`, which cannot replace a file that any
+/// reader holds open. `std::fs::rename` retries that refusal with POSIX
+/// semantics, which swap the name while open readers keep the old contents,
+/// as long as they opened it with delete sharing (std's own opens do). On Unix
+/// both are rename(2).
+fn publish_staged_rewrite(temp: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()> {
+    let mut staged = temp.into_temp_path();
+    std::fs::rename(&staged, path)?;
+    // The staging name no longer exists, so there is nothing left to clean up.
+    staged.disable_cleanup(true);
+    Ok(())
+}
+
+/// Create a staging file the way `NamedTempFile::new_in` does (exclusively,
+/// owner-only on Unix) but without the Windows temporary attribute: `persist`
+/// would clear that attribute, and the plain rename that publishes the file
+/// would carry it onto the session file.
+fn create_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
 }
 
 fn is_regular_jsonl_session_file(path: &Path) -> bool {
@@ -578,6 +609,29 @@ impl SessionBackend for SessionStore {
         self.clear_messages(session_key)
     }
 
+    fn with_session_owner(
+        &self,
+        _session_key: &str,
+        effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let _guard = self.mutation_guard()?;
+        effect(None)
+    }
+
+    fn delete_session_authorized(
+        &self,
+        session_key: &str,
+        expected_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        let _guard = self.mutation_guard()?;
+        let _authority = authorize(None)?;
+        if expected_owner.is_some() {
+            return Ok(false);
+        }
+        self.delete_session_unlocked(session_key)
+    }
+
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         self.delete_session(session_key)
     }
@@ -591,6 +645,46 @@ impl SessionBackend for SessionStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_state_backend_admits_locked_live_owner_without_persisting_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        // Named admin creators may keep a live owner even though JSONL cannot
+        // persist attribution; scoped creation already refuses this backend.
+        assert!(backend.set_session_principal("s", "user:alice").is_err());
+        let calls = std::cell::Cell::new(0);
+        backend
+            .set_session_state_authorized(
+                "s",
+                "running",
+                Some("turn"),
+                Some("user:alice"),
+                &|owner| {
+                    assert_eq!(owner, Some("user:alice"));
+                    calls.set(calls.get() + 1);
+                    Ok(Box::new(()))
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(backend.get_session_state("s").unwrap().is_none());
+        assert!(
+            backend
+                .set_session_state_authorized(
+                    "s",
+                    "running",
+                    Some("turn"),
+                    Some("user:alice"),
+                    &|_| Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "revoked"
+                    ))
+                )
+                .is_err()
+        );
+    }
+
     use super::*;
     use std::path::Path;
     use std::sync::{Arc, mpsc};
@@ -983,6 +1077,36 @@ mod tests {
         assert!(!temp_path.unwrap().exists());
     }
 
+    /// Readers take no lock, so one can hold a session file open while a
+    /// writer replaces it. That must not stop the replace, and the reader
+    /// keeps the transcript it opened. Windows refuses a plain replace of an
+    /// open file, so this pins the replace itself rather than leaving it to a
+    /// race.
+    #[test]
+    fn a_rewrite_replaces_a_session_file_a_reader_holds_open() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        let key = "held_open";
+        backend.append(key, &ChatMessage::user("first")).unwrap();
+        backend.append(key, &ChatMessage::assistant("old")).unwrap();
+        let mut held = std::fs::File::open(store.session_path(key)).unwrap();
+
+        backend
+            .replace_conversation_state(
+                key,
+                &[ChatMessage::user("first"), ChatMessage::assistant("new")],
+                false,
+            )
+            .expect("an open reader must not stop the rewrite");
+
+        let held_transcript = std::io::read_to_string(&mut held).unwrap();
+        assert!(held_transcript.contains("old"), "{held_transcript}");
+        let messages = backend.load(key);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "new");
+    }
+
     #[test]
     fn concurrent_append_waits_for_update_last_commit() {
         let tmp = TempDir::new().unwrap();
@@ -1003,7 +1127,7 @@ mod tests {
             update_worker.update_last_with(key, &ChatMessage::assistant("new"), |temp, path| {
                 staged_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                temp.persist(path).map(|_| ()).map_err(|error| error.error)
+                publish_staged_rewrite(temp, path)
             })
         });
 

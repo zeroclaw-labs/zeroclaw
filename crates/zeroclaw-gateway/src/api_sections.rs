@@ -123,6 +123,7 @@ pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigSta
         "fresh_install"
     };
     ConfigStatusResult {
+        application: None,
         needs_quickstart: !ready,
         reason: reason.to_string(),
         has_partial_state,
@@ -1240,7 +1241,10 @@ mod tests {
     }
 
     fn assert_common_dev_template_contract(cfg: &zeroclaw_config::schema::Config) {
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(
+            cfg.schema_version,
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
 
         let provider = cfg
             .providers
