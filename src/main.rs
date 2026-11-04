@@ -121,6 +121,56 @@ use std::sync::Arc;
 #[cfg(feature = "agent-runtime")]
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
+/// Localized, operator-facing text for one config migration notice about the
+/// config file at `path`. Printed on stderr: the matching WARN record is
+/// hidden without `-v`, and these report config the operator wrote being
+/// dropped, moved, or read under an assumed schema version.
+fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, path: &str) -> String {
+    use crate::config::migration::MigrationNotice;
+    match notice {
+        MigrationNotice::AssumedV1 => ta(
+            "cli-config-migration-assumed-v1",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it)."
+            ),
+        ),
+        MigrationNotice::InferredV3 => ta(
+            "cli-config-migration-inferred-v3",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file."
+            ),
+        ),
+        MigrationNotice::Removed { path: key, reason } => {
+            let reason = retirement_reason_text(reason);
+            ta(
+                "cli-config-retired-key-removed",
+                &[("key", key), ("path", path), ("reason", &reason)],
+                format!("warning: dropped retired config key `{key}` from {path}: {reason}"),
+            )
+        }
+        MigrationNotice::IgnoredEnvOverride { variable, reason } => {
+            let reason = retirement_reason_text(reason);
+            ta(
+                "cli-config-env-override-retired",
+                &[("variable", variable), ("reason", &reason)],
+                format!("warning: ignored `{variable}`, which sets a retired config key: {reason}"),
+            )
+        }
+    }
+}
+
+/// A retirement reason in the operator's locale. Notices carry the English
+/// reason, which logs keep; the CLI catalogue holds each one under the Fluent
+/// id its `RETIRED_KEYS` entry names.
+fn retirement_reason_text(reason: &str) -> String {
+    match crate::config::migration::retirement_reason_id(reason) {
+        Some(id) => t(id, reason),
+        None => reason.to_string(),
+    }
+}
+
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
 /// i18n catalogue under `agent-runtime` (default + CI/release); without that
 /// feature the runtime crate is absent, so the English `fallback` is used.
@@ -1574,12 +1624,15 @@ and smoke test. Automatic rollback on failure.
 Use --check to only check for updates without installing.
 Use --force to skip the confirmation prompt.
 Use --version to target a specific release instead of latest.
+Use --standard in a CLI-only build to switch it to the standard build, \
+which adds the dashboard and web gateway.
 
 Examples:
   zeroclaw update                      # download and install latest
   zeroclaw update --check              # check only, don't install
   zeroclaw update --force              # install without confirmation
-  zeroclaw update --version 0.6.0      # install specific version")]
+  zeroclaw update --version 0.6.0      # install specific version
+  zeroclaw update --standard           # CLI-only build: switch to the standard build")]
     Update {
         /// Only check for updates, don't install
         #[arg(long)]
@@ -1593,6 +1646,10 @@ Examples:
         /// With --check, emit machine-readable JSON instead of human text
         #[arg(long)]
         json: bool,
+        /// In a CLI-only build, install the standard build, which adds the
+        /// dashboard and web gateway. No effect in a standard build
+        #[arg(long)]
+        standard: bool,
     },
 
     /// Run diagnostic self-tests
@@ -9821,33 +9878,6 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             config.data_dir.display()
         );
     }
-    #[cfg(feature = "agent-runtime")]
-    let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
-        anyhow::ensure!(
-            config.data_dir == *expected_data_dir,
-            "resolved config data directory changed during standalone startup: locked {}, loaded {}",
-            expected_data_dir.display(),
-            config.data_dir.display()
-        );
-        let ownership = standalone_ownership.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "path": expected_data_dir.display().to_string(),
-                    })),
-                "standalone config ownership invariant failed"
-            );
-            anyhow::Error::msg("standalone ownership was not acquired")
-        })?;
-        Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
-            config.clone(),
-            ownership,
-        ))
-    } else {
-        None
-    };
     let running_executable =
         running_executable_for_remediation().map(|path| path.display().to_string());
     for section in config
@@ -9882,27 +9912,36 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         };
         eprintln!("{warning}");
     }
-    for section in &config.retired_wati_config_sections {
-        let fallback = format!(
-            "warning: retired WATI channel config section '{section}' is ignored because WATI support was removed. Migrate to '[channels.whatsapp.<alias>]' using the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
-        );
-        eprintln!(
-            "{}",
-            ta(
-                "cli-config-section-retired-wati",
-                &[("section", section)],
-                &fallback,
-            )
-        );
-    }
-    if config.retired_node_transport_config {
-        eprintln!(
-            "{}",
-            t(
-                "cli-config-section-retired-node-transport",
-                "warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml."
-            )
-        );
+    // `config migrate` reports the same notices itself, as changes it wrote.
+    let reports_own_migration = matches!(
+        &cli.command,
+        Commands::Config {
+            config_command: ConfigCommands::Migrate { .. }
+        }
+    );
+    if !reports_own_migration && !config.migration_notices.is_empty() {
+        let path = config.config_path.display().to_string();
+        for notice in &config.migration_notices {
+            eprintln!("{}", migration_notice_text(notice, &path));
+        }
+        // Only a change to the file can be written; an ignored environment
+        // variable or a kept reference is for the operator to fix.
+        if config
+            .migration_notices
+            .iter()
+            .any(crate::config::migration::MigrationNotice::changes_file)
+        {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-config-migration-pending",
+                    &[("path", &path)],
+                    format!(
+                        "warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {path}."
+                    ),
+                )
+            );
+        }
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
@@ -9910,6 +9949,43 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     // The daemon reload arm calls the same helper against its reloaded config.
     #[cfg(feature = "agent-runtime")]
     warn_verifiable_intent_withheld(&config);
+    // This process has just become the data directory's only owner and has
+    // admitted nothing yet: any session turn still marked running belongs to
+    // a process that is gone. It happens once per process, so a reload does
+    // not repeat it. It follows the trace sink init above so that what it
+    // settles, or fails to, is on record.
+    #[cfg(feature = "agent-runtime")]
+    if let Some((_, ownership)) = daemon_ownership.as_ref() {
+        ownership.recover_abandoned_turns_or_log();
+    }
+    #[cfg(feature = "agent-runtime")]
+    let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
+        anyhow::ensure!(
+            config.data_dir == *expected_data_dir,
+            "resolved config data directory changed during standalone startup: locked {}, loaded {}",
+            expected_data_dir.display(),
+            config.data_dir.display()
+        );
+        let ownership = standalone_ownership.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": expected_data_dir.display().to_string(),
+                    })),
+                "standalone config ownership invariant failed"
+            );
+            anyhow::Error::msg("standalone ownership was not acquired")
+        })?;
+        ownership.recover_abandoned_turns_or_log();
+        Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
+            config.clone(),
+            ownership,
+        ))
+    } else {
+        None
+    };
     // Enrollment's contract is that stdout carries exactly the token and
     // nothing else, so the `oidc` commands are dispatched before any
     // startup prelude that may print: the OTP prelude below discloses a
@@ -10239,6 +10315,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         }
 
         Commands::Gateway { gateway_command } => {
+            if !cfg!(feature = "gateway") {
+                bail!("{}", no_dashboard_in_build_message());
+            }
             match gateway_command {
                 Some(zeroclaw::GatewayCommands::Restart {
                     port,
@@ -11250,12 +11329,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         // One-time pairing code gates enrollment. Print it AND the
                         // CA-bound short-auth-string so the operator reads both to
                         // the client out of band (no blind trust-on-first-use).
-                        let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
-                            true,
-                            &[],
-                            startup_pairing_code_policy,
-                        ));
-                        if let Some(code) = pairing.pairing_code() {
+                        // The code lives in the enrollment slot of the daemon's
+                        // canonical pairing authority: it enrolls but never
+                        // pairs a bearer, and it leaves the gateway's pending
+                        // code alone. Enrollment always requires a code, even
+                        // with gateway pairing disabled.
+                        let pairing = std::sync::Arc::clone(ctx.auth.pairing());
+                        {
+                            let code = pairing.enrollment_code(startup_pairing_code_policy);
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
                             let enroll_bind = enroll_cfg.bind.to_string();
                             let enroll_port = enroll_cfg.port.to_string();
@@ -11653,6 +11734,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     }
                 }
             }
+            #[cfg(not(feature = "gateway"))]
+            println!(
+                "{}",
+                t(
+                    "cli-status-web-ui-not-in-build",
+                    "🌐 Web UI:        not included in this build (CLI-only)"
+                )
+            );
             let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
@@ -12328,6 +12417,10 @@ Add pricing to the active provider profile or supply a catalog entry."
         Commands::Desktop {
             install: do_install,
         } => {
+            // The companion app needs the gateway this build does not have.
+            if !cfg!(feature = "gateway") {
+                bail!("{}", no_dashboard_in_build_message());
+            }
             // The marketing download page is not live; point at the GitHub
             // releases page, which hosts the desktop download assets (.deb /
             // .AppImage / .dmg) for the latest release.
@@ -12528,9 +12621,10 @@ Add pricing to the active provider profile or supply a catalog entry."
             force,
             version,
             json,
+            standard,
         } => {
             if check {
-                let info = commands::update::check(version.as_deref()).await?;
+                let info = commands::update::check(version.as_deref(), standard).await?;
                 if json {
                     // Machine-readable shape consumed by the gateway's
                     // `GET /api/version/check`. Keep field names stable.
@@ -12569,7 +12663,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref(), force).await
+                commands::update::run(version.as_deref(), force, standard).await
             }
         }
 
@@ -13102,7 +13196,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                             let envelope = serde_json::json!({
                                 "migrated": true,
                                 "backup_path": report.backup_path.display().to_string(),
+                                "version_backup_path": report
+                                    .version_backup_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
                                 "schema_version": to,
+                                "notices": report.notices,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
@@ -13114,10 +13213,26 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     "Backed up to"
                                 )
                             );
+                            if let Some(kept) = &report.version_backup_path {
+                                let kept = kept.display().to_string();
+                                let from = report.from_version.to_string();
+                                println!(
+                                    "{}",
+                                    ta(
+                                        "cli-config-kept-original",
+                                        &[("version", &from), ("path", &kept)],
+                                        "Kept the schema V{$version} original as {$path}, readable only by you. It is never replaced, and it still holds any secrets the migration removed; delete it once you no longer need to go back to an older ZeroClaw."
+                                    )
+                                );
+                            }
                             println!(
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
                             );
+                            let path = config.config_path.display().to_string();
+                            for notice in &report.notices {
+                                eprintln!("{}", migration_notice_text(notice, &path));
+                            }
                         }
                     }
                     None => {
@@ -16524,10 +16639,20 @@ async fn run_gateway_if_enabled(
     _config: zeroclaw::config::Config,
     _event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
+    anyhow::bail!("{}", no_dashboard_in_build_message())
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+/// The answer a build without the gateway gives for the gateway commands and
+/// the desktop companion: they need the standard build, which has the dashboard.
+#[cfg(feature = "agent-runtime")]
+fn no_dashboard_in_build_message() -> String {
+    t(
+        "cli-no-dashboard-in-build",
+        "This ZeroClaw build has no dashboard or web gateway (CLI-only build). To use them, install the standard build: curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh",
+    )
+}
+
+#[cfg(any(feature = "gateway", test))]
 fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -16536,7 +16661,7 @@ fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
     host == default_host && port == default_port
 }
@@ -16550,7 +16675,7 @@ fn gateway_browser_host(host: &str) -> &str {
     }
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -16594,7 +16719,7 @@ fn gateway_addr_in_use_message(
     lines.join("\n")
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
     let mut command = format!("    zeroclaw gateway start --port {port}");
     if host != default_host {
@@ -16603,7 +16728,7 @@ fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -
     command
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn gateway_paircode_recovery_command(
     host: &str,
     port: u16,
@@ -16621,7 +16746,7 @@ fn gateway_paircode_recovery_command(
     command
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     const SCAN_LIMIT: u16 = 20;
 
@@ -17510,6 +17635,45 @@ mod tests {
         }
     }
 
+    /// Every retirement reason a migration notice can show has its text in
+    /// every locale the CLI ships.
+    #[test]
+    fn every_retirement_reason_is_in_every_cli_locale() {
+        let locales: [(&str, &str); 5] = [
+            (
+                "en",
+                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
+            ),
+        ];
+        for key in crate::config::migration::RETIRED_KEYS {
+            for (locale, cli_ftl) in locales {
+                let entry = format!("{} = ", key.reason_id);
+                assert!(
+                    cli_ftl.lines().any(|line| line.starts_with(&entry)),
+                    "{locale}: missing `{}` for {:?}",
+                    key.reason_id,
+                    key.path
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "agent-runtime")]
     #[test]
     fn quickstart_selector_rejects_widths_that_erase_action_labels() {
@@ -18313,6 +18477,29 @@ mod tests {
                     json: true,
                 }
             } if run_id == "run-123-0001"
+        ));
+    }
+
+    #[test]
+    fn update_cli_parses_standard_with_version_and_force() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "update",
+            "--standard",
+            "--version",
+            "0.9.0",
+            "--force",
+        ])
+        .expect("update --standard should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Update {
+                check: false,
+                force: true,
+                version: Some(version),
+                json: false,
+                standard: true,
+            } if version == "0.9.0"
         ));
     }
 
