@@ -49,9 +49,6 @@ pub fn upgrade_installation(
         let source = LegacySqliteReader::open(&directory).map_err(storage)?;
         for family in source.upgrade_keys().map_err(storage)? {
             sqlite_keys.insert(family.clone());
-            if existing.contains_key(&family) && !import_pending(store.as_ref(), &family)? {
-                continue;
-            }
             let metadata = source.upgrade_metadata(&family).map_err(storage)?;
             let alias = metadata
                 .as_ref()
@@ -99,7 +96,8 @@ pub fn upgrade_installation(
                     metadata: fields,
                 },
             )?;
-            existing.insert(family.clone(), session_id(&family)?);
+            let id = session_id(&family)?;
+            existing.insert(id.as_str().to_owned(), id);
         }
     }
     // Inspect disk directly: listing a corrupt source must never become an
@@ -120,7 +118,7 @@ pub fn upgrade_installation(
                 .file_stem()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| AppendError::Corrupt("non-UTF-8 trim source key".into()))?;
-            if !existing.contains_key(family) {
+            if !existing.contains_key(session_id(family)?.as_str()) {
                 return Err(AppendError::Corrupt(
                     "trim source has no completed history import".into(),
                 ));
@@ -175,7 +173,7 @@ pub fn upgrade_installation(
                     "divergent SQLite and JSONL legacy history".into(),
                 ));
             }
-        } else if !existing.contains_key(family) || import_pending(store.as_ref(), family)? {
+        } else {
             import_one(
                 store.as_ref(),
                 family,
@@ -198,6 +196,8 @@ pub fn upgrade_installation(
                 },
             )?;
         }
+        let id = session_id(family)?;
+        existing.insert(id.as_str().to_owned(), id);
         backups.push(path.clone());
         backups.push(path.with_extension("trim_breadcrumb"));
     }
@@ -233,11 +233,24 @@ fn import_one(
     snapshot: LegacySnapshot,
 ) -> Result<(), AppendError> {
     let stream = session_id(family)?;
+    let (_, source) = legacy_identity(family);
+    let source = if source == "legacy" {
+        snapshot
+            .metadata
+            .iter()
+            .find_map(|(key, value)| (key == "channel_id").then(|| value.as_str()).flatten())
+            .and_then(|channel| channel.split('.').next())
+            .filter(|channel| !channel.is_empty())
+            .unwrap_or(source)
+            .to_owned()
+    } else {
+        source.to_owned()
+    };
     import_snapshot(
         store,
         LegacyImport {
             family,
-            creation_source: "legacy",
+            creation_source: &source,
             owning_agent: alias,
             target,
             branch: BranchId::parse(format!("branch-{stream}"))?,
@@ -250,25 +263,31 @@ fn import_one(
     Ok(())
 }
 
-fn import_pending(store: &dyn SessionEventStore, family: &str) -> Result<bool, AppendError> {
-    let id = session_id(family)?;
-    Ok(store
-        .lookup_receipt(&id, &format!("legacy-import-root:{id}"))
-        .map_err(storage)?
-        .is_some()
-        && store
-            .lookup_receipt(&id, &format!("legacy-family-import:{id}"))
-            .map_err(storage)?
-            .is_none())
+/// Only master transcript storage added these wrappers. Strip one wrapper:
+/// the remaining ID is opaque and may itself begin with the same text.
+fn legacy_identity(key: &str) -> (&str, &'static str) {
+    if let Some(id) = key.strip_prefix("gw_") {
+        (id, "gateway")
+    } else if let Some(id) = key.strip_prefix("rpc_") {
+        (id, "rpc")
+    } else {
+        (key, "legacy")
+    }
 }
 
 pub fn session_id(family: &str) -> Result<SessionId, ContractError> {
+    opaque_session_id(legacy_identity(family).0)
+}
+
+// ACP and file-based CLI sessions already use their public ID, without the
+// transcript wrappers. Do not interpret a user-chosen ID as a protocol tag.
+pub(super) fn opaque_session_id(id: &str) -> Result<SessionId, ContractError> {
     // Old storage accepted keys outside the native ID grammar. Normal paths
     // parse their session ID directly; only import normalizes a legacy key.
-    SessionId::parse(family.to_owned()).or_else(|_| {
+    SessionId::parse(id.to_owned()).or_else(|_| {
         SessionId::parse(format!(
             "legacy-{}",
-            Digest::from_bytes(family.as_bytes()).as_str()
+            Digest::from_bytes(id.as_bytes()).as_str()
         ))
     })
 }

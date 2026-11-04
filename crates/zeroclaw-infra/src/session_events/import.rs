@@ -50,17 +50,14 @@ pub(super) fn import_snapshot(
     snapshot: LegacySnapshot,
 ) -> Result<SessionId, AppendError> {
     let completed = format!("legacy-family-import:{}", command.stream);
-    if store
+    let is_complete = store
         .lookup_receipt(&command.stream, &completed)
         .map_err(corrupt)?
-        .is_some()
-    {
-        return Ok(command.stream);
-    }
+        .is_some();
     let messages = snapshot.messages;
     let metadata = snapshot.metadata;
-    // Keep the original content commitment stable for interrupted older imports;
-    // new imports additionally bind the source clocks before committing chunks.
+    // Freeze source rows and clocks so an interrupted import resumes the same
+    // snapshot, including when different old keys normalize to the same ID.
     let message_times_digest = Digest::from_bytes(&canonical_json(
         &messages
             .iter()
@@ -111,15 +108,19 @@ pub(super) fn import_snapshot(
                 != Some(&command.branch)
             || value["source_digest"] != serde_json::json!(source_digest)
             || value["source_kind"] != command.source_kind
-            || value
-                .get("message_times_digest")
-                .is_some_and(|digest| digest != &serde_json::json!(message_times_digest))
+            || value["source_key"] != command.family
+            || value["message_times_digest"] != serde_json::json!(message_times_digest)
         {
             return Err(AppendError::Corrupt(
                 "frozen legacy source or import scope changed".into(),
             ));
         }
     } else {
+        if store.head(&command.stream).map_err(corrupt)?.sequence > 0 {
+            return Err(AppendError::InvalidReference(
+                "legacy session ID collides with another session".into(),
+            ));
+        }
         let mut root = SessionEvent::typed(
             command.stream.clone(),
             EventData::SessionStarted {
@@ -133,6 +134,7 @@ pub(super) fn import_snapshot(
             "session.evidence/v1",
             &serde_json::json!({
                 "source_kind": command.source_kind, "source_digest": source_digest,
+                "source_key": command.family,
                 "source_message_count": messages.len(), "capture_mode": "legacy_message_only",
                 "message_times_digest": message_times_digest,
             }),
@@ -179,6 +181,10 @@ pub(super) fn import_snapshot(
         append(store, &command.stream, root_key, events, payloads)?;
         #[cfg(test)]
         super::crash_tests::crash_boundary("legacy_import_root");
+    }
+
+    if is_complete {
+        return Ok(command.stream);
     }
 
     let mut entries = Vec::with_capacity(messages.len());

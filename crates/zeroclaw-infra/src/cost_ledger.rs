@@ -182,6 +182,12 @@ impl CostLedger {
                             .context("legacy cost record is not an object")?;
                         fields.remove("session_id");
                         if let Some(session) = fields.remove("conversation_id") {
+                            let session = match session {
+                                serde_json::Value::String(id) => serde_json::Value::String(
+                                    crate::session_events::upgrade::session_id(&id)?.to_string(),
+                                ),
+                                other => other,
+                            };
                             fields.insert("session_id".into(), session);
                         }
                         records.push(serde_json::to_vec(&value)?);
@@ -562,6 +568,44 @@ mod tests {
             }
             assert!(!legacy.exists());
             assert!(dir.path().join("state/costs.jsonl.backup").exists());
+        }
+    }
+
+    #[test]
+    fn legacy_cost_session_references_follow_transcript_id_normalization() {
+        for (backend, name) in [(Backend::Sqlite, "sqlite"), (Backend::Jsonl, "jsonl")] {
+            let dir = TempDir::new().unwrap();
+            let path = resolve_path(dir.path(), name).unwrap();
+            let ledger = CostLedger::open_backend(&path, backend, false).unwrap();
+            // Prefix interpretation belongs exclusively to master migration.
+            let mut native: serde_json::Value = serde_json::from_slice(&record("new")).unwrap();
+            native["session_id"] = "gw_opaque".into();
+            ledger
+                .append(&serde_json::to_vec(&native).unwrap(), File::sync_all)
+                .unwrap();
+            drop(ledger);
+            let legacy = dir.path().join("state/costs.jsonl");
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            fs::write(
+                &legacy,
+                [
+                    legacy_record("a", Some("gw_abc")),
+                    legacy_record("b", Some("rpc_def")),
+                    legacy_record("c", Some("gw_rpc_literal")),
+                ]
+                .join(&b'\n'),
+            )
+            .unwrap();
+            let ledger = CostLedger::open(&path).unwrap();
+            let records = ledger.read_records().unwrap();
+            assert_eq!(records.len(), 4);
+            for (raw, expected) in records
+                .iter()
+                .zip(["gw_opaque", "abc", "def", "rpc_literal"])
+            {
+                let value: serde_json::Value = serde_json::from_slice(raw).unwrap();
+                assert_eq!(value["session_id"], expected);
+            }
         }
     }
 

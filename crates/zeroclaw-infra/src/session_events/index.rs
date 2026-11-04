@@ -560,7 +560,8 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert!(rows[0].first_user_message_id.is_some());
             assert_eq!(rows[0].first_user_preview.as_deref(), Some("首条用户消息"));
-            assert_eq!(rows[0].creation_source.as_deref(), Some("legacy"));
+            assert_eq!(rows[0].session_id.as_str(), "import");
+            assert_eq!(rows[0].creation_source.as_deref(), Some("gateway"));
             assert_eq!(rows[0].title.as_deref(), Some("Migrated title"));
             let session = catalog
                 .query()

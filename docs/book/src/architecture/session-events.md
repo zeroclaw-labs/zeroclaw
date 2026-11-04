@@ -481,7 +481,12 @@ there is no second session key or stream ID. The immutable `creation_source`
 metadata only records the first entrance protocol. Channel entrances record
 their actual protocol name. Legacy SQLite/JSONL imports record `legacy` when
 the original entrance is unknown; ACP and CLI imports retain their known
-protocol. Session ID prefixes never supply the source.
+protocol. During master-format transcript import only, the upgrader removes
+one `gw_` or `rpc_` storage wrapper and records `gateway` or `rpc` as the
+creation source. Thus the browser's public ID resumes the imported history
+directly. ACP and CLI public IDs are opaque and are not prefix-decoded.
+Normal execution never derives the source from a session ID. Distinct old
+keys that map to one new ID fail the upgrade without archiving the sources.
 
 Legacy writers, including read-side repairs of old ACP derived columns,
 share the installation publication lock and are fenced before import starts.

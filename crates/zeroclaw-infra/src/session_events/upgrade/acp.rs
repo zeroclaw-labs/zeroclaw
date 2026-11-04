@@ -17,7 +17,7 @@ pub(super) fn import_all(
     let source = super::legacy_acp::LegacyAcpStore::open_import(guard).map_err(storage)?;
     for id in source.list_session_ids().map_err(storage)? {
         let family = id.clone();
-        let stream = session_id(&family)?;
+        let stream = opaque_session_id(&family)?;
         let key = format!("legacy-acp-complete:{stream}");
         if store
             .lookup_receipt(&stream, &key)
@@ -86,7 +86,7 @@ fn import_one(
         closed,
         metadata,
     } = imported;
-    let stream = session_id(family)?;
+    let stream = opaque_session_id(family)?;
     let branch = BranchId::parse(format!("branch-{stream}"))?;
     let history = data.messages.clone();
     let context = data.retained_context.take().unwrap_or_else(|| {
