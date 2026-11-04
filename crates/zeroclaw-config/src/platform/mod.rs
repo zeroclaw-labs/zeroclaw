@@ -366,6 +366,66 @@ mod tests {
 
     #[cfg(all(unix, not(target_os = "android")))]
     #[test]
+    fn factory_native_unprobeable_path_entry_is_not_reported_as_missing_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The only PATH entry that could hold the shell cannot be searched, so
+        // its absence is not established: the earlier behavior stays (an error
+        // with an injected PATH, a failure at command build time otherwise).
+        let outer = tempfile::tempdir().unwrap();
+        let locked = outer.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let shell = locked.join("sh");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Restore on exit (also on panic) so the tempdir can be removed.
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = Restore(locked.clone());
+        if std::fs::symlink_metadata(&shell).is_ok() {
+            // Directory permissions are not enforced for this process (root).
+            return;
+        }
+
+        let cfg = RuntimeConfig {
+            kind: RuntimeKind::Native,
+            shell: Some("sh".into()),
+            ..RuntimeConfig::default()
+        };
+        let err = create_runtime_with_path(&cfg, Some(locked.as_os_str()))
+            .err()
+            .expect("an unprobeable entry must not be reported as an absent shell");
+        assert!(
+            format!("{err:#}").contains("could not be resolved in the injected PATH"),
+            "the resolver diagnostic must be kept, got: {err:#}"
+        );
+
+        // Absolute shell path below the same directory, ambient PATH:
+        // construction succeeds with a shell that is still advertised, and the
+        // resolver error surfaces when a command is built.
+        let rt = create_runtime(&RuntimeConfig {
+            kind: RuntimeKind::Native,
+            shell: Some(shell.to_string_lossy().into_owned()),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        assert!(rt.has_shell_access());
+        let err = rt
+            .build_shell_command("echo hi", &std::env::temp_dir())
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("no usable shell"),
+            "an unprobeable shell must report the resolver error, got: {err}"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
     fn factory_native_broken_symlink_shell_is_present_but_unusable() {
         // A dangling symlink is a filesystem entry, so the shell is not
         // "absent": it is a misconfiguration and keeps its earlier behavior.

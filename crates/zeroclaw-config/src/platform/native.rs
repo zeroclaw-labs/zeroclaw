@@ -277,14 +277,36 @@ pub fn windows_std_cmd_shell_command(command: &str) -> std::process::Command {
     process
 }
 
-/// Whether `shell` is absent on this host: no filesystem entry of that name is
-/// reachable, as opposed to present but unusable (not executable, a directory),
-/// which stays a misconfiguration. Android pins its shell to `/system/bin/sh`,
-/// so it is never absent here.
+/// Whether probing `candidate` proves that nothing is there: the probe failed
+/// with `NotFound`, or with `NotADirectory` (a path component is a regular
+/// file, so nothing can live below it).
 ///
-/// Presence is decided by existence, not by the resolver's error kind: the
-/// resolver reports the error of *some other* PATH entry (for example an
-/// unreadable directory) when the shell is nowhere to be found.
+/// Any other failure (an unsearchable parent directory, a symlink loop in a
+/// parent component, ...) proves nothing: the entry may well exist.
+#[cfg(unix)]
+fn probe_proves_absent(candidate: &Path) -> bool {
+    match std::fs::symlink_metadata(candidate) {
+        Ok(_) => false,
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
+/// Whether `shell` is absent on this host: every place it could be was probed
+/// and none holds an entry of that name. Present but unusable (not executable,
+/// a directory) is not absent, it stays a misconfiguration. Android pins its
+/// shell to `/system/bin/sh`, so it is never absent here.
+///
+/// A place that cannot be probed (an unsearchable directory, a symlink loop
+/// in a parent component) is not evidence of absence either: the shell may be
+/// there. The result is then "not absent" and the resolver reports the
+/// underlying error, so an unexpectedly missing shell stays diagnosable.
+///
+/// This is decided by probing existence, not by the resolver's error kind:
+/// the resolver reports the error of *some other* PATH entry (for example a
+/// regular file used as a directory) when the shell is nowhere to be found.
 #[cfg(unix)]
 pub(crate) fn shell_is_absent<I, P>(shell: &OsStr, path_entries: I) -> bool
 where
@@ -294,15 +316,14 @@ where
     if is_android() {
         return false;
     }
-    let exists = |candidate: &Path| std::fs::symlink_metadata(candidate).is_ok();
     let requested = Path::new(shell);
     if requested.is_absolute() {
-        return !exists(requested);
+        return probe_proves_absent(requested);
     }
     // Same entries the resolver considers: absolute ones only.
-    !path_entries.into_iter().any(|entry| {
+    path_entries.into_iter().all(|entry| {
         let entry = entry.as_ref();
-        entry.is_absolute() && exists(&entry.join(requested))
+        !entry.is_absolute() || probe_proves_absent(&entry.join(requested))
     })
 }
 
@@ -690,6 +711,95 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!shell_is_absent_on_host(&file.to_string_lossy()));
         assert!(!shell_is_absent_on_host(&dir.path().to_string_lossy()));
+    }
+
+    /// A directory holding an executable `sh` that the current user cannot
+    /// search. Permissions are restored on drop so the tempdir can be removed.
+    #[cfg(all(unix, not(target_os = "android")))]
+    struct LockedDir {
+        _outer: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    impl Drop for LockedDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// `None` when the process ignores directory permissions (root): the case
+    /// cannot be built there.
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn unsearchable_dir_with_sh() -> Option<LockedDir> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outer = tempfile::tempdir().unwrap();
+        let path = outer.path().join("locked");
+        std::fs::create_dir(&path).unwrap();
+        let shell = path.join("sh");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = LockedDir {
+            _outer: outer,
+            path,
+        };
+        // Directory permissions are not enforced for this process.
+        std::fs::symlink_metadata(&shell).is_err().then_some(locked)
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn shell_absence_is_not_concluded_from_an_unprobeable_entry() {
+        let Some(guard) = unsearchable_dir_with_sh() else {
+            return;
+        };
+        let locked = guard.path.clone();
+        let empty = tempfile::tempdir().unwrap();
+
+        // The only place the shell could be cannot be probed: not absent.
+        assert!(!shell_is_absent(OsStr::new("sh"), [&locked]));
+        // Absolute path below the unsearchable directory: same.
+        assert!(!shell_is_absent(
+            OsStr::new(&locked.join("sh")),
+            std::iter::empty::<&Path>()
+        ));
+        // One unprobeable entry among readable, empty ones is enough.
+        assert!(!shell_is_absent(
+            OsStr::new("sh"),
+            [empty.path(), locked.as_path()]
+        ));
+        // Positive control: probing every entry and finding nothing is absent.
+        assert!(shell_is_absent(OsStr::new("sh"), [empty.path()]));
+        // A shell in a readable entry is found whatever the other entries are.
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(bin.path().join("sh"), "").unwrap();
+        assert!(!shell_is_absent(
+            OsStr::new("sh"),
+            [locked.as_path(), bin.path()]
+        ));
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn shell_absence_is_not_concluded_from_a_symlink_loop() {
+        // ELOOP (a loop in a parent component) proves nothing about the shell.
+        // Whether the platform reports it for this layout is checked first.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        if !matches!(
+            std::fs::symlink_metadata(a.join("sh")),
+            Err(ref error) if error.kind() != std::io::ErrorKind::NotFound
+                && error.kind() != std::io::ErrorKind::NotADirectory
+        ) {
+            return;
+        }
+        assert!(!shell_is_absent(OsStr::new("sh"), [&a]));
     }
 
     #[cfg(all(unix, not(target_os = "android")))]
