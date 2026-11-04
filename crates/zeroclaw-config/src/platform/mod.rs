@@ -284,18 +284,17 @@ mod tests {
     #[cfg(all(unix, not(target_os = "android")))]
     #[test]
     fn factory_native_without_shell_on_ambient_path_reports_no_shell() {
-        for shell in [
-            "/nonexistent-zeroclaw-shell/bin/sh",
-            "zc-no-such-shell-on-path",
-        ] {
-            let rt = create_runtime(&RuntimeConfig {
-                kind: RuntimeKind::Native,
-                shell: Some(shell.into()),
-                ..RuntimeConfig::default()
-            })
-            .unwrap_or_else(|e| panic!("shell {shell:?} must not fail construction: {e}"));
-            assert_reports_no_shell(rt.as_ref());
-        }
+        // Only an absolute path here: it does not depend on the process PATH.
+        // Bare names on the ambient PATH are covered with a controlled PATH in
+        // `tests/native_shell_absent_ambient_path.rs`.
+        let shell = "/nonexistent-zeroclaw-shell/bin/sh";
+        let rt = create_runtime(&RuntimeConfig {
+            kind: RuntimeKind::Native,
+            shell: Some(shell.into()),
+            ..RuntimeConfig::default()
+        })
+        .unwrap_or_else(|e| panic!("shell {shell:?} must not fail construction: {e}"));
+        assert_reports_no_shell(rt.as_ref());
     }
 
     #[cfg(all(unix, not(target_os = "android")))]
@@ -388,7 +387,9 @@ mod tests {
         }
         let _restore = Restore(locked.clone());
         if std::fs::symlink_metadata(&shell).is_ok() {
-            // Directory permissions are not enforced for this process (root).
+            eprintln!(
+                "skipped: directory permissions are not enforced for this process (running as root?)"
+            );
             return;
         }
 

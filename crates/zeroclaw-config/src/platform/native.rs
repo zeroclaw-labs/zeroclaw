@@ -698,10 +698,23 @@ mod tests {
     fn shell_absence_is_only_reported_for_a_missing_shell() {
         use std::os::unix::fs::PermissionsExt;
 
+        // Absolute paths do not depend on the process PATH.
         assert!(shell_is_absent_on_host(
             "/nonexistent-zeroclaw-shell/bin/sh"
         ));
-        assert!(shell_is_absent_on_host("zc-no-such-shell-on-path"));
+        // Bare names are probed against explicit entries, not the host PATH:
+        // one unsearchable entry there would otherwise change the outcome.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(shell_is_absent(
+            OsStr::new("zc-no-such-shell-on-path"),
+            [empty.path()]
+        ));
+        let with_sh = tempfile::tempdir().unwrap();
+        std::fs::write(with_sh.path().join("sh"), "").unwrap();
+        assert!(!shell_is_absent(OsStr::new("sh"), [with_sh.path()]));
+        // The host PATH can only turn "present" into "not absent" (an entry
+        // that cannot be probed counts as not absent), so this holds on any
+        // PATH that has a shell.
         assert!(!shell_is_absent_on_host("sh"));
 
         // Present but unusable is a misconfiguration, not an absent shell.
@@ -755,6 +768,9 @@ mod tests {
     #[test]
     fn shell_absence_is_not_concluded_from_an_unprobeable_entry() {
         let Some(guard) = unsearchable_dir_with_sh() else {
+            eprintln!(
+                "skipped: directory permissions are not enforced for this process (running as root?)"
+            );
             return;
         };
         let locked = guard.path.clone();
@@ -774,9 +790,16 @@ mod tests {
         ));
         // Positive control: probing every entry and finding nothing is absent.
         assert!(shell_is_absent(OsStr::new("sh"), [empty.path()]));
-        // A shell in a readable entry is found whatever the other entries are.
+        // A shell in a readable entry means "not absent" in either order, but
+        // for different reasons: found when it comes first, and with the
+        // unprobeable entry first the probe stops there (`all` short-circuits)
+        // and never reaches the readable one.
         let bin = tempfile::tempdir().unwrap();
         std::fs::write(bin.path().join("sh"), "").unwrap();
+        assert!(!shell_is_absent(
+            OsStr::new("sh"),
+            [bin.path(), locked.as_path()]
+        ));
         assert!(!shell_is_absent(
             OsStr::new("sh"),
             [locked.as_path(), bin.path()]
@@ -797,6 +820,9 @@ mod tests {
             Err(ref error) if error.kind() != std::io::ErrorKind::NotFound
                 && error.kind() != std::io::ErrorKind::NotADirectory
         ) {
+            eprintln!(
+                "skipped: no error other than NotFound or NotADirectory for the symlink loop"
+            );
             return;
         }
         assert!(!shell_is_absent(OsStr::new("sh"), [&a]));
