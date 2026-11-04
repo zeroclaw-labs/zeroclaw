@@ -677,6 +677,10 @@ struct LagReattach {
     /// `zc-queue-dispatch-failed` notice after the reload that consumes this
     /// carrier clears the info bar. `None` when the response was `Ok`.
     prompt_error: Option<String>,
+    /// The turn took an accepted steer and its terminal frame said it ended
+    /// early, so the `zc-steer-ended-early` warning that frame set must be
+    /// re-applied after the terminal reload clears the info bar.
+    steer_ended_early: bool,
 }
 
 /// Which resync notice a reloaded transcript opens with. Decided in
@@ -881,19 +885,36 @@ enum SteerOutcome {
     /// The daemon answered and did not take it (refusal or an error reply,
     /// including an older daemon without the method). Safe to queue.
     Refused,
-    /// No answer in time. The daemon may still have taken it.
+    /// No daemon answer: a timeout, or the connection dropped while the
+    /// request was out. The daemon may still have taken it.
     Unknown,
 }
 
 impl SteerOutcome {
-    fn from_reply(reply: anyhow::Result<crate::client::SessionSteerResult>) -> Self {
+    /// `transport_down` is whether the connection was lost by the time the
+    /// reply resolved. Only an error reply the daemon itself sent counts as a
+    /// refusal; client-side failures (closed transport, dropped request,
+    /// undecodable reply) leave delivery unknown so the text is never queued
+    /// for a second run.
+    fn from_reply(
+        reply: anyhow::Result<crate::client::SessionSteerResult>,
+        transport_down: bool,
+    ) -> Self {
         match reply {
             Ok(result) if result.accepted => Self::Accepted,
             Ok(_) => Self::Refused,
-            Err(error) if crate::client::DaemonRpcTimeout::from_anyhow(&error).is_some() => {
-                Self::Unknown
-            }
-            Err(_) => Self::Refused,
+            Err(_) if transport_down => Self::Unknown,
+            Err(error) => match error.downcast_ref::<crate::jsonrpc::JsonRpcError>() {
+                // The client synthesizes INTERNAL_ERROR for a closed or
+                // dropped transport; the daemon's steer refusals use
+                // specific codes.
+                Some(rpc_error)
+                    if rpc_error.code != crate::jsonrpc::error_codes::INTERNAL_ERROR =>
+                {
+                    Self::Refused
+                }
+                _ => Self::Unknown,
+            },
         }
     }
 }
@@ -2911,6 +2932,7 @@ impl Chat {
                     generation,
                     carried: None,
                     prompt_error,
+                    steer_ended_early: false,
                 });
             }
             settled = true;
@@ -3176,6 +3198,8 @@ impl Chat {
                         } else {
                             None
                         };
+                        let steer_ended_early =
+                            terminal_followup && lag.as_ref().is_some_and(|l| l.steer_ended_early);
                         let prompt_error = lag.and_then(|l| l.prompt_error);
                         let notice = if terminal_followup {
                             ResyncNotice::TurnFinished
@@ -3192,6 +3216,7 @@ impl Chat {
                             notice,
                             carried,
                             prompt_error,
+                            steer_ended_early,
                         );
                         state.message_count = snapshot.message_count;
                         if let Some(plan) = snapshot.plan {
@@ -4451,9 +4476,12 @@ impl Chat {
                     // falls back to the queue unchanged.
                     if state.can_steer_running_turn(&prompt, &attachments) {
                         let session_id = state.session_id.clone();
-                        let outcome = SteerOutcome::from_reply(
-                            self.rpc.session_steer(&session_id, &prompt).await,
+                        let reply = self.rpc.session_steer(&session_id, &prompt).await;
+                        let transport_down = matches!(
+                            self.rpc.connection_state(),
+                            crate::client::ConnectionState::Disconnected { .. }
                         );
+                        let outcome = SteerOutcome::from_reply(reply, transport_down);
                         let steered = outcome == SteerOutcome::Accepted;
                         if let ChatPhase::Active(ref mut state) = self.phase
                             && state.session_id == session_id
@@ -12450,6 +12478,7 @@ impl ChatState {
             generation: self.turn_generation,
             carried: None,
             prompt_error: None,
+            steer_ended_early: false,
         });
         self.mark_dirty_append();
     }
@@ -12470,12 +12499,14 @@ impl ChatState {
             } => Some((*outcome, content.clone())),
             _ => None,
         };
+        let took_accepted_steer = self.turn_took_accepted_steer;
         self.apply_update(update);
         if let Some((outcome, content)) = terminal
             && outcome != crate::client::TurnEndOutcome::Completed
             && let Some(lag) = self.lag_reattach.as_mut()
         {
             lag.carried = Some((outcome, Arc::<str>::from(content.as_str())));
+            lag.steer_ended_early = took_accepted_steer;
         }
     }
 
@@ -12499,6 +12530,7 @@ impl ChatState {
         notice: ResyncNotice,
         carried: Option<(crate::client::TurnEndOutcome, Arc<str>)>,
         prompt_error: Option<String>,
+        steer_ended_early: bool,
     ) {
         self.entries.clear();
         self.first_message = None;
@@ -12539,6 +12571,12 @@ impl ChatState {
                 }
                 crate::client::TurnEndOutcome::Completed => {}
             }
+        }
+        // The steer warning the carried terminal frame raised: the info bar
+        // was cleared above, so raise it again. Set before the prompt error
+        // so the order matches the live path (frame first, then response).
+        if steer_ended_early {
+            self.set_info_notice(crate::i18n::t("zc-steer-ended-early"));
         }
         // The prompt-response error recorded on the carrier by
         // `drain_prompt_completions`: this reload's own notices cleared the
@@ -18122,7 +18160,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(5),
         });
         assert_eq!(
-            SteerOutcome::from_reply(Err(timeout)),
+            SteerOutcome::from_reply(Err(timeout), false),
             SteerOutcome::Unknown
         );
         let refusal = anyhow::Error::new(crate::jsonrpc::JsonRpcError {
@@ -18131,7 +18169,54 @@ mod tests {
             data: None,
         });
         assert_eq!(
-            SteerOutcome::from_reply(Err(refusal)),
+            SteerOutcome::from_reply(Err(refusal), false),
+            SteerOutcome::Refused
+        );
+    }
+
+    #[test]
+    fn a_steer_lost_to_a_dropped_connection_is_not_treated_as_a_refusal() {
+        // What `fail_pending` hands a request that was in flight when the
+        // transport closed, wrapped the way `RpcClient::call` wraps it.
+        let closed = || {
+            let error = crate::jsonrpc::JsonRpcError {
+                code: crate::jsonrpc::error_codes::INTERNAL_ERROR,
+                message: "Connection closed: eof".to_string(),
+                data: None,
+            };
+            let message = format!("RPC session/steer: {} ({})", error.message, error.code);
+            anyhow::Error::new(error).context(message)
+        };
+        assert_eq!(
+            SteerOutcome::from_reply(Err(closed()), true),
+            SteerOutcome::Unknown
+        );
+        // Even if the state already flipped back, the synthesized code alone
+        // keeps it unknown.
+        assert_eq!(
+            SteerOutcome::from_reply(Err(closed()), false),
+            SteerOutcome::Unknown
+        );
+        // A real daemon refusal that arrives as the link drops is still not
+        // safe to queue: the connection loss wins.
+        let busy = anyhow::Error::new(crate::jsonrpc::JsonRpcError {
+            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            message: "Unknown method".to_string(),
+            data: None,
+        });
+        assert_eq!(
+            SteerOutcome::from_reply(Err(busy), true),
+            SteerOutcome::Unknown
+        );
+        // A daemon refusal wrapped by `RpcClient::call` still reads as one.
+        let wrapped = anyhow::Error::new(crate::jsonrpc::JsonRpcError {
+            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            message: "Unknown method".to_string(),
+            data: None,
+        })
+        .context("RPC session/steer: Unknown method (-32601)");
+        assert_eq!(
+            SteerOutcome::from_reply(Err(wrapped), false),
             SteerOutcome::Refused
         );
     }
@@ -18312,6 +18397,7 @@ mod tests {
             ResyncNotice::Idle,
             None,
             None,
+            false,
         );
         assert_eq!(failed.last_error, Some(SessionError::TurnFailed));
         assert_eq!(failed.sidebar_status(), SidebarStatus::Errored);
@@ -18324,6 +18410,7 @@ mod tests {
             ResyncNotice::Idle,
             None,
             None,
+            false,
         );
         assert_eq!(unreconciled.last_error, None);
         assert_eq!(unreconciled.sidebar_status(), SidebarStatus::Ready);
@@ -19320,6 +19407,108 @@ mod tests {
             writer_rx.try_recv().is_err(),
             "a session-lost turn must not dispatch a new prompt before re-attaching"
         );
+    }
+
+    /// A kept-running turn that took an accepted steer and then ends early:
+    /// the steer delivery warning its terminal frame raised must survive the
+    /// terminal reload, which otherwise clears the info bar.
+    #[tokio::test]
+    async fn lag_reattach_keeps_steer_warning_across_terminal_reload() {
+        let (tx, mut writer_rx) = mpsc::channel::<String>(32);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut running = state_for("sess-1", "myagent");
+        running.push_user_message(Some("kept running".to_string()), Vec::new());
+        running.push_steered_user_message("also X".into());
+        chat.phase = ChatPhase::Active(Box::new(running));
+        chat.session_order = vec!["sess-1".to_string()];
+
+        for _ in 0..65 {
+            chat.rpc
+                .push_notification_for_test("session/update", serde_json::Value::Null);
+        }
+        chat.drain_notifications();
+        for _ in 0..2 {
+            let frame = next_rpc_request(&mut writer_rx, "resync reloads the session").await;
+            match frame.get("method").and_then(serde_json::Value::as_str) {
+                Some(method::SESSION_STATE) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({ "session_id": "sess-1", "state": "running", "turn_id": "9" }),
+                ),
+                Some(method::SESSION_MESSAGES) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({
+                        "messages": [{ "role": "user", "content": "kept running" }],
+                        "total": 1
+                    }),
+                ),
+                other => panic!("unexpected resync frame: {other:?}"),
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first resync should finish");
+        chat.tick_transport_events();
+
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "turn_complete",
+                "session_id": "sess-1",
+                "outcome": "cancelled",
+                "content": "[interrupted by user]",
+                "client_turn_generation": 1,
+            }),
+        );
+        chat.tick_transport_events();
+
+        let idle = next_rpc_request(&mut writer_rx, "terminal frame triggers reload").await;
+        assert_eq!(idle["method"], method::SESSION_STATE);
+        respond_ok(
+            &outbound,
+            &idle,
+            serde_json::json!({ "session_id": "sess-1", "state": "idle" }),
+        );
+        let reconciled =
+            next_rpc_request(&mut writer_rx, "terminal reload fetches the transcript").await;
+        assert_eq!(reconciled["method"], method::SESSION_MESSAGES);
+        respond_ok(
+            &outbound,
+            &reconciled,
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "kept running" }]
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal reload should finish");
+        chat.tick_transport_events();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("session remains active after the terminal reload");
+        };
+        assert!(state.lag_reattach.is_none());
+        assert!(!state.turn_in_flight);
+        assert_eq!(
+            state
+                .info_message
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some(crate::i18n::t("zc-steer-ended-early").as_str()),
+            "the steer warning must outlive the terminal reload"
+        );
+        assert_eq!(state.queue_len(), 0, "uncertain delivery must not resend");
     }
 
     /// A kept-running turn that completes cleanly: the intercepted terminal
