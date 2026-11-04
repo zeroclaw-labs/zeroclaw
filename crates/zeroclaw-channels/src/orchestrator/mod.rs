@@ -23958,7 +23958,7 @@ temperature = 0.3
         tokio::fs::write(
             &config_path,
             r#"
-schema_version = 3
+schema_version = 4
 
 [agents.agent_a]
 model_provider = "openrouter.hot"
@@ -25735,7 +25735,7 @@ api_key = "anthropic-key"
     fn email_wire(message: &SendMessage) -> String {
         let channel = EmailChannel::new(
             crate::email_channel::EmailConfig {
-                from_address: "bot@example.invalid".to_string(),
+                from_address: Some("bot@example.invalid".to_string()),
                 ..crate::email_channel::EmailConfig::default()
             },
             "test",
