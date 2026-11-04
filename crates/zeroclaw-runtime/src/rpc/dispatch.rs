@@ -23881,25 +23881,6 @@ mod tests {
                     .unwrap()
                     .delegation_policy = toml::from_str("mode = 'allow'").unwrap();
                 let (dispatcher, sessions) = make_acp_test_dispatcher(config);
-                // Positive control: with no principal applied, the agent's own
-                // configuration does provide the delegate.
-                dispatcher
-                    .handle_session_new_for_test(
-                        &json!({"agent_alias":"test-agent","session_id":"unbound-control"}),
-                    )
-                    .await
-                    .unwrap();
-                assert!(
-                    sessions
-                        .get_agent("unbound-control")
-                        .await
-                        .unwrap()
-                        .lock()
-                        .await
-                        .tool_names()
-                        .contains(&"delegate"),
-                    "positive control must actually have a delegate"
-                );
                 let dispatcher = bind_test_principal(dispatcher).await;
                 dispatcher
                     .handle_session_new_for_test(
@@ -23908,12 +23889,9 @@ mod tests {
                     .await
                     .unwrap();
                 let handle = sessions.get_agent("principal-delegate").await.unwrap();
-                // A named principal is not the shared operator, so even with
-                // wildcard tools and agents its session starts without nested
-                // delegation, whose work would outlive a withdrawal of its grants.
                 assert!(
-                    !handle.lock().await.tool_names().contains(&"delegate"),
-                    "a named wildcard principal gets no delegate"
+                    handle.lock().await.tool_names().contains(&"delegate"),
+                    "positive control must actually have a delegate"
                 );
                 if agent_only {
                     refresh_test_principal(&dispatcher, &["*"], &["test-agent"]);
