@@ -5694,8 +5694,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
         // Voice notes carry no caption, so in a mention_only group the gate
         // would drop every one of them. The opt-in bypass keeps the gate for
-        // everything else; the allowlist check above still applies.
-        if !self.voice_without_mention
+        // everything else and applies to voice notes only: an `audio` file is
+        // shared content, not a personal address, so it still needs a mention;
+        // the allowlist check above still applies either way.
+        let is_voice_note = message.get("voice").is_some();
+        if !(self.voice_without_mention && is_voice_note)
             && self
                 .check_media_mention_gate(message, voice_caption)
                 .is_none()
@@ -19452,6 +19455,40 @@ mod tests {
                 "message_id": 11,
                 "voice": { "file_id": "voice_file", "duration": 4 },
                 "from": { "id": 999, "username": "bob" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_bypass_does_not_cover_audio_files() {
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+
+        // The bypass opts voice *notes* out of the mention gate; an ordinary
+        // `audio` file is shared content, not a personal address, so an
+        // unmentioned one must be dropped even with the bypass enabled.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_voice_without_mention(true)
+        .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 13,
+                "audio": { "file_id": "audio_file", "duration": 120 },
+                "from": { "id": 123, "username": "alice" },
                 "chat": { "id": -100_200_300, "type": "supergroup" }
             }
         });
