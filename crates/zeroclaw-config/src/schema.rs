@@ -24316,7 +24316,9 @@ impl Config {
 
         // Pairing limits. A saved code lifetime above the cap was already
         // lowered on load (`migration::CAPPED_KEYS`), so a value out of range
-        // here was set explicitly, and is refused rather than changed.
+        // here was set explicitly, and is refused rather than changed. Startup
+        // only warns about it, so the guard also holds what it reads to these
+        // ranges (`PairingLimits::within_bounds`).
         let dashboard = &self.gateway.pairing_dashboard;
         for (path, value, range) in [
             (
