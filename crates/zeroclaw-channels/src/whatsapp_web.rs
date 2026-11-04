@@ -1580,6 +1580,13 @@ impl WhatsAppWebChannel {
         to: &wacore_binary::jid::Jid,
         notice: String,
     ) {
+        #[cfg(test)]
+        if VOICE_DROP_NOTICE_SINK
+            .try_with(|sink| sink.lock().push((to.clone(), notice.clone())))
+            .is_ok()
+        {
+            return;
+        }
         let outgoing = waproto::whatsapp::Message {
             conversation: Some(notice),
             ..Default::default()
@@ -3241,6 +3248,16 @@ fn validate_whatsapp_location_target(
             "WhatsApp Web location marker must be `lat,lng[,name[,address]]` with in-range WGS84 coordinates",
         ))
     })
+}
+
+#[cfg(all(test, feature = "whatsapp-web"))]
+tokio::task_local! {
+    /// Where `send_voice_drop_notice` records `(chat, notice)` instead of
+    /// sending, inside a test's scope. It is the vendor send that is replaced,
+    /// so everything before it (admission, policy, mention gates, the drop
+    /// reason and the target chat) runs as in production without a paired
+    /// account.
+    static VOICE_DROP_NOTICE_SINK: Arc<Mutex<Vec<(wacore_binary::jid::Jid, String)>>>;
 }
 
 /// Ceiling on one voice-drop notice send. It runs inline in the inbound
@@ -6500,6 +6517,138 @@ mod tests {
                         .await
                         .is_err(),
                     "{mode:?} must honour policy=ignore for a listed sender (is_group={is_group})"
+                );
+            }
+        }
+    }
+
+    /// A voice note that cannot be transcribed is answered with a notice in
+    /// the sender's own chat, and only for a sender the allowlist admits.
+    ///
+    /// Driven through the real inbound handler: admission, chat policy, the
+    /// duration check (before any download, so no network) and the drop
+    /// notice all run as in production. Only the vendor send is replaced by
+    /// `VOICE_DROP_NOTICE_SINK`, so no paired account is needed.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn inbound_voice_drop_notice_reaches_only_an_admitted_sender() {
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        const ALLOWED: &str = "15551234567";
+        const UNKNOWN: &str = "15559999999";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend_arc(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        let transcription = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 5,
+            ..Default::default()
+        };
+        let manager = Arc::new(
+            super::super::transcription::manager_from_snapshot(&transcription)
+                .expect("an enabled snapshot builds a manager"),
+        );
+
+        let voice_note = |sender: &str| {
+            let sender_jid: Jid = format!("{sender}@s.whatsapp.net")
+                .parse()
+                .expect("sender jid parses");
+            single_message_event(
+                Arc::new(waproto::whatsapp::Message {
+                    audio_message: waproto::whatsapp::message::AudioMessage {
+                        ptt: Some(true),
+                        seconds: Some(30),
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: sender_jid.clone(),
+                        sender: sender_jid,
+                        is_from_me: false,
+                        is_group: false,
+                        ..Default::default()
+                    },
+                    id: format!("voice-{sender}"),
+                    r#type: "media".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        for mode in [Mode::Business, Mode::Personal] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let context = WhatsAppInboundContext {
+                tx,
+                alias: Arc::new("voice-drop-notice".to_string()),
+                peer_resolver: Arc::new(|| vec![format!("+{ALLOWED}")]),
+                allowed_groups_resolver: Arc::new(Vec::new),
+                mode: mode.clone(),
+                dm_policy: Policy::Allowlist,
+                group_policy: Policy::Allowlist,
+                self_chat_mode: false,
+                mention_only: false,
+                passive_group_context: false,
+                bot_phone: Arc::new(Mutex::new(None)),
+                bot_lid: Arc::new(Mutex::new(None)),
+                dm_mention_patterns: Arc::new(Vec::new()),
+                group_mention_patterns: Arc::new(Vec::new()),
+                transcription_config: Some(transcription.clone()),
+                transcription_manager: Some(Arc::clone(&manager)),
+                voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            };
+
+            for (sender, admitted) in [(UNKNOWN, false), (ALLOWED, true)] {
+                let sink = Arc::new(Mutex::new(Vec::new()));
+                let event = voice_note(sender);
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    VOICE_DROP_NOTICE_SINK.scope(
+                        Arc::clone(&sink),
+                        WhatsAppWebChannel::handle_inbound_message_event(&event, &client, &context),
+                    ),
+                )
+                .await
+                .expect("a voice drop must finish without a paired account");
+
+                let sent = sink.lock().clone();
+                if admitted {
+                    assert_eq!(sent.len(), 1, "{mode:?}: one notice for {sender}: {sent:?}");
+                    let (chat, notice) = &sent[0];
+                    assert_eq!(chat.to_string(), format!("{sender}@s.whatsapp.net"));
+                    assert_eq!(
+                        notice,
+                        &VoiceDropReason::TooLong { limit_secs: 5 }.notice(),
+                        "{mode:?}: the notice names the duration limit"
+                    );
+                } else {
+                    assert!(
+                        sent.is_empty(),
+                        "{mode:?}: a rejected sender gets nothing: {sent:?}"
+                    );
+                }
+                assert!(
+                    rx.try_recv().is_err(),
+                    "{mode:?}: an untranscribed note never reaches the agent"
                 );
             }
         }
