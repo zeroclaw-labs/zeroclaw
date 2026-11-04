@@ -383,24 +383,49 @@ pub fn write_cached_registry_collection(
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
+    write_registry_cache(&path, &staged, |file| {
+        use std::io::Write;
+        file.write_all(json.as_bytes())
+    })
+}
+
+fn write_registry_cache(
+    path: &Path,
+    staged: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    // Armed only after exclusive creation. Drop the file before this guard so
+    // error cleanup also works on platforms that cannot unlink an open file.
+    struct OwnedStage<'a>(&'a Path);
+    impl Drop for OwnedStage<'_> {
+        fn drop(&mut self) {
+            // Cleanup is best effort; never replace the original I/O error.
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         // Preserve restrictive existing privacy, never widening past owner-only.
-        let mode = std::fs::metadata(&path)
+        let mode = std::fs::metadata(path)
             .map(|m| m.permissions().mode() & 0o600)
             .unwrap_or(0o600);
         options.mode(mode);
     }
-    use std::io::Write;
+    let cleanup;
     let mut file = options
-        .open(&staged)
+        .open(staged)
         .context("staging private plugin registry cache")?;
-    file.write_all(json.as_bytes())?;
+    cleanup = OwnedStage(staged);
+    write(&mut file)?;
     drop(file);
-    std::fs::rename(&staged, &path).context("publishing plugin registry cache")
+    std::fs::rename(staged, path).context("publishing plugin registry cache")?;
+    // The rename consumed our stage; do not remove a later writer at that path.
+    std::mem::forget(cleanup);
+    Ok(())
 }
 /// No configured credential bytes enter successful labels; the full digest
 /// also distinguishes two same-host URLs differing only in credential data.
@@ -634,6 +659,101 @@ mod tests {
         assert!(registry_sources("hTtP://example.invalid/index").is_ok());
     }
 
+    #[test]
+    fn cache_staging_collision_preserves_foreign_file_and_canonical_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let staged = dir.path().join("collision.tmp");
+        std::fs::write(&path, b"last good cache").unwrap();
+        std::fs::write(&staged, b"another writer stage").unwrap();
+
+        let error = write_registry_cache(&path, &staged, |_| {
+            panic!("exclusive creation must fail before writing")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "staging private plugin registry cache");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"last good cache");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"another writer stage");
+    }
+
+    #[test]
+    fn cache_staging_partial_write_failure_preserves_canonical_cache() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.json");
+        let staged = dir.path().join("owned.tmp");
+        std::fs::write(&path, b"last good cache").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+
+        let error = write_registry_cache(&path, &staged, |file| {
+            file.write_all(b"partial new cache")?;
+            assert_eq!(std::fs::read(&staged).unwrap(), b"partial new cache");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "injected cache write failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected cache write failure");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WriteZero
+        );
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"last good cache");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cache_staging_rename_failure_removes_only_owned_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry_cache_path(dir.path());
+        // A directory at the destination makes the real publication rename fail.
+        std::fs::create_dir_all(&path).unwrap();
+        let sentinel = path.join("last-good");
+        std::fs::write(&sentinel, b"keep canonical contents").unwrap();
+        let foreign = path.with_extension("foreign.tmp");
+        std::fs::write(&foreign, b"another writer stage").unwrap();
+
+        let error = write_cached_registry_index(
+            dir.path(),
+            "https://example.invalid/index",
+            &sample_index(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "publishing plugin registry cache");
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"keep canonical contents");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"another writer stage");
+        let mut remaining: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        remaining.sort();
+        let mut expected = vec![path, foreign];
+        expected.sort();
+        assert_eq!(
+            remaining, expected,
+            "owned staging file leaked after rename failure"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn cache_refresh_never_widens_an_existing_private_cache() {
@@ -642,22 +762,34 @@ mod tests {
         write_cached_registry_index(dir.path(), "https://example.invalid/index", &sample_index())
             .unwrap();
         let path = registry_cache_path(dir.path());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        write_cached_registry_index(
-            dir.path(),
-            "https://user:secret@example.invalid/index?token=secret",
-            &sample_index(),
-        )
-        .unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+        for mode in [0o600, 0o400] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            write_cached_registry_index(
+                dir.path(),
+                "https://user:secret@example.invalid/index?token=secret",
+                &sample_index(),
+            )
+            .unwrap();
             assert_eq!(
-                entry.unwrap().metadata().unwrap().permissions().mode() & 0o077,
-                0
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
             );
+            assert_eq!(
+                read_cached_registry_index(dir.path())
+                    .unwrap()
+                    .unwrap()
+                    .plugins,
+                sample_index().plugins
+            );
+            let remaining: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(remaining, vec![path.clone()]);
         }
     }
 
