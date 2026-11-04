@@ -258,12 +258,6 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     },
     RetiredKey {
         retired_in: 3,
-        path: &["transcription", "default_provider"],
-        reason: RETIRED_GLOBAL_TRANSCRIPTION,
-        reason_id: "cli-config-retired-reason-global-transcription",
-    },
-    RetiredKey {
-        retired_in: 3,
         path: &["transcription", "default_model_provider"],
         reason: RETIRED_GLOBAL_TRANSCRIPTION,
         reason_id: "cli-config-retired-reason-global-transcription",
@@ -507,7 +501,6 @@ const LEGACY_LAYOUT_PATHS: &[&[&str]] = &[
     &["tts", "edge"],
     &["tts", "piper"],
     &["tts", "default_provider"],
-    &["transcription", "default_provider"],
     &["transcription", "default_model_provider"],
     &["transcription", "default_transcription_provider"],
     &["gateway", "pairing_dashboard", "code_length"],
@@ -6360,10 +6353,6 @@ mention_only = false
             "[tts]\ndefault_provider = \"openai\"\n",
         ),
         (
-            "transcription.default_provider",
-            "[transcription]\ndefault_provider = \"groq\"\n",
-        ),
-        (
             "transcription.default_model_provider",
             "[transcription]\ndefault_model_provider = \"groq\"\n",
         ),
@@ -8729,13 +8718,15 @@ summary_model = "opus"
          default_model_provider = \"groq\"\ndefault_transcription_provider = \"groq\"\n\n\
          [identity]\nformat = \"openclaw\"\n";
 
-    const V3_RETIRED_PATHS: [&str; 8] = [
+    // `transcription.default_provider` is deliberately absent: it is a valid
+    // current key again (the deployment-wide transcription default this
+    // feature restores), so the V3 step must keep it.
+    const V3_RETIRED_PATHS: [&str; 7] = [
         "identity",
         "reliability.fallback_providers",
         "reliability.model_fallbacks",
         "swarms",
         "transcription.default_model_provider",
-        "transcription.default_provider",
         "transcription.default_transcription_provider",
         "tts.default_provider",
     ];
@@ -8761,7 +8752,6 @@ summary_model = "opus"
                 "swarms",
                 "fallback_providers",
                 "model_fallbacks",
-                "default_provider",
                 "default_model_provider",
                 "default_transcription_provider",
                 "[identity]",
@@ -8771,6 +8761,11 @@ summary_model = "opus"
                     "V{version} kept {gone}:\n{migrated}"
                 );
             }
+            assert_eq!(
+                value["transcription"]["default_provider"].as_str(),
+                Some("groq"),
+                "V{version}: the restored current key survives the V3 step"
+            );
 
             let load = migrate_to_current_salvaged(&raw);
             assert_eq!(
