@@ -8,6 +8,7 @@ use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
 use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
+use crate::scattered_types::OutboundSmtp;
 use crate::traits::{ApplicationCapability, ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
@@ -7955,6 +7956,13 @@ pub struct GatewayConfig {
     #[nested]
     pub pairing_dashboard: PairingDashboardConfig,
 
+    /// Opt-in dashboard sign-in through configured OIDC providers
+    /// (`[gateway.dashboard_sign_in]`). Off by default: the dashboard keeps
+    /// pairing as its only sign-in until `oidc` names a provider.
+    #[serde(default)]
+    #[nested]
+    pub dashboard_sign_in: DashboardSignInConfig,
+
     /// Path to the web dashboard `dist` directory. When set, the gateway
     /// serves the compiled frontend from the filesystem instead of requiring
     /// it to be embedded in the binary. Accepts absolute paths or paths
@@ -8071,6 +8079,7 @@ impl Default for GatewayConfig {
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
+            dashboard_sign_in: DashboardSignInConfig::default(),
             web_dist_dir: None,
             tls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
@@ -8128,6 +8137,60 @@ impl Default for PairingDashboardConfig {
             max_failed_attempts: default_max_failed_attempts(),
             lockout_secs: default_pairing_lockout_secs(),
         }
+    }
+}
+
+/// Shortest accepted `gateway.dashboard_sign_in.session_lifetime_secs`.
+pub const DASHBOARD_SESSION_LIFETIME_MIN_SECS: u64 = 300;
+
+/// Longest accepted `gateway.dashboard_sign_in.session_lifetime_secs`.
+pub const DASHBOARD_SESSION_LIFETIME_MAX_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Opt-in dashboard sign-in (`[gateway.dashboard_sign_in]`).
+///
+/// The providers named here are `[oidc.<alias>]` entries, verified and
+/// mapped to principals exactly as RPC verifies them. The gateway runs the
+/// browser's Authorization Code + PKCE flow and keeps the resulting access
+/// token server-side behind a session cookie; the token never reaches the
+/// browser. Pairing keeps working alongside it.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.dashboard_sign_in"]
+pub struct DashboardSignInConfig {
+    /// `[oidc.<alias>]` entries the dashboard offers on its sign-in screen,
+    /// in display order. Empty (the default) turns dashboard sign-in off.
+    /// Turning it on requires `gateway.require_pairing = true`.
+    #[serde(default)]
+    pub oidc: Vec<String>,
+    /// Hard cap on one dashboard session, in seconds, whatever the access
+    /// token's own lifetime. A session also ends when its token expires.
+    /// Range: 300..=604800. Default: 28800 (8 hours).
+    #[serde(default = "default_dashboard_session_lifetime_secs")]
+    pub session_lifetime_secs: u64,
+}
+
+fn default_dashboard_session_lifetime_secs() -> u64 {
+    8 * 60 * 60
+}
+
+impl Default for DashboardSignInConfig {
+    fn default() -> Self {
+        Self {
+            oidc: Vec::new(),
+            session_lifetime_secs: default_dashboard_session_lifetime_secs(),
+        }
+    }
+}
+
+impl DashboardSignInConfig {
+    /// Whether the dashboard offers OIDC sign-in at all.
+    pub fn enabled(&self) -> bool {
+        !self.oidc.is_empty()
+    }
+
+    /// Whether `alias` is one of the providers the dashboard offers.
+    pub fn offers(&self, alias: &str) -> bool {
+        self.oidc.iter().any(|offered| offered == alias)
     }
 }
 
@@ -13123,6 +13186,45 @@ pub fn validate_memory_semantics(
         .collect()
 }
 
+/// Warn when only one half of the outbound SMTP pair is configured.
+///
+/// `smtp_host` and `from_address` are each optional so an IMAP-only mailbox can
+/// be read without granting send access. That makes a half-configured pair — a
+/// relay host with no From identity, or the reverse — look like a working
+/// channel that silently never sends: the channel loads, reads mail, and
+/// refuses every send. Surface the cause once per alias instead of leaving the
+/// operator to discover it from a reply that never leaves.
+///
+/// The classification is shared with the runtime gate rather than restated
+/// here, so `config validate` and `EmailChannel` cannot drift into disagreeing
+/// about which aliases can send.
+///
+/// Called from `Config::collect_warnings`, so this reaches the CLI and the
+/// gateway dashboard on the same path as the other warnings.
+pub fn validate_email_smtp_semantics(
+    alias: &str,
+    em: &crate::scattered_types::EmailConfig,
+) -> Vec<crate::validation_warnings::ValidationWarning> {
+    if !em.enabled {
+        return Vec::new();
+    }
+    // Only a half-configured pair is diagnosable; the classifier names the
+    // missing half. A fully configured pair and the supported inbound-only
+    // mode both stay quiet.
+    let OutboundSmtp::Partial { set, missing } = em.outbound_smtp() else {
+        return Vec::new();
+    };
+    vec![crate::validation_warnings::ValidationWarning::new(
+        crate::validation_warnings::EMAIL_SMTP_PARTIALLY_CONFIGURED,
+        format!(
+            "channels.email.{alias}.{set} is set but {missing} is not, so outbound \
+             sending stays disabled. Set both to enable SMTP, or neither for an \
+             inbound-only mailbox."
+        ),
+        format!("channels.email.{alias}.{missing}"),
+    )]
+}
+
 /// Surface WhatsApp chat-policy keys that are accepted but never consulted.
 ///
 /// `self_chat_mode` is read only by the Web transport inside its
@@ -14325,6 +14427,58 @@ impl Config {
         }
         Ok(())
     }
+
+    /// `[gateway.dashboard_sign_in]`: every offered provider is a configured
+    /// `[oidc.<alias>]` entry, offered once, and sign-in is only turned on
+    /// where the dashboard is not already open to anyone who reaches it.
+    ///
+    /// Kept out of [`Self::validate_auth`] on purpose: that boundary is
+    /// shared with policy compilation, and a dashboard misconfiguration must
+    /// not keep RPC's inbound-auth policy from compiling.
+    fn validate_dashboard_sign_in(&self) -> Result<()> {
+        let sign_in = &self.gateway.dashboard_sign_in;
+        if !(DASHBOARD_SESSION_LIFETIME_MIN_SECS..=DASHBOARD_SESSION_LIFETIME_MAX_SECS)
+            .contains(&sign_in.session_lifetime_secs)
+        {
+            validation_bail!(
+                InvalidNumericRange,
+                "gateway.dashboard_sign_in.session_lifetime_secs",
+                "gateway.dashboard_sign_in.session_lifetime_secs must be between {DASHBOARD_SESSION_LIFETIME_MIN_SECS} and {DASHBOARD_SESSION_LIFETIME_MAX_SECS} seconds, got {}",
+                sign_in.session_lifetime_secs
+            );
+        }
+        if !sign_in.enabled() {
+            return Ok(());
+        }
+        for (index, alias) in sign_in.oidc.iter().enumerate() {
+            if !self.oidc.contains_key(alias) {
+                validation_bail!(
+                    DanglingReference,
+                    "gateway.dashboard_sign_in.oidc",
+                    "gateway.dashboard_sign_in.oidc names {alias:?} but [oidc.{alias}] is not configured",
+                );
+            }
+            if sign_in.oidc[..index].contains(alias) {
+                validation_bail!(
+                    ValidationFailed,
+                    "gateway.dashboard_sign_in.oidc",
+                    "gateway.dashboard_sign_in.oidc lists {alias:?} more than once",
+                );
+            }
+        }
+        // With pairing off every dashboard route is open to whoever reaches
+        // the gateway, so a sign-in screen would protect nothing. The Docker
+        // image writes `require_pairing = false` into its default config, so
+        // the message names that case and both ways to change it.
+        if !self.gateway.require_pairing {
+            validation_bail!(
+                ValidationFailed,
+                "gateway.require_pairing",
+                "[gateway.dashboard_sign_in] needs gateway.require_pairing = true, but it is false. Set require_pairing = true under [gateway] (or ZEROCLAW_gateway__require_pairing=true); the official Docker image's default config sets it to false",
+            );
+        }
+        Ok(())
+    }
 }
 
 impl OidcConfig {
@@ -14850,7 +15004,13 @@ pub struct RuntimeProfileConfig {
     pub max_system_prompt_chars: Option<usize>,
     /// Maximum characters for a single tool result. `None` inherits.
     pub max_tool_result_chars: Option<usize>,
-    /// Number of recent turns whose full tool context is preserved. `None` inherits.
+    /// Number of completed turns before the running one whose tool-call and
+    /// tool-result rows are still sent to the model; older turns are sent as
+    /// their user prompt, a tool-exchange summary and the closing assistant
+    /// reply. The running turn is always sent whole, so `0` keeps tool context
+    /// for the running turn only. The stored transcript is not affected. On
+    /// channels, `0` also skips persisting the current turn's tool rows.
+    /// `None` inherits the global default (2).
     pub keep_tool_context_turns: Option<usize>,
     /// Maximum memory entries injected per turn. `None` inherits global default (5).
     /// Set to `0` for unlimited.
@@ -23529,6 +23689,9 @@ impl Config {
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
         }
+        for (alias, em) in &self.channels.email {
+            warnings.extend(validate_email_smtp_semantics(alias, em));
+        }
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
         // Surface that so an operator who sets it on, e.g., `mistral` learns it
@@ -24927,6 +25090,8 @@ impl Config {
                 "security.password_auth.enabled requires gateway.require_pairing: with pairing off the gateway accepts requests that carry no credential, so a password would protect nothing",
             );
         }
+
+        self.validate_dashboard_sign_in()?;
 
         // Security OTP / estop
         if self.security.otp.challenge_max_attempts == 0 {
@@ -30697,6 +30862,85 @@ zeroclaw-operators = "operator"
         config
             .validate()
             .expect("an existing paired token is a path");
+    }
+
+    #[::core::prelude::v1::test]
+    fn dashboard_sign_in_is_off_by_default() {
+        let config = Config::default();
+        assert!(!config.gateway.dashboard_sign_in.enabled());
+        assert_eq!(
+            config.gateway.dashboard_sign_in.session_lifetime_secs,
+            28_800
+        );
+
+        let parsed: Config = toml::from_str("[gateway]\n").unwrap();
+        assert!(!parsed.gateway.dashboard_sign_in.enabled());
+
+        let parsed: Config =
+            toml::from_str("[gateway.dashboard_sign_in]\noidc = [\"corp\"]\n").unwrap();
+        assert!(parsed.gateway.dashboard_sign_in.offers("corp"));
+        assert!(!parsed.gateway.dashboard_sign_in.offers("other"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn dashboard_sign_in_offers_only_configured_providers_once() {
+        let mut config = auth_config();
+        config.gateway.dashboard_sign_in.oidc = vec!["corp".into()];
+        config
+            .validate()
+            .expect("a configured provider with pairing required validates");
+
+        config.gateway.dashboard_sign_in.oidc = vec!["corp".into(), "missing".into()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("names \"missing\" but [oidc.missing] is not configured"),
+            "got: {err}"
+        );
+
+        config.gateway.dashboard_sign_in.oidc = vec!["corp".into(), "corp".into()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn dashboard_sign_in_with_pairing_off_names_the_fix() {
+        let mut config = auth_config();
+        config.gateway.dashboard_sign_in.oidc = vec!["corp".into()];
+        config.gateway.require_pairing = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("require_pairing = true"), "got: {err}");
+        assert!(
+            err.contains("ZEROCLAW_gateway__require_pairing=true"),
+            "got: {err}"
+        );
+        assert!(err.contains("Docker"), "got: {err}");
+
+        // Off, the same pairing posture is still a valid config.
+        config.gateway.dashboard_sign_in.oidc.clear();
+        config
+            .validate()
+            .expect("pairing off without dashboard sign-in validates");
+    }
+
+    #[::core::prelude::v1::test]
+    fn dashboard_session_lifetime_is_bounded_even_when_off() {
+        let mut config = Config::default();
+        for bad in [
+            0,
+            DASHBOARD_SESSION_LIFETIME_MIN_SECS - 1,
+            DASHBOARD_SESSION_LIFETIME_MAX_SECS + 1,
+        ] {
+            config.gateway.dashboard_sign_in.session_lifetime_secs = bad;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("session_lifetime_secs"), "{bad}: {err}");
+        }
+        for good in [
+            DASHBOARD_SESSION_LIFETIME_MIN_SECS,
+            DASHBOARD_SESSION_LIFETIME_MAX_SECS,
+        ] {
+            config.gateway.dashboard_sign_in.session_lifetime_secs = good;
+            config.validate().expect("bound is inclusive");
+        }
     }
 
     #[::core::prelude::v1::test]
@@ -37129,6 +37373,7 @@ allowed_numbers = ["+1", "+2"]
             websocket_ping_interval_secs: 30,
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
+            dashboard_sign_in: DashboardSignInConfig::default(),
             web_dist_dir: None,
             tls: None,
             request_timeout_secs: 30,
@@ -50284,6 +50529,58 @@ group_policy = "all"
 
     fn owned_codex_args(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    async fn email_half_configured_smtp_warns_while_inbound_only_and_full_outbound_stay_quiet() {
+        let code = crate::validation_warnings::EMAIL_SMTP_PARTIALLY_CONFIGURED;
+        let email_config = |enabled: bool, extra: &str| -> Config {
+            toml::from_str(&format!(
+                "[channels.email.mail]\nenabled = {enabled}\nimap_host = \"imap.example.com\"\n\
+                 username = \"u\"\npassword = \"p\"\n{extra}"
+            ))
+            .unwrap()
+        };
+
+        for (extra, missing) in [
+            ("smtp_host = \"smtp.example.com\"\n", "from_address"),
+            ("from_address = \"bot@example.com\"\n", "smtp_host"),
+        ] {
+            let warnings = warnings_with_code(&email_config(true, extra), code);
+            assert_eq!(warnings.len(), 1, "one warning for a half pair: {extra}");
+            assert_eq!(
+                warnings[0].path,
+                format!("channels.email.mail.{missing}"),
+                "the warning must point at the missing half"
+            );
+            assert!(
+                warnings[0].message.contains(missing),
+                "the message must name the missing field: {}",
+                warnings[0].message
+            );
+        }
+
+        for quiet in [
+            // Inbound-only: the supported read-write, never-send mode.
+            "",
+            // Fully configured outbound.
+            "smtp_host = \"smtp.example.com\"\nfrom_address = \"bot@example.com\"\n",
+        ] {
+            assert!(
+                warnings_with_code(&email_config(true, quiet), code).is_empty(),
+                "no half-pair warning expected for: {quiet:?}"
+            );
+        }
+
+        // A disabled channel is inert, so it is not diagnosed.
+        assert!(
+            warnings_with_code(
+                &email_config(false, "smtp_host = \"smtp.example.com\"\n"),
+                code
+            )
+            .is_empty(),
+            "a disabled channel must not be diagnosed as a half-configured sender"
+        );
     }
 
     #[::core::prelude::v1::test]
