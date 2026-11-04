@@ -531,6 +531,11 @@ zc-chat-status-awaiting-input = awaiting input
 zc-chat-status-cancelling = cancelling
 zc-chat-session-close-error = Failed to close session: { $error }
 zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
+zc-chat-elicitation-answered = You answered: { $answer }
+zc-chat-elicitation-cancelled = You dismissed the question without answering.
+zc-chat-elicitation-withdrawn = The question closed before you answered (the view reloaded). The agent was told it was cancelled.
+zc-chat-elicitation-expired = The agent stopped waiting for an answer to its question.
+zc-chat-elicitation-outcome-note = { $outcome } (Question: { $question })
 zc-chat-session-restarted = New session started.
 zc-chat-session-cap = Session limit for this pane reached ({ $max }). Close a session from the sidebar first.
 zc-chat-load-session-not-found = No saved session matches "{ $query }".
@@ -893,3 +898,5 @@ zc-config-setup-create = Enter a name. { $confirm } saves it and opens fields. {
 zc-config-setup-required = required
 zc-config-setup-required-missing = missing
 zc-config-setup-no-filter-matches = No matches. Clear filter.
+
+zc-chat-tool-question = question
