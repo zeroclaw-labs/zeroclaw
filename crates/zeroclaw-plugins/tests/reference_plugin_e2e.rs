@@ -33,26 +33,8 @@ use support::state_service;
 
 /// The fixture package's manifest: the single source of truth for both the
 /// seeded `manifest.toml` and the instance key its config entry is stored under.
-const FIXTURE_MANIFEST: &str = r#"name = "tool-fixture"
-version = "0.0.0"
-wasm_path = "tool-fixture.wasm"
-capabilities = ["tool"]
-permissions = ["config_read"]
-
-[config_schema]
-"$schema" = "https://json-schema.org/draft/2020-12/schema"
-type = "object"
-additionalProperties = false
-
-[config_schema.properties.label]
-type = "string"
-
-[config_schema.properties.max_len]
-type = "integer"
-
-[config_schema.properties.uppercase]
-type = "boolean"
-"#;
+/// The release-artifact smoke packages the same file.
+const FIXTURE_MANIFEST: &str = include_str!("fixtures/tool-fixture/plugin-manifest.toml");
 
 fn toml_basic_string(value: &str) -> String {
     toml::Value::String(value.to_owned()).to_string()
