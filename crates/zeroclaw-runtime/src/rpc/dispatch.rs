@@ -17565,16 +17565,26 @@ mod tests {
             }
             assert!(!add.is_finished(), "the add is still queued on the gate");
 
-            // The gate frees; the add takes it and blocks in the busy store.
+            // The gate frees and passes to the add, which then blocks in the
+            // busy store. The handoff alone shows nothing about the wait, so
+            // give the add time to reach the store and check again there: for
+            // as long as the competing writer holds jobs.db, the add must keep
+            // both the gate and the reservation.
             drop(in_flight);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             while !ctx.config_authority.config_write_lock_is_held() {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the add must hold the writer gate while the store is busy"
+                    "the add must take the writer gate once it frees"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(!add.is_finished(), "the add is still waiting for the store");
+            assert!(
+                ctx.config_authority.config_write_lock_is_held(),
+                "the add holds the writer gate while the store is busy"
+            );
             assert!(reserved(&ctx), "the reservation is held through the insert");
 
             writer
