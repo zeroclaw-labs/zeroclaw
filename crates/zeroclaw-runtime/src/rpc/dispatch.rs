@@ -17054,15 +17054,27 @@ mod tests {
                     assert!(response.get("error").is_none(), "{scenario}: {response}");
                     assert_eq!(stored.name.as_deref(), Some("patched"));
                 } else {
+                    // The patch holds the config writer gate through its wait
+                    // for the store, so a demotion or revocation cannot publish
+                    // before the write. The patch gives up when the store stays
+                    // busy, and is refused with nothing written; the new policy
+                    // publishes after it.
+                    let queued_behind = matches!(scenario, "agent-demotion" | "shell-revocation");
                     assert_eq!(
                         response["error"]["code"],
-                        json!(if scenario == "owner-change" {
-                            INVALID_PARAMS
-                        } else {
-                            FORBIDDEN
+                        json!(match scenario {
+                            "owner-change" => INVALID_PARAMS,
+                            _ if queued_behind => INTERNAL_ERROR,
+                            _ => FORBIDDEN,
                         }),
                         "{scenario}: {response}"
                     );
+                    if queued_behind {
+                        assert!(
+                            !ctx.config.read().permission_profiles["cron-alpha"].admin,
+                            "{scenario}: the queued publication lands after the patch"
+                        );
+                    }
                     assert_eq!(stored.name.as_deref(), Some("original"), "{scenario}");
                     assert_eq!(stored.command, job.command);
                     assert_eq!(stored.next_run, job.next_run);
