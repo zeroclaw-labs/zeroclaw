@@ -480,6 +480,8 @@ where
             delivered: false,
             idem_key: None,
             principal_id: Some(sender_alias.to_string()),
+            session_id: None,
+            execution_epoch: 0,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
         })
@@ -985,6 +987,8 @@ mod tests {
         assert_eq!(record.originator_route.as_deref(), Some("telegram.prod"));
         assert!(record.parent_id.is_none());
         assert!(record.idem_key.is_none());
+        assert!(record.session_id.is_none());
+        assert_eq!(record.execution_epoch, 0);
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
     }
 

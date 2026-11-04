@@ -359,6 +359,9 @@ fn delete_model_provider(
 }
 
 fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
+    if cfg.goal.verifier.model_provider.trim() == target {
+        cfg.goal.verifier.model_provider = crate::providers::ModelProviderRef::default();
+    }
     for agent in cfg.agents.values_mut() {
         if agent.classifier_provider.trim() == target {
             agent.classifier_provider = crate::providers::ModelProviderRef::default();
@@ -791,6 +794,10 @@ fn rewrite_model_provider_refs(
     let old_target = format!("{family}.{old}");
     let new_target = format!("{family}.{new}");
     let mut dirty = Vec::new();
+    if cfg.goal.verifier.model_provider.trim() == old_target {
+        cfg.goal.verifier.model_provider = new_target.as_str().into();
+        dirty.push("goal.verifier.model_provider".to_string());
+    }
     for (name, agent) in cfg.agents.iter_mut() {
         let mut touched = false;
         if agent.model_provider.trim() == old_target {
@@ -1003,6 +1010,22 @@ fn collect_provider_refs(
     let target = format!("{family}.{alias}");
     match category {
         ProviderCategory::Models => {
+            if cfg.goal.verifier.model_provider.trim() == target {
+                let site = if cfg.goal.enabled {
+                    RefSite::hard(
+                        "goal.verifier.model_provider".to_string(),
+                        ScrubAction::Refuse,
+                        cfg.goal.verifier.model_provider.as_str(),
+                    )
+                } else {
+                    RefSite::soft(
+                        "goal.verifier.model_provider".to_string(),
+                        ScrubAction::ClearOptional,
+                        cfg.goal.verifier.model_provider.as_str(),
+                    )
+                };
+                sites.push(site);
+            }
             for (name, agent) in sorted_agents(cfg) {
                 if agent.model_provider.trim() == target {
                     sites.push(RefSite::hard(
@@ -1871,6 +1894,48 @@ mod tests {
         assert!(cfg.model_routes.is_empty());
         assert!(cfg.embedding_routes.is_empty());
         assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn goal_verifier_provider_follows_model_alias_lifecycle() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.goal.enabled = true;
+        cfg.goal.default_token_limit = Some(0);
+        cfg.goal.default_cost_limit_usd = Some(0.0);
+        cfg.goal.verifier.model_provider = "anthropic.default".into();
+        let kind = provider_kind("anthropic");
+
+        let plan = plan_delete(&cfg, &kind, "default");
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|site| site.path == "goal.verifier.model_provider"),
+            "the enabled mandatory verifier must block provider deletion: {plan:?}"
+        );
+
+        let report = rename_with_cascade(&mut cfg, &kind, "default", "primary")
+            .expect("provider rename rewrites the verifier reference");
+        assert_eq!(
+            cfg.goal.verifier.model_provider.as_str(),
+            "anthropic.primary"
+        );
+        assert!(
+            report
+                .dirty_paths
+                .iter()
+                .any(|path| path == "goal.verifier.model_provider")
+        );
+
+        cfg.goal.enabled = false;
+        let report = delete_with_cascade(&mut cfg, &kind, "primary", CascadePolicy::RefuseOnHard)
+            .expect("disabled optional verifier reference is scrubbed on deletion");
+        assert!(
+            report
+                .applied
+                .iter()
+                .any(|site| site.path == "goal.verifier.model_provider")
+        );
+        assert!(cfg.goal.verifier.model_provider.is_empty());
     }
 
     #[test]
