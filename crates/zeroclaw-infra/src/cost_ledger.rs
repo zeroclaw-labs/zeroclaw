@@ -162,15 +162,13 @@ impl CostLedger {
             workspace.join("state/costs.jsonl"),
             workspace.join(".zeroclaw/costs.db"),
         ];
-        if self.has_records()? {
-            return Ok(());
-        }
         for source in candidates {
             if !source.exists() || source == self.path {
                 continue;
             }
             let bytes = fs::read(&source)
                 .with_context(|| format!("read legacy cost ledger {}", source.display()))?;
+            let mut records = Vec::new();
             for line in bytes.split(|byte| *byte == b'\n') {
                 if !line.iter().all(u8::is_ascii_whitespace) {
                     for value in
@@ -186,32 +184,18 @@ impl CostLedger {
                         if let Some(session) = fields.remove("conversation_id") {
                             fields.insert("session_id".into(), session);
                         }
-                        let raw = serde_json::to_vec(&value)?;
-                        match self.append(&raw, File::sync_all)? {
-                            AppendOutcome::Synced => {}
-                            AppendOutcome::AppendedButSyncFailed(error) => return Err(error),
-                        }
+                        records.push(serde_json::to_vec(&value)?);
                     }
                 }
             }
+            // The source remains the completion marker until it is archived.
+            // Reuse record IDs to resume an interrupted import even when the
+            // target already contains imported or newly recorded usage.
+            self.import_records(&records)?;
             archive_legacy(&source)?;
             break;
         }
         Ok(())
-    }
-
-    fn has_records(&self) -> Result<bool> {
-        match self.backend {
-            Backend::Jsonl => Ok(self.path.metadata()?.len() > 0),
-            Backend::Sqlite => {
-                let conn = Connection::open(&self.path)?;
-                Ok(conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM session_cost_records)",
-                    [],
-                    |row| row.get(0),
-                )?)
-            }
-        }
     }
 
     pub fn read_records(&self) -> Result<Vec<Vec<u8>>> {
@@ -493,6 +477,92 @@ mod tests {
         target.import_records(&records).unwrap();
         target.import_records(&records).unwrap();
         assert_eq!(target.read_records().unwrap(), records);
+    }
+
+    #[test]
+    fn legacy_import_resumes_into_nonempty_backends_before_archiving() {
+        for (backend, name) in [(Backend::Sqlite, "sqlite"), (Backend::Jsonl, "jsonl")] {
+            for source_name in ["state/costs.jsonl", ".zeroclaw/costs.db"] {
+                // A new native record, a partially imported source, and a
+                // completed import interrupted immediately before archiving.
+                for imported in 0..=2 {
+                    let dir = TempDir::new().unwrap();
+                    let path = resolve_path(dir.path(), name).unwrap();
+                    let ledger = CostLedger::open_backend(&path, backend, false).unwrap();
+                    ledger.append(&record("new"), File::sync_all).unwrap();
+                    for id in ["a", "b"].into_iter().take(imported) {
+                        ledger.append(&record(id), File::sync_all).unwrap();
+                    }
+                    drop(ledger);
+
+                    let legacy = dir.path().join(source_name);
+                    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+                    let original = [
+                        legacy_record("a", Some("session")),
+                        legacy_record("b", Some("session")),
+                    ]
+                    .join(&b'\n');
+                    fs::write(&legacy, &original).unwrap();
+
+                    // Reopen twice to verify recovery and subsequent startup
+                    // neither skip source records nor charge them twice.
+                    for _ in 0..2 {
+                        let ledger = CostLedger::open(&path).unwrap();
+                        let records = ledger.read_records().unwrap();
+                        assert_eq!(records.len(), 3);
+                        let mut ids = Vec::new();
+                        for raw in records {
+                            let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                            ids.push(value["id"].as_str().unwrap().to_owned());
+                            assert_eq!(value["session_id"], "session");
+                            assert!(value.get("conversation_id").is_none());
+                            assert_eq!(value["usage"]["cost_usd"], 0.1);
+                        }
+                        ids.sort();
+                        assert_eq!(ids, ["a", "b", "new"]);
+                    }
+                    assert!(!legacy.exists());
+                    assert_eq!(
+                        fs::read(dir.path().join(format!("{source_name}.backup"))).unwrap(),
+                        original
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_legacy_import_retains_source_and_resumes_without_duplicates() {
+        for name in ["sqlite", "jsonl"] {
+            let dir = TempDir::new().unwrap();
+            let path = resolve_path(dir.path(), name).unwrap();
+            let legacy = dir.path().join("state/costs.jsonl");
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            let first = legacy_record("a", Some("session"));
+            let second = legacy_record("b", Some("session"));
+            let mut invalid: serde_json::Value = serde_json::from_slice(&second).unwrap();
+            invalid.as_object_mut().unwrap().remove("id");
+            let original = [first.clone(), serde_json::to_vec(&invalid).unwrap()].join(&b'\n');
+            fs::write(&legacy, &original).unwrap();
+
+            for _ in 0..2 {
+                let error = CostLedger::open(&path).err().unwrap();
+                assert!(error.to_string().contains("cost record has no id"));
+                assert_eq!(fs::read(&legacy).unwrap(), original);
+                assert!(!dir.path().join("state/costs.jsonl.backup").exists());
+            }
+
+            fs::write(&legacy, [first, second].join(&b'\n')).unwrap();
+            let ledger = CostLedger::open(&path).unwrap();
+            let records = ledger.read_records().unwrap();
+            assert_eq!(records.len(), 2);
+            for (raw, id) in records.iter().zip(["a", "b"]) {
+                let value: serde_json::Value = serde_json::from_slice(raw).unwrap();
+                assert_eq!(value["id"], id);
+            }
+            assert!(!legacy.exists());
+            assert!(dir.path().join("state/costs.jsonl.backup").exists());
+        }
     }
 
     #[test]
