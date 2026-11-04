@@ -127,6 +127,16 @@ version = "=0.1.4"
 name = "mio"
 version = "=0.8.11"
 
+# zip 9.0.3 (root crate, macOS and BSD only) requires nix 0.31, while
+# zeroclaw-providers' unix dependency and process-wrap =9.0.0 (a Windows-only
+# dependency whose nix edge is cfg(unix)) still require nix 0.30. Remove this
+# skip when zeroclaw-providers moves to nix 0.31 and process-wrap moves to
+# 9.0.3 or later, which also needs the workspace's `windows` crates on 0.62.
+[[bans.skip]]
+name = "nix"
+version = "=0.30.1"
+reason = "zip 9.0.3 requires nix 0.31; zeroclaw-providers and process-wrap =9.0.0 still require nix 0.30"
+
 [[bans.skip]]
 name = "nom"
 version = "=7.1.3"

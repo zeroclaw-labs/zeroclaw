@@ -89,16 +89,17 @@ impl Chord {
     pub fn display(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         let mut literal_word_control = false;
-        if self.primary {
-            parts.push(if cfg!(target_os = "macos") {
-                "⌘"
-            } else {
-                "Ctrl"
-            });
-        }
         if self.modifiers.contains(KeyModifiers::CONTROL) {
             literal_word_control = true;
             parts.push("Ctrl");
+        }
+        if self.primary {
+            #[cfg(target_os = "macos")]
+            parts.push("⌘");
+            #[cfg(not(target_os = "macos"))]
+            if !self.modifiers.contains(KeyModifiers::CONTROL) {
+                parts.push("Ctrl");
+            }
         }
         if self.modifiers.contains(KeyModifiers::SUPER) {
             parts.push(if cfg!(target_os = "macos") {
@@ -475,8 +476,21 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn display_ctrl_on_non_darwin() {
+    fn session_shortcut_display_ctrl_on_non_darwin() {
         assert_eq!(Chord::ctrl('k').display(), "Ctrl+k");
+        assert_eq!(
+            Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL).display(),
+            "Ctrl+1"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_shortcut_display_ctrl_primary_on_darwin() {
+        assert_eq!(
+            Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL).display(),
+            "Ctrl+⌘+1"
+        );
     }
 
     #[cfg(target_os = "macos")]

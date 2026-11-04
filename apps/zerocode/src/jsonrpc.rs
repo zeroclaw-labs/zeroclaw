@@ -70,6 +70,14 @@ pub struct JsonRpcError {
     pub data: Option<Value>,
 }
 
+impl std::fmt::Display for JsonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for JsonRpcError {}
+
 // ── Error codes ──────────────────────────────────────────────────
 
 pub mod error_codes {
@@ -78,7 +86,6 @@ pub mod error_codes {
 
     pub const SESSION_NOT_FOUND: i32 = -32000;
     pub const SESSION_BUSY: i32 = -32002;
-    #[cfg(test)]
     pub const INVALID_PARAMS: i32 = -32602;
 }
 

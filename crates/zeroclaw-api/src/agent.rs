@@ -83,6 +83,14 @@ impl TokenCountSource {
     }
 }
 
+/// The cost-limit period a [`TurnEvent::BudgetWarning`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetWarningPeriod {
+    Day,
+    Month,
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
@@ -156,6 +164,17 @@ pub enum TurnEvent {
         /// the trim is announced. Wire and observer adapters deliberately
         /// ignore this field; it is never serialized as a turn event.
         retained_context: Option<RetainedContextSnapshot>,
+    },
+    /// Recorded spend has reached `cost.warn_at_percent` of a shared daily or
+    /// monthly limit. Non-blocking: the turn continues. Emitted at most once
+    /// per turn, before the first provider call that sees the warning.
+    BudgetWarning {
+        /// Spend recorded in `period` before this turn's next call.
+        current_usd: f64,
+        /// Configured limit for `period`.
+        limit_usd: f64,
+        /// Which limit is near.
+        period: BudgetWarningPeriod,
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.

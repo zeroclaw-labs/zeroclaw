@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role, ToolProvenance};
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolExecutionContext, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Type alias for a path-extraction closure used by [`PathGuardedTool`].
@@ -61,6 +61,15 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_with_context(args, &ToolExecutionContext::current().unwrap_or_default())
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
         let reservation = match self.security.reserve_action() {
             Some(reservation) => reservation,
             None => {
@@ -72,7 +81,7 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
             }
         };
 
-        let result = self.inner.execute(args).await?;
+        let result = self.inner.execute_with_context(args, context).await?;
 
         if result.success {
             reservation.commit();
@@ -162,6 +171,15 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_with_context(args, &ToolExecutionContext::current().unwrap_or_default())
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
         if let Some(arg) = self.extract_path_string(&args) {
             // For shell command arguments, use the full token-aware scanner.
             // For plain path values (e.g. "path" or custom extractor), fall back
@@ -185,7 +203,7 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
             }
         }
 
-        self.inner.execute(args).await
+        self.inner.execute_with_context(args, context).await
     }
 }
 
@@ -428,6 +446,143 @@ mod tests {
     }
 
     // ── Composition test ──────────────────────────────────────────────────────
+
+    struct ContextAwareTool {
+        calls: Arc<AtomicUsize>,
+        tokens: Arc<std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ContextAwareTool);
+
+    #[async_trait]
+    impl Tool for ContextAwareTool {
+        fn name(&self) -> &str {
+            "context_aware"
+        }
+        fn description(&self) -> &str {
+            "Records explicit execution contexts"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            anyhow::bail!("the wrapper must forward execute_with_context")
+        }
+        async fn execute_with_context(
+            &self,
+            _args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> anyhow::Result<ToolResult> {
+            context
+                .run(async {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.tokens.lock().unwrap().push(
+                        ToolExecutionContext::current()
+                            .unwrap()
+                            .cancellation_token()
+                            .unwrap()
+                            .clone(),
+                    );
+                    Ok(ToolResult::ok("ok"))
+                })
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_context_wrapper_chain_preserves_policy_and_forwards_token() {
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(
+                ContextAwareTool {
+                    calls: calls.clone(),
+                    tokens: tokens.clone(),
+                },
+                sec.clone(),
+            ),
+            sec,
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+
+        let blocked = tool
+            .execute_with_context(
+                serde_json::json!({"path": absolute_path_outside_workspace()}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(!blocked.success);
+        assert!(blocked.error.unwrap().contains("Path blocked"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // A rejected path releases the reservation, and the legacy wrapper
+        // entrypoint must still forward the active explicit context.
+        let allowed = context
+            .run(tool.execute(serde_json::json!({"path": "src/main.rs"})))
+            .await
+            .unwrap();
+        assert!(allowed.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let exhausted = tool
+            .execute_with_context(serde_json::json!({"path": "src/main.rs"}), &context)
+            .await
+            .unwrap();
+        assert!(!exhausted.success);
+        assert!(exhausted.error.unwrap().contains("Rate limit exceeded"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        token.cancel();
+        assert!(tokens.lock().unwrap()[0].is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn tool_context_wrapper_cancellation_releases_rate_reservation() {
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let entered = Arc::new(Notify::new());
+        let tool = RateLimitedTool::new(
+            BlockingTool {
+                entered: entered.clone(),
+                release: Arc::new(Notify::new()),
+            },
+            sec.clone(),
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+        let mut call = Box::pin(tool.execute_with_context(serde_json::json!({}), &context));
+        tokio::select! {
+            result = &mut call => panic!("blocking tool completed early: {result:?}"),
+            () = entered.notified() => {},
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("blocking tool did not start")
+        }
+        token.cancel();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), call)
+            .await
+            .expect("cancellation should release the reservation")
+            .unwrap_err();
+        assert!(error.is::<zeroclaw_api::tool::ToolExecutionCancelled>());
+
+        let (inner, calls) = CountingTool::new();
+        assert!(
+            RateLimitedTool::new(inner, sec)
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn composed_wrappers_both_enforce() {
