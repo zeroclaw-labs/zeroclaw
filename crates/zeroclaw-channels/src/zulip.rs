@@ -2463,3 +2463,530 @@ mod tests {
         );
     }
 }
+
+/// Network tests against a mock Zulip server.
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use wiremock::matchers::{body_string_contains, method, path, path_regex};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+    use zeroclaw_api::channel::{GateChoice, GateChoiceEmphasis};
+
+    const OPERATOR: u64 = 10;
+    const STRANGER: u64 = 42;
+    const BOT: u64 = 99;
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn ok(extra: serde_json::Value) -> ResponseTemplate {
+        let mut body = serde_json::json!({ "result": "success", "msg": "" });
+        if let (Some(b), Some(e)) = (body.as_object_mut(), extra.as_object()) {
+            b.extend(e.clone());
+        }
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+
+    fn channel_for(server: &MockServer) -> Arc<ZulipChannel> {
+        Arc::new(
+            ZulipChannel::new(
+                server.uri(),
+                "bot@example.com".into(),
+                "secret".into(),
+                "wire",
+                Arc::new(|| vec![OPERATOR.to_string()]),
+                false,
+            )
+            .with_approval_timeout_secs(5),
+        )
+    }
+
+    fn me() -> BotIdentity {
+        BotIdentity {
+            user_id: BOT,
+            full_name: "ZeroClaw".into(),
+        }
+    }
+
+    async fn mount_identity(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/users/me"))
+            .respond_with(ok(
+                serde_json::json!({ "user_id": BOT, "full_name": "ZeroClaw" }),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_register(server: &MockServer, feature_level: u64, expect: u64) {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/register"))
+            .respond_with(ok(serde_json::json!({
+                "queue_id": "q1",
+                "last_event_id": -1,
+                "zulip_feature_level": feature_level,
+            })))
+            .expect(expect)
+            .mount(server)
+            .await;
+    }
+
+    /// Idle polls: a slow heartbeat so the listener keeps waiting.
+    async fn mount_idle_events(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events"))
+            .respond_with(
+                ok(serde_json::json!({ "events": [{ "id": 1000, "type": "heartbeat" }] }))
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/events"))
+            .respond_with(ok(serde_json::json!({})))
+            .mount(server)
+            .await;
+    }
+
+    fn dm_event(id: i64, sender: u64, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "type": "message", "flags": [],
+            "message": {
+                "id": 500 + id, "sender_id": sender,
+                "display_recipient": [{ "id": sender }, { "id": BOT }],
+                "content": content, "timestamp": 1_700_000_000u64,
+            }
+        })
+    }
+
+    async fn mount_events_once(server: &MockServer, events: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events"))
+            .respond_with(ok(serde_json::json!({ "events": events })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    struct Listening {
+        rx: tokio::sync::mpsc::Receiver<ChannelMessage>,
+        cancel: CancellationToken,
+        handle: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    fn start_listening(ch: &Arc<ZulipChannel>) -> Listening {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        ch.set_cancel_token(cancel.clone());
+        let listener = Arc::clone(ch);
+        let handle = zeroclaw_spawn::spawn!(async move { listener.listen(tx).await });
+        Listening { rx, cancel, handle }
+    }
+
+    impl Listening {
+        async fn next(&mut self) -> ChannelMessage {
+            tokio::time::timeout(WAIT, self.rx.recv())
+                .await
+                .expect("no message within the timeout")
+                .expect("listener channel closed")
+        }
+
+        async fn stop(self) -> Result<()> {
+            self.cancel.cancel();
+            tokio::time::timeout(WAIT, self.handle)
+                .await
+                .expect("listener did not stop")
+                .expect("listener panicked")
+        }
+    }
+
+    #[tokio::test]
+    async fn listen_registers_and_delivers_an_authorized_dm() {
+        let server = MockServer::start().await;
+        mount_identity(&server).await;
+        mount_register(&server, 421, 1).await;
+        mount_events_once(
+            &server,
+            serde_json::json!([
+                dm_event(1, STRANGER, "ignored"),
+                dm_event(2, OPERATOR, "hello")
+            ]),
+        )
+        .await;
+        mount_idle_events(&server).await;
+
+        let ch = channel_for(&server);
+        let mut l = start_listening(&ch);
+        let msg = l.next().await;
+        assert_eq!(msg.content, "hello");
+        assert_eq!(msg.reply_target, format!("dm:{OPERATOR}"));
+        assert_eq!(ch.listener_health(), Some(ListenerHealth::Healthy));
+        l.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_queue_is_registered_again() {
+        let server = MockServer::start().await;
+        mount_identity(&server).await;
+        mount_register(&server, 421, 2).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "result": "error", "msg": "Bad event queue id", "code": "BAD_EVENT_QUEUE_ID",
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_events_once(&server, serde_json::json!([dm_event(3, OPERATOR, "after")])).await;
+        mount_idle_events(&server).await;
+
+        let ch = channel_for(&server);
+        let mut l = start_listening(&ch);
+        assert_eq!(l.next().await.content, "after");
+        l.stop().await.unwrap();
+        // `expect(2)` on register is checked when the server drops
+    }
+
+    #[tokio::test]
+    async fn rate_limit_waits_for_retry_after() {
+        let server = MockServer::start().await;
+        mount_identity(&server).await;
+        mount_register(&server, 421, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0.2"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_events_once(&server, serde_json::json!([dm_event(4, OPERATOR, "late")])).await;
+        mount_idle_events(&server).await;
+
+        let ch = channel_for(&server);
+        let mut l = start_listening(&ch);
+        assert_eq!(l.next().await.content, "late");
+        l.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_server_error_keeps_the_queue() {
+        let server = MockServer::start().await;
+        mount_identity(&server).await;
+        mount_register(&server, 421, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("<html>Bad Gateway</html>"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_events_once(
+            &server,
+            serde_json::json!([dm_event(5, OPERATOR, "recovered")]),
+        )
+        .await;
+        mount_idle_events(&server).await;
+
+        let ch = channel_for(&server);
+        let mut l = start_listening(&ch);
+        assert_eq!(l.next().await.content, "recovered");
+        l.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_server_is_refused() {
+        let server = MockServer::start().await;
+        mount_identity(&server).await;
+        mount_register(&server, 174, 1).await;
+
+        let ch = channel_for(&server);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let err = ch.listen(tx).await.unwrap_err().to_string();
+        assert!(err.contains("Zulip 8.0"), "{err}");
+    }
+
+    async fn mount_send(server: &MockServer, message_id: u64) {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/messages"))
+            .respond_with(ok(serde_json::json!({ "id": message_id })))
+            .mount(server)
+            .await;
+        Mock::given(path_regex(r"^/api/v1/messages/\d+/reactions$"))
+            .respond_with(ok(serde_json::json!({})))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_edit(server: &MockServer, message_id: u64, expected_text: &str) {
+        Mock::given(method("PATCH"))
+            .and(path(format!("/api/v1/messages/{message_id}")))
+            .and(body_string_contains(expected_text))
+            .respond_with(ok(serde_json::json!({})))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn approval_request() -> ChannelApprovalRequest {
+        ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "command: date".into(),
+            raw_arguments: None,
+            position: None,
+        }
+    }
+
+    /// Waits until the prompt is posted and bound to its message.
+    async fn pending_token(ch: &ZulipChannel) -> String {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if let Some(token) = {
+                    let state = ch.approvals.lock();
+                    state.posts.values().next().map(|(t, _)| t.clone())
+                } {
+                    return token;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("approval prompt was not posted")
+    }
+
+    fn reaction(message_id: u64, user_id: u64, emoji: &str) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "id": 77, "type": "reaction", "op": "add",
+            "message_id": message_id, "user_id": user_id, "emoji_name": emoji,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn approval_resolved_by_reaction_edits_the_prompt() {
+        let server = MockServer::start().await;
+        mount_send(&server, 700).await;
+        mount_edit(&server, 700, "Approved").await;
+
+        let ch = channel_for(&server);
+        let asker = Arc::clone(&ch);
+        let pending = zeroclaw_spawn::spawn!(async move {
+            asker
+                .request_approval_attributed(&format!("dm:{OPERATOR}"), &approval_request())
+                .await
+        });
+        pending_token(&ch).await;
+        // A stranger's reaction does not decide
+        assert!(!ch.try_resolve_approval_reaction(&reaction(700, STRANGER, "check"), &me()));
+        assert!(ch.try_resolve_approval_reaction(&reaction(700, OPERATOR, "check"), &me()));
+
+        let answer = pending.await.unwrap().unwrap().unwrap();
+        assert_eq!(answer.response, ChannelApprovalResponse::Approve);
+        assert_eq!(answer.source, ApprovalSource::Operator);
+    }
+
+    #[tokio::test]
+    async fn approval_resolved_by_token_reply() {
+        let server = MockServer::start().await;
+        mount_send(&server, 701).await;
+        mount_edit(&server, 701, "Denied").await;
+
+        let ch = channel_for(&server);
+        let asker = Arc::clone(&ch);
+        let pending = zeroclaw_spawn::spawn!(async move {
+            asker
+                .request_approval_attributed(&format!("dm:{OPERATOR}"), &approval_request())
+                .await
+        });
+        let token = pending_token(&ch).await;
+        let reply = dm_event(9, OPERATOR, &format!("{token} no"));
+        let msg = serde_json::from_value::<Event>(reply)
+            .unwrap()
+            .message
+            .unwrap();
+        assert_eq!(
+            ch.try_resolve_approval_reply(&msg, &me()),
+            ApprovalReplyOutcome::Consumed
+        );
+
+        let answer = pending.await.unwrap().unwrap().unwrap();
+        assert_eq!(answer.response, ChannelApprovalResponse::Deny);
+        assert_eq!(answer.source, ApprovalSource::Operator);
+    }
+
+    #[tokio::test]
+    async fn approval_times_out_as_a_runtime_denial() {
+        let server = MockServer::start().await;
+        mount_send(&server, 702).await;
+        mount_edit(&server, 702, "Expired").await;
+
+        let ch = Arc::new(
+            ZulipChannel::new(
+                server.uri(),
+                "bot@example.com".into(),
+                "secret".into(),
+                "wire",
+                Arc::new(|| vec![OPERATOR.to_string()]),
+                false,
+            )
+            .with_approval_timeout_secs(1),
+        );
+        let answer = ch
+            .request_approval_attributed(&format!("dm:{OPERATOR}"), &approval_request())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.response, ChannelApprovalResponse::Deny);
+        assert_eq!(answer.source, ApprovalSource::TimedOut);
+    }
+
+    fn gate(reference: &str) -> ChannelGatePrompt {
+        let choice = |kind: GateChoiceKind| GateChoice {
+            id: kind.id().to_string(),
+            label: kind.id().to_string(),
+            emphasis: GateChoiceEmphasis::Neutral,
+            input: None,
+        };
+        ChannelGatePrompt {
+            title: "SOP approval needed: deploy".into(),
+            description: "Approve?".into(),
+            reference: reference.into(),
+            choices: vec![
+                choice(GateChoiceKind::Approve),
+                choice(GateChoiceKind::Deny),
+            ],
+            resolved_description: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_prompt_is_signed_and_finalized_in_place() {
+        let server = MockServer::start().await;
+        mount_send(&server, 800).await;
+        mount_edit(&server, 800, "Approved").await;
+
+        let ch = channel_for(&server);
+        let target = "stream:5:approvals";
+        assert!(ch.send_gate_prompt(target, &gate("run-w1")).await.unwrap());
+        let posted = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r: &Request| r.url.path() == "/api/v1/messages")
+            .unwrap();
+        let content = reqwest::Url::parse(&format!(
+            "http://form/?{}",
+            String::from_utf8_lossy(&posted.body)
+        ))
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "content")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+        let (reference, sig) = parse_gate_marker(&content).unwrap();
+        assert_eq!(reference, "run-w1");
+        assert!(verify_gate(
+            &derive_gate_key("secret"),
+            &reference,
+            target,
+            &sig
+        ));
+
+        assert!(
+            ch.finalize_gate_prompt("run-w1", "Approved by 10")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_outcome_falls_back_to_a_reply_when_editing_is_refused() {
+        let server = MockServer::start().await;
+        mount_send(&server, 801).await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/messages/801"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "result": "error", "msg": "The time limit for editing this message has passed",
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = channel_for(&server);
+        assert!(
+            ch.send_gate_prompt("stream:5:approvals", &gate("run-w2"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            ch.finalize_gate_prompt("run-w2", "Denied by 10")
+                .await
+                .unwrap()
+        );
+        let replies = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/api/v1/messages")
+            .count();
+        assert_eq!(replies, 2, "prompt plus the outcome reply");
+    }
+
+    async fn mount_posted_message(server: &MockServer, id: u64, sender: u64, content: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/messages/{id}")))
+            .respond_with(ok(serde_json::json!({ "message": {
+                "id": id, "sender_id": sender, "stream_id": 5, "subject": "approvals",
+                "display_recipient": "ops", "content": content, "timestamp": 1_700_000_000u64,
+            }})))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reaction_after_restart_uses_the_signed_marker() {
+        let server = MockServer::start().await;
+        let key = derive_gate_key("secret");
+        let signed = sign_gate(&key, "run-w3", "stream:5:approvals");
+        mount_posted_message(
+            &server,
+            900,
+            BOT,
+            &format!("**SOP approval needed: deploy**\n\n`zeroclaw-gate:run-w3:{signed}`"),
+        )
+        .await;
+        // Same marker signed for another topic: refused
+        let other = sign_gate(&key, "run-w4", "stream:5:elsewhere");
+        mount_posted_message(
+            &server,
+            901,
+            BOT,
+            &format!("`zeroclaw-gate:run-w4:{other}`"),
+        )
+        .await;
+
+        let ch = channel_for(&server);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            !ch.try_answer_gate_reaction(&reaction(901, OPERATOR, "check"), &me(), &tx)
+                .await
+        );
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            !ch.try_answer_gate_reaction(&reaction(900, OPERATOR, "check"), &me(), &tx)
+                .await
+        );
+        let answer = rx.try_recv().unwrap();
+        assert_eq!(
+            answer.internal_sop_event.as_deref(),
+            Some("sop.gate:approve:run-w3")
+        );
+        assert_eq!(answer.reply_target, "stream:5:approvals");
+        // Registered, so finalization can edit it
+        assert_eq!(
+            gate_for_message("wire", 900),
+            Some(("run-w3".into(), "stream:5:approvals".into()))
+        );
+    }
+}
