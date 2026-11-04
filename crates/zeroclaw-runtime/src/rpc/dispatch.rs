@@ -17410,6 +17410,86 @@ mod tests {
         assert_eq!(stored.name.as_deref(), Some("alpha-shell"));
     }
 
+    /// `cron/add` takes the alias reservation before the config writer gate,
+    /// the order `config/set` takes them, and holds both through the insert.
+    /// While it queues on the gate it already holds the reservation, so a
+    /// lifecycle delete or rename of the alias is refused; while the store is
+    /// busy it holds both; once the row is written it holds neither.
+    #[test]
+    fn cron_add_reserves_the_alias_before_the_writer_gate_and_holds_both_through_the_insert() {
+        use crate::live_config_authority::AgentDeleteBlocker;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the test runtime builds");
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = cron_roster_config_in(&tmp, 4242);
+            // Creates jobs.db, so the competing writer has a database to hold.
+            seed_shell_cron_job(&config, "alpha", "alpha-shell");
+            let ctx = enforcement_ctx(config.clone());
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let reserved = |ctx: &Arc<RpcContext>| {
+                matches!(
+                    ctx.agent_lifecycle.delete_blocker("alpha"),
+                    Some(AgentDeleteBlocker::Reservations { count: 1, .. })
+                )
+            };
+            assert!(
+                ctx.agent_lifecycle.delete_blocker("alpha").is_none(),
+                "nothing holds alpha before the add"
+            );
+
+            // An unrelated writer holds the gate, so the add queues on it.
+            let in_flight = ctx.config_authority.lock_config_writer().await;
+            let writer = rusqlite::Connection::open(config.data_dir.join("cron").join("jobs.db"))
+                .expect("the competing writer opens jobs.db");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("the competing writer takes the write lock");
+            let params = json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"});
+            let add = zeroclaw_spawn::spawn!(async move { alice.handle_cron_add(&params).await });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !reserved(&ctx) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the add must reserve alpha before it waits for the writer gate"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(!add.is_finished(), "the add is still queued on the gate");
+
+            // The gate frees; the add takes it and blocks in the busy store.
+            drop(in_flight);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !ctx.config_authority.config_write_lock_is_held() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the add must hold the writer gate while the store is busy"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(reserved(&ctx), "the reservation is held through the insert");
+
+            writer
+                .execute_batch("ROLLBACK")
+                .expect("the competing writer releases jobs.db");
+            let added = add
+                .await
+                .expect("the add task must not panic")
+                .expect("the add commits");
+            assert_eq!(added["agent_alias"], json!("alpha"), "{added}");
+            assert!(
+                ctx.agent_lifecycle.delete_blocker("alpha").is_none(),
+                "the add releases the reservation once the row is written"
+            );
+            assert!(!ctx.config_authority.config_write_lock_is_held());
+        });
+    }
+
     /// The store's write is synchronous and can wait out SQLite's busy
     /// timeout. While a competing writer holds `jobs.db`, the cron write must
     /// already hold the publication lock, so a revocation published meanwhile
