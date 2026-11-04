@@ -33,6 +33,7 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+pub mod dashboard_session;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
@@ -1141,7 +1142,7 @@ where
 /// What a stopped gateway answers: try again on a new connection, which the
 /// next gateway serves. Nothing in it comes from the stopped gateway's
 /// configuration or state.
-fn gateway_restarting(version: axum::http::Version) -> Response {
+pub(crate) fn gateway_restarting(version: axum::http::Version) -> Response {
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
         [(header::RETRY_AFTER, "1")],
@@ -2449,6 +2450,8 @@ pub async fn run_gateway_with_plugin_webhooks(
         },
     };
 
+    let dashboard_layer_state = state.clone();
+
     // Build router with middleware
     let inner = Router::new()
         .merge(config_admin_router(&inbound_auth))
@@ -2786,6 +2789,26 @@ pub async fn run_gateway_with_plugin_webhooks(
         inner
     };
 
+    // Dashboard sign-in sessions: classified once per request for every
+    // route, upgrades and the fallback included. A no-op unless
+    // `[gateway.dashboard_sign_in]` offers a provider.
+    // Bound to this generation before it serves anything, so its stop
+    // retires the sessions' sockets and refuses their later requests.
+    let dashboard_auth = Arc::new(
+        dashboard_session::DashboardAuth::new(
+            dashboard_session::DashboardSessions::process_shared(),
+            Arc::clone(&inbound_auth),
+        )
+        .for_generation(&dashboard_layer_state),
+    );
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        dashboard_session::DashboardLayer {
+            state: dashboard_layer_state,
+            auth: dashboard_auth,
+        },
+        dashboard_session::layer,
+    ));
+
     let tls_enabled = config
         .gateway
         .tls
@@ -2907,7 +2930,8 @@ pub async fn run_gateway_with_plugin_webhooks(
                                 }
                             };
                             let io = hyper_util::rt::TokioIo::new(tls_stream);
-                            serve_until_stopped!(builder.serve_connection(io, hyper_svc))
+                            // With upgrades, as over plain HTTP: WebSockets work over TLS too.
+                            serve_until_stopped!(builder.serve_connection_with_upgrades(io, hyper_svc))
                         }
                         None => {
                             let io = hyper_util::rt::TokioIo::new(tcp_stream);
@@ -8656,6 +8680,262 @@ path = "{trigger_path}"
             next_shutdown.send(true).unwrap();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), next).await;
         }
+    }
+
+    /// The native TLS listener serves WebSocket upgrades, as plain HTTP
+    /// does: a socket opened over TLS completes its upgrade, gets its
+    /// route's first frame, and stays open.
+    #[tokio::test]
+    async fn a_websocket_over_native_tls_stays_open() {
+        use futures_util::StreamExt;
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+            &tmp.path().join("tls-ws"),
+            0,
+            Some((cert_path.as_path(), key_path.as_path())),
+            None,
+        )
+        .await;
+        let tls = drain_test_tls_connect(&connector, addr).await;
+        let url = format!("ws://localhost:{}/ws/canvas/tls-upgrade", addr.port());
+        let (mut socket, response) = tokio_tungstenite::client_async(url, tls)
+            .await
+            .expect("the upgrade completes");
+        assert_eq!(response.status(), 101);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a first frame in time")
+            .expect("the upgraded TLS socket is still open")
+            .expect("a frame, not an error");
+        let text = first.into_text().expect("a text frame").to_string();
+        assert!(text.contains(r#""type":"connected""#), "{text}");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), socket.next())
+                .await
+                .is_err(),
+            "the upgraded TLS socket closed on its own"
+        );
+        drop(socket);
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+    }
+
+    /// A TLS gateway generation with dashboard sign-in on, at the root path,
+    /// verified by the mock provider at `issuer`.
+    async fn start_signed_in_tls_gateway(
+        data: &std::path::Path,
+        cert_path: &std::path::Path,
+        key_path: &std::path::Path,
+        issuer: &str,
+    ) -> (
+        SocketAddr,
+        Config,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let mut config = Config {
+            data_dir: data.join("data"),
+            config_path: data.join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.memory.backend = "none".into();
+        crate::dashboard_session::test_support::add_sign_in(&mut config, issuer);
+        // The process's rustls provider, as `main.rs` installs it: with both
+        // ring and aws-lc-rs compiled in (a workspace build), rustls picks none.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: cert_path.display().to_string(),
+            key_path: key_path.display().to_string(),
+            ..Default::default()
+        });
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
+            reload_tx,
+        );
+        let served = config.clone();
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                0,
+                served,
+                None,
+                Some(controls),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("the gateway becomes ready");
+        let addr = ready_rx.borrow().unwrap();
+        (addr, config, shutdown_tx, server)
+    }
+
+    /// A signed-in dashboard socket over native TLS is closed with 1001
+    /// (going away) when its gateway stops, as over plain HTTP: the upgrade
+    /// hands the socket to its route, and the session's watch ends it.
+    #[tokio::test]
+    async fn a_signed_in_socket_over_native_tls_closes_when_its_gateway_stops() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::{
+            Message, client::IntoClientRequest, protocol::frame::coding::CloseCode,
+        };
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let (addr, config, shutdown_tx, server) = start_signed_in_tls_gateway(
+            &tmp.path().join("signed-in"),
+            &cert_path,
+            &key_path,
+            &idp.uri(),
+        )
+        .await;
+        // Signed in on the process's shared store, which every generation reads.
+        let pairing = Arc::new(PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        let auth = crate::dashboard_session::DashboardAuth::new(
+            crate::dashboard_session::DashboardSessions::process_shared(),
+            Arc::new(
+                crate::principal_gate::GatewayInboundAuth::from_config(&config, pairing).unwrap(),
+            ),
+        );
+        let (cookie, _) = auth
+            .sign_in(
+                "corp",
+                crate::dashboard_session::ProviderPin::of(&config.oidc["corp"]),
+                "at-alice".into(),
+                3600,
+            )
+            .await
+            .expect("alice signs in");
+
+        let tls = drain_test_tls_connect(&connector, addr).await;
+        let origin = format!("https://localhost:{}", addr.port());
+        let mut request = format!("{origin}/ws/canvas/signed-in")
+            .replacen("https", "ws", 1)
+            .into_client_request()
+            .unwrap();
+        let headers = request.headers_mut();
+        headers.insert(
+            "cookie",
+            format!("{}={cookie}", crate::dashboard_session::HOST_SESSION_COOKIE)
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("origin", origin.parse().unwrap());
+        let (mut socket, response) = tokio_tungstenite::client_async(request, tls)
+            .await
+            .expect("the signed-in upgrade completes");
+        assert_eq!(response.status(), 101);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a first frame in time")
+            .expect("the socket is open")
+            .expect("a frame");
+        assert!(
+            first.to_string().contains(r#""type":"connected""#),
+            "{first}"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(frame) = socket.next().await {
+                if let Ok(Message::Close(close)) = frame {
+                    return close.map(|close| close.code);
+                }
+            }
+            None
+        })
+        .await
+        .expect("the socket is closed when its gateway stops");
+        assert_eq!(
+            closed,
+            Some(CloseCode::Away),
+            "closed with 1001 (going away)"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("the gateway returns")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
+    }
+
+    /// The same race as `an_upgrade_racing_the_stop_never_upgrades`, over
+    /// native TLS, which now serves upgrades: the upgrade request never
+    /// upgrades once the stop is sent.
+    #[tokio::test]
+    async fn an_upgrade_racing_the_stop_over_tls_never_upgrades() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (cert_path, key_path, connector) = drain_test_tls(tmp.path());
+        let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+            &tmp.path().join("tls-upgrade"),
+            0,
+            Some((cert_path.as_path(), key_path.as_path())),
+            None,
+        )
+        .await;
+        let mut kept = drain_test_tls_connect(&connector, addr).await;
+        let head = drain_test_request(&mut kept, "/health").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        kept.write_all(
+            b"GET /ws/canvas/race HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+              Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        kept.flush().await.unwrap();
+        shutdown_tx.send(true).unwrap();
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            kept.read_to_end(&mut answer),
+        )
+        .await
+        .expect("the kept connection closes");
+        let answer = String::from_utf8_lossy(&answer).to_ascii_lowercase();
+        assert!(
+            !answer.contains(" 101 "),
+            "an upgrade was admitted after the stop: {answer}"
+        );
+        if !answer.is_empty() {
+            assert!(answer.starts_with("http/1.1 503"), "{answer}");
+            assert!(answer.contains("connection: close"), "{answer}");
+            assert!(
+                answer.contains(r#""reason":"gateway_restarting""#),
+                "{answer}"
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("the gateway returns")
+            .expect("the gateway task does not panic")
+            .expect("the gateway stops cleanly");
     }
 
     #[tokio::test]
