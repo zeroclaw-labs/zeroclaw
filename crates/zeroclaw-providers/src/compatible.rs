@@ -16696,6 +16696,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_tool_rejection_matches_the_rendered_provider_http_error() {
+        // The runtime classifies the error the provider actually returns, so
+        // exercise the real `provider_http_error` shape, not a hand-built string.
+        for body in [
+            r#"{"error":{"message":"tools are not supported by this endpoint"}}"#,
+            r#"{"error":{"message":"unknown parameter: tool_choice"}}"#,
+            r#"{"error":"function calling is not supported"}"#,
+        ] {
+            let error = provider_http_error("Custom", reqwest::StatusCode::BAD_REQUEST, body);
+            assert!(
+                crate::rejects_native_tool_calling(error.as_ref()),
+                "rendered: {error}"
+            );
+            assert!(
+                OpenAiCompatibleModelProvider::is_native_tool_schema_unsupported(
+                    reqwest::StatusCode::BAD_REQUEST,
+                    body
+                )
+            );
+        }
+
+        let unrelated = provider_http_error(
+            "Custom",
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"invalid API key"}}"#,
+        );
+        assert!(!crate::rejects_native_tool_calling(unrelated.as_ref()));
+        assert!(
+            !OpenAiCompatibleModelProvider::is_native_tool_schema_unsupported(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "tools are not supported"
+            )
+        );
+    }
+
     /// A profile that authenticates purely through `extra_headers` (a
     /// `Cookie`- or `X-Auth`-style bridge, rather than a credential
     /// `resolve_credential()` returns) must still probe the configured
