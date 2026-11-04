@@ -383,6 +383,52 @@ and the named deferred MCP tool for on-demand activation; the helper is never
 implicitly granted. Permitted `mode = "always"` MCP tools are preactivated and
 remain callable without the helper.
 
+If either the principal's tool selector or agent selector is constrained,
+`delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
+are unavailable, including skill aliases wrapping those tools. These nested
+paths do not yet carry both current principal ceilings; the ordinary parent
+turn remains usable. Admin principals keep their agent's configured nested
+capabilities. Principals with both selectors set to `"*"` keep `delegate`
+itself, but lose its skill aliases, `spawn_subagent`, and `execute_pipeline`
+with the session-data tools below.
+
+The session-data tools `sessions_list`, `sessions_history`, and
+`sessions_send` list, read, and append to other sessions without checking
+who owns them, so no principal without `admin` holds them in its sessions,
+whatever its selectors name, `"*"` included. Skill aliases of those tools go
+with them, and so do `spawn_subagent` and `execute_pipeline` (with their
+skill aliases), whose nested runs would hold them again. A retained
+`delegate` withholds the same tools from every bounded, independent,
+background, and parallel child it builds. `sessions_current`, which reports
+only the caller's own session, stays. The withholding is applied at session
+creation, at rehydration, before every prompt, and when accepted steering is
+consumed, including its recheck after memory writes. An administrator demoted
+mid-session loses the tools at the next prompt or accepted steering. Like selector
+narrowing, it never gives them back to a live session. Admin principals and
+the shared operator keep them.
+
+A queued prompt resolves authority again on the exact Agent that will execute
+the turn, after provider reconciliation and Agent/task waits. The same admission
+applies withholding and protects prompt checkpoint or running-state writes
+after storage contention. A refused admission does not call the provider or
+persist a terminal turn. This is a turn-admission boundary, not continuous
+revocation of a turn that is already running.
+
+The model-facing tools `cron_add`, `cron_update`, `cron_run`, `cron_list`,
+`cron_runs`, `cron_remove`, `schedule`, and `send_message_to_peer` are also
+withheld from every non-admin principal, including their skill aliases and
+copies in delegated registries. Scheduled and peer turns do not carry the
+calling principal's restrictions, and cron rows and run output are shared by
+agent rather than owned by the calling principal. The same creation,
+rehydration, prompt-admission, and steering-consumption checks apply; administrator and shared
+operator sessions keep their configured tools. Existing jobs keep running.
+
+RPC `cron/patch` and `cron/trigger` also refuse agent jobs for non-admins,
+including wildcard selectors. These jobs cannot carry the caller's session
+restrictions; the check uses current authority after looking up the job.
+Shell jobs retain their existing grant and command-policy checks. Cron reads,
+deletion, and jobs already scheduled by an operator are unchanged.
+
 Non-admin RPC sessions cannot use `sop_execute`, `sop_approve`,
 `sop_advance`, or `sop_workshop`, including skill aliases. They also cannot
 use `spawn_subagent` or `execute_pipeline`: those builders can restore SOP
@@ -838,6 +884,11 @@ the restored file without a migration step.
 Consolidation and governance derive shared-plane rows and do not run for
 private sessions, and administrative access into another principal's
 private memory has no surfaced pathway yet (deny-by-default).
+The session-data tools have no principal-aware view yet, so they are
+withheld from principals without `admin` (see
+[Permission profiles](#permission-profiles)) instead of being scoped to the
+caller's own sessions, and scheduled agent jobs, SOP runs, and peer turns can
+still call them unless the agent's risk profile excludes them.
 `sops/runs` and `sops/run-detail` return the run history of every
 procedure to a principal holding `Sops:Read`, whichever agents it ran as,
 unlike cron history. Gateway HTTP routes outside the configuration
