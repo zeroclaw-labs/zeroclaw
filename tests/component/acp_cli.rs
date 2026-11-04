@@ -11,7 +11,7 @@ fn standalone_acp_agent_flag_selects_alias_less_session_owner() {
     let session_cwd = tempfile::tempdir().expect("temp session cwd");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        r#"schema_version = 3
+        r#"schema_version = 4
 
 [providers.models.ollama.default]
 model = "test-model"
