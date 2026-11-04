@@ -2083,26 +2083,34 @@ pub async fn handle_rename_map_key(
         Ok(commit) => commit,
         Err(e) => return error_response(config_commit_admission_error(e)),
     };
-    let working = _cfg_guard.current_config();
-
     match zeroclaw_config::alias_refs::alias_kind_for_map_path(&body.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
-            rename_agent_cascade(
+            // Each cascade contains large config/task futures. Keep their
+            // state on the heap rather than inflating the transport future.
+            Box::pin(rename_agent_cascade(
                 &state,
                 &principal,
-                working,
+                _cfg_guard.current_config(),
                 &body,
                 _cfg_guard,
                 agent_lifecycle_leases,
-            )
+            ))
             .await
         }
         Some(kind) => {
-            rename_config_cascade(&state, &principal, working, &kind, &body, _cfg_guard).await
+            Box::pin(rename_config_cascade(
+                &state,
+                &principal,
+                _cfg_guard.current_config(),
+                &kind,
+                &body,
+                _cfg_guard,
+            ))
+            .await
         }
         None => {
             // Non-aliased section: the generic key-swap rename (unchanged).
-            let mut working = working;
+            let mut working = _cfg_guard.current_config();
             let renamed = match working.rename_map_key(&body.path, &body.from, &body.to) {
                 Ok(b) => b,
                 Err(msg) => {
@@ -2119,18 +2127,17 @@ pub async fn handle_rename_map_key(
                 working.mark_dirty(&to_path);
                 // Source and destination are both in the write set: a
                 // rename removes one entry and creates another.
-                let before = state.config.read().clone();
-                let authorization = match authorize_config_write(
-                    &principal,
+                let writes = {
+                    let before = state.config.read();
                     ConfigWriteSet::by_effect(
                         &before,
                         &working,
                         working.dirty_paths.iter().map(String::as_str),
                     )
                     .with(from_path, Verb::Delete)
-                    .with(to_path, Verb::Create),
-                    &_cfg_guard,
-                ) {
+                    .with(to_path, Verb::Create)
+                };
+                let authorization = match authorize_config_write(&principal, writes, &_cfg_guard) {
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
                 };
@@ -2172,12 +2179,11 @@ async fn rename_config_cascade(
     for path in &report.dirty_paths {
         working.mark_dirty(path);
     }
-    let before = state.config.read().clone();
-    let authorization = match authorize_config_write(
-        principal,
-        rename_write_set(&before, &working, body),
-        &guard,
-    ) {
+    let writes = {
+        let before = state.config.read();
+        rename_write_set(&before, &working, body)
+    };
+    let authorization = match authorize_config_write(principal, writes, &guard) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
@@ -2303,7 +2309,6 @@ async fn rename_agent_cascade(
     // all, the residue re-run included (it writes no config but moves the
     // agent's owned state). The complete write set, once the cascade has
     // computed it, is authorized again below before the persist.
-    let before = state.config.read().clone();
     if let Err(denied) = authorize_config_write(
         principal,
         ConfigWriteSet::default()
@@ -2341,11 +2346,11 @@ async fn rename_agent_cascade(
                     working.mark_dirty(path);
                 }
                 let dirty_count = report.dirty_paths.len();
-                let authorization = match authorize_config_write(
-                    principal,
-                    rename_write_set(&before, &working, body),
-                    &guard,
-                ) {
+                let writes = {
+                    let before = state.config.read();
+                    rename_write_set(&before, &working, body)
+                };
+                let authorization = match authorize_config_write(principal, writes, &guard) {
                     Ok(authorization) => authorization,
                     Err(denied) => return denied.into_response(),
                 };

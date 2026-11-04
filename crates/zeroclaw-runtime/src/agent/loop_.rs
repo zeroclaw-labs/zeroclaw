@@ -1609,86 +1609,93 @@ async fn prepare_skill_child(
     )))
 }
 
-async fn execute_skill_child<T: serde::Serialize + Send>(
+fn execute_skill_child<T: serde::Serialize + Send>(
     child: Option<PreparedSkillChild>,
     engine: impl std::future::Future<Output = Result<T>> + Send,
-) -> Result<T> {
-    let Some(mut child) = child else {
-        return engine.await;
-    };
-    let port = child
-        .port
-        .as_ref()
-        .ok_or_else(|| {
+) -> impl std::future::Future<Output = Result<T>> + Send {
+    // Keep the nested skill engine out of the parent turn and task-local
+    // futures. Polling and cancellation still happen in the caller's scope.
+    Box::pin(async move {
+        let Some(mut child) = child else {
+            return engine.await;
+        };
+        let port = child
+            .port
+            .as_ref()
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                    "skill_child_execution_handle_missing"
+                );
+                anyhow::Error::msg("skill child execution handle missing")
+            })?
+            .clone();
+        let mut observed = None;
+        let recorded = port
+            .execute(Box::pin(async {
+                let result = engine.await;
+                let terminal = match &result {
+                    Ok(value) => serde_json::to_string(value).map_err(anyhow::Error::from),
+                    Err(error) => {
+                        let diagnostic = crate::agent::Agent::session_execution_diagnostic(error);
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(serde_json::json!({"error": diagnostic})),
+                            "skill_child_execution_failed"
+                        );
+                        Err(anyhow::Error::msg(diagnostic))
+                    }
+                };
+                observed = Some(result);
+                terminal
+            }))
+            .await;
+        if let Err(error) = recorded
+            && (observed.is_none()
+                || zeroclaw_api::session_events::capture::is_capture_stopped(&error)
+                || error.chain().any(|source| {
+                    source.is::<zeroclaw_kernel::session::SessionError>()
+                        || source.is::<zeroclaw_api::session_events::AppendError>()
+                        || source.is::<zeroclaw_api::session_events::ReadError>()
+                }))
+        {
+            if let Err(cleanup) = child.interrupted("skill_child_execution_stopped").await {
+                return Err(zeroclaw_api::session_events::capture::capture_stopped(
+                    error.context(format!(
+                        "skill_child_interruption_capture_failed: {}",
+                        crate::agent::Agent::session_execution_diagnostic(&cleanup)
+                    )),
+                ));
+            }
+            return Err(zeroclaw_api::session_events::capture::capture_stopped(
+                error,
+            ));
+        }
+        child.port = None;
+        let result = observed.ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
-                "skill_child_execution_handle_missing"
+                "skill_child_result_missing"
             );
-            anyhow::Error::msg("skill child execution handle missing")
-        })?
-        .clone();
-    let mut observed = None;
-    let recorded = port
-        .execute(Box::pin(async {
-            let result = engine.await;
-            let terminal = match &result {
-                Ok(value) => serde_json::to_string(value).map_err(anyhow::Error::from),
-                Err(error) => {
-                    let diagnostic = crate::agent::Agent::session_execution_diagnostic(error);
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_attrs(serde_json::json!({"error": diagnostic})),
-                        "skill_child_execution_failed"
-                    );
-                    Err(anyhow::Error::msg(diagnostic))
-                }
-            };
-            observed = Some(result);
-            terminal
-        }))
-        .await;
-    if let Err(error) = recorded
-        && (observed.is_none()
-            || zeroclaw_api::session_events::capture::is_capture_stopped(&error)
-            || error.chain().any(|source| {
+            anyhow::Error::msg("skill child result missing")
+        })?;
+        result.map_err(|error| {
+            if error.chain().any(|source| {
                 source.is::<zeroclaw_kernel::session::SessionError>()
                     || source.is::<zeroclaw_api::session_events::AppendError>()
                     || source.is::<zeroclaw_api::session_events::ReadError>()
-            }))
-    {
-        if let Err(cleanup) = child.interrupted("skill_child_execution_stopped").await {
-            return Err(zeroclaw_api::session_events::capture::capture_stopped(
-                error.context(format!(
-                    "skill_child_interruption_capture_failed: {}",
-                    crate::agent::Agent::session_execution_diagnostic(&cleanup)
-                )),
-            ));
-        }
-        return Err(zeroclaw_api::session_events::capture::capture_stopped(
-            error,
-        ));
-    }
-    child.port = None;
-    let result = observed.ok_or_else(|| {
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
-            "skill_child_result_missing"
-        );
-        anyhow::Error::msg("skill child result missing")
-    })?;
-    result.map_err(|error| {
-        if error.chain().any(|source| {
-            source.is::<zeroclaw_kernel::session::SessionError>()
-                || source.is::<zeroclaw_api::session_events::AppendError>()
-                || source.is::<zeroclaw_api::session_events::ReadError>()
-        }) {
-            zeroclaw_api::session_events::capture::capture_stopped(error)
-        } else {
-            error
-        }
+            }) {
+                zeroclaw_api::session_events::capture::capture_stopped(error)
+            } else {
+                error
+            }
+        })
     })
 }
 
