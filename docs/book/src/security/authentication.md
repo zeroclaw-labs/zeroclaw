@@ -482,9 +482,8 @@ an approval. The runtime approves only the call it dispatched, so under
 supervised autonomy a command that needs approval is refused there; call the
 tool directly to be asked.
 
-A principal-owned session that offers `delegate` may use synchronous and
-parallel delegation when its grants allow it; a named principal's RPC session
-does not offer it (see above). Background delegation and its `check_result`,
+Principal-owned sessions may use synchronous and parallel delegation when
+their grants allow it. Background delegation and its `check_result`,
 `list_results`, `cancel_task`, and `await_sessions` actions are refused,
 including calls through skill aliases and nested delegates. Those task rows
 and result files currently use agent-alias visibility, which cannot protect
