@@ -17353,6 +17353,45 @@ mod tests {
         );
     }
 
+    /// A non-admin's change to an agent job is refused under the config
+    /// writer gate, before the patch waits for the cron store's writer. With
+    /// that writer held elsewhere the refusal still arrives, and the job is
+    /// left as it was. Without the check under the gate, only the one under
+    /// the store's writer refuses it, after the store's busy wait.
+    #[tokio::test]
+    async fn cron_patch_refuses_an_agent_job_change_before_waiting_on_the_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let job = seed_cron_job(&config, "alpha", "alpha-agent");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let writer = rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/patch",
+            json!({"id": job.id, "agent": "alpha", "prompt": "say goodbye"}),
+        )
+        .await;
+        writer.execute_batch("COMMIT").unwrap();
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            refused["error"]["message"],
+            json!(crate::i18n::get_required_cli_string(
+                "rpc-cron-agent-principal-required"
+            )),
+            "{refused}"
+        );
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(
+            stored.prompt, job.prompt,
+            "a refused patch must not change the prompt"
+        );
+    }
+
     /// Republish the accepted policy with alice's entitlement to `alpha` gone.
     fn revoke_alice_cron_agent(ctx: &Arc<RpcContext>) {
         let mut narrowed = ctx.config.read().clone();
