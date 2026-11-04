@@ -839,7 +839,9 @@ async fn dispatch_sop_event_filtered(
             if let Some(authorize) = authorize {
                 let authorization = eng
                     .get_sop(sop_name)
-                    .ok_or_else(|| format!("SOP '{sop_name}' is no longer loaded"))
+                    .ok_or_else(|| {
+                        crate::i18n::get_required_cli_string("sop-rpc-definition-unavailable")
+                    })
                     .and_then(authorize);
                 if let Err(reason) = authorization {
                     results.push(DispatchResult::Skipped {

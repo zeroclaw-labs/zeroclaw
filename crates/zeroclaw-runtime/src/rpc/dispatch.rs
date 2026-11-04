@@ -20296,6 +20296,7 @@ mod tests {
                 "tools",
                 "agents",
                 "definition",
+                "removed",
                 "identity",
                 "expiry",
                 "control",
@@ -20387,6 +20388,7 @@ mod tests {
                             sop.agent = Some("beta".into());
                             engine.lock().unwrap().set_sops_for_test(vec![sop]);
                         }
+                        "removed" => engine.lock().unwrap().set_sops_for_test(vec![]),
                         // Removing the roster identity revokes the credential's
                         // live resolution, independently of the tool selector.
                         "identity" => {
@@ -20406,7 +20408,24 @@ mod tests {
                     model.release.notify_one();
                 };
                 let (response, ()) = tokio::join!(request, mutate);
-                if matches!(change, "control" | "definition") {
+                if change == "removed" {
+                    // A procedure unloaded during the decision wait is refused
+                    // in the caller's language, and nothing starts.
+                    assert_eq!(
+                        response["error"]["code"],
+                        json!(INVALID_PARAMS),
+                        "dedup={deduplicated}: {response}"
+                    );
+                    assert_eq!(
+                        response["error"]["message"],
+                        json!(crate::i18n::get_required_cli_string(
+                            "sop-rpc-definition-unavailable"
+                        )),
+                        "dedup={deduplicated}: {response}"
+                    );
+                    assert!(engine.lock().unwrap().active_runs().is_empty());
+                    assert_eq!(store.claim_counts("alpha-sop").unwrap(), (0, 0));
+                } else if matches!(change, "control" | "definition") {
                     assert!(response.get("error").is_none(), "{response}");
                     assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
                 } else {
