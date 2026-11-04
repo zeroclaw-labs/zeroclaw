@@ -31,6 +31,11 @@ export default function Layout() {
   const { pathname } = useLocation();
   const { open: paletteOpen, openPalette, closePalette } = useCommandPalette();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // Chat owns its own scroll container (the message list). Letting the page
+  // shell scroll too would move the composer and header with the transcript.
+  // Exclude /agent/:alias/workspace — that route has its own page-level scroll
+  // and is not a chat view.
+  const isChat = pathname.startsWith('/agent/') && !pathname.includes('/workspace');
 
   // Close the mobile drawer on route change.
   useEffect(() => {
@@ -54,13 +59,13 @@ export default function Layout() {
   }, [pathname]);
 
   return (
-    <div className="min-h-screen bg-pc-base text-pc-text">
+    <div className="h-[100dvh] overflow-hidden bg-pc-base text-pc-text">
       {/* Fixed slim icon rail (desktop) + drawer (mobile). */}
       <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
       {/* Main area — offset by the fixed 56px rail on desktop, full-width on
           mobile. The rail is always slim, so the offset is constant. */}
-      <div className="flex flex-col flex-1 min-w-0 h-screen md:ml-14 ml-0">
+      <div className="flex flex-col flex-1 min-w-0 h-full md:ml-14 ml-0">
         <Header
           onMenuToggle={() => setSidebarOpen((v) => !v)}
           onOpenPalette={openPalette}
@@ -74,7 +79,7 @@ export default function Layout() {
             changes within a page (e.g. /config/providers → /config/browser).
             Keying on the full pathname remounted the entire route tree
             on every section click and reset scroll/state. */}
-        <main className="flex-1 overflow-y-auto min-h-0">
+        <main className={`flex-1 min-h-0 ${isChat ? 'overflow-hidden' : 'overflow-y-auto'}`}>
           <ErrorBoundary key={pathname.split('/')[1] ?? ''}>
             <Outlet />
           </ErrorBoundary>
