@@ -29,8 +29,11 @@ restart preserves the stored owner and attachments.
 
 RPC operations also recheck the caller's current authority after waiting for
 session or storage access. Losing permission while queued cannot authorize
-attachment-owner creation, cancellation, or deletion. Deleting Chat aliases
+attachment-owner creation, cancellation, or deletion. Deleting SQLite Chat aliases
 still uses one storage transaction, including their prompt attachments.
+Ordinary JSONL sessions, which cannot enable this feature, retain sequential
+alias cleanup under the storage and authority guards; an I/O failure can leave
+that non-transactional cleanup partially completed.
 An attachment-load failure before execution preparation leaves the session
 idle and reports a failed turn to the client.
 

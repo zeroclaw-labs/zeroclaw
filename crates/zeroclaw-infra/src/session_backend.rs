@@ -423,10 +423,12 @@ pub trait SessionBackend: Send + Sync {
         Ok(deleted)
     }
 
-    /// Delete a complete alias set atomically, checking every existing owner's
-    /// equality and current authority under the storage serialization boundary.
-    /// Retain the returned guard through commit; never emulate this with a
-    /// sequence of single-key commits. Unsupported stores fail closed.
+    /// Delete a complete alias set, checking every existing owner's equality
+    /// and current authority under the storage serialization boundary.
+    /// Transactional stores retain the returned guard through one atomic
+    /// commit, never a sequence of single-key commits. Non-transactional stores
+    /// retain it through their established sequential cleanup, which may fail
+    /// after partial deletion. Unsupported stores fail closed.
     fn delete_session_key_set_authorized(
         &self,
         _session_keys: &[&str],

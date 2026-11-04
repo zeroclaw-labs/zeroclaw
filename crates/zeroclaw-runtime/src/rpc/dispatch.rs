@@ -32972,6 +32972,34 @@ mod tests {
         }
     }
 
+    // Prompt support remains SQLite-only; the guarded RPC integration must
+    // preserve ordinary deletion for a JSONL-backed Chat with prompts disabled.
+    #[tokio::test]
+    async fn rpc_delete_jsonl_session_preserves_ordinary_alias_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        assert!(!config.channels.session_prompts_enabled);
+        let data_dir = config.data_dir.clone();
+        let (mut fixture, _, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+        let backend = Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(&tmp.path().join("jsonl")).unwrap(),
+        );
+        for key in ["plain", "rpc_plain", "gw_plain"] {
+            backend
+                .append(key, &ChatMessage::user("saved history"))
+                .unwrap();
+        }
+        Arc::get_mut(&mut fixture.ctx).unwrap().session_backend = Some(backend.clone());
+        let result = fixture
+            .handle_session_delete(&json!({"session_id": "plain"}))
+            .await
+            .unwrap();
+        assert_eq!(result["deleted"], true);
+        for key in ["plain", "rpc_plain", "gw_plain"] {
+            assert!(backend.try_load(key).unwrap().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn rpc_delete_scoped_session_succeeds_without_a_gateway_alias() {
         let tmp = tempfile::TempDir::new().unwrap();
