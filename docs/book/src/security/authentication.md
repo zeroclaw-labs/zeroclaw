@@ -492,6 +492,26 @@ provider registry and resolver:
   always has. Any other method outside GET, HEAD, POST, PUT, PATCH and
   DELETE is refused.
 
+Verifying an OIDC bearer is work an unauthenticated caller makes the
+gateway do, and with `validation = "introspection"` each verification
+is one authenticated round trip to the identity provider under the
+daemon's own client credentials. Two limits bound it. A refused
+credential counts against a per-client ledger with the same thresholds
+as a bad pairing token (10 in a minute, then a 5-minute lockout, with
+loopback exempt), kept on its own ledger, so a client replaying a token
+past its expiry never locks its operator out of pairing, and a pairing
+lockout never blocks a bearer. A transport failure on the gateway's own
+leg to the identity provider, and a verified identity the policy grants
+nothing, say nothing about the caller and are not billed to it. At most
+16 bearer verifications are in flight at once across all clients,
+loopback included, which bounds what the gateway will do to the
+identity provider on everyone's behalf; the slot is held for the
+verification alone, never across the request it admits. A locked-out
+client gets HTTP 429 and a verification refused for capacity gets HTTP
+503, each with a `Retry-After` naming the delay in seconds. Dashboard
+sessions are verified by their own layer and never compete for these
+limits.
+
 A scoped principal's `Config` grants are enforced in two steps. The
 route layer applies a coarse floor per HTTP method: a read needs
 `read`, anything else needs at least one of `create`, `update` or

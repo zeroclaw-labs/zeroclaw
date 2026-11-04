@@ -1973,6 +1973,9 @@ mod tests {
         router: Router,
         auth: Arc<DashboardAuth>,
         state: AppState,
+        /// The config route group's bearer limits, held so a test can fill
+        /// the outbound cap and show a session is never behind it.
+        route_limits: Arc<crate::principal_gate::BearerVerificationLimits>,
     }
 
     /// The sign-in routes, the config route group and an operator route,
@@ -2037,8 +2040,11 @@ mod tests {
         };
         let auth =
             Arc::new(DashboardAuth::new(sessions, Arc::clone(&inbound)).for_generation(&state));
+        let route_auth =
+            crate::principal_gate::ConfigRouteAuth::new(&inbound, state.trust_forwarded_headers);
+        let route_limits = Arc::clone(&route_auth.limits);
         let router = Router::new()
-            .merge(crate::config_admin_router(&inbound))
+            .merge(crate::config_admin_router(route_auth))
             .merge(crate::api_oidc::routes())
             .route(
                 "/api/operator-probe",
@@ -2059,6 +2065,7 @@ mod tests {
             router,
             auth,
             state,
+            route_limits,
         }
     }
 
@@ -2409,6 +2416,48 @@ mod tests {
         let (status, body) = probe(&fixture, &[("cookie", &cookie)]).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["reason"], "session_invalid");
+    }
+
+    #[tokio::test]
+    async fn a_session_is_never_behind_the_bearer_verification_cap() {
+        let server = idp(&["ops"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let signed_in = sign_in(&fixture, &server).await;
+        let cookie = signed_in.cookie_header();
+
+        // Every bearer-verification slot taken, as under a flood of junk
+        // bearers: a bearer is refused for capacity, while the session,
+        // classified by its own layer, reaches the config group untouched.
+        let _held = fixture
+            .route_limits
+            .outbound
+            .try_acquire_many(crate::principal_gate::OUTBOUND_BEARER_CAP as u32)
+            .expect("all permits free");
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                "/api/quickstart/state",
+                loopback(),
+                &[
+                    ("authorization", "Bearer opaque-token"),
+                    (crate::principal_gate::AUTH_PROVIDER_HEADER, "oidc.corp"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                "/api/quickstart/state",
+                loopback(),
+                &[("cookie", &cookie), ("sec-fetch-site", "same-origin")],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

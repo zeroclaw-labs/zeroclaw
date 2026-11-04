@@ -852,7 +852,7 @@ impl GatewaySupervision {
 /// never per handler: every route whose handler lives in `api_config`,
 /// `api_quickstart`, or `api_sections` MUST be registered on THIS router,
 /// whatever its URL prefix.
-fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -> Router<AppState> {
+fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<AppState> {
     Router::new()
         .route(
             "/api/config",
@@ -938,7 +938,7 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
             post(api_config::handle_api_channel_bind),
         )
         .route_layer(axum::middleware::from_fn_with_state(
-            Arc::clone(inbound_auth),
+            route_auth,
             principal_gate::config_route_auth,
         ))
 }
@@ -2454,7 +2454,10 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Build router with middleware
     let inner = Router::new()
-        .merge(config_admin_router(&inbound_auth))
+        .merge(config_admin_router(principal_gate::ConfigRouteAuth::new(
+            &inbound_auth,
+            state.trust_forwarded_headers,
+        )))
         .merge(api_oidc::routes())
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
