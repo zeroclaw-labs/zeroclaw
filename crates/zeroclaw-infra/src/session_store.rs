@@ -666,6 +666,24 @@ pub(crate) fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<Muta
     Ok(lock)
 }
 
+/// Run `effect` while holding the mutation lock that every [`SessionStore`]
+/// on `sessions_dir` takes for appends, claims and ownership writes.
+///
+/// Session-file maintenance that runs outside a store, such as the memory
+/// hygiene archive pass, uses it so that its retention check and its renames
+/// see the same files, and so that no claim or read sees a transcript
+/// without its ownership sidecar. Like the store's own lock it is
+/// in-process. It is taken even after the directory has migrated to SQLite,
+/// because migrated transcripts are still archived.
+pub fn with_session_directory_lock<R>(
+    sessions_dir: &Path,
+    effect: impl FnOnce() -> R,
+) -> std::io::Result<R> {
+    let lock = mutation_lock_for(sessions_dir)?;
+    let _guard = lock.lock();
+    Ok(effect())
+}
+
 pub(crate) fn mark_session_directory_migrated(
     sessions_dir: &Path,
     state: &mut MutationState,
