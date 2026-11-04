@@ -10,14 +10,25 @@
 # the operator-facing plugin config surface that zeroclaw-plugins compiles
 # against, so a change there can break this job while nothing under
 # crates/zeroclaw-plugins moves.
-# The root-package channel activation and channel egress e2e targets are listed
-# individually because they are the pieces of this job's coverage that live
-# outside a crate directory: they drive zeroclaw-runtime, which zeroclaw-plugins
-# cannot depend on without inverting the crate graph, so they have to be root
+# The root-package channel e2e targets are listed individually because they are
+# the pieces of this job's coverage that live outside a crate directory: they
+# drive zeroclaw-runtime, which zeroclaw-plugins cannot depend on without
+# inverting the crate graph, so they have to be root
 # `zeroclaw` test targets. The root binary's plugin modules are listed for the
 # same reason: `mod plugins` and the plugin registry only compile under
 # `plugins-wasm`, so the default-feature Test job cannot run their tests and
-# this job is where they run. `src/main.rs` holds the plugin CLI itself.
+# this job is where they run. `src/main.rs` holds the plugin CLI itself, and
+# the plugin CLI component tests that drive it run only in this job too.
+# The gateway's `/plugin/{path}` ingress is listed for the same reason: its
+# handler and HTTP tests compile only under the gateway's `plugins-wasm`
+# feature, so this job is the only required one that runs them and the plugin
+# webhook golden frames that pin its public HTTP contract. The paths are the
+# handler and its tests, the router that mounts it, the manifest that defines
+# the feature, the golden harness and fixtures, the shared webhook types in
+# zeroclaw-api, and the plugin webhook ingress in zeroclaw-infra. Other gateway
+# paths stay out: the default-feature Test job covers them.
+# The plugin artifact smoke harness is listed as well: this job is the only
+# place its scripts run before a release, so a change to them has to run it.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
 # printed value to GITHUB_OUTPUT.
 
@@ -30,13 +41,24 @@ while IFS= read -r path; do
         crates/zeroclaw-plugins/*|\
         crates/zeroclaw-runtime/*|\
         crates/zeroclaw-config/*|\
+        tests/channel_websocket_e2e.rs|\
         tests/plugin_channel_runtime_e2e.rs|\
         tests/channel_egress_e2e.rs|\
-        src/plugins/*|src/plugin_registry.rs|src/main.rs|\
+        tests/component/plugin_info_cli.rs|tests/component/plugin_update_cli.rs|\
+        crates/zeroclaw-gateway/src/plugin_webhook*|\
+        crates/zeroclaw-gateway/src/lib.rs|\
+        crates/zeroclaw-gateway/Cargo.toml|\
+        crates/zeroclaw-gateway/tests/golden*|\
+        crates/zeroclaw-api/src/webhook.rs|\
+        crates/zeroclaw-infra/src/plugin_webhook*|\
+        src/plugins/*|src/plugin_registry.rs|src/quickstart_plugins/*|src/main.rs|\
         wit/*|\
         Cargo.toml|Cargo.lock|\
         .github/workflows/ci.yml|\
-        scripts/ci/plugin_backend_change_filter*.sh)
+        scripts/ci/plugin_backend_change_filter*.sh|\
+        scripts/ci/plugin_artifact_smoke*.sh|\
+        scripts/ci/plugin_smoke_provider*.py|\
+        scripts/ci/build_plugin_smoke_packages.sh)
             run=true
             ;;
     esac

@@ -211,16 +211,12 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let host_shell = root.join("host-only-shell");
         let docker = root.join("docker-recorder");
-        for (path, script) in [
-            (&host_shell, "#!/bin/sh\nexit 99\n"),
-            (
-                &docker,
-                "#!/bin/sh\nprintf '%s\\n' DOCKER_RECORDER \"$@\"\n",
-            ),
-        ] {
-            std::fs::write(path, script).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        std::fs::write(&host_shell, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&host_shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Only the recorder is executed; keep its bytes outside runtime writes.
+        let recorder =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/docker-recorder.sh");
+        symlink(recorder, &docker).unwrap();
         symlink(&host_shell, root.join("sh")).unwrap();
         symlink(&host_shell, root.join("MixedCaseShell")).unwrap();
         let path = std::env::join_paths([root.clone()]).unwrap();
@@ -421,12 +417,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn docker_wrap_uses_the_resolved_launcher_identity() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let launcher = dir.path().join("docker");
-        std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let success = which::which("true").unwrap();
+        std::os::unix::fs::symlink(success, &launcher).unwrap();
         let launcher = launcher.canonicalize().unwrap();
         let sandbox = DockerSandbox {
             launcher: Some(launcher.clone()),

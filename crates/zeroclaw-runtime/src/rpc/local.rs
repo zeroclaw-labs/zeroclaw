@@ -1,7 +1,7 @@
 //! Local IPC transport for the RPC layer.
 
 use super::context::RpcContext;
-use super::dispatch::RpcDispatcher;
+use super::dispatch::{LocalRpcSessionChannelFactory, RpcAccessPolicy, RpcDispatcher};
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -171,6 +171,144 @@ pub fn socket_path(config: &Config) -> PathBuf {
     platform::default_endpoint(&config.data_dir)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum LocalRpcCallError {
+    #[error("local daemon is unavailable at {path}: {source}")]
+    Unavailable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("local daemon protocol failed: {0}")]
+    Protocol(String),
+    #[error("local daemon rejected the request ({code}): {message}")]
+    Remote { code: i64, message: String },
+}
+
+#[cfg(unix)]
+async fn connect_client(path: &std::path::Path) -> std::io::Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(path).await
+}
+
+#[cfg(windows)]
+async fn connect_client(
+    path: &std::path::Path,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let name = path.to_string_lossy();
+    for _ in 0..50 {
+        match ClientOptions::new().open(name.as_ref()) {
+            Ok(client) => return Ok(client),
+            Err(error) if error.raw_os_error() == Some(231) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::TimedOut,
+        format!("named pipe {name} remained busy"),
+    ))
+}
+
+async fn request_response<S>(
+    stream: &mut BufReader<S>,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<serde_json::Value, LocalRpcCallError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    let mut encoded = serde_json::to_vec(&request)
+        .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+    encoded.push(b'\n');
+    stream
+        .get_mut()
+        .write_all(&encoded)
+        .await
+        .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+
+    loop {
+        let mut line = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read_line(&mut line))
+            .await
+            .map_err(|_| LocalRpcCallError::Protocol(format!("{method} response timed out")))?
+            .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+        if read == 0 {
+            return Err(LocalRpcCallError::Protocol(format!(
+                "daemon closed the connection during {method}"
+            )));
+        }
+        let frame: serde_json::Value = serde_json::from_str(line.trim())
+            .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+        if frame.get("id") != Some(&serde_json::Value::String(id.to_string())) {
+            continue;
+        }
+        if let Some(error) = frame.get("error") {
+            return Err(LocalRpcCallError::Remote {
+                code: error
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1),
+                message: error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown RPC error")
+                    .to_string(),
+            });
+        }
+        return frame.get("result").cloned().ok_or_else(|| {
+            LocalRpcCallError::Protocol(format!("{method} response omitted result"))
+        });
+    }
+}
+
+/// Call one administrative method on the daemon owning `config`.
+pub async fn call_local(
+    config: &Config,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<serde_json::Value, LocalRpcCallError> {
+    let path = socket_path(config);
+    let stream = connect_client(&path)
+        .await
+        .map_err(|source| LocalRpcCallError::Unavailable {
+            path: path.clone(),
+            source,
+        })?;
+    let mut stream = BufReader::new(stream);
+    let initialize = request_response(
+        &mut stream,
+        "cli-initialize",
+        "initialize",
+        serde_json::json!({
+            "protocol_version": super::dispatch::RPC_PROTOCOL_VERSION,
+            "clientCapabilities": {},
+        }),
+    )
+    .await?;
+    let server_version = initialize
+        .get("server_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LocalRpcCallError::Protocol("initialize response omitted server_version".to_string())
+        })?;
+    if server_version != env!("CARGO_PKG_VERSION") {
+        return Err(LocalRpcCallError::Protocol(format!(
+            "daemon version {server_version} does not match CLI {}",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    request_response(&mut stream, "cli-request", method, params).await
+}
+
 // ── Transport ────────────────────────────────────────────────────
 
 /// Platform-neutral half-read type produced by `tokio::io::split`.
@@ -204,8 +342,10 @@ enum WriteOutcome {
 }
 
 /// Write one frame under the per-frame deadline. A peer that does not drain
-/// the frame in time is disconnected by cancelling the connection token, which
-/// also ends the dispatcher reading from it.
+/// the frame in time, or whose stream fails the write, is disconnected by
+/// cancelling the connection token, which also ends the dispatcher reading
+/// from it. The dispatcher ignores failed sends, so without the cancel a
+/// peer that can still send would keep a connection whose answers are lost.
 async fn write_frame<W>(
     writer: &mut W,
     line: &str,
@@ -223,7 +363,20 @@ where
     };
     match result {
         Ok(Ok(())) => WriteOutcome::Written,
-        Ok(Err(_)) => WriteOutcome::Stopped,
+        Ok(Err(error)) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "peer": peer_label,
+                        "error_kind": format!("{:?}", error.kind()),
+                    })),
+                "local RPC write failed; closing its connection"
+            );
+            cancel.cancel();
+            WriteOutcome::Stopped
+        }
         Err(_) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -300,7 +453,8 @@ impl LocalTransport {
         // Session approval channels and log forwarders retain writer senders
         // past disconnect, so channel closure alone cannot end this task.
         // Cancellation interrupts both queue waits and an in-flight write;
-        // each write and the final shutdown are bounded for suspended peers.
+        // each write and the final shutdown are bounded for suspended peers,
+        // and a stalled or failed write cancels the connection.
         let writer_peer_label = peer_label.clone();
         zeroclaw_spawn::spawn!(run_writer(
             write_half,
@@ -445,8 +599,26 @@ pub async fn run_local_listener(
     client_count: Arc<AtomicUsize>,
     readiness: Option<crate::daemon::SocketReadinessReporter>,
 ) -> Result<()> {
+    run_local_listener_with_factory(ctx, cancel, client_count, readiness, None).await
+}
+
+pub async fn run_local_listener_with_factory(
+    ctx: Arc<RpcContext>,
+    cancel: CancellationToken,
+    client_count: Arc<AtomicUsize>,
+    readiness: Option<crate::daemon::SocketReadinessReporter>,
+    channel_factory: Option<LocalRpcSessionChannelFactory>,
+) -> Result<()> {
     let limits = LocalListenerLimits::from_config(&ctx.config.read());
-    run_local_listener_with_limits(ctx, cancel, client_count, readiness, limits).await
+    run_local_listener_with_factory_and_limits(
+        ctx,
+        cancel,
+        client_count,
+        readiness,
+        channel_factory,
+        limits,
+    )
+    .await
 }
 
 /// [`run_local_listener`] with explicit limits.
@@ -455,6 +627,18 @@ pub async fn run_local_listener_with_limits(
     cancel: CancellationToken,
     client_count: Arc<AtomicUsize>,
     readiness: Option<crate::daemon::SocketReadinessReporter>,
+    limits: LocalListenerLimits,
+) -> Result<()> {
+    run_local_listener_with_factory_and_limits(ctx, cancel, client_count, readiness, None, limits)
+        .await
+}
+
+async fn run_local_listener_with_factory_and_limits(
+    ctx: Arc<RpcContext>,
+    cancel: CancellationToken,
+    client_count: Arc<AtomicUsize>,
+    readiness: Option<crate::daemon::SocketReadinessReporter>,
+    channel_factory: Option<LocalRpcSessionChannelFactory>,
     limits: LocalListenerLimits,
 ) -> Result<()> {
     let path = {
@@ -485,8 +669,9 @@ pub async fn run_local_listener_with_limits(
         "RPC local IPC listening"
     );
 
+    let connections_cancel = cancel.child_token();
     let mut connection_tasks = tokio::task::JoinSet::new();
-
+    let mut listener_result: Result<()> = Ok(());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -497,7 +682,16 @@ pub async fn run_local_listener_with_limits(
                 );
                 break;
             }
-            Some(_) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {}
+            completed = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("RPC local IPC connection task failed: {error}")
+                    );
+                }
+            }
             accept = platform::accept(&mut listener, &path) => {
                 let stream = match accept {
                     Ok(v) => v,
@@ -516,7 +710,8 @@ pub async fn run_local_listener_with_limits(
                             tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
                             continue;
                         }
-                        return Err(e).context("local IPC accept error");
+                        listener_result = Err(e).context("local IPC accept error");
+                        break;
                     }
                 };
 
@@ -559,7 +754,8 @@ pub async fn run_local_listener_with_limits(
                 refusing = false;
 
                 let ctx = ctx.clone();
-                let conn_cancel = cancel.child_token();
+                let conn_cancel = connections_cancel.child_token();
+                let channel_factory = channel_factory.clone();
 
                 // Counted here rather than inside the task so an accepted
                 // connection is visible to the daemon immediately.
@@ -575,11 +771,13 @@ pub async fn run_local_listener_with_limits(
                         LocalTransport::new(stream, conn_cancel.clone(), write_timeout, frame_read_timeout);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+                    let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
                         ctx.clone(),
                         writer_tx,
                         peer,
                         conn_cancel.clone(),
+                        RpcAccessPolicy::TrustedLocal,
+                        channel_factory,
                     )
                     .with_connection_activity(activity)
                     .with_initialize_deadline(initialize_deadline)
@@ -625,6 +823,7 @@ pub async fn run_local_listener_with_limits(
         }
     }
 
+    connections_cancel.cancel();
     // Drain accepted connection tasks. Each connection cancels its prompts
     // and drains them in `dispatcher.shutdown().await`. In-flight prompts have
     // up to CANCEL_GRACE (5 seconds) to unwind cooperatively. If a connection
@@ -640,7 +839,7 @@ pub async fn run_local_listener_with_limits(
         }
     }
 
-    Ok(())
+    listener_result
 }
 
 // ── Platform shims ───────────────────────────────────────────────
@@ -1133,6 +1332,72 @@ mod tests {
         Arc::new(AtomicUsize::new(0))
     }
 
+    #[cfg(unix)]
+    struct BlockingModelProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for BlockingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[cfg(unix)]
+    impl zeroclaw_api::attribution::Attributable for BlockingModelProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "blocking-local-test"
+        }
+    }
+
+    #[cfg(unix)]
+    async fn insert_blocking_session(
+        ctx: &Arc<RpcContext>,
+        session_id: &str,
+        started: Arc<tokio::sync::Notify>,
+    ) {
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(BlockingModelProvider { started }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("blocking local test agent should build");
+        ctx.sessions
+            .insert(
+                session_id.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    std::env::temp_dir().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .expect("blocking local test session should insert");
+    }
+
     fn rpc_request<T: serde::Serialize>(method: Method, params: &T, id: u64) -> String {
         let req = JsonRpcRequest::new(
             method.wire_name(),
@@ -1303,6 +1568,57 @@ mod tests {
         cancel.cancel();
         drop(writer);
         let _ = handle.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_local_initializes_and_executes_one_admin_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        // Seed the agent as a publication — the read-only handle the
+        // context exposes has no raw write path.
+        let mut seeded = ctx.config.snapshot();
+        seeded.create_map_key("agents", "local_client").unwrap();
+        ctx.config_authority.publish_for_test(seeded);
+        let config = ctx.config.read().clone();
+        let sock_path = socket_path(&config);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
+        });
+        wait_for_socket(&sock_path).await;
+
+        let value = call_local(&config, "agents/list", serde_json::json!({}))
+            .await
+            .expect("local administrative call");
+        let result: crate::rpc::types::AgentsListResult =
+            serde_json::from_value(value).expect("agents/list wire shape");
+        assert!(
+            result
+                .agents
+                .iter()
+                .any(|agent| agent.alias == "local_client")
+        );
+
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_local_classifies_absent_endpoint_as_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let error = call_local(&config, "agents/list", serde_json::json!({}))
+            .await
+            .expect_err("absent endpoint must not look like a protocol failure");
+        assert!(matches!(error, LocalRpcCallError::Unavailable { .. }));
     }
 
     #[cfg(unix)]
@@ -1891,7 +2207,6 @@ mod tests {
         zeroclaw_spawn::spawn!(async move {
             let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
         });
-
         wait_for_socket(&sock_path).await;
 
         let (mut reader, mut writer) = do_initialize(&sock_path).await;
@@ -2656,6 +2971,128 @@ mod tests {
         drop(writer_tx);
     }
 
+    /// A stream whose every write fails, as a write to a peer that can no
+    /// longer receive does.
+    struct BrokenPipeWriter;
+
+    impl AsyncWrite for BrokenPipeWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_error_cancels_the_connection() {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(4);
+        let (_terminal_tx, terminal_rx) = mpsc::channel::<TerminalFrame>(1);
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.clone();
+        let writer_task = zeroclaw_spawn::spawn!(run_writer(
+            BrokenPipeWriter,
+            writer_rx,
+            terminal_rx,
+            writer_cancel,
+            // The write deadline is far longer than the test, so only the
+            // write error can end the connection here.
+            WriterTimeouts {
+                write: Duration::from_secs(600),
+                shutdown: Duration::from_millis(50),
+            },
+            "test".to_string(),
+        ));
+
+        writer_tx.send("frame".to_string()).await.unwrap();
+
+        // The dispatcher ignores failed sends, so without this the connection
+        // would keep reading and running requests it can no longer answer.
+        tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("a failed write cancels the connection");
+        tokio::time::timeout(Duration::from_secs(1), writer_task)
+            .await
+            .expect("the writer ends after a failed write")
+            .expect("writer task must not panic");
+        drop(writer_tx);
+    }
+
+    /// Linux fails a write to a Unix socket whose peer shut down its read
+    /// side (`EPIPE`). macOS accepts and buffers such writes, so there the
+    /// half-close is not detected from a successful write: the connection is
+    /// retired only if later writes fill the buffer and stall past the write
+    /// deadline, as in `stalled_reader_is_dropped_while_other_connections_proceed`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn half_closed_peer_retires_its_connection_after_a_write_error() {
+        use std::os::fd::AsRawFd;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server_count = count.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener_with_limits(
+                server_ctx,
+                server_cancel,
+                server_count,
+                None,
+                LocalListenerLimits {
+                    max_connections: 8,
+                    // Longer than the wait below, so the write deadline
+                    // cannot be what closes the connection.
+                    write_timeout: Duration::from_secs(30),
+                    initialize_timeout: LOCAL_INITIALIZE_TIMEOUT,
+                    frame_read_timeout: LOCAL_FRAME_READ_TIMEOUT,
+                },
+            )
+            .await;
+        });
+        wait_for_socket(&sock_path).await;
+
+        let (reader, mut writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+
+        // Stop receiving but keep the sending side open.
+        let fd = reader.get_ref().as_ref().as_raw_fd();
+        // SAFETY: `fd` is the open socket owned by `reader`, which outlives
+        // this call; `shutdown` does not close or invalidate it.
+        let rc = unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+        assert_eq!(rc, 0, "shutdown(SHUT_RD) failed");
+
+        // The daemon's answer to this request is the write that fails.
+        writer
+            .write_all(rpc_request(Method::Status, &serde_json::json!({}), 2).as_bytes())
+            .await
+            .unwrap();
+
+        wait_for_client_count(&count, 0).await;
+
+        drop(writer);
+        drop(reader);
+        cancel.cancel();
+    }
+
     #[tokio::test]
     async fn terminal_frame_is_written_ahead_of_queued_frames_then_the_stream_ends() {
         let (server, mut peer) = tokio::io::duplex(64 * 1024);
@@ -3287,6 +3724,72 @@ mod tests {
         drop(first);
         cancel.cancel();
         let _ = server.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_closes_connection_and_joins_inflight_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let session_id = "inflight-local-prompt";
+        insert_blocking_session(&ctx, session_id, Arc::clone(&started)).await;
+
+        let server_cancel = cancel.clone();
+        let server_ctx = Arc::clone(&ctx);
+        let server_count = Arc::clone(&count);
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, server_count, None).await
+        });
+        wait_for_socket(&sock_path).await;
+
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({
+                        "session_id": session_id,
+                        "prompt": "remain in flight until the connection closes",
+                    }),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("local prompt should reach the blocking provider");
+        assert!(ctx.sessions.has_inflight_turn(session_id));
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("listener should drain the in-flight prompt before returning")
+            .expect("listener task should not panic")
+            .expect("listener should stop cleanly");
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(!ctx.sessions.has_inflight_turn(session_id));
+        assert!(ctx.sessions.get_agent(session_id).await.is_some());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.expect("client read") == 0 {
+                    break;
+                }
+                serde_json::from_str::<serde_json::Value>(line.trim())
+                    .expect("shutdown may emit only complete final RPC frames");
+            }
+        })
+        .await
+        .expect("cancelled client should observe EOF");
     }
 
     #[cfg(windows)]

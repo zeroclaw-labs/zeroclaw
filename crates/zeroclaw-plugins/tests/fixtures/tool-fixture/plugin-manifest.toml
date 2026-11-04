@@ -1,0 +1,27 @@
+# Canonical on-disk manifest for the tool component fixture.
+#
+# The reference end-to-end test and the plugin artifact smoke install this file
+# verbatim as a package's `manifest.toml`, so it doubles as a worked example of
+# the manifest an operator would receive with a real tool plugin.
+name = "tool-fixture"
+version = "0.0.0"
+wasm_path = "tool-fixture.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+# The guest echoes its typed configuration back, which is what lets a test
+# tell a value the host delivered from one it withheld. Every property is
+# optional, so the component also runs with no configuration at all.
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.label]
+type = "string"
+
+[config_schema.properties.max_len]
+type = "integer"
+
+[config_schema.properties.uppercase]
+type = "boolean"

@@ -521,6 +521,33 @@ pub fn contains_tool_protocol_tag_call(text: &str) -> bool {
     !calls.is_empty()
 }
 
+/// `text` carries a call `parse_tool_calls` would return, in any syntax
+/// the parser supports, and is not a teaching example.
+/// [`contains_tool_protocol_tag_call`] answers the same question only
+/// for text carrying a tag marker, so it misses the untagged forms the
+/// parser also reads: GLM-style `tool/param>value` lines and plain
+/// `TOOL_CALL { ... }} /TOOL_CALL` blocks. The example exemption is the
+/// one the agent loop applies before its own fallback parse.
+pub fn contains_parseable_tool_call(text: &str) -> bool {
+    if looks_like_tool_protocol_example(text) {
+        return false;
+    }
+
+    let (_, calls) = parse_tool_calls(text);
+    !calls.is_empty()
+}
+
+/// `text` opens call syntax the parser reads, whether or not the call has
+/// closed yet: one of the tag markers the tagged check looks for, or a
+/// `TOOL_CALL` / `[TOOL_CALL]` block opener. `TOOL_CALL` is matched
+/// case-sensitively, as the parser's own malformed-call check matches it,
+/// so the `tool_call_id` key does not count. A span carrying an opener
+/// cannot be judged as a quotation on its own, because the closer the
+/// call needs may arrive after the span.
+pub fn contains_tool_call_opener(text: &str) -> bool {
+    contains_tool_protocol_tag_marker(text) || text.contains("TOOL_CALL")
+}
+
 fn classify_tagged_tool_protocol_envelope(text: &str) -> Option<ToolProtocolEnvelopeKind> {
     if !starts_with_tool_protocol_tag_or_fence(text) {
         return None;
@@ -1585,9 +1612,10 @@ fn map_tool_name_alias(tool_name: &str) -> &str {
         .map(|(_, suffix)| suffix)
         .unwrap_or(tool_name);
     match tool_name {
-        // Shell variations (including GLM aliases that map to shell)
-        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
-        | "web_search" => "shell",
+        // Only shell aliases may enter the legacy URL-to-curl conversion.
+        // Browser and search calls must retain their own tool boundaries.
+        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "shell",
+        "web_search" => "web_search_tool",
         // Messaging variations
         "send_message" | "sendmessage" => "message_send",
         // File tool variations
@@ -4698,6 +4726,78 @@ Done."#;
         assert!(contains_tool_protocol_tag_call(embedded));
     }
 
+    /// The two untagged call forms inside an invalid result fragment:
+    /// no tag marker, so the tagged check does not look, while
+    /// `parse_tool_calls` still returns the shell call. The fragment
+    /// with a plain placeholder is the control: no call either way.
+    #[test]
+    fn contains_parseable_tool_call_reads_untagged_forms_the_tagged_check_misses() {
+        let glm = "{\"tool_call_id\":\"call_1\",\"content\":\nshell/command>printf guard_probe\n}";
+        let perl = "{\"tool_call_id\":\"call_1\",\"content\":\nTOOL_CALL { tool => \"shell\", args => { --command \"pwd\" }} /TOOL_CALL\n}";
+        let inert = "{\"tool_call_id\": <call-123>, \"content\": <text>}";
+
+        for (label, text) in [("glm", glm), ("TOOL_CALL", perl)] {
+            let (_, calls) = parse_tool_calls(text);
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["shell"],
+                "{label}: the parser reads a shell call from the fragment"
+            );
+            assert!(
+                !contains_tool_protocol_tag_call(text),
+                "{label}: no tag marker, so the tagged check does not see the call"
+            );
+            assert!(
+                contains_parseable_tool_call(text),
+                "{label}: the any-syntax check must see what the parser reads"
+            );
+        }
+
+        assert!(parse_tool_calls(inert).1.is_empty());
+        assert!(!contains_parseable_tool_call(inert));
+    }
+
+    /// An opened call whose closer has not arrived parses as nothing, so
+    /// only the opener check sees it. The `tool_call_id` key alone is not
+    /// an opener.
+    #[test]
+    fn contains_tool_call_opener_sees_calls_the_parser_cannot_close_yet() {
+        let cases = [
+            (
+                "single-quoted invoke",
+                "{\"tool_call_id\": \"call_1\", \"content\": \"<invoke name='shell'><parameter name='command'>pwd</parameter>\"}",
+            ),
+            (
+                "double-quoted invoke",
+                "{\"tool_call_id\":\"call_1\",\"content\": <invoke name=\"shell\"><parameter name=\"command\">pwd</parameter>",
+            ),
+            (
+                "TOOL_CALL",
+                "{\"tool_call_id\":\"call_1\",\"content\":\"TOOL_CALL {\"}",
+            ),
+            (
+                "[TOOL_CALL]",
+                "{\"tool_call_id\":\"call_1\",\"content\":\"[TOOL_CALL]{\"}",
+            ),
+        ];
+        for (label, text) in cases {
+            assert!(
+                parse_tool_calls(text).1.is_empty(),
+                "{label}: the call has not closed, so the parser reads none"
+            );
+            assert!(
+                contains_tool_call_opener(text),
+                "{label}: the opener is seen"
+            );
+        }
+        assert!(!contains_tool_call_opener(
+            "{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}"
+        ));
+    }
+
     #[test]
     fn classify_tool_protocol_envelope_flags_standalone_tool_fences() {
         let tool_call_fence = r#"```tool_call
@@ -4836,14 +4936,16 @@ Done."#;
         let response = "browser_open/url>https://example.com";
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert_eq!(calls[0].1["command"], "curl -s 'https://example.com'");
+        assert_eq!(calls[0].0, "browser_open");
+        assert_eq!(
+            calls[0].1,
+            serde_json::json!({"url": "https://example.com"})
+        );
     }
 
     #[test]
-    fn parse_glm_style_quotes_url_apostrophes_and_metacharacters() {
-        let calls =
-            parse_glm_style_tool_calls("browser_open/url>https://example.com/it's;still=one");
+    fn parse_glm_style_shell_quotes_url_apostrophes_and_metacharacters() {
+        let calls = parse_glm_style_tool_calls("shell/url>https://example.com/it's;still=one");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
         assert_eq!(
@@ -4906,14 +5008,18 @@ browser_open/url>https://example.com"#;
         let response = "Checking...\nbrowser_open/url>https://example.com\nDone";
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].name, "browser_open");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"url": "https://example.com"})
+        );
         assert!(text.contains("Checking"));
         assert!(text.contains("Done"));
     }
 
     #[test]
-    fn parse_glm_style_rejects_non_http_url_param() {
-        let response = "browser_open/url>javascript:alert(1)";
+    fn parse_glm_style_shell_rejects_non_http_url_param() {
+        let response = "shell/url>javascript:alert(1)";
         let calls = parse_glm_style_tool_calls(response);
         assert!(calls.is_empty());
     }
@@ -5142,14 +5248,13 @@ Let me check the result."#;
     }
 
     #[test]
-    fn parse_glm_shortened_body_browser_open_maps_to_shell_command() {
-        // browser_open aliases to shell, and shortened calls must still emit
-        // shell's canonical "command" argument.
+    fn parse_glm_shortened_body_browser_open_preserves_url() {
         let call = parse_glm_shortened_body("browser_open>https://example.com").unwrap();
-        assert_eq!(call.name, "shell");
-        let cmd = call.arguments["command"].as_str().unwrap();
-        assert!(cmd.contains("curl"));
-        assert!(cmd.contains("example.com"));
+        assert_eq!(call.name, "browser_open");
+        assert_eq!(
+            call.arguments,
+            serde_json::json!({"url": "https://example.com"})
+        );
     }
 
     #[test]

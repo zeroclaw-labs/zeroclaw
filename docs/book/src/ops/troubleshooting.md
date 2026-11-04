@@ -80,17 +80,21 @@ For the Raspberry Pi specifics, see [Raspberry Pi setup → build](../hardware/r
 
 ### Build is very slow
 
-The Matrix E2EE stack (`matrix-sdk`, `ruma`, `vodozemac`) and TLS/crypto native deps (`aws-lc-sys`, `ring`) are the main cost. Opt out if you don't need them:
+Build time scales with the features you enable. The Matrix E2EE stack (`matrix-sdk`, `ruma`, `vodozemac`) and the `aws-lc-sys` native crypto build are not in the default feature set: `channel-matrix` pulls in both, and `channels-full` pulls in `aws-lc-sys`. If you enabled features you don't need, drop them first.
+
+To build less than the default set, build the agent runtime alone:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-cargo build --release --locked --no-default-features --features "default-lean"
+cargo build --release --locked --no-default-features --features agent-runtime
 ```
 
 </div>
+
+This leaves out the other default features: `default-channels`, `gateway`, `acp-bridge`, `observability-prometheus`, and `schema-export`. Add back what you use by extending the list, for example `--features "agent-runtime,gateway,channel-telegram"`. [Channels overview](../channels/overview.md) lists the per-channel flags.
 
 Or check what's happening:
 

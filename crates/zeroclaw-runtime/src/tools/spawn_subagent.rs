@@ -4,6 +4,7 @@
 //! dispatch is the other SubAgent spawn site; both funnel through
 
 use crate::agent::loop_::AgentRunOverrides;
+use crate::live_config_authority::AgentExecutionCapability;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use crate::subagent::{SubAgentOverrides, SubAgentSpawn};
@@ -26,6 +27,13 @@ pub struct SpawnSubagentTool {
     /// any spawn work happens. Set by the agent loop from
     /// `AgentRunOverrides.is_subagent` at registry construction time.
     is_subagent_caller: bool,
+    /// The capabilities and principal the parent turn was built from. When
+    /// bound, the child runs through them, so it uses the parent's provider,
+    /// memory and supplied tools and resolves for the same principal. Empty
+    /// only for a registry no capability entry point bound, which keeps the
+    /// config-backed child run.
+    capabilities: crate::composition::CapabilitySlot,
+    execution_capability: Option<AgentExecutionCapability>,
 }
 
 impl SpawnSubagentTool {
@@ -43,7 +51,32 @@ impl SpawnSubagentTool {
             parent_alias: parent_alias.into(),
             security,
             is_subagent_caller: false,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
+            execution_capability: None,
         }
+    }
+
+    /// Run children through `capabilities` for `principal`. The first
+    /// binding wins.
+    #[must_use]
+    pub fn with_capabilities(
+        self,
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Self {
+        let _ = self
+            .capabilities
+            .set(crate::composition::BoundCapabilities {
+                capabilities,
+                principal,
+            });
+        self
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
     }
 
     /// Mark this tool instance as belonging to a SubAgent's tool
@@ -52,6 +85,14 @@ impl SpawnSubagentTool {
     #[must_use]
     pub fn with_subagent_caller(mut self, is_subagent_caller: bool) -> Self {
         self.is_subagent_caller = is_subagent_caller;
+        self
+    }
+
+    pub fn with_execution_capability(
+        mut self,
+        capability: Option<AgentExecutionCapability>,
+    ) -> Self {
+        self.execution_capability = capability;
         self
     }
 }
@@ -76,11 +117,14 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
         // Subagents keep a live memory backend and the memory tools; only
         // the injected context preamble is suppressed above.
         memory_free: false,
+        suppress_memory_auto_save: false,
         // Subagent runs are short-lived; no cross-turn reuse contract,
         // so the per-call `connect_all` path inside `agent::run` is
         // the correct choice. The daemon heartbeat worker is the
         // only `mcp_registry` supplier.
         mcp_registry: None,
+        execution_capability: None,
+        execution_admission: None,
         sop_step_scope: crate::sop::active_scope::active_headless_step_scope(),
         // Not yet propagated: a sub-turn spawned by an internally
         // initiated parent (e.g. a cron turn delegating) loses the
@@ -140,7 +184,26 @@ impl Tool for SpawnSubagentTool {
             });
         }
 
-        let risk_profile = self.config.risk_profile_for_agent(&self.parent_alias);
+        let execution_admission = match self
+            .execution_capability
+            .as_ref()
+            .map(|capability| capability.admit(&self.parent_alias))
+            .transpose()
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("subagent admission failed: {error}")),
+                });
+            }
+        };
+        let config = execution_admission
+            .as_ref()
+            .map(|admission| admission.config())
+            .unwrap_or_else(|| Arc::clone(&self.config));
+        let risk_profile = config.risk_profile_for_agent(&self.parent_alias);
         if let Some(rp) = risk_profile {
             let excluded = rp.excluded_tools.iter().any(|t| t == "spawn_subagent");
             let allowed_when_listed = rp
@@ -190,7 +253,7 @@ impl Tool for SpawnSubagentTool {
         }
 
         let subagent_ctx = match SubAgentSpawn::for_agent_with_policy(
-            &self.config,
+            &config,
             &self.parent_alias,
             Arc::clone(&self.security),
         )
@@ -208,13 +271,13 @@ impl Tool for SpawnSubagentTool {
 
         let run_id = uuid::Uuid::new_v4().to_string();
 
-        let temperature: Option<f64> = self
-            .config
+        let temperature: Option<f64> = config
             .model_provider_for_agent(&self.parent_alias)
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
-        let run_overrides = child_run_overrides(subagent_ctx.policy.clone());
+        let mut run_overrides = child_run_overrides(subagent_ctx.policy.clone());
+        run_overrides.execution_admission = execution_admission.clone();
         let parent_alias = subagent_ctx.parent_alias.clone();
 
         let cp_task_id = run_id.clone();
@@ -242,24 +305,55 @@ impl Tool for SpawnSubagentTool {
                 .await;
         }
 
+        // A bound parent passes its capabilities and principal to the child,
+        // so the child cannot reach a provider or memory store the parent's
+        // sources would not have returned.
+        let bound = self.capabilities.get().cloned();
+        let config = (*config).clone();
         let run_result = Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,
             =>
-            crate::agent::run(
-                (*self.config).clone(),
-                &self.parent_alias,
-                Some(prompt),
-                None,
-                None,
-                temperature,
-                vec![],
-                false,
-                Some(session_path),
-                None,
-                zeroclaw_api::ingress::TurnOrigin::SubTurn,
-                run_overrides,
-            )
+            async {
+                match bound {
+                    Some(bound) => {
+                        crate::agent::run_with_capabilities(
+                            config,
+                            bound.capabilities,
+                            bound.principal,
+                            &self.parent_alias,
+                            Some(prompt),
+                            None,
+                            None,
+                            temperature,
+                            vec![],
+                            false,
+                            Some(session_path),
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::SubTurn,
+                            run_overrides,
+                        )
+                        .await
+                    }
+                    None => {
+                        crate::agent::run(
+                            config,
+                            &self.parent_alias,
+                            Some(prompt),
+                            None,
+                            None,
+                            temperature,
+                            vec![],
+                            false,
+                            Some(session_path),
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::SubTurn,
+                            run_overrides,
+                        )
+                        .await
+                    }
+                }
+            }
         ))
         .await;
 
@@ -320,6 +414,86 @@ mod tests {
             },
         );
         config
+    }
+
+    /// A bound spawn tool runs its child through the bound provider and
+    /// memory sources for the bound principal. The configured endpoint is
+    /// unroutable, so a child built from config could not answer.
+    #[tokio::test]
+    async fn a_bound_spawn_runs_the_child_on_the_bound_capabilities() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, RecordingProviders, STUB_REPLY, recording_capabilities,
+        };
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = config_with_agent("alpha");
+        config.data_dir = tmp.path().join("data");
+        config.config_path = tmp.path().join("config.toml");
+        config.memory.backend = "none".to_string();
+        config.providers.models.openai.insert(
+            "alpha".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        if let Some(agent) = config.agents.get_mut("alpha") {
+            agent.model_provider = "openai.alpha".into();
+        }
+        let security =
+            Arc::new(SecurityPolicy::for_agent(&config, "alpha").expect("alpha has a policy"));
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let principal =
+            zeroclaw_api::principal::PrincipalId::for_oidc("https://issuer.example", "subject-p");
+        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha", security).with_capabilities(
+            recording_capabilities(
+                Arc::clone(&providers),
+                Arc::clone(&memory),
+                Arc::new(NoTools),
+            ),
+            Some(principal.clone()),
+        );
+
+        let result = tool
+            .execute(json!({ "prompt": "Summarize this private task" }))
+            .await
+            .expect("execute returns a result");
+
+        assert!(result.success, "child failed: {:?}", result.error);
+        assert!(result.output.contains(STUB_REPLY));
+        let seen = providers.seen.lock();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].agent_alias, "alpha");
+        assert_eq!(seen[0].principal, Some(principal));
+        assert!(memory.agents.lock().iter().any(|alias| alias == "alpha"));
+    }
+
+    #[tokio::test]
+    async fn closed_authority_rejects_subagent_before_construction() {
+        let config = config_with_agent("alpha");
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_execution_capability(Some(authority.execution_capability()));
+        authority.close_agent_lifecycle();
+
+        let result = tool.execute(json!({"prompt": "hello"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("lifecycle generation is closing")
+        );
+        assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 0);
     }
 
     #[tokio::test]

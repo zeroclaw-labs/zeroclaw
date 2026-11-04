@@ -442,13 +442,7 @@ pub async fn submit_pairing_enhanced(
                         .into_response();
                 }
             }
-            if let Err(e) = super::persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
+            if let Err(e) = super::persist_pairing_tokens(&state).await {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -538,34 +532,38 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
 
 /// Delete `device_id` and invalidate its bearer token as one revocation.
 ///
-/// Runs through [`zeroclaw_config::pairing::PairingGuard::revoke_under_config_write_lock`]:
-/// nothing changes until the config write lock is held, and then the device
-/// row and the live token go in one synchronous step. A request dropped
-/// while it waits for the lock, by the gateway's request timeout say, leaves
-/// the device and its token in place, so the same revocation can simply be
-/// retried.
+/// Runs through [`zeroclaw_config::pairing::PairingGuard::revoke_under_config_write_lock`]
+/// with an admitted config commit: nothing changes until the commit holds the
+/// config writer gate, and then the device row and the live token go in one
+/// synchronous step. A request dropped while it waits for the gate, by the
+/// gateway's request timeout say, leaves the device and its token in place,
+/// so the same revocation can simply be retried. A commit the daemon refuses
+/// because its generation is closing changes nothing either.
 ///
-/// `reauthorize` checks the caller again once the lock is held, before
+/// `reauthorize` checks the caller again once the gate is held, before
 /// anything is deleted. The caller was authenticated when the request
 /// arrived, but another revocation queued ahead of this one can revoke it
 /// while it waits: that caller is refused here and changes nothing, rather
 /// than deleting a device and, for a rotation, being handed a new pairing
-/// code. The caller keeps the returned guard until its response is decided.
+/// code. The caller keeps the returned commit until its response is decided.
 ///
-/// Returns the refusal, or whether the device existed, and the held guard
+/// Returns the refusal, or whether the device existed, and the held commit
 /// for persisting the token set under it.
 pub(crate) async fn revoke_device_credential<R>(
     state: &AppState,
     registry: &DeviceRegistry,
     device_id: &str,
     reauthorize: impl FnOnce() -> Result<(), R>,
-) -> (
-    Result<Result<bool, rusqlite::Error>, R>,
-    super::ConfigWriteGuard,
-) {
+) -> Result<
+    (
+        Result<Result<bool, rusqlite::Error>, R>,
+        super::ConfigWriteGuard,
+    ),
+    zeroclaw_runtime::live_config_authority::ConfigCommitError,
+> {
     state
         .pairing
-        .revoke_under_config_write_lock(state.config_write_lock.clone(), |pairing| {
+        .revoke_under_config_write_lock(state.begin_config_commit(), |pairing| {
             reauthorize()?;
             Ok(registry.revoke(device_id).map(|token_hash| {
                 if let Some(hash) = token_hash.as_deref() {
@@ -575,6 +573,17 @@ pub(crate) async fn revoke_device_credential<R>(
             }))
         })
         .await
+}
+
+/// The response when a revocation's config commit is refused before
+/// anything changed: the daemon generation is closing.
+pub(crate) fn revocation_not_admitted(
+    error: zeroclaw_runtime::live_config_authority::ConfigCommitError,
+) -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("Revocation refused without any change: {error}"),
+    )
 }
 
 /// DELETE /api/devices/{id} — revoke a paired device and its bearer token.
@@ -596,10 +605,14 @@ pub async fn revoke_device(
     };
 
     let (reauthorized, config_write_guard) =
-        revoke_device_credential(&state, registry, &device_id, || {
+        match revoke_device_credential(&state, registry, &device_id, || {
             require_auth(&state, &headers)
         })
-        .await;
+        .await
+        {
+            Ok(revoked) => revoked,
+            Err(e) => return revocation_not_admitted(e).into_response(),
+        };
     let revoked = match reauthorized {
         Ok(revoked) => revoked,
         Err(e) => return e.into_response(),
@@ -616,13 +629,7 @@ pub async fn revoke_device(
         }
     }
 
-    if let Err(e) = super::persist_pairing_tokens_under(
-        state.config.clone(),
-        &state.pairing,
-        &config_write_guard,
-    )
-    .await
-    {
+    if let Err(e) = super::persist_pairing_tokens_under(&state, config_write_guard).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Token revoked in memory but config persist failed: {e}"),
@@ -709,10 +716,14 @@ pub async fn rotate_token(
     };
 
     let (reauthorized, config_write_guard) =
-        revoke_device_credential(&state, registry, &device_id, || {
+        match revoke_device_credential(&state, registry, &device_id, || {
             require_auth(&state, &headers)
         })
-        .await;
+        .await
+        {
+            Ok(revoked) => revoked,
+            Err(e) => return revocation_not_admitted(e).into_response(),
+        };
     let revoked = match reauthorized {
         Ok(revoked) => revoked,
         Err(e) => return e.into_response(),
@@ -732,21 +743,19 @@ pub async fn rotate_token(
     // Same persist-fail caveat as `revoke_device`: device row + in-memory
     // token are already gone; surfacing the persist error tells the caller
     // a restart could resurrect the token.
-    if let Err(e) = super::persist_pairing_tokens_under(
-        state.config.clone(),
-        &state.pairing,
-        &config_write_guard,
-    )
-    .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Token revoked in memory but config persist failed: {e}"),
-        )
-            .into_response();
-    }
+    let _config_write_guard =
+        match super::persist_pairing_tokens_under(&state, config_write_guard).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Token revoked in memory but config persist failed: {e}"),
+                )
+                    .into_response();
+            }
+        };
 
-    // Issue the new pairing code while the config write guard is still held,
+    // Issue the new pairing code while the config commit is still held,
     // so a revocation of this caller queued behind it cannot land between the
     // check above and the code. The code is issued atomically against the
     // slot. If another flow holds the slot, the revoke still stands — return 200 with
@@ -865,10 +874,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"").expect("seed blocker file");
-        {
-            let mut cfg = state.config.write();
-            cfg.config_path = blocker.join("config.toml");
-        }
+        state.publish_test_config(|cfg| cfg.config_path = blocker.join("config.toml"));
 
         let code = state
             .pairing

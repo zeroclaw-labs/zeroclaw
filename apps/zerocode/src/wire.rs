@@ -182,9 +182,9 @@ pub enum MemoryBackendKind {
 // ── Config explorer wire shapes ────────────────────────────────
 
 /// Schema field-kind tag mirroring `zeroclaw_config::traits::PropKind`.
-/// Carries the canonical eight variants — adding one in the schema
-/// must mirror here too; `wire_drift::prop_kind_variants_round_trip`
-/// fails when they diverge.
+/// zerocode does not depend on `zeroclaw-config`, so adding a variant in
+/// the schema must be mirrored here by hand: an unknown tag fails to
+/// deserialize the whole `config/list` response.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PropKind {
@@ -197,6 +197,9 @@ pub enum PropKind {
     StringArray,
     ObjectArray,
     Object,
+    /// Container row for a secret key/value map (MCP `env`, `headers`, …).
+    /// Entries are the sibling `<path>.<KEY>` rows.
+    SecretMap,
 }
 
 impl PropKind {
@@ -214,6 +217,7 @@ impl PropKind {
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
+            Self::SecretMap => "secret_map",
         }
     }
 }
@@ -303,6 +307,13 @@ impl std::fmt::Display for ConfigTab {
     }
 }
 
+/// Setup facts supplied by the canonical config owner. Absence of this
+/// metadata means requirements are unknown, not that a field is optional.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigFieldSetup {
+    pub missing: bool,
+}
+
 /// Single config-property descriptor returned by `config/list` and
 /// `config/sections`. Mirrors `zeroclaw_config::traits::ConfigFieldEntry`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +337,8 @@ pub struct ConfigFieldEntry {
     pub tab: ConfigTab,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_source: Option<AliasSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<ConfigFieldSetup>,
 }
 
 /// Section-page shape returned by `config/sections`. Mirrors
@@ -627,4 +640,69 @@ mod plan_wire_tests {
         let back: PlanEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back, entry);
     }
+}
+
+// Config publication receipts and the daemon's bounded application ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishedConfigRevision {
+    pub epoch: String,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigStatusResult {
+    #[serde(default)]
+    pub application: Option<ConfigApplicationStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigApplicationStatus {
+    pub published_revision: PublishedConfigRevision,
+    pub records: Vec<ConfigApplicationRecord>,
+    pub record_limit: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigApplicationRecord {
+    pub path: Vec<String>,
+    pub target: ConfigApplicationTarget,
+    pub revision: PublishedConfigRevision,
+    pub outcome: ConfigApplicationOutcome,
+    #[serde(default)]
+    pub reason: Option<ConfigApplicationReason>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigApplicationTarget {
+    Daemon,
+    Session {
+        id: String,
+        generation: u64,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApplicationOutcome {
+    Pending,
+    AppliedLive,
+    QueuedForReload,
+    Rejected,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigApplicationReason {
+    AwaitingAcknowledgement,
+    DaemonReloadRequired,
+    ChangeScopeUnavailable,
+    TargetRetired,
+    #[serde(other)]
+    Unknown,
 }

@@ -232,10 +232,16 @@ UMask=0077
 ReadWritePaths=${dataDir}
 ```
 
-`MemoryDenyWriteExecute=yes` is safe because ZeroClaw 0.7.x is a plain
-Rust binary with no JIT; if a future version adopts a JIT (e.g. through a
-WASM plugin host), this single setting will need to flip and that should
-be flagged in the changelog.
+`MemoryDenyWriteExecute=yes` stays on even though the package built from the
+distribution feature list carries the WASM plugin host, whose compiler needs
+memory that becomes executable after it is written. Under this unit every
+plugin load fails with a memory-protection error while the rest of the daemon
+runs normally, which is the intended default: plugins are off unless the
+operator enables them. An instance that runs plugins must override the
+setting on its own unit, for example
+`systemd.services."zeroclaw-<name>".serviceConfig.MemoryDenyWriteExecute = lib.mkForce false;`
+for the instance `services.zeroclaw.instances.<name>`, and accepts the wider
+memory surface that comes with it.
 
 Resource caps (`MemoryMax`, `CPUQuota`, etc.) are intentionally **not** set
 in the module — Rust servers have widely varying resource profiles

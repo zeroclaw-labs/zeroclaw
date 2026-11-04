@@ -14,11 +14,11 @@ Use case: paired-identity channels where sub-second replies are an AI-tell. Wire
 
 > **Webhook caveat:** on a synchronous webhook channel the outbound reply is the HTTP response to the caller's request. A non-zero `reply_min_interval_secs` floor can hold that response open for the floor duration, which may exceed the caller's own request timeout. Set the floor only when the webhook caller tolerates a delayed response, or leave it at `0` and pace upstream.
 
-## iMessage (macOS only)
+## iMessage
 
-iMessage is bridged through the Linq Partner API (`[channels.linq.<alias>]`):
+iMessage can use the Linq Partner API (`[channels.linq.<alias>]`) or the experimental direct adapter (`[channels.imessage.<alias>]`).
 
-**macOS-only** and requires either Linq as a third-party relay, or direct AppleScript automation (experimental, requires Full Disk Access and Accessibility grants).
+The direct adapter is **macOS-only**. It sends through AppleScript automation and receives by reading `~/Library/Messages/chat.db`; grant Automation access to control Messages and Full Disk Access to read the database.
 
 ## WeChat personal iLink Bot (微信个人号 iLink)
 

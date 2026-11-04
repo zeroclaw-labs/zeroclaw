@@ -14,6 +14,52 @@ pub(crate) struct ResolvedVisionProvider {
     pub(crate) model: String,
 }
 
+/// The provider source a turn was built from, for resolving its vision route.
+///
+/// A turn that holds one asks this source for the configured vision route,
+/// with the turn's principal, instead of building the route from config; a
+/// refusal ends routing. A turn without one (a configless test agent) keeps
+/// the direct factory.
+#[derive(Clone, Copy)]
+pub(crate) struct VisionProviderSource<'a> {
+    pub(crate) source: &'a dyn crate::composition::ProviderSource,
+    pub(crate) agent_alias: &'a str,
+    pub(crate) principal: Option<&'a zeroclaw_api::principal::PrincipalId>,
+}
+
+impl<'a> VisionProviderSource<'a> {
+    /// The vision source for a turn bound to `binding` as `agent_alias`.
+    pub(crate) fn from_binding(
+        binding: &'a crate::composition::BoundCapabilities,
+        agent_alias: &'a str,
+    ) -> Self {
+        Self {
+            source: binding.capabilities.providers.as_ref(),
+            agent_alias,
+            principal: binding.principal.as_ref(),
+        }
+    }
+}
+
+/// The model a configured `<family>.<alias>` entry names, as the alias-aware
+/// vision factory reports it: `None` for a bare family, a colon ref, an alias
+/// with no configured entry, or an entry without a model.
+fn configured_route_model(config: &Config, provider_ref: &str) -> Option<String> {
+    let (family, alias) = provider_ref.split_once('.')?;
+    if family.contains(':') {
+        return None;
+    }
+    config
+        .providers
+        .models
+        .find(family, alias)?
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+}
+
 /// The exact `file_read` read ledger for one image-marker path: the
 /// string-level `is_path_allowed` check first (no filesystem access for a
 /// path it rejects), then the same symlink-aware readability check
@@ -55,7 +101,7 @@ pub(crate) fn policy_permits_image_path(policy: &SecurityPolicy, path: &std::pat
 /// probed. `None` fails closed: no local path resolves, so a configless
 /// caller degrades to a text-only turn instead of erroring, and data-URI
 /// and remote references are unaffected by `None`.
-pub(crate) async fn resolve_vision_provider(
+pub(crate) async fn resolve_vision_provider_with_allowed_refs(
     config: Option<&Config>,
     model_provider: &dyn ModelProvider,
     history: &[ChatMessage],
@@ -64,6 +110,8 @@ pub(crate) async fn resolve_vision_provider(
     model: &str,
     dispatch_model: &str,
     security: Option<&SecurityPolicy>,
+    vision_source: Option<VisionProviderSource<'_>>,
+    allowed_provider_refs: Option<&std::collections::HashSet<String>>,
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
@@ -73,6 +121,26 @@ pub(crate) async fn resolve_vision_provider(
         && !model_provider.capabilities_for_model(dispatch_model).vision
     {
         if let Some(ref vp) = multimodal_config.vision_model_provider {
+            let provider_allowed = allowed_provider_refs.map_or_else(
+                || zeroclaw_providers::reliable::provider_ref_allowed_for_turn(vp),
+                |allowed| allowed.contains(vp),
+            );
+            if !provider_allowed {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "vision_provider": vp,
+                            "reason": "effort_routing_policy",
+                        })),
+                    "vision model_provider blocked by turn routing policy"
+                );
+                return Err(anyhow::Error::msg(format!(
+                    "configured vision model_provider '{vp}' is not permitted by the selected effort route"
+                )));
+            }
             // Resolve the configured vision provider through the alias-aware
             // factory so its per-alias `vision` override and typed config
             // (endpoint URI, credentials) are honored - the legacy
@@ -81,12 +149,42 @@ pub(crate) async fn resolve_vision_provider(
             // for this route would have been ignored. `config` is `None` only on
             // configless (test-builder) agents - every production agent/loop path
             // threads `Some`; that fallback keeps the prior legacy behavior.
-            let (vp_instance, alias_model) = match config {
-                Some(config) => {
+            //
+            // A turn built from a provider source asks that source for the
+            // route, with the turn's principal, so an image cannot move a
+            // supplied-capability turn onto a config-built provider. A refusal
+            // is final: routing does not retry through config.
+            let configured_vision_model = multimodal_config
+                .vision_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty());
+            let (vp_instance, alias_model) = match (vision_source, config) {
+                (Some(vision_source), Some(config)) => {
+                    let alias_model = configured_route_model(config, vp);
+                    let requested_model = configured_vision_model
+                        .map(ToString::to_string)
+                        .or_else(|| alias_model.clone())
+                        .unwrap_or_else(|| model.to_string());
+                    vision_source
+                        .source
+                        .vision_model_provider(&crate::composition::ProviderRequest {
+                            config,
+                            agent_alias: vision_source.agent_alias,
+                            provider_ref: Some(vp),
+                            model: Some(&requested_model),
+                            principal: vision_source.principal,
+                        })
+                        .map(|provider| (Box::new(provider) as Box<dyn ModelProvider>, alias_model))
+                }
+                (Some(_), None) => Err(anyhow::Error::msg(
+                    "a turn built from a provider source has no config to resolve its vision route",
+                )),
+                (None, Some(config)) => {
                     zeroclaw_providers::create_model_provider_from_ref_with_model(config, vp)
                         .map(|resolved| (resolved.provider, resolved.model))
                 }
-                None => zeroclaw_providers::create_model_provider(vp, None)
+                (None, None) => zeroclaw_providers::create_model_provider(vp, None)
                     .map(|provider| (provider, None)),
             }
             .map_err(|error| {
@@ -237,6 +335,33 @@ pub(crate) async fn resolve_vision_provider(
     Ok((vision_model_provider, degrade_strip_images))
 }
 
+#[cfg(test)]
+async fn resolve_vision_provider(
+    config: Option<&Config>,
+    model_provider: &dyn ModelProvider,
+    history: &[ChatMessage],
+    multimodal_config: &MultimodalConfig,
+    provider_name: &str,
+    model: &str,
+    dispatch_model: &str,
+    security: Option<&SecurityPolicy>,
+    vision_source: Option<VisionProviderSource<'_>>,
+) -> Result<(Option<ResolvedVisionProvider>, bool)> {
+    resolve_vision_provider_with_allowed_refs(
+        config,
+        model_provider,
+        history,
+        multimodal_config,
+        provider_name,
+        model,
+        dispatch_model,
+        security,
+        vision_source,
+        None,
+    )
+    .await
+}
+
 pub(crate) async fn prepare_messages_for_iteration(
     history: &[ChatMessage],
     multimodal_config: &MultimodalConfig,
@@ -284,19 +409,19 @@ pub(super) async fn prepare_messages_with_source_rows(
         // Text-only fallback: replace every media marker with the prose
         // placeholder so no filesystem path or data URI reaches the
         // text-only provider, while surrounding text (captions, tool
-        // metadata) survives. An assistant tool-call envelope is rewritten
-        // field-wise instead: signed thinking (`reasoning_content`) and
-        // tool-call signatures (`tool_calls[].extra_content`) must replay
-        // byte-for-byte, and a composite provider (the reliable wrapper)
-        // reports no vision whenever one of its fallbacks lacks it — so the
-        // primary that receives this degraded request may be the very
-        // provider that verifies those signatures.
+        // metadata) survives. Tool-result carriers keep their bodies
+        // verbatim: a carrier's images are its declared attachments, and a
+        // marker in its body text is text. An assistant tool-call envelope
+        // is rewritten field-wise instead: signed thinking
+        // (`reasoning_content`) and tool-call signatures
+        // (`tool_calls[].extra_content`) must replay byte-for-byte, and a
+        // composite provider (the reliable wrapper) reports no vision
+        // whenever one of its fallbacks lacks it — so the primary that
+        // receives this degraded request may be the very provider that
+        // verifies those signatures.
         let stripped: Vec<ChatMessage> = history
             .iter()
-            .map(|m| ChatMessage {
-                role: m.role.clone(),
-                content: multimodal::strip_media_markers_model_visible(m),
-            })
+            .map(multimodal::strip_message_media)
             .collect();
         match image_cache {
             Some(cache) => {
@@ -417,34 +542,6 @@ mod tests {
             first_non_system.role, "user",
             "leading non-user turns must be dropped before dispatch"
         );
-    }
-
-    /// A tool-result `[AUDIO:...]` marker on the non-degrade path must be
-    /// stripped before dispatch so a raw filesystem path never reaches the
-    /// provider as literal text (the silent-hallucination failure mode). This
-    /// exercises the real turn-loop prep entrypoint, not just the provider-layer
-    /// helper, so it covers the degrade/non-degrade branch selection.
-    #[tokio::test]
-    async fn prepare_iteration_strips_tool_result_audio_marker() {
-        let history = vec![
-            ChatMessage::user("what do you hear in the clip?"),
-            ChatMessage::tool("[AUDIO:/tmp/clip.wav] recorded 3:00 PM"),
-        ];
-        let cfg = MultimodalConfig::default();
-        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None)
-            .await
-            .unwrap();
-        let joined = prepared
-            .messages
-            .iter()
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !joined.contains("/tmp/clip.wav"),
-            "audio path leaked to the provider payload: {joined}"
-        );
-        assert!(joined.contains(multimodal::MEDIA_PLACEHOLDER));
     }
 
     /// The text-only degrade path used to map `strip_media_markers` over
@@ -600,7 +697,7 @@ mod tests {
 
         let config: Config = toml::from_str(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.llamacpp.forced_off]
 model = "qwen3-4b"
 vision = false
@@ -623,6 +720,7 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -701,6 +799,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -771,6 +870,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -834,6 +934,7 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -902,6 +1003,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -1102,6 +1204,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -1177,6 +1280,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("markers outside the read boundary must degrade, never fail the turn");
@@ -1202,6 +1306,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("missing files must degrade, never fail the turn");
@@ -1261,6 +1366,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -1323,6 +1429,7 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -1401,6 +1508,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("a vision-capable primary serves image turns itself");
@@ -1456,7 +1564,7 @@ vision = false
         };
         let config: Config = toml::from_str(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.visionroute]
 uri = "http://127.0.0.1:9/v1"
 model = "vision-model"
@@ -1481,6 +1589,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("the configured vision fallback must build");
@@ -1497,6 +1606,51 @@ model = "vision-model"
             !degrade_strip_images,
             "a live vision route must not degrade/strip images"
         );
+
+        let allowed =
+            std::sync::Arc::new(std::collections::HashSet::from(
+                ["custom.local".to_string()],
+            ));
+        let result = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+            Some(allowed),
+            resolve_vision_provider(
+                Some(&config),
+                &PlainNonVisionPrimary,
+                &history,
+                &multimodal,
+                "custom.local",
+                "primary-model",
+                "primary-model",
+                Some(&security),
+                None,
+            ),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("an excluded vision provider must fail closed before dispatch"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not permitted"));
+
+        let direct_allowed = std::collections::HashSet::from(["custom.local".to_string()]);
+        let direct_result = resolve_vision_provider_with_allowed_refs(
+            Some(&config),
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "custom.local",
+            "primary-model",
+            "primary-model",
+            Some(&security),
+            None,
+            Some(&direct_allowed),
+        )
+        .await;
+        let direct_error = match direct_result {
+            Ok(_) => panic!("the explicit direct-turn boundary must block the vision side route"),
+            Err(error) => error,
+        };
+        assert!(direct_error.to_string().contains("not permitted"));
     }
 
     /// Success-path companion to the error-branch test above: when the primary
@@ -1571,7 +1725,7 @@ model = "vision-model"
         // production dispatch boundary.
         let config: Config = toml::from_str(&format!(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.myvision]
 uri = "http://{addr}/v1"
 model = "vision-model"
@@ -1592,6 +1746,7 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -1643,6 +1798,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             None,
+            None,
         )
         .await
         .expect("an explicit vision model must resolve");
@@ -1654,5 +1810,123 @@ model = "vision-model"
             "multimodal.vision_model must override the provider alias model"
         );
         server.abort();
+    }
+    /// DECISIVE, no-vision route: a tool-result carrier with one declared
+    /// attachment and marker-looking body text. The degrade strips exactly
+    /// the declared attachment; the body — including its literal marker —
+    /// survives byte for byte, so a model reading source that mentions the
+    /// marker syntax still sees what the tool printed.
+    #[tokio::test]
+    async fn no_vision_degrade_strips_carrier_attachments_not_bodies() {
+        struct NonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for NonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            fn capabilities_for_model(
+                &self,
+                _model: &str,
+            ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    vision: false,
+                    ..Default::default()
+                }
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for NonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "NonVisionPrimary"
+            }
+        }
+
+        let body = "the source contains [IMAGE:/tmp/example.png] as literal text";
+        let carrier = ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "tc1",
+                "content": body,
+                "attachments": [{"kind": "image", "target": "/tmp/real.png"}],
+            })
+            .to_string(),
+        );
+        let history = vec![
+            ChatMessage::user("read the multimodal source".to_string()),
+            carrier,
+        ];
+
+        let (vision, degrade) = resolve_vision_provider(
+            None,
+            &NonVisionPrimary,
+            &history,
+            &MultimodalConfig::default(),
+            "primary",
+            "primary-model",
+            "primary-model",
+            None,
+            None,
+        )
+        .await
+        .expect("no capability error on a plain degrade");
+        assert!(vision.is_none());
+        assert!(degrade, "the declared attachment must trigger the degrade");
+
+        let prepared =
+            prepare_messages_for_iteration(&history, &MultimodalConfig::default(), true, None)
+                .await
+                .expect("degrade preparation succeeds");
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&prepared.messages[1].content)
+                .expect("degraded carrier still parses");
+        assert!(
+            parsed.attachments.is_empty(),
+            "the declared attachment is stripped"
+        );
+        assert_eq!(
+            parsed.text, body,
+            "the carrier body, marker syntax included, survives the degrade"
+        );
+
+        // A carrier whose body only LOOKS like it carries images never
+        // triggers the vision machinery at all: its count is zero.
+        let text_only = ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "tc2",
+                "content": body,
+                "attachments": [],
+            })
+            .to_string(),
+        );
+        let history = vec![
+            ChatMessage::user("read the source again".to_string()),
+            text_only.clone(),
+        ];
+        assert_eq!(multimodal::count_image_markers(&history), 0);
+        let (_, degrade) = resolve_vision_provider(
+            None,
+            &NonVisionPrimary,
+            &history,
+            &MultimodalConfig::default(),
+            "primary",
+            "primary-model",
+            "primary-model",
+            None,
+            None,
+        )
+        .await
+        .expect("no capability error");
+        assert!(!degrade, "body markers alone must not degrade anything");
     }
 }

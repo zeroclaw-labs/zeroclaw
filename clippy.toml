@@ -53,6 +53,12 @@ disallowed-macros = [
 # carry a local `#![allow(clippy::disallowed_methods)]`.
 disallowed-methods = [
     { path = "tokio::spawn", reason = "use ::zeroclaw_spawn::spawn!(...) so the spawned task inherits the caller's attribution span" },
+    # The working directory is process-wide. `cargo test` runs a binary's
+    # tests as threads of one process, so a test that changes it races its
+    # siblings and any child process spawned meanwhile; CI runs nextest (one
+    # process per test) and never sees the race. The `tokio::spawn`
+    # exemptions above allow the whole lint, so they lift this ban too.
+    { path = "std::env::set_current_dir", reason = "the working directory is process-wide, so changing it races every other thread and any child process spawned meanwhile; pass an explicit root path, or set Command::current_dir on the child" },
 ]
 # `std::println` / `std::eprintln` — DAEMON-PATH INTENT: these must NOT be
 # used in daemon/supervisor code paths (zeroclaw-channels orchestrator,
