@@ -3573,16 +3573,54 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
     const SKILLS_END: &str = "</available_skills>";
     const WORKSPACE_HEADER: &str = "## Workspace\n\n";
 
-    if let Some(start) = base_prompt.find(SKILLS_HEADER)
-        && let Some(rel_end) = base_prompt[start..].find(SKILLS_END)
-    {
-        let end = start + rel_end + SKILLS_END.len();
-        let tail = base_prompt[end..]
-            .strip_prefix("\n\n")
-            .unwrap_or(&base_prompt[end..]);
+    if let Some(start) = base_prompt.find(SKILLS_HEADER) {
+        if let Some(rel_end) = base_prompt[start..].find(SKILLS_END) {
+            let end = start + rel_end + SKILLS_END.len();
+            let tail = base_prompt[end..]
+                .strip_prefix("\n\n")
+                .unwrap_or(&base_prompt[end..]);
+
+            let mut refreshed = String::with_capacity(
+                base_prompt.len().saturating_sub(end.saturating_sub(start))
+                    + refreshed_skills.len()
+                    + 2,
+            );
+            refreshed.push_str(&base_prompt[..start]);
+            if !refreshed_skills.is_empty() {
+                refreshed.push_str(refreshed_skills);
+                refreshed.push_str("\n\n");
+            }
+            refreshed.push_str(tail);
+            return refreshed;
+        }
+
+        // Truncated skills section: a startup-time cap landed inside it, so
+        // the closing marker (and usually the Workspace heading) is gone.
+        // Replace the remnant in place — up to the next known section
+        // boundary — so the refreshed section never migrates behind the
+        // mandatory additions: the turn-time cap reserves the whole tail from
+        // the delivery instructions or tool protocol onward, and optional
+        // skill bodies inside that reservation would blow the budget with
+        // the documented reserve-or-exceed fallback. Without a recognizable
+        // boundary the legacy append behavior stays: a prompt with no
+        // mandatory tail takes the plain cap, so nothing is reserved over
+        // the budget.
+        let remnant_end = [
+            base_prompt[start..]
+                .find(WORKSPACE_HEADER)
+                .map(|rel| start + rel),
+            channel_delivery_tail_start(base_prompt).filter(|&offset| offset > start),
+            base_prompt[start..]
+                .find(TEXT_TOOL_PROTOCOL_HEADER)
+                .map(|rel| start + rel),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(base_prompt.len());
 
         let mut refreshed = String::with_capacity(
-            base_prompt.len().saturating_sub(end.saturating_sub(start))
+            base_prompt.len().saturating_sub(remnant_end.saturating_sub(start))
                 + refreshed_skills.len()
                 + 2,
         );
@@ -3591,7 +3629,7 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
             refreshed.push_str(refreshed_skills);
             refreshed.push_str("\n\n");
         }
-        refreshed.push_str(tail);
+        refreshed.push_str(&base_prompt[remnant_end..]);
         return refreshed;
     }
 
@@ -3854,6 +3892,26 @@ const TEXT_TOOL_PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
 /// runtime instruction block.
 const TEXT_TOOL_TOOLS_HEADER: &str = "### Available Tools\n\n";
 
+/// Opener of the per-channel delivery instructions block (`channel_delivery_
+/// instructions`). Native-tool providers have no text tool protocol tail, so
+/// these instructions are the mandatory tail the cap must reserve on their
+/// own — they carry the attachment/button formats the model must emit.
+const CHANNEL_DELIVERY_HEADER_PREFIX: &str = "When responding on ";
+
+/// Byte offset where the channel delivery instructions tail starts, or
+/// `None` when the prompt does not carry them. An `rfind` hit on the bare
+/// opener is only trusted when the tail actually carries the marker contract
+/// every channel block shares — skill or personality content can quote the
+/// opener literal without being the runtime instruction block.
+fn channel_delivery_tail_start(prompt: &str) -> Option<usize> {
+    let start = prompt.rfind(CHANNEL_DELIVERY_HEADER_PREFIX)?;
+    let tail = &prompt[start..];
+    ["attachment markers", "attachments use markers", "[IMAGE:"]
+        .iter()
+        .any(|marker| tail.contains(marker))
+        .then_some(start)
+}
+
 fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -> String {
     cap_channel_system_prompt(
         prompt,
@@ -3888,12 +3946,27 @@ fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -
 /// instruction block when it actually carries the tool listing, so a skill or
 /// personality file that quotes the bare protocol heading collides with the
 /// sentinel harmlessly and takes the plain cap.
+///
+/// The same reservation covers the channel delivery instructions (attachment
+/// markers, Discord embed/button formats): they precede the protocol
+/// additions in every assembled prompt, and a native-tool provider has no
+/// text tool protocol tail at all — without the reservation the plain cap
+/// would cut exactly the output formats native tool schemas do not replace.
+/// The reserved tail starts at the earliest verified mandatory block.
 fn cap_channel_system_prompt(prompt: String, max_chars: usize, agent_alias: &str) -> String {
-    if max_chars > 0
-        && let Some(start) = prompt.rfind(TEXT_TOOL_PROTOCOL_HEADER)
-    {
-        let (head, tail) = prompt.split_at(start);
-        if tail.contains(TEXT_TOOL_TOOLS_HEADER) {
+    if max_chars > 0 {
+        let delivery_start = channel_delivery_tail_start(&prompt);
+        let protocol_start = prompt
+            .rfind(TEXT_TOOL_PROTOCOL_HEADER)
+            .filter(|&start| prompt[start..].contains(TEXT_TOOL_TOOLS_HEADER));
+        let tail_start = match (delivery_start, protocol_start) {
+            (Some(delivery), Some(protocol)) => Some(delivery.min(protocol)),
+            (Some(delivery), None) => Some(delivery),
+            (None, Some(protocol)) => Some(protocol),
+            (None, None) => None,
+        };
+        if let Some(start) = tail_start {
+            let (head, tail) = prompt.split_at(start);
             return finalize_base_reserving_additions(
                 head.to_string(),
                 tail,
@@ -47932,6 +48005,177 @@ BTC is currently around $65,000 based on latest tool output."#
                  rather than truncate the protocol"
             );
         }
+    }
+
+    #[test]
+    fn truncated_startup_skills_section_replaces_in_place_before_protocol() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // Startup for a heavy Full-mode catalogue: the base fills the cap,
+        // and reserving the post-builder additions truncates the cached base
+        // inside the skills section — the closing marker is gone.
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let skill_dir = workspace.path().join("skills").join("cap-filler");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let bulky_instructions = format!(
+            "Cap filler skill instructions.\n{}",
+            "filler line ".repeat(2_000)
+        );
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "prompts = [{bulky_instructions:?}]\n\
+                 [skill]\n\
+                 name = \"cap-filler\"\n\
+                 description = \"Fills the prompt cap\"\n\
+                 version = \"1\"\n"
+            ),
+        )
+        .unwrap();
+        let skills = zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+        let base = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &[],
+            |_| false,
+            &skills,
+            None,
+            None,
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            false,
+            PROMPT_CAP,
+            true,
+            false,
+            None,
+        );
+        let additions = format!(
+            "{TEXT_TOOL_PROTOCOL_HEADER}{TEXT_TOOL_TOOLS_HEADER}\
+             **read_skill**: Read a skill.\nParameters: {{`args`}}\n"
+        );
+        let cached = finalize_base_reserving_additions(base, &additions, PROMPT_CAP, "test-agent");
+        assert!(
+            cached.contains("## Available Skills"),
+            "scenario setup: the skills header must survive the startup cap"
+        );
+        assert!(
+            !cached.contains("</available_skills>"),
+            "scenario setup: the startup cap must truncate the skills section \
+             before its closing marker"
+        );
+
+        // Turn time: the refresh replaces the remnant in place, ahead of the
+        // tool protocol, instead of appending after it.
+        let refreshed =
+            "## Available Skills\n\n<available_skills>\n\n- **tiny**: A tiny skill.\n\n\
+             </available_skills>\n\n";
+        let spliced = replace_available_skills_section(&cached, refreshed);
+        let skills_at = spliced.find("## Available Skills").unwrap();
+        let protocol_at = spliced.find(TEXT_TOOL_PROTOCOL_HEADER).unwrap();
+        assert!(
+            skills_at < protocol_at,
+            "the refreshed skills must stay ahead of the tool protocol, not \
+             migrate into the reserved tail"
+        );
+        assert!(
+            !spliced.contains("filler line"),
+            "the truncated remnant between the skills header and the protocol \
+             must be replaced, not preserved"
+        );
+
+        // The re-cap then reserves only the mandatory tail: protocol intact,
+        // total within the cap because the mandatory additions fit.
+        let capped = cap_channel_system_prompt(spliced, PROMPT_CAP, "test-agent");
+        assert!(
+            text_tool_protocol_advertised(&capped),
+            "the re-cap must retain the complete text tool protocol"
+        );
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "the spliced and re-capped prompt ({} chars) must respect the cap \
+             when the mandatory additions fit",
+            capped.chars().count()
+        );
+    }
+
+    #[test]
+    fn channel_prompt_cap_reserves_delivery_instructions_without_text_tool_protocol() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // A native-tool provider has no text tool protocol tail: a cap-filling
+        // cached prompt plus the Telegram delivery block must still keep the
+        // attachment markers — the plain head cap would cut exactly the output
+        // formats native tool schemas do not replace. The cap is sized above
+        // the delivery block so the reservation fits inside the budget; the
+        // reserve-or-exceed fallback for a tail that alone meets the cap is
+        // covered by the protocol test above.
+        let delivery = channel_delivery_instructions("telegram")
+            .expect("telegram delivery instructions must exist");
+        assert!(
+            delivery.chars().count() < PROMPT_CAP,
+            "scenario setup: the cap must accommodate the delivery block"
+        );
+        let mut prompt = "n".repeat(PROMPT_CAP);
+        prompt.push_str("\n\n");
+        prompt.push_str(delivery);
+        assert!(
+            prompt.chars().count() > PROMPT_CAP,
+            "scenario setup: the assembled prompt must exceed the cap"
+        );
+
+        let capped = cap_channel_system_prompt(prompt, PROMPT_CAP, "test-agent");
+
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "the capped prompt ({} chars) must respect the cap",
+            capped.chars().count()
+        );
+        assert!(
+            capped.contains("[IMAGE:<path-or-url>]"),
+            "the delivery instructions' attachment markers must survive the cap whole"
+        );
+        assert!(
+            capped.contains("When responding on Telegram:"),
+            "the delivery instructions opener must survive the cap whole"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_cap_ignores_delivery_opener_quoted_without_markers() {
+        const PROMPT_CAP: usize = 500;
+
+        // A skill or personality body that quotes the bare delivery opener
+        // collides with the sentinel. Without the marker contract the tail is
+        // content, not instructions, so the plain cap applies.
+        let mut prompt = "x".repeat(PROMPT_CAP);
+        prompt.push_str(
+            "\n\nSkill body quoting the opener.\n\nWhen responding on nothing in particular.",
+        );
+        assert!(
+            prompt.chars().count() > PROMPT_CAP,
+            "scenario setup: the assembled prompt must exceed the cap"
+        );
+
+        let capped = cap_channel_system_prompt(prompt, PROMPT_CAP, "test-agent");
+
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "a quoted opener without the marker contract must not be reserved \
+             (got {} chars)",
+            capped.chars().count()
+        );
+        assert!(
+            !capped.contains("quoting the opener"),
+            "the plain cap keeps the head and cuts the quoted tail"
+        );
     }
 
     #[test]
