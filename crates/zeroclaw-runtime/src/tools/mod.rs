@@ -773,8 +773,10 @@ pub struct AllToolsResult {
     pub capability_slots: Vec<crate::composition::CapabilitySlot>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
-    /// The same concrete delegate registered in `tools`, retained so callers
-    /// can bind its child registries to their live RPC authority resolver.
+    /// Retained so an owned session can bind its principal to the exact
+    /// registered delegate before any child memory tools are built, and so
+    /// callers can bind its child registries to their live RPC authority
+    /// resolver.
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
@@ -2086,6 +2088,7 @@ pub(crate) fn all_tools_with_runtime_context(
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
+    let owner = memory.principal_scope();
     #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
     let late_trace = late_tool_search_observer::capture();
     let builder = move || {
@@ -2135,13 +2138,20 @@ pub(crate) fn all_tools_with_runtime_context(
                     "failed to spawn tool-registry builder thread: {error}"
                 ))
             })?;
-        match handle.join() {
+        let result = match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
+        }?;
+        // Child runs and cross-agent SOP steps arrive with already-private
+        // memory and never pass through Agent's later session routing. Bind
+        // the same delegate instance its canonical name and aliases retain.
+        if let (Some(owner), Some(delegate)) = (owner, result.delegate_tool.as_ref()) {
+            delegate.bind_principal_scope(owner)?;
         }
+        Ok(result)
     })
 }
 
