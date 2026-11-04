@@ -890,9 +890,7 @@ fn safe_endpoint_identifier(url: &str) -> String {
     if !scheme_ok {
         return UNPARSEABLE_ENDPOINT.to_string();
     }
-    let authority_end = rest
-        .find(|c| matches!(c, '/' | '\\' | '?' | '#'))
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(authority_end);
     let host_port = authority.rsplit('@').next().unwrap_or_default();
     let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
