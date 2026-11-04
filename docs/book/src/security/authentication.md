@@ -384,12 +384,20 @@ and the named deferred MCP tool for on-demand activation; the helper is never
 implicitly granted. Permitted `mode = "always"` MCP tools are preactivated and
 remain callable without the helper.
 
-If either the principal's tool selector or agent selector is constrained,
-`delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
-are unavailable, including skill aliases wrapping those tools. These nested
-paths do not yet carry both current principal ceilings; the ordinary parent
-turn remains usable. Admin principals and principals with both selectors set
-to `"*"` keep their agent's configured nested capabilities.
+Some tools start work that runs without the RPC connection that asked for
+it. `delegate` (bounded and independent), `spawn_subagent`, and
+`execute_pipeline` build nested agents. `cron_add`, `cron_update`, `cron_run`,
+and `schedule` store or run a job that executes later under the agent's own
+tools, and `send_message_to_peer` starts a turn on another agent with that
+agent's tools. None of them carries the caller's current grants to that work
+yet, so only the shared operator's RPC sessions keep them. Every named
+principal's RPC session withholds them, including an administrator and a
+principal whose tool and agent selectors are both `"*"`, because those grants
+can be withdrawn while the work they started is still running. Skill aliases
+wrapping these tools are withheld too. The ordinary parent turn remains
+usable. The rule also applies when a named principal steers a running turn:
+the round its message starts runs without these tools, even in the shared
+operator's turn.
 
 The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
 constructor remains available. RPC uses the additive
@@ -397,14 +405,29 @@ constructor remains available. RPC uses the additive
 the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
-and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, or give an
-existing agent job a new prompt and trigger it, and one holding SOP create
-or update grants can save a procedure whose trigger runs it later. Treat
-cron and SOP authoring grants as grants of the agent's tools.
+and SOP authoring check only the agent selector. A principal holding cron
+grants can still create or edit a shell job for its agent with RPC `cron/add`
+and `cron/patch`. The command meets the agent's approval policy there, as it
+does from the CLI and the dashboard, so under supervised autonomy a command
+that needs approval is refused rather than stored. The job keeps running after
+the principal loses its grants. Only the shared operator may change an agent
+job with `cron/patch` or run one with `cron/trigger`, because the job later
+runs with its own stored tool list, not the caller's. A principal holding SOP
+create or update grants can save a procedure whose trigger runs it later.
+Treat cron and SOP authoring grants as grants of the agent's tools.
 
-Principal-owned sessions may use synchronous and parallel delegation when
-their grants allow it. Background delegation and its `check_result`,
+These checks run again when the job is written, not only when the request
+arrives. A grant withdrawn, or a paired device revoked, while a cron write
+waits for the database either stops that write or waits for it to finish.
+
+A tool called from a `pipeline` step or through a skill alias never inherits
+an approval. The runtime approves only the call it dispatched, so under
+supervised autonomy a command that needs approval is refused there; call the
+tool directly to be asked.
+
+A principal-owned session that offers `delegate` may use synchronous and
+parallel delegation when its grants allow it; a named principal's RPC session
+does not offer it (see above). Background delegation and its `check_result`,
 `list_results`, `cancel_task`, and `await_sessions` actions are refused,
 including calls through skill aliases and nested delegates. Those task rows
 and result files currently use agent-alias visibility, which cannot protect
