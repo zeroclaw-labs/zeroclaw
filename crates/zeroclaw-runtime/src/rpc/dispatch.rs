@@ -9647,9 +9647,25 @@ impl RpcDispatcher {
                         )
                     })?;
             } else {
-                let _authority = self.session_effect_lease(Method::SessionDelete, None)?;
-                gateway_cancellation =
-                    Some(coordination.signal_deletion_at_generation(&gateway_key, *generation));
+                let authority = self.session_effect_lease(
+                    Method::SessionDelete,
+                    authorized
+                        .as_ref()
+                        .and_then(|record| record.owner.as_deref()),
+                )?;
+                let grants = self
+                    .auth
+                    .as_ref()
+                    .map(|auth| current_authority_under(&authority, auth, Method::SessionDelete))
+                    .transpose()
+                    .map_err(|denied| rpc_err(denied.code, denied.message))?;
+                // Without storage, gateway ownership cannot be verified.
+                // Skip this optional effect for scoped callers while retaining
+                // the existing finalization checks for their RPC session.
+                if self.scoped_principal_id_from(grants.as_ref()).is_none() {
+                    gateway_cancellation =
+                        Some(coordination.signal_deletion_at_generation(&gateway_key, *generation));
+                }
             }
         }
         let _gateway_cancellation = gateway_cancellation;
@@ -32969,6 +32985,77 @@ mod tests {
                     transcript_generation
                 );
             }
+        }
+    }
+
+    // The optional gateway cancellation must not reject a scoped caller when
+    // its owner cannot be verified. The existing finalization check still
+    // refuses scoped deletion without durable storage; preserve that policy.
+    #[tokio::test]
+    async fn rpc_delete_scoped_live_session_without_backend() {
+        use zeroclaw_infra::gateway_session::{GatewaySessionCoordination, register_cancel_token};
+
+        for administrator in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = if administrator {
+                two_user_config_with_administrator_alice(&tmp)
+            } else {
+                two_user_config(&tmp)
+            };
+            let data_dir = config.data_dir.clone();
+            let (mut fixture, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+            let coordination = GatewaySessionCoordination::for_gateway();
+            let ctx = Arc::get_mut(&mut fixture.ctx).unwrap();
+            ctx.session_backend = None;
+            ctx.gateway_sessions = Some(coordination.clone());
+            let owner = scoped_dispatcher(&fixture.ctx, 4242).await;
+            let sid = "live-without-store";
+            owner
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent", "session_id": sid, "chat_mode": "chat"
+                }))
+                .await
+                .unwrap();
+            let key = zeroclaw_infra::gateway_session::gateway_cancel_key(sid);
+            let (generation, _lease) = coordination.queue().capture_generation(&key).await;
+            let transcript_generation = coordination.queue().transcript_generation(&key);
+            let token = Arc::new(CancellationToken::new());
+            register_cancel_token(
+                coordination.cancellations(),
+                &key,
+                &key,
+                generation,
+                token.clone(),
+            );
+            let (arrived, release) = sessions.set_test_effect_pause("removal-store");
+            let params = json!({"session_id": sid});
+            let deletion = owner.handle_session_delete(&params);
+            tokio::pin!(deletion);
+            tokio::select! {
+                reached = tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified()) => {
+                    reached.expect("deletion must reach finalization");
+                }
+                result = &mut deletion => panic!("optional cancellation rejected before finalization: {result:?}"),
+            }
+            assert_eq!(token.is_cancelled(), administrator);
+            release.notify_one();
+            let result = deletion.await;
+            if administrator {
+                assert_eq!(result.unwrap()["deleted"], true);
+                assert!(sessions.get_agent(sid).await.is_none());
+            } else {
+                assert_eq!(result.unwrap_err().code, FORBIDDEN);
+                assert!(sessions.get_agent(sid).await.is_some());
+            }
+            assert_eq!(token.is_cancelled(), administrator);
+            assert_eq!(
+                coordination.queue().lifecycle_generation(&key).await,
+                generation
+            );
+            assert_eq!(
+                coordination.queue().transcript_generation(&key),
+                transcript_generation
+            );
         }
     }
 
