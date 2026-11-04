@@ -3914,19 +3914,7 @@ impl OpenAiCompatibleModelProvider {
             return false;
         }
 
-        let lower = error.to_lowercase();
-        [
-            "unknown parameter: tools",
-            "unsupported parameter: tools",
-            "unrecognized field `tools`",
-            "does not support tools",
-            "function calling is not supported",
-            "tool_choice",
-            "tool call validation failed",
-            "was not in request",
-        ]
-        .iter()
-        .any(|hint| lower.contains(hint))
+        super::rejects_native_tool_calling_message(error)
     }
 }
 

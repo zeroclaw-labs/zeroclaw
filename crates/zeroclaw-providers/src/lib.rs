@@ -1238,8 +1238,11 @@ pub fn rejects_native_tool_calling_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     let clauses = error_message_clauses(&message);
     clauses.into_iter().any(|clause| {
+        // An unknown or invalid `tool_choice` is a tool-spec rejection on its own.
+        if clause.contains("tool_choice") {
+            return true;
+        }
         let mentions_native_tools = mentions_tools_token(clause)
-            || clause.contains("tool_choice")
             || clause.contains("function_call")
             || clause.contains("function calling")
             || clause.contains("function call");
