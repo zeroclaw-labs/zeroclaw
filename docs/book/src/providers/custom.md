@@ -14,7 +14,7 @@ This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `m
 
 Custom OpenAI-compatible endpoints default to native tool calling, whether referenced as a `custom.<alias>` entry or as a bare `custom:<url>`. If a gateway rejects `tools`, `tool_choice`, or function-calling fields, the turn retries once with prompt-guided tools and logs a warning. To skip the failing native request entirely, set `native_tools = false` on `[providers.models.custom.<alias>]`; a bare `custom:<url>` has no entry to carry that setting, so define an alias with the same `uri` and reference it instead.
 
-For a gateway that cannot accept image-bearing tool results, omit those payloads while retaining the surrounding tool text:
+For a gateway that cannot accept image-bearing tool results, omit those payloads while retaining the surrounding tool text. Tool images are declared in an `attachments` array on the native tool-result carrier, so omitting them never edits the result text. This policy governs the native `role = "tool"` carrier's `attachments` array only; prompt-mode tool results (the count-line carrier delivered in a user message) resolve their declared images through a separate path and are unaffected by the setting. To opt in:
 
 ```toml
 [providers.models.custom.gateway]

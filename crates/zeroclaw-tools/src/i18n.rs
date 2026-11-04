@@ -278,4 +278,46 @@ mod tests {
         );
         assert!(value.contains("404 Not Found"));
     }
+
+    #[test]
+    fn model_routing_profile_errors_use_translation_and_english_fallback() {
+        let args = [("agent", "coder"), ("profile", "shared")];
+        for kind in ["risk", "runtime"] {
+            let cases = [
+                (
+                    format!("tool-model-routing-config-error-missing-{kind}-profile"),
+                    format!("agent `coder` references missing {kind} profile `shared`"),
+                ),
+                (
+                    format!("tool-model-routing-config-error-shared-{kind}-profile"),
+                    format!(
+                        "{kind} profile `shared` is shared by another agent; refusing an agent-scoped mutation"
+                    ),
+                ),
+                (
+                    format!("tool-model-routing-config-error-{kind}-profile-collision"),
+                    format!(
+                        "{kind} profile `shared` already exists; refusing to overwrite it while isolating agent `coder`"
+                    ),
+                ),
+            ];
+            for (key, english) in cases {
+                let mut sources = ToolFtlSources {
+                    locale: "fr".to_string(),
+                    disk: Some(format!(
+                        "{key} = Agent {{$agent}}, profil {{$profile}} : modification refusee."
+                    )),
+                };
+                assert_eq!(
+                    format_tool_string_with_args(&sources, &key, &args).as_deref(),
+                    Some("Agent coder, profil shared : modification refusee.")
+                );
+                sources.disk = Some("unrelated-key = Autre message".to_string());
+                assert_eq!(
+                    format_tool_string_with_args(&sources, &key, &args).as_deref(),
+                    Some(english.as_str())
+                );
+            }
+        }
+    }
 }
