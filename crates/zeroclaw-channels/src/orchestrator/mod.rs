@@ -3620,7 +3620,9 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
         .unwrap_or(base_prompt.len());
 
         let mut refreshed = String::with_capacity(
-            base_prompt.len().saturating_sub(remnant_end.saturating_sub(start))
+            base_prompt
+                .len()
+                .saturating_sub(remnant_end.saturating_sub(start))
                 + refreshed_skills.len()
                 + 2,
         );
@@ -48074,8 +48076,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         // Turn time: the refresh replaces the remnant in place, ahead of the
         // tool protocol, instead of appending after it.
-        let refreshed =
-            "## Available Skills\n\n<available_skills>\n\n- **tiny**: A tiny skill.\n\n\
+        let refreshed = "## Available Skills\n\n<available_skills>\n\n- **tiny**: A tiny skill.\n\n\
              </available_skills>\n\n";
         let spliced = replace_available_skills_section(&cached, refreshed);
         let skills_at = spliced.find("## Available Skills").unwrap();
