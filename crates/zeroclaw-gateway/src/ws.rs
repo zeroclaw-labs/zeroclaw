@@ -866,7 +866,16 @@ async fn handle_socket(
         // Construction is delayed until the first client frame. Deletion may
         // have committed while this socket was idle; attribution setters can
         // create metadata, so they need the same fence as transcript writers.
-        let _session_guard = match state.session_queue.acquire(&session_key).await {
+        // This wait can also outlast dashboard approval authority, before
+        // the socket reaches the ordinary turn-admission loop.
+        let acquired = match acquire_turn_permit(&state, &session_key, &mut session_watch).await {
+            Ok(acquired) => acquired,
+            Err(code) => {
+                close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                return;
+            }
+        };
+        let _session_guard = match acquired {
             Ok(guard) => guard,
             Err(error) => {
                 let err = serde_json::json!({
