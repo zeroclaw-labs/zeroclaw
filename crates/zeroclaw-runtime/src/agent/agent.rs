@@ -7431,6 +7431,63 @@ mod tests {
         );
     }
 
+    /// The route is checked before the native memory tools bind. A registry
+    /// built over alice's plane has its route pinned to alice from the start;
+    /// routing it to bob is refused, and its memory tools stay on alice's
+    /// plane rather than being rebound to bob's before the refusal.
+    #[tokio::test]
+    async fn a_route_pinned_to_another_owner_refuses_routing_before_the_tools_bind() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = factory_test_config();
+        let shared: Arc<dyn Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
+        );
+        let alice: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&shared),
+            PrincipalScope::new("user:alice"),
+        ));
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let registry =
+            factory_assembled_registry(&tmp, &config, Arc::clone(&alice), &security).await;
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(registry)
+            .memory(Arc::clone(&alice))
+            .memory_security(Arc::clone(&security))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent builds");
+
+        assert!(
+            agent
+                .route_memory_to_principal(PrincipalScope::new("user:bob"))
+                .is_err()
+        );
+        assert!(agent.memory_principal().is_none());
+        let stored = agent
+            .execute_tool_for_test(
+                "memory_store",
+                serde_json::json!({"key": "b-marker", "content": "B-MARKER"}),
+            )
+            .await
+            .expect("memory_store is registered")
+            .unwrap();
+        assert!(stored.success, "{stored:?}");
+        assert!(
+            shared
+                .get_for_principal(&PrincipalScope::new("user:alice"), "b-marker")
+                .await
+                .unwrap()
+                .is_some(),
+            "the memory tools stay on alice's plane"
+        );
+    }
+
     /// Fails closed: a registry holding `spawn_subagent` that was not assembled
     /// from the factory carries no route, so pinning the session is refused
     /// and nothing about its memory moves.
