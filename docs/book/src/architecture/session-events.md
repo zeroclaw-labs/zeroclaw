@@ -326,12 +326,11 @@ of the second commit can leave the context cleared; it does not acknowledge
 success or clear the uncommitted in-memory thinking selection.
 
 Model provider identity currently uses its configured `<family>.<alias>`.
-Native RPC and HTTP configuration reject model provider alias renames because
-configuration publication cannot atomically migrate references in session
-history and frozen branches. The offline CLI also rejects the rename when
-native or migrating history exists, under configuration ownership and the
-installation format guard. Keep the existing alias. This restriction does not apply
-to non-model provider aliases.
+Provider aliases can be renamed or deleted under the existing configuration
+reference and ownership rules. These operations leave recorded model selections
+in session history and frozen branches unchanged. If a historical provider
+reference no longer resolves, the user must manually select an available model;
+history does not impose an additional restriction on configuration edits.
 
 Authenticated RPC `session/compact` accepts the owning `session_id` for chat
 and ACP sessions. It takes the foreground execution lane, records a maintenance

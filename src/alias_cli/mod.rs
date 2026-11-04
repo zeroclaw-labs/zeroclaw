@@ -957,30 +957,6 @@ pub async fn handle_providers(cmd: ProvidersCommands, config: &mut Config) -> Re
             } else {
                 None
             };
-            // Hold the existing installation fence through config persistence:
-            // a concurrent upgrade must not publish recorded model references
-            // between the check and the rename.
-            let _installation = if category == ProviderCategory::Models {
-                let sessions = config.data_dir.join("sessions");
-                let installation = tokio::task::spawn_blocking(move || {
-                    zeroclaw_infra::session_events::installation::InstallationGuard::acquire(
-                        &sessions,
-                    )
-                })
-                .await??;
-                if installation.require_legacy().is_err() {
-                    bail!(
-                        "{}",
-                        mt(
-                            "cli-alias-rename-model-native-history",
-                            "Model provider aliases cannot be renamed while native session history exists or is being migrated; keep the existing alias so recorded model selections remain resolvable."
-                        )
-                    );
-                }
-                Some(installation)
-            } else {
-                None
-            };
             rename_config(
                 config,
                 &AliasKind::Provider { category, family },

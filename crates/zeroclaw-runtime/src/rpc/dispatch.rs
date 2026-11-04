@@ -13322,17 +13322,6 @@ impl RpcDispatcher {
                     &req.to,
                 )
                 .map_err(|e| rename_error_to_rpc(&req.path, &req.from, e))?;
-                // Persisted selections can be restored from any frozen branch;
-                // refreshing live sessions cannot migrate those references.
-                if model_provider_family.is_some() && self.ctx.native_sessions.is_some() {
-                    return Err(rpc_err(
-                        INVALID_PARAMS,
-                        format!(
-                            "{}.{}: model provider alias rename is not supported while native session storage is enabled",
-                            req.path, req.from
-                        ),
-                    ));
-                }
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
@@ -33681,8 +33670,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_provider_alias_rename_preserves_config_and_persisted_selection() {
+    async fn native_provider_alias_rename_and_delete_preserve_persisted_selection() {
         use zeroclaw_api::session_events::capture::{ModelOverrideSelection, ModelRouteMode};
+        use zeroclaw_api::session_events::{EventCursor, SessionId};
 
         for backend in ["sqlite", "jsonl"] {
             let tmp = tempfile::TempDir::new().expect("directory");
@@ -33751,9 +33741,23 @@ mod tests {
                 native.restore_model_override().await.expect("selection"),
                 Some(selection.clone())
             );
+            let store = zeroclaw_infra::session_events::open_event_store(
+                &dispatcher.ctx.config.read().data_dir,
+                backend,
+            )
+            .expect("history store");
+            let stream = SessionId::parse(sid.to_owned()).expect("session ID");
+            let head = store.head(&stream).expect("history head");
+            let history = store
+                .read_page(
+                    &stream,
+                    &EventCursor::beginning(stream.clone()),
+                    Some(&head),
+                    256,
+                )
+                .expect("original history");
             let before = serde_json::to_value(dispatcher.ctx.config.snapshot()).unwrap();
             for (from, to, message) in [
-                ("pinned_provider", "renamed", "native session storage"),
                 ("pinned_provider", "pinned_provider", "must differ"),
                 ("missing", "renamed", "not found"),
             ] {
@@ -33775,12 +33779,86 @@ mod tests {
                     Some(selection.clone())
                 );
             }
+            dispatcher
+                .handle_config_map_key_rename(&json!({
+                    "path":"providers.models.openai",
+                    "from":"pinned_provider", "to":"renamed",
+                }))
+                .await
+                .expect("history does not prevent provider rename");
+            assert!(
+                dispatcher
+                    .ctx
+                    .config
+                    .read()
+                    .providers
+                    .models
+                    .find("openai", "renamed")
+                    .is_some()
+            );
+            assert_eq!(
+                native
+                    .restore_model_override()
+                    .await
+                    .expect("original selection after rename"),
+                Some(selection.clone())
+            );
+            dispatcher
+                .handle_session_configure(&json!({
+                    "session_id":sid,
+                    "overrides":{"model_provider":"openai.test-provider"},
+                }))
+                .await
+                .expect("user can manually select an available provider");
+            let manual_selection = native
+                .restore_model_override()
+                .await
+                .expect("manual selection");
+            dispatcher
+                .handle_config_map_key_delete(&json!({
+                    "path":"providers.models.openai", "key":"renamed",
+                }))
+                .await
+                .expect("history does not prevent provider deletion");
+            assert!(
+                dispatcher
+                    .ctx
+                    .config
+                    .read()
+                    .providers
+                    .models
+                    .find("openai", "renamed")
+                    .is_none()
+            );
+            assert_eq!(
+                native
+                    .restore_model_override()
+                    .await
+                    .expect("manual selection after deletion"),
+                manual_selection
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    store
+                        .read_page(
+                            &stream,
+                            &EventCursor::beginning(stream.clone()),
+                            Some(&head),
+                            256
+                        )
+                        .expect("retained history")
+                        .events
+                )
+                .unwrap(),
+                serde_json::to_value(history.events).unwrap(),
+                "configuration edits must not rewrite historical provider references"
+            );
             drop(native);
             assert!(dispatcher.ctx.sessions.remove(sid).await);
             dispatcher
                 .handle_session_new_for_test(&new_params)
                 .await
-                .expect("reopen pinned selection");
+                .expect("reopen manually selected provider");
             assert_eq!(
                 dispatcher
                     .ctx
@@ -33789,12 +33867,9 @@ mod tests {
                     .await
                     .and_then(|overrides| overrides.model_provider)
                     .as_deref(),
-                Some("openai.pinned_provider")
+                Some("openai.test-provider")
             );
-            assert_eq!(
-                model_name_for_session(&dispatcher, sid).await,
-                "pinned-model"
-            );
+            assert_eq!(model_name_for_session(&dispatcher, sid).await, "old-model");
             dispatcher
                 .handle_config_map_key_rename(&json!({
                     "path":"providers.tts.elevenlabs", "from":"voice", "to":"studio",

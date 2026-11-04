@@ -2181,24 +2181,6 @@ async fn rename_config_cascade(
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
-    // Config cascades cannot rewrite canonical selections in session history.
-    if state.native_sessions.is_some()
-        && matches!(
-            kind,
-            zeroclaw_config::alias_refs::AliasKind::Provider {
-                category: zeroclaw_config::alias_refs::ProviderCategory::Models,
-                ..
-            }
-        )
-    {
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::OpNotSupported,
-                "Model provider alias rename is not supported while native session storage is enabled",
-            )
-            .with_path(format!("{}.{}", body.path, body.from)),
-        );
-    }
     if let Err(e) = persist_and_swap(state, authorization, working, guard).await {
         return e;
     }
@@ -5097,7 +5079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_provider_alias_rename_preserves_config_and_other_alias_renames() {
+    async fn native_provider_alias_rename_updates_config_and_allows_other_alias_renames() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
         config
@@ -5115,12 +5097,6 @@ mod tests {
         )));
         let before = serde_json::to_value(state.config.snapshot()).unwrap();
         for (from, to, expected_status, code) in [
-            (
-                "primary",
-                "renamed",
-                StatusCode::BAD_REQUEST,
-                "op_not_supported",
-            ),
             (
                 "primary",
                 "primary",
@@ -5161,6 +5137,21 @@ mod tests {
                 State(state.clone()),
                 None,
                 Json(RenameMapKeyBody {
+                    path: "providers.models.openai".into(),
+                    from: "primary".into(),
+                    to: "renamed".into(),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["renamed"], true);
+        let (status, body) = response_json(
+            handle_rename_map_key(
+                State(state.clone()),
+                None,
+                Json(RenameMapKeyBody {
                     path: "providers.tts.elevenlabs".into(),
                     from: "voice".into(),
                     to: "studio".into(),
@@ -5185,7 +5176,7 @@ mod tests {
                 .read()
                 .get_map_keys("providers.models.openai")
                 .unwrap(),
-            vec!["primary".to_string()]
+            vec!["renamed".to_string()]
         );
     }
 

@@ -1125,7 +1125,7 @@ fn model_provider_rename_cli_without_native_history_updates_saved_config() {
 }
 
 #[test]
-fn model_provider_rename_cli_refuses_native_frozen_and_migrating_history() {
+fn model_provider_rename_cli_preserves_native_frozen_and_migrating_history() {
     use zeroclaw_infra::session_events::installation::{InstallationGuard, NativeBackend};
     for phase in ["sqlite", "jsonl", "frozen", "migrating"] {
         let config_dir = tempfile::tempdir().unwrap();
@@ -1171,16 +1171,18 @@ fn model_provider_rename_cli_refuses_native_frozen_and_migrating_history() {
         }
         let config_path = config_dir.path().join("config.toml");
         let locator_path = data_dir.join("sessions/session-format.json");
-        let before = std::fs::read(&config_path).unwrap();
         let before_locator = std::fs::read(&locator_path).unwrap();
         let output = run_provider_rename(config_dir.path(), "models", "ollama");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{phase} must reject rename");
-        assert!(
-            stderr.contains("native session history"),
-            "{phase}: {stderr}"
+        assert!(output.status.success(), "{phase}: {stderr}");
+        let config: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config.agents["fixture"].model_provider, "ollama.renamed");
+        assert_eq!(
+            config.get_map_keys("providers.models.ollama").unwrap(),
+            vec!["renamed".to_string()],
+            "{phase}"
         );
-        assert_eq!(std::fs::read(&config_path).unwrap(), before, "{phase}");
         assert_eq!(
             std::fs::read(&locator_path).unwrap(),
             before_locator,
@@ -1218,7 +1220,7 @@ fn model_provider_rename_cli_cannot_bypass_live_owner_without_endpoint() {
 }
 
 #[test]
-fn non_model_provider_rename_cli_ignores_native_history_guard() {
+fn non_model_provider_rename_cli_preserves_native_history() {
     let config_dir = tempfile::tempdir().unwrap();
     seed_provider_rename_config(config_dir.path());
     seed_native_provider_rename_family(
