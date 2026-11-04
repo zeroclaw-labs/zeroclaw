@@ -51,6 +51,19 @@ impl SessionRepository {
             .context("standard session storage has not been initialized")
     }
 
+    /// Run a synchronous effect while the canonical catalog holds its owner
+    /// read boundary. Metadata changes and backend cutover take the same lock.
+    pub fn with_session_owner<R>(
+        &self,
+        session_id: &str,
+        effect: impl FnOnce(Option<&str>) -> Result<R>,
+    ) -> Result<R> {
+        let view = self.view()?;
+        let record = view.required(session_id)?;
+        let owner: Option<String> = view::RepositoryView::value(&record, "principal_id", None)?;
+        effect(owner.as_deref())
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn legacy_fixture(data_dir: &Path) -> Result<Self> {
         let mut repository = Self::new(data_dir)?;
@@ -196,9 +209,22 @@ impl SessionRepository {
             bind_interaction_surface_if_unset(session_uuid, interaction_surface)
         );
 
+        self.bind_interaction_surface_if_unset_authorized(session_uuid, interaction_surface, |_| {
+            Ok(())
+        })
+    }
+
+    pub fn bind_interaction_surface_if_unset_authorized<G>(
+        &self,
+        session_uuid: &str,
+        interaction_surface: &str,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<String> {
         let native = self.view()?;
 
         let record = native.required(session_uuid)?;
+        let owner: Option<String> = view::RepositoryView::value(&record, "principal_id", None)?;
+        let _authority = authorize(owner.as_deref())?;
         let surface: Option<String> =
             view::RepositoryView::value(&record, "interaction_surface", None)?;
         if let Some(surface) = surface {
@@ -511,8 +537,25 @@ impl SessionRepository {
             mark_session_killed_atomic_for_owner(session_uuid, owner_principal_id)
         );
 
-        let native = self.view()?;
+        self.mark_session_killed_atomic_for_owner_authorized(
+            session_uuid,
+            owner_principal_id,
+            |_| Ok(()),
+        )
+    }
 
+    pub fn mark_session_killed_atomic_for_owner_authorized<G>(
+        &self,
+        session_uuid: &str,
+        owner_principal_id: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<SessionKillTransition> {
+        let native = self.view()?;
+        let Some(record) = native.record(session_uuid)? else {
+            return Ok(SessionKillTransition::Missing);
+        };
+        let owner: Option<String> = view::RepositoryView::value(&record, "principal_id", None)?;
+        let _authority = authorize(owner.as_deref())?;
         native.kill(session_uuid, owner_principal_id)
     }
 
@@ -557,6 +600,73 @@ impl SessionRepository {
 mod tests {
     use super::*;
     use crate::session_events::{installation::NativeBackend, upgrade::upgrade_installation};
+
+    #[test]
+    fn native_owner_effect_refusal_preserves_metadata_and_lifecycle() {
+        for backend in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().expect("directory");
+            upgrade_installation(directory.path(), backend, |_| "agent".into()).expect("ready");
+            let repository = SessionRepository::new(directory.path()).expect("repository");
+            repository
+                .create_session("owned", "rpc", "agent", "/workspace", Some("owner"))
+                .expect("session");
+            assert!(
+                repository
+                    .bind_interaction_surface_if_unset_authorized(
+                        "owned",
+                        "code",
+                        |owner| -> Result<()> {
+                            assert_eq!(owner, Some("owner"));
+                            anyhow::bail!("authority revoked")
+                        }
+                    )
+                    .is_err()
+            );
+            assert!(
+                repository
+                    .mark_session_killed_atomic_for_owner_authorized(
+                        "owned",
+                        Some("owner"),
+                        |owner| -> Result<()> {
+                            assert_eq!(owner, Some("owner"));
+                            anyhow::bail!("authority revoked")
+                        }
+                    )
+                    .is_err()
+            );
+            assert!(
+                repository
+                    .with_session_owner("owned", |owner| -> Result<()> {
+                        assert_eq!(owner, Some("owner"));
+                        anyhow::bail!("disclosure refused")
+                    })
+                    .is_err()
+            );
+            assert_eq!(
+                repository
+                    .session_owner_and_surface("owned")
+                    .expect("metadata"),
+                Some((Some("owner".into()), None))
+            );
+            assert!(!repository.is_session_killed("owned").expect("lifecycle"));
+            assert_eq!(
+                repository
+                    .bind_interaction_surface_if_unset_authorized("owned", "code", |_| Ok(()))
+                    .expect("surface"),
+                "code"
+            );
+            assert!(matches!(
+                repository
+                    .mark_session_killed_atomic_for_owner_authorized(
+                        "owned",
+                        Some("owner"),
+                        |_| Ok(())
+                    )
+                    .expect("kill"),
+                SessionKillTransition::Marked
+            ));
+        }
+    }
 
     #[test]
     fn protocol_entries_share_one_canonical_session_without_changing_owner_or_creation_source() {

@@ -125,6 +125,41 @@ where
     F: Fn(TurnEvent) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    execute_turn_prepared(
+        agent,
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        steering_rx,
+        admission,
+        recovery,
+        (|guard| async { Ok(guard) }, on_event),
+    )
+    .await
+}
+
+pub async fn execute_turn_prepared<F, Fut, P, Prep>(
+    agent: Arc<Mutex<Agent>>,
+    prompt: impl Into<zeroclaw_api::model_provider::ChatMessage>,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
+    admission: Option<TurnAdmission>,
+    recovery: Option<TurnRecovery>,
+    callbacks: (P, F),
+) -> Result<TurnOutcome, TurnError>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+    P: FnOnce(tokio::sync::OwnedMutexGuard<Agent>) -> Prep + Send + 'static,
+    Prep: std::future::Future<Output = Result<tokio::sync::OwnedMutexGuard<Agent>, StreamedTurnError>>
+        + Send,
+{
+    let (prepare, on_event) = callbacks;
     let prompt = prompt.into();
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
@@ -143,7 +178,8 @@ where
         let mut steering_rx = steering_rx;
         let mut admission = admission;
         let mut attribution = attribution;
-        let mut guard = agent.lock().await;
+        let guard = agent.lock_owned().await;
+        let mut guard = prepare(guard).await?;
         // Judged on this guard, with no await before the turn starts under
         // it: every earlier check predates at least this lock wait.
         if let Some(admit) = admission.as_mut()
