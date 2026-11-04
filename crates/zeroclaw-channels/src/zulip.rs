@@ -26,8 +26,8 @@ use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::channel::{
     ApprovalSource, AttributedApprovalResponse, Channel, ChannelApprovalRequest,
-    ChannelApprovalResponse, ChannelGatePrompt, ChannelMessage, GateChoiceKind, ListenerHealth,
-    SendMessage,
+    ChannelApprovalResponse, ChannelGatePrompt, ChannelMessage, FinalizePartialDelivery,
+    GateChoiceKind, ListenerHealth, SendMessage,
 };
 
 /// Zulip's long-poll returns at least a heartbeat roughly every minute.
@@ -350,6 +350,25 @@ impl BoundedSet {
                 self.items.remove(&old);
             }
         }
+    }
+}
+
+/// The orchestrator passes Unicode emoji (👀, ✅, ⚠️ …); Zulip's reaction
+/// API wants short names. Short names (with or without colons) pass through.
+fn zulip_emoji_name(emoji: &str) -> &str {
+    match emoji {
+        "\u{1F440}" => "eyes",                        // 👀
+        "\u{2705}" => "check",                        // ✅
+        "\u{274C}" => "cross_mark",                   // ❌
+        "\u{26A0}\u{FE0F}" | "\u{26A0}" => "warning", // ⚠️
+        "\u{1F44D}" => "thumbs_up",                   // 👍
+        "\u{1F44E}" => "thumbs_down",                 // 👎
+        "\u{1F6AB}" => "prohibited",                  // 🚫
+        "\u{2B50}" => "star",                         // ⭐
+        "\u{1F389}" => "tada",                        // 🎉
+        "\u{1F914}" => "thinking",                    // 🤔
+        "\u{1F525}" => "fire",                        // 🔥
+        _ => emoji.trim_matches(':'),
     }
 }
 
@@ -705,7 +724,6 @@ pub struct ZulipChannel {
     /// one bot (one per stream): only one of them, or none, should take DMs.
     dm_enabled: bool,
     proxy_url: Option<String>,
-    tls_ca_cert: Option<reqwest::Certificate>,
     gate_key: [u8; 32],
     /// Messages without a valid marker: avoids refetching them on every ✅/❌.
     not_gate: Mutex<BoundedSet>,
@@ -739,7 +757,6 @@ impl ZulipChannel {
             mention_only,
             dm_enabled: true,
             proxy_url: None,
-            tls_ca_cert: None,
             // From the config type, so the Rust default cannot drift from the serde one
             approval_timeout_secs: zeroclaw_config::schema::ZulipConfig::default()
                 .approval_timeout_secs,
@@ -781,23 +798,45 @@ impl ZulipChannel {
         Ok(self)
     }
 
+    /// Must come before `with_tls_ca_cert_path`, which builds the client.
     #[must_use]
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        debug_assert!(
+            self.client.get().is_none(),
+            "with_proxy_url called after the HTTP client was built"
+        );
         self.proxy_url = proxy_url;
         self
     }
 
     /// Loads an extra PEM root CA from `path` (servers behind a private CA).
-    pub fn with_tls_ca_cert_path(mut self, path: Option<&str>) -> Result<Self> {
-        if let Some(path) = path.map(str::trim).filter(|p| !p.is_empty()) {
-            let pem = std::fs::read(path).map_err(|e| {
-                anyhow::Error::msg(format!("cannot read Zulip tls_ca_cert_path {path}: {e}"))
-            })?;
-            let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
-                anyhow::Error::msg(format!("invalid PEM in Zulip tls_ca_cert_path {path}: {e}"))
-            })?;
-            self.tls_ca_cert = Some(cert);
-        }
+    /// The client is built here, so a bad CA or proxy fails at startup instead
+    /// of silently falling back to a client without them.
+    pub fn with_tls_ca_cert_path(self, path: Option<&str>) -> Result<Self> {
+        let Some(path) = path.map(str::trim).filter(|p| !p.is_empty()) else {
+            return Ok(self);
+        };
+        let pem = std::fs::read(path).map_err(|e| {
+            anyhow::Error::msg(format!("cannot read Zulip tls_ca_cert_path {path}: {e}"))
+        })?;
+        let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
+            anyhow::Error::msg(format!("invalid PEM in Zulip tls_ca_cert_path {path}: {e}"))
+        })?;
+        // With a private CA the client cannot come from the shared cache
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .add_root_certificate(cert);
+        let client = zeroclaw_config::schema::apply_channel_proxy_to_builder(
+            builder,
+            "channel.zulip",
+            self.proxy_url.as_deref(),
+        )
+        .build()
+        .map_err(|e| anyhow::Error::msg(format!("cannot build Zulip HTTP client: {e}")))?;
+        self.client
+            .set(client)
+            .map_err(|_| anyhow::Error::msg("Zulip HTTP client already built"))?;
         Ok(self)
     }
 
@@ -812,34 +851,14 @@ impl ZulipChannel {
     }
 
     fn http_client(&self) -> &reqwest::Client {
+        // A client with a private CA is already set by `with_tls_ca_cert_path`
         self.client.get_or_init(|| {
-            let Some(ca) = self.tls_ca_cert.clone() else {
-                return zeroclaw_config::schema::build_channel_proxy_client_with_timeouts(
-                    "channel.zulip",
-                    self.proxy_url.as_deref(),
-                    REQUEST_TIMEOUT_SECS,
-                    CONNECT_TIMEOUT_SECS,
-                );
-            };
-            // With a private CA the client cannot come from the shared cache
-            let builder = reqwest::Client::builder()
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-                .add_root_certificate(ca);
-            zeroclaw_config::schema::apply_channel_proxy_to_builder(
-                builder,
+            zeroclaw_config::schema::build_channel_proxy_client_with_timeouts(
                 "channel.zulip",
                 self.proxy_url.as_deref(),
+                REQUEST_TIMEOUT_SECS,
+                CONNECT_TIMEOUT_SECS,
             )
-            .build()
-            .unwrap_or_else(|error| {
-                log_warn(
-                    ::zeroclaw_log::Action::Note,
-                    serde_json::json!({"error": error.to_string()}),
-                    "Zulip: failed to build client with custom CA",
-                );
-                reqwest::Client::new()
-            })
         })
     }
 
@@ -1645,14 +1664,22 @@ impl Channel for ZulipChannel {
         text: &str,
         _suppress_voice: bool,
     ) -> Result<()> {
+        let target = Target::parse(recipient)?;
         let mut chunks = chunk_message(text, MAX_MESSAGE_CHARS).into_iter();
         let first = chunks.next().unwrap_or_default();
         self.edit_message(parse_message_id(message_id)?, &first)
             .await?;
-        // Whatever does not fit in one message goes into new messages
-        let target = Target::parse(recipient)?;
-        for chunk in chunks {
-            self.send_one(&target, &chunk).await?;
+        // Whatever does not fit in one message goes into new messages. The draft
+        // already shows chunk 1: on a later failure the caller must not resend it all.
+        for (delivered, chunk) in (1..).zip(chunks) {
+            if let Err(error) = self.send_one(&target, &chunk).await {
+                log_warn(
+                    ::zeroclaw_log::Action::Note,
+                    serde_json::json!({"delivered": delivered, "error": error.to_string()}),
+                    "Zulip: draft finalized only in part",
+                );
+                return Err(anyhow::Error::new(FinalizePartialDelivery { delivered }));
+            }
         }
         Ok(())
     }
@@ -1668,7 +1695,8 @@ impl Channel for ZulipChannel {
     }
 
     async fn add_reaction(&self, _channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
-        self.react(parse_message_id(message_id)?, emoji, true).await
+        self.react(parse_message_id(message_id)?, zulip_emoji_name(emoji), true)
+            .await
     }
 
     async fn remove_reaction(
@@ -1677,8 +1705,12 @@ impl Channel for ZulipChannel {
         message_id: &str,
         emoji: &str,
     ) -> Result<()> {
-        self.react(parse_message_id(message_id)?, emoji, false)
-            .await
+        self.react(
+            parse_message_id(message_id)?,
+            zulip_emoji_name(emoji),
+            false,
+        )
+        .await
     }
 
     async fn request_approval(
@@ -3044,5 +3076,78 @@ mod wire_tests {
             gate_for_message("wire", 900),
             Some(("run-w3".into(), "stream:5:approvals".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn reactions_use_zulip_short_names() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/messages/7/reactions"))
+            .and(body_string_contains("emoji_name=eyes"))
+            .respond_with(ok(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/messages/7/reactions"))
+            .and(body_string_contains("emoji_name=warning"))
+            .respond_with(ok(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ch = channel_for(&server);
+        ch.add_reaction("", "zulip_7", "\u{1F440}").await.unwrap();
+        ch.remove_reaction("", "zulip_7", "\u{26A0}\u{FE0F}")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_reports_partial_delivery() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/messages/300"))
+            .respond_with(ok(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "result": "error", "msg": "Stream does not exist", "code": "BAD_REQUEST"
+            })))
+            .mount(&server)
+            .await;
+        let ch = channel_for(&server);
+        let text = "a".repeat(MAX_MESSAGE_CHARS + 10);
+        let error = ch
+            .finalize_draft("stream:5:topic", "zulip_300", &text, false)
+            .await
+            .unwrap_err();
+        let partial = error
+            .downcast_ref::<FinalizePartialDelivery>()
+            .expect("partial delivery error");
+        assert_eq!(partial.delivered, 1);
+    }
+
+    #[test]
+    fn invalid_ca_fails_at_build_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("ca.pem");
+        std::fs::write(
+            &bad,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let built = ZulipChannel::new(
+            "https://zulip.example.com".into(),
+            "bot@example.com".into(),
+            "secret".into(),
+            "wire",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_tls_ca_cert_path(bad.to_str());
+        assert!(built.is_err());
     }
 }
