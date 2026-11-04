@@ -178,6 +178,7 @@ mod tests {
             arguments_summary: "path=a.txt".to_string(),
             raw_arguments: None,
             position: None,
+            thread_ts: None,
         }
     }
 
