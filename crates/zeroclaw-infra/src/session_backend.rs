@@ -146,8 +146,14 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-/// Trait for session persistence backends.
-/// Implementations must be `Send + Sync` for sharing across async tasks.
+/// A caller-owned, synchronous authority hold. Storage knows no runtime policy.
+pub trait SessionEffectGuard {}
+impl<T> SessionEffectGuard for T {}
+
+pub type SessionEffectAuthorization<'a> =
+    dyn Fn(Option<&str>) -> std::io::Result<Box<dyn SessionEffectGuard + 'a>> + 'a;
+
+/// Trait for session persistence backends shared across async tasks.
 pub trait SessionBackend: Send + Sync {
     /// Admit prompt access, creating an empty owner before its first message
     /// when necessary. Only a primary-turn/session admission may call this.
@@ -158,6 +164,20 @@ pub trait SessionBackend: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Admit an attachment owner after acquiring the storage mutation boundary.
+    /// Hold the caller's current authority through creation and commit. The
+    /// callback must not re-enter this backend; unsupported stores fail closed.
+    fn admit_session_prompt_owner_authorized(
+        &self,
+        _session_key: &str,
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<SessionPromptOwner> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session prompt admission unsupported",
         ))
     }
 
@@ -403,6 +423,22 @@ pub trait SessionBackend: Send + Sync {
         Ok(deleted)
     }
 
+    /// Delete a complete alias set atomically, checking every existing owner's
+    /// equality and current authority under the storage serialization boundary.
+    /// Retain the returned guard through commit; never emulate this with a
+    /// sequence of single-key commits. Unsupported stores fail closed.
+    fn delete_session_key_set_authorized(
+        &self,
+        _session_keys: &[&str],
+        _expected_owner: Option<&str>,
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session key-set deletion unsupported",
+        ))
+    }
+
     fn clear_agent_attribution(&self, _agent_alias: &str) -> std::io::Result<usize> {
         Ok(0)
     }
@@ -574,11 +610,49 @@ pub trait SessionBackend: Send + Sync {
         ))
     }
 
-    /// Delete a session ONLY if `owner_principal_id` matches the stored
-    /// owner: the ownership check and the destruction of the ownership row
-    /// are one SQL statement (the RFC 7141 atomic storage predicate), so a
-    /// concurrent re-stamp cannot race them apart. Backends without
-    /// ownership support fail closed: `Ok(false)`, nothing deleted.
+    /// Invoke a disclosure effect under the backend's owner-read boundary.
+    fn with_session_owner(
+        &self,
+        _session_key: &str,
+        _effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session disclosure unsupported",
+        ))
+    }
+
+    /// Authorize after the backend serialization boundary, retaining the guard
+    /// through the exact-owner mutation. Unsupported stores fail closed.
+    fn delete_session_authorized(
+        &self,
+        _session_key: &str,
+        _expected_owner: Option<&str>,
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session deletion unsupported",
+        ))
+    }
+
+    /// Backends with no state effect still admit against the caller's locked
+    /// live incarnation. Persisting implementations must resolve the stored owner
+    /// under their mutation lock instead of trusting this fallback identity.
+    fn set_session_state_authorized(
+        &self,
+        _session_key: &str,
+        _state: &str,
+        _turn_id: Option<&str>,
+        live_owner: Option<&str>,
+        authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<()> {
+        let _authority = authorize(live_owner)?;
+        Ok(())
+    }
+
+    /// Delete only a matching stored owner. Backends without ownership support
+    /// fail closed without deleting anything.
     fn delete_session_owned(
         &self,
         _session_key: &str,

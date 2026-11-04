@@ -27,6 +27,21 @@ deleted owner or accessing a replacement session with the same key. An empty
 session may acquire its owner at admission before its first message; daemon
 restart preserves the stored owner and attachments.
 
+RPC operations also recheck the caller's current authority after waiting for
+session or storage access. Losing permission while queued cannot authorize
+attachment-owner creation, cancellation, or deletion. Deleting Chat aliases
+still uses one storage transaction, including their prompt attachments.
+An attachment-load failure before execution preparation leaves the session
+idle and reports a failed turn to the client.
+
+Custom `SessionBackend` implementations used by RPC must implement the guarded
+`admit_session_prompt_owner_authorized` and `delete_session_key_set_authorized`
+operations when they support the corresponding effects. Resolve the supplied
+authority callback after taking the storage serialization boundary and retain
+its guard through commit. The callback must not re-enter the backend. The
+default implementations reject these effects; forwarding decorators must
+forward the callback and the entire alias set without splitting commits.
+
 `/new` attempts that same durable cleanup even when prompt injection is
 currently disabled, provided a durable session backend is attached. If that
 backend cannot prove that cleanup completed, the command reports failure and

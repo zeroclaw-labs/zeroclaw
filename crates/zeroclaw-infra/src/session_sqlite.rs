@@ -1174,8 +1174,28 @@ impl SqliteSessionBackend {
 
 impl SessionBackend for SqliteSessionBackend {
     fn admit_session_prompt_owner(&self, session_key: &str) -> std::io::Result<SessionPromptOwner> {
+        self.admit_session_prompt_owner_authorized(session_key, &|_| Ok(Box::new(())))
+    }
+
+    fn admit_session_prompt_owner_authorized(
+        &self,
+        session_key: &str,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<SessionPromptOwner> {
         let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let principal: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        let _authority = authorize(principal.as_deref())?;
         let now = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
@@ -1739,6 +1759,119 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(!owned_keys.is_empty())
     }
 
+    fn with_session_owner(
+        &self,
+        session_key: &str,
+        effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        effect(owner.as_deref())
+    }
+
+    fn delete_session_authorized(
+        &self,
+        session_key: &str,
+        expected_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        self.delete_session_key_set_authorized(&[session_key], expected_owner, authorize)
+    }
+
+    fn delete_session_key_set_authorized(
+        &self,
+        session_keys: &[&str],
+        expected_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let mut keys = Vec::new();
+        for key in session_keys {
+            if keys.contains(key) {
+                continue;
+            }
+            let owner: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(std::io::Error::other)?;
+            let Some(owner) = owner else {
+                continue;
+            };
+            if owner.as_deref() != expected_owner {
+                return Ok(false);
+            }
+            keys.push(*key);
+        }
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        // Every row has the same checked owner. Resolve once under both storage
+        // boundaries and retain that hold through commit; reacquiring a fair
+        // authority lock per alias could deadlock behind a queued publisher.
+        let _authority = authorize(expected_owner)?;
+        for key in &keys {
+            tx.execute("DELETE FROM sessions WHERE session_key = ?1", params![key])
+                .map_err(std::io::Error::other)?;
+            let deleted = tx
+                .execute(
+                    "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id IS ?2",
+                    params![key, expected_owner],
+                )
+                .map_err(std::io::Error::other)?;
+            if deleted != 1 {
+                return Err(std::io::Error::other(
+                    "authorized session key changed during deletion",
+                ));
+            }
+        }
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(!keys.is_empty())
+    }
+
+    fn set_session_state_authorized(
+        &self,
+        session_key: &str,
+        state: &str,
+        turn_id: Option<&str>,
+        _live_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        let _authority = authorize(owner.as_deref())?;
+        let now = Utc::now().to_rfc3339();
+        let started_at = (state == "running").then_some(now.as_str());
+        tx.execute("UPDATE session_metadata SET state = ?1, turn_id = ?2, turn_started_at = ?3 WHERE session_key = ?4", params![state, turn_id, started_at, session_key]).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
     fn delete_session_owned(
         &self,
         session_key: &str,
@@ -2197,6 +2330,76 @@ impl SessionBackend for SqliteSessionBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guarded_state_and_delete_recheck_owner_and_authority_after_connection_wait() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        for delete in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+            backend.set_session_agent_alias("s", "test").unwrap();
+            backend.set_session_principal("s", "user:bob").unwrap();
+            backend.append("s", &ChatMessage::user("private")).unwrap();
+            let before = backend.get_session_state("s").unwrap();
+            let allowed = Arc::new(AtomicBool::new(true));
+            let lock = backend.conn.lock();
+            let (started, waiting) = std::sync::mpsc::channel();
+            let worker_backend = Arc::clone(&backend);
+            let worker_allowed = Arc::clone(&allowed);
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let authorize = |owner: Option<&str>| -> std::io::Result<
+                    Box<dyn crate::session_backend::SessionEffectGuard>,
+                > {
+                    assert_eq!(owner, Some("user:bob"));
+                    if !worker_allowed.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "revoked",
+                        ));
+                    }
+                    Ok(Box::new(()))
+                };
+                if delete {
+                    worker_backend
+                        .delete_session_authorized("s", Some("user:bob"), &authorize)
+                        .map(|_| ())
+                } else {
+                    worker_backend.set_session_state_authorized(
+                        "s",
+                        "running",
+                        Some("turn"),
+                        Some("user:alice"),
+                        &authorize,
+                    )
+                }
+            });
+            waiting.recv().unwrap();
+            allowed.store(false, Ordering::SeqCst);
+            drop(lock);
+            assert!(worker.join().unwrap().is_err());
+            assert_eq!(
+                backend.get_session_state("s").unwrap().map(|s| (
+                    s.state,
+                    s.turn_id,
+                    s.turn_started_at
+                )),
+                before.map(|s| (s.state, s.turn_id, s.turn_started_at))
+            );
+            assert_eq!(backend.load("s").len(), 1);
+            assert_eq!(
+                backend
+                    .get_session_metadata("s")
+                    .unwrap()
+                    .principal_id
+                    .as_deref(),
+                Some("user:bob")
+            );
+        }
+    }
+
     use super::*;
     use crate::session_prompts::MAX_SESSION_PROMPT_BYTES;
     use crate::session_store::SessionStore;
@@ -3091,6 +3294,121 @@ mod tests {
                 1,
                 "{key} prompt attachments must survive"
             );
+        }
+    }
+
+    #[test]
+    fn authorized_alias_delete_rolls_back_and_resolves_authority_once() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let keys = ["guarded", "rpc_guarded", "gw_guarded"];
+        for key in keys {
+            backend.append(key, &ChatMessage::user("history")).unwrap();
+            backend.set_session_principal(key, "user:alice").unwrap();
+            backend.set_session_prompt(key, "task", "context").unwrap();
+        }
+        backend
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER reject_guarded_delete BEFORE DELETE ON session_metadata \
+             WHEN OLD.session_key = 'gw_guarded' \
+             BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let authorize = |owner: Option<&str>| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard>,
+        > {
+            assert_eq!(owner, Some("user:alice"));
+            calls.set(calls.get() + 1);
+            Ok(Box::new(()))
+        };
+        assert!(
+            backend
+                .delete_session_key_set_authorized(&keys, Some("user:alice"), &authorize)
+                .is_err()
+        );
+        assert_eq!(calls.get(), 1);
+        for key in keys {
+            assert_eq!(backend.load(key).len(), 1);
+            assert_eq!(backend.list_session_prompts(key).unwrap().len(), 1);
+        }
+        backend
+            .conn
+            .lock()
+            .execute_batch("DROP TRIGGER reject_guarded_delete")
+            .unwrap();
+        assert!(
+            backend
+                .delete_session_key_set_authorized(&keys, Some("user:alice"), &authorize)
+                .unwrap()
+        );
+        assert_eq!(calls.get(), 2);
+        for key in keys {
+            assert!(!backend.session_exists(key));
+            assert!(backend.list_session_prompts(key).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn guarded_prompt_effects_recheck_authority_after_connection_wait() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        for delete in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+            let keys = ["guarded", "rpc_guarded", "gw_guarded"];
+            if delete {
+                for key in keys {
+                    backend.append(key, &ChatMessage::user("history")).unwrap();
+                    backend.set_session_principal(key, "user:alice").unwrap();
+                    backend.set_session_prompt(key, "task", "context").unwrap();
+                }
+            }
+            let allowed = Arc::new(AtomicBool::new(true));
+            let lock = backend.conn.lock();
+            let worker_backend = Arc::clone(&backend);
+            let worker_allowed = Arc::clone(&allowed);
+            let (started, waiting) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let authorize = |owner: Option<&str>| -> std::io::Result<
+                    Box<dyn crate::session_backend::SessionEffectGuard>,
+                > {
+                    assert_eq!(owner, delete.then_some("user:alice"));
+                    assert!(!worker_allowed.load(Ordering::SeqCst));
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "revoked",
+                    ))
+                };
+                if delete {
+                    worker_backend
+                        .delete_session_key_set_authorized(&keys, Some("user:alice"), &authorize)
+                        .map(|_| ())
+                } else {
+                    worker_backend
+                        .admit_session_prompt_owner_authorized("guarded", &authorize)
+                        .map(|_| ())
+                }
+            });
+            waiting.recv().unwrap();
+            allowed.store(false, Ordering::SeqCst);
+            drop(lock);
+            assert_eq!(
+                worker.join().unwrap().unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            for key in keys {
+                assert_eq!(backend.session_exists(key), delete);
+                if delete {
+                    assert_eq!(backend.load(key).len(), 1);
+                    assert_eq!(backend.list_session_prompts(key).unwrap().len(), 1);
+                }
+            }
         }
     }
 
