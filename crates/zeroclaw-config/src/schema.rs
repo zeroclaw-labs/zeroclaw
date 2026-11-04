@@ -40077,15 +40077,16 @@ api_token = "tok"
             listener.local_addr().expect("fixture address")
         );
         let server = zeroclaw_spawn::spawn!(async move {
-            let mut connection_id = 0;
             loop {
                 let (socket, _) = listener.accept().await.expect("HTTP fixture connection");
-                let body = connection_id.to_string();
-                connection_id += 1;
                 zeroclaw_spawn::spawn!(async move {
                     let mut socket = BufReader::new(socket);
                     let mut line = String::new();
+                    // Pool checkout can race a speculative connection. Bind a
+                    // socket to its first request's runtime, not an accept ID.
+                    let mut connection_runtime = None;
                     loop {
+                        let mut request_runtime = None;
                         loop {
                             line.clear();
                             if socket.read_line(&mut line).await.expect("request header") == 0 {
@@ -40094,7 +40095,15 @@ api_token = "tok"
                             if line == "\r\n" {
                                 break;
                             }
+                            if let Some((name, value)) = line.split_once(':')
+                                && name.eq_ignore_ascii_case("x-fixture-runtime")
+                            {
+                                request_runtime = Some(value.trim().to_owned());
+                            }
                         }
+                        let body = connection_runtime.get_or_insert(
+                            request_runtime.expect("request must identify its runtime"),
+                        );
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
                             body.len()
@@ -40122,29 +40131,39 @@ api_token = "tok"
             let first = new_runtime();
             let second = new_runtime();
             let service_key = format!("model_provider.runtime_scope.{}", uuid::Uuid::new_v4());
-            let request = |runtime: &tokio::runtime::Runtime| {
+            let cache_key = runtime_proxy_cache_key(&service_key, Some(5), Some(5));
+            let request = |runtime: &tokio::runtime::Runtime, label: &str, cached: bool| {
                 runtime.block_on(async {
-                    build_runtime_proxy_client_with_timeouts(&service_key, 5, 5)
+                    assert_eq!(runtime_proxy_cache_contains(&cache_key), cached);
+                    let client = build_runtime_proxy_client_with_timeouts(&service_key, 5, 5);
+                    {
+                        let cache = runtime_proxy_client_cache().read().unwrap();
+                        let entry = cache.get(&cache_key).expect("cached client");
+                        assert_eq!(entry.runtime_id, runtime.handle().id());
+                        assert_eq!(entry.generation, runtime_proxy_current_generation());
+                    }
+                    client
                         .get(&url)
+                        .header("x-fixture-runtime", label)
                         .send()
                         .await
                         .expect("request must use a live runtime")
                         .text()
                         .await
-                        .expect("connection identity")
+                        .expect("connection runtime")
                 })
             };
-            assert_eq!(request(&first), "0");
-            assert_eq!(request(&first), "0", "same-runtime pooling must remain");
+            assert_eq!(request(&first, "first", false), "first");
+            assert_eq!(request(&first, "first", true), "first");
             assert_eq!(
-                request(&second),
-                "1",
+                request(&second, "second", false),
+                "second",
                 "another runtime cannot borrow the first runtime's connection"
             );
             drop(first);
             assert_eq!(
-                request(&second),
-                "1",
+                request(&second, "second", true),
+                "second",
                 "the second runtime's pool must survive the first runtime's shutdown"
             );
         })
