@@ -12,6 +12,7 @@ use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
+const SCENARIO_REQUIRED_STRING_FIELDS: [&str; 3] = ["hint", "model_provider", "model"];
 
 /// Why a model probe failed.
 ///
@@ -269,6 +270,28 @@ impl ModelRoutingConfigTool {
         }
 
         anyhow::bail!("'{field}' must be a string, string[], or delegate target object[]")
+    }
+
+    fn validate_scenario_required_strings(args: &Value) -> anyhow::Result<()> {
+        let invalid: Vec<&str> = SCENARIO_REQUIRED_STRING_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| {
+                args.get(*field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+            .collect();
+        if !invalid.is_empty() {
+            anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                "tool-model-routing-config-invalid-scenario",
+                &[
+                    ("required", &SCENARIO_REQUIRED_STRING_FIELDS.join(", ")),
+                    ("invalid", &invalid.join(", ")),
+                ],
+            ));
+        }
+        Ok(())
     }
 
     fn parse_non_empty_string(args: &Value, field: &str) -> anyhow::Result<String> {
@@ -950,6 +973,7 @@ impl ModelRoutingConfigTool {
     }
 
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
+        Self::validate_scenario_required_strings(args)?;
         let hint = Self::parse_non_empty_string(args, "hint")?;
         let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
         let model = Self::parse_non_empty_string(args, "model")?;
@@ -1567,6 +1591,16 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn parameters_schema(&self) -> Value {
+        let scenario_string_properties: serde_json::Map<String, Value> =
+            SCENARIO_REQUIRED_STRING_FIELDS
+                .iter()
+                .map(|field| {
+                    (
+                        (*field).to_string(),
+                        json!({"type": "string", "minLength": 1, "pattern": "\\S"}),
+                    )
+                })
+                .collect();
         let delegates_schema = json!({
             "description": "Explicit delegate roster. Accepts a comma-separated string, string array, or objects with {agent, mode}; mode is bounded or independent.",
             "oneOf": [
@@ -1612,15 +1646,15 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "hint": {
                     "type": "string",
-                    "description": "Scenario hint name (for example: conversation, coding, reasoning)"
+                    "description": "Scenario hint name (for example: conversation, coding, reasoning). Required and nonblank for upsert_scenario."
                 },
                 "model_provider": {
                     "type": "string",
-                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent"
+                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent. Required and nonblank for upsert_scenario."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref"
+                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref. Required and nonblank for upsert_scenario."
                 },
                 "temperature": {
                     "type": ["number", "null"],
@@ -1702,7 +1736,16 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "delegates": delegates_schema
             },
-            "additionalProperties": false
+            "additionalProperties": false,
+            // The selector is required so omitted action keeps the read-only get default.
+            "if": {
+                "required": ["action"],
+                "properties": {"action": {"enum": ["upsert_scenario"]}}
+            },
+            "then": {
+                "required": SCENARIO_REQUIRED_STRING_FIELDS,
+                "properties": scenario_string_properties
+            }
         })
     }
 
@@ -1794,6 +1837,121 @@ mod tests {
         let contents = std::fs::read_to_string(cfg_path).ok()?;
         let cfg = zeroclaw_config::migration::migrate_to_current(&contents).ok()?;
         cfg.providers.models.find(family, alias).cloned()
+    }
+
+    #[test]
+    fn scenario_requirements_reach_cleaned_schema_and_tool_prompt() {
+        let tool = ModelRoutingConfigTool::new(Arc::new(Config::default()), test_security());
+        let spec = tool.spec();
+        let openai =
+            zeroclaw_api::schema::SchemaCleanr::clean_for_openai((*spec.parameters).clone());
+        let anthropic =
+            zeroclaw_api::schema::SchemaCleanr::clean_for_anthropic((*spec.parameters).clone());
+
+        for schema in [spec.parameters.as_ref(), &openai, &anthropic] {
+            assert_eq!(schema["type"], "object");
+            assert!(schema.get("required").is_none());
+            for composition in ["allOf", "anyOf", "oneOf"] {
+                assert!(schema.get(composition).is_none());
+            }
+            assert_eq!(schema["if"]["required"], json!(["action"]));
+            assert_eq!(
+                schema["if"]["properties"]["action"]["enum"],
+                json!(["upsert_scenario"])
+            );
+            assert_eq!(
+                schema["then"]["required"],
+                json!(["hint", "model_provider", "model"])
+            );
+            for field in ["hint", "model_provider", "model"] {
+                assert_eq!(
+                    schema["then"]["properties"][field],
+                    json!({"type": "string", "minLength": 1, "pattern": "\\S"})
+                );
+            }
+        }
+
+        let parameters = serde_json::to_string(&spec.parameters).unwrap();
+        let prompt = zeroclaw_api::model_provider::build_tool_instructions_text(&[spec]);
+        assert!(prompt.contains(&format!("Parameters: `{parameters}`")));
+    }
+
+    #[tokio::test]
+    async fn invalid_scenario_reports_all_required_strings_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let original = fs::read(&config.config_path).unwrap();
+        let tool = ModelRoutingConfigTool::new(config.clone(), test_security());
+
+        for (args, invalid) in [
+            (
+                json!({"action": "upsert_scenario"}),
+                "hint, model_provider, model",
+            ),
+            (
+                json!({"action": "upsert_scenario", "hint": null, "model_provider": 42, "model": " \t\n"}),
+                "hint, model_provider, model",
+            ),
+            (
+                json!({"action": "upsert_scenario", "hint": "coding"}),
+                "model_provider, model",
+            ),
+            (
+                json!({"action": "upsert_scenario", "hint": "coding", "model_provider": "openai", "model": "\u{2003}"}),
+                "model",
+            ),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success);
+            let error = result.error.unwrap();
+            assert!(error.contains("Supply nonempty strings for: hint, model_provider, model."));
+            assert!(error.contains(&format!(
+                "Fix missing, non-string, or blank fields: {invalid}."
+            )));
+            assert_eq!(fs::read(&config.config_path).unwrap(), original);
+        }
+
+        // No file exists at this path. Invalid arguments must win over a config-read error.
+        let missing_config = Config {
+            config_path: tmp.path().join("missing.toml"),
+            ..Config::default()
+        };
+        let tool = ModelRoutingConfigTool::new(Arc::new(missing_config), test_security());
+        let result = tool
+            .execute(json!({"action": "upsert_scenario"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("Invalid upsert_scenario arguments.")
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_requirements_do_not_change_read_or_partial_default_calls() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let tool = ModelRoutingConfigTool::new(config.clone(), test_security());
+        let implicit_get = tool.execute(json!({})).await.unwrap();
+        let explicit_get = tool.execute(json!({"action": "get"})).await.unwrap();
+        assert!(implicit_get.success);
+        assert_eq!(implicit_get.output, explicit_get.output);
+        assert!(
+            tool.execute(json!({"action": "list_hints"}))
+                .await
+                .unwrap()
+                .success
+        );
+
+        let result = tool
+            .execute(json!({"action": "set_default", "temperature": 0.3}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
     }
 
     /// Mount the OpenAI-shaped `404 model_not_found` rejection the composed
@@ -2867,6 +3025,18 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("read-only"));
+
+        let invalid_scenario = tool
+            .execute(json!({"action": "upsert_scenario"}))
+            .await
+            .unwrap();
+        assert!(!invalid_scenario.success);
+        assert!(
+            invalid_scenario
+                .error
+                .unwrap_or_default()
+                .contains("read-only")
+        );
     }
 
     #[tokio::test]
