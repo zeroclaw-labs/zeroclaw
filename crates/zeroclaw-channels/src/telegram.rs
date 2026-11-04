@@ -6268,7 +6268,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     cache.clear();
                 }
                 cache.insert(key, text);
-                return;
             }
         }
     }
