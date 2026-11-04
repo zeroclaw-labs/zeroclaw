@@ -791,11 +791,8 @@ impl ScopedToolRegistry {
             channel_room_handle,
             mut unfiltered_tool_arcs,
             capability_slots: _,
-            // Test-only capture of the concrete delegate instance; `assemble`
-            // has no use for it and must keep destructuring exhaustively so a
-            // new field cannot be silently dropped here.
-            #[cfg(test)]
-                delegate_tool: _,
+            // The Agent captures this before assembly for owner binding.
+            delegate_tool: _,
         } = built;
 
         // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for

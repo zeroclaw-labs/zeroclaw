@@ -632,7 +632,7 @@ pub struct Agent {
     /// The principal whose private memory plane `memory` is pinned to, set by
     /// `route_memory_to_principal` at session construction. `None` = the
     /// shared/legacy handle (the shared operator's sessions).
-    memory_principal: Option<String>,
+    memory_principal: Option<zeroclaw_api::memory_traits::PrincipalScope>,
     /// MCP pinned resources, read once at construction from each server's
     /// `pinned_resources` and provenance-wrapped (`trust="untrusted-external"`).
     /// Kept as attributed blocks rather than pre-rendered text so a later
@@ -676,19 +676,8 @@ pub struct Agent {
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
     turn_entry_pause: Option<TestTurnEntryPause>,
-    /// The `DelegateTool` this Agent's registry registered, in its concrete
-    /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
-    /// otherwise cannot drive the *constructed* delegate's nested-registry
-    /// build and can only re-derive the wiring by hand - which is precisely
-    /// what must not be trusted for live-config threading. `None` when the
-    /// agent has no configured delegation targets.
-    ///
-    /// `allow(dead_code)`: its only reader is the delegated live-config
-    /// regression, which additionally needs `plugins-wasm-cranelift` to have a
-    /// plugin tool to execute at all. Under a narrower test feature set the
-    /// field is written and never read.
-    #[cfg(test)]
-    #[allow(dead_code)]
+    /// Concrete delegate registered in this Agent's tool set. Owned sessions
+    /// bind their principal to it before delegation can construct child tools.
     pub(crate) delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -905,7 +894,6 @@ pub struct AgentBuilder {
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
     turn_entry_pause: Option<TestTurnEntryPause>,
-    #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -971,7 +959,6 @@ impl AgentBuilder {
             turn_datetime: None,
             #[cfg(test)]
             turn_entry_pause: None,
-            #[cfg(test)]
             delegate_tool: None,
         }
     }
@@ -1272,9 +1259,7 @@ impl AgentBuilder {
         self
     }
 
-    /// Retain the concrete `DelegateTool` the registry built, for regressions
-    /// that must drive the *constructed* delegate rather than a hand-rolled one.
-    #[cfg(test)]
+    /// Retain the concrete delegate for principal binding at session routing.
     fn delegate_tool(mut self, delegate_tool: Option<Arc<crate::tools::DelegateTool>>) -> Self {
         self.delegate_tool = delegate_tool;
         self
@@ -1488,7 +1473,6 @@ impl AgentBuilder {
             turn_datetime: self.turn_datetime,
             #[cfg(test)]
             turn_entry_pause: self.turn_entry_pause,
-            #[cfg(test)]
             delegate_tool: self.delegate_tool,
         })
     }
@@ -2155,12 +2139,21 @@ impl Agent {
         scope: zeroclaw_api::memory_traits::PrincipalScope,
     ) -> anyhow::Result<()> {
         if let Some(current) = &self.memory_principal {
-            if *current == scope.principal_id {
+            if *current == scope {
                 return Ok(());
             }
             anyhow::bail!(
-                "session memory is already pinned to principal {current:?}; refusing to re-route it"
+                "session memory is already pinned to principal {:?}; refusing to re-route it",
+                current.principal_id
             );
+        }
+        if self.delegate_tool.is_none()
+            && self
+                .tools
+                .iter()
+                .any(|tool| tool.name() == crate::tools::DelegateTool::NAME)
+        {
+            anyhow::bail!("owned session has a delegate tool without a principal binding handle");
         }
         let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
             Arc::clone(&self.memory),
@@ -2173,22 +2166,28 @@ impl Agent {
         self.tools.check_session_memory_pin(&routed)?;
         self.tools
             .rebind_memory_tools(&self.memory, Arc::clone(&routed), &self.memory_security)?;
-        // Pin the route only after the native binding accepted `routed`, so a
-        // refused routing leaves the route unpinned too. The check above and
-        // `&mut self` mean nothing pinned it to another plane since.
+        // Pin the route and bind the delegate only after the native binding
+        // accepted `routed`, so a routing the memory binding refuses leaves
+        // both unbound. The check above and `&mut self` mean nothing pinned
+        // the route to another plane since.
         self.tools
             .pin_session_memory(Arc::clone(&routed), Arc::clone(&self.memory_security))?;
+        if let Some(delegate) = &self.delegate_tool {
+            delegate.bind_principal_scope(scope.clone())?;
+        }
         // Commit only after every genuine capture's shared owner accepted its
         // one-time binding. A used/foreign owner leaves the Agent unchanged.
         self.memory = routed;
-        self.memory_principal = Some(scope.principal_id);
+        self.memory_principal = Some(scope);
         Ok(())
     }
 
     /// The principal whose private plane this session's memory is pinned to,
     /// if any.
     pub fn memory_principal(&self) -> Option<&str> {
-        self.memory_principal.as_deref()
+        self.memory_principal
+            .as_ref()
+            .map(|scope| scope.principal_id.as_str())
     }
 
     /// Apply a current principal tool ceiling to an existing session. This is
@@ -3370,9 +3369,9 @@ impl Agent {
             Vec::new()
         };
         // Captured before `assemble` consumes the result: the concrete delegate
-        // instance this registry built, so live-config regressions can drive its
-        // nested-registry construction instead of re-deriving the wiring.
-        #[cfg(test)]
+        // instance this registry built. `route_memory_to_principal` binds the
+        // session owner to it, and live-config regressions drive its
+        // nested-registry construction through it.
         let built_delegate_tool = all_tools_result.delegate_tool.clone();
         // Capture before `runtime` is moved into `ScopedAssembly`.
         let shell_profile = runtime.shell_profile();
@@ -3537,7 +3536,6 @@ impl Agent {
             };
 
         let builder = Agent::builder();
-        #[cfg(test)]
         let builder = builder.delegate_tool(built_delegate_tool);
         let mut builder = builder
             .model_provider(model_provider)
@@ -6425,7 +6423,17 @@ mod tests {
     /// BEHAVIOUR, not merely the `memory_principal()` marker.
     #[tokio::test]
     async fn routing_rebinds_the_memory_tools_to_the_owners_private_plane() {
+        assert_routing_rebinds_memory_tools(false).await;
+    }
+
+    #[tokio::test]
+    async fn routing_rebinds_memory_skill_aliases_to_the_owners_private_plane() {
+        assert_routing_rebinds_memory_tools(true).await;
+    }
+
+    async fn assert_routing_rebinds_memory_tools(aliased: bool) {
         use zeroclaw_api::memory_traits::PrincipalScope;
+
         let tmp = tempfile::TempDir::new().unwrap();
         let shared: Arc<dyn Memory> = Arc::new(
             zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
@@ -6443,6 +6451,241 @@ mod tests {
             .unwrap();
 
         let security = Arc::new(crate::security::SecurityPolicy::default());
+        let delegate = Arc::new(crate::tools::DelegateTool::new(
+            std::collections::HashMap::new(),
+            None,
+            Arc::clone(&security),
+        ));
+        // Aliases come from a builtin skill over the factory's own memory tools,
+        // as in production, so routing must reach them through those tools.
+        let skills: Vec<crate::skills::Skill> = if aliased {
+            vec![crate::skills::Skill {
+                name: "notes".to_string(),
+                description: "private memory aliases".to_string(),
+                description_localizations: Default::default(),
+                version: "1.0.0".to_string(),
+                author: None,
+                tags: Vec::new(),
+                tools: zeroclaw_tools::MEMORY_TOOL_NAMES
+                    .iter()
+                    .map(|target| crate::skills::SkillTool {
+                        name: (*target).to_string(),
+                        description: "private memory alias".to_string(),
+                        kind: "builtin".to_string(),
+                        command: String::new(),
+                        args: HashMap::new(),
+                        target: Some((*target).to_string()),
+                        locked_args: if *target == "memory_store" {
+                            HashMap::from([("category".to_string(), "core".to_string())])
+                        } else {
+                            HashMap::new()
+                        },
+                        timeout_secs: None,
+                    })
+                    .collect(),
+                prompts: Vec::new(),
+                slash_options: Vec::new(),
+                always: false,
+                location: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        let tool_name = |name: &str| {
+            if aliased {
+                format!("notes__{name}")
+            } else {
+                name.to_string()
+            }
+        };
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(
+                native_memory_registry(Arc::clone(&shared), Arc::clone(&security), &skills).await,
+            )
+            .delegate_tool(Some(Arc::clone(&delegate)))
+            .memory(Arc::clone(&shared))
+            .memory_security(Arc::clone(&security))
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent builds");
+
+        let admitted: Vec<String> = agent
+            .tools
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+
+        // Pin the session to alice's private plane; this must rebind the tools.
+        agent
+            .route_memory_to_principal(PrincipalScope::new("user:alice"))
+            .unwrap();
+        assert!(
+            delegate
+                .bind_principal_scope(PrincipalScope::new("user:mallory"))
+                .is_err(),
+            "the registered delegate must retain the session owner"
+        );
+
+        // The store tool must write to ALICE's private plane, not the shared one.
+        let store = agent
+            .tools
+            .iter()
+            .find(|t| t.name() == tool_name("memory_store"))
+            .expect("memory_store present");
+        store
+            .execute(
+                serde_json::json!({"key": "note", "content": "alice-note", "category": "daily"}),
+            )
+            .await
+            .unwrap();
+
+        // Shared plane is untouched by the owned session's store.
+        assert!(
+            shared.get("note").await.unwrap().is_none(),
+            "an owned session's memory_store must not land on the shared plane"
+        );
+        // It DID land on alice's private plane.
+        let on_alice = shared
+            .get_for_principal(&PrincipalScope::new("user:alice"), "note")
+            .await
+            .unwrap()
+            .expect("alice's private plane holds the note");
+        assert_eq!(on_alice.content, "alice-note");
+        if aliased {
+            assert_eq!(
+                on_alice.category,
+                MemoryCategory::Core,
+                "locked arguments survive routing"
+            );
+            assert!(
+                store.parameters_schema()["properties"]
+                    .get("category")
+                    .is_none()
+            );
+        }
+
+        // The recall tool must read ONLY alice's plane: neither the shared
+        // sentinel nor mallory's sentinel is reachable through the tool.
+        let recall = agent
+            .tools
+            .iter()
+            .find(|t| t.name() == tool_name("memory_recall"))
+            .expect("memory_recall present");
+        let result = recall
+            .execute(serde_json::json!({"query": "secret"}))
+            .await
+            .unwrap();
+        let text = format!("{result:?}");
+        assert!(
+            !text.contains("shared-secret"),
+            "recall leaked the shared plane: {text}"
+        );
+        assert!(
+            !text.contains("mallory-secret"),
+            "recall leaked another owner's plane: {text}"
+        );
+        agent
+            .route_memory_to_principal(PrincipalScope::new("user:alice"))
+            .unwrap();
+        assert!(
+            agent
+                .route_memory_to_principal(PrincipalScope::new("user:mallory"))
+                .is_err()
+        );
+        assert_eq!(
+            agent
+                .tools
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>(),
+            admitted,
+            "routing must preserve the admitted names"
+        );
+        if aliased {
+            let export = agent
+                .tools
+                .iter()
+                .find(|t| t.name() == tool_name("memory_export"))
+                .unwrap()
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(export.success, "{export:?}");
+            assert!(export.output.contains("alice-note"));
+            assert!(!export.output.contains("shared-secret"));
+            assert!(!export.output.contains("mallory-secret"));
+            let forget = agent
+                .tools
+                .iter()
+                .find(|t| t.name() == tool_name("memory_forget"))
+                .unwrap()
+                .execute(serde_json::json!({"key": "note"}))
+                .await
+                .unwrap();
+            assert!(forget.success, "{forget:?}");
+            assert!(
+                shared
+                    .get_for_principal(&PrincipalScope::new("user:alice"), "note")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            for scope in [PrincipalScope::new("user:alice"), mallory.clone()] {
+                shared
+                    .store_for_principal(
+                        &scope,
+                        "purge",
+                        "private row",
+                        MemoryCategory::Core,
+                        Some("session"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            shared
+                .store("purge", "shared row", MemoryCategory::Core, Some("session"))
+                .await
+                .unwrap();
+            let purge = agent
+                .tools
+                .iter()
+                .find(|t| t.name() == tool_name("memory_purge"))
+                .unwrap()
+                .execute(serde_json::json!({"session_id": "session"}))
+                .await
+                .unwrap();
+            assert!(purge.success, "{purge:?}");
+            assert!(
+                shared
+                    .get_for_principal(&PrincipalScope::new("user:alice"), "purge")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                shared
+                    .get_for_principal(&mallory, "purge")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(shared.get("purge").await.unwrap().is_some());
+        }
+    }
+
+    /// A registry from the real factory and assembly, so its native memory
+    /// tools carry the binding `route_memory_to_principal` rebinds.
+    async fn native_memory_registry(
+        memory: Arc<dyn Memory>,
+        security: Arc<crate::security::SecurityPolicy>,
+        skills: &[crate::skills::Skill],
+    ) -> crate::tools::scoped::ScopedToolRegistry {
         let config = Config::default();
         let built = crate::tools::all_tools_with_runtime_context(
             Arc::new(config.clone()),
@@ -6450,7 +6693,7 @@ mod tests {
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "default",
             Arc::new(crate::platform::NativeRuntime::new()),
-            Arc::clone(&shared),
+            memory,
             None,
             None,
             &config.browser,
@@ -6470,32 +6713,60 @@ mod tests {
             None,
         )
         .unwrap();
-        let registry = crate::tools::scoped::ScopedToolRegistry::assemble(
-            crate::tools::scoped::ScopedAssembly {
-                config: &config,
-                agent_alias: "default",
-                security: &security,
-                built,
-                skills: &[],
-                runtime: Arc::new(crate::platform::NativeRuntime::new()),
-                caller_allowed: None,
-                connect_mcp: false,
-                connect_peripherals: false,
-                exclude_memory: false,
-                acp_delivery: false,
-                list_deferred_mcp_specs: false,
-                emit_assembly_logs: false,
-                mcp_registry: None,
-            },
-        )
+        crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built,
+            skills,
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
         .await
-        .registry;
+        .registry
+    }
+
+    /// An owned session must not route while its registry holds a delegate
+    /// the Agent cannot bind: that delegate's children would build their
+    /// memory without the owner. Routing refuses, and the session stays
+    /// unpinned with its memory tools untouched.
+    #[tokio::test]
+    async fn routing_refuses_a_registered_delegate_without_a_binding_handle() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        use zeroclaw_tools::memory_store::MemoryStoreTool;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
+        );
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let delegate: Arc<dyn Tool> = Arc::new(crate::tools::DelegateTool::new(
+            std::collections::HashMap::new(),
+            None,
+            Arc::clone(&security),
+        ));
+        let raw_tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(MemoryStoreTool::new(
+                Arc::clone(&shared),
+                Arc::clone(&security),
+            )),
+            Box::new(crate::tools::ArcToolRef(delegate)),
+        ];
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(Vec::new()),
             }))
-            .tools(registry)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                raw_tools,
+            ))
             .memory(Arc::clone(&shared))
             .memory_security(Arc::clone(&security))
             .observer(observer)
@@ -6504,55 +6775,189 @@ mod tests {
             .build()
             .expect("agent builds");
 
-        // Pin the session to alice's private plane; this must rebind the tools.
-        agent
+        let error = agent
             .route_memory_to_principal(PrincipalScope::new("user:alice"))
-            .unwrap();
+            .expect_err("routing must refuse a delegate it cannot bind");
+        assert!(
+            error
+                .to_string()
+                .contains("delegate tool without a principal binding handle"),
+            "{error}"
+        );
+        assert_eq!(agent.memory_principal(), None);
 
-        // The store tool must write to ALICE's private plane, not the shared one.
+        // The memory tools were not rebound: a store still lands on the
+        // shared handle the session was built with.
         let store = agent
             .tools
             .iter()
             .find(|t| t.name() == "memory_store")
             .expect("memory_store present");
         store
+            .execute(serde_json::json!({"key": "note", "content": "unrouted-note"}))
+            .await
+            .unwrap();
+        assert!(shared.get("note").await.unwrap().is_some());
+        assert!(
+            shared
+                .get_for_principal(&PrincipalScope::new("user:alice"), "note")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A routing the memory binding refuses (a native memory tool already ran)
+    /// must not bind the delegate either: its children would build their
+    /// memory for an owner the session never took.
+    #[tokio::test]
+    async fn refused_routing_leaves_the_delegate_unbound() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("used", tmp.path()).unwrap());
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let delegate = Arc::new(crate::tools::DelegateTool::new(
+            std::collections::HashMap::new(),
+            None,
+            Arc::clone(&security),
+        ));
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(native_memory_registry(Arc::clone(&shared), Arc::clone(&security), &[]).await)
+            .delegate_tool(Some(Arc::clone(&delegate)))
+            .memory(Arc::clone(&shared))
+            .memory_security(Arc::clone(&security))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        let used = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "memory_store")
+            .unwrap()
+            .execute(serde_json::json!({"key": "before", "content": "shared-before"}))
+            .await
+            .unwrap();
+        assert!(used.success, "{used:?}");
+
+        assert!(
+            agent
+                .route_memory_to_principal(PrincipalScope::new("owner:late"))
+                .is_err()
+        );
+        assert!(agent.memory_principal().is_none());
+        assert!(
+            delegate
+                .bind_principal_scope(PrincipalScope::new("owner:other"))
+                .is_ok(),
+            "a refused routing must leave the delegate unbound"
+        );
+    }
+
+    /// A session's memory in production is the per-agent stack from
+    /// `create_memory_for_agent`, not a raw backend. Routed to an owner, its
+    /// memory tool and its auto-saved turn both reach the owner's private
+    /// plane through that stack, and neither lands on the shared plane.
+    #[tokio::test]
+    async fn routed_session_memory_on_the_agent_stack_reaches_the_owners_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.agents.insert(
+            "session".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let memory = zeroclaw_memory::create_memory_for_agent(&config, "session", None)
+            .await
+            .expect("per-agent memory stack");
+
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let capturing = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn Observer> = capturing.clone();
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                }]),
+            }))
+            .tools(native_memory_registry(Arc::clone(&memory), Arc::clone(&security), &[]).await)
+            .memory(Arc::clone(&memory))
+            .memory_security(Arc::clone(&security))
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .auto_save(true)
+            .build()
+            .expect("agent builds");
+        let owner = PrincipalScope::new("user:alice").with_agent(Some("session".to_string()));
+        agent.route_memory_to_principal(owner.clone()).unwrap();
+
+        // A turn succeeds even when its auto-save fails, so check the
+        // store outcome and the rows, not only the turn result.
+        agent.turn("compositionprobe from alice").await.unwrap();
+        assert!(
+            capturing
+                .events
+                .lock()
+                .iter()
+                .any(|e| matches!(e, ObserverEvent::MemoryStore { success: true, .. })),
+            "the owned session's auto-save must succeed"
+        );
+        let saved = memory
+            .list_for_principal(&owner, Some(&MemoryCategory::Conversation), None)
+            .await
+            .unwrap();
+        assert!(
+            saved
+                .iter()
+                .any(|entry| entry.content.contains("compositionprobe")),
+            "auto-save must land on the owner's plane: {saved:?}"
+        );
+        let shared = memory
+            .list(Some(&MemoryCategory::Conversation), None)
+            .await
+            .unwrap();
+        assert!(
+            !shared
+                .iter()
+                .any(|entry| entry.content.contains("compositionprobe")),
+            "auto-save must not land on the shared plane: {shared:?}"
+        );
+
+        let store = agent
+            .tools
+            .iter()
+            .find(|t| t.name() == "memory_store")
+            .expect("memory_store present");
+        let stored = store
             .execute(serde_json::json!({"key": "note", "content": "alice-note"}))
             .await
             .unwrap();
-
-        // Shared plane is untouched by the owned session's store.
         assert!(
-            shared.get("note").await.unwrap().is_none(),
-            "an owned session's memory_store must not land on the shared plane"
-        );
-        // It DID land on alice's private plane.
-        let on_alice = shared
-            .get_for_principal(&PrincipalScope::new("user:alice"), "note")
-            .await
-            .unwrap()
-            .expect("alice's private plane holds the note");
-        assert_eq!(on_alice.content, "alice-note");
-
-        // The recall tool must read ONLY alice's plane: neither the shared
-        // sentinel nor mallory's sentinel is reachable through the tool.
-        let recall = agent
-            .tools
-            .iter()
-            .find(|t| t.name() == "memory_recall")
-            .expect("memory_recall present");
-        let result = recall
-            .execute(serde_json::json!({"query": "secret"}))
-            .await
-            .unwrap();
-        let text = format!("{result:?}");
-        assert!(
-            !text.contains("shared-secret"),
-            "recall leaked the shared plane: {text}"
+            stored.success,
+            "owned memory_store must succeed: {stored:?}"
         );
         assert!(
-            !text.contains("mallory-secret"),
-            "recall leaked another owner's plane: {text}"
+            memory
+                .get_for_principal(&owner, "note")
+                .await
+                .unwrap()
+                .is_some()
         );
+        assert!(memory.get("note").await.unwrap().is_none());
     }
 
     async fn native_memory_binding_agent(
