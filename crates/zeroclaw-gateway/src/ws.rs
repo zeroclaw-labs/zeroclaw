@@ -3526,6 +3526,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .expect("messages")
                 .into_iter()
                 .map(|message| zeroclaw_providers::ChatMessage {
+                    timestamp: None,
                     tool_calls: Vec::new(),
                     tool_result: None,
                     reasoning_content: None,

@@ -2666,16 +2666,12 @@ async fn run_inner(
                 })
                 .unwrap_or_default();
             let context = hw_context;
-            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-            let enriched = if context.is_empty() {
-                format!("[{now}] {effective_msg}")
-            } else {
-                format!("{context}[{now}] {effective_msg}")
-            };
+            let timestamp = chrono::Utc::now().timestamp_millis();
+            let enriched = format!("{context}{effective_msg}");
 
             let mut history = vec![
                 ChatMessage::system(&system_prompt),
-                ChatMessage::user(&enriched),
+                ChatMessage::user(&enriched).with_timestamp(timestamp),
             ];
             let mut native_restored_crumb = false;
             if let Some(port) = zeroclaw_api::session_events::capture::current_session_execution()
@@ -2691,7 +2687,7 @@ async fn run_inner(
                 }
                 normalize_system_messages(&mut history);
                 crate::agent::history_pruner::remove_orphaned_tool_messages(&mut history);
-                history.push(ChatMessage::user(&enriched));
+                history.push(ChatMessage::user(&enriched).with_timestamp(timestamp));
             }
             let execution_tree_budget = ExecutionTreeBudget::current()
                 .map(|budget| budget.child())
@@ -3433,14 +3429,10 @@ async fn run_inner(
                     })
                     .unwrap_or_default();
                 let context = hw_context;
-                let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-                let enriched = if context.is_empty() {
-                    format!("[{now}] {effective_input}")
-                } else {
-                    format!("{context}[{now}] {effective_input}")
-                };
+                let timestamp = chrono::Utc::now().timestamp_millis();
+                let enriched = format!("{context}{effective_input}");
 
-                history.push(ChatMessage::user(&enriched));
+                history.push(ChatMessage::user(&enriched).with_timestamp(timestamp));
                 let execution_tree_budget = ExecutionTreeBudget::current()
                     .map(|budget| budget.child())
                     .or_else(|| {
@@ -4804,12 +4796,8 @@ async fn process_message_inner(
             })
             .unwrap_or_default();
         let context = hw_context;
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {effective_message}")
-        } else {
-            format!("{context}[{now}] {effective_message}")
-        };
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let enriched = format!("{context}{effective_message}");
 
         let native = zeroclaw_api::session_events::capture::current_session_execution();
         let restored = if let Some(port) = &native {
@@ -4832,7 +4820,11 @@ async fn process_message_inner(
             }
             normalize_system_messages(&mut history);
         }
-        history.push(ChatMessage::user(&enriched).with_attachments(__zc_message.attachments));
+        history.push(
+            ChatMessage::user(&enriched)
+                .with_timestamp(timestamp)
+                .with_attachments(__zc_message.attachments),
+        );
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,

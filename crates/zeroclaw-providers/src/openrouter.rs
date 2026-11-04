@@ -1270,6 +1270,7 @@ mod tests {
             .credential(None)
             .build();
         let messages = vec![ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
@@ -1315,6 +1316,7 @@ mod tests {
             .credential(Some("key"))
             .build();
         let messages = vec![ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
@@ -1399,6 +1401,7 @@ data: [DONE]
             .streaming_base_url(&format!("http://{addr}"))
             .build();
         let messages = vec![ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
@@ -1663,6 +1666,7 @@ data: [DONE]
             .build();
         let messages = vec![
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -1671,6 +1675,7 @@ data: [DONE]
                 content: "be concise".into(),
             },
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -1723,6 +1728,7 @@ data: [DONE]
     fn chat_request_serializes_history_messages() {
         let messages = [
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -1732,6 +1738,7 @@ data: [DONE]
                 attachments: Vec::new(),
             },
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -1820,6 +1827,7 @@ data: [DONE]
             .credential(None)
             .build();
         let messages = vec![ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
@@ -2102,6 +2110,7 @@ data: [DONE]
     fn full_native_request_serializes_system_as_blocks_user_as_string() {
         let messages = vec![
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -2110,6 +2119,7 @@ data: [DONE]
                 content: "Be helpful".into(),
             },
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -2698,6 +2708,7 @@ data: [DONE]
             .extra_body(serde_json::json!(["invalid"]))
             .build();
         let messages = vec![ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,

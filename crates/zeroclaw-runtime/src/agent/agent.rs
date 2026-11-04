@@ -13,7 +13,6 @@ use crate::security::ingress::{IngressPolicy, steering_policy};
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
-use chrono::{Datelike, Timelike};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -1386,21 +1385,6 @@ impl Agent {
         chrono::Local::now()
     }
 
-    /// Prefixes a user message with the current date/time in the labeled
-    /// shape both embedded Agent turn paths store in history, including the
-    /// streamed path used by RPC and ACP. Other runtime owners format their
-    /// own user-message envelopes independently.
-    fn enrich_user_message(&self, user_message: &str) -> String {
-        let now = self.current_turn_datetime();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
-
-        format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
-    }
-
     pub fn set_channel_name(&mut self, name: String) {
         self.channel_name = name;
     }
@@ -1561,6 +1545,7 @@ impl Agent {
             (ConversationMessage::Chat(left), ConversationMessage::Chat(right)) => {
                 left.role == right.role
                     && left.content == right.content
+                    && left.timestamp == right.timestamp
                     && left.attachments == right.attachments
             }
             (
@@ -1832,10 +1817,10 @@ impl Agent {
             });
         }
 
-        let enriched = self.enrich_user_message(user_message);
-
         let user_msg = ConversationMessage::Chat(
-            ChatMessage::user(enriched).with_attachments(input.attachments.clone()),
+            ChatMessage::user(user_message)
+                .with_timestamp(self.current_turn_datetime().timestamp_millis())
+                .with_attachments(input.attachments.clone()),
         );
         new_msgs.push(user_msg.clone());
         self.history.push(user_msg);
@@ -2117,8 +2102,8 @@ impl Agent {
                 if !self.admit_steering_input(&input, turn_id) {
                     continue;
                 }
-                // Mirror the enrichment logic from append_streamed_user_message_to_history
-                // but route through the round's messages instead of self.history/new_msgs.
+                // Append the same structured user metadata through this round's
+                // messages instead of self.history/new_msgs.
                 if self.auto_save {
                     let store_start = std::time::Instant::now();
                     let store_result = self
@@ -2140,8 +2125,8 @@ impl Agent {
                         turn_id: Some(turn_id.to_string()),
                     });
                 }
-                let enriched = self.enrich_user_message(input.text());
-                let message = ChatMessage::user(enriched)
+                let message = ChatMessage::user(input.text())
+                    .with_timestamp(self.current_turn_datetime().timestamp_millis())
                     .with_attachments(input.message().attachments.clone());
                 prepared.push((input, message));
             }
@@ -3944,10 +3929,10 @@ impl Agent {
             });
         }
 
-        let enriched = self.enrich_user_message(user_message);
-
         self.history.push(ConversationMessage::Chat(
-            ChatMessage::user(enriched).with_attachments(input.attachments.clone()),
+            ChatMessage::user(user_message)
+                .with_timestamp(self.current_turn_datetime().timestamp_millis())
+                .with_attachments(input.attachments.clone()),
         ));
 
         let active_dispatcher = {
@@ -14516,7 +14501,8 @@ mod tests {
             .rev()
             .find(|message| message.role == "user")
             .expect("provider request must contain a user message");
-        assert_eq!(provider_user.content, "hook-only provider request");
+        assert!(provider_user.content.starts_with("[CURRENT DATE & TIME: "));
+        assert!(provider_user.content.ends_with("\n\nhook-only provider request"));
         assert_eq!(seen_models.lock().as_slice(), ["hook-selected-model"]);
         let hook_inputs = hook_inputs.lock();
         let hook_user = hook_inputs[0]
@@ -15739,7 +15725,7 @@ mod tests {
         }
 
         // Frozen clock so both turns share a byte-identical bare transcript (the
-        // per-turn `[CURRENT DATE & TIME]` prefix is otherwise second-precision),
+        // provider-only timestamp rendering is otherwise second-precision),
         // which is what makes the two pre-injection cache keys collide.
         let fixed = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+00:00")
             .unwrap()
@@ -16301,24 +16287,14 @@ mod tests {
                 .any(|(role, content)| { *role == "user" && content.contains("second") }),
             "accepted steering must be retained as its own user turn"
         );
-        // The steering turn must reach history in the SAME canonical
-        // labeled envelope as the initial streamed user message. A bare
-        // `[timestamp] text` prefix is the log/API-payload shape this
-        // change exists to remove, so assert the exact envelope rather
-        // than only that the text survived.
+        // Context retains literal input; provider dispatch renders time only
+        // on the temporary request copy below.
         let committed_steering = new_chat_messages
             .iter()
             .find(|(role, content)| *role == "user" && content.contains("second"))
             .expect("accepted steering must be retained as its own user turn")
             .1;
-        assert!(
-            committed_steering.starts_with("[CURRENT DATE & TIME: "),
-            "committed steering must carry the labeled envelope, got: {committed_steering}"
-        );
-        assert!(
-            committed_steering.ends_with("]\n\nsecond"),
-            "committed steering must end with the raw user text after the envelope, got: {committed_steering}"
-        );
+        assert_eq!(committed_steering, "second");
 
         let seen = seen_messages.lock();
         assert_eq!(seen.len(), 2);
@@ -21966,7 +21942,7 @@ model_provider = "custom.only"
     }
 
     #[tokio::test]
-    async fn streamed_history_uses_labeled_shape_not_bare_timestamp() {
+    async fn streamed_history_keeps_literal_body_and_structured_time() {
         let fixed = chrono::Local
             .with_ymd_and_hms(2026, 3, 14, 9, 30, 0)
             .single()
@@ -21982,22 +21958,15 @@ model_provider = "custom.only"
             .await;
 
         let stored = stored_user_message(&agent);
-        assert!(
-            stored.starts_with("[CURRENT DATE & TIME: 2026-03-14 09:30:00"),
-            "streamed history must use the labeled shape, got: {stored}"
-        );
-        assert!(
-            stored.contains("hello there"),
-            "stored message must retain the original text: {stored}"
-        );
-        assert!(
-            !stored.starts_with("[2026-03-14 09:30:00"),
-            "streamed history must not fall back to the bare `[{{ts}}] {{msg}}` shape: {stored}"
-        );
+        assert_eq!(stored, "hello there");
+        let ConversationMessage::Chat(message) = new_msgs.last().unwrap() else {
+            panic!("expected user chat");
+        };
+        assert_eq!(message.timestamp, Some(fixed.timestamp_millis()));
     }
 
     #[tokio::test]
-    async fn streamed_and_non_streamed_enrichment_match_for_same_clock_and_message() {
+    async fn streamed_and_non_streamed_history_keep_same_body_and_time() {
         let fixed = chrono::Local
             .with_ymd_and_hms(2026, 3, 14, 9, 30, 0)
             .single()
@@ -22029,8 +21998,20 @@ model_provider = "custom.only"
 
         assert_eq!(
             streamed_content, non_streamed_content,
-            "streamed and non-streamed enrichment must be byte-identical for the same clock and message"
+            "streamed and non-streamed history must retain identical literal text"
         );
+        assert_eq!(streamed_content, "same message");
+        for agent in [&streamed_agent, &non_streamed_agent] {
+            let message = agent
+                .history()
+                .iter()
+                .find_map(|message| match message {
+                    ConversationMessage::Chat(chat) if chat.role == "user" => Some(chat),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(message.timestamp, Some(fixed.timestamp_millis()));
+        }
     }
 }
 

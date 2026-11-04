@@ -302,11 +302,6 @@ impl EngineSession {
             .restore_context()
             .await?
             .ok_or_else(|| anyhow::Error::msg("session_context_missing"))?;
-        snapshot
-            .messages
-            .push(zeroclaw_api::model_provider::ConversationMessage::Chat(
-                ChatMessage::user(observed_context),
-            ));
         let accepted = query
             .latest_event(
                 self.stream.clone(),
@@ -316,6 +311,11 @@ impl EngineSession {
             )
             .await?
             .ok_or_else(|| anyhow::Error::msg("context input admission missing"))?;
+        snapshot
+            .messages
+            .push(zeroclaw_api::model_provider::ConversationMessage::Chat(
+                ChatMessage::user(observed_context).with_timestamp(accepted.occurred_at),
+            ));
         let binding = command
             .input_payloads
             .iter()

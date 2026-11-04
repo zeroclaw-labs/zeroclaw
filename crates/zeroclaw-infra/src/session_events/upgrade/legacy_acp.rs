@@ -1588,6 +1588,7 @@ impl LegacyAcpStore {
             // result once, so the reload must present the same entries.
             if ins.is_empty() {
                 out.push(ConversationMessage::Chat(ChatMessage {
+                    timestamp: None,
                     role,
                     content,
                     attachments,
@@ -2018,6 +2019,7 @@ impl LegacyAcpStore {
             .map(|message| match message {
                 ConversationMessage::Chat(chat) if chat.role == "system" => {
                     ConversationMessage::Chat(ChatMessage {
+                        timestamp: None,
                         tool_calls: Vec::new(),
                         tool_result: None,
                         reasoning_content: None,
@@ -3242,6 +3244,7 @@ impl ProjectedGroup {
         if !self.has_tool_events {
             if range.start == 0 && range.end > 0 {
                 messages.push(ConversationMessage::Chat(ChatMessage {
+                    timestamp: None,
                     tool_calls: Vec::new(),
                     tool_result: None,
                     reasoning_content: None,
@@ -3263,6 +3266,7 @@ impl ProjectedGroup {
         let narration = usize::from(!self.content.is_empty());
         if range.start < narration && !self.content.is_empty() {
             messages.push(ConversationMessage::Chat(ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,

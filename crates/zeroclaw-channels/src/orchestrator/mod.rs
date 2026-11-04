@@ -2197,7 +2197,7 @@ fn build_channel_system_prompt_for_message(
 /// recall. Provider-side prompt caching keys on this prefix, so any
 /// per-turn data here invalidates the cache for every turn.
 ///
-/// The volatile per-turn data (datetime, reply_target, sender, message_id,
+/// The volatile per-turn data (reply_target, sender, message_id,
 /// cron_add delivery hint, and bot_mention for the current turn only)
 /// lives in [`build_channel_turn_context_preamble`] and is prepended to
 /// the outgoing user turn by the caller.
@@ -2208,8 +2208,8 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Strip volatile date sections: the per-turn
-    // [turn-context] preamble already carries time/date/weekday/tz, and a
+    // Strip volatile date sections: provider dispatch renders message time,
+    // including the weekday, from structured metadata, and a
     // ## Current Date value that changes at midnight busts the prompt cache
     // for every live channel session.
     strip_channel_prompt_volatile_date_sections(&mut prompt);
@@ -2386,7 +2386,7 @@ fn find_latest_date_heading_before(prompt: &str, before: usize) -> Option<(usize
 /// `reply_target` / `sender` / delivery hint; this helper removes that
 /// regression.)
 ///
-/// Carries: channel/reply_target/sender/message_id, the wall-clock datetime,
+/// Carries: channel/reply_target/sender/message_id,
 /// the `cron_add` delivery hint (with the webhook `delivery.thread_id`
 /// contract preserved), and (if set) the bot_mention handle.
 fn build_channel_turn_context_preamble(
@@ -2399,7 +2399,6 @@ fn build_channel_turn_context_preamble(
         return String::new();
     }
 
-    let now = chrono::Local::now();
     let channel_name = msg.channel.as_str();
     let reply_target = msg.reply_target.as_str();
     let sender = msg.sender.as_str();
@@ -2422,8 +2421,7 @@ fn build_channel_turn_context_preamble(
     };
 
     let mut preamble = format!(
-        "[turn-context] time={time} date={date} weekday={weekday} tz={tz} \
-         channel={channel} reply_target={reply_target} sender={sender} \
+        "[turn-context] channel={channel} reply_target={reply_target} sender={sender} \
          message_id={message_id}. The sender field is the platform-specific \
          user ID of the person who sent this message. Use it to distinguish \
          between different users. The message_id field identifies this \
@@ -2431,10 +2429,6 @@ fn build_channel_turn_context_preamble(
          the `reaction` tool. When scheduling delayed messages or reminders \
          via cron_add for this conversation, use {delivery_hint} so the \
          message reaches the user.\n\n",
-        time = now.format("%H:%M:%S"),
-        date = now.format("%Y-%m-%d"),
-        weekday = now.format("%A"),
-        tz = now.format("%Z"),
         channel = channel_name,
         reply_target = reply_target,
         sender = sender,
@@ -2464,11 +2458,6 @@ fn compose_outgoing_user_turn_with_context(preamble: &str, raw_user_content: &st
     }
     parts.push(raw_user_content);
     parts.join("\n\n")
-}
-
-fn timestamp_channel_user_content(content: &str) -> String {
-    let now = chrono::Local::now();
-    format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
 }
 
 fn format_whatsapp_group_history_turn(label: &str, sender: &str, content: &str) -> String {
@@ -2521,12 +2510,20 @@ fn attributed_channel_user_turn(
     content.to_string()
 }
 
-fn timestamped_channel_user_history_content(
+fn channel_user_history_content(
     msg: &zeroclaw_api::channel::ChannelMessage,
     label: &str,
 ) -> String {
-    let timestamped_content = timestamp_channel_user_content(&msg.content);
-    attributed_channel_user_turn(msg, label, &timestamped_content)
+    attributed_channel_user_turn(msg, label, &msg.content)
+}
+
+fn channel_user_history_message(msg: &ChannelMessage, label: &str) -> ChatMessage {
+    let mut message = ChatMessage::user(channel_user_history_content(msg, label))
+        .with_attachments(media_pipeline::attachment_references(&msg.attachments));
+    message.timestamp = i64::try_from(msg.timestamp)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000));
+    message
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -4096,7 +4093,9 @@ fn turns_appended_after<'a>(
             known_prefix[known_prefix.len() - n..]
                 .iter()
                 .zip(&live[..n])
-                .all(|(a, b)| a.role == b.role && a.content == b.content)
+                .all(|(a, b)| {
+                    a.role == b.role && a.content == b.content && a.timestamp == b.timestamp
+                })
         })
         .unwrap_or(0);
     &live[overlap..]
@@ -4241,7 +4240,7 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
 fn rollback_orphan_user_turn(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
-    expected_content: &str,
+    expected: &ChatMessage,
 ) -> bool {
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key
@@ -4256,9 +4255,12 @@ fn rollback_orphan_user_turn(
         return false;
     };
 
-    let should_pop = turns
-        .last()
-        .is_some_and(|turn| turn.role == "user" && turn.content == expected_content);
+    let should_pop = turns.last().is_some_and(|turn| {
+        turn.role == "user"
+            && turn.content == expected.content
+            && turn.timestamp == expected.timestamp
+            && turn.attachments == expected.attachments
+    });
     if !should_pop {
         return false;
     }
@@ -8885,13 +8887,10 @@ async fn reconcile_early_ack(
 }
 
 fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, history_key: &str) {
-    let timestamped_content =
-        timestamped_channel_user_history_content(msg, WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL);
     append_sender_turn(
         ctx,
         history_key,
-        ChatMessage::user(&timestamped_content)
-            .with_attachments(media_pipeline::attachment_references(&msg.attachments)),
+        channel_user_history_message(msg, WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL),
     );
     ::zeroclaw_log::record!(
         INFO,
@@ -9215,10 +9214,8 @@ async fn process_channel_message_body_inner(
     }
     if msg.passive_context {
         if let Some(native) = &native_history {
-            let context_text = timestamped_channel_user_history_content(
-                &msg,
-                WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL,
-            );
+            let context_text =
+                channel_user_history_content(&msg, WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL);
             let captured = async {
                 let defaults = runtime_defaults_snapshot(ctx.as_ref());
                 let route = get_route_selection(ctx.as_ref(), &msg, &history_key, &defaults);
@@ -9606,11 +9603,8 @@ async fn process_channel_message_body_inner(
             .is_some_and(|turns| !turns.is_empty())
     };
 
-    // Preserve the dated user turn verbatim before the LLM call so interrupted
-    // requests keep the same temporal context as CLI turns. History stores the
-    // full content for every marker type so a later turn can re-load it.
-    let timestamped_content =
-        timestamped_channel_user_history_content(&msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+    // Keep time as metadata so interrupted turns retain temporal context
+    // without storing provider-only textual envelopes in message bodies.
     // The returned snapshot is exactly what this turn's own append produced
     // (including any race with a concurrent same-sender worker still in
     // flight), taken under the same lock as the append itself. A separate,
@@ -9618,12 +9612,9 @@ async fn process_channel_message_body_inner(
     // write that landed in between and silently shifting what "this turn's
     // own prefix" means once the post-loop resync tries to reconcile against
     // it (see `turns_appended_after`).
-    let known_prefix = append_sender_turn(
-        ctx.as_ref(),
-        &history_key,
-        ChatMessage::user(&timestamped_content)
-            .with_attachments(media_pipeline::attachment_references(&msg.attachments)),
-    );
+    let current_user_turn =
+        channel_user_history_message(&msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+    let known_prefix = append_sender_turn(ctx.as_ref(), &history_key, current_user_turn.clone());
 
     // Build history from per-sender conversation cache.
     let prior_turns = provider_ready_cached_turns(known_prefix.clone());
@@ -11586,7 +11577,7 @@ async fn process_channel_message_body_inner(
                 let should_rollback_user_turn =
                     context_window_exceeded.is_none() && should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &current_user_turn);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -19007,7 +18998,7 @@ pub(crate) mod tests {
             ..ChannelMessage::new("1", "alice", "-100200300", "I'll deploy", "telegram", 0)
         };
 
-        let rendered = timestamped_channel_user_history_content(&msg, "Observed group message");
+        let rendered = channel_user_history_content(&msg, "Observed group message");
 
         assert!(
             rendered.contains("alice"),
@@ -23118,17 +23109,11 @@ api_key = "anthropic-key"
     }
 
     #[test]
-    fn timestamp_channel_user_content_adds_wall_clock_prefix() {
-        let stamped = timestamp_channel_user_content("hello");
-
-        assert!(
-            stamped.starts_with('['),
-            "timestamped content should start with a bracketed timestamp: {stamped}"
-        );
-        assert!(
-            stamped.contains("] hello"),
-            "timestamped content should preserve the user message after the timestamp: {stamped}"
-        );
+    fn channel_history_keeps_body_and_platform_time_separate() {
+        let msg = ChannelMessage::new("1", "alice", "room", "hello", "telegram", 42);
+        let message = channel_user_history_message(&msg, "Observed");
+        assert_eq!(message.content, "hello");
+        assert_eq!(message.timestamp, Some(42_000));
     }
 
     #[test]
@@ -23230,7 +23215,16 @@ api_key = "anthropic-key"
             sop_driver_sink: None,
         };
 
-        assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
+        assert!(!rollback_orphan_user_turn(
+            &ctx,
+            &sender,
+            &ChatMessage::user("pending").with_timestamp(42)
+        ));
+        assert!(rollback_orphan_user_turn(
+            &ctx,
+            &sender,
+            &ChatMessage::user("pending")
+        ));
 
         let locked_histories = ctx
             .conversation_histories
@@ -38799,10 +38793,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let alice = shared_topic_message("alice", "m1", "the budget file is v3");
         let bob = shared_topic_message("bob", "m2", "use v4 instead");
 
-        let alice_turn =
-            timestamped_channel_user_history_content(&alice, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
-        let bob_turn =
-            timestamped_channel_user_history_content(&bob, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let alice_turn = channel_user_history_content(&alice, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let bob_turn = channel_user_history_content(&bob, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
 
         assert!(
             alice_turn.starts_with("[Message from alice]\n"),
@@ -38819,8 +38811,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // change when per_user_session = true).
         let mut solo = shared_topic_message("alice", "m3", "just me here");
         solo.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
-        let solo_turn =
-            timestamped_channel_user_history_content(&solo, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let solo_turn = channel_user_history_content(&solo, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             !solo_turn.contains("[Message from"),
             "sender-scoped turns must stay unlabelled: {solo_turn}"
@@ -38831,8 +38822,7 @@ BTC is currently around $65,000 based on latest tool output."#
         wa.channel = "whatsapp".into();
         wa.reply_target = "12036302@g.us".into();
         wa.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::Sender;
-        let wa_turn =
-            timestamped_channel_user_history_content(&wa, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let wa_turn = channel_user_history_content(&wa, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             wa_turn.starts_with("[Current WhatsApp group message from carol]\n"),
             "whatsapp group label must be unchanged: {wa_turn}"
@@ -38848,8 +38838,7 @@ BTC is currently around $65,000 based on latest tool output."#
         dm.channel = "wecom_ws".into();
         dm.reply_target = "user--user-1".into();
         dm.thread_ts = None;
-        let dm_turn =
-            timestamped_channel_user_history_content(&dm, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let dm_turn = channel_user_history_content(&dm, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             !dm_turn.contains("[Message from"),
             "a single-party WeCom chat must not gain attribution: {dm_turn}"
@@ -38860,8 +38849,7 @@ BTC is currently around $65,000 based on latest tool output."#
         group.channel = "wecom_ws".into();
         group.reply_target = "group--room-9".into();
         group.thread_ts = None;
-        let group_turn =
-            timestamped_channel_user_history_content(&group, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
+        let group_turn = channel_user_history_content(&group, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
         assert!(
             group_turn.starts_with("[Message from user-1]\n"),
             "a WeCom group room must keep speaker attribution: {group_turn}"
@@ -46389,8 +46377,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!calls[0][0].1.contains("\"other-room\""));
         assert!(!calls[0][0].1.contains("\"other-agent\""));
         assert_eq!(calls[0][1].0, "user");
-        // User turn now carries the volatile preamble (turn-context, memory
-        // context) followed by the timestamped user content.
+        // User turn carries the volatile preamble and literal content; its
+        // timestamp is a separate structured field.
         assert!(calls[0][1].1.contains("[turn-context]"));
         assert!(
             calls[0][1].1.contains(MEMORY_CONTEXT_OPEN),
@@ -46412,15 +46400,11 @@ BTC is currently around $65,000 based on latest tool output."#
             .peek("test-channel_chat-ctx_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
-        // Cached history must be the raw timestamped user content with NO
+        // Cached history must be the raw user content with NO
         // [turn-context] preamble and NO memory context — those only live on
         // the outgoing LLM call, not in the persisted session log.
-        assert!(turns[0].content.starts_with('['));
-        assert!(
-            turns[0].content.contains("] hello"),
-            "stored channel user turn should be timestamped: {}",
-            turns[0].content
-        );
+        assert_eq!(turns[0].content, "hello");
+        assert!(turns[0].timestamp.is_some());
         assert!(
             !turns[0].content.contains("[turn-context]"),
             "cached history must not include the runtime preamble (would accumulate): {}",
@@ -51498,11 +51482,8 @@ This is an example JSON object for profile settings."#;
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
-        assert!(
-            turns[0].content.contains("] What is WAL?"),
-            "follow-up user turn should be timestamped: {}",
-            turns[0].content
-        );
+        assert_eq!(turns[0].content, "What is WAL?");
+        assert!(turns[0].timestamp.is_some());
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "ok");
         assert!(
@@ -51672,11 +51653,8 @@ This is an example JSON object for profile settings."#;
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
-        assert!(
-            turns[0].content.contains("] What is WAL?"),
-            "follow-up user turn should be timestamped: {}",
-            turns[0].content
-        );
+        assert_eq!(turns[0].content, "What is WAL?");
+        assert!(turns[0].timestamp.is_some());
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "ok");
         assert!(
@@ -56303,8 +56281,8 @@ Done."#;
             "preamble must carry sender (for disambiguation): {preamble}"
         );
         assert!(
-            preamble.contains("weekday="),
-            "preamble must carry the weekday (pins the fix/channels weekday field): {preamble}"
+            !preamble.contains("weekday=") && !preamble.contains("time="),
+            "provider dispatch owns temporal rendering: {preamble}"
         );
         assert!(
             preamble.contains("message_id=msg-xyz789"),

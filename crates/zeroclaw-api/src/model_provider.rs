@@ -51,6 +51,11 @@ impl ThinkingDisplay {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Observed message time in Unix milliseconds. Context retains this value;
+    /// only provider request projection renders it as a textual prefix.
+    /// Absent for undated messages, including unparsed legacy body timestamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<i64>,
     /// Deliberate media inputs owned by this message. Text never grants an
     /// attachment: callers supply references through this field explicitly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -160,6 +165,7 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
+            timestamp: None,
             content: content.into(),
             attachments: Vec::new(),
             tool_calls: Vec::new(),
@@ -171,6 +177,7 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
+            timestamp: None,
             content: content.into(),
             attachments: Vec::new(),
             tool_calls: Vec::new(),
@@ -182,6 +189,7 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
+            timestamp: None,
             content: content.into(),
             attachments: Vec::new(),
             tool_calls: Vec::new(),
@@ -205,6 +213,7 @@ impl ChatMessage {
     pub fn tool_result(result: ToolResultMessage) -> Self {
         Self {
             role: "tool".into(),
+            timestamp: None,
             content: result.content,
             tool_result: Some(ToolResultMetadata {
                 tool_call_id: result.tool_call_id,
@@ -252,6 +261,9 @@ impl ChatMessage {
     /// Text population used by context budgeting, including typed tool fields.
     pub fn context_text_bytes(&self) -> usize {
         self.content.len()
+            // Reserve an approximate provider-rendered date envelope while
+            // keeping its text out of durable context.
+            + if self.role == "user" && self.timestamp.is_some() { 64 } else { 0 }
             + self.reasoning_content.as_ref().map_or(0, String::len)
             + self
                 .tool_calls
@@ -273,6 +285,11 @@ impl ChatMessage {
 
     pub fn with_attachments(mut self, attachments: Vec<crate::media::AttachmentReference>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    pub fn with_timestamp(mut self, timestamp: i64) -> Self {
+        self.timestamp = Some(timestamp);
         self
     }
 

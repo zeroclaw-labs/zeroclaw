@@ -1342,6 +1342,7 @@ mod tests {
         }));
 
         let mut messages = vec![ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,
@@ -1387,6 +1388,7 @@ mod tests {
         let mut runner = HookRunner::new();
         runner.register(Box::new(MutateThenPanicHook));
         let mut messages = vec![ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,

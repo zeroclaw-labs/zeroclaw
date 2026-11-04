@@ -67,6 +67,7 @@ impl LegacySqliteReader {
             let raw: Option<String> = row.get(2)?;
             Ok(TimestampedMessage {
                 message: ChatMessage {
+                    timestamp: None,
                     tool_calls: Vec::new(),
                     tool_result: None,
                     reasoning_content: None,

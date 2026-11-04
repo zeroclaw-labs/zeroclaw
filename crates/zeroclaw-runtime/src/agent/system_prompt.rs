@@ -567,9 +567,8 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
     } // end if !compact_context (full Channel Capabilities copy)
 
-    // Emitted unconditionally: small local models mistake the enrichment
-    // prefix for log/API data without this orientation. The prefix format
-    // is canonical in agent.rs `Agent::enrich_user_message` — keep in sync.
+    // Explain the provider-only timestamp envelope so small local models do
+    // not mistake it for user log or API data.
     //
     // This orientation is runtime-owned and must survive the compact/finite
     // `max_system_prompt_chars` budget: it is what stops small local models

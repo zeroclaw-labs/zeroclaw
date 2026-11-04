@@ -201,9 +201,25 @@ pub fn resolve_message(
                 }
             }
             let mut fields = metadata.as_object().cloned().unwrap_or_default();
+            let is_user = role == "user";
             fields.insert("role".into(), role.into());
             fields.insert("content".into(), text.into());
             fields.insert("attachments".into(), serde_json::json!(attachments));
+            let timestamp = if matches!(event.body.data, EventData::ContextProjectionCreated { .. })
+            {
+                // Only an existing independent legacy column provides time;
+                // literal body prefixes are never inspected or rewritten.
+                metadata
+                    .get("created_at")
+                    .and_then(serde_json::Value::as_i64)
+            } else if is_user {
+                Some(event.occurred_at)
+            } else {
+                None
+            };
+            if let Some(timestamp) = timestamp {
+                fields.insert("timestamp".into(), timestamp.into());
+            }
             let message: ChatMessage = serde_json::from_value(serde_json::Value::Object(fields))
                 .map_err(|error| ReadError::Corrupt(error.to_string()))?;
             Ok(Some(message.into_conversation()))

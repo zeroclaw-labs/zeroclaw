@@ -215,6 +215,66 @@ impl Attributable for Mixed {
         "audit-fixture"
     }
 }
+
+#[tokio::test]
+async fn timestamp_rendering_is_request_only_and_capture_retains_structured_time() {
+    struct TimestampEcho;
+    impl Attributable for TimestampEcho {
+        fn role(&self) -> Role {
+            Role::System
+        }
+        fn alias(&self) -> &str {
+            "timestamp-echo"
+        }
+    }
+    #[async_trait::async_trait]
+    impl ModelProvider for TimestampEcho {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            message: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            assert!(message.starts_with("[CURRENT DATE & TIME: "));
+            assert!(message.ends_with("\n\nliteral input"));
+            Ok("answer".into())
+        }
+    }
+    for backend in ["sqlite", "jsonl"] {
+        let h = Harness::new(backend);
+        let messages = [ChatMessage::user("literal input").with_timestamp(1_800_000_000_000)];
+        scope_provider_capture(
+            h.admission.clone(),
+            ProviderDispatch::from_ref(&TimestampEcho).chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "fixture",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let request = h
+            .events()
+            .iter()
+            .find_map(|event| match &event.body.data {
+                EventData::ProviderRequestPrepared { request_ref, .. } => {
+                    Some(h.payload::<serde_json::Value>(request_ref))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let messages_ref: StoredPayloadRef =
+            serde_json::from_value(request["messages_ref"].clone()).unwrap();
+        let stored: Vec<ChatMessage> = h.payload(&messages_ref);
+        assert_eq!(stored[0].content, "literal input");
+        assert_eq!(stored[0].timestamp, messages[0].timestamp);
+    }
+}
 #[async_trait::async_trait]
 impl ModelProvider for Mixed {
     async fn chat_with_system(

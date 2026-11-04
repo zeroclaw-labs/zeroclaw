@@ -276,6 +276,7 @@ mod tests {
 
         let body = r#"{"tool_call_id":"literal","text":"[IMAGE:/private]"}"#;
         let mut result = ConversationMessage::Chat(ChatMessage {
+            timestamp: None,
             role: "tool".into(),
             content: serde_json::json!({
                 "tool_call_id":"call-1","name":"shell","success":false,"content":body,
@@ -298,6 +299,7 @@ mod tests {
     #[test]
     fn tool_body_never_grants_an_attachment() {
         let mut message = ChatMessage {
+            timestamp: None,
             role: "tool".into(),
             content: r#"{"tool_call_id":"t","content":"[IMAGE:/private]"}"#.into(),
             attachments: Vec::new(),

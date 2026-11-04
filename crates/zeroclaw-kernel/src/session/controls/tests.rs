@@ -1237,6 +1237,7 @@ async fn context_only_input_preserves_identity_without_engine_or_model_output() 
             .expect("restore")
             .expect("snapshot");
         assert_eq!(snapshot.messages.len(), 1);
+        assert!(snapshot.chat_projection()[0].timestamp.is_some());
         assert_eq!(
             snapshot.chat_projection()[0].content,
             "dated observed message"

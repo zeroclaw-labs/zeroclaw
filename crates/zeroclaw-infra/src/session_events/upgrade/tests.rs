@@ -266,6 +266,44 @@ fn sqlite_message_timestamps_survive_upgrade_to_each_native_backend() {
 }
 
 #[test]
+fn legacy_timestamp_prefixes_stay_literal_during_sqlite_and_jsonl_upgrade() {
+    use zeroclaw_api::session_events::context_read;
+    let body =
+        "[CURRENT DATE & TIME: 2001-02-03 04:05:06 UTC]\n\n[2020-01-01 00:00:00 UTC] literal";
+    for sqlite in [false, true] {
+        for target in [NativeBackend::Sqlite, NativeBackend::Jsonl] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = old_source(directory.path(), sqlite, 1);
+            source
+                .rewrite_messages("gw_fixture", &[ChatMessage::user(body)])
+                .unwrap();
+            drop(source);
+            upgrade_installation(directory.path(), target, |_| "fixture".into()).unwrap();
+            let store = open_event_store(directory.path(), target.name()).unwrap();
+            let stream = session_id("gw_fixture").unwrap();
+            let page = store
+                .read_page(&stream, &EventCursor::beginning(stream.clone()), None, 100)
+                .unwrap();
+            let context = page.events.iter().rev().find(|event| {
+                matches!(&event.body.data, EventData::ContextProjectionCreated { reason_key, .. } if reason_key == "legacy_import")
+            }).unwrap();
+            let restored: Vec<_> = context_read::context_refs(store.as_ref(), context)
+                .unwrap()
+                .iter()
+                .filter_map(|reference| {
+                    context_read::resolve_message(store.as_ref(), &stream, reference).unwrap()
+                })
+                .collect();
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].chat_messages()[0].content, body);
+            if !sqlite {
+                assert!(restored[0].chat_messages()[0].timestamp.is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn legacy_tool_metadata_survives_storage_upgrade_and_context_reconstruction() {
     use zeroclaw_api::model_provider::ConversationMessage;
     use zeroclaw_api::session_events::context_read;
@@ -293,6 +331,7 @@ fn legacy_tool_metadata_survives_storage_upgrade_and_context_reconstruction() {
                 .append(
                     "gw_fixture",
                     &ChatMessage {
+                        timestamp: None,
                         role: "tool".into(),
                         content: serde_json::json!({
                             "tool_call_id":"call-1","name":"shell","success":false,"content":output,

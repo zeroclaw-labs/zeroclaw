@@ -217,10 +217,9 @@ pub(crate) async fn finish_after_max_iterations(
                 &selected_model,
             );
             let suffix_only = messages.len() >= pre_hook_messages.len()
-                && messages
-                    .iter()
-                    .zip(&pre_hook_messages)
-                    .all(|(a, b)| a.role == b.role && a.content == b.content);
+                && messages.iter().zip(&pre_hook_messages).all(|(a, b)| {
+                    a.role == b.role && a.content == b.content && a.timestamp == b.timestamp
+                });
             let hook_suffix = if suffix_only {
                 messages[pre_hook_messages.len()..].to_vec()
             } else {

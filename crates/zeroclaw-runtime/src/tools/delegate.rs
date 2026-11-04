@@ -3484,6 +3484,13 @@ impl DelegateTool {
                 })
             });
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt_ref {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(
+            ChatMessage::user(&full_prompt).with_timestamp(chrono::Utc::now().timestamp_millis()),
+        );
         // A single-call background delegate has no tool loop to observe, so
         // its one model request and the reply are recorded here.
         if let Some(sink) = self.progress.as_deref() {
@@ -3492,7 +3499,7 @@ impl DelegateTool {
         }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            dispatcher.chat_with_history(&messages, &model, temperature),
         )
         .await;
         if let Some(sink) = self.progress.as_deref() {
@@ -5235,8 +5242,7 @@ impl DelegateTool {
             .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
-            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
-            .add_section(Box::new(crate::agent::prompt::DateTimeSection));
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection));
 
         let mut enriched = builder
             .build_with_approval_policy(&ctx, &always_ask_values)
@@ -5725,7 +5731,7 @@ impl DelegateTool {
             })
         });
 
-        // Build enriched system prompt with tools, skills, workspace, datetime context.
+        // Build stable system context; message time is provider-request metadata.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
         // the skill prompt content matches the target's skill tools; bounded delegation
         // keeps the caller's `self.workspace_dir`.
@@ -5787,7 +5793,11 @@ impl DelegateTool {
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
         }
-        history.push(full_prompt.into());
+        let mut message = full_prompt.into();
+        if message.timestamp.is_none() {
+            message.timestamp = Some(chrono::Utc::now().timestamp_millis());
+        }
+        history.push(message);
 
         let noop_observer = NoopObserver;
 
@@ -15355,7 +15365,7 @@ target = "memory_recall"
     }
 
     #[test]
-    fn enriched_prompt_includes_tools_workspace_date() {
+    fn enriched_prompt_includes_tools_workspace_without_generated_date() {
         let config = AliasedAgentConfig {
             model_provider: "openrouter.test".into(),
             ..Default::default()
@@ -15395,8 +15405,8 @@ target = "memory_recall"
             "should contain workspace path"
         );
         assert!(
-            prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
-            "should contain date section"
+            !prompt.contains("## CRITICAL CONTEXT: CURRENT DATE"),
+            "system context must not contain a generated date"
         );
         assert!(!prompt.contains("CURRENT DATE & TIME"));
         assert!(!prompt.contains("Time:"));

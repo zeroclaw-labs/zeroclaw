@@ -2398,7 +2398,9 @@ async fn run_tool_call_loop_inner<'a>(
             && provider_request_messages
                 .iter()
                 .zip(pre_hook_messages.iter())
-                .all(|(a, b)| a.role == b.role && a.content == b.content);
+                .all(|(a, b)| {
+                    a.role == b.role && a.content == b.content && a.timestamp == b.timestamp
+                });
         let hook_suffix = if hook_appended_suffix_only {
             provider_request_messages[pre_hook_messages.len()..].to_vec()
         } else {

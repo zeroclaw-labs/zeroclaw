@@ -252,6 +252,7 @@ impl SessionCoordinator {
             }
             if supported {
                 let message = ConversationMessage::Chat(ChatMessage {
+                    timestamp: (role == "user").then_some(event.occurred_at),
                     tool_calls: Vec::new(),
                     tool_result: None,
                     reasoning_content: None,

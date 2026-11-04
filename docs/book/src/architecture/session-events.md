@@ -504,6 +504,16 @@ filtering. Configuration credentials retain their existing encryption.
 SQLite message timestamps are retained in imported context entries; native
 message history uses each content event's observation time. Sources without
 message timestamps remain unknown rather than acquiring the migration time.
+New runtime context messages retain literal text and an optional `timestamp`
+in Unix milliseconds. Agent turns, CLI loops, child agents and channel history
+never store generated date prefixes in message bodies. Heartbeat decision
+prompts and child system prompts also omit generated current-date text.
+Provider dispatch renders the
+`[CURRENT DATE & TIME: ...]` prefix on a temporary request copy at the physical
+adapter boundary, including streaming and retry paths. Context persistence,
+restoration and provider intent capture keep the structured representation.
+Legacy SQLite and JSONL body text is neither parsed for timestamps nor stripped;
+only independently recorded time fields are used.
 Channel and sender attribution are derived from accepted ingress in the common
 session projection. Later legacy imports cannot replace these native facts.
 Channel-specific room and thread details remain in the original reply route;

@@ -69,6 +69,7 @@ mod tests {
 
     fn make_message(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
+            timestamp: None,
             tool_calls: Vec::new(),
             tool_result: None,
             reasoning_content: None,

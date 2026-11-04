@@ -778,6 +778,12 @@ impl ProviderDispatch {
             request.thinking,
         );
         intent.tool_round_policy = policy;
+        let messages =
+            crate::message_time::project(request.messages, self.inner.is_dispatch_composite());
+        let request = ChatRequest {
+            messages: &messages,
+            ..request
+        };
         accounted_chat_call(&*self.inner, model, intent, async move {
             zeroclaw_log::scope!(
                 model: model,
@@ -890,9 +896,14 @@ impl ProviderDispatch {
             request.thinking,
         );
         intent.tool_round_policy = policy;
+        let projected =
+            crate::message_time::project(request.messages, self.inner.is_dispatch_composite());
         let inner_stream = capture::stream_events(
             self.inner.stream_chat_with_tool_round_policy(
-                request,
+                ChatRequest {
+                    messages: &projected,
+                    ..request
+                },
                 model,
                 temperature,
                 options,
@@ -1016,9 +1027,10 @@ impl ProviderDispatch {
         }
         let provider_ref = provider_reference(&*self.inner);
         let model_name = model.to_string();
+        let projected = crate::message_time::project(messages, self.inner.is_dispatch_composite());
         let mut inner_stream = capture::stream_chunks(
             self.inner
-                .stream_chat_with_history(messages, model, temperature, options),
+                .stream_chat_with_history(&projected, model, temperature, options),
             &*self.inner,
             capture::intent(&*self.inner, model, messages, None, temperature, None),
         );
@@ -1176,9 +1188,11 @@ impl ProviderDispatch {
             model,
             capture::intent(&*self.inner, model, messages, None, temperature, None),
             async move {
+                let projected =
+                    crate::message_time::project(messages, self.inner.is_dispatch_composite());
                 zeroclaw_log::scope!(
                     model: model,
-                    => self.inner.chat_with_history(messages, model, temperature)
+                    => self.inner.chat_with_history(&projected, model, temperature)
                 )
                 .await
             },
@@ -1209,9 +1223,11 @@ impl ProviderDispatch {
                 None,
             ),
             async move {
+                let projected =
+                    crate::message_time::project(messages, self.inner.is_dispatch_composite());
                 zeroclaw_log::scope!(
                     model: model,
-                    => self.inner.chat_with_tools(messages, tools, model, temperature)
+                    => self.inner.chat_with_tools(&projected, tools, model, temperature)
                 )
                 .await
             },
@@ -1306,6 +1322,12 @@ impl<'a> ProviderDispatchRef<'a> {
             request.thinking,
         );
         intent.tool_round_policy = policy;
+        let messages =
+            crate::message_time::project(request.messages, self.inner.is_dispatch_composite());
+        let request = ChatRequest {
+            messages: &messages,
+            ..request
+        };
         accounted_chat_call(self.inner, model, intent, async move {
             zeroclaw_log::scope!(
                 model: model,
@@ -1437,9 +1459,14 @@ impl<'a> ProviderDispatchRef<'a> {
             request.thinking,
         );
         intent.tool_round_policy = policy;
+        let projected =
+            crate::message_time::project(request.messages, self.inner.is_dispatch_composite());
         let inner_stream = capture::stream_events(
             self.inner.stream_chat_with_tool_round_policy(
-                request,
+                ChatRequest {
+                    messages: &projected,
+                    ..request
+                },
                 model,
                 temperature,
                 options,
@@ -1561,9 +1588,10 @@ impl<'a> ProviderDispatchRef<'a> {
         }
         let provider_ref = provider_reference(self.inner);
         let model_name = model.to_string();
+        let projected = crate::message_time::project(messages, self.inner.is_dispatch_composite());
         let mut inner_stream = capture::stream_chunks(
             self.inner
-                .stream_chat_with_history(messages, model, temperature, options),
+                .stream_chat_with_history(&projected, model, temperature, options),
             self.inner,
             capture::intent(self.inner, model, messages, None, temperature, None),
         );
@@ -1725,9 +1753,11 @@ impl<'a> ProviderDispatchRef<'a> {
             model,
             capture::intent(self.inner, model, messages, None, temperature, None),
             async move {
+                let projected =
+                    crate::message_time::project(messages, self.inner.is_dispatch_composite());
                 zeroclaw_log::scope!(
                     model: model,
-                    => self.inner.chat_with_history(messages, model, temperature)
+                    => self.inner.chat_with_history(&projected, model, temperature)
                 )
                 .await
             },
@@ -1758,9 +1788,11 @@ impl<'a> ProviderDispatchRef<'a> {
                 None,
             ),
             async move {
+                let projected =
+                    crate::message_time::project(messages, self.inner.is_dispatch_composite());
                 zeroclaw_log::scope!(
                     model: model,
-                    => self.inner.chat_with_tools(messages, tools, model, temperature)
+                    => self.inner.chat_with_tools(&projected, tools, model, temperature)
                 )
                 .await
             },

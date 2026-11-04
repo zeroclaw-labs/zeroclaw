@@ -1029,7 +1029,7 @@ mod tests {
         let expected_prompts = ["first accepted", "second accepted", "new request"].map(|prompt| {
             format!(
                 "[CURRENT DATE & TIME: {}]\n\n{prompt}",
-                fixed.format("%Y-%m-%d %H:%M:%S %Z")
+                fixed.format("%Y-%m-%d %H:%M:%S %Z (%A)")
             )
         });
         for revoked in [false, true] {

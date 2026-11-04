@@ -6643,6 +6643,7 @@ mod tests {
         let messages = vec![
             ChatMessage::user("Inspect this screenshot.".to_string()),
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -6655,6 +6656,7 @@ mod tests {
                 &["/tmp/tool-image.png".to_string()],
             )),
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -6680,6 +6682,7 @@ mod tests {
         let messages = vec![
             (native_carrier("tc1", "Generated", &["/tmp/stale-tool.png".to_string()])),
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
@@ -6708,6 +6711,7 @@ mod tests {
             ChatMessage::user("Create an image, then check the weather.".to_string()),
             (native_carrier("tc1", "Generated", &["/tmp/same-turn-tool.png".to_string()])),
             ChatMessage {
+                timestamp: None,
                 tool_calls: Vec::new(),
                 tool_result: None,
                 reasoning_content: None,
