@@ -27,6 +27,19 @@ impl BuiltModel {
         }
     }
 
+    /// Bind a supplied routed provider and the resolver belonging to its request.
+    pub fn from_routed_provider(
+        provider: Box<dyn ModelProvider>,
+        identity: ModelIdentity,
+        model_route_resolver: Arc<crate::router::ModelRouteResolver>,
+    ) -> Self {
+        Self {
+            provider,
+            identity,
+            model_route_resolver,
+        }
+    }
+
     pub fn provider(&self) -> &dyn ModelProvider {
         self.provider.as_ref()
     }

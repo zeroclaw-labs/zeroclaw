@@ -14,6 +14,46 @@ pub(crate) struct ResolvedVisionProvider {
     pub(crate) model: String,
 }
 
+/// The provider source a turn was built from, for resolving its vision route.
+///
+/// A turn that holds one asks this source for the configured vision route,
+/// with the turn's principal, instead of building the route from config; a
+/// refusal ends routing. A turn without one (a configless test agent) keeps
+/// the direct factory.
+#[derive(Clone, Copy)]
+pub(crate) struct VisionProviderSource<'a> {
+    pub(crate) source: &'a Arc<dyn crate::composition::ProviderSource>,
+    pub(crate) agent_alias: &'a str,
+    pub(crate) principal: Option<&'a zeroclaw_api::principal::PrincipalId>,
+}
+
+impl<'a> VisionProviderSource<'a> {
+    /// The vision source for a turn bound to `binding` as `agent_alias`.
+    pub(crate) fn from_binding(
+        binding: &'a crate::composition::BoundCapabilities,
+        agent_alias: &'a str,
+    ) -> Self {
+        Self {
+            source: &binding.capabilities.providers,
+            agent_alias,
+            principal: binding.principal.as_ref(),
+        }
+    }
+}
+
+/// The model a configured `<family>.<alias>` entry names, as the alias-aware
+/// vision factory reports it: `None` for a bare family, a colon ref, an alias
+/// with no configured entry, or an entry without a model.
+fn configured_route_model(config: &Config, provider_ref: &str) -> Option<String> {
+    config
+        .resolve_model_selection(provider_ref)?
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+}
+
 /// The exact `file_read` read ledger for one image-marker path: the
 /// string-level `is_path_allowed` check first (no filesystem access for a
 /// path it rejects), then the same symlink-aware readability check
@@ -64,6 +104,7 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
     model: &str,
     dispatch_model: &str,
     security: Option<&SecurityPolicy>,
+    vision_source: Option<VisionProviderSource<'_>>,
     allowed_provider_refs: Option<&std::collections::HashSet<String>>,
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
@@ -97,38 +138,75 @@ pub(crate) async fn resolve_vision_provider_with_allowed_refs(
                     "configured vision model_provider '{vp}' is not permitted by the selected effort route"
                 )));
             }
-            // Raw vision routing retains alias options without adding retries.
-            // OAuth credential refresh must run outside the async executor.
-            let admitted_config = config.cloned();
-            let reference = vp.clone();
-            let (vp_instance, alias_model) =
-                zeroclaw_providers::model::build_nonblocking(move || match admitted_config {
-                    Some(config) => zeroclaw_providers::model::build_raw_provider(
-                        &config,
-                        &reference,
-                        Default::default(),
-                    )
-                    .map(|resolved| (resolved.provider, resolved.model)),
-                    None => zeroclaw_providers::create_model_provider(&reference, None)
+            // Resolve the configured vision provider through the alias-aware
+            // factory so its per-alias `vision` override and typed config
+            // (endpoint URI, credentials) are honored - the legacy
+            // `create_model_provider(vp, None)` passed `config = None` and could
+            // not see them, so a text-family alias forced to `vision = true`
+            // for this route would have been ignored. `config` is `None` only on
+            // configless (test-builder) agents - every production agent/loop path
+            // threads `Some`; that fallback keeps the prior legacy behavior.
+            //
+            // A turn built from a provider source asks that source for the
+            // route, with the turn's principal, so an image cannot move a
+            // supplied-capability turn onto a config-built provider. A refusal
+            // is final: routing does not retry through config.
+            let configured_vision_model = multimodal_config
+                .vision_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty());
+            let route_ref = vp.clone();
+            let requested_model = configured_vision_model.map(str::to_owned);
+            let fallback_model = model.to_string();
+            let owned_config = config.map(|config| Arc::new(config.clone()));
+            let source = vision_source.map(|source| {
+                (
+                    Arc::clone(source.source),
+                    source.agent_alias.to_owned(),
+                    source.principal.cloned(),
+                )
+            });
+            let (vp_instance, alias_model) = zeroclaw_providers::model::build_nonblocking(move || {
+                match (source, owned_config) {
+                    (Some((source, agent_alias, principal)), Some(config)) => {
+                        let alias_model = configured_route_model(&config, &route_ref);
+                        let requested_model = requested_model.as_deref()
+                            .or(alias_model.as_deref()).unwrap_or(&fallback_model);
+                        source.vision_model_provider(&crate::composition::ProviderRequest {
+                            config: &config, agent_alias: &agent_alias,
+                            provider_ref: Some(&route_ref), model: Some(requested_model),
+                            principal: principal.as_ref(),
+                        }).map(|provider| (Box::new(provider) as Box<dyn ModelProvider>, alias_model))
+                    }
+                    (Some(_), None) => Err(anyhow::Error::msg(
+                        "a turn built from a provider source has no config to resolve its vision route",
+                    )),
+                    (None, Some(config)) => zeroclaw_providers::model::build_raw_provider(
+                        &config, &route_ref, zeroclaw_providers::model::ProviderOverrides {
+                            model: requested_model.as_deref(), ..Default::default()
+                        },
+                    ).map(|resolved| (resolved.provider, resolved.model)),
+                    (None, None) => zeroclaw_providers::create_model_provider(&route_ref, None)
                         .map(|provider| (provider, None)),
-                })
-                .await
-                .map_err(|error| {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Provider)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "vision_provider": vp,
-                                "error": format!("{error}"),
-                            })),
-                        "vision model_provider construction failed"
-                    );
-                    anyhow::Error::msg(format!(
-                        "failed to create vision model_provider '{vp}': {error}"
-                    ))
-                })?;
+                }
+            }).await
+            .map_err(|error| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "vision_provider": vp,
+                            "error": format!("{error}"),
+                        })),
+                    "vision model_provider construction failed"
+                );
+                anyhow::Error::msg(format!(
+                    "failed to create vision model_provider '{vp}': {error}"
+                ))
+            })?;
             let vision_model = multimodal_config
                 .vision_model
                 .as_deref()
@@ -271,6 +349,7 @@ async fn resolve_vision_provider(
     model: &str,
     dispatch_model: &str,
     security: Option<&SecurityPolicy>,
+    vision_source: Option<VisionProviderSource<'_>>,
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     resolve_vision_provider_with_allowed_refs(
         config,
@@ -281,6 +360,7 @@ async fn resolve_vision_provider(
         model,
         dispatch_model,
         security,
+        vision_source,
         None,
     )
     .await
@@ -621,7 +701,7 @@ mod tests {
 
         let config: Config = toml::from_str(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.llamacpp.forced_off]
 model = "qwen3-4b"
 vision = false
@@ -644,6 +724,7 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -722,6 +803,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -792,6 +874,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -855,6 +938,7 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -923,6 +1007,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -1123,6 +1208,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -1198,6 +1284,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("markers outside the read boundary must degrade, never fail the turn");
@@ -1223,6 +1310,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("missing files must degrade, never fail the turn");
@@ -1282,6 +1370,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -1344,6 +1433,7 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -1422,6 +1512,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("a vision-capable primary serves image turns itself");
@@ -1477,7 +1568,7 @@ vision = false
         };
         let config: Config = toml::from_str(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.visionroute]
 uri = "http://127.0.0.1:9/v1"
 model = "vision-model"
@@ -1502,6 +1593,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("the configured vision fallback must build");
@@ -1534,6 +1626,7 @@ model = "vision-model"
                 "primary-model",
                 "primary-model",
                 Some(&security),
+                None,
             ),
         )
         .await;
@@ -1553,6 +1646,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
             Some(&direct_allowed),
         )
         .await;
@@ -1635,7 +1729,7 @@ model = "vision-model"
         // production dispatch boundary.
         let config: Config = toml::from_str(&format!(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.myvision]
 uri = "http://{addr}/v1"
 model = "vision-model"
@@ -1656,6 +1750,7 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -1706,6 +1801,7 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -1784,6 +1880,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             None,
+            None,
         )
         .await
         .expect("no capability error on a plain degrade");
@@ -1829,6 +1926,7 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await

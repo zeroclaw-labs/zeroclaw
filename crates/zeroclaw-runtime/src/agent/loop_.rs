@@ -1,5 +1,6 @@
 use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::approval::ApprovalManager;
+use crate::composition::RuntimeCapabilities;
 use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 
 /// Format token count with thousands separators.
@@ -240,6 +241,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, TurnOrigin};
+use zeroclaw_api::principal::PrincipalId;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 #[cfg(test)]
@@ -1092,6 +1094,7 @@ pub async fn agent_turn(
     strict_tool_parsing: bool,
     parallel_tools: bool,
     max_tool_result_chars: usize,
+    keep_tool_context_turns: usize,
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
     origin: TurnOrigin,
@@ -1125,6 +1128,7 @@ pub async fn agent_turn(
         strict_tool_parsing,
         parallel_tools,
         max_tool_result_chars,
+        keep_tool_context_turns,
         context_token_budget,
         channel,
         origin,
@@ -1132,6 +1136,7 @@ pub async fn agent_turn(
         memory,
         agent_alias,
         turn_id,
+        None,
         None,
     )
     .await
@@ -1166,6 +1171,7 @@ async fn agent_turn_with_sop_reassembly(
     strict_tool_parsing: bool,
     parallel_tools: bool,
     max_tool_result_chars: usize,
+    keep_tool_context_turns: usize,
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
     origin: TurnOrigin,
@@ -1174,6 +1180,7 @@ async fn agent_turn_with_sop_reassembly(
     agent_alias: Option<&str>,
     turn_id: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
+    capability_binding: Option<&crate::composition::BoundCapabilities>,
 ) -> Result<String> {
     let temperature = temperature.into();
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
@@ -1230,6 +1237,7 @@ async fn agent_turn_with_sop_reassembly(
     );
     let result = Box::pin(run_tool_call_loop(ToolLoop {
         sop_reassembly,
+        capability_binding,
         history_has_trim_breadcrumb,
         injected_memory_preamble,
         exec: ResolvedAgentExecution::resolve(
@@ -1261,6 +1269,7 @@ async fn agent_turn_with_sop_reassembly(
                 strict_tool_parsing,
                 parallel_tools,
                 max_tool_result_chars,
+                keep_tool_context_turns,
                 context_limits,
                 context_limits_resolver: None,
                 knobs: &LoopKnobs {
@@ -1409,6 +1418,23 @@ pub fn apply_text_tool_prompt_policy(
     expose_text_tool_protocol
 }
 
+/// The cross-agent SOP step handle for a run over `memory`. A run started
+/// with an owner's plane (a pinned session's subagent child) re-assembles its
+/// steps under that owner, so a step agent's memory is the owner's plane for
+/// that agent rather than its shared plane.
+fn sop_reassembly_over<'a>(
+    config: &'a Config,
+    capabilities: Option<&'a crate::composition::BoundCapabilities>,
+    memory: &Arc<dyn Memory>,
+) -> crate::agent::turn::SopStepReassembly<'a> {
+    crate::agent::turn::SopStepReassembly {
+        config,
+        capabilities,
+        live_config: None,
+        memory_owner: memory.principal_scope(),
+    }
+}
+
 #[derive(Default)]
 pub struct AgentRunOverrides {
     pub security: Option<Arc<SecurityPolicy>>,
@@ -1529,6 +1555,7 @@ pub struct AgentRunRequest<'a> {
     pub session_state_file: Option<PathBuf>,
     pub allowed_tools: Option<Vec<String>>,
     pub origin: TurnOrigin,
+    pub capabilities: Option<crate::composition::BoundCapabilities>,
 }
 
 impl<'a> AgentRunRequest<'a> {
@@ -1542,6 +1569,7 @@ impl<'a> AgentRunRequest<'a> {
             session_state_file: None,
             allowed_tools: None,
             origin: TurnOrigin::SubTurn,
+            capabilities: None,
         }
     }
 }
@@ -1579,6 +1607,52 @@ pub fn run<'a>(
                 session_state_file,
                 allowed_tools,
                 origin,
+                capabilities: None,
+            },
+            overrides,
+        )
+        .await
+    })
+}
+
+/// Compatibility entry for callers that supply their runtime sources and principal.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_capabilities<'a>(
+    config: Config,
+    capabilities: RuntimeCapabilities,
+    principal: Option<PrincipalId>,
+    agent_alias: &'a str,
+    message: Option<String>,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: Option<f64>,
+    peripheral_overrides: Vec<String>,
+    interactive: bool,
+    session_state_file: Option<PathBuf>,
+    allowed_tools: Option<Vec<String>>,
+    origin: TurnOrigin,
+    overrides: AgentRunOverrides,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(async move {
+        run_with_request(
+            Arc::new(config),
+            AgentRunRequest {
+                agent_alias,
+                message,
+                model: crate::agent::agent::ModelOverrides {
+                    provider: provider_override.as_deref(),
+                    model: model_override.as_deref(),
+                    temperature,
+                },
+                peripheral_overrides,
+                interactive,
+                session_state_file,
+                allowed_tools,
+                origin,
+                capabilities: Some(crate::composition::BoundCapabilities {
+                    capabilities,
+                    principal,
+                }),
             },
             overrides,
         )
@@ -1611,7 +1685,11 @@ async fn run_inner(
         session_state_file,
         allowed_tools,
         origin,
+        capabilities: supplied_capabilities,
     } = request;
+    let (capabilities, principal) = supplied_capabilities
+        .map(|bound| (Some(bound.capabilities), bound.principal))
+        .unwrap_or_default();
     let provider_override = model.provider.map(str::to_owned);
     let model_override = model.model.map(str::to_owned);
     let temperature = model.temperature;
@@ -1637,6 +1715,7 @@ async fn run_inner(
     if overrides.suppress_memory_auto_save {
         Arc::make_mut(&mut config).memory.auto_save = false;
     }
+    let capabilities = capabilities.unwrap_or_else(|| RuntimeCapabilities::config_backed(&config));
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
@@ -1683,8 +1762,13 @@ async fn run_inner(
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
-        let base_observer = observability::create_observer(&config.observability);
-        let observer: Arc<dyn Observer> = Arc::from(base_observer);
+        let observer: Arc<dyn Observer> = Arc::clone(&capabilities.observer);
+        // What operations started inside this turn inherit: a spawned
+        // sub-agent, a delegate, a peer turn, a cross-agent SOP step.
+        let bound_capabilities = crate::composition::BoundCapabilities {
+            capabilities: capabilities.clone(),
+            principal: principal.clone(),
+        };
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
         let _flush_guard = interactive.then(|| observability::FlushGuard::new(observer.clone()));
@@ -1718,21 +1802,13 @@ async fn run_inner(
         let agent_provider_resolved = config
             .resolved_model_provider_for_agent(agent_alias)
             .map(|(ty, alias, cfg)| (ty, alias.to_string(), cfg.clone()));
-        let agent_model_provider = agent_provider_resolved.as_ref().map(|(_, _, cfg)| cfg);
 
         let mem: Arc<dyn Memory> = if memory_free {
             Arc::new(zeroclaw_memory::NoneMemory::new("none"))
         } else {
             match overrides.memory {
                 Some(m) => m,
-                None => {
-                    zeroclaw_memory::create_memory_for_agent(
-                        &config,
-                        agent_alias,
-                        agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                    )
-                    .await?
-                }
+                None => capabilities.agent_memory(&config, agent_alias).await?,
             }
         };
         ::zeroclaw_log::record!(
@@ -1755,28 +1831,30 @@ async fn run_inner(
         }
 
         // ── Tools (including memory tools and peripherals) ────────────
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
+        let tool_config = Arc::new(config.clone());
+        let tool_request = crate::composition::ToolRequest {
+            config: &tool_config,
+            agent_alias,
+            security: &security,
+            runtime: &runtime,
+            memory: &mem,
         };
-
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (CLI agent run). No channel map is wired on this
-        // path, so the approval route adapter is the no-op (log-only); the daemon
-        // path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
-            let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
-                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
+        let selected_recipe = capabilities.tools.native_recipe(&tool_request)?;
+        let construction = if selected_recipe.is_some() {
+            crate::composition::RegistryConstruction::NativeCompat
+        } else {
+            crate::composition::RegistryConstruction::SuppliedOnly
+        };
+        let (sop_engine, sop_audit) = if construction
+            == crate::composition::RegistryConstruction::NativeCompat
+            && config.sop.runtime_enabled()
+        {
             let (engine, audit) = crate::sop::build_sop_engine_with_capability(
                 config.sop.clone(),
                 &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
-                sop_mem,
+                Arc::clone(&mem),
                 Default::default(),
                 execution_capability.clone(),
             );
@@ -1784,62 +1862,71 @@ async fn run_inner(
         } else {
             (None, None)
         };
-
-        let all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::clone(&config),
-            &security,
-            &risk_profile,
-            agent_alias,
-            runtime.clone(),
-            mem.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            agent_model_provider.and_then(|e| e.api_key.as_deref()),
-            &config,
-            None,
-            is_subagent_caller,
-            None,
-            sop_engine,
-            sop_audit,
-            execution_capability
-                .as_ref()
-                .map(AgentExecutionCapability::config_handle),
-            execution_capability.clone(),
+        let all_tools_result = match selected_recipe {
+            Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+                model_config: None,
+                request: &tool_request,
+                workspace_dir: &config.data_dir,
+                canvas_store: None,
+                is_subagent_caller,
+                forwarded_environment: None,
+                sop_engine,
+                sop_audit,
+                live_config: execution_capability
+                    .as_ref()
+                    .map(AgentExecutionCapability::config_handle),
+                execution_capability: execution_capability.clone(),
+                acp_sessions: None,
+            })?,
+            None => tools::supplied_registry_base()?,
+        };
+        let crate::composition::PreparedRegistry {
+            built: all_tools_result,
+            construction,
+            supplied_tail,
+        } = capabilities.prepare_registry(
+            all_tools_result,
+            construction,
+            &tool_request,
+            principal.as_ref(),
         )?;
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
+        let skills = if construction == crate::composition::RegistryConstruction::NativeCompat {
+            crate::skills::load_skills_for_agent_from_config(&config, agent_alias)
+        } else {
+            Vec::new()
+        };
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
         // run() per-run allowlist; connect_peripherals is true (execution path).
-        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-            config: &config,
-            agent_alias,
-            security: &security,
-            built: all_tools_result,
-            skills: &skills,
-            runtime: runtime.clone(),
-            caller_allowed: allowed_tools.as_deref(),
-            connect_mcp: true,
-            connect_peripherals: true,
-            // A memory-free run drops the persistent memory tools so the model
-            // cannot read or write memory even though the registry is otherwise
-            // built identically.
-            exclude_memory: memory_free,
-            acp_delivery: false,
-            list_deferred_mcp_specs: false,
-            emit_assembly_logs: true,
-            // Honor the daemon worker's pre-built shared registry so stdio
-            // MCP children live for the daemon's lifetime, not per
-            // `agent::run` call. CLI/one-shot callers leave
-            // `mcp_registry` at its default (`None`) and the seam
-            // falls back to the per-call `connect_all`.
-            mcp_registry: overrides.mcp_registry.as_ref().map(Arc::clone),
-        })
+        let assembled = scoped::ScopedToolRegistry::assemble_prepared(
+            scoped::ScopedAssembly {
+                config: &config,
+                agent_alias,
+                security: &security,
+                built: all_tools_result,
+                skills: &skills,
+                runtime: runtime.clone(),
+                caller_allowed: allowed_tools.as_deref(),
+                connect_mcp: true,
+                connect_peripherals: true,
+                // A memory-free run drops the persistent memory tools so the model
+                // cannot read or write memory even though the registry is otherwise
+                // built identically.
+                exclude_memory: memory_free,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: true,
+                // Honor the daemon worker's pre-built shared registry so stdio
+                // MCP children live for the daemon's lifetime, not per
+                // `agent::run` call. CLI/one-shot callers leave
+                // `mcp_registry` at its default (`None`) and the seam
+                // falls back to the per-call `connect_all`.
+                mcp_registry: overrides.mcp_registry.as_ref().map(Arc::clone),
+            },
+            construction,
+            supplied_tail,
+        )
         .await;
         // run injects one combined MCP prompt block: deferred tool-search listing +
         // pinned resources, composed by the harness.
@@ -1946,13 +2033,9 @@ async fn run_inner(
         if let Some(selection) = selection.as_ref() {
             active_effort_provider_refs = Some(Arc::clone(&selection.allowed_provider_refs));
         }
-        let entry_model = zeroclaw_providers::model::build_model_nonblocking(
-            build_config,
-            agent_alias,
-            build_ref,
-            build_override,
-        )
-        .await?;
+        let entry_model = bound_capabilities
+            .build_model(build_config, agent_alias, build_ref, build_override, false)
+            .await?;
         let mut provider_name = entry_model.provider_name();
         let (mut model_provider, identity, _) = entry_model.into_parts();
         let mut capacity_ref = identity.provider_ref();
@@ -1980,10 +2063,13 @@ async fn run_inner(
         );
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
+        // Datasheet context describes native peripheral tools, so a
+        // supplied-only registry does not get it.
         let hardware_rag: Option<crate::rag::HardwareRag> = config
             .peripherals
             .datasheet_dir
             .as_ref()
+            .filter(|_| construction == crate::composition::RegistryConstruction::NativeCompat)
             .filter(|d| !d.trim().is_empty())
             .map(|dir| crate::rag::HardwareRag::load(&config.data_dir, dir.trim()))
             .and_then(Result::ok)
@@ -2456,6 +2542,7 @@ async fn run_inner(
                                         strict_tool_parsing: agent.resolved.strict_tool_parsing,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
+                                        keep_tool_context_turns: agent.resolved.keep_tool_context_turns,
                                         context_limits,
                                         context_limits_resolver: None,
                                         knobs: &LoopKnobs {
@@ -2500,10 +2587,12 @@ async fn run_inner(
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
                                 served_route_sink: None,
-                                sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                    config: &config,
-                                    live_config: None,
-                                }),
+                                capability_binding: Some(&bound_capabilities),
+                                sop_reassembly: Some(sop_reassembly_over(
+                                    &config,
+                                    Some(&bound_capabilities),
+                                    &mem,
+                                )),
                             }),
                         ),
                     )
@@ -2539,11 +2628,12 @@ async fn run_inner(
                             let switch_config = active_effort_provider_refs.as_deref().map(|allowed|
                                 Arc::from(effort_scoped_provider_config(&config, allowed))
                             ).unwrap_or_else(|| Arc::clone(&config));
-                            let model = zeroclaw_providers::model::build_model_nonblocking(
+                            let model = bound_capabilities.build_model(
                                 switch_config,
                                 agent_alias,
                                 &new_model_provider,
                                 Some(&new_model),
+                                true,
                             )
                             .await?;
                             provider_name = model.provider_name();
@@ -2572,7 +2662,10 @@ async fn run_inner(
             }
 
             // After successful multi-step execution, attempt autonomous skill creation.
-            if config.skills.skill_creation.enabled {
+            // Skills are native work: a supplied-only registry never writes them.
+            if construction == crate::composition::RegistryConstruction::NativeCompat
+                && config.skills.skill_creation.enabled
+            {
                 let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
                 if tool_calls.len() >= 2 {
                     let creator = crate::skills::creator::SkillCreator::new(
@@ -2660,7 +2753,10 @@ async fn run_inner(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
-            if config.skills.skill_improvement.enabled {
+            // The review builds native skill tools, so it shares the gate above.
+            if construction == crate::composition::RegistryConstruction::NativeCompat
+                && config.skills.skill_improvement.enabled
+            {
                 let review_workspace = config.agent_workspace_dir(agent_alias);
                 let review_config = config.skills.skill_improvement.clone();
                 let failed_slugs: Vec<String> =
@@ -2688,6 +2784,7 @@ async fn run_inner(
                             agent.resolved.effective_context_budget(),
                             None, // cancellation_token — no parent token in single-shot run
                             Some(agent_alias),
+                            Some(&bound_capabilities),
                         ),
                     )
                     .await;
@@ -2695,9 +2792,11 @@ async fn run_inner(
         } else {
             println!("🦀 ZeroClaw Interactive Mode");
             println!("Type /help for commands.\n");
-            let cli = CLI_CHANNEL_FN.get().expect(
-                "CLI channel factory not registered — call register_cli_channel_fn at startup",
-            )();
+            let cli = capabilities.channels.channel("cli").ok_or_else(|| {
+                anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                    "cli-agent-error-channel-unavailable",
+                ))
+            })?;
 
             // Persistent conversation history across turns, with explicit
             // breadcrumb provenance. Legacy v1 files are migrated by inspecting
@@ -2860,13 +2959,15 @@ async fn run_inner(
                             &config,
                             &selection.allowed_provider_refs,
                         ));
-                        let built = zeroclaw_providers::model::build_model_nonblocking(
-                            scoped_config,
-                            agent_alias,
-                            &selection.model_provider,
-                            Some(&selection.model),
-                        )
-                        .await?;
+                        let built = bound_capabilities
+                            .build_model(
+                                scoped_config,
+                                agent_alias,
+                                &selection.model_provider,
+                                Some(&selection.model),
+                                false,
+                            )
+                            .await?;
                         provider_name = built.provider_name();
                         let (provider, identity, _) = built.into_parts();
                         capacity_ref = identity.provider_ref();
@@ -3124,6 +3225,9 @@ async fn run_inner(
                                             max_tool_result_chars: agent
                                                 .resolved
                                                 .max_tool_result_chars,
+                                            keep_tool_context_turns: agent
+                                                .resolved
+                                                .keep_tool_context_turns,
                                             context_limits,
                                             context_limits_resolver: None,
                                             knobs: &LoopKnobs {
@@ -3172,10 +3276,12 @@ async fn run_inner(
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
                                     served_route_sink: None,
-                                    sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                        config: &config,
-                                        live_config: None,
-                                    }),
+                                    capability_binding: Some(&bound_capabilities),
+                                    sop_reassembly: Some(sop_reassembly_over(
+                                        &config,
+                                        Some(&bound_capabilities),
+                                        &mem,
+                                    )),
                                 }),
                             ),
                         )
@@ -3208,11 +3314,12 @@ async fn run_inner(
                                 let switch_config = active_effort_provider_refs.as_deref().map(|allowed|
                                     Arc::from(effort_scoped_provider_config(&config, allowed))
                                 ).unwrap_or_else(|| Arc::clone(&config));
-                                let model = zeroclaw_providers::model::build_model_nonblocking(
+                                let model = bound_capabilities.build_model(
                                     switch_config,
                                     agent_alias,
                                     &new_model_provider,
                                     Some(&new_model),
+                                    true,
                                 )
                                 .await?;
                                 provider_name = model.provider_name();
@@ -3451,7 +3558,11 @@ async fn run_inner(
 
         Ok(final_output)
     };
-    Box::pin(__zc_body)
+    // Keep tracing wrappers out of the concrete turn future's Send proof.
+    let __zc_body: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
+    > = Box::pin(__zc_body);
+    __zc_body
         .instrument(__zc_scope_span)
         .instrument(__zc_attribution_span)
         .await
@@ -3478,16 +3589,25 @@ pub async fn process_message(
     .await
 }
 
-pub(crate) async fn process_message_shared(
+/// Shared-snapshot implementation for callers that already own the canonical
+/// config behind an [`Arc`]. Keeping that allocation through the whole turn
+/// avoids placing or cloning the large [`Config`] value in detached task
+/// futures.
+///
+/// Compatibility adapter over the config-backed capabilities. Returns the
+/// inner future directly, for the same recursion-limit reason as [`run`].
+pub(crate) fn process_message_shared<'a>(
     config: Arc<Config>,
-    agent_alias: &str,
-    message: &str,
-    session_id: Option<&str>,
+    agent_alias: &'a str,
+    message: &'a str,
+    session_id: Option<&'a str>,
     origin: TurnOrigin,
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
-) -> Result<String> {
+) -> impl std::future::Future<Output = Result<String>> + 'a {
     process_message_inner(
         config,
+        None,
+        None,
         None,
         agent_alias,
         message,
@@ -3496,7 +3616,65 @@ pub(crate) async fn process_message_shared(
         None,
         internal_principal,
     )
-    .await
+}
+
+/// Process a single message with supplied capabilities: the provider, the
+/// agent's memory, the observer and any source-supplied tools come from
+/// `capabilities`, and `principal` reaches the provider source.
+/// `internal_principal` is the in-process sender's envelope, as for
+/// [`process_message`].
+#[allow(clippy::too_many_arguments)]
+pub fn process_message_with_capabilities<'a>(
+    config: Arc<Config>,
+    capabilities: RuntimeCapabilities,
+    principal: Option<PrincipalId>,
+    agent_alias: &'a str,
+    message: &'a str,
+    session_id: Option<&'a str>,
+    origin: TurnOrigin,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    process_message_inner(
+        config,
+        None,
+        Some(capabilities),
+        principal,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        None,
+        internal_principal,
+    )
+}
+
+/// [`process_message_with_capabilities`] that also keeps the daemon's live
+/// tool-policy source, for in-process callers that hold one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_message_shared_with_capabilities<'a>(
+    config: Arc<Config>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    capabilities: RuntimeCapabilities,
+    principal: Option<PrincipalId>,
+    agent_alias: &'a str,
+    message: &'a str,
+    session_id: Option<&'a str>,
+    origin: TurnOrigin,
+    execution_admission: Option<AgentExecutionAdmission>,
+    internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    process_message_inner(
+        config,
+        live_config,
+        Some(capabilities),
+        principal,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        execution_admission,
+        internal_principal,
+    )
 }
 
 /// Process a message after admitting its target through the daemon-owned
@@ -3602,8 +3780,10 @@ pub(crate) async fn process_message_shared_with_live_config_and_admission_and_pr
     internal_principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
 ) -> Result<String> {
     process_message_inner(
-        config,
+        Arc::clone(&config),
         live_config,
+        None,
+        None,
         agent_alias,
         message,
         session_id,
@@ -3648,6 +3828,8 @@ pub async fn process_message_with_live_config_and_admission(
     process_message_inner(
         Arc::new(config),
         Some(live_config),
+        None,
+        None,
         agent_alias,
         message,
         session_id,
@@ -3658,9 +3840,13 @@ pub async fn process_message_with_live_config_and_admission(
     .await
 }
 
+/// One message turn with supplied sources, lifecycle admission and sender provenance.
+#[allow(clippy::too_many_arguments)]
 async fn process_message_inner(
     mut config: Arc<Config>,
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    capabilities: Option<RuntimeCapabilities>,
+    principal: Option<PrincipalId>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -3677,6 +3863,7 @@ async fn process_message_inner(
         );
         config = admission.config();
     }
+    let capabilities = capabilities.unwrap_or_else(|| RuntimeCapabilities::config_backed(&config));
     let execution_capability = execution_admission
         .as_ref()
         .map(AgentExecutionAdmission::capability);
@@ -3736,61 +3923,43 @@ async fn process_message_inner(
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
 
-        let observer: Arc<dyn Observer> =
-            Arc::from(observability::create_observer(&config.observability));
+        let observer: Arc<dyn Observer> = Arc::clone(&capabilities.observer);
+        // What operations started inside this turn inherit: a spawned
+        // sub-agent, a delegate, a peer turn, a cross-agent SOP step.
+        let bound_capabilities = crate::composition::BoundCapabilities {
+            capabilities: capabilities.clone(),
+            principal: principal.clone(),
+        };
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let (_, _, agent_model_provider) = match config
-            .resolved_model_provider_for_agent(agent_alias)
-        {
-            Some(resolved) => (resolved.0, resolved.1.to_string(), Some(resolved.2.clone())),
-            None => {
-                let agent_ref = agent.model_provider.as_str();
-                if !agent_ref.is_empty() {
-                    anyhow::bail!(
-                        "agents.{agent_alias}.model_provider = \"{agent_ref}\" does not resolve to \
-                     a configured [providers.models.<type>.<alias>] entry"
-                    );
-                }
-                anyhow::bail!(
-                    "agents.{agent_alias}.model_provider is empty \u{2014} set it to a configured \
-                 \"<type>.<alias>\" (e.g. \"anthropic.{agent_alias}\")"
-                );
-            }
-        };
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
-        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
-            &config,
+        let mem: Arc<dyn Memory> = capabilities.agent_memory(&config, agent_alias).await?;
+
+        let tool_config = Arc::clone(&config);
+        let tool_request = crate::composition::ToolRequest {
+            config: &tool_config,
             agent_alias,
-            agent_model_provider
-                .as_ref()
-                .and_then(|e| e.api_key.as_deref()),
-        )
-        .await?;
-
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
+            security: &security,
+            runtime: &runtime,
+            memory: &mem,
         };
-
-        // Build SOP engine when sops_dir is configured so SOP tools are
-        // available on this path (process_message CLI agent). No channel map is
-        // wired here, so the approval route adapter is the no-op (log-only); the
-        // daemon path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
-            let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
-                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
+        let selected_recipe = capabilities.tools.native_recipe(&tool_request)?;
+        let construction = if selected_recipe.is_some() {
+            crate::composition::RegistryConstruction::NativeCompat
+        } else {
+            crate::composition::RegistryConstruction::SuppliedOnly
+        };
+        let (sop_engine, sop_audit) = if construction
+            == crate::composition::RegistryConstruction::NativeCompat
+            && config.sop.runtime_enabled()
+        {
             let (engine, audit) = crate::sop::build_sop_engine_with_capability(
                 config.sop.clone(),
                 &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
-                sop_mem,
+                Arc::clone(&mem),
                 Default::default(),
                 execution_capability.clone(),
             );
@@ -3798,56 +3967,63 @@ async fn process_message_inner(
         } else {
             (None, None)
         };
-
-        let all_tools_result_pm = tools::all_tools_with_runtime_and_execution_capability(
-            Arc::clone(&config),
-            &security,
-            &risk_profile,
-            agent_alias,
-            runtime.clone(),
-            mem.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            agent_model_provider
-                .as_ref()
-                .and_then(|e| e.api_key.as_deref()),
-            &config,
-            None,
-            false,
-            None,
-            sop_engine,
-            sop_audit,
-            live_config.clone(),
-            execution_capability.clone(),
-        )?;
-        let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
-        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-            config: &config,
-            agent_alias,
-            security: &security,
+        let all_tools_result_pm = match selected_recipe {
+            Some(recipe) => recipe(crate::composition::NativeRecipeInputs {
+                model_config: None,
+                request: &tool_request,
+                workspace_dir: &config.data_dir,
+                canvas_store: None,
+                is_subagent_caller: false,
+                forwarded_environment: None,
+                sop_engine,
+                sop_audit,
+                live_config: live_config.clone(),
+                execution_capability: execution_capability.clone(),
+                acp_sessions: None,
+            })?,
+            None => tools::supplied_registry_base()?,
+        };
+        let crate::composition::PreparedRegistry {
             built: all_tools_result_pm,
-            skills: &skills,
-            runtime: runtime.clone(),
-            caller_allowed: None,
-            connect_mcp: true,
-            connect_peripherals: true,
-            exclude_memory: false,
-            acp_delivery: false,
-            list_deferred_mcp_specs: false,
-            emit_assembly_logs: true,
-            // `process_message` is the channel/orchestrator live-chat path;
-            // it has no cross-turn reuse contract, so the per-call
-            // `connect_all` path inside `assemble` is the correct choice.
-            // The daemon heartbeat worker — the only caller that has a
-            // reuse contract — passes its own `mcp_registry` through
-            // `agent::run` (`AgentRunOverrides::mcp_registry`).
-            mcp_registry: None,
-        })
+            construction,
+            supplied_tail,
+        } = capabilities.prepare_registry(
+            all_tools_result_pm,
+            construction,
+            &tool_request,
+            principal.as_ref(),
+        )?;
+        let skills = if construction == crate::composition::RegistryConstruction::NativeCompat {
+            crate::skills::load_skills_for_agent_from_config(&config, agent_alias)
+        } else {
+            Vec::new()
+        };
+        let assembled = scoped::ScopedToolRegistry::assemble_prepared(
+            scoped::ScopedAssembly {
+                config: &config,
+                agent_alias,
+                security: &security,
+                built: all_tools_result_pm,
+                skills: &skills,
+                runtime: runtime.clone(),
+                caller_allowed: None,
+                connect_mcp: true,
+                connect_peripherals: true,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: true,
+                // `process_message` is the channel/orchestrator live-chat path;
+                // it has no cross-turn reuse contract, so the per-call
+                // `connect_all` path inside `assemble` is the correct choice.
+                // The daemon heartbeat worker — the only caller that has a
+                // reuse contract — passes its own `mcp_registry` through
+                // `agent::run` (`AgentRunOverrides::mcp_registry`).
+                mcp_registry: None,
+            },
+            construction,
+            supplied_tail,
+        )
         .await;
         // process_message injects one combined MCP prompt block: deferred tool-search
         // listing + pinned resources, composed by the harness. `mut` because the
@@ -3919,22 +4095,25 @@ async fn process_message_inner(
         let build_override = effort_selection
             .as_ref()
             .map(|selection| selection.model.as_str());
-        let entry_model = zeroclaw_providers::model::build_model_nonblocking(
-            build_config,
-            agent_alias,
-            build_ref,
-            build_override,
-        )
-        .await?;
+        let bound_capabilities = crate::composition::BoundCapabilities {
+            capabilities: capabilities.clone(),
+            principal: principal.clone(),
+        };
+        let entry_model = bound_capabilities
+            .build_model(build_config, agent_alias, build_ref, build_override, false)
+            .await?;
         let provider_name = entry_model.provider_name();
         let (model_provider, identity, _) = entry_model.into_parts();
         let model_provider_ref = identity.provider_ref();
         let model_name = identity.model_id;
 
+        // Datasheet context describes native peripheral tools, so a
+        // supplied-only registry does not get it.
         let hardware_rag: Option<crate::rag::HardwareRag> = config
             .peripherals
             .datasheet_dir
             .as_ref()
+            .filter(|_| construction == crate::composition::RegistryConstruction::NativeCompat)
             .filter(|d| !d.trim().is_empty())
             .map(|dir| crate::rag::HardwareRag::load(&config.data_dir, dir.trim()))
             .and_then(Result::ok)
@@ -4262,6 +4441,7 @@ async fn process_message_inner(
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
+                    agent.resolved.keep_tool_context_turns,
                     config
                         .resolved_context_limits_for_route(
                             agent_alias,
@@ -4289,8 +4469,11 @@ async fn process_message_inner(
                     Some(&turn_id),
                     Some(SopStepReassembly {
                         config: &config,
+                        capabilities: Some(&bound_capabilities),
                         live_config,
+                        memory_owner: mem.principal_scope(),
                     }),
+                    Some(&bound_capabilities),
                 ),
             )
             .await
@@ -4303,6 +4486,29 @@ async fn process_message_inner(
 
 #[cfg(test)]
 mod tests {
+    /// A run over an owner's plane re-assembles its SOP steps under that
+    /// owner; a run over shared memory carries none.
+    #[test]
+    fn a_runs_sop_steps_reassemble_under_the_owner_of_its_memory() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let config = Config::default();
+        let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        assert!(
+            super::sop_reassembly_over(&config, None, &shared)
+                .memory_owner
+                .is_none()
+        );
+        let scope = PrincipalScope::new("user:alice").with_agent(Some("alpha".to_string()));
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            shared,
+            scope.clone(),
+        ));
+        assert_eq!(
+            super::sop_reassembly_over(&config, None, &routed).memory_owner,
+            Some(scope)
+        );
+    }
+
     use super::{
         apply_text_tool_prompt_policy, effort_scoped_provider_config, effort_turn_route,
         estimate_history_tokens, load_interactive_session_history, make_query_summary,
@@ -6170,6 +6376,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6194,6 +6401,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -6417,6 +6625,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6441,6 +6650,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -6849,6 +7059,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6873,6 +7084,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -6934,6 +7146,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -6958,6 +7171,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7048,6 +7262,7 @@ mod tests {
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7072,6 +7287,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7218,6 +7434,7 @@ mod tests {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -7243,6 +7460,7 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
                         0,
                     ),
@@ -7316,6 +7534,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7340,6 +7559,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7413,6 +7633,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7437,6 +7658,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7495,6 +7717,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7519,6 +7742,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7580,6 +7804,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7604,6 +7829,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7666,6 +7892,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -7690,6 +7917,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7739,6 +7967,7 @@ mod tests {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -7763,6 +7992,7 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: test_context_limits(0),
                     context_limits_resolver: None,
                     receipt_generator: None,
@@ -7935,6 +8165,7 @@ mod tests {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -7959,6 +8190,7 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: test_context_limits(0),
                     context_limits_resolver: None,
                     receipt_generator: None,
@@ -8068,6 +8300,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8092,6 +8325,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8153,6 +8387,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8177,6 +8412,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8237,6 +8473,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8261,6 +8498,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8406,6 +8644,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8430,6 +8669,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8575,6 +8815,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8599,6 +8840,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8710,6 +8952,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -8734,6 +8977,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9016,6 +9260,7 @@ mod tests {
                 parent_agent_alias: None,
                 served_route_sink: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
@@ -9040,6 +9285,7 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: test_context_limits(0),
                     context_limits_resolver: None,
                     receipt_generator: None,
@@ -9308,6 +9554,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9332,6 +9579,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9461,6 +9709,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9485,6 +9734,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9641,6 +9891,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9665,6 +9916,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9757,6 +10009,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9781,6 +10034,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9857,6 +10111,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9881,6 +10136,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9949,6 +10205,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -9973,6 +10230,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10049,6 +10307,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10073,6 +10332,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10152,6 +10412,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10176,6 +10437,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10261,6 +10523,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10285,6 +10548,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10362,6 +10626,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10386,6 +10651,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10547,6 +10813,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10571,6 +10838,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10691,6 +10959,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10715,6 +10984,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10805,6 +11075,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10829,6 +11100,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10905,6 +11177,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -10929,6 +11202,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11009,6 +11283,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -11033,6 +11308,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11115,6 +11391,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -11139,6 +11416,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11239,6 +11517,7 @@ mod tests {
                         parent_agent_alias: None,
                         served_route_sink: None,
                         sop_reassembly: None,
+                        capability_binding: None,
                         exec: ResolvedAgentExecution {
                             model_access: ResolvedModelAccess {
                                 model_provider: &model_provider,
@@ -11265,6 +11544,7 @@ mod tests {
                             strict_tool_parsing: false,
                             parallel_tools: false,
                             max_tool_result_chars: 0,
+                            keep_tool_context_turns: 2,
                             context_limits: test_context_limits(0),
                             context_limits_resolver: None,
                             receipt_generator: None,
@@ -11337,6 +11617,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -11361,6 +11642,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11433,6 +11715,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11457,6 +11740,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11524,6 +11808,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11548,6 +11833,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11613,6 +11899,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11637,6 +11924,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11708,6 +11996,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11732,6 +12021,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11830,6 +12120,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11854,6 +12145,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11958,6 +12250,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -11982,6 +12275,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12074,6 +12368,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12098,6 +12393,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12168,6 +12464,7 @@ mod tests {
         let error = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -12192,6 +12489,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12266,6 +12564,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12290,6 +12589,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12347,6 +12647,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12371,6 +12672,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12429,6 +12731,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12453,6 +12756,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12511,6 +12815,7 @@ mod tests {
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12535,6 +12840,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12595,6 +12901,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12619,6 +12926,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12683,6 +12991,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12707,6 +13016,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12783,6 +13093,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12807,6 +13118,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12867,6 +13179,7 @@ Done."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12891,6 +13204,7 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12954,6 +13268,7 @@ Done."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -12978,6 +13293,7 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13039,6 +13355,7 @@ Done."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -13063,6 +13380,7 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13125,6 +13443,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -13149,6 +13468,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13268,6 +13588,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -13292,6 +13613,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13362,6 +13684,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -13386,6 +13709,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13459,6 +13783,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -13483,6 +13808,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13579,6 +13905,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13603,6 +13930,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13712,6 +14040,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13736,6 +14065,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13815,6 +14145,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -13839,6 +14170,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13929,6 +14261,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -13953,6 +14286,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -14846,6 +15180,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -14870,6 +15205,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -14962,6 +15298,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -14986,6 +15323,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15073,6 +15411,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -15097,6 +15436,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15184,6 +15524,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -15208,6 +15549,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15353,6 +15695,7 @@ This is an example, not an invocation."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &router,
@@ -15377,6 +15720,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15499,6 +15843,7 @@ This is an example, not an invocation."#;
                 false,
                 false, // parallel_tools
                 0,     // max_tool_result_chars: disabled for test
+                2,     // keep_tool_context_turns
                 0,     // context_token_budget: disabled for test
                 None,  // channel
                 TurnOrigin::SubTurn,
@@ -15576,6 +15921,7 @@ This is an example, not an invocation."#;
                 true,
                 false, // parallel_tools
                 0,     // max_tool_result_chars: disabled for test
+                2,     // keep_tool_context_turns
                 0,     // context_token_budget: disabled for test
                 None,  // channel
                 TurnOrigin::SubTurn,
@@ -15649,6 +15995,7 @@ This is an example, not an invocation."#;
             false,
             false,
             0,
+            2, // keep_tool_context_turns
             0,
             None,
             TurnOrigin::SubTurn,
@@ -15723,6 +16070,7 @@ This is an example, not an invocation."#;
             false,
             false,
             0,
+            2, // keep_tool_context_turns
             0,
             None,
             TurnOrigin::SubTurn,
@@ -15795,6 +16143,7 @@ This is an example, not an invocation."#;
             false,
             false,
             0,
+            2, // keep_tool_context_turns
             0,
             None,
             TurnOrigin::SubTurn,
@@ -15935,7 +16284,8 @@ This is an example, not an invocation."#;
                 false,
                 false,
                 100, // max_tool_result_chars: truncate at 100 chars
-                0,   // context_token_budget: disabled
+                2,
+                0, // context_token_budget: disabled
                 None,
                 TurnOrigin::SubTurn,
                 None,
@@ -16019,6 +16369,7 @@ This is an example, not an invocation."#;
                 false,
                 false,
                 0, // max_tool_result_chars: disabled (no truncation)
+                2, // keep_tool_context_turns
                 0, // context_token_budget: disabled
                 None,
                 TurnOrigin::SubTurn,
@@ -17223,15 +17574,18 @@ Let me check the result."#;
         });
         let risk_profile = RiskProfileConfig::default();
         let built = crate::tools::AllToolsResult {
+            native_memory: Default::default(),
             tools: vec![mock_tool("shell")],
             reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            capability_slots: Vec::new(),
             delegate_tool: None,
         };
         let skill = crate::skills::Skill {
@@ -18367,6 +18721,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -18391,6 +18746,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -18559,6 +18915,7 @@ Let me check the result."#;
                     parent_agent_alias: None,
                     served_route_sink: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
@@ -18584,6 +18941,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         context_limits: test_context_limits(0),
                         context_limits_resolver: None,
                         receipt_generator: None,
@@ -18686,6 +19044,7 @@ Let me check the result."#;
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     served_route_sink: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
@@ -18711,6 +19070,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         // The reported-budget enforcement projects the NEXT
                         // request from the durable history at the calibration
                         // ratio (reported 80 / estimated ~30 ≈ 2.7), which lands
@@ -18905,6 +19265,7 @@ Let me check the result."#;
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &provider,
@@ -18929,6 +19290,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                             model_context_window: 100,
                             context_token_budget: 100,
@@ -19012,6 +19374,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -19038,6 +19401,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -19140,6 +19504,7 @@ Let me check the result."#;
                     parent_agent_alias: None,
                     served_route_sink: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
@@ -19165,6 +19530,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         context_limits: test_context_limits(0),
                         context_limits_resolver: None,
                         receipt_generator: None,
@@ -19241,6 +19607,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -19267,6 +19634,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -19339,6 +19707,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -19365,6 +19734,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(50),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -19454,6 +19824,105 @@ Let me check the result."#;
         ]
     }
 
+    /// The skill-review fork reuses the reviewed turn's provider and history.
+    /// When that history holds an image and the provider lacks vision, the
+    /// fork's vision route goes through the turn's binding, for its principal,
+    /// and the configured route behind the counting endpoint is never
+    /// contacted, whether the source refuses the route or serves it.
+    #[tokio::test]
+    async fn skill_review_routes_vision_through_the_turns_binding() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, VisionRouteProviders, capabilities_with_providers, counting_endpoint,
+        };
+        use crate::observability::noop::NoopObserver;
+
+        let principal =
+            zeroclaw_api::principal::PrincipalId::for_oidc("https://issuer.example", "subject-sr");
+        for refuse in [true, false] {
+            let endpoint = counting_endpoint().await;
+            let workspace = tempfile::TempDir::new().unwrap();
+            let mut config = Config {
+                data_dir: workspace.path().join("data"),
+                config_path: workspace.path().join("config.toml"),
+                ..Config::default()
+            };
+            config.providers.models.custom.insert(
+                "vision".to_string(),
+                zeroclaw_config::schema::CustomModelProviderConfig {
+                    base: zeroclaw_config::schema::ModelProviderConfig {
+                        uri: Some(endpoint.url.clone()),
+                        model: Some("vision-model".to_string()),
+                        api_key: Some("ambient-key".to_string()),
+                        ..zeroclaw_config::schema::ModelProviderConfig::default()
+                    },
+                },
+            );
+            config.multimodal.vision_model_provider = Some("custom.vision".to_string());
+            let providers = Arc::new(if refuse {
+                VisionRouteProviders::refusing()
+            } else {
+                VisionRouteProviders::default()
+            });
+            let bound = crate::composition::BoundCapabilities {
+                capabilities: capabilities_with_providers(Arc::clone(&providers) as _),
+                principal: Some(principal.clone()),
+            };
+            let model_provider = ScriptedModelProvider {
+                responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                    text: Some("Nothing to save.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }]))),
+                capabilities: ProviderCapabilities::default(),
+            };
+            let mut history = review_test_history();
+            history[1] = ChatMessage::user(IMAGE_TURN);
+            let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+                enabled: true,
+                cooldown_secs: 0,
+                nudge_interval_iterations: 1,
+                max_review_iterations: 2,
+            };
+
+            crate::skills::review::maybe_run_skill_review(
+                Some(&config),
+                workspace.path().to_path_buf(),
+                review_config,
+                false,
+                history,
+                Vec::new(),
+                &model_provider,
+                "mock-provider",
+                "mock-model",
+                &NoopObserver,
+                &config.multimodal,
+                &zeroclaw_config::schema::PacingConfig::default(),
+                0,
+                0,
+                None,
+                Some("reviewed-agent"),
+                Some(&bound),
+            )
+            .await;
+
+            let vision = providers.vision.lock();
+            assert!(
+                !vision.is_empty(),
+                "the review fork asks the turn's source for the vision route (refuse = {refuse})"
+            );
+            for request in vision.iter() {
+                assert_eq!(request.provider_ref.as_deref(), Some("custom.vision"));
+                assert_eq!(request.principal.as_ref(), Some(&principal));
+            }
+            assert_eq!(
+                endpoint.connections(),
+                0,
+                "the configured vision route was contacted (refuse = {refuse})"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn skill_review_fork_records_cost_usage_under_parent_scope() {
         use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
@@ -19512,7 +19981,8 @@ Let me check the result."#;
                     0,
                     0,
                     None,
-                    None, // agent_alias — no parent alias in the review-fork test fixture
+                    None, // agent_alias — no parent alias in the review-fork test fixture,
+                    None,
                 ),
             )
             .await;
@@ -19598,7 +20068,8 @@ Let me check the result."#;
                     0,
                     0,
                     None,
-                    None, // agent_alias — no parent alias in the review-fork test fixture
+                    None, // agent_alias — no parent alias in the review-fork test fixture,
+                    None,
                 ),
             )
             .await;
@@ -19709,7 +20180,8 @@ Let me check the result."#;
             // reported-budget trim mid-fork.
             100,
             None,
-            None, // agent_alias — no parent alias in the review-fork test fixture
+            None, // agent_alias — no parent alias in the review-fork test fixture,
+            None,
         )
         .await;
     }
@@ -21220,6 +21692,7 @@ Let me check the result."#;
             parent_agent_alias: None,
             served_route_sink: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
@@ -21244,6 +21717,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -21321,6 +21795,7 @@ Let me check the result."#;
                     parent_agent_alias: None,
                     served_route_sink: None,
                     sop_reassembly: None,
+                    capability_binding: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
@@ -21345,6 +21820,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         context_limits: test_context_limits(0),
                         context_limits_resolver: None,
                         receipt_generator: None,
@@ -21598,6 +22074,7 @@ Let me check the result."#;
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -21625,6 +22102,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(budget),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -21809,6 +22287,7 @@ Let me check the result."#;
         run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -21834,6 +22313,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -21916,6 +22396,7 @@ Let me check the result."#;
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
+            capability_binding: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
@@ -21943,6 +22424,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(100_000),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -22238,6 +22720,7 @@ Let me check the result."#;
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,
@@ -22263,6 +22746,7 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: test_context_limits(budget),
                     context_limits_resolver: Some(Arc::new(move |_, selected_model| {
                         zeroclaw_config::schema::ResolvedContextLimits {
@@ -22654,6 +23138,7 @@ Let me check the result."#;
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,
@@ -22679,6 +23164,7 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     // Tight enough that the second request's hook-grown
                     // population exceeds it, but comfortable for the first.
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
@@ -22778,6 +23264,7 @@ Let me check the result."#;
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: if streaming {
@@ -22807,6 +23294,7 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window,
                         ..test_context_limits(context_token_budget)
@@ -23052,6 +23540,7 @@ Let me check the result."#;
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
+                capability_binding: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,
@@ -23077,6 +23566,7 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     // Between the image-expanded population (well over
                     // 1,000 estimated tokens for a ~3KB attachment) and the
                     // real rebuilt population once that turn is dropped
@@ -23200,6 +23690,7 @@ Let me check the result."#;
             false,
             false,
             0,
+            2, // keep_tool_context_turns
             0,
             None,
             TurnOrigin::SubTurn,
@@ -23257,6 +23748,7 @@ Let me check the result."#;
             false,
             false, // parallel_tools
             0,     // max_tool_result_chars: disabled for test
+            2,     // keep_tool_context_turns
             0,     // context_token_budget: disabled for test
             None,  // channel
             TurnOrigin::SubTurn,
@@ -23330,9 +23822,10 @@ Let me check the result."#;
             None,
             false,
             false, // parallel_tools
-            0,     // max_tool_result_chars: disabled for test
-            0,     // context_token_budget: disabled for test
-            None,  // channel
+            0,
+            2,    // max_tool_result_chars: disabled for test
+            0,    // context_token_budget: disabled for test
+            None, // channel
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
@@ -24646,5 +25139,1234 @@ Pin 13: LED
             CappedLine::Line(line) => assert_eq!(line, "next-line"),
             other => panic!("expected Line, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_entry_point_tests {
+    use crate::composition::test_support::{
+        NoTools, RecordingMemory, RecordingProviders, STUB_REPLY, SeenProviderRequest,
+        recording_capabilities,
+    };
+    use std::sync::Arc;
+    use zeroclaw_api::ingress::TurnOrigin;
+    use zeroclaw_api::principal::PrincipalId;
+    use zeroclaw_config::schema::{
+        AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+        RiskProfileConfig,
+    };
+
+    /// The shared turn loop resolves an image turn's vision route through the
+    /// turn's supplied source, for its principal, and stops at a refusal
+    /// rather than building the configured (unreachable) route from config.
+    #[tokio::test]
+    async fn process_message_asks_the_supplied_source_for_the_vision_route() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, VISION_REFUSAL, VisionRouteProviders, capabilities_with_providers,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        for (alias, model) in [("fast", "gpt-4o-mini"), ("vision", "gpt-4o")] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        // Unroutable: only the supplied source can answer.
+                        uri: Some("http://127.0.0.1:9".to_string()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config.multimodal.vision_model_provider = Some("openai.vision".to_string());
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let providers = Arc::new(VisionRouteProviders::refusing());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-vision");
+
+        let error = super::process_message_with_capabilities(
+            Arc::new(config),
+            capabilities_with_providers(Arc::clone(&providers) as _),
+            Some(principal.clone()),
+            "test-agent",
+            IMAGE_TURN,
+            None,
+            TurnOrigin::SubTurn,
+            None,
+        )
+        .await
+        .expect_err("the source refuses the vision route");
+
+        assert!(
+            format!("{error:#}").contains(VISION_REFUSAL),
+            "the source's refusal reaches the caller: {error:#}"
+        );
+        let vision = providers.vision.lock();
+        assert!(
+            !vision.is_empty(),
+            "the vision route is asked of the source"
+        );
+        for request in vision.iter() {
+            assert_eq!(
+                request,
+                &SeenProviderRequest {
+                    agent_alias: "test-agent".into(),
+                    provider_ref: Some("openai.vision".into()),
+                    model: Some("gpt-4o".into()),
+                    principal: Some(principal.clone()),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn process_message_serves_the_turn_from_the_supplied_provider_for_the_principal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    // Unroutable: only the supplied provider can answer.
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        config.sop.sops_dir = Some(tmp.path().join("sops").display().to_string());
+        let sop_state = config.data_dir.join("sop");
+        assert!(!sop_state.exists());
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-2");
+
+        let reply = super::process_message_with_capabilities(
+            Arc::new(config),
+            recording_capabilities(
+                Arc::clone(&providers),
+                Arc::clone(&memory),
+                Arc::new(NoTools),
+            ),
+            Some(principal.clone()),
+            "test-agent",
+            "hello",
+            None,
+            TurnOrigin::SubTurn,
+            None,
+        )
+        .await
+        .expect("the turn completes on the supplied provider");
+
+        assert!(reply.contains(STUB_REPLY), "unexpected reply: {reply}");
+        assert!(
+            !sop_state.exists(),
+            "SuppliedOnly process_message must not construct a native SOP run store"
+        );
+        assert_eq!(
+            *providers.seen.lock(),
+            vec![SeenProviderRequest {
+                agent_alias: "test-agent".into(),
+                provider_ref: None,
+                model: Some("gpt-4o-mini".into()),
+                principal: Some(principal),
+            }]
+        );
+        assert!(
+            memory
+                .agents
+                .lock()
+                .iter()
+                .any(|alias| alias == "test-agent")
+        );
+    }
+
+    const SWITCH_AGENT: &str = "supplied-cli-switch-agent";
+    const START_REF: &str = "openai.initial";
+    const START_MODEL: &str = "initial-model";
+    const SWITCH_REF: &str = "openai.switched";
+    const SWITCH_MODEL: &str = "switched-model";
+    const SWITCH_REPLY: &str = "distinct supplied switch reply";
+    const SWITCH_REFUSAL: &str = "supplied CLI switch refused";
+    const STARTUP_REUSED: &str = "startup source was reused for a switch";
+    const SWITCH_CHILD: &str =
+        "agent::loop_::capability_entry_point_tests::supplied_cli_switch_child";
+    const SWITCH_CASE_ENV: &str = "ZEROCLAW_TEST_SUPPLIED_CLI_SWITCH_CASE";
+
+    #[derive(Default)]
+    struct SwitchSeen {
+        startup: std::sync::Mutex<Vec<SeenProviderRequest>>,
+        switches: std::sync::Mutex<Vec<SeenProviderRequest>>,
+        chats: std::sync::Mutex<Vec<(bool, String)>>,
+        context_windows: std::sync::Mutex<Vec<usize>>,
+    }
+
+    struct SwitchSource {
+        seen: Arc<SwitchSeen>,
+        refuse: bool,
+    }
+
+    fn switch_request(request: &crate::composition::ProviderRequest<'_>) -> SeenProviderRequest {
+        SeenProviderRequest {
+            agent_alias: request.agent_alias.to_owned(),
+            provider_ref: request.provider_ref.map(str::to_owned),
+            model: request.model.map(str::to_owned),
+            principal: request.principal.cloned(),
+        }
+    }
+
+    impl crate::composition::ProviderSource for SwitchSource {
+        fn model_provider(
+            &self,
+            request: &crate::composition::ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn zeroclaw_api::model_provider::ModelProvider>> {
+            let mut startup = self.seen.startup.lock().unwrap();
+            startup.push(switch_request(request));
+            if startup.len() != 1
+                || request.provider_ref != Some(START_REF)
+                || request.model != Some(START_MODEL)
+            {
+                anyhow::bail!(STARTUP_REUSED);
+            }
+            self.seen.context_windows.lock().unwrap().push(
+                request
+                    .config
+                    .resolved_context_limits_for_route(request.agent_alias, START_REF, START_MODEL)
+                    .model_context_window,
+            );
+            Ok(Arc::new(SwitchProvider {
+                switched: false,
+                seen: self.seen.clone(),
+            }))
+        }
+
+        fn switched_model_provider(
+            &self,
+            request: &crate::composition::ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn zeroclaw_api::model_provider::ModelProvider>> {
+            self.seen
+                .switches
+                .lock()
+                .unwrap()
+                .push(switch_request(request));
+            self.seen.context_windows.lock().unwrap().push(
+                request
+                    .config
+                    .resolved_context_limits_for_route(
+                        request.agent_alias,
+                        request.provider_ref.expect("explicit switch target"),
+                        request.model.expect("explicit switch model"),
+                    )
+                    .model_context_window,
+            );
+            if self.refuse {
+                anyhow::bail!(SWITCH_REFUSAL);
+            }
+            Ok(Arc::new(SwitchProvider {
+                switched: true,
+                seen: self.seen.clone(),
+            }))
+        }
+    }
+
+    struct SwitchProvider {
+        switched: bool,
+        seen: Arc<SwitchSeen>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SwitchProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            use zeroclaw_api::attribution::{ModelProviderKind, ProviderKind, Role};
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            if self.switched {
+                "supplied-switched"
+            } else {
+                "supplied-initial"
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for SwitchProvider {
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: true,
+                ..Default::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected unstructured chat in CLI switch control")
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            use zeroclaw_api::model_provider::{ChatResponse, ToolCall};
+            {
+                let mut chats = self.seen.chats.lock().unwrap();
+                assert_eq!(
+                    chats.len(),
+                    usize::from(self.switched),
+                    "unexpected provider retry"
+                );
+                chats.push((self.switched, model.to_owned()));
+            }
+            if self.switched {
+                assert_eq!(model, SWITCH_MODEL);
+                Ok(ChatResponse {
+                    text: Some(SWITCH_REPLY.into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                assert_eq!(model, START_MODEL);
+                let tools = request
+                    .tools
+                    .expect("the actual native tool must be advertised");
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0].name, "model_switch");
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "supplied-cli-switch-call".into(),
+                        name: "model_switch".into(),
+                        arguments: serde_json::json!({
+                            "action": "set", "model_provider": SWITCH_REF, "model": SWITCH_MODEL,
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct SwitchObserver(std::sync::Mutex<Vec<zeroclaw_api::observability_traits::ObserverEvent>>);
+
+    impl zeroclaw_api::observability_traits::Observer for SwitchObserver {
+        fn record_event(&self, event: &zeroclaw_api::observability_traits::ObserverEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "supplied-cli-switch-control"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct SwitchCli(Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct SwitchChannels(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::composition::ChannelSource for SwitchChannels {
+        fn channel(&self, alias: &str) -> Option<Arc<dyn zeroclaw_api::channel::Channel>> {
+            (alias == "cli").then(|| {
+                Arc::new(SwitchCli(self.0.clone())) as Arc<dyn zeroclaw_api::channel::Channel>
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SwitchCli {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            use zeroclaw_api::attribution::{ChannelKind, Role};
+            Role::Channel(ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "cli"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::channel::Channel for SwitchCli {
+        fn name(&self) -> &str {
+            "cli"
+        }
+        async fn send(&self, message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(message.content.clone());
+            println!("{}", message.content);
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            panic!("run_inner must read the child's actual stdin")
+        }
+    }
+
+    async fn switch_endpoint_probe(
+        endpoint: &crate::composition::test_support::CountingEndpoint,
+        expected: usize,
+    ) {
+        use tokio::io::AsyncReadExt as _;
+
+        assert_eq!(
+            endpoint.connections(),
+            expected - 1,
+            "unexpected configured-provider connection before probe"
+        );
+        let address = endpoint
+            .url
+            .strip_prefix("http://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut probe = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut acknowledgment = [0_u8; 1];
+            assert_eq!(
+                probe.read(&mut acknowledgment).await.unwrap(),
+                0,
+                "counting endpoint must close its accepted probe"
+            );
+        })
+        .await
+        .expect("the independent sentinel probe must be accepted");
+        assert_eq!(
+            endpoint.connections(),
+            expected,
+            "unexpected configured-provider connection"
+        );
+    }
+
+    async fn exercise_cli_switch(interactive: bool, refuse: bool) {
+        use crate::composition::test_support::{capabilities_with_providers, counting_endpoint};
+        use zeroclaw_api::observability_traits::ObserverEvent;
+
+        let endpoint = counting_endpoint().await;
+        switch_endpoint_probe(&endpoint, 1).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".into();
+        config.memory.auto_save = false;
+        config.plugins.enabled = false;
+        config.plugins.auto_discover = false;
+        config.mcp.enabled = false;
+        config.skills.skill_creation.enabled = false;
+        config.risk_profiles.insert(
+            "switch-control".into(),
+            RiskProfileConfig {
+                allowed_tools: vec!["model_switch".into()],
+                auto_approve: vec!["model_switch".into()],
+                ..Default::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "switch-control".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                deferred_builtin_tools: false,
+                ..Default::default()
+            },
+        );
+        for (alias, model, window) in [
+            ("initial", START_MODEL, 64_000),
+            ("switched", SWITCH_MODEL, 128_000),
+        ] {
+            config.providers.models.openai.insert(
+                alias.into(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.into()),
+                        uri: Some(endpoint.url.clone()),
+                        api_key: Some("synthetic-switch-control".into()),
+                        context_window: Some(window),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config.agents.insert(
+            SWITCH_AGENT.into(),
+            AliasedAgentConfig {
+                model_provider: START_REF.into(),
+                risk_profile: "switch-control".into(),
+                runtime_profile: "switch-control".into(),
+                ..Default::default()
+            },
+        );
+        let principal = PrincipalId::for_oidc("https://issuer.example", "cli-switch-control");
+        let source = Arc::new(SwitchSource {
+            seen: Arc::new(SwitchSeen::default()),
+            refuse,
+        });
+        let observer = Arc::new(SwitchObserver::default());
+        let mut capabilities = capabilities_with_providers(source.clone());
+        capabilities.observer = observer.clone();
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel_messages = sent.clone();
+        capabilities.tools = Arc::new(crate::composition::defaults::NoSuppliedTools);
+        capabilities.channels = Arc::new(SwitchChannels(sent.clone()));
+        config.tools.optional = vec!["model_switch".into()];
+        assert!(super::CLI_CHANNEL_FN.get().is_none());
+        super::register_cli_channel_fn(Box::new(move || {
+            Box::new(SwitchCli(channel_messages.clone()))
+        }));
+        let result = super::run_with_capabilities(
+            config,
+            capabilities,
+            Some(principal.clone()),
+            SWITCH_AGENT,
+            (!interactive).then(|| "please switch models".to_owned()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            true,
+            None,
+            Some(vec!["model_switch".into()]),
+            TurnOrigin::Interactive,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+        // A second independently accepted probe fences the zero-production-attempt assertion.
+        switch_endpoint_probe(&endpoint, 2).await;
+        let events = observer.0.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ObserverEvent::ToolCall {
+            tool, success: true, agent_alias, ..
+        } if tool == "model_switch" && agent_alias.as_deref() == Some(SWITCH_AGENT)))
+                .count(),
+            1
+        );
+        println!("SUPPLIED_CLI_SWITCH_TOOL_COMPLETED");
+        if refuse {
+            let error =
+                result.expect_err("the supplied switch source must refuse the actual CLI turn");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.to_string() == SWITCH_REFUSAL),
+                "{error:#}"
+            );
+        } else {
+            assert_eq!(
+                result.expect("the distinct supplied provider must serve the switched turn"),
+                SWITCH_REPLY
+            );
+        }
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "CLI response must use actual stdout"
+        );
+        assert_eq!(
+            *source.seen.startup.lock().unwrap(),
+            vec![SeenProviderRequest {
+                agent_alias: SWITCH_AGENT.into(),
+                provider_ref: Some(START_REF.into()),
+                model: Some(START_MODEL.into()),
+                principal: Some(principal.clone()),
+            }]
+        );
+        assert_eq!(
+            *source.seen.switches.lock().unwrap(),
+            vec![SeenProviderRequest {
+                agent_alias: SWITCH_AGENT.into(),
+                provider_ref: Some(SWITCH_REF.into()),
+                model: Some(SWITCH_MODEL.into()),
+                principal: Some(principal),
+            }]
+        );
+        let expected_chats: Vec<(bool, String)> = if refuse {
+            vec![(false, START_MODEL.into())]
+        } else {
+            vec![(false, START_MODEL.into()), (true, SWITCH_MODEL.into())]
+        };
+        assert_eq!(*source.seen.chats.lock().unwrap(), expected_chats);
+        assert_eq!(
+            *source.seen.context_windows.lock().unwrap(),
+            vec![64_000, 128_000]
+        );
+        let brackets: Vec<_> = events.iter().filter(|e| matches!(e,
+            ObserverEvent::AgentStart { agent_alias, .. } | ObserverEvent::AgentEnd { agent_alias, .. }
+            if agent_alias.as_deref() == Some(SWITCH_AGENT))).collect();
+        assert_eq!(brackets.len(), 2, "{events:?}");
+        assert!(matches!(brackets[0], ObserverEvent::AgentStart { .. }));
+        match brackets[1] {
+            ObserverEvent::AgentEnd {
+                model_provider,
+                model,
+                ..
+            } => {
+                assert_eq!(model_provider, if refuse { START_REF } else { SWITCH_REF });
+                assert_eq!(model, if refuse { START_MODEL } else { SWITCH_MODEL });
+            }
+            event => panic!("unbalanced CLI switch lifecycle: {event:?}"),
+        }
+    }
+
+    // Only this explicitly selected child registers the process-global CLI factory.
+    #[test]
+    #[ignore = "private same-executable fixture, invoked by the six parent controls"]
+    fn supplied_cli_switch_child() {
+        let case = std::env::var(SWITCH_CASE_ENV).expect("explicit private CLI switch case");
+        if matches!(case.as_str(), "no-channel" | "config-backed-channel") {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let mut config = Config {
+                        data_dir: tmp.path().join("data"),
+                        config_path: tmp.path().join("config.toml"),
+                        ..Default::default()
+                    };
+                    config.memory.auto_save = false;
+                    config.sop.sops_dir = Some(tmp.path().join("sops").display().to_string());
+                    let sop_state = config.data_dir.join("sop");
+                    assert!(!sop_state.exists());
+                    config
+                        .risk_profiles
+                        .insert("no-channel".into(), RiskProfileConfig::default());
+                    config.providers.models.openai.insert(
+                        "initial".into(),
+                        OpenAIModelProviderConfig {
+                            base: ModelProviderConfig {
+                                model: Some(START_MODEL.into()),
+                                ..Default::default()
+                            },
+                        },
+                    );
+                    config.agents.insert(
+                        SWITCH_AGENT.into(),
+                        AliasedAgentConfig {
+                            model_provider: START_REF.into(),
+                            risk_profile: "no-channel".into(),
+                            ..Default::default()
+                        },
+                    );
+                    let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let observed = factory_calls.clone();
+                    assert!(super::CLI_CHANNEL_FN.get().is_none());
+                    super::register_cli_channel_fn(Box::new(move || {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Box::new(SwitchCli(Default::default()))
+                    }));
+                    let providers = Arc::new(RecordingProviders::default());
+                    let mut caps = recording_capabilities(
+                        providers.clone(),
+                        Arc::new(RecordingMemory::default()),
+                        Arc::new(NoTools),
+                    );
+                    let observer = Arc::new(SwitchObserver::default());
+                    caps.observer = observer.clone();
+                    if case == "config-backed-channel" {
+                        caps.channels = Arc::new(crate::composition::defaults::NoOutboundChannels);
+                    }
+                    let result = super::run_with_capabilities(
+                        config,
+                        caps,
+                        None,
+                        SWITCH_AGENT,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        true,
+                        None,
+                        None,
+                        TurnOrigin::Interactive,
+                        super::AgentRunOverrides::default(),
+                    )
+                    .await;
+                    if case == "config-backed-channel" {
+                        assert_eq!(
+                            result.expect("the config-backed CLI serves the turn"),
+                            STUB_REPLY
+                        );
+                        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                        let events = observer.0.lock().unwrap();
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| matches!(event,
+                            zeroclaw_api::observability_traits::ObserverEvent::LlmResponse {
+                                success: true, agent_alias: Some(alias), ..
+                            } if alias == SWITCH_AGENT))
+                                .count(),
+                            1,
+                            "exactly one served turn"
+                        );
+                        println!("CONFIG_BACKED_CLI_ONE_FACTORY_ONE_TURN");
+                    } else {
+                        let error = result.expect_err(
+                            "NoChannels is authoritative even with a registered factory",
+                        );
+                        assert_eq!(
+                            error.to_string(),
+                            crate::i18n::get_required_cli_string(
+                                "cli-agent-error-channel-unavailable"
+                            )
+                        );
+                        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                        println!("SUPPLIED_CLI_NO_CHANNEL_REFUSED");
+                    }
+                    assert_eq!(
+                        providers.seen.lock().len(),
+                        1,
+                        "the real CLI reached its channel boundary after provider setup"
+                    );
+                    assert!(
+                        !sop_state.exists(),
+                        "SuppliedOnly run must not construct a native SOP run store"
+                    );
+                })
+                .await
+                .expect("bounded actual channel refusal");
+            });
+            println!("SUPPLIED_CLI_SWITCH_PASSED:{case}");
+            return;
+        }
+        let (interactive, refuse) = match case.as_str() {
+            "one-shot-serve" => (false, false),
+            "one-shot-refuse" => (false, true),
+            "interactive-serve" => (true, false),
+            "interactive-refuse" => (true, true),
+            _ => panic!("unknown private CLI switch case"),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                exercise_cli_switch(interactive, refuse),
+            )
+            .await
+            .expect("bounded actual CLI switch case");
+        });
+        println!("SUPPLIED_CLI_SWITCH_PASSED:{case}");
+    }
+
+    struct SwitchChild {
+        child: std::process::Child,
+        reaped: bool,
+    }
+
+    impl SwitchChild {
+        fn wait_until(&mut self, deadline: std::time::Instant) -> Option<std::process::ExitStatus> {
+            loop {
+                if let Some(status) = self.child.try_wait().expect("poll owned switch child") {
+                    self.reaped = true;
+                    return Some(status);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for SwitchChild {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // A direct Child remains unreaped here; never signal a stored numeric PID/group.
+                match self.child.try_wait() {
+                    Ok(Some(_)) => {
+                        self.reaped = true;
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(_) => return, // Uncertain waitability never authorizes a signal.
+                }
+                let _ = self.child.kill();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(Some(_)) = self.child.try_wait() {
+                        self.reaped = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    fn switch_child_output(
+        reader: impl std::io::Read + Send + 'static,
+    ) -> (
+        std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::Read as _;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = reader.take(65_537).read_to_end(&mut bytes).and_then(|_| {
+                if bytes.len() > 65_536 {
+                    Err(std::io::Error::other(
+                        "CLI switch child output exceeded its cap",
+                    ))
+                } else {
+                    Ok(bytes)
+                }
+            });
+            let _ = tx.send(result);
+        });
+        (rx, handle)
+    }
+
+    fn run_switch_child(case: &str) {
+        use std::io::Write as _;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                SWITCH_CHILD,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SWITCH_CASE_ENV, case)
+            .env_remove("ZEROCLAW_OPEN_SKILLS_ENABLED")
+            .env_remove("ZEROCLAW_OPEN_SKILLS_DIR")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut owned = SwitchChild {
+            child: command.spawn().unwrap(),
+            reaped: false,
+        };
+        let (stdout, out_thread) = switch_child_output(owned.child.stdout.take().unwrap());
+        let (stderr, err_thread) = switch_child_output(owned.child.stderr.take().unwrap());
+        let mut input = owned.child.stdin.take().unwrap();
+        let _ = input.write_all(b"please switch models\n");
+        drop(input); // EOF is delivered through the real child's stdin, without fd mutation.
+        let status = owned
+            .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(30))
+            .expect("actual CLI switch child exceeded the parent deadline");
+        let output = stdout
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let errors = stderr
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        out_thread.join().unwrap();
+        err_thread.join().unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let errors = String::from_utf8(errors).unwrap();
+        assert!(status.success(), "{case}: {status}\n{output}\n{errors}");
+        assert_eq!(
+            output.matches("SUPPLIED_CLI_SWITCH_TOOL_COMPLETED").count(),
+            usize::from(!matches!(case, "no-channel" | "config-backed-channel"))
+        );
+        assert_eq!(
+            output.matches("SUPPLIED_CLI_NO_CHANNEL_REFUSED").count(),
+            usize::from(case == "no-channel")
+        );
+        assert_eq!(
+            output
+                .matches("CONFIG_BACKED_CLI_ONE_FACTORY_ONE_TURN")
+                .count(),
+            usize::from(case == "config-backed-channel")
+        );
+        assert_eq!(
+            output.matches(STUB_REPLY).count(),
+            usize::from(case == "config-backed-channel"),
+            "the real CLI prints the one served response: {output}"
+        );
+        assert_eq!(
+            output
+                .matches(&format!("SUPPLIED_CLI_SWITCH_PASSED:{case}"))
+                .count(),
+            1
+        );
+        assert!(
+            output.contains("1 passed; 0 failed"),
+            "private fixture must actually execute: {output}"
+        );
+        assert_eq!(
+            output.contains(SWITCH_REPLY),
+            case.ends_with("-serve"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn run_supplied_one_shot_switch_uses_switch_source() {
+        run_switch_child("one-shot-serve");
+    }
+
+    #[test]
+    fn run_supplied_no_channels_refuses_without_global_factory_fallback() {
+        run_switch_child("no-channel");
+    }
+
+    #[test]
+    fn run_config_backed_cli_channel_factory_serves_exactly_one_turn() {
+        run_switch_child("config-backed-channel");
+    }
+
+    #[test]
+    fn run_supplied_one_shot_switch_refusal_has_no_startup_fallback() {
+        run_switch_child("one-shot-refuse");
+    }
+
+    #[test]
+    fn run_supplied_interactive_switch_uses_switch_source() {
+        run_switch_child("interactive-serve");
+    }
+
+    #[test]
+    fn run_supplied_interactive_switch_refusal_has_no_startup_fallback() {
+        run_switch_child("interactive-refuse");
+    }
+
+    /// Counts every chat it serves: two tool-call rounds for `skill_probe`,
+    /// then plain text for the turn's answer and for any later request (a
+    /// post-turn skill review). XML calls stay in the history text, where the
+    /// skill creator reads them; native calls produce the `tool` messages the
+    /// skill review counts.
+    struct SkillHookProvider {
+        chats: Arc<std::sync::atomic::AtomicUsize>,
+        native_calls: bool,
+    }
+
+    const SKILL_HOOK_REPLY: &str = "skill hook turn answered";
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for SkillHookProvider {
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: self.native_calls,
+                ..Default::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(SKILL_HOOK_REPLY.into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
+            let call = self.chats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (text, tool_calls) = match (call < 2, self.native_calls) {
+                (false, _) => (Some(SKILL_HOOK_REPLY.to_string()), Vec::new()),
+                (true, true) => (
+                    None,
+                    vec![zeroclaw_api::model_provider::ToolCall {
+                        id: format!("probe-{call}"),
+                        name: "skill_probe".into(),
+                        arguments: format!(r#"{{"step":{call}}}"#),
+                        extra_content: None,
+                    }],
+                ),
+                (true, false) => (
+                    Some(format!(
+                        r#"<tool_call>{{"name":"skill_probe","arguments":{{"step":{call}}}}}</tool_call>"#
+                    )),
+                    Vec::new(),
+                ),
+            };
+            Ok(zeroclaw_api::model_provider::ChatResponse {
+                text,
+                tool_calls,
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SkillHookProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "skill-hook"
+        }
+    }
+
+    struct SkillHookProviders(Arc<std::sync::atomic::AtomicUsize>, bool);
+
+    impl crate::composition::ProviderSource for SkillHookProviders {
+        fn model_provider(
+            &self,
+            _request: &crate::composition::ProviderRequest<'_>,
+        ) -> anyhow::Result<Arc<dyn zeroclaw_api::model_provider::ModelProvider>> {
+            Ok(Arc::new(SkillHookProvider {
+                chats: Arc::clone(&self.0),
+                native_calls: self.1,
+            }))
+        }
+    }
+
+    struct SkillProbeTool(Arc<std::sync::atomic::AtomicUsize>);
+
+    zeroclaw_api::mock_tool_attribution!(SkillProbeTool);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for SkillProbeTool {
+        fn name(&self) -> &str {
+            "skill_probe"
+        }
+        fn description(&self) -> &str {
+            "Records that the turn executed a supplied tool."
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(zeroclaw_api::tool::ToolResult {
+                success: true,
+                output: zeroclaw_api::tool::ToolOutput::default(),
+                error: None,
+            })
+        }
+    }
+
+    /// Supplies `skill_probe`; `native` selects the native compatibility recipe
+    /// as well, so the same source covers both construction modes.
+    struct SkillProbeTools {
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+        native: bool,
+    }
+
+    impl crate::composition::ToolSource for SkillProbeTools {
+        fn native_recipe<'s>(
+            &'s self,
+            _request: &crate::composition::ToolRequest<'_>,
+        ) -> anyhow::Result<Option<&'s crate::composition::NativeRegistryRecipe>> {
+            Ok(self
+                .native
+                .then_some(&crate::composition::defaults::native_compat_registry))
+        }
+
+        fn tools(
+            &self,
+            _request: &crate::composition::ToolRequest<'_>,
+        ) -> anyhow::Result<Vec<Box<dyn crate::tools::Tool>>> {
+            Ok(vec![Box::new(SkillProbeTool(Arc::clone(&self.executions)))])
+        }
+    }
+
+    fn skill_files(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    skill_files(&path)
+                } else {
+                    usize::from(matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("SKILL.toml" | "SKILL.md")
+                    ))
+                }
+            })
+            .sum()
+    }
+
+    /// Runs one CLI turn that makes two supplied tool calls with skill creation
+    /// and skill review both enabled; `native` selects the native recipe and
+    /// `native_calls` native tool calls instead of XML ones. Returns (provider
+    /// chats, tool executions, skill files under the creator's directory).
+    async fn run_skill_hook_turn(native: bool, native_calls: bool) -> (usize, usize, usize) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.plugins.enabled = false;
+        config.plugins.auto_discover = false;
+        config.mcp.enabled = false;
+        config.skills.skill_creation.enabled = true;
+        config.skills.skill_creation.reflection_enabled = false;
+        config.skills.skill_improvement.enabled = true;
+        config.skills.skill_improvement.cooldown_secs = 0;
+        config.skills.skill_improvement.nudge_interval_iterations = 1;
+        config.risk_profiles.insert(
+            "skill-hooks".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["skill_probe".into()],
+                auto_approve: vec!["skill_probe".into()],
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    // Unroutable: only the supplied provider can answer.
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "skill-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "skill-hooks".into(),
+                ..Default::default()
+            },
+        );
+        let skills_dir = config.data_dir.join("skills");
+        let chats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut capabilities = recording_capabilities(
+            Arc::new(RecordingProviders::default()),
+            Arc::new(RecordingMemory::default()),
+            Arc::new(SkillProbeTools {
+                executions: Arc::clone(&executions),
+                native,
+            }),
+        );
+        capabilities.providers = Arc::new(SkillHookProviders(Arc::clone(&chats), native_calls));
+
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::run_with_capabilities(
+                config,
+                capabilities,
+                None,
+                "skill-agent",
+                Some("probe the supplied tool twice".to_owned()),
+                None,
+                None,
+                None,
+                Vec::new(),
+                false,
+                None,
+                None,
+                TurnOrigin::Interactive,
+                super::AgentRunOverrides::default(),
+            ),
+        )
+        .await
+        .expect("bounded skill hook turn")
+        .expect("the supplied provider serves the turn");
+        assert_eq!(reply, SKILL_HOOK_REPLY);
+        (
+            chats.load(std::sync::atomic::Ordering::SeqCst),
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            skill_files(&skills_dir),
+        )
+    }
+
+    /// A supplied-only CLI turn runs no native skill work after it answers:
+    /// no skill is written and no review asks the provider again, whichever
+    /// way the model calls tools.
+    #[tokio::test]
+    async fn run_supplied_only_turn_skips_post_turn_skill_creation_and_review() {
+        for native_calls in [false, true] {
+            let (chats, executions, skills) = run_skill_hook_turn(false, native_calls).await;
+            assert_eq!(
+                executions, 2,
+                "native_calls={native_calls}: both tool calls ran"
+            );
+            assert_eq!(chats, 3, "native_calls={native_calls}: no review call");
+            assert_eq!(skills, 0, "native_calls={native_calls}: no skill written");
+        }
+    }
+
+    /// The same turns with the native recipe still run both hooks, so the
+    /// supplied-only control above is not passing vacuously. Skill creation
+    /// reads XML calls from the history; skill review counts native tool
+    /// messages, so each hook is shown with the call style it reads.
+    #[tokio::test]
+    async fn run_native_compat_turn_keeps_post_turn_skill_creation_and_review() {
+        let (_, executions, skills) = run_skill_hook_turn(true, false).await;
+        assert_eq!(executions, 2, "the XML turn made both supplied tool calls");
+        assert_eq!(skills, 1, "skill creation wrote one skill");
+        let (chats, executions, _) = run_skill_hook_turn(true, true).await;
+        assert_eq!(
+            executions, 2,
+            "the native turn made both supplied tool calls"
+        );
+        assert!(
+            chats > 3,
+            "the skill review asked the provider again: {chats}"
+        );
     }
 }
