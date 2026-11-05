@@ -16,7 +16,10 @@ fn root() -> PathBuf {
 // do not affect this check; concrete construction cannot be waved through by a
 // retained manifest edge. Known entry bodies use balanced braces in literals too.
 fn function<'a>(source: &'a str, name: &str) -> &'a str {
-    let marker = format!("fn {name}(");
+    // Some async boundary adapters are generic over their borrowed lifetime
+    // (`fn name<'a>(...)`). Match the function name first, then locate the
+    // opening brace so the check remains independent of generic parameters.
+    let marker = format!("fn {name}");
     let start = source
         .find(&marker)
         .unwrap_or_else(|| panic!("missing boundary function {name}"));
