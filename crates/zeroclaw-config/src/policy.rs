@@ -506,7 +506,9 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
 /// with English `C:\…` fallbacks so relocated installs stay covered. Secret
 /// trees that Unix defaults protect via `~/.gnupg` / `~/.config` are named
 /// under `%APPDATA%` / `%LOCALAPPDATA%` (or `~/AppData/…` when those vars are
-/// unset), because the Unix spellings do not exist on a typical Windows home.
+/// unset). The Unix `~/.gnupg` / `~/.config` spellings are retained as well so
+/// a Windows operator who still keeps credentials there does not lose those
+/// default denies when `workspace_only = false`.
 #[cfg(any(test, target_os = "windows"))]
 pub(crate) fn windows_default_forbidden_paths_with(
     getenv: &dyn Fn(&str) -> Option<String>,
@@ -553,7 +555,9 @@ pub(crate) fn windows_default_forbidden_paths_with(
     }
 
     // Portable Unix-style homes that also exist under the Windows user profile.
-    for homeish in ["~/.ssh", "~/.aws"] {
+    // Keep ~/.gnupg and ~/.config: operators may still store credentials there
+    // (WSL/Git Bash layouts, relocated tools) even when AppData roots are set.
+    for homeish in ["~/.ssh", "~/.aws", "~/.gnupg", "~/.config"] {
         push_unique(&mut paths, homeish.into());
     }
 
@@ -10993,7 +10997,7 @@ mod tests {
                     "System dir should be blocked: {dir}"
                 );
             }
-            for dot in &["~/.ssh", "~/.aws"] {
+            for dot in &["~/.ssh", "~/.aws", "~/.gnupg", "~/.config"] {
                 assert!(
                     p.forbidden_paths.iter().any(|f| f == *dot),
                     "Default forbidden_paths must include {dot}"
@@ -11003,11 +11007,6 @@ mod tests {
                     "Sensitive dotfile dir should be blocked: {dot}"
                 );
             }
-            assert!(
-                !p.forbidden_paths
-                    .iter()
-                    .any(|f| f == "~/.gnupg" || f == "~/.config")
-            );
         }
         #[cfg(not(target_os = "windows"))]
         for dot in &["~/.ssh", "~/.gnupg", "~/.aws"] {
@@ -11042,7 +11041,12 @@ mod tests {
         }
         #[cfg(target_os = "windows")]
         {
-            for path in ["~/.ssh/id_rsa", "~/.aws/credentials"] {
+            for path in [
+                "~/.ssh/id_rsa",
+                "~/.aws/credentials",
+                "~/.gnupg/secring.gpg",
+                "~/.config/secrets",
+            ] {
                 assert!(
                     !p.is_path_allowed(path),
                     "Sensitive dotfile should be blocked: {path}"
@@ -12563,13 +12567,14 @@ mod tests {
             r"D:\Users\alice\AppData\Local",
             "~/.ssh",
             "~/.aws",
+            "~/.gnupg",
+            "~/.config",
         ] {
             assert!(
                 paths.iter().any(|p| p == expected),
                 "missing {expected:?} in {paths:?}"
             );
         }
-        assert!(!paths.iter().any(|p| p == "~/.gnupg" || p == "~/.config"));
     }
 
     #[test]
@@ -12588,6 +12593,7 @@ mod tests {
         );
         assert!(paths.iter().any(|p| p == "~/AppData/Roaming"));
         assert!(paths.iter().any(|p| p == "~/AppData/Local"));
-        assert!(!paths.iter().any(|p| p == "~/.gnupg" || p == "~/.config"));
+        assert!(paths.iter().any(|p| p == "~/.gnupg"));
+        assert!(paths.iter().any(|p| p == "~/.config"));
     }
 }
