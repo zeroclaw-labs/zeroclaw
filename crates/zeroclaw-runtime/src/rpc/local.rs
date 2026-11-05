@@ -19,7 +19,7 @@ use zeroclaw_config::schema::Config;
 
 use platform::LocalStream;
 
-pub(crate) const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
 
 /// Best-effort deadline for half-closing a local stream after daemon
 /// cancellation. Windows named-pipe shutdown can wait on a non-reading peer.
