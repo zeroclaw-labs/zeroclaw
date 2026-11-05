@@ -4419,7 +4419,7 @@ impl RpcDispatcher {
                     let session = session
                         .filter(|s| Arc::ptr_eq(&s.agent, &expected_agent))
                         .ok_or_else(|| current.stale_session_incarnation_error())?;
-                    if remote && session.owner_tui_id != current.tui_id {
+                    if remote && session.owner_tui_id() != current.tui_id.as_deref() {
                         return Err(current.stale_session_incarnation_error());
                     }
                     // Channel refresh uses the Agent mutex. Keep transport eligibility,
@@ -4524,7 +4524,7 @@ impl RpcDispatcher {
                         if session.generation != expected_generation
                             || !Arc::ptr_eq(&session.agent, expected_agent)
                             || (self.access_policy == RpcAccessPolicy::RemoteSessionOwner
-                                && session.owner_tui_id != self.tui_id)
+                                && session.owner_tui_id() != self.tui_id.as_deref())
                         {
                             return Err(self.stale_session_incarnation_error());
                         }
@@ -8216,11 +8216,28 @@ impl RpcDispatcher {
             origin: TurnOrigin::Interactive,
             internal_principal: None,
         });
-        match self.ctx.sessions.steer_session_for_generation(
-            &req.session_id,
-            session_generation,
-            input,
-        ) {
+        // Fence the current transport owner through queue insertion. Consumption
+        // checks the revocable binding too, without contending on the global map.
+        let outcome = self
+            .ctx
+            .sessions
+            .with_session_effect(&req.session_id, |session| {
+                if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                    && !session.is_some_and(|live| {
+                        Some(live.generation) == session_generation
+                            && live.owner_tui_id() == self.tui_id.as_deref()
+                    })
+                {
+                    return Err(self.stale_session_incarnation_error());
+                }
+                Ok(self.ctx.sessions.steer_session_for_generation(
+                    &req.session_id,
+                    session_generation,
+                    input,
+                ))
+            })
+            .await?;
+        match outcome {
             crate::rpc::session::SteerOutcome::Accepted => to_result(SessionSteerResult {
                 session_id: req.session_id,
                 accepted: true,
@@ -8364,13 +8381,14 @@ impl RpcDispatcher {
         let generation = record
             .and_then(|rec| rec.live_generation)
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "No active turn for this session"))?;
-        let (agent_alias, workspace, has_environment, reaction_channels) = self
+        let (agent_alias, workspace, has_environment, reaction_channels, owner_revoked) = self
             .ctx
             .sessions
             .steering_binding_for_generation(
                 session_id,
                 generation,
                 record.and_then(|rec| rec.owner.as_deref()),
+                self.resume_access_fence(Some(generation)),
             )
             .await
             .ok_or_else(|| self.stale_session_incarnation_error())?;
@@ -8383,6 +8401,11 @@ impl RpcDispatcher {
                 audit_denial(binding.as_ref(), Method::SessionSteer, &denied);
                 SteeringAdmission::Refused(message)
             };
+            if dispatcher.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                && owner_revoked.is_cancelled()
+            {
+                return refuse("Session transport ownership changed".into());
+            }
             if dispatcher.access_policy != RpcAccessPolicy::TrustedLocal
                 && let Err(denied) = Self::ensure_session_channel_access(&reaction_channels)
             {
@@ -8542,7 +8565,7 @@ impl RpcDispatcher {
                 if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
                     && !session
                         .as_ref()
-                        .is_some_and(|s| s.owner_tui_id == self.tui_id)
+                        .is_some_and(|s| s.owner_tui_id() == self.tui_id.as_deref())
                 {
                     return Err(self.stale_session_incarnation_error());
                 }
@@ -8642,7 +8665,7 @@ impl RpcDispatcher {
                 if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
                     && !session.as_ref().is_some_and(|live| {
                         Some(live.generation) == record.as_ref().and_then(|r| r.live_generation)
-                            && live.owner_tui_id == self.tui_id
+                            && live.owner_tui_id() == self.tui_id.as_deref()
                             && live.owner_principal_id.as_deref() == expected_owner
                     })
                 {
@@ -8980,7 +9003,7 @@ impl RpcDispatcher {
                         // A trusted-local resume rebinds the TUI owner without a
                         // new generation, so the remote owner is rechecked here too.
                         if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
-                            && live.is_none_or(|s| s.owner_tui_id != self.tui_id)
+                            && live.is_none_or(|s| s.owner_tui_id() != self.tui_id.as_deref())
                         {
                             return Err(self.stale_session_incarnation_error());
                         }
@@ -12070,7 +12093,7 @@ impl RpcDispatcher {
                                             && grants.may_use_agent(&session.agent_alias)
                                     })
                                     && (self.access_policy == RpcAccessPolicy::TrustedLocal
-                                        || session.owner_tui_id.as_deref().is_some_and(|owner| {
+                                        || session.owner_tui_id().is_some_and(|owner| {
                                             self.tui_id.as_deref() == Some(owner)
                                         }))
                             })
@@ -50215,6 +50238,147 @@ mod tests {
         assert_eq!(response["result"]["accepted"], json!(true), "{response}");
         assert_eq!(calls.len(), 2, "re-resolution admits it: {calls:?}");
         assert!(steered(&calls));
+    }
+
+    /// A remote steer is fenced on its TUI's ownership twice: through queue
+    /// insertion, and again when the running turn consumes it. Another TUI
+    /// taking the session over (even if the original returns before the
+    /// steer is consumed) drops it; the same TUI reconnecting keeps it.
+    #[tokio::test]
+    async fn remote_steering_rechecks_tui_binding_before_enqueue_and_consumption() {
+        for phase in ["before", "queued", "aba", "same"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sid = "s-steer-owner";
+            let (ctx, backend, workspace) = steering_ctx(&tmp, |_| {});
+            let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (started, _started_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_release, gate) = tokio::sync::oneshot::channel();
+            let memory = GatedMemory {
+                stored: Arc::clone(&stored),
+                gate_on: "never matched by this test".into(),
+                started,
+                release: tokio::sync::Mutex::new(Some(gate)),
+            };
+            let mut handles = install_recording_session_with(
+                &ctx,
+                &backend,
+                sid,
+                "user:alice",
+                &workspace,
+                Vec::new(),
+                true,
+                SessionExtras {
+                    auto_save_memory: Some(Arc::new(memory)),
+                    owner_tui_id: Some("original-tui".into()),
+                    ..SessionExtras::default()
+                },
+            )
+            .await;
+            let generation = ctx.sessions.get_generation(sid).await;
+            let agent = ctx.sessions.get_agent(sid).await.unwrap();
+            let (mut prompter, mut prompt_rx) = roster_peer(&ctx, 4242).await;
+            let (mut remote, mut remote_rx) = roster_peer(&ctx, 4242).await;
+            remote.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+            remote.tui_id = Some("original-tui".into());
+            send_prompt(&mut prompter, 1, sid, 1).await;
+            handles.await_start().await;
+            let params = json!({"session_id":sid, "content":STEER_TEXT});
+            if phase == "before" {
+                remote
+                    .ensure_method_session_access(Method::SessionSteer, &params)
+                    .await
+                    .unwrap();
+                let (entered, release) = ctx.sessions.set_test_control_pause();
+                let mut request = Box::pin(remote.handle_session_steer(&params));
+                tokio::select! {
+                    result = &mut request => panic!("steer returned before the pause: {result:?}"),
+                    _ = entered.notified() => {},
+                }
+                ctx.sessions
+                    .resume_existing(
+                        sid,
+                        "test-agent",
+                        &ChatMode::Chat,
+                        Some("successor-tui".into()),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                release.notify_one();
+                assert_eq!(request.await.unwrap_err().code, SESSION_NOT_OWNED);
+            } else {
+                let response = rpc(&mut remote, &mut remote_rx, 2, "session/steer", params).await;
+                assert_eq!(response["result"]["accepted"], true, "{response}");
+                ctx.sessions
+                    .resume_existing(
+                        sid,
+                        "test-agent",
+                        &ChatMode::Chat,
+                        Some(
+                            if phase == "same" {
+                                "original-tui"
+                            } else {
+                                "successor-tui"
+                            }
+                            .into(),
+                        ),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if phase == "aba" {
+                    ctx.sessions
+                        .resume_existing(
+                            sid,
+                            "test-agent",
+                            &ChatMode::Chat,
+                            Some("original-tui".into()),
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            assert_eq!(ctx.sessions.get_generation(sid).await, generation);
+            assert!(Arc::ptr_eq(
+                &ctx.sessions.get_agent(sid).await.unwrap(),
+                &agent
+            ));
+            handles.release();
+            let (response, _) = response_and_notifications(&mut prompt_rx, 1).await;
+            assert!(response.get("error").is_none(), "{response}");
+            let permitted = phase == "same";
+            let calls = handles.calls().await;
+            assert_eq!(
+                calls.len(),
+                if permitted { 2 } else { 1 },
+                "{phase}: {calls:?}"
+            );
+            assert_eq!(steered(&calls), permitted, "{phase}");
+            assert_eq!(
+                live_holds(&ctx, sid, STEER_TEXT).await,
+                permitted,
+                "{phase}"
+            );
+            assert_eq!(
+                durable_holds(&backend, &format!("rpc_{sid}"), STEER_TEXT),
+                permitted,
+                "{phase}"
+            );
+            assert_eq!(
+                stored
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.contains(STEER_TEXT))
+                    .count(),
+                usize::from(permitted),
+                "{phase}: the steer is stored exactly once or never"
+            );
+        }
     }
 
     #[tokio::test]
