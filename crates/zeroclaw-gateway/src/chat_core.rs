@@ -63,7 +63,7 @@ type Receiver = SplitStream<WebSocket>;
 
 /// How long one frame may wait on a browser that stopped reading before the
 /// socket counts as gone.
-const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The socket's sending half. Every write gives up when the session ends,
 /// when the gateway generation stops, or when a browser that stopped reading

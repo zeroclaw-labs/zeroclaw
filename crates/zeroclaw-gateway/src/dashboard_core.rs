@@ -2216,7 +2216,13 @@ mod tests {
 
         /// Wait until the core holds no live conversation at all.
         async fn assert_nothing_live(&self, why: &str) {
-            let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+            self.assert_nothing_live_within(why, Duration::from_secs(15))
+                .await;
+        }
+
+        /// [`Self::assert_nothing_live`], waiting up to `limit`.
+        async fn assert_nothing_live_within(&self, why: &str, limit: Duration) {
+            let outcome = tokio::time::timeout(limit, async {
                 while !self.store.list_ids().await.is_empty() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -2403,13 +2409,72 @@ mod tests {
         >,
         tokio_tungstenite::tungstenite::Error,
     > {
+        connect_async(chat_request(addr, cookie, agent, session_id))
+            .await
+            .map(|(socket, _)| socket)
+    }
+
+    fn chat_request(
+        addr: SocketAddr,
+        cookie: &str,
+        agent: &str,
+        session_id: &str,
+    ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
         let mut request = format!("ws://{addr}/ws/chat?agent={agent}&session_id={session_id}")
             .into_client_request()
             .unwrap();
         let headers = request.headers_mut();
         headers.insert("cookie", format!("zc_session={cookie}").parse().unwrap());
         headers.insert("origin", format!("http://{addr}").parse().unwrap());
-        connect_async(request).await.map(|(socket, _)| socket)
+        request
+    }
+
+    /// The socket buffer a stuck-write test pins at both ends. Left to the
+    /// host, TCP autotuning may grow a loopback connection's buffers past a
+    /// 7 MiB frame: the browser that stopped reading then never holds up the
+    /// write, and the chat waits for input that never comes.
+    const STUCK_SOCKET_BUFFER: u32 = 64 * 1024;
+
+    /// [`serve`], with every accepted socket's send buffer pinned to
+    /// [`STUCK_SOCKET_BUFFER`] (accepted sockets inherit it from the
+    /// listener).
+    async fn serve_with_small_send_buffers(router: Router) -> SocketAddr {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_send_buffer_size(STUCK_SOCKET_BUFFER).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(64).unwrap();
+        let addr = listener.local_addr().unwrap();
+        zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        addr
+    }
+
+    /// [`open_chat`] on a client socket whose receive buffer is pinned to
+    /// [`STUCK_SOCKET_BUFFER`], which also stops the kernel growing it.
+    async fn open_chat_with_small_receive_buffer(
+        addr: SocketAddr,
+        cookie: &str,
+        agent: &str,
+        session_id: &str,
+    ) -> Result<ChatSocket, tokio_tungstenite::tungstenite::Error> {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(STUCK_SOCKET_BUFFER).unwrap();
+        let stream = socket
+            .connect(addr)
+            .await
+            .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+        tokio_tungstenite::client_async(
+            chat_request(addr, cookie, agent, session_id),
+            tokio_tungstenite::MaybeTlsStream::Plain(stream),
+        )
+        .await
+        .map(|(socket, _)| socket)
     }
 
     /// Chat one message and return the frame that ended the turn.
@@ -4835,9 +4900,11 @@ mod tests {
         })
         .await;
         mount_flood(&fixture).await;
-        let addr = serve(fixture.router()).await;
+        // Small socket buffers at both ends, so the turn's end can't fit in
+        // them whatever the host's TCP autotuning would allow.
+        let addr = serve_with_small_send_buffers(fixture.router()).await;
         let (alice, _) = fixture.sign_in("alice").await;
-        let mut socket = open_chat(addr, &alice, "support", "web-1")
+        let mut socket = open_chat_with_small_receive_buffer(addr, &alice, "support", "web-1")
             .await
             .expect("the account may chat");
         let _ = await_frame(&mut socket, "session_start").await;
@@ -4847,11 +4914,13 @@ mod tests {
             .await
             .unwrap();
         // The browser takes the reply's chunk, then stops reading: only the
-        // turn's end is left stuck in the write.
+        // turn's end is left stuck in the write. The chat gives up on it at
+        // the write deadline; the rest of the wait is headroom.
         let _ = await_frame(&mut socket, "chunk").await;
         fixture
-            .assert_nothing_live(
+            .assert_nothing_live_within(
                 "a chat that could not write its reply's end closes its conversation",
+                crate::chat_core::WRITE_DEADLINE + Duration::from_secs(20),
             )
             .await;
         drop(socket);
