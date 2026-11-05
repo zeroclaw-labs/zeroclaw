@@ -1,5 +1,6 @@
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage, StoreOptions,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, PrincipalScope, ProceduralMessage,
+    StoreOptions,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -174,6 +175,91 @@ impl Memory for AgentScopedMemory {
         // visible only through the `agent_alias` tracing field bound
         // at agent-loop entry.
         self.inner.name()
+    }
+
+    // Private-plane operations already carry the authorized owner and agent
+    // alias in `scope`. Forward them to the backend; the UUID-based shared
+    // agent grants above must never replace that ownership predicate.
+    async fn store_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        self.inner
+            .store_for_principal(scope, key, content, category, session_id)
+            .await
+    }
+
+    async fn recall_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.inner
+            .recall_for_principal(scope, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn list_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.inner
+            .list_for_principal(scope, category, session_id)
+            .await
+    }
+
+    async fn get_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> Result<Option<MemoryEntry>> {
+        self.inner.get_for_principal(scope, key).await
+    }
+
+    async fn forget_for_principal(&self, scope: &PrincipalScope, key: &str) -> Result<bool> {
+        self.inner.forget_for_principal(scope, key).await
+    }
+
+    async fn count_for_principal(&self, scope: &PrincipalScope) -> Result<usize> {
+        self.inner.count_for_principal(scope).await
+    }
+
+    async fn export_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        filter: &ExportFilter,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.inner.export_for_principal(scope, filter).await
+    }
+
+    async fn purge_namespace_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        namespace: &str,
+    ) -> Result<usize> {
+        self.inner
+            .purge_namespace_for_principal(scope, namespace)
+            .await
+    }
+
+    async fn purge_session_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        session_id: &str,
+    ) -> Result<usize> {
+        self.inner
+            .purge_session_for_principal(scope, session_id)
+            .await
     }
 
     async fn health_check(&self) -> bool {
