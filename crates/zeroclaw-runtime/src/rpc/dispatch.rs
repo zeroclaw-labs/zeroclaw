@@ -24177,50 +24177,78 @@ mod tests {
     #[tokio::test]
     async fn configure_refuses_an_incarnation_replaced_under_the_lock() {
         use crate::rpc::types::ChatMode;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = two_user_config(&tmp);
-        let data_dir = config.data_dir.clone();
-        let (fixture, sessions, _chat_backend, _acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        let ctx = Arc::clone(&fixture.ctx);
-        install_live_session_owned_by(&sessions, "cfg", Some("user:alice"), ChatMode::Chat).await;
-        let alice = scoped_dispatcher(&ctx, 4242).await;
-        let lock = sessions
-            .lock_model_provider_update("cfg")
-            .await
-            .expect("the live session has an update lock");
-        let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
-        let waiting = sessions.model_provider_update_waiting();
-        let operation = alice.handle_session_configure(&params);
-        let replace = async {
-            // Replace only once configure is parked on the update lock, after
-            // its generation capture; a fixed delay cannot promise that under
-            // parallel test load.
-            tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+        for (owner, replace_session) in [
+            ("user:alice", false),
+            ("user:alice", true),
+            ("user:bob", true),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, _chat_backend, _acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let ctx = Arc::clone(&fixture.ctx);
+            install_live_session_owned_by(&sessions, "cfg", Some("user:alice"), ChatMode::Chat)
+                .await;
+            let alice = scoped_dispatcher(&ctx, 4242).await;
+            let lock = sessions
+                .lock_model_provider_update("cfg")
                 .await
-                .expect("configure must reach the provider update lock");
-            assert!(sessions.remove("cfg").await);
-            let successor =
-                install_live_session_owned_by(&sessions, "cfg", Some("user:bob"), ChatMode::Chat)
-                    .await;
-            drop(lock);
-            successor
-        };
-        // Poll the replacement first: without its real Pending signal this
-        // control must reject early rather than depending on scheduler timing.
-        let (successor, result) = tokio::join!(biased; replace, operation);
-        let err = result.expect_err("a replaced session cannot be configured by the old owner");
-        assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
-        assert!(err.message.contains("Session changed while queued"));
-        assert_eq!(sessions.get_generation("cfg").await, Some(successor));
-        assert_eq!(
-            sessions
-                .get_overrides("cfg")
-                .await
-                .and_then(|o| o.temperature),
-            None,
-            "bob's successor keeps its own overrides"
-        );
+                .expect("the live session has an update lock");
+            let params = json!({"session_id": "cfg", "overrides": {"temperature": 0.2}});
+            let waiting = sessions.model_provider_update_waiting();
+            let operation = alice.handle_session_configure(&params);
+            let replace = async {
+                // Replace only once configure is parked on the update lock,
+                // after its generation capture; a fixed delay cannot promise
+                // that under parallel test load.
+                tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+                    .await
+                    .expect("configure must reach the provider update lock");
+                let successor = if replace_session {
+                    assert!(sessions.remove("cfg").await);
+                    install_live_session_owned_by(&sessions, "cfg", Some(owner), ChatMode::Chat)
+                        .await
+                } else {
+                    sessions.get_generation("cfg").await.unwrap()
+                };
+                drop(lock);
+                successor
+            };
+            // Poll the replacement first: without its real Pending signal this
+            // control must reject early rather than depending on scheduler timing.
+            let (successor, result) = tokio::join!(biased; replace, operation);
+            if !replace_session {
+                result.expect("the unchanged owner's configure must succeed after the same wait");
+            } else {
+                let err =
+                    result.expect_err("a replaced session cannot be configured by the old owner");
+                // The original incarnation was captured before the lock wait.
+                // Either replacement must first fail its generation fence,
+                // whoever owns the successor.
+                assert_eq!(err.code, SESSION_NOT_FOUND, "{}", err.message);
+                assert_eq!(err.message, "Session changed while queued");
+                if owner != "user:alice" {
+                    // A fresh request has not captured the old incarnation:
+                    // admission must instead hide the foreign session.
+                    let fresh = alice.handle_session_configure(&params).await.unwrap_err();
+                    assert_eq!(fresh.code, FORBIDDEN, "{}", fresh.message);
+                    assert_eq!(
+                        fresh.message,
+                        "Session not found or not owned by this principal"
+                    );
+                }
+            }
+            assert_eq!(sessions.get_generation("cfg").await, Some(successor));
+            assert_eq!(
+                sessions
+                    .get_overrides("cfg")
+                    .await
+                    .and_then(|o| o.temperature),
+                if replace_session { None } else { Some(0.2) },
+                "a successor keeps its own overrides; the unchanged owner's update succeeds"
+            );
+        }
     }
 
     /// The waits between configure's ownership check and its generation
