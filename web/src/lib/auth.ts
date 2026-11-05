@@ -31,6 +31,9 @@ export interface OidcSession {
   features: {
     chat: boolean;
     operator_pages: boolean;
+    /** Chat goes through the core, one conversation per chat socket: nothing
+     * to load, list or resume. Absent on servers without core-path chat. */
+    core_sessions?: boolean;
   };
 }
 
