@@ -5589,6 +5589,16 @@ impl DelegateTool {
                 assembled_bounded.registry
             }
         };
+        // Judge the originating credential again on the finished registry. Both
+        // modes awaited target memory or assembly since their first check, so
+        // a credential that lost administrator authority in the meantime must
+        // not hand the child the tools it now withholds. A target-bound delegate
+        // stays: it shares this withholding, so its children withhold too.
+        if self.withholds_unrestricted_tools() {
+            sub_tools.retain(|tool| {
+                tool.name() == Self::NAME || !tool.requires_unrestricted_principal()
+            });
+        }
 
         // A delegation from inside a headless SOP step carries that step's tool
         // boundary onto the target. Both modes reach it: bounded starts from the
@@ -20477,6 +20487,87 @@ target = "spawn_subagent"
                 "the {path} child keeps sessions_current"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_bounded_child_built_across_a_demotion_withholds_unrestricted_tools() {
+        // A bounded child's registry is finished only after the child waits
+        // for its target's memory and for assembly. The resolver here answers
+        // as an administrator for its first check only, as when the credential
+        // is demoted while the child is being built. The child the delegation
+        // starts must withhold what the demoted credential no longer carries.
+        let server = start_tool_capturing_chat_server(2).await;
+        let DelegateMemoryFixture { _tmp, tool, .. } =
+            delegate_memory_fixture(Some(server.uri.clone())).await;
+        let probes = [
+            "sessions_history",
+            "cron_add",
+            "spawn_subagent",
+            "sessions_current",
+        ];
+        let mut config = tool
+            .root_config
+            .as_deref()
+            .expect("fixture root config")
+            .clone();
+        config
+            .risk_profiles
+            .get_mut("agentic_test")
+            .expect("fixture risk profile")
+            .allowed_tools
+            .extend(probes.map(String::from));
+        let parent_tools = probes
+            .into_iter()
+            .map(|name| {
+                Arc::new(ParentToolProbe {
+                    name,
+                    nested: name != "sessions_current",
+                }) as Arc<dyn Tool>
+            })
+            .collect();
+        let config = Arc::new(config);
+        let tool = DelegateTool {
+            security: Arc::new(SecurityPolicy::for_agent(&config, "caller").unwrap()),
+            risk_profiles: Arc::new(config.risk_profiles.clone()),
+            root_config: Some(Arc::clone(&config)),
+            ..tool
+        }
+        .with_parent_tools(Arc::new(RwLock::new(parent_tools)));
+
+        tool.set_principal_admission(Arc::new(|| true));
+        let control = tool
+            .execute(json!({"agent": "target", "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(control.success, "control delegate failed: {control:?}");
+
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&checks);
+        tool.set_principal_admission(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst) == 0
+        }));
+        let demoted = tool
+            .execute(json!({"agent": "target", "prompt": "run"}))
+            .await
+            .unwrap();
+        assert!(demoted.success, "demoted delegate failed: {demoted:?}");
+
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "one provider request per delegation");
+        for name in ["sessions_history", "cron_add", "spawn_subagent"] {
+            assert!(
+                offered_tool(&requests[0], name),
+                "control: an administrator's child is offered {name}"
+            );
+            assert!(
+                !offered_tool(&requests[1], name),
+                "a child built across the demotion was offered {name}"
+            );
+        }
+        assert!(
+            offered_tool(&requests[1], "sessions_current"),
+            "the child keeps its ordinary tools"
+        );
     }
 
     #[tokio::test]
