@@ -196,7 +196,7 @@ impl Tool for ShellTool {
         // Keep `approved` out of the model-facing schema. The agent runtime
         // injects it via `set_runtime_approved_arg` after the operator gate;
         // exposing it made models emit a value that looked like it controlled
-        // approval (#12227).
+        // approval.
         json!({
             "type": "object",
             "properties": {
