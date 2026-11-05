@@ -8414,21 +8414,37 @@ impl RpcDispatcher {
             let Some(binding) = binding.as_ref() else {
                 return SteeringAdmission::Admitted(SteeringPosture::default());
             };
-            let grants = match current_authority(&inbound, binding, Method::SessionSteer) {
+            // Match publication lock order and resolve the whole steering
+            // decision from one config/accepted-policy view. The lease ends
+            // here, before any asynchronous memory write by the consumer.
+            let config = dispatcher.ctx.config.read();
+            let authority = inbound.hold_authority();
+            let grants = match current_authority_under(&authority, binding, Method::SessionSteer) {
                 Ok(grants) => grants,
                 Err(denied) => {
                     audit_denial(Some(binding), Method::SessionSteer, &denied);
                     return SteeringAdmission::Refused(denied.message);
                 }
             };
-            if let Err(denied) = dispatcher.authorize_admitted_session(
-                Method::SessionSteer,
-                Some(&grants),
-                admitted.as_ref(),
-                &agent_alias,
-                Some(&workspace),
-                has_environment,
-            ) {
+            let checked = dispatcher
+                .require_ownership_under(Some(&grants), admitted.as_ref())
+                .and_then(|()| {
+                    dispatcher.authorize_live_session_binding(
+                        Method::SessionSteer,
+                        Some(&grants),
+                        &config,
+                        &agent_alias,
+                        &workspace,
+                    )
+                })
+                .and_then(|()| {
+                    dispatcher.authorize_session_environment(
+                        Method::SessionSteer,
+                        Some(&grants),
+                        has_environment,
+                    )
+                });
+            if let Err(denied) = checked {
                 return refuse(denied.message);
             }
             SteeringAdmission::Admitted(SteeringPosture {
