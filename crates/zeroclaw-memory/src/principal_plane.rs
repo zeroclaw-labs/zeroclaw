@@ -74,6 +74,10 @@ impl Memory for PrincipalPlaneMemory {
         &self.name
     }
 
+    fn principal_scope(&self) -> Option<PrincipalScope> {
+        Some(self.scope.clone())
+    }
+
     async fn store(
         &self,
         key: &str,
@@ -338,6 +342,18 @@ impl Memory for PrincipalPlaneMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Code that builds tools or a run over a handle it was given reads the
+    /// owner from the handle: a principal-plane view reports its scope, a
+    /// shared backend reports none.
+    #[test]
+    fn a_principal_plane_reports_its_scope_and_a_shared_backend_none() {
+        let shared: Arc<dyn Memory> = Arc::new(crate::NoneMemory::new("none"));
+        assert!(shared.principal_scope().is_none());
+        let scope = PrincipalScope::new("user:alice").with_agent(Some("alpha".to_string()));
+        let routed = PrincipalPlaneMemory::new(Arc::clone(&shared), scope.clone());
+        assert_eq!(routed.principal_scope(), Some(scope));
+    }
     use crate::sqlite::SqliteMemory;
 
     fn sqlite() -> (tempfile::TempDir, Arc<dyn Memory>) {

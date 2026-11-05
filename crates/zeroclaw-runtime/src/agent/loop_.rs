@@ -1082,6 +1082,7 @@ pub async fn agent_turn(
     strict_tool_parsing: bool,
     parallel_tools: bool,
     max_tool_result_chars: usize,
+    keep_tool_context_turns: usize,
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
     origin: TurnOrigin,
@@ -1115,6 +1116,7 @@ pub async fn agent_turn(
         strict_tool_parsing,
         parallel_tools,
         max_tool_result_chars,
+        keep_tool_context_turns,
         context_token_budget,
         channel,
         origin,
@@ -1157,6 +1159,7 @@ async fn agent_turn_with_sop_reassembly(
     strict_tool_parsing: bool,
     parallel_tools: bool,
     max_tool_result_chars: usize,
+    keep_tool_context_turns: usize,
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
     origin: TurnOrigin,
@@ -1253,6 +1256,7 @@ async fn agent_turn_with_sop_reassembly(
                 strict_tool_parsing,
                 parallel_tools,
                 max_tool_result_chars,
+                keep_tool_context_turns,
                 context_limits,
                 context_limits_resolver: None,
                 knobs: &LoopKnobs {
@@ -1399,6 +1403,23 @@ pub fn apply_text_tool_prompt_policy(
         deferred_section.clear();
     }
     expose_text_tool_protocol
+}
+
+/// The cross-agent SOP step handle for a run over `memory`. A run started
+/// with an owner's plane (a pinned session's subagent child) re-assembles its
+/// steps under that owner, so a step agent's memory is the owner's plane for
+/// that agent rather than its shared plane.
+fn sop_reassembly_over<'a>(
+    config: &'a Config,
+    capabilities: Option<&'a crate::composition::BoundCapabilities>,
+    memory: &Arc<dyn Memory>,
+) -> crate::agent::turn::SopStepReassembly<'a> {
+    crate::agent::turn::SopStepReassembly {
+        config,
+        capabilities,
+        live_config: None,
+        memory_owner: memory.principal_scope(),
+    }
 }
 
 #[derive(Default)]
@@ -2455,6 +2476,7 @@ async fn run_inner(
                                         strict_tool_parsing: agent.resolved.strict_tool_parsing,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
+                                        keep_tool_context_turns: agent.resolved.keep_tool_context_turns,
                                         context_limits,
                                         context_limits_resolver: None,
                                         knobs: &LoopKnobs {
@@ -2500,11 +2522,11 @@ async fn run_inner(
                                 turn_id: &turn_id,
                                 served_route_sink: None,
                                 capability_binding: Some(&bound_capabilities),
-                                sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                    config: &config,
-                                    capabilities: Some(&bound_capabilities),
-                                    live_config: None,
-                                }),
+                                sop_reassembly: Some(sop_reassembly_over(
+                                    &config,
+                                    Some(&bound_capabilities),
+                                    &mem,
+                                )),
                             }),
                         ),
                     )
@@ -3111,6 +3133,9 @@ async fn run_inner(
                                             max_tool_result_chars: agent
                                                 .resolved
                                                 .max_tool_result_chars,
+                                            keep_tool_context_turns: agent
+                                                .resolved
+                                                .keep_tool_context_turns,
                                             context_limits,
                                             context_limits_resolver: None,
                                             knobs: &LoopKnobs {
@@ -3160,11 +3185,11 @@ async fn run_inner(
                                     turn_id: &turn_id,
                                     served_route_sink: None,
                                     capability_binding: Some(&bound_capabilities),
-                                    sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
-                                        config: &config,
-                                        capabilities: Some(&bound_capabilities),
-                                        live_config: None,
-                                    }),
+                                    sop_reassembly: Some(sop_reassembly_over(
+                                        &config,
+                                        Some(&bound_capabilities),
+                                        &mem,
+                                    )),
                                 }),
                             ),
                         )
@@ -4345,6 +4370,7 @@ async fn process_message_inner(
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
+                    agent.resolved.keep_tool_context_turns,
                     config
                         .resolved_context_limits_for_route(
                             agent_alias,
@@ -4374,6 +4400,7 @@ async fn process_message_inner(
                         config: &config,
                         capabilities: Some(&bound_capabilities),
                         live_config,
+                        memory_owner: mem.principal_scope(),
                     }),
                     Some(&bound_capabilities),
                 ),
@@ -4388,6 +4415,29 @@ async fn process_message_inner(
 
 #[cfg(test)]
 mod tests {
+    /// A run over an owner's plane re-assembles its SOP steps under that
+    /// owner; a run over shared memory carries none.
+    #[test]
+    fn a_runs_sop_steps_reassemble_under_the_owner_of_its_memory() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let config = Config::default();
+        let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        assert!(
+            super::sop_reassembly_over(&config, None, &shared)
+                .memory_owner
+                .is_none()
+        );
+        let scope = PrincipalScope::new("user:alice").with_agent(Some("alpha".to_string()));
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            shared,
+            scope.clone(),
+        ));
+        assert_eq!(
+            super::sop_reassembly_over(&config, None, &routed).memory_owner,
+            Some(scope)
+        );
+    }
+
     use super::{
         apply_text_tool_prompt_policy, effort_scoped_provider_config, effort_turn_route,
         estimate_history_tokens, load_interactive_session_history, make_query_summary,
@@ -6280,6 +6330,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -6528,6 +6579,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -6961,6 +7013,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7047,6 +7100,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7162,6 +7216,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7334,6 +7389,7 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
                         0,
                     ),
@@ -7432,6 +7488,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7530,6 +7587,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7613,6 +7671,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7699,6 +7758,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7786,6 +7846,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -7860,6 +7921,7 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: test_context_limits(0),
                     context_limits_resolver: None,
                     receipt_generator: None,
@@ -8057,6 +8119,7 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: test_context_limits(0),
                     context_limits_resolver: None,
                     receipt_generator: None,
@@ -8191,6 +8254,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8277,6 +8341,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8362,6 +8427,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8532,6 +8598,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8702,6 +8769,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -8838,6 +8906,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9145,6 +9214,7 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: test_context_limits(0),
                     context_limits_resolver: None,
                     receipt_generator: None,
@@ -9438,6 +9508,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9592,6 +9663,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9773,6 +9845,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9890,6 +9963,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -9991,6 +10065,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10084,6 +10159,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10185,6 +10261,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10289,6 +10366,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10399,6 +10477,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10501,6 +10580,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10687,6 +10767,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10832,6 +10913,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -10947,6 +11029,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11048,6 +11131,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11153,6 +11237,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11260,6 +11345,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11387,6 +11473,7 @@ mod tests {
                             strict_tool_parsing: false,
                             parallel_tools: false,
                             max_tool_result_chars: 0,
+                            keep_tool_context_turns: 2,
                             context_limits: test_context_limits(0),
                             context_limits_resolver: None,
                             receipt_generator: None,
@@ -11484,6 +11571,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11581,6 +11669,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11673,6 +11762,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11763,6 +11853,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11859,6 +11950,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -11982,6 +12074,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12111,6 +12204,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12228,6 +12322,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12323,6 +12418,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12422,6 +12518,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12504,6 +12601,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12587,6 +12685,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12670,6 +12769,7 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12755,6 +12855,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12844,6 +12945,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -12945,6 +13047,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13030,6 +13133,7 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13118,6 +13222,7 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13204,6 +13309,7 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13291,6 +13397,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13435,6 +13542,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13530,6 +13638,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13628,6 +13737,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13749,6 +13859,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13883,6 +13994,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -13987,6 +14099,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -14102,6 +14215,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15020,6 +15134,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15137,6 +15252,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15249,6 +15365,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15361,6 +15478,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15531,6 +15649,7 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -15653,6 +15772,7 @@ This is an example, not an invocation."#;
                 false,
                 false, // parallel_tools
                 0,     // max_tool_result_chars: disabled for test
+                2,     // keep_tool_context_turns
                 0,     // context_token_budget: disabled for test
                 None,  // channel
                 TurnOrigin::SubTurn,
@@ -15730,6 +15850,7 @@ This is an example, not an invocation."#;
                 true,
                 false, // parallel_tools
                 0,     // max_tool_result_chars: disabled for test
+                2,     // keep_tool_context_turns
                 0,     // context_token_budget: disabled for test
                 None,  // channel
                 TurnOrigin::SubTurn,
@@ -15803,6 +15924,7 @@ This is an example, not an invocation."#;
             false,
             false,
             0,
+            2, // keep_tool_context_turns
             0,
             None,
             TurnOrigin::SubTurn,
@@ -15877,6 +15999,7 @@ This is an example, not an invocation."#;
             false,
             false,
             0,
+            2, // keep_tool_context_turns
             0,
             None,
             TurnOrigin::SubTurn,
@@ -15949,6 +16072,7 @@ This is an example, not an invocation."#;
             false,
             false,
             0,
+            2, // keep_tool_context_turns
             0,
             None,
             TurnOrigin::SubTurn,
@@ -16089,7 +16213,8 @@ This is an example, not an invocation."#;
                 false,
                 false,
                 100, // max_tool_result_chars: truncate at 100 chars
-                0,   // context_token_budget: disabled
+                2,
+                0, // context_token_budget: disabled
                 None,
                 TurnOrigin::SubTurn,
                 None,
@@ -16173,6 +16298,7 @@ This is an example, not an invocation."#;
                 false,
                 false,
                 0, // max_tool_result_chars: disabled (no truncation)
+                2, // keep_tool_context_turns
                 0, // context_token_budget: disabled
                 None,
                 TurnOrigin::SubTurn,
@@ -17384,6 +17510,7 @@ Let me check the result."#;
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
@@ -18548,6 +18675,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -18742,6 +18870,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         context_limits: test_context_limits(0),
                         context_limits_resolver: None,
                         receipt_generator: None,
@@ -18870,6 +18999,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         // The reported-budget enforcement projects the NEXT
                         // request from the durable history at the calibration
                         // ratio (reported 80 / estimated ~30 ≈ 2.7), which lands
@@ -19089,6 +19219,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                             model_context_window: 100,
                             context_token_budget: 100,
@@ -19199,6 +19330,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -19327,6 +19459,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         context_limits: test_context_limits(0),
                         context_limits_resolver: None,
                         receipt_generator: None,
@@ -19430,6 +19563,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -19529,6 +19663,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(50),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -21394,6 +21529,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -21496,6 +21632,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        keep_tool_context_turns: 2,
                         context_limits: test_context_limits(0),
                         context_limits_resolver: None,
                         receipt_generator: None,
@@ -21777,6 +21914,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(budget),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -21987,6 +22125,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(0),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -22097,6 +22236,7 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: test_context_limits(100_000),
                 context_limits_resolver: None,
                 receipt_generator: None,
@@ -22418,6 +22558,7 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: test_context_limits(budget),
                     context_limits_resolver: Some(Arc::new(move |_, selected_model| {
                         zeroclaw_config::schema::ResolvedContextLimits {
@@ -22835,6 +22976,7 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     // Tight enough that the second request's hook-grown
                     // population exceeds it, but comfortable for the first.
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
@@ -22964,6 +23106,7 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                         model_context_window,
                         ..test_context_limits(context_token_budget)
@@ -23235,6 +23378,7 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
                     // Between the image-expanded population (well over
                     // 1,000 estimated tokens for a ~3KB attachment) and the
                     // real rebuilt population once that turn is dropped
@@ -23358,6 +23502,7 @@ Let me check the result."#;
             false,
             false,
             0,
+            2, // keep_tool_context_turns
             0,
             None,
             TurnOrigin::SubTurn,
@@ -23415,6 +23560,7 @@ Let me check the result."#;
             false,
             false, // parallel_tools
             0,     // max_tool_result_chars: disabled for test
+            2,     // keep_tool_context_turns
             0,     // context_token_budget: disabled for test
             None,  // channel
             TurnOrigin::SubTurn,
@@ -23488,9 +23634,10 @@ Let me check the result."#;
             None,
             false,
             false, // parallel_tools
-            0,     // max_tool_result_chars: disabled for test
-            0,     // context_token_budget: disabled for test
-            None,  // channel
+            0,
+            2,    // max_tool_result_chars: disabled for test
+            0,    // context_token_budget: disabled for test
+            None, // channel
             TurnOrigin::SubTurn,
             None,
             Some("test-agent"),
