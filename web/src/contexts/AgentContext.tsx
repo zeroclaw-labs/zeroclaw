@@ -496,14 +496,17 @@ export function AgentProvider({
           setConnected(true);
           const pending = pendingSendRef.current;
           if (pending !== null) {
-            pendingSendRef.current = null;
             try {
               wsRef.current?.sendMessage(pending);
-              setTyping(true);
-              foldTurnStream({ type: 'turn_start' });
             } catch {
-              setError(t('agent.send_error'));
+              // The socket started closing before this start was handled, so
+              // the message never went out. It stays pending: the close that
+              // follows gives it back to the composer, with its notice.
+              break;
             }
+            pendingSendRef.current = null;
+            setTyping(true);
+            foldTurnStream({ type: 'turn_start' });
           }
           break;
         }

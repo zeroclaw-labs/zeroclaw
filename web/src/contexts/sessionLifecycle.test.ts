@@ -166,6 +166,8 @@ class FakeSocket implements SessionSocket {
     this.approvalResponses.push({ requestId, decision });
   }
   emitOpen(): void { this.open = true; this.onOpen?.(); }
+  /** The close frame arrived, but its event hasn't been delivered yet. */
+  beginClosing(): void { this.open = false; }
   emitClose(code = 1006): void {
     this.open = false;
     this.onClose?.({ code } as CloseEvent);
@@ -1953,6 +1955,38 @@ for (const code of [1006, 1001, 4410]) {
     });
   });
 }
+
+test('a socket already closing when its conversation start is handled gives the message back', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime, true);
+    await typeInComposer(mounted.renderer, 'hello');
+    const send = mounted.renderer.root.findAllByType('button')
+      .find((button) => button.props['aria-label'] === 'Send');
+    assert.ok(send);
+    await act(async () => { send.props.onClick(); });
+    const socket = runtime.sockets[0]!;
+    await act(async () => { socket.emitOpen(); });
+    // The gateway's close is already in behind the queued start, so the
+    // start's send throws, and the close is delivered after it.
+    await act(async () => {
+      socket.beginClosing();
+      socket.emitMessage(conversationStart('core-1'));
+    });
+    assert.deepEqual(socket.sent, []);
+    assert.equal(mounted.context().typing, false);
+    await act(async () => { socket.emitClose(1006); });
+    await settle();
+
+    // Never sent, so not shown as sent: it is back in the composer.
+    assert.equal(mounted.context().messages.some((m) => m.content === 'hello'), false);
+    assert.equal(endedNotice(mounted).length, 0);
+    assert.equal(textarea(mounted.renderer).props.value, 'hello');
+    assert.equal(mounted.context().error, 'Failed to send message. Please try again.');
+    assert.equal(mounted.context().startsConversationOnSend, true);
+    await unmount(mounted.renderer);
+  });
+});
 
 test('a new conversation closes this one, clears the page, and deletes nothing', async () => {
   await withSession(scopedSession, async () => {
