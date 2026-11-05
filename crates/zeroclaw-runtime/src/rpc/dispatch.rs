@@ -8511,35 +8511,73 @@ impl RpcDispatcher {
         // Preserve the post-lookup authority checkpoint before either write.
         let grants = self.recheck_authority_after_admission(Method::SessionAppend)?;
         self.require_ownership_under(grants.as_ref(), admitted.as_ref())?;
-        let key = Self::rpc_chat_writer_key(sid, admitted)?;
+        let key = Self::rpc_chat_writer_key(sid, admitted.clone())?;
+        let expected_owner = admitted.as_ref().and_then(|record| record.owner.as_deref());
+        let expected_generation = admitted.as_ref().and_then(|record| record.live_generation);
         let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
-        backend.append(&key, &message).map_err(|e| {
-            rpc_err(
-                INTERNAL_ERROR,
-                format!("Failed to append session message: {e}"),
-            )
-        })?;
-        // A live agent persists its own history over the durable row after
-        // its next turn, so it has to see the append too.
-        if self.ctx.sessions.get_agent(sid).await.is_some() {
-            self.ctx
-                .sessions
-                .seed_history(sid, std::slice::from_ref(&message))
-                .await;
-        }
-        if let Some(event_tx) = self.ctx.event_tx.as_ref() {
-            let _ = event_tx.send(serde_json::json!({
-                "type": "message",
-                "session_id": sid,
-                "role": "assistant",
-                "content": req.content,
-                "source": "rpc",
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }));
-        }
+        // Acquire the Agent before the session map; both precede storage and
+        // authority. No await separates the durable write and its live effects:
+        // a live agent persists its own history over the durable row after its
+        // next turn, so it has to see the append in the same commit.
+        let agent = self.ctx.sessions.get_agent(sid).await;
+        let mut agent_guard = match agent.as_ref() {
+            Some(agent) => Some(agent.lock().await),
+            None => None,
+        };
+        let message_count = self
+            .ctx
+            .sessions
+            .with_session_effect(sid, |session| {
+                if session.as_ref().map(|s| s.generation) != expected_generation
+                    || session.as_ref().is_some_and(|s| {
+                        s.owner_principal_id.as_deref() != expected_owner
+                            || !agent
+                                .as_ref()
+                                .is_some_and(|agent| Arc::ptr_eq(&s.agent, agent))
+                    })
+                {
+                    return Err(self.stale_session_incarnation_error());
+                }
+                let authorize = |owner: Option<&str>| {
+                    self.durable_effect_lease(Method::SessionAppend, expected_owner, owner)
+                        .map(|lease| {
+                            Box::new(lease)
+                                as Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>
+                        })
+                        .map_err(session_effect_io_error)
+                };
+                let mut committed = || {
+                    if let Some(agent) = agent_guard.as_mut() {
+                        agent.seed_history_with_event(std::slice::from_ref(&message));
+                    }
+                    if let Some(event_tx) = self.ctx.event_tx.as_ref() {
+                        let _ = event_tx.send(serde_json::json!({
+                            "type": "message",
+                            "session_id": sid,
+                            "role": "assistant",
+                            "content": req.content,
+                            "source": "rpc",
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        }));
+                    }
+                };
+                let mut work =
+                    || backend.append_authorized(&key, &message, &authorize, &mut committed);
+                let result = if tokio::runtime::Handle::current().runtime_flavor()
+                    == tokio::runtime::RuntimeFlavor::MultiThread
+                {
+                    tokio::task::block_in_place(work)
+                } else {
+                    work()
+                };
+                result.map_err(|error| {
+                    session_effect_error(error.into(), "Failed to append session message")
+                })
+            })
+            .await?;
         to_result(SessionAppendResult {
             session_id: req.session_id.clone(),
-            message_count: backend.load(&key).len(),
+            message_count,
         })
     }
 
@@ -8565,10 +8603,26 @@ impl RpcDispatcher {
             .session_backend
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-        let key = Self::durable_chat_key(record, Method::SessionRename)?;
-        backend
-            .set_session_name(&key, name)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to rename session: {e}")))?;
+        let expected_owner = record.as_ref().and_then(|record| record.owner.as_deref());
+        let key = Self::durable_chat_key(record.clone(), Method::SessionRename)?;
+        // The ownership lookup awaited. Decide again under the row's write
+        // lock, judged by the authority in force now and the row's owner.
+        let authorize = |owner: Option<&str>| {
+            self.durable_effect_lease(Method::SessionRename, expected_owner, owner)
+                .map(|lease| {
+                    Box::new(lease) as Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>
+                })
+                .map_err(session_effect_io_error)
+        };
+        let work = || backend.set_session_name_authorized(&key, name, &authorize);
+        let result = if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(work)
+        } else {
+            work()
+        };
+        result.map_err(|error| session_effect_error(error.into(), "Failed to rename session"))?;
         to_result(SessionRenameResult {
             session_id: req.session_id.clone(),
             name: name.to_string(),
@@ -48917,6 +48971,80 @@ mod tests {
                 );
                 assert_eq!(serde_json::to_value(backend.load(&key)).unwrap(), before);
                 assert!(!live_holds(&ctx, sid, APPENDED).await, "no live write");
+            }
+        }
+    }
+
+    /// An append decides again under the live Agent lock and the store's
+    /// write lock. A revocation, demotion or owner change that lands while it
+    /// waits for the Agent refuses both history writes and the event; an
+    /// unrelated publication does not.
+    #[tokio::test]
+    async fn append_rechecks_authority_and_owner_after_the_real_agent_lock() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+        for change in ["revoke", "demote", "owner", "unrelated"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sid = "append-effect";
+            let owner = if change == "demote" {
+                "user:bob"
+            } else {
+                "user:alice"
+            };
+            let (mut ctx, backend, key) =
+                append_review_fixture(&tmp, sid, owner, change == "demote").await;
+            let (events, mut received) = tokio::sync::broadcast::channel(8);
+            let fixture = Arc::get_mut(&mut ctx).expect("exclusive fixture context");
+            fixture.event_tx = Some(events);
+            // This chat-only fixture must not yield in the unrelated ACP owner
+            // lookup before it reaches the Agent lock we deliberately hold.
+            fixture.acp_session_store = None;
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let agent = ctx.sessions.get_agent(sid).await.unwrap();
+            let held = agent.lock().await;
+            let params = json!({"session_id": sid, "content": APPENDED});
+            let mut request = Box::pin(tokio::task::coop::unconstrained(
+                alice.handle_session_append(&params),
+            ));
+            // Every preceding mutex and semaphore is uncontended, ACP I/O is
+            // absent, and cooperative budget cannot introduce an earlier yield.
+            // The first Pending therefore proves we reached the held Agent lock.
+            assert!(futures_util::poll!(&mut request).is_pending());
+            assert_eq!(ctx.sessions.session_queue.queue_depth(sid).await, 1);
+            assert!(!durable_holds(&backend, &key, APPENDED));
+            assert!(received.try_recv().is_err());
+            match change {
+                "revoke" => republish_session_scoped(&ctx, |profile| {
+                    profile.grants.insert(
+                        zeroclaw_api::grants::Resource::Sessions,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    );
+                }),
+                "demote" => republish_session_scoped(&ctx, |profile| profile.admin = false),
+                "owner" => backend.set_session_principal(&key, "user:bob").unwrap(),
+                _ => republish_session_scoped(&ctx, |profile| {
+                    profile.grants.insert(
+                        zeroclaw_api::grants::Resource::Memory,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    );
+                }),
+            }
+            drop(held);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .expect("append completes after releasing its lock");
+            if change == "unrelated" {
+                result.expect("an unrelated publication preserves permission");
+                assert!(durable_holds(&backend, &key, APPENDED));
+                assert!(live_holds(&ctx, sid, APPENDED).await);
+                assert_eq!(received.try_recv().unwrap()["content"], APPENDED);
+            } else {
+                assert_eq!(result.expect_err(change).code, FORBIDDEN, "{change}");
+                assert!(
+                    !durable_holds(&backend, &key, APPENDED),
+                    "{change}: durable"
+                );
+                assert!(!live_holds(&ctx, sid, APPENDED).await, "{change}: live");
+                assert!(received.try_recv().is_err(), "{change}: event");
             }
         }
     }
