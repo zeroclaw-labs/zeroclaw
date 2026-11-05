@@ -7,6 +7,7 @@ pub mod context;
 pub mod dispatch;
 pub mod fs;
 pub mod git;
+pub mod inproc;
 pub mod local;
 pub mod locales;
 pub mod session;
