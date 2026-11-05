@@ -121,7 +121,7 @@ class Pool:
                                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                     log.attach(process.stderr)
                     return process
-                entry = dict(process=None, future=self.spawner.submit(spawn), path=path,
+                entry = dict(key=key, process=None, future=self.spawner.submit(spawn), path=path,
                              host=host, log=log, active=0, last=self.clock(), failed=False,
                              ready=threading.Event(), stop_lock=threading.Lock())
                 self.entries[key] = entry
@@ -137,6 +137,7 @@ class Pool:
                         break
                     time.sleep(0.05)
                 with self.lock:
+                    entry['last'] = self.clock()
                     entry['failed'] = (self.closed or not pathlib.Path(entry['path']).exists()
                                        or process.poll() is not None)
             except Exception:
@@ -151,17 +152,19 @@ class Pool:
         else:
             if not entry['ready'].wait(timeout=18):
                 raise RuntimeError('SSH connection setup did not complete')
-        if entry.get('retired'):
-            return self.acquire(key, options, host)
         with self.lock:
             if self.closed:
                 raise RuntimeError('SSH task has ended')
-            if entry['failed'] or entry['process'] is None or entry['process'].poll() is not None:
-                entry['failed'] = True
-                raise RuntimeError('SSH transport unavailable; diagnose before starting a new task')
-            entry['active'] += 1
-            entry['last'] = self.clock()
-            return entry['path']
+            # Expiry may have retired this entry after ready.wait returned.
+            # Validate its generation under the same lock as the active lease.
+            if self.entries.get(key) is entry and not entry.get('retired'):
+                if entry['failed'] or entry['process'] is None or entry['process'].poll() is not None:
+                    entry['failed'] = True
+                    raise RuntimeError('SSH transport unavailable; diagnose before starting a new task')
+                entry['active'] += 1
+                entry['last'] = self.clock()
+                return entry['path']
+        return self.acquire(key, options, host)
 
     def release(self, key):
         with self.lock:
@@ -204,8 +207,8 @@ class Pool:
             self.stop(entry)
             if entry.get('retired'):
                 with self.lock:
-                    if self.entries.get(entry['path'].rsplit('/', 1)[-1]) is entry:
-                        del self.entries[entry['path'].rsplit('/', 1)[-1]]
+                    if self.entries.get(entry['key']) is entry:
+                        del self.entries[entry['key']]
                 entry['ready'].set()
 
     def close(self):

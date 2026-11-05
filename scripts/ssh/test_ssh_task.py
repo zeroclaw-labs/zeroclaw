@@ -205,4 +205,39 @@ class TaskTransportTests(unittest.TestCase):
         self.assertEqual(len(FakeMaster.starts), 1)
 
 
+
+    def test_idle_retirement_finishes_before_a_new_generation_uses_the_path(self):
+        self.pool.acquire('same', [], 'host')
+        self.pool.release('same')
+        self.clock += 1801
+        stopping, proceed = threading.Event(), threading.Event()
+        original_stop = self.pool.stop
+        def paused_stop(entry):
+            if entry.get('retired'):
+                stopping.set()
+                self.assertTrue(proceed.wait(timeout=3))
+            original_stop(entry)
+        results = []
+        with patch.object(self.pool, 'stop', paused_stop):
+            expiry = threading.Thread(target=self.pool.expire)
+            expiry.start()
+            self.assertTrue(stopping.wait(timeout=2))
+            acquire = threading.Thread(target=lambda: results.append(self.pool.acquire('same', [], 'host')))
+            acquire.start()
+            try:
+                time.sleep(.05)
+                self.assertTrue(acquire.is_alive())
+                self.assertEqual(len(FakeMaster.starts), 1)
+            finally:
+                proceed.set()
+                expiry.join(timeout=2)
+                acquire.join(timeout=2)
+            self.assertFalse(expiry.is_alive())
+            self.assertFalse(acquire.is_alive())
+        self.assertEqual(len(FakeMaster.starts), 2)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(pathlib.Path(results[0]).exists())
+        self.assertEqual(self.pool.entries['same']['active'], 1)
+
+
 if __name__ == '__main__': unittest.main()
