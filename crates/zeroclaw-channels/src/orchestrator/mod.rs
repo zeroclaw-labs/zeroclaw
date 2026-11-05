@@ -4536,6 +4536,26 @@ fn resync_sender_history_after_trim(
 /// recreate an unreconciled entry from its own working buffer instead of
 /// letting the next turn reload from the backend.
 #[allow(clippy::too_many_arguments)]
+/// Runtime-generated user prompts (for example a tools-free closeout) are
+/// part of this turn's delta, not a new inbound boundary. Resync only the
+/// retained base through the original inbound; its tool results are appended
+/// once from the delta below. Prompt-format tool results are not user turns.
+fn channel_history_before_turn_delta<'a>(
+    history: &'a [ChatMessage],
+    delta: &[ChatMessage],
+) -> &'a [ChatMessage] {
+    let inbound = history.iter().enumerate().rposition(|(index, message)| {
+        message.role == "user"
+            && !is_paired_prompt_tool_result(history, index)
+            && !delta.iter().enumerate().any(|(delta_index, generated)| {
+                generated.role == "user"
+                    && !is_paired_prompt_tool_result(delta, delta_index)
+                    && generated.content == message.content
+            })
+    });
+    &history[..inbound.map_or(history.len().min(1), |index| index + 1)]
+}
+
 fn resync_history_after_trim_or_evict_cache(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
@@ -10786,7 +10806,7 @@ async fn process_channel_message_body(
     let history_resync_failed = resync_history_after_trim_or_evict_cache(
         ctx.as_ref(),
         &history_key,
-        &history,
+        channel_history_before_turn_delta(&history, &completed_turn_messages),
         history_has_trim_breadcrumb,
         crumb_present_before_loop,
         prior_turns_len_before_loop,
