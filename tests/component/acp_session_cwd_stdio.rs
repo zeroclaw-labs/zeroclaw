@@ -22,13 +22,14 @@ use std::time::{Duration, Instant};
 /// resolves to `<install-root>/agents/test-agent/workspace`, where the install
 /// root is the directory holding `config.toml` (i.e. `ZEROCLAW_CONFIG_DIR`).
 ///
-/// `schema_version = 3` is REQUIRED: `Config::load_or_init` treats a config with
-/// no `schema_version` as V1 (`detect_version` → 1) and runs the V1→V3 migration,
-/// which reshapes `[providers.models.*]` and drops the already-V3 `model` field —
-/// so `session/new` would then fail with "model_provider … no model set". Declaring
-/// the current schema version skips the migration, exactly as a real V3 install does.
+/// `schema_version = 4` is REQUIRED: `Config::load_or_init` treats a config with
+/// no `schema_version` as V1 (`detect_version` → 1) and runs the V1 migration,
+/// which reshapes `[providers.models.*]` and drops the already-current `model`
+/// field — so `session/new` would then fail with "model_provider … no model set".
+/// Declaring the current schema version skips the migration, exactly as a real
+/// current install does.
 const TEST_CONFIG: &str = r#"
-schema_version = 3
+schema_version = 4
 
 [providers.models.anthropic.default]
 model = "claude-haiku-4-5"
