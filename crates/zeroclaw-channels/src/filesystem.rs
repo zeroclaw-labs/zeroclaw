@@ -936,28 +936,231 @@ mod tests {
         result.expect("shutdown is a clean exit");
     }
 
-    /// The dispatch loop still processes synthetic watcher events and exits
-    /// cleanly when the event source ends.
+    /// The dispatch loop still processes synthetic watcher events, reaches the
+    /// SOP dispatch boundary, and exits cleanly when the event source ends.
+    /// Asserting only clean exit is not enough: a future refactor could drop
+    /// `dispatch_untrusted_fan_in_driven` and this test would still pass.
     #[tokio::test]
     async fn dispatch_loop_delivers_events_then_exits_when_source_ends() {
         use notify::event::{CreateKind, EventKind};
+        use zeroclaw_api::memory_traits::{Memory, MemoryCategory, MemoryEntry};
+        use zeroclaw_runtime::sop::types::{
+            Sop, SopExecutionMode, SopPriority, SopRun, SopStep, SopTrigger, SopTriggerSource,
+        };
+
+        #[derive(Default)]
+        struct RecordingMemory {
+            entries: Mutex<std::collections::HashMap<String, MemoryEntry>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Memory for RecordingMemory {
+            fn name(&self) -> &str {
+                "recording-memory"
+            }
+
+            async fn store(
+                &self,
+                key: &str,
+                content: &str,
+                category: MemoryCategory,
+                session_id: Option<&str>,
+            ) -> anyhow::Result<()> {
+                self.entries.lock().unwrap().insert(
+                    key.to_string(),
+                    MemoryEntry {
+                        principal_id: None,
+                        id: key.to_string(),
+                        key: key.to_string(),
+                        content: content.to_string(),
+                        category,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        session_id: session_id.map(str::to_string),
+                        score: None,
+                        namespace: "default".into(),
+                        importance: None,
+                        superseded_by: None,
+                        kind: None,
+                        pinned: false,
+                        tenant_id: None,
+                        agent_alias: None,
+                        agent_id: None,
+                    },
+                );
+                Ok(())
+            }
+
+            async fn recall(
+                &self,
+                _query: &str,
+                limit: usize,
+                _session_id: Option<&str>,
+                _since: Option<&str>,
+                _until: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(self
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .take(limit)
+                    .cloned()
+                    .collect())
+            }
+
+            async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+                Ok(self.entries.lock().unwrap().get(key).cloned())
+            }
+
+            async fn list(
+                &self,
+                category: Option<&MemoryCategory>,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(self
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|entry| {
+                        category
+                            .is_none_or(|wanted| entry.category.to_string() == wanted.to_string())
+                    })
+                    .cloned()
+                    .collect())
+            }
+
+            async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+                Ok(self.entries.lock().unwrap().remove(key).is_some())
+            }
+
+            async fn forget_for_agent(&self, key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+                self.forget(key).await
+            }
+
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(self.entries.lock().unwrap().len())
+            }
+
+            async fn health_check(&self) -> bool {
+                true
+            }
+
+            async fn store_with_agent(
+                &self,
+                key: &str,
+                content: &str,
+                category: MemoryCategory,
+                session_id: Option<&str>,
+                _namespace: Option<&str>,
+                _importance: Option<f64>,
+                agent_id: Option<&str>,
+            ) -> anyhow::Result<()> {
+                self.entries.lock().unwrap().insert(
+                    key.to_string(),
+                    MemoryEntry {
+                        principal_id: None,
+                        id: key.to_string(),
+                        key: key.to_string(),
+                        content: content.to_string(),
+                        category,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        session_id: session_id.map(str::to_string),
+                        score: None,
+                        namespace: "default".into(),
+                        importance: None,
+                        superseded_by: None,
+                        kind: None,
+                        pinned: false,
+                        tenant_id: None,
+                        agent_alias: agent_id.map(str::to_string),
+                        agent_id: agent_id.map(str::to_string),
+                    },
+                );
+                Ok(())
+            }
+
+            async fn recall_for_agents(
+                &self,
+                _allowed_agent_ids: &[&str],
+                query: &str,
+                limit: usize,
+                session_id: Option<&str>,
+                since: Option<&str>,
+                until: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                self.recall(query, limit, session_id, since, until).await
+            }
+        }
+
+        impl zeroclaw_api::attribution::Attributable for RecordingMemory {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Memory(
+                    zeroclaw_api::attribution::MemoryKind::InMemory,
+                )
+            }
+            fn alias(&self) -> &str {
+                "recording"
+            }
+        }
 
         let watched = tempfile::tempdir().unwrap();
+        let watch_root = watched.path().to_string_lossy().to_string();
         let file = watched.path().join("order-1.json");
         std::fs::write(&file, b"{}").unwrap();
+        let file_path = file.to_string_lossy().to_string();
 
-        let channel = test_channel(
-            FilesystemConfig {
-                paths: vec![watched.path().to_string_lossy().to_string()],
+        let sop = Sop {
+            name: "fs-delivery".into(),
+            description: "Observe filesystem delivery".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Filesystem {
+                // Exact file path (not the directory): directory-child matching
+                // uses a `/` suffix and fails on Windows native separators.
+                path: file_path.clone(),
+                events: vec![],
+                condition: None,
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Observe".into(),
+                body: "noop".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: zeroclaw_runtime::sop::SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        };
+
+        let memory = Arc::new(RecordingMemory::default());
+        let mut engine = SopEngine::new(Default::default());
+        engine.set_sops_for_test(vec![sop]);
+        let channel = FilesystemChannel::new(FilesystemChannelConfig {
+            config: FilesystemConfig {
+                paths: vec![watch_root],
                 settle_ms: 0,
                 ..FilesystemConfig::default()
             },
-            "fs-loop",
-        );
+            alias: "fs-loop".into(),
+            engine: Arc::new(Mutex::new(engine)),
+            audit: Arc::new(SopAuditLogger::new(memory.clone())),
+            driver_sink: None,
+        });
 
         let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
         raw_tx
-            .send(Event::new(EventKind::Create(CreateKind::File)).add_path(file))
+            .send(Event::new(EventKind::Create(CreateKind::File)).add_path(file.clone()))
             .unwrap();
         drop(raw_tx);
 
@@ -971,6 +1174,30 @@ mod tests {
         .await
         .expect("loop must exit once the event source ends")
         .expect("processing a delivered event is not an error");
+
+        let runs: Vec<SopRun> = memory
+            .list(Some(&MemoryCategory::Custom("sop".into())), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.key.starts_with("sop_run_"))
+            .filter_map(|entry| serde_json::from_str(&entry.content).ok())
+            .collect();
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one filesystem SOP run must be audited"
+        );
+        let run = &runs[0];
+        assert_eq!(run.sop_name, "fs-delivery");
+        assert_eq!(run.trigger_event.source, SopTriggerSource::Filesystem);
+        assert_eq!(run.trigger_event.topic.as_deref(), Some(file_path.as_str()));
+        let payload: serde_json::Value =
+            serde_json::from_str(run.trigger_event.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["event"], "created");
+        assert_eq!(payload["path"], file_path);
+        assert_eq!(payload["file_name"], "order-1.json");
+        assert_eq!(payload["extension"], "json");
     }
 
     #[allow(clippy::await_holding_lock)]
