@@ -3840,12 +3840,13 @@ fn le_u24(bytes: &[u8]) -> u32 {
     u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
 }
 
-/// Splits RIFF-style chunk data into `(fourcc, payload)` pairs.
+/// Splits RIFF-style chunk data into `(fourcc, payload, declared_size)` triples.
 ///
 /// A payload that runs past the end of `data` is returned truncated, and a
-/// trailing fragment too short for a chunk header ends the walk, so the caller
-/// sees exactly the bytes a decoder reading the same buffer could reach.
-fn riff_chunks(data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
+/// trailing fragment too short for a chunk header ends the walk. Sizes are
+/// stepped over rounded up to even, as `image-webp`'s chunk scan does; the
+/// declared (unrounded) size is returned so a caller can see odd ones.
+fn riff_chunks(data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8], usize)> {
     let mut offset = 0usize;
     std::iter::from_fn(move || {
         let header = data.get(offset..offset.checked_add(8)?)?;
@@ -3854,7 +3855,7 @@ fn riff_chunks(data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
         let start = offset + 8;
         let end = start.saturating_add(size).min(data.len());
         offset = start.saturating_add(size).saturating_add(size & 1);
-        Some((fourcc, &data[start..end]))
+        Some((fourcc, &data[start..end], size))
     })
 }
 
@@ -3875,9 +3876,12 @@ fn riff_chunks(data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
 /// bare `VP8` or `VP8L` file has no enclosing canvas to disagree with, and any
 /// other first chunk is rejected by the decoder before it allocates.
 ///
-/// Every `VP8` chunk found is checked, not only the one the decoder would use.
-/// A structure this walk cannot read, such as a canvas chunk too short to hold
-/// its dimensions, is refused rather than admitted.
+/// Every `VP8` chunk this walk reaches is checked, not only the one the decoder
+/// would use, and an `ANMF` chunk of odd size is refused (see the comment at
+/// that check). The walk is a superset of what the decoder reads: it ignores
+/// the RIFF size and follows the padded chunk sizes the decoder also uses. A
+/// structure it cannot read, such as a canvas chunk too short to hold its
+/// dimensions, is refused rather than admitted.
 fn ensure_vp8_matches_enclosing_canvas(
     source: &str,
     mime: &str,
@@ -3918,7 +3922,7 @@ fn ensure_vp8_matches_enclosing_canvas(
         return refuse("not a RIFF/WEBP container".to_string());
     };
     let mut chunks = riff_chunks(body).peekable();
-    let Some((b"VP8X", vp8x)) = chunks.peek().map(|(fourcc, payload)| (fourcc, *payload)) else {
+    let Some((b"VP8X", vp8x)) = chunks.peek().map(|(fourcc, payload, _)| (fourcc, *payload)) else {
         return Ok(());
     };
     let Some(canvas) = vp8x.get(4..10) else {
@@ -3926,15 +3930,26 @@ fn ensure_vp8_matches_enclosing_canvas(
     };
     let canvas = (le_u24(&canvas[..3]) + 1, le_u24(&canvas[3..]) + 1);
 
-    for (fourcc, payload) in chunks {
+    for (fourcc, payload, declared_size) in chunks {
         match &fourcc {
             b"VP8 " => check("VP8X canvas", payload, canvas)?,
             b"ANMF" => {
+                // `read_frame` advances to the next frame by the unrounded
+                // `ANMF` size (`next_frame_start += anmf_size + 8`) while
+                // `read_data` and this walk step over the padding byte. With an
+                // odd size the decoder's next frame starts one byte before the
+                // chunk this walk sees next, so a frame could be read from
+                // bytes this walk files under another chunk. A well-formed
+                // `ANMF` is always even, because its sub-chunks are padded.
+                if declared_size % 2 == 1 {
+                    return refuse("ANMF chunk has an odd size".to_string());
+                }
                 let Some(rect) = payload.get(6..12) else {
                     return refuse("ANMF chunk is too short to hold the frame size".to_string());
                 };
                 let frame = (le_u24(&rect[..3]) + 1, le_u24(&rect[3..]) + 1);
-                for (sub_fourcc, sub_payload) in riff_chunks(payload.get(16..).unwrap_or_default())
+                for (sub_fourcc, sub_payload, _) in
+                    riff_chunks(payload.get(16..).unwrap_or_default())
                 {
                     if &sub_fourcc == b"VP8 " {
                         check("ANMF frame", sub_payload, frame)?;
@@ -3957,6 +3972,7 @@ fn ensure_vp8_matches_enclosing_canvas(
 /// decoder's scratch). A caller that re-encodes the result hands the validator
 /// a different image, judged on its own smaller cost, so this can refuse an
 /// image whose re-encoding the validator would admit.
+///
 /// `image::Limits` is not a substitute: `WebPDecoder` (image 0.25.10) does not
 /// enforce `max_alloc`, and neither `Limits` nor `ImageReader::decode` sees the
 /// decoder's scratch buffers. Nothing is decoded and no pixel buffer is allocated.
@@ -9012,6 +9028,68 @@ mod tests {
         for (name, webp) in fixtures {
             ensure_decode_within_per_image_cap("vp8.webp", "image/webp", &webp)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn odd_sized_anmf_chunk_is_refused_so_frames_cannot_hide_from_the_walk() {
+        // `read_frame` finds frame N+1 at `start + anmf_size + 8` (unrounded)
+        // but the chunk scan steps over the pad byte. Build the layout where
+        // that one-byte difference puts a 16383x16383 VP8 header, in a 16x16
+        // frame, where the scan sees only an unknown chunk: frame 1 has an odd
+        // size, then the pad byte `A`, then `NMF0` (an unknown chunk of size 0
+        // as the scan reads it), whose bytes `A N M F 0x30 0 0 0` the decoder
+        // reads as an ANMF header of size 48 starting on the pad byte.
+        let mut frame_one = vec![0u8; 16];
+        frame_one[6..9].copy_from_slice(&[15, 0, 0]);
+        frame_one[9..12].copy_from_slice(&[15, 0, 0]);
+        frame_one.extend_from_slice(b"VP8 ");
+        // An odd-sized VP8 payload (header plus one byte) with no pad byte
+        // inside the frame, so the frame's own size is odd.
+        frame_one.extend_from_slice(&11u32.to_le_bytes());
+        frame_one.extend_from_slice(&vp8_header_payload(16, 16));
+        frame_one.push(0);
+        assert_eq!(frame_one.len() % 2, 1, "the first frame must be odd-sized");
+
+        let mut body = Vec::new();
+        append_webp_chunk(&mut body, b"VP8X", &vp8x_payload(true, (16, 16)));
+        append_webp_chunk(&mut body, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+        body.extend_from_slice(b"ANMF");
+        body.extend_from_slice(&(frame_one.len() as u32).to_le_bytes());
+        body.extend_from_slice(&frame_one);
+        // The pad byte, then `NMF0`, then four zero bytes: the size field of
+        // the "unknown" chunk as the scan reads it, and as the decoder reads
+        // it the last three bytes of the size 48 plus the first byte of the
+        // hidden frame (x). Then the rest of the hidden frame: x, y, width-1 = 15,
+        // height-1 = 15, duration and flags, and a VP8 chunk declaring 16383x16383.
+        // The scan reads that run as another chunk whose size field is 0x0F00,
+        // so it never reaches the VP8 chunk.
+        body.extend_from_slice(b"A");
+        body.extend_from_slice(b"NMF0");
+        body.extend_from_slice(&[0, 0, 0, 0]);
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 15, 0, 0, 15, 0, 0, 0, 0, 0, 0]);
+        body.extend_from_slice(b"VP8 ");
+        body.extend_from_slice(&10u32.to_le_bytes());
+        body.extend_from_slice(&vp8_header_payload(16383, 16383));
+        let hostile = riff_webp(body);
+
+        // The plain odd-sized shape, without the hiding trick.
+        let mut plain = Vec::new();
+        append_webp_chunk(&mut plain, b"VP8X", &vp8x_payload(true, (16, 16)));
+        append_webp_chunk(&mut plain, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+        plain.extend_from_slice(b"ANMF");
+        plain.extend_from_slice(&(frame_one.len() as u32).to_le_bytes());
+        plain.extend_from_slice(&frame_one);
+        plain.push(0);
+        let plain = riff_webp(plain);
+
+        for (name, webp) in [("hiding trick", hostile), ("plain odd size", plain)] {
+            let error = ensure_decode_within_per_image_cap("odd.webp", "image/webp", &webp)
+                .expect_err(name);
+            assert!(
+                error.to_string().contains("ANMF chunk has an odd size"),
+                "{name}: {error}"
+            );
         }
     }
 
