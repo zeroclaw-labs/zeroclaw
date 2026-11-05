@@ -103,12 +103,12 @@ impl BoundCapabilities {
             let request = ProviderRequest {
                 config: &config,
                 agent_alias: &agent_alias,
-                provider_ref: if !switched && config.agent(&agent_alias)
-                    .is_some_and(|agent| agent.model_provider == provider_ref) {
-                    None
-                } else {
-                    Some(&provider_ref)
-                },
+                // The model identity has already been resolved at this
+                // boundary. Preserve the exact provider key for the source on
+                // initial admission as well as switches, including canonical
+                // keys that contain dots; `None` is reserved for callers
+                // intentionally asking a source for its own agent default.
+                provider_ref: Some(&provider_ref),
                 model: Some(&identity.model_id),
                 principal: bound.principal.as_ref(),
             };
