@@ -552,16 +552,6 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
         } => {
             require_configured_agent(config, &agent_alias)?;
             let delivery_requested = delivery.any_set();
-            if expression.is_none()
-                && tz.is_none()
-                && command.is_none()
-                && name.is_none()
-                && allowed_tools.is_empty()
-                && uses_memory.is_none()
-                && !delivery_requested
-            {
-                bail!("{}", get_required_cli_string("cli-cron-update-no-field"));
-            }
 
             let existing = if expression.is_some()
                 || tz.is_some()
@@ -630,6 +620,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 },
                 uses_memory,
                 delivery,
+                agent_alias: Some(agent_alias.clone()),
                 ..CronJobPatch::default()
             };
 
@@ -637,6 +628,13 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!(
                 "{}",
                 get_required_cli_string_with_args("cli-cron-updated", &[("id", &job.id)])
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-cron-agent",
+                    &[("v", &job.agent_alias)]
+                )
             );
             println!(
                 "{}",

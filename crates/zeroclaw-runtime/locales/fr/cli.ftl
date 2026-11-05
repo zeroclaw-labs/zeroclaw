@@ -543,6 +543,7 @@ cli-cron-added-oneshot-agent = ✅ Tâche cron d'agent à exécution unique {$id
 cli-cron-added-oneshot = ✅ Tâche cron à exécution unique {$id} ajoutée
 cli-cron-added-interval-agent = ✅ Tâche cron d'agent par intervalle {$id} ajoutée
 cli-cron-added-interval = ✅ Tâche cron par intervalle {$id} ajoutée
+cli-cron-agent = {"  "}Agent : {$v}
 cli-cron-updated = ✅ Tâche cron {$id} mise à jour
 cli-cron-update-no-field = Au moins un des paramètres --expression, --tz, --command, --name, --allowed-tool, --uses-memory ou une option de livraison (--channel, --to, --thread, --best-effort, --no-best-effort) doit être fourni
 cli-cron-removed = ✅ Tâche cron {$id} supprimée

@@ -679,6 +679,7 @@ cli-cron-added-oneshot-agent = ✅ Added one-shot agent cron job {$id}
 cli-cron-added-oneshot = ✅ Added one-shot cron job {$id}
 cli-cron-added-interval-agent = ✅ Added interval agent cron job {$id}
 cli-cron-added-interval = ✅ Added interval cron job {$id}
+cli-cron-agent = {"  "}Agent: {$v}
 cli-cron-updated = ✅ Updated cron job {$id}
 cli-cron-update-no-field = At least one of --expression, --tz, --command, --name, --allowed-tool, --uses-memory, or a delivery flag (--channel, --to, --thread, --best-effort, --no-best-effort) must be provided
 cli-cron-removed = ✅ Removed cron job {$id}

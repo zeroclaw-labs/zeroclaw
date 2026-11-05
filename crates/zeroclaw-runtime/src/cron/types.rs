@@ -249,6 +249,10 @@ pub struct CronJobPatch {
     pub allowed_tools: Option<Vec<String>>,
     pub uses_memory: Option<bool>,
     pub shell_output_format: Option<CronShellOutputFormat>,
+    /// Reassign the job to another configured agent. `None` leaves the
+    /// current owner unchanged. Rejected for declarative jobs, whose
+    /// owner comes from `[agents.<alias>].cron_jobs` in config.toml.
+    pub agent_alias: Option<String>,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for CronJob {

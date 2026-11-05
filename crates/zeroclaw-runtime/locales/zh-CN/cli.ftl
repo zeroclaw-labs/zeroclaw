@@ -539,6 +539,7 @@ cli-cron-added-oneshot-agent = ✅ 已添加一次性 agent cron 任务 {$id}
 cli-cron-added-oneshot = ✅ 已添加一次性 cron 任务 {$id}
 cli-cron-added-interval-agent = ✅ 已添加间隔 agent cron 任务 {$id}
 cli-cron-added-interval = ✅ 已添加间隔 cron 任务 {$id}
+cli-cron-agent = {"  "}代理: {$v}
 cli-cron-updated = ✅ 已更新 cron 任务 {$id}
 cli-cron-update-no-field = 必须至少提供 --expression、--tz、--command、--name、--allowed-tool、--uses-memory 或投递选项（--channel、--to、--thread、--best-effort、--no-best-effort）中的一个
 cli-cron-removed = ✅ 已移除 cron 任务 {$id}

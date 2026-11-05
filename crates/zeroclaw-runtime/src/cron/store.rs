@@ -852,6 +852,21 @@ fn update_job_inner(
         }
         job.shell_output_format = shell_output_format;
     }
+    if let Some(agent_alias) = patch.agent_alias {
+        let agent_alias = agent_alias.trim().to_string();
+        if agent_alias.is_empty() {
+            anyhow::bail!("Cron job '{job_id}': agent_alias cannot be empty");
+        }
+        // Declarative ownership is config-driven (`[agents.<x>].cron_jobs`).
+        // Writing the column here would appear to succeed and then drift from
+        // the config claim (or be overwritten only on insert/recreate paths).
+        if job.source == "declarative" {
+            anyhow::bail!(
+                "Cron job '{job_id}': owning agent is determined by [agents.<alias>].cron_jobs                  in config.toml for a declarative job, not the database. Move the id between                  agents' cron_jobs lists and restart the daemon."
+            );
+        }
+        job.agent_alias = agent_alias;
+    }
 
     if schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
@@ -870,8 +885,8 @@ fn update_job_inner(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14
-                 WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, agent_alias = ?15
+                 WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
                 params![
                     job.expression,
                     job.command,
@@ -887,6 +902,7 @@ fn update_job_inner(
                     encode_allowed_tools(job.allowed_tools.as_ref())?,
                     job.next_run.to_rfc3339(),
                     if job.uses_memory { 1 } else { 0 },
+                    job.agent_alias,
                     job.id,
                     owner,
                 ],
@@ -896,8 +912,9 @@ fn update_job_inner(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
-                 WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15,
+                     agent_alias = ?16
+                 WHERE id = ?17 AND (?18 IS NULL OR agent_alias = ?18)",
                 params![
                     job.expression,
                     job.command,
@@ -917,6 +934,7 @@ fn update_job_inner(
                         CronShellOutputFormat::Wrapped => "wrapped",
                         CronShellOutputFormat::Raw => "raw",
                     },
+                    job.agent_alias,
                     job.id,
                     owner,
                 ],
@@ -5740,6 +5758,89 @@ mod tests {
             Some(vec!["shell".into()])
         );
     }
+
+    #[test]
+    fn update_job_persists_agent_alias_reassignment() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_agent_job(
+            &config,
+            "test-agent",
+            Some("weekly".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "do the weekly thing",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(job.agent_alias, "test-agent");
+
+        let updated = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                agent_alias: Some("secretary".into()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.agent_alias, "secretary");
+        assert_eq!(get_job(&config, &job.id).unwrap().agent_alias, "secretary");
+    }
+
+    #[test]
+    fn update_job_rejects_agent_alias_patch_for_declarative_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        // Seed a declarative row the same way sync_declarative_jobs inserts.
+        let now = Utc::now();
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs (
+                    id, expression, command, schedule, job_type, prompt, name,
+                    session_target, model, enabled, delivery, delete_after_run,
+                    allowed_tools, source, uses_memory, agent_alias, created_at, next_run
+                 ) VALUES (?1, ?2, '', ?3, 'agent', 'prompt', 'decl', 'isolated', NULL, 1, ?4, 0, NULL,
+                           'declarative', 1, 'test-agent', ?5, ?6)",
+                params![
+                    "decl-job",
+                    "0 6 * * 1",
+                    serde_json::to_string(&Schedule::Cron {
+                        expr: "0 6 * * 1".into(),
+                        tz: None,
+                    })?,
+                    serde_json::to_string(&DeliveryConfig::default())?,
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::days(1)).to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let err = update_job(
+            &config,
+            "decl-job",
+            CronJobPatch {
+                agent_alias: Some("secretary".into()),
+                ..CronJobPatch::default()
+            },
+        )
+        .expect_err("declarative owner must stay config-owned");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("declarative") && msg.contains("cron_jobs"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(get_job(&config, "decl-job").unwrap().agent_alias, "test-agent");
+    }
+
 
     #[test]
     fn reschedule_after_run_persists_last_status_and_last_run() {

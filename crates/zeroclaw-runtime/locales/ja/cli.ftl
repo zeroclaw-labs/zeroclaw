@@ -538,6 +538,7 @@ cli-cron-added-oneshot-agent = ✅ ワンショットエージェントcronジ�
 cli-cron-added-oneshot = ✅ ワンショットcronジョブ {$id} を追加しました
 cli-cron-added-interval-agent = ✅ インターバルエージェントcronジョブ {$id} を追加しました
 cli-cron-added-interval = ✅ インターバルcronジョブ {$id} を追加しました
+cli-cron-agent = {"  "}エージェント: {$v}
 cli-cron-updated = ✅ cronジョブ {$id} を更新しました
 cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory、または配信オプション（--channel、--to、--thread、--best-effort、--no-best-effort）のうち少なくとも1つを指定する必要があります
 cli-cron-removed = ✅ cronジョブ {$id} を削除しました
