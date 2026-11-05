@@ -690,7 +690,8 @@ fn build_memory_with_storage(
             config.embedding_cache_size,
             sqlite_open_timeout_secs,
             config.search_mode.clone(),
-        )?;
+        )?
+        .with_query_prefix(config.embedding_query_prefix.clone());
 
         if let Some(resolved_embedding) = resolved_embedding
             && has_embedder
@@ -740,7 +741,8 @@ fn build_memory_with_storage(
             )
         );
         return wrap_scanned_and_audit(
-            QdrantMemory::new_lazy("qdrant", &url, &collection, qdrant_api_key, embedder),
+            QdrantMemory::new_lazy("qdrant", &url, &collection, qdrant_api_key, embedder)
+                .with_query_prefix(config.embedding_query_prefix.clone()),
             &config.policy,
             workspace_dir,
             config.audit_enabled,
