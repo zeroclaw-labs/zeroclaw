@@ -122,8 +122,9 @@ required_group = "release"
 request_route = "zulip.main:stream:5:approvals"
 ```
 
-The prompt shows the title, the description and ✅/❌ reactions, and ends with a
-marker line:
+The prompt shows the title, what is being approved (the step's `- prompt:` when
+the SOP has one) and the ✅/❌ reactions. The text-reply form and a marker line
+are folded in a collapsed **Details** spoiler:
 
 ```
 `zeroclaw-gate:<reference>:<signature>`

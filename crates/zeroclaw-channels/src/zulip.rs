@@ -609,24 +609,37 @@ fn neutralize_gate_markers(text: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// What to approve stays in view; the text-reply form and the marker go in a
+/// collapsed spoiler. When the prompt offers reactions, the body is the context
+/// without the how-to-answer text (`resolved_description`): the reactions are
+/// the answer, the text form is the fallback.
 fn render_gate_prompt(prompt: &ChannelGatePrompt, emojis: &[&str], signature: &str) -> String {
-    let hint = if emojis.is_empty() {
-        String::new()
-    } else {
-        let list: Vec<String> = emojis.iter().map(|e| format!(":{e}:")).collect();
-        format!("\n\nReact with {} to answer.", list.join(" or "))
+    let labels: Vec<String> = emojis
+        .iter()
+        .filter_map(|e| {
+            let word = match gate_choice_for_emoji(e)? {
+                GateChoiceKind::Approve => "approve",
+                GateChoiceKind::Deny => "deny",
+                GateChoiceKind::Edit | GateChoiceKind::Revise => return None,
+            };
+            Some(format!(":{e}: {word}"))
+        })
+        .collect();
+    let (body, hint) = match prompt.resolved_description.as_deref() {
+        Some(context) if !labels.is_empty() => (context, format!("\n\n{}", labels.join(" · "))),
+        _ => (prompt.description.as_str(), String::new()),
     };
     let head = format!("**{}**\n\n", neutralize_gate_markers(&prompt.title));
+    let reference = &prompt.reference;
     let tail = format!(
-        "{hint}\n\n{GATE_MARKER_PREFIX}{}:{signature}`",
-        prompt.reference
+        "{hint}\n\n```spoiler Details\nOr reply `approve {reference}` / `deny {reference}`.\n\n\
+         {GATE_MARKER_PREFIX}{reference}:{signature}`\n```"
     );
-    // The marker must never be cut: the description is shortened instead.
+    // The marker must never be cut: the body is shortened instead.
     // `truncate_with_ellipsis` appends "..." beyond the limit: 3 extra chars.
     let budget = MAX_MESSAGE_CHARS.saturating_sub(head.chars().count() + tail.chars().count() + 3);
-    let description =
-        crate::util::truncate_with_ellipsis(&neutralize_gate_markers(&prompt.description), budget);
-    format!("{head}{description}{tail}")
+    let body = crate::util::truncate_with_ellipsis(&neutralize_gate_markers(body), budget);
+    format!("{head}{body}{tail}")
 }
 
 /// Outcome line appended to an approval prompt once it is decided.
@@ -2366,7 +2379,7 @@ mod tests {
     fn gate_marker_roundtrip() {
         let content = signed_prompt("run-b#1", "Approve the deploy?");
         assert!(content.starts_with("**SOP approval needed: deploy**"));
-        assert!(content.contains(":check: or :cross_mark:"));
+        assert!(content.contains(":check: approve · :cross_mark: deny"));
         let (reference, _) = parse_gate_marker(&content).unwrap();
         assert_eq!(reference, "run-b#1");
         assert!(marker_is_valid(
@@ -2374,6 +2387,36 @@ mod tests {
             &derive_gate_key("test-api-key"),
             TEST_TARGET
         ));
+    }
+
+    #[test]
+    fn gate_prompt_shows_context_and_folds_technical_details() {
+        let content = signed_prompt(
+            "run-c#1",
+            "Approve? Reply `approve run-c#1` or use the CLI.",
+        );
+        let (visible, details) = content.split_once("```spoiler Details").unwrap();
+        // With reactions on offer the body is the context, not the how-to-answer text
+        assert!(visible.contains("Deploy v1.2 to production"));
+        assert!(!visible.contains("CLI"));
+        assert!(!visible.contains("zeroclaw-gate:"));
+        assert!(details.contains("`approve run-c#1`"));
+        assert!(details.trim_end().ends_with("```"));
+        assert!(marker_is_valid(
+            &content,
+            &derive_gate_key("test-api-key"),
+            TEST_TARGET
+        ));
+    }
+
+    #[test]
+    fn gate_prompt_without_context_keeps_the_full_description() {
+        let mut prompt = gate_prompt("run-d#1", "Approve the deploy? Reply `approve run-d#1`.");
+        prompt.resolved_description = None;
+        let content = render_gate_prompt(&prompt, &gate_emojis(&prompt), "00");
+        let (visible, _) = content.split_once("```spoiler").unwrap();
+        assert!(visible.contains("Approve the deploy? Reply `approve run-d#1`."));
+        assert!(!visible.contains(":check: approve"));
     }
 
     #[test]
