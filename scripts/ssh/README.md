@@ -1,8 +1,10 @@
 # Task-owned SSH transports (Linux, opt-in)
 
 This adapter reuses an OpenSSH connection for commands addressed to the same
-resolved login, host, port, proxy and agent route during one tool-loop task.
-Concurrent calls use separate channels over that connection. The task owner
+configured alias and identical effective OpenSSH configuration during one logical
+turn. Distinct aliases never share a master, even when their resolved endpoint is
+the same. Concurrent calls use separate channels over a matching connection.
+Streamed steering rounds retain the same owner and cached failures. The task owner
 closes its helper pipe on success, error or cancellation; the helper closes all
 masters. Masters also receive a Linux parent-death signal if the helper dies.
 
@@ -37,7 +39,9 @@ The runtime supplies `ZEROCLAW_SSH_TASK` and `ZEROCLAW_SSH_STATE_DIR` after
 constructing the shell environment. Do not set them manually for agent tasks.
 The helper uses a user-owned 0700 directory under XDG_RUNTIME_DIR or the private
 temporary directory. No private keys are written there; it contains control
-sockets, readiness state and bounded connection error logs.
+sockets and readiness state. Connection stderr is drained continuously into an
+8 KiB in-memory tail, not an unbounded file. Connecting one key does not hold the
+pool lock while waiting for the network; other keys and task shutdown proceed.
 
 ## Trust and credentials
 
