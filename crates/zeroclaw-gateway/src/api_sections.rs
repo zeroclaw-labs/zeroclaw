@@ -171,7 +171,7 @@ fn quickstart_agent_missing_requirements(
     let model_ref = agent.model_provider.trim();
     if model_ref.is_empty() {
         missing.push(format!("Set a model provider for agent `{alias}`."));
-    } else if cfg.is_configured_model_ref(model_ref) {
+    } else if cfg.is_canonical_model_ref(model_ref) {
         if cfg.resolve_model_id(model_ref).is_none() {
             missing.push(format!("Choose a model for model provider `{model_ref}`."));
         }

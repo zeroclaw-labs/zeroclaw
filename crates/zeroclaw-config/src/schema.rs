@@ -4845,19 +4845,28 @@ impl Config {
             .and_then(|selection| selection.temperature())
     }
 
+    /// Test whether a reference names an exact-key model in the canonical
+    /// registry. Canonical references are never split on `.` and are kept
+    /// separate from the legacy family/alias maps so consumers can choose the
+    /// correct resolution path without losing credentials or other legacy
+    /// provider fields.
+    #[must_use]
+    pub fn is_canonical_model_ref(&self, model_ref: &str) -> bool {
+        self.providers.models.has_canonical_models()
+            && self
+                .providers
+                .models
+                .canonical_model(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+                .is_some()
+    }
+
     /// Test whether a reference names a canonical model or a legacy model
     /// profile/entry. Callers that only need admission should use this instead
     /// of destructuring the legacy `ModelSelection` type.
     #[must_use]
     pub fn is_configured_model_ref(&self, model_ref: &str) -> bool {
-        let model_ref = model_ref.trim();
-        (self.providers.models.has_canonical_models()
-            && self
-                .providers
-                .models
-                .canonical_model(&crate::provider_registry::ModelRef::from(model_ref))
-                .is_some())
-            || self.resolve_model_selection(model_ref).is_some()
+        self.is_canonical_model_ref(model_ref)
+            || self.resolve_model_selection(model_ref.trim()).is_some()
     }
 
     /// Resolve the risk profile for an explicit agent alias.

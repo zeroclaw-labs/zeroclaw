@@ -2990,7 +2990,7 @@ fn runtime_defaults_from_config(
     config: &Config,
     model_provider: &str,
 ) -> anyhow::Result<ChannelRuntimeDefaults> {
-    if config.is_configured_model_ref(model_provider.trim())
+    if config.is_canonical_model_ref(model_provider.trim())
         && let Some(model) = config.resolve_model_id(model_provider.trim())
     {
         let api_key = config.provider_registry().ok().and_then(|registry| {

@@ -267,13 +267,17 @@ macro_rules! emit_model_providers_struct {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 let raw = serde_json::Value::deserialize(deserializer)?;
                 let object = raw.as_object().ok_or_else(|| serde::de::Error::custom("providers.models must be a TOML table"))?;
-                let known = [$($type_str),+];
-                let canonical = object.keys().any(|key| !known.contains(&key.as_str()))
-                    || object.values().any(|value| {
-                        value
-                            .as_object()
-                            .is_some_and(|entry| entry.contains_key("capability"))
-                    });
+                // Legacy family maps may contain an unknown family; those
+                // entries must remain parseable so the startup detector can
+                // report the typo instead of turning it into a malformed
+                // canonical model. Canonical rows are identified by their
+                // required capability field, while exact dotted keys remain
+                // untouched once admitted through this branch.
+                let canonical = object.values().any(|value| {
+                    value
+                        .as_object()
+                        .is_some_and(|entry| entry.contains_key("capability"))
+                });
                 if canonical {
                     let mut models = BTreeMap::new();
                     for (key, value) in object {
