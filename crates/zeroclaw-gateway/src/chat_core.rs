@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, watch};
 use zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED;
 use zeroclaw_rpc_client::{ClientError, Method, Notification, RpcClient};
+use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
 use zeroclaw_rpc_proto::notification::SESSION_UPDATE;
 use zeroclaw_rpc_proto::types::{SessionUpdateEvent, TurnCompletionOutcome, TurnUsageTotals};
 
@@ -159,6 +160,12 @@ pub(crate) async fn ws_chat_through_core(
     } else {
         ws
     };
+    // Bound both a single frame and fragmented-message assembly before
+    // parsing or copying the prompt. RpcClient checks the final encoded RPC
+    // envelope separately, including escaping and the terminating newline.
+    let ws = ws
+        .max_frame_size(MAX_FRAME_BYTES as usize)
+        .max_message_size(MAX_FRAME_BYTES as usize);
     let mut core = match caller.open_chat(&agent_alias, cwd.as_deref()).await {
         Ok(core) => core,
         // Said on the socket: the browser would see only a dropped one.

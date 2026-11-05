@@ -1717,6 +1717,7 @@ mod tests {
         RiskProfileConfig, WireApi,
     };
     use zeroclaw_infra::session_backend::SessionBackend as _;
+    use zeroclaw_rpc_proto::MAX_FRAME_BYTES;
     use zeroclaw_runtime::rpc::context::RpcContext;
     use zeroclaw_runtime::rpc::inproc::InprocConnector;
     use zeroclaw_runtime::rpc::session::SessionStore;
@@ -4024,6 +4025,88 @@ mod tests {
         }
         let end = turn_end(&mut socket).await;
         assert_eq!(end["type"], "done", "alice's turn ran to its end: {end}");
+    }
+
+    #[tokio::test]
+    async fn oversized_chat_frames_are_rejected_before_json_parsing() {
+        use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        let payload = json!({
+            "type": "message",
+            "content": "oversized-padded",
+            "padding": "x".repeat(MAX_FRAME_BYTES as usize),
+        })
+        .to_string();
+        for fragmented in [false, true] {
+            let mut socket = open_chat(addr, &cookie, "support", "web-1").await.unwrap();
+            let _ = await_frame(&mut socket, "session_start").await;
+            if fragmented {
+                let midpoint = payload.len() / 2;
+                for (bytes, kind, final_frame) in [
+                    (&payload.as_bytes()[..midpoint], Data::Text, false),
+                    (&payload.as_bytes()[midpoint..], Data::Continue, true),
+                ] {
+                    let _ = socket
+                        .send(ClientMessage::Frame(Frame::message(
+                            bytes.to_vec(),
+                            OpCode::Data(kind),
+                            final_frame,
+                        )))
+                        .await;
+                }
+            } else {
+                let _ = socket
+                    .send(ClientMessage::Text(payload.clone().into()))
+                    .await;
+            }
+            let (frames, _) = read_to_close(&mut socket).await;
+            assert!(
+                frames.is_empty(),
+                "the oversized input never starts a turn: {frames:?}"
+            );
+            fixture
+                .assert_nothing_live("oversized input closes its conversation")
+                .await;
+        }
+        assert!(fixture._model.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_chat_prompt_over_the_encoded_rpc_limit_keeps_its_connection() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &cookie, "support", "web-1").await.unwrap();
+        let start = await_frame(&mut socket, "session_start").await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        // Escapes count as wire bytes, as do the RPC envelope and newline.
+        // The browser message fits, but its larger RPC envelope does not.
+        let payload = json!({
+            "type": "message",
+            "content": "\n".repeat((MAX_FRAME_BYTES as usize - 64) / 2),
+        })
+        .to_string();
+        assert!(payload.len() as u64 <= MAX_FRAME_BYTES);
+        socket
+            .send(ClientMessage::Text(payload.into()))
+            .await
+            .unwrap();
+        let refused = turn_end(&mut socket).await;
+        assert_eq!(refused["code"], "CORE_REFUSED", "{refused}");
+        assert!(fixture._model.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            chat_once(&mut socket, "a small prompt").await["type"],
+            "done"
+        );
+        assert_eq!(introspections_of(&fixture._idp, "tok-alice").await, before);
+        assert_eq!(
+            fixture.store.list_ids().await,
+            vec![start["session_id"].as_str().unwrap()]
+        );
     }
 
     /// Read text frames until the turn ends, and return the frame that ends
