@@ -126,7 +126,7 @@ impl CanvasStore {
     /// Clear a canvas (removes current content and history).
     ///
     /// When the canvas has no remaining viewers, the empty entry is removed so it
-    /// no longer occupies a slot toward [`MAX_CANVAS_COUNT`].
+    /// no longer occupies a slot toward the maximum canvas count.
     pub fn clear(&self, canvas_id: &str) -> bool {
         let mut store = self.inner.write();
         let Some(entry) = store.get_mut(canvas_id) else {
@@ -181,7 +181,7 @@ impl CanvasStore {
     }
 
     /// Drop empty canvases that have no live subscribers so they stop counting
-    /// toward [`MAX_CANVAS_COUNT`].
+    /// toward the maximum canvas count.
     fn prune_unused_empty_locked(store: &mut HashMap<String, CanvasEntry>) {
         store.retain(|_, entry| {
             entry.current.is_some() || !entry.history.is_empty() || entry.tx.receiver_count() > 0
