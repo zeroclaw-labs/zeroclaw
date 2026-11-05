@@ -70,7 +70,14 @@ pub struct OpenAiEmbedding {
     api_key: String,
     model: String,
     dims: usize,
+    request_timeout_secs: u64,
 }
+
+/// Upper bound on one embedding request. Recall waits for the query
+/// embedding before a turn starts, so an embedder that never answers has to
+/// fail rather than hold the turn indefinitely.
+const EMBEDDING_REQUEST_TIMEOUT_SECS: u64 = 60;
+const EMBEDDING_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 impl OpenAiEmbedding {
     pub fn new(base_url: &str, api_key: &str, model: &str, dims: usize) -> Self {
@@ -79,11 +86,22 @@ impl OpenAiEmbedding {
             api_key: api_key.to_string(),
             model: model.to_string(),
             dims,
+            request_timeout_secs: EMBEDDING_REQUEST_TIMEOUT_SECS,
         }
     }
 
+    #[cfg(test)]
+    fn with_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.request_timeout_secs = secs;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
-        zeroclaw_config::schema::build_runtime_proxy_client("memory.embeddings")
+        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+            "memory.embeddings",
+            self.request_timeout_secs,
+            EMBEDDING_CONNECT_TIMEOUT_SECS,
+        )
     }
 
     fn has_explicit_api_path(&self) -> bool {
@@ -229,6 +247,29 @@ pub fn create_embedding_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_embedder_that_never_answers_fails_instead_of_hanging() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        // Accept the connection and hold it open without ever replying.
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = done_rx.recv();
+        });
+
+        let p = OpenAiEmbedding::new(&base_url, "key", "model", 4).with_request_timeout_secs(1);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), p.embed_one("hello"))
+            .await
+            .expect("the embedding request must time out on its own");
+        assert!(result.is_err());
+
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
 
     #[test]
     fn noop_name() {
