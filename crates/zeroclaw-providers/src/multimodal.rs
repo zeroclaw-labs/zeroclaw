@@ -9019,8 +9019,10 @@ mod tests {
                 "animated, ALPH then a differently named chunk",
                 animated_webp_with_frame_chunk((16, 16), (16, 16), (16383, 16383), Some(b"JUNK")),
             ),
-            // Smaller than the canvas is a mismatch too: the decoder rejects
-            // it as `InconsistentImageSizes`, so refusing it early costs nothing.
+            // Smaller than the canvas is a mismatch too: the decoder compares the
+            // header with the canvas only after decoding the frame, and not at
+            // all for the frame after an `ALPH`, so refusing it early costs
+            // nothing.
             (
                 "still, smaller header",
                 still_lossy_webp((64, 64), (16, 16)),
@@ -9074,28 +9076,42 @@ mod tests {
         }
     }
 
-    #[test]
-    fn odd_sized_anmf_chunk_is_refused_so_frames_cannot_hide_from_the_walk() {
-        // `read_frame` finds frame N+1 at `start + anmf_size + 8` (unrounded)
-        // but the chunk scan steps over the pad byte. Build the layout where
-        // that one-byte difference puts a 16383x16383 VP8 header, in a 16x16
-        // frame, where the scan sees only an unknown chunk: frame 1 has an odd
-        // size, then the pad byte `A`, then `NMF0` (an unknown chunk of size 0
-        // as the scan reads it), whose bytes `A N M F 0x30 0 0 0` the decoder
-        // reads as an ANMF header of size 48 starting on the pad byte.
-        //
-        // This documents the shape of the layout; it is not a file the decoder
-        // is known to carry to the hidden frame (the unpadded frame one fails
-        // the size check at `decoder.rs` `chunk_size_rounded + 24 > anmf_size`
-        // first). The test proves the refusal, not the decoder's reachability.
+    /// The payload of a lossless 16x16 `VP8L` chunk, taken from what the
+    /// `image` crate's own WebP encoder writes, so the decoder accepts it as a
+    /// complete first frame.
+    fn lossless_16x16_payload() -> Vec<u8> {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::ImageBuffer::from_pixel(
+            16,
+            16,
+            image::Rgb([200, 30, 30]),
+        ))
+        .write_to(&mut encoded, image::ImageFormat::WebP)
+        .expect("test lossless WebP encodes");
+        let encoded = encoded.into_inner();
+        riff_chunks(&encoded[12..])
+            .find(|(fourcc, _, _)| fourcc == b"VP8L")
+            .map(|(_, payload, _)| payload.to_vec())
+            .expect("the encoder writes a VP8L chunk")
+    }
+
+    /// A two-frame animation in which `read_frame` and the chunk scan disagree
+    /// about where the second frame starts.
+    ///
+    /// Frame one is an `ANMF` of odd size holding a valid lossless 16x16 frame
+    /// plus one trailing byte. `read_frame` finds frame two at
+    /// `start + anmf_size + 8` (`decoder.rs`, `next_frame_start += anmf_size +
+    /// 8`), the pad byte; the chunk scan steps over that byte. The pad byte is
+    /// `A`, so the decoder reads `ANMF` there, with a size whose low byte is
+    /// `0` and whose second byte is 0x21. The scan, one byte later, reads an
+    /// unknown chunk `NMF0` of size 0x21 and steps over the whole hidden frame,
+    /// so it never sees the `VP8 ` chunk declaring 16383x16383 inside it. A
+    /// genuine `ANMF` after it keeps the frame count at two.
+    fn animation_hiding_a_frame_behind_an_odd_anmf() -> Vec<u8> {
         let mut frame_one = vec![0u8; 16];
         frame_one[6..9].copy_from_slice(&[15, 0, 0]);
         frame_one[9..12].copy_from_slice(&[15, 0, 0]);
-        frame_one.extend_from_slice(b"VP8 ");
-        // An odd-sized VP8 payload (header plus one byte) with no pad byte
-        // inside the frame, so the frame's own size is odd.
-        frame_one.extend_from_slice(&11u32.to_le_bytes());
-        frame_one.extend_from_slice(&vp8_header_payload(16, 16));
+        append_webp_chunk(&mut frame_one, b"VP8L", &lossless_16x16_payload());
         frame_one.push(0);
         assert_eq!(frame_one.len() % 2, 1, "the first frame must be odd-sized");
 
@@ -9105,33 +9121,69 @@ mod tests {
         body.extend_from_slice(b"ANMF");
         body.extend_from_slice(&(frame_one.len() as u32).to_le_bytes());
         body.extend_from_slice(&frame_one);
-        // The pad byte, then `NMF0`, then four zero bytes: the size field of
-        // the "unknown" chunk as the scan reads it, and as the decoder reads
-        // it the last three bytes of the size 48 plus the first byte of the
-        // hidden frame (x). Then the rest of the hidden frame: x, y, width-1 = 15,
-        // height-1 = 15, duration and flags, and a VP8 chunk declaring 16383x16383.
-        // The scan reads that run as another chunk whose size field is 0x0F00,
-        // so it never reaches the VP8 chunk.
-        body.extend_from_slice(b"A");
-        body.extend_from_slice(b"NMF0");
-        body.extend_from_slice(&[0, 0, 0, 0]);
-        body.extend_from_slice(&[0, 0, 0, 0, 0, 15, 0, 0, 15, 0, 0, 0, 0, 0, 0]);
-        body.extend_from_slice(b"VP8 ");
-        body.extend_from_slice(&10u32.to_le_bytes());
-        body.extend_from_slice(&vp8_header_payload(16383, 16383));
-        let hostile = riff_webp(body);
+        // The pad byte the decoder reads as the start of frame two.
+        body.push(b'A');
+        body.extend_from_slice(b"NMF");
+        body.extend_from_slice(&[0x30, 0x21, 0, 0]);
+        // Frame two: a 16-byte frame header for a 16x16 rectangle, then a `VP8 `
+        // chunk declaring 16383x16383. Its first byte also closes the size the
+        // scan reads for `NMF0`, so it must be zero.
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 15, 0, 0, 15, 0, 0, 0, 0, 0, 0]);
+        append_webp_chunk(&mut body, b"VP8 ", &vp8_header_payload(16383, 16383));
+        // The pad byte the scan steps over after `NMF0`.
+        body.push(0);
+        // A genuine `ANMF` so the scan counts two frames. The scan rejects an
+        // `ANMF` under 24 bytes, so it carries an empty sub-chunk header.
+        let mut genuine = vec![0u8; 16];
+        genuine[6..9].copy_from_slice(&[15, 0, 0]);
+        genuine[9..12].copy_from_slice(&[15, 0, 0]);
+        append_webp_chunk(&mut genuine, b"VP8L", &[]);
+        append_webp_chunk(&mut body, b"ANMF", &genuine);
+        riff_webp(body)
+    }
+
+    #[test]
+    fn odd_sized_anmf_chunk_is_refused_and_the_frame_it_hides_is_reachable() {
+        let hostile = animation_hiding_a_frame_behind_an_odd_anmf();
+
+        // What makes the refusal necessary: the decoder gets to frame two, which
+        // the chunk scan files under an unknown chunk. Frame two has no pixel
+        // data, so it ends in an error, but a bitstream error: the decoder read
+        // the `VP8 ` header it was not meant to see, which is where it sizes
+        // the planes.
+        let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&hostile))
+            .expect("the container parses");
+        assert!(decoder.has_animation());
+        let frames: Vec<_> = image::AnimationDecoder::into_frames(decoder).collect();
+        assert_eq!(frames.len(), 2, "the scan counts two frames");
+        frames[0]
+            .as_ref()
+            .expect("frame one is a valid lossless frame");
+        let second = frames[1]
+            .as_ref()
+            .err()
+            .expect("frame two has no pixel data");
+        assert!(
+            format!("{second:?}").contains("BitStreamError"),
+            "frame two must fail inside its VP8 bitstream, not on a chunk header: {second:?}"
+        );
 
         // The plain odd-sized shape, without the hiding trick.
         let mut plain = Vec::new();
         append_webp_chunk(&mut plain, b"VP8X", &vp8x_payload(true, (16, 16)));
         append_webp_chunk(&mut plain, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+        let mut frame = vec![0u8; 16];
+        frame[6..9].copy_from_slice(&[15, 0, 0]);
+        frame[9..12].copy_from_slice(&[15, 0, 0]);
+        append_webp_chunk(&mut frame, b"VP8L", &lossless_16x16_payload());
+        frame.push(0);
         plain.extend_from_slice(b"ANMF");
-        plain.extend_from_slice(&(frame_one.len() as u32).to_le_bytes());
-        plain.extend_from_slice(&frame_one);
+        plain.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        plain.extend_from_slice(&frame);
         plain.push(0);
         let plain = riff_webp(plain);
 
-        for (name, webp) in [("hiding trick", hostile), ("plain odd size", plain)] {
+        for (name, webp) in [("hiding a frame", hostile), ("plain odd size", plain)] {
             let error = ensure_decode_within_per_image_cap("odd.webp", "image/webp", &webp)
                 .expect_err(name);
             assert!(
@@ -9142,17 +9194,80 @@ mod tests {
     }
 
     #[test]
+    fn vp8_header_off_by_one_pixel_is_refused() {
+        // The comparison is exact: one pixel either way is a mismatch, in the
+        // still path and in the animated frame rectangle.
+        let fixtures = [
+            ("still, 17 wide", still_lossy_webp((16, 16), (17, 16))),
+            ("still, 17 tall", still_lossy_webp((16, 16), (16, 17))),
+            ("still, 15 wide", still_lossy_webp((16, 16), (15, 16))),
+            (
+                "animated, 17 tall",
+                animated_lossy_webp((16, 16), (16, 16), (16, 17), false),
+            ),
+        ];
+        for (name, webp) in fixtures {
+            let error =
+                ensure_decode_within_per_image_cap("px.webp", "image/webp", &webp).expect_err(name);
+            assert!(
+                error.to_string().contains("VP8 bitstream declares"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn vp8_scale_bits_do_not_count_towards_the_declared_size() {
+        // The top two bits of each 16-bit dimension are an upscaling hint, not
+        // part of the size (`image-webp` `vp8.rs`, `read_frame_header` masks
+        // with 0x3FFF). A header `16 | 0x4000` by `16 | 0x8000` declares 16x16.
+        let scaled = still_lossy_webp((16, 16), (16 | 0x4000, 16 | 0x8000));
+        ensure_decode_within_per_image_cap("scale.webp", "image/webp", &scaled)
+            .expect("scale bits must be masked off before the comparison");
+
+        // And the mask is not a way to hide a large size: the low 14 bits are
+        // still compared.
+        let large = still_lossy_webp((16, 16), (16383 | 0x4000, 16383 | 0x8000));
+        let error = ensure_decode_within_per_image_cap("scale.webp", "image/webp", &large)
+            .expect_err("a 16383x16383 header is refused whatever its scale bits");
+        assert!(
+            error.to_string().contains("declares 16383x16383"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn vp8_dimension_check_refuses_structures_it_cannot_read() {
+        // Calls the helper directly: `projected_allocation` would stop at these
+        // files for its own reasons, and this pins the helper's own messages.
         let mut short_vp8x = Vec::new();
         append_webp_chunk(&mut short_vp8x, b"VP8X", &[0; 6]);
         let mut short_vp8 = Vec::new();
         append_webp_chunk(&mut short_vp8, b"VP8X", &vp8x_payload(false, (16, 16)));
         append_webp_chunk(&mut short_vp8, b"VP8 ", &[0x10, 0, 0, 0x9d, 0x01]);
-        for (name, webp) in [
-            ("VP8X too short for the canvas", riff_webp(short_vp8x)),
-            ("VP8 too short for its header", riff_webp(short_vp8)),
+        let mut short_anmf = Vec::new();
+        append_webp_chunk(&mut short_anmf, b"VP8X", &vp8x_payload(true, (16, 16)));
+        append_webp_chunk(&mut short_anmf, b"ANMF", &[0; 8]);
+        for (name, webp, message) in [
+            (
+                "VP8X too short for the canvas",
+                riff_webp(short_vp8x),
+                "too short to hold the canvas size",
+            ),
+            (
+                "VP8 too short for its header",
+                riff_webp(short_vp8),
+                "VP8 bitstream header is truncated",
+            ),
+            (
+                "ANMF too short for the frame size",
+                riff_webp(short_anmf),
+                "too short to hold the frame size",
+            ),
         ] {
-            ensure_vp8_matches_enclosing_canvas("x.webp", "image/webp", &webp).expect_err(name);
+            let error =
+                ensure_vp8_matches_enclosing_canvas("x.webp", "image/webp", &webp).expect_err(name);
+            assert!(error.to_string().contains(message), "{name}: {error}");
         }
     }
 
