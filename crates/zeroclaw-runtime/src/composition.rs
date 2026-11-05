@@ -88,6 +88,7 @@ impl BoundCapabilities {
         provider_ref: &str,
         model: Option<&str>,
         switched: bool,
+        explicit_provider_ref: bool,
     ) -> anyhow::Result<zeroclaw_providers::model::BuiltModel> {
         let bound = self.clone();
         let agent_alias = agent_alias.to_owned();
@@ -103,12 +104,20 @@ impl BoundCapabilities {
             let request = ProviderRequest {
                 config: &config,
                 agent_alias: &agent_alias,
-                // The model identity has already been resolved at this
-                // boundary. Preserve the exact provider key for the source on
-                // initial admission as well as switches, including canonical
-                // keys that contain dots; `None` is reserved for callers
-                // intentionally asking a source for its own agent default.
-                provider_ref: Some(&provider_ref),
+                // Preserve an explicit source key when the caller selected a
+                // route (including canonical keys containing dots). Ordinary
+                // agent admission keeps the historical `None` contract so a
+                // source can resolve its own configured default.
+                provider_ref: if explicit_provider_ref
+                    || switched
+                    || !config.agent(&agent_alias).is_some_and(|agent| {
+                        agent.model_provider == provider_ref
+                    })
+                {
+                    Some(&provider_ref)
+                } else {
+                    None
+                },
                 model: Some(&identity.model_id),
                 principal: bound.principal.as_ref(),
             };

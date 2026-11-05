@@ -3361,6 +3361,7 @@ impl Agent {
                 model_ref,
                 model_overrides.model,
                 false,
+                false,
             )
             .await
             .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
@@ -4089,6 +4090,7 @@ impl Agent {
                     &self.agent_alias,
                     &new_model_provider,
                     Some(&new_model),
+                    true,
                     true,
                 )
                 .await?;

@@ -4285,6 +4285,7 @@ pub(crate) async fn assemble_owned_execution_with_capabilities(
         &agent.model_provider,
         None,
         false,
+        true,
     )
     .await?;
     let (model_provider, identity, _) = built.into_parts();

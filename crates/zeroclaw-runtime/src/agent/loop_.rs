@@ -2034,7 +2034,14 @@ async fn run_inner(
             active_effort_provider_refs = Some(Arc::clone(&selection.allowed_provider_refs));
         }
         let entry_model = bound_capabilities
-            .build_model(build_config, agent_alias, build_ref, build_override, false)
+            .build_model(
+                build_config,
+                agent_alias,
+                build_ref,
+                build_override,
+                false,
+                true,
+            )
             .await?;
         let mut provider_name = entry_model.provider_name();
         let (mut model_provider, identity, _) = entry_model.into_parts();
@@ -2634,6 +2641,7 @@ async fn run_inner(
                                 &new_model_provider,
                                 Some(&new_model),
                                 true,
+                                true,
                             )
                             .await?;
                             provider_name = model.provider_name();
@@ -2966,6 +2974,7 @@ async fn run_inner(
                                 &selection.model_provider,
                                 Some(&selection.model),
                                 false,
+                                true,
                             )
                             .await?;
                         provider_name = built.provider_name();
@@ -3319,6 +3328,7 @@ async fn run_inner(
                                     agent_alias,
                                     &new_model_provider,
                                     Some(&new_model),
+                                    true,
                                     true,
                                 )
                                 .await?;
@@ -4096,7 +4106,14 @@ async fn process_message_inner(
             principal: principal.clone(),
         };
         let entry_model = bound_capabilities
-            .build_model(build_config, agent_alias, build_ref, build_override, false)
+            .build_model(
+                build_config,
+                agent_alias,
+                build_ref,
+                build_override,
+                false,
+                false,
+            )
             .await?;
         let provider_name = entry_model.provider_name();
         let (model_provider, identity, _) = entry_model.into_parts();
