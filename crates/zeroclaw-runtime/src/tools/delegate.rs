@@ -883,6 +883,17 @@ impl DelegateTool {
         self
     }
 
+    /// Refuse what [`Self::bind_principal_scope`] would refuse, without
+    /// binding: a scope other than the one already bound.
+    pub(crate) fn check_principal_scope(&self, scope: &PrincipalScope) -> anyhow::Result<()> {
+        match self.principal_scope.read().as_ref() {
+            Some(existing) if existing != scope => {
+                anyhow::bail!("delegate memory is already pinned to a different principal scope")
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Bind the owning session's principal scope. Binding the same scope again
     /// is a no-op; a different scope is refused.
     pub(crate) fn bind_principal_scope(&self, scope: PrincipalScope) -> anyhow::Result<()> {
