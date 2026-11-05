@@ -53,3 +53,18 @@ pub mod security {
     pub use crate::policy::SecurityPolicy;
     pub use crate::secrets::SecretStore;
 }
+
+/// A receiver of the process-wide log capture, for tests that assert on
+/// emitted events. The capture is installed once for the whole test binary:
+/// `zeroclaw_log::subscribe_or_install` checks for a channel and installs one
+/// in two steps, so tests starting together could each install their own,
+/// and every receiver but the last would hear nothing.
+#[cfg(test)]
+pub(crate) fn capture_log_events() -> tokio::sync::broadcast::Receiver<serde_json::Value> {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        ::zeroclaw_log::try_install_capture_subscriber();
+        drop(::zeroclaw_log::subscribe_or_install());
+    });
+    ::zeroclaw_log::subscribe_or_install()
+}
