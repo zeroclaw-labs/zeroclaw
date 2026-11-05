@@ -817,6 +817,41 @@ mod tests {
         );
     }
 
+    /// Closing admission refuses a connect already parked at the admission
+    /// boundary even though the generation is not cancelled yet: the seal
+    /// check inside the critical section holds `close_admission`'s contract
+    /// on its own, not only the cancellation check behind it.
+    #[tokio::test]
+    async fn connect_paused_at_admission_is_refused_once_admission_is_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(base_config(tmp.path()));
+        let cancel = CancellationToken::new();
+        let (gate_tx, gate_rx) = watch::channel(false);
+        let connector = InprocConnector::with_admission_gate(cancel.clone(), gate_rx);
+        connector.bind(ctx);
+        let parked = connector.clone();
+        let pending = zeroclaw_spawn::spawn!(async move { parked.connect().await.is_some() });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(connector.registered_tasks(), 0);
+
+        connector.close_admission();
+        assert!(!cancel.is_cancelled());
+        gate_tx.send(true).unwrap();
+        let admitted = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("parked connect finishes")
+            .expect("connect task");
+        assert!(
+            !admitted,
+            "a connect that reaches admission after close_admission must be refused"
+        );
+        assert_eq!(connector.connection_count(), 0);
+        assert_eq!(connector.registered_tasks(), 0);
+        cancel.cancel();
+    }
+
     /// Many connects racing retirement: each one either belongs to the drain
     /// (its connection is joined, the client sees EOF) or is refused; none
     /// leaves activity or a task behind once the drain has returned.
