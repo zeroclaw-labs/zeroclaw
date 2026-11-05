@@ -347,7 +347,7 @@ pub struct SessionStore {
     /// replaces a session entry. Captured by provider-refresh callers so
     /// `apply_model_provider` can reject work from a stale instance.
     session_generation: std::sync::atomic::AtomicU64,
-    /// Test-only gate: when set, `set_overrides_gated` and
+    /// Test-only gate: when set, `configure_authorized` and
     /// `apply_model_provider` signal `entered` on entry, wait on
     /// `release`, then signal `done` on exit, letting a regression test
     /// atomically replace the session and wait for completion.
@@ -1210,7 +1210,7 @@ impl SessionStore {
     fn signal_test_gate_done(&self, _done: ()) {}
 
     /// Install a test-only pause gate at the pre-commit boundary inside
-    /// `set_overrides_gated` and `apply_model_provider`. Returns
+    /// `configure_authorized` and `apply_model_provider`. Returns
     /// `(entered, release, done)`.
     #[cfg(test)]
     pub fn set_test_gated_op_pause(&self) -> GatedOpPause {
@@ -1382,64 +1382,20 @@ impl SessionStore {
         Some(overrides)
     }
 
-    /// Like `set_overrides`, but validates `generation` before mutating the
-    /// session entry or its agent. Returns `None` if the session is absent
-    /// *or* if it was replaced under the same ID — both cases mean the caller
-    /// captured a stale generation and the work must be discarded.
-    pub async fn set_overrides_gated(
-        &self,
-        id: &str,
-        generation: u64,
-        patch: SessionOverrides,
-    ) -> Option<SessionOverrides> {
-        let explicit_model_selection = patch.model.is_some() || patch.model_provider.is_some();
-        let done = self.wait_test_gate().await;
-        let merged = match self.preview_overrides(id, &patch).await {
-            Some(merged) => merged,
-            None => {
-                self.signal_test_gate_done(done);
-                return None;
-            }
-        };
-        let mut sessions = self.sessions.lock().await;
-        let session = match sessions.get_mut(id) {
-            Some(session) => session,
-            None => {
-                self.signal_test_gate_done(done);
-                return None;
-            }
-        };
-        if session.generation != generation {
-            self.signal_test_gate_done(done);
-            return None;
-        }
-        session.overrides = merged.clone();
-        // Apply to agent immediately.
-        let overrides = session.overrides.clone();
-        let agent = session.agent.clone();
-        drop(sessions);
-        let mut guard = agent.lock().await;
-        if let Some(ref m) = overrides.model {
-            guard.set_model_name(m.clone());
-        }
-        if explicit_model_selection {
-            guard.disable_automatic_model_routing();
-        }
-        if overrides.temperature.is_some() {
-            guard.set_temperature(overrides.temperature);
-        }
-        self.signal_test_gate_done(done);
-        Some(overrides)
-    }
-
     /// Commit a prepared configure operation after the Agent and canonical
     /// incarnation are locked. The caller's authority guard spans every
     /// mutation; no await separates the override and provider publications.
+    /// Returns `None` if the session is absent or was replaced under the same
+    /// ID: the caller captured a stale generation and the work is discarded.
+    ///
+    /// `explicit_model_selection` is whether the request itself named a model
+    /// or provider; such a choice turns off automatic model routing.
     pub(crate) async fn configure_authorized<G, E>(
         &self,
         id: &str,
         generation: u64,
         merged: SessionOverrides,
+        explicit_model_selection: bool,
         update: Option<ModelProviderUpdate>,
         authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
     ) -> Result<Option<SessionOverrides>, E> {
@@ -1461,6 +1417,9 @@ impl SessionStore {
                 session.overrides = merged.clone();
                 if let Some(model) = &merged.model {
                     guard.set_model_name(model.clone());
+                }
+                if explicit_model_selection {
+                    guard.disable_automatic_model_routing();
                 }
                 if merged.temperature.is_some() {
                     guard.set_temperature(merged.temperature);
@@ -1533,7 +1492,7 @@ impl SessionStore {
     /// set to `v` (which may be `None`, clearing a prior profile temperature).
     /// When `temperature` is `None`, the agent's temperature is left unchanged
     /// — used by `session/configure` where temperature is already committed
-    /// via `set_overrides_gated`.
+    /// via `configure_authorized`.
     ///
     /// `multimodal_config` must be the same `[multimodal]` policy snapshot the
     /// caller built the provider box from, so the agent-side preparation pass
@@ -3643,7 +3602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_overrides_gated_rejects_stale_generation() {
+    async fn configure_authorized_rejects_stale_generation() {
         let store = make_store(4);
         store
             .insert(
@@ -3665,16 +3624,22 @@ mod tests {
 
         // Stale generation must be rejected — successor untouched.
         let result = store
-            .set_overrides_gated(
+            .configure_authorized(
                 "s",
                 captured_gen,
                 SessionOverrides {
                     model: Some("intruder".into()),
                     ..Default::default()
                 },
+                true,
+                None,
+                |_| Ok::<(), ()>(()),
             )
             .await;
-        assert!(result.is_none(), "stale generation must be rejected");
+        assert!(
+            matches!(result, Ok(None)),
+            "stale generation must be rejected"
+        );
 
         // Successor's overrides must remain default.
         let overrides = store.get_overrides("s").await.unwrap();
@@ -3686,7 +3651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_overrides_gated_accepts_current_generation() {
+    async fn configure_authorized_accepts_current_generation() {
         let store = make_store(4);
         store
             .insert(
@@ -3698,7 +3663,7 @@ mod tests {
         let captured_gen = store.get_generation("s").await.unwrap();
 
         let result = store
-            .set_overrides_gated(
+            .configure_authorized(
                 "s",
                 captured_gen,
                 SessionOverrides {
@@ -3706,10 +3671,14 @@ mod tests {
                     temperature: Some(0.7),
                     ..Default::default()
                 },
+                true,
+                None,
+                |_| Ok::<(), ()>(()),
             )
             .await;
-        assert!(result.is_some(), "current generation must be accepted");
-        let overrides = result.unwrap();
+        let overrides = result
+            .expect("the commit is authorized")
+            .expect("current generation must be accepted");
         assert_eq!(overrides.model.as_deref(), Some("valid"));
         assert_eq!(overrides.temperature, Some(0.7));
     }

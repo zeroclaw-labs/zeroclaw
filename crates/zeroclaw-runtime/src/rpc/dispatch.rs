@@ -8026,6 +8026,10 @@ impl RpcDispatcher {
             None
         };
 
+        // Only a model or provider the request itself names is an explicit
+        // selection; one carried over from earlier overrides is not.
+        let explicit_model_selection =
+            req.overrides.model.is_some() || req.overrides.model_provider.is_some();
         let update = built_model_provider.map(
             |(
                 model_provider,
@@ -8052,6 +8056,7 @@ impl RpcDispatcher {
                 &req.session_id,
                 session_generation,
                 merged,
+                explicit_model_selection,
                 update,
                 |session| {
                     self.session_effect_lease(
@@ -46772,7 +46777,7 @@ mod tests {
 
         // Spawn the configure handler — it will capture the generation,
         // acquire the per-session lock, build the provider, then block at
-        // the gate inside set_overrides_gated.
+        // the gate inside configure_authorized.
         let handle = zeroclaw_spawn::spawn!(async move {
             dispatcher
                 .handle_session_configure(&json!({
