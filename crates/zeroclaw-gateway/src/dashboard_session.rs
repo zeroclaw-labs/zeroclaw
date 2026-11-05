@@ -1355,6 +1355,10 @@ pub(crate) struct SessionWatch {
     auth: Arc<DashboardAuth>,
     session: Arc<SessionAuth>,
     require_admin: bool,
+    /// For a scoped chat, the agent it talks to: the session must keep the
+    /// grants a chat needs and that agent, as the upgrade checked them, or
+    /// the socket closes as an administrator's does on demotion.
+    chat_agent: Option<String>,
     recheck: tokio::time::Interval,
     /// A recheck in progress. Kept here, not in a `lost` future, because
     /// a socket's loop drops that future whenever another branch fires: a
@@ -1387,11 +1391,25 @@ impl SessionWatch {
             auth,
             session,
             require_admin,
+            chat_agent: None,
             recheck,
             pending: None,
             stopping,
             stopped: false,
         }
+    }
+
+    /// The watch for a scoped chat with `agent`: on top of the session
+    /// staying valid, every check requires what the chat was opened with.
+    pub(crate) fn for_chat(
+        auth: Arc<DashboardAuth>,
+        session: Arc<SessionAuth>,
+        agent: &str,
+        state: &AppState,
+    ) -> Self {
+        let mut watch = Self::new(auth, session, false, state);
+        watch.chat_agent = Some(agent.to_string());
+        watch
     }
 
     pub(crate) fn principal_id(&self) -> &str {
@@ -1430,12 +1448,29 @@ impl SessionWatch {
 
     fn judge(&mut self, outcome: DashboardCaller) -> Result<(), u16> {
         match outcome {
-            DashboardCaller::Session(session) if !self.require_admin || session.is_admin() => {
+            DashboardCaller::Session(session) if self.still_admits(&session) => {
                 self.session = session;
                 Ok(())
             }
             DashboardCaller::Session(_) => Err(WS_CLOSE_ACCESS_LOST),
             DashboardCaller::Rejected(_) => Err(WS_CLOSE_SESSION_ENDED),
+        }
+    }
+
+    /// Whether a session that still verifies keeps what the socket was
+    /// opened with, under the current policy: administrator rights for an
+    /// operator stream; for a scoped chat, the session grants a chat needs
+    /// and its agent.
+    fn still_admits(&self, session: &SessionAuth) -> bool {
+        if self.require_admin && !session.is_admin() {
+            return false;
+        }
+        match &self.chat_agent {
+            Some(agent) => {
+                crate::dashboard_core::may_chat(&session.grants)
+                    && session.grants.may_use_agent(agent)
+            }
+            None => true,
         }
     }
 
@@ -3067,6 +3102,71 @@ mod tests {
     }
 
     // ── Long-lived sockets ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_chat_watch_closes_on_narrowed_grants_without_input() {
+        use zeroclaw_api::grants::{Resource, Verb};
+
+        for narrowing in ["sessions:read", "sessions:update", "agent"] {
+            let server = idp(&["admins"], "gw").await;
+            let mut config = sign_in_config(&server.uri());
+            for alias in ["support", "other"] {
+                config.agents.insert(alias.into(), Default::default());
+            }
+            let profile = config.permission_profiles.get_mut("admin").unwrap();
+            profile.admin = false;
+            profile.allowed_agents = vec!["support".into()];
+            profile.grants.insert(
+                Resource::Sessions,
+                vec![Verb::Create, Verb::Read, Verb::Execute, Verb::Update],
+            );
+            config.validate_auth().unwrap();
+            let fixture = fixture(config.clone());
+            let signed_in = sign_in(&fixture, &server).await;
+            let DashboardCaller::Session(session) = fixture
+                .auth
+                .admit(|alias| Some(pin_for(&fixture, alias)), &signed_in.cookie)
+                .await
+            else {
+                panic!("signed in");
+            };
+            let mut watch = SessionWatch::for_chat(
+                Arc::clone(&fixture.auth),
+                session,
+                "support",
+                &fixture.state,
+            );
+            assert_eq!(watch.admits_now(&fixture.state).await, Ok(()));
+            let profile = config.permission_profiles.get_mut("admin").unwrap();
+            match narrowing {
+                "agent" => profile.allowed_agents = vec!["other".into()],
+                verb => {
+                    let verb = if verb == "sessions:read" {
+                        Verb::Read
+                    } else {
+                        Verb::Update
+                    };
+                    profile
+                        .grants
+                        .get_mut(&Resource::Sessions)
+                        .unwrap()
+                        .retain(|granted| *granted != verb);
+                }
+            }
+            let authority = fixture.auth.inbound.authority_ref().upgrade().unwrap();
+            authority
+                .publish_accepted(&config, authority.accepted_revision() + 1)
+                .unwrap();
+            watch.recheck = tokio::time::interval(std::time::Duration::from_millis(1));
+            let code = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                watch.lost(&fixture.state),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("without {narrowing}, an idle chat closes"));
+            assert_eq!(code, WS_CLOSE_ACCESS_LOST, "without {narrowing}");
+        }
+    }
 
     #[tokio::test]
     async fn a_socket_watch_fires_when_its_session_is_signed_out() {

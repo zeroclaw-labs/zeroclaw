@@ -32,7 +32,7 @@ use crate::AppState;
 use crate::dashboard_core::{
     CoreCaller, CoreChat, CoreFailure, agent_not_allowed, chat_not_permitted,
 };
-use crate::dashboard_session::{SessionWatch, WS_CLOSE_SESSION_ENDED, session_lost};
+use crate::dashboard_session::{DashboardAuth, SessionWatch, WS_CLOSE_SESSION_ENDED, session_lost};
 use crate::ws::{
     ConnectParams, WS_PROTOCOL, WsQuery, close_for_reconnect, close_with, gateway_stop_signal,
     history_trimmed_ws_frame, tick_websocket_ping, websocket_ping_interval,
@@ -118,7 +118,7 @@ pub(crate) async fn ws_chat_through_core(
     params: WsQuery,
     headers: &HeaderMap,
     ws: WebSocketUpgrade,
-    watch: Option<SessionWatch>,
+    dashboard: Option<Arc<DashboardAuth>>,
 ) -> Response {
     let Some(agent_alias) = params.agent_alias.filter(|s| !s.trim().is_empty()) else {
         return (
@@ -142,6 +142,11 @@ pub(crate) async fn ws_chat_through_core(
         )
             .into_response();
     }
+    // The socket closes once the session ends, or stops granting what was
+    // just checked: the chat's session grants and its agent.
+    let watch = dashboard.map(|auth| {
+        SessionWatch::for_chat(auth, Arc::clone(&caller.session), &agent_alias, &state)
+    });
     // Every socket starts a conversation of its own: a dashboard id in the
     // URL names nothing here.
     let cwd = params.cwd.or(params.workspace_dir);
@@ -372,7 +377,8 @@ impl Chat {
         text: &str,
     ) -> Option<Stop> {
         // Between turns, every frame is checked against the session as a
-        // request would be, before anything is done with it: a lost grant is
+        // request would be, before anything is done with it: a session that
+        // ended, or no longer grants the chat's session verbs or its agent, is
         // seen here, not at the next periodic recheck.
         if let Err(code) =
             crate::dashboard_session::session_admits_now(&mut self.watch, &self.state).await

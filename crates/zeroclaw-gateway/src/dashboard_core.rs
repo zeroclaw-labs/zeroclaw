@@ -2160,6 +2160,23 @@ mod tests {
                 .expect("the revoked policy is accepted by the core");
         }
 
+        /// Publish the same policy with `profile` changed by `change`, to the
+        /// gateway's authority only, as [`Self::revoke_group`] does. The
+        /// account keeps its profile and its session still verifies, so only
+        /// the gateway's check of what a chat needs can close the socket.
+        fn narrow_profile(&self, profile: &str, change: impl FnOnce(&mut PermissionProfileConfig)) {
+            let mut narrowed = self.config.clone();
+            change(
+                narrowed
+                    .permission_profiles
+                    .get_mut(profile)
+                    .expect("the fixture's profile"),
+            );
+            self.rpc_auth
+                .publish_accepted(&narrowed, self.rpc_auth.accepted_revision() + 1)
+                .expect("the narrowed policy is accepted");
+        }
+
         /// Wait until the core holds no live conversation at all.
         async fn assert_nothing_live(&self, why: &str) {
             let outcome = tokio::time::timeout(Duration::from_secs(15), async {
@@ -3119,6 +3136,66 @@ mod tests {
                 .any(|message| message.content.contains("after the revocation")),
             "the frame never reached the conversation: {transcript:?}"
         );
+    }
+
+    /// Narrow alice's profile with `change` while her chat is open, then send
+    /// a frame: the socket closes with `4403`, as an administrator's does on
+    /// demotion, the frame never reaches the conversation, and the
+    /// conversation is closed, not deleted.
+    async fn a_narrowed_grant_closes_the_chat(change: impl FnOnce(&mut PermissionProfileConfig)) {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let (mut socket, core_id) = chat_in(addr, &alice, "web-1").await;
+
+        fixture.narrow_profile("chat-user", change);
+        let message = json!({ "type": "message", "content": "after the narrowing" });
+        socket
+            .send(ClientMessage::Text(message.to_string().into()))
+            .await
+            .unwrap();
+        let (frames, code) = read_to_close(&mut socket).await;
+        assert_eq!(
+            code,
+            Some(crate::dashboard_session::WS_CLOSE_ACCESS_LOST),
+            "{frames:?}"
+        );
+        assert_closed_not_deleted(&fixture, &core_id).await;
+        let durable =
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&fixture.config.data_dir)
+                .expect("sqlite session backend");
+        let transcript = durable.load(&format!("rpc_{core_id}"));
+        assert!(
+            !transcript
+                .iter()
+                .any(|message| message.content.contains("after the narrowing")),
+            "the frame never reached the conversation: {transcript:?}"
+        );
+    }
+
+    fn without_session_verb(profile: &mut PermissionProfileConfig, verb: Verb) {
+        profile
+            .grants
+            .get_mut(&Resource::Sessions)
+            .expect("the profile's session grants")
+            .retain(|granted| *granted != verb);
+    }
+
+    #[tokio::test]
+    async fn a_chat_closes_when_its_account_loses_sessions_read() {
+        a_narrowed_grant_closes_the_chat(|profile| without_session_verb(profile, Verb::Read)).await;
+    }
+
+    #[tokio::test]
+    async fn a_chat_closes_when_its_account_loses_sessions_update() {
+        a_narrowed_grant_closes_the_chat(|profile| without_session_verb(profile, Verb::Update))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_chat_closes_when_its_account_loses_its_agent() {
+        a_narrowed_grant_closes_the_chat(|profile| profile.allowed_agents = vec!["other".into()])
+            .await;
     }
 
     #[tokio::test]

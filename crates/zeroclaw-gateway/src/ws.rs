@@ -161,16 +161,11 @@ pub async fn handle_ws_chat(
             crate::dashboard_core::Reach::ScopedOnly,
         )
     {
-        let watch = dashboard.as_ref().map(|Extension(auth)| {
-            crate::dashboard_session::SessionWatch::new(
-                Arc::clone(auth),
-                Arc::clone(&caller.session),
-                false,
-                &state,
-            )
-        });
-        return crate::chat_core::ws_chat_through_core(caller, state, params, &headers, ws, watch)
-            .await;
+        let dashboard = dashboard.map(|Extension(auth)| auth);
+        return crate::chat_core::ws_chat_through_core(
+            caller, state, params, &headers, ws, dashboard,
+        )
+        .await;
     }
     // A signed-in dashboard session presents no token; the session layer
     // classified it for this upgrade, the dashboard's own origin included.
