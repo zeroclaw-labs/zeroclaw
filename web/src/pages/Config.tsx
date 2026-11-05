@@ -335,9 +335,12 @@ export default function Config() {
               key={`${reloadKey}-${modelsMapPath}`}
               sectionKey={modelsMapPath}
               sectionHelp={t("config.models_subtable_help")}
-              onSelectAlias={async (modelAlias) => {
-                // Idempotent for an existing row (create returns false); creates
-                // the entry when the operator adds a new one via the inline row.
+              onOpenAlias={(modelAlias) => {
+                navigate(
+                  `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeParam)}/${encodeURIComponent(aliasParam)}/${encodeURIComponent(modelAlias)}`,
+                );
+              }}
+              onCreateAlias={async (modelAlias) => {
                 await createMapKey(modelsMapPath, modelAlias);
                 navigate(
                   `/config/${encodeURIComponent(activeSection.key)}/${encodeURIComponent(typeParam)}/${encodeURIComponent(aliasParam)}/${encodeURIComponent(modelAlias)}`,
