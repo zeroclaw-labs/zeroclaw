@@ -8068,6 +8068,11 @@ impl RpcDispatcher {
                 explicit_model_selection,
                 update,
                 |session| {
+                    if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                        && session.owner_tui_id() != self.tui_id.as_deref()
+                    {
+                        return Err(self.stale_session_incarnation_error());
+                    }
                     self.session_effect_lease(
                         Method::SessionConfigure,
                         session.owner_principal_id.as_deref(),
@@ -46923,6 +46928,113 @@ mod tests {
                     );
                 } else {
                     assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(temperature_for_session(&dispatcher, &sid).await, Some(0.99));
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        if model_change {
+                            "configured-model"
+                        } else {
+                            before_model.as_str()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_configure_rechecks_tui_ownership_at_commit() {
+        for model_change in [false, true] {
+            for (remote, transfer) in [(true, true), (true, false), (false, true)] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = make_model_refresh_test_config(&tmp);
+                config.gateway.paired_tokens = vec!["zc_configure_transport_test".into()];
+                let mut dispatcher = make_config_set_test_dispatcher(config);
+                dispatcher
+                    .handle_initialize(&json!({"auth_token":"zc_configure_transport_test"}))
+                    .await
+                    .unwrap();
+                dispatcher.tui_id = Some("original-owner".into());
+                if remote {
+                    dispatcher.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+                }
+                let sid = create_model_refresh_test_session(&dispatcher, &tmp).await;
+                let sessions = Arc::clone(&dispatcher.ctx.sessions);
+                let generation = sessions.get_generation(&sid).await.unwrap();
+                let before_overrides = sessions
+                    .preview_overrides(&sid, &Default::default())
+                    .await
+                    .unwrap();
+                let before_model = model_name_for_session(&dispatcher, &sid).await;
+                let before_temperature = temperature_for_session(&dispatcher, &sid).await;
+                let (entered, release, _) = sessions.set_test_gated_op_pause();
+                let mut overrides = json!({"temperature":0.99});
+                if model_change {
+                    overrides["model_provider"] = json!("openai.test-provider");
+                    overrides["model"] = json!("configured-model");
+                }
+                let params = json!({"session_id":sid,"overrides":overrides});
+                let request = dispatcher.handle_session_configure(&params);
+                let resume = async {
+                    entered.notified().await;
+                    // A same-mode resume can rebind this incarnation while
+                    // configure holds its config-writer and provider locks.
+                    sessions
+                        .resume_existing(
+                            &sid,
+                            "test-agent",
+                            &ChatMode::Chat,
+                            Some(
+                                if transfer {
+                                    "successor-owner"
+                                } else {
+                                    "original-owner"
+                                }
+                                .into(),
+                            ),
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(sessions.get_generation(&sid).await, Some(generation));
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, resume)
+                })
+                .await
+                .expect("configure reaches and leaves its final commit boundary");
+                sessions.clear_test_gated_op_pause();
+                if remote && transfer {
+                    assert_eq!(result.unwrap_err().code, SESSION_NOT_OWNED);
+                    let after = sessions
+                        .preview_overrides(&sid, &Default::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(after).unwrap(),
+                        serde_json::to_value(before_overrides).unwrap()
+                    );
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        before_model
+                    );
+                    assert_eq!(
+                        temperature_for_session(&dispatcher, &sid).await,
+                        before_temperature
+                    );
+                    assert_eq!(
+                        dispatcher
+                            .handle_session_configure(&params)
+                            .await
+                            .unwrap_err()
+                            .code,
+                        SESSION_NOT_OWNED,
+                        "the queued request must obey the same ownership rule as a fresh one"
+                    );
+                } else {
+                    result.expect("same-TUI reconnect and trusted-local configure remain allowed");
                     assert_eq!(temperature_for_session(&dispatcher, &sid).await, Some(0.99));
                     assert_eq!(
                         model_name_for_session(&dispatcher, &sid).await,
