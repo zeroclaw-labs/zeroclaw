@@ -136,4 +136,29 @@ mod tests {
         assert!(!core.is_connected().await);
         assert!(core.client().await.is_none());
     }
+
+    /// The client crate keeps its own copy of the daemon's endpoint
+    /// derivation so it need not link the runtime. This crate links both,
+    /// so it is where the two copies are held to the same answer.
+    #[test]
+    fn the_client_resolves_the_endpoint_the_daemon_listens_on() {
+        assert_eq!(zeroclaw_rpc_client::endpoint::SOCKET_ENV, "ZEROCLAW_SOCKET");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        for data_dir in [
+            tmp.path().join("data"),
+            tmp.path().join("data dir with spaces"),
+            tmp.path().join("données-数据"),
+        ] {
+            let config = zeroclaw_config::schema::Config {
+                data_dir: data_dir.clone(),
+                ..Default::default()
+            };
+            assert_eq!(
+                zeroclaw_rpc_client::endpoint::resolve_socket_path(&data_dir),
+                zeroclaw_runtime::rpc::local::socket_path(&config),
+                "{}",
+                data_dir.display()
+            );
+        }
+    }
 }
