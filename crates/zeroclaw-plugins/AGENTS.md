@@ -48,44 +48,19 @@ schemas. This crate knows how to run plugins, not what they do.
 - Config schema definitions (those go in `zeroclaw-config`)
 - Plugin registry client or distribution (future separate crate)
 
-## Proposed #12216 registry placement clarification (inactive)
+## Proposed registry placement exception
 
-**PENDING Core Team interpretation and approval; INACTIVE.** This section
-requests a narrow clarification of this crate's own contract. The runtime
-exception process does not delegate authority to waive this contract. Core
-has not selected continued placement or agreed the destination; it may instead
-direct a named minimal relocation. Record the approving Core reviewer and
-review permalink here before this separate proposal merges, and land the
-approved record before #12216. The feature cannot grant itself permission.
+**Pending Core approval; inactive.** For #12216 only, permit the existing
+`src/registry.rs` utilities and their focused tests (including
+`tests/registry_literal_compat.rs`) to add multi-registry selection, metadata
+caching, source-set validation and publisher-bound lookup/command suggestions.
+This does not expand fetching, installation or execution authority, or waive
+the registry/distribution exclusion for other work.
 
-The proposed carve-out is limited to the existing registry client utilities in
-`src/registry.rs` and their focused in-file tests, plus the source-compatibility
-checks in `tests/registry_literal_compat.rs`, for the selection, cache and
-origin-preserving multi-registry behaviors added by #12216: parse the existing
-registry selection as one URL or a bounded JSON URL list; retain each
-publisher (including empty indexes) in the cached collection; require exact
-source-set matches; preserve legacy single-index compatibility; and keep
-search, resolution, origin labels and rendered install-command suggestions
-bound to their publisher, refusing ambiguous cross-publisher resolution.
-Cache work is limited to that existing metadata cache and its bounded write
-integrity; it does not authorize a cache-cleanup project or new storage owner.
-
-This is not a blanket registry/distribution waiver. The general exclusion above
-remains in force outside this exact proposal. It grants no fetching,
-installation, activation or execution authority, new subsystem, dependency on
-runtime/config schemas, broader distribution ownership, or scope growth. Other
-#12216 paths and implementation acceptance are not approved by this text.
-
-Proposed future destination: the already-planned separate registry owner,
-with the skills adapter following the planned skills extraction; Core must
-confirm the actual destination and registry/skills split, not an author-named
-new crate. Reconsider at the first relevant skills/registry extraction design
-review, or before widening scope, selection/fallback policy, retained state or
-authority. This is a review condition, not a calendar expiry.
-
-The bounded request avoids forcing an unagreed cross-crate extraction into the
-ordinary #12109 feature. It neither changes the roadmap, security model or RFC
-process nor claims that continued placement has already been chosen.
+Proposed destination: the planned separate registry owner, subject to Core
+confirmation. Review when registry/skills extraction is designed or before
+expanding this scope. Record the approving Core review and confirmed destination
+here before this separate proposal merges, ahead of #12216.
 
 ## Related ADRs
 
