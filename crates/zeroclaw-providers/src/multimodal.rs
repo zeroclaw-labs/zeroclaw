@@ -3865,11 +3865,13 @@ fn riff_chunks(data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8], usize)> {
 /// [`projected_allocation`] charges the canvas the container declares, but
 /// `image-webp` 0.2.4 sizes the VP8 frame planes from the bitstream header
 /// (`vp8.rs`, `read_frame_header`: `ybuf`/`ubuf`/`vbuf`) and compares that
-/// header with the canvas only after decoding the frame (`decoder.rs`,
-/// `read_image` and `read_frame`). A small canvas around a 16383x16383 header
-/// therefore passes the projection and still asks the decoder for roughly
-/// 384 MiB of planes. The decoder rejects such a file once it has allocated;
-/// this rejects it before any decoder is constructed.
+/// header with the canvas only after decoding the frame, or not at all for the
+/// frame that follows an `ALPH` sub-chunk (`decoder.rs`, `read_image` and
+/// `read_frame`). Those are the three places the crate calls
+/// `Vp8Decoder::decode_frame`; this walk covers each. A small canvas around a
+/// 16383x16383 header therefore passes the projection and still asks the
+/// decoder for roughly 384 MiB of planes. This rejects such a file before any
+/// decoder is constructed.
 ///
 /// `VP8L` needs no such check: `LosslessDecoder::decode_frame` compares its
 /// header with the expected size before it allocates anything of its own. A
@@ -3948,12 +3950,19 @@ fn ensure_vp8_matches_enclosing_canvas(
                     return refuse("ANMF chunk is too short to hold the frame size".to_string());
                 };
                 let frame = (le_u24(&rect[..3]) + 1, le_u24(&rect[3..]) + 1);
+                // `read_frame` VP8-decodes the first sub-chunk when it is named
+                // `VP8 ` and, when it is `ALPH`, the sub-chunk after it
+                // whatever that one is called (`decoder.rs`, the `VP8` and
+                // `ALPH` arms). Check both, so a differently named chunk after
+                // an `ALPH` cannot carry a VP8 header past the walk.
+                let mut after_alpha = false;
                 for (sub_fourcc, sub_payload, _) in
                     riff_chunks(payload.get(16..).unwrap_or_default())
                 {
-                    if &sub_fourcc == b"VP8 " {
+                    if after_alpha || &sub_fourcc == b"VP8 " {
                         check("ANMF frame", sub_payload, frame)?;
                     }
+                    after_alpha = &sub_fourcc == b"ALPH";
                 }
             }
             _ => {}
@@ -8948,13 +8957,37 @@ mod tests {
         vp8: (u16, u16),
         with_alpha: bool,
     ) -> Vec<u8> {
+        let name = if with_alpha { Some(b"VP8 ") } else { None };
+        animated_webp_with_frame_chunk(canvas, rect, vp8, name)
+    }
+
+    /// As [`animated_lossy_webp`], but with `alpha_then` = `Some(name)` the
+    /// frame is an `ALPH` chunk followed by a chunk called `name` that holds
+    /// the VP8 header. `read_frame` decodes whatever follows an `ALPH` as VP8
+    /// without looking at its name (`decoder.rs`, the `ALPH` arm).
+    fn animated_webp_with_frame_chunk(
+        canvas: (u32, u32),
+        rect: (u32, u32),
+        vp8: (u16, u16),
+        alpha_then: Option<&[u8; 4]>,
+    ) -> Vec<u8> {
+        let with_alpha = alpha_then.is_some();
         let mut frame = vec![0u8; 16];
         frame[6..9].copy_from_slice(&(rect.0 - 1).to_le_bytes()[..3]);
         frame[9..12].copy_from_slice(&(rect.1 - 1).to_le_bytes()[..3]);
         if with_alpha {
-            append_webp_chunk(&mut frame, b"ALPH", &[0]);
+            // Header byte 0 (uncompressed, unfiltered) plus one byte per
+            // pixel: `read_alpha_chunk` reads exactly that, so the decoder
+            // gets past the alpha and on to the VP8 chunk.
+            let mut alpha = vec![0u8];
+            alpha.resize(1 + (rect.0 * rect.1) as usize, 0);
+            append_webp_chunk(&mut frame, b"ALPH", &alpha);
         }
-        append_webp_chunk(&mut frame, b"VP8 ", &vp8_header_payload(vp8.0, vp8.1));
+        append_webp_chunk(
+            &mut frame,
+            alpha_then.unwrap_or(b"VP8 "),
+            &vp8_header_payload(vp8.0, vp8.1),
+        );
 
         let mut body = Vec::new();
         append_webp_chunk(&mut body, b"VP8X", &vp8x_payload(true, canvas));
@@ -8979,6 +9012,12 @@ mod tests {
             (
                 "animated with ALPH",
                 animated_lossy_webp((16, 16), (16, 16), (16383, 16383), true),
+            ),
+            // `read_frame` VP8-decodes whatever follows an `ALPH`, whatever its
+            // name, and never compares that frame with the rectangle.
+            (
+                "animated, ALPH then a differently named chunk",
+                animated_webp_with_frame_chunk((16, 16), (16, 16), (16383, 16383), Some(b"JUNK")),
             ),
             // Smaller than the canvas is a mismatch too: the decoder rejects
             // it as `InconsistentImageSizes`, so refusing it early costs nothing.
@@ -9018,6 +9057,10 @@ mod tests {
                 "animated with ALPH",
                 animated_lossy_webp((16, 16), (16, 16), (16, 16), true),
             ),
+            (
+                "animated, ALPH then a differently named chunk",
+                animated_webp_with_frame_chunk((16, 16), (16, 16), (16, 16), Some(b"JUNK")),
+            ),
             // A frame smaller than the canvas is legal: the rectangle, not the
             // canvas, is what the frame's VP8 header must equal.
             (
@@ -9040,6 +9083,11 @@ mod tests {
         // size, then the pad byte `A`, then `NMF0` (an unknown chunk of size 0
         // as the scan reads it), whose bytes `A N M F 0x30 0 0 0` the decoder
         // reads as an ANMF header of size 48 starting on the pad byte.
+        //
+        // This documents the shape of the layout; it is not a file the decoder
+        // is known to carry to the hidden frame (the unpadded frame one fails
+        // the size check at `decoder.rs` `chunk_size_rounded + 24 > anmf_size`
+        // first). The test proves the refusal, not the decoder's reachability.
         let mut frame_one = vec![0u8; 16];
         frame_one[6..9].copy_from_slice(&[15, 0, 0]);
         frame_one[9..12].copy_from_slice(&[15, 0, 0]);
