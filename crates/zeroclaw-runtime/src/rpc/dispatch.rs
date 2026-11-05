@@ -5712,10 +5712,15 @@ impl RpcDispatcher {
             hooks.fire_session_start(&session_id, "rpc").await;
         }
 
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("session-new-return")
+            .await;
         if let Some(created) = create_only {
-            // Still under the admission permit: this is the incarnation this
-            // call created, not one a later caller installed.
-            *created.lock() = self.ctx.sessions.get_generation(&session_id).await;
+            // This is the incarnation this call published, not one a later
+            // caller installed. Report it even if it has since been removed,
+            // so the bound turn and close refuse rather than run unbound.
+            *created.lock() = Some(published_generation);
         }
 
         to_result(SessionNewResult {
@@ -49538,6 +49543,75 @@ mod tests {
         assert!(
             ctx.sessions.get_agent(sid).await.is_none(),
             "run-once must not have built or resumed a live session"
+        );
+    }
+
+    /// A create-only `session/new` reports the generation it published even
+    /// if that session is removed before the call returns, so run-once never
+    /// falls back to an unbound turn or close against a successor.
+    #[tokio::test]
+    async fn create_only_retains_its_published_generation_after_late_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let (ctx, backend, _acp) = persistence_enforcement_ctx(config);
+        let (operator, _rx) = local_operator(&ctx).await;
+        let sid = "create-only-late-removal";
+        let params = json!({"agent_alias": "test-agent", "session_id": sid, "keep_siblings": true});
+        let created = parking_lot::Mutex::new(None);
+        let (entered, release) = ctx.sessions.set_test_effect_pause("session-new-return");
+        let mut request = Box::pin(operator.session_new_with_mode(&params, Some(&created)));
+        tokio::select! {
+            result = &mut request => panic!("creation returned before the pause: {result:?}"),
+            _ = entered.notified() => {},
+        }
+        let original = ctx.sessions.get_generation(sid).await.unwrap();
+        assert!(ctx.sessions.remove(sid).await);
+        release.notify_one();
+        request
+            .await
+            .expect("creation has already published successfully");
+        assert_eq!(
+            *created.lock(),
+            Some(original),
+            "never degrade the bound call to None"
+        );
+        let (provider, mut handles) = scripted_turn_provider();
+        let workspace = ctx.config.read().agent_workspace_dir("test-agent");
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &backend,
+            sid,
+            provider,
+            None,
+            None,
+            &workspace,
+        )
+        .await;
+        let successor = ctx.sessions.get_generation(sid).await.unwrap();
+        assert_ne!(successor, original);
+        let bound = *created.lock();
+        let prompt = operator
+            .run_session_prompt(
+                SessionPromptParams {
+                    session_id: sid.into(),
+                    prompt: "must not run".into(),
+                    client_turn_generation: None,
+                    attachments: Vec::new(),
+                },
+                bound,
+            )
+            .await;
+        assert!(prompt.is_err());
+        assert!(
+            operator
+                .handle_session_close_bound(&json!({"session_id":sid}), bound)
+                .await
+                .is_err()
+        );
+        assert_eq!(ctx.sessions.get_generation(sid).await, Some(successor));
+        assert!(
+            handles.0.try_recv().is_err(),
+            "successor provider was not called"
         );
     }
 
