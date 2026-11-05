@@ -1541,6 +1541,7 @@ impl DelegateTool {
                     model_provider,
                     None,
                     false,
+                    false,
                 )
                 .await?;
             let (provider, identity, _) = built.into_parts();
