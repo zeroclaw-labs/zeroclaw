@@ -9298,6 +9298,130 @@ mod tests {
         }
     }
 
+    /// The payload of one `ANMF` frame: a 16-byte frame header for a `rect`
+    /// rectangle followed by a `VP8 ` chunk whose own header declares `vp8`.
+    fn anmf_frame_payload(rect: (u32, u32), vp8: (u16, u16)) -> Vec<u8> {
+        let mut frame = vec![0u8; 16];
+        frame[6..9].copy_from_slice(&(rect.0 - 1).to_le_bytes()[..3]);
+        frame[9..12].copy_from_slice(&(rect.1 - 1).to_le_bytes()[..3]);
+        append_webp_chunk(&mut frame, b"VP8 ", &vp8_header_payload(vp8.0, vp8.1));
+        frame
+    }
+
+    fn animated_webp_of_frames(canvas: (u32, u32), frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        append_webp_chunk(&mut body, b"VP8X", &vp8x_payload(true, canvas));
+        append_webp_chunk(&mut body, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+        for frame in frames {
+            append_webp_chunk(&mut body, b"ANMF", frame);
+        }
+        riff_webp(body)
+    }
+
+    #[test]
+    fn every_frame_of_an_animation_is_checked_not_only_the_first() {
+        let ok = || anmf_frame_payload((16, 16), (16, 16));
+        let big = || anmf_frame_payload((16, 16), (16383, 16383));
+        for (name, frames) in [
+            ("second frame", vec![ok(), big()]),
+            ("third frame", vec![ok(), ok(), big()]),
+        ] {
+            let webp = animated_webp_of_frames((16, 16), &frames);
+            let error = ensure_decode_within_per_image_cap("anim.webp", "image/webp", &webp)
+                .expect_err(name);
+            assert!(
+                error.to_string().contains("ANMF frame"),
+                "{name}: the refusal must name the frame check: {error}"
+            );
+        }
+        let all_matching = animated_webp_of_frames((16, 16), &[ok(), ok(), ok()]);
+        ensure_decode_within_per_image_cap("anim.webp", "image/webp", &all_matching)
+            .expect("three matching frames are admitted");
+    }
+
+    #[test]
+    fn an_alph_with_nothing_after_it_is_admitted() {
+        // `ALPH` is the last sub-chunk of the frame: there is no VP8 header
+        // after it to check, and the walk must not read past the frame for one.
+        let mut frame = vec![0u8; 16];
+        frame[6..9].copy_from_slice(&[15, 0, 0]);
+        frame[9..12].copy_from_slice(&[15, 0, 0]);
+        append_webp_chunk(&mut frame, b"ALPH", &[0u8; 1 + 16 * 16]);
+        let webp = animated_webp_of_frames((16, 16), &[frame]);
+        ensure_decode_within_per_image_cap("alph.webp", "image/webp", &webp)
+            .expect("an ALPH with no following chunk has nothing to check");
+    }
+
+    #[test]
+    fn metadata_chunks_before_the_vp8_chunk_do_not_hide_it() {
+        // `ICCP` of 4 bytes and `EXIF` of 5 (odd, so followed by a pad byte)
+        // sit between `VP8X` and `VP8 `: the walk has to step over both, pad
+        // included, to land on the `VP8 ` header.
+        let still = |vp8: (u16, u16)| {
+            let mut body = Vec::new();
+            append_webp_chunk(&mut body, b"VP8X", &vp8x_payload(false, (16, 16)));
+            append_webp_chunk(&mut body, b"ICCP", &[1, 2, 3, 4]);
+            append_webp_chunk(&mut body, b"EXIF", &[1, 2, 3, 4, 5]);
+            append_webp_chunk(&mut body, b"VP8 ", &vp8_header_payload(vp8.0, vp8.1));
+            riff_webp(body)
+        };
+        ensure_decode_within_per_image_cap("meta.webp", "image/webp", &still((16, 16)))
+            .expect("matching header behind metadata chunks is admitted");
+        let error =
+            ensure_decode_within_per_image_cap("meta.webp", "image/webp", &still((16383, 16383)))
+                .expect_err("a large header behind metadata chunks is still found");
+        assert!(
+            error.to_string().contains("declares 16383x16383"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_vp8_chunk_is_checked_in_full() {
+        // The decoder uses the first `VP8 ` chunk and ignores later ones; the
+        // walk checks every one it meets, so it refuses a file whose second
+        // `VP8 ` disagrees with the canvas even though the decoder would not
+        // read it. That is deliberate: a superset is safe, a subset is not.
+        let mut body = Vec::new();
+        append_webp_chunk(&mut body, b"VP8X", &vp8x_payload(false, (16, 16)));
+        append_webp_chunk(&mut body, b"VP8 ", &vp8_header_payload(16, 16));
+        append_webp_chunk(&mut body, b"VP8 ", &vp8_header_payload(16383, 16383));
+        let error =
+            ensure_decode_within_per_image_cap("twice.webp", "image/webp", &riff_webp(body))
+                .expect_err("the second VP8 chunk disagrees with the canvas");
+        assert!(
+            error.to_string().contains("declares 16383x16383"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn files_without_a_canvas_or_with_lossless_frames_are_left_to_the_other_checks() {
+        // A bare `VP8` or `VP8L` has no enclosing canvas to contradict (its own
+        // header is the size, which the projection charges), and a `VP8L`
+        // inside an `ANMF` is compared by the decoder before it allocates
+        // (`lossless.rs`), so the walk ignores it whatever it holds.
+        let mut bare_vp8 = Vec::new();
+        append_webp_chunk(&mut bare_vp8, b"VP8 ", &vp8_header_payload(16383, 16383));
+        let mut bare_vp8l = Vec::new();
+        append_webp_chunk(&mut bare_vp8l, b"VP8L", &[0xff; 10]);
+        let mut lossless_frame = vec![0u8; 16];
+        lossless_frame[6..9].copy_from_slice(&[15, 0, 0]);
+        lossless_frame[9..12].copy_from_slice(&[15, 0, 0]);
+        append_webp_chunk(&mut lossless_frame, b"VP8L", &[0xff; 10]);
+        for (name, webp) in [
+            ("bare VP8", riff_webp(bare_vp8)),
+            ("bare VP8L", riff_webp(bare_vp8l)),
+            (
+                "VP8L inside ANMF",
+                animated_webp_of_frames((16, 16), &[lossless_frame]),
+            ),
+        ] {
+            ensure_vp8_matches_enclosing_canvas("x.webp", "image/webp", &webp)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+    }
+
     #[test]
     fn vp8_dimension_check_refuses_structures_it_cannot_read() {
         // Calls the helper directly: `projected_allocation` would stop at these
