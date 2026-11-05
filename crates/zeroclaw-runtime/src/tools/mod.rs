@@ -767,6 +767,11 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// The session memory route this factory's memory-starting tools share
+    /// (`spawn_subagent` here, and the pipeline `assemble` mints). The sealed
+    /// registry keeps it and pins it when its session is pinned to an owner.
+    /// `None` when the tool set was not built by this factory.
+    pub session_memory: Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
     /// Pre-boxed Arcs eligible for indirect execution (before policy filter).
     /// Used by pipeline construction and skill-scoped builtin elevation.
     /// Direct-only session-prompt tools are deliberately absent.
@@ -808,6 +813,7 @@ impl AllToolsResult {
             channel_room_handle: None,
             reaction_handle: Arc::new(RwLock::new(HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
             capability_slots: Vec::new(),
@@ -921,6 +927,10 @@ impl zeroclaw_api::attribution::Attributable for NativeMemoryBinding {
 impl Memory for NativeMemoryBinding {
     fn name(&self) -> &str {
         self.selected().name()
+    }
+
+    fn principal_scope(&self) -> Option<zeroclaw_api::memory_traits::PrincipalScope> {
+        self.selected().principal_scope()
     }
 
     async fn store(
@@ -1502,6 +1512,13 @@ impl NativeMemoryProjection {
         };
         drop(wrapper);
         (Some(actual), entry.native_memory, entry.supplied)
+    }
+
+    /// Whether a sealed entry is the published view of a source-supplied tool.
+    pub(crate) fn is_supplied_entry(&self, tool: &dyn Tool) -> bool {
+        self.wrappers
+            .get(&Self::key(tool))
+            .is_some_and(|entry| entry.supplied && entry.wrapper.upgrade().is_some())
     }
 
     pub(crate) fn retains_source(
@@ -2340,6 +2357,18 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
+    // One route for the tools here that start memory work of their own; the
+    // sealed registry pins it when its session is pinned to an owner.
+    let session_memory = Arc::new(zeroclaw_tools::session_memory::SessionMemoryRoute::default());
+    // A registry built over memory that is already an owner's plane (a
+    // delegated target, a SOP step, or a child run of an owned session)
+    // belongs to that owner from the start. Pin its route now: nothing pins
+    // it later, and an empty route reads as an unowned session, so its
+    // spawner and pipeline would fall back to the agent's shared memory.
+    if memory.principal_scope().is_some() {
+        let pinned = session_memory.pin(Arc::clone(&memory), Arc::clone(security));
+        debug_assert!(pinned.is_ok(), "a fresh route holds no other handle");
+    }
     let mut capability_slots = Vec::new();
     let mut native_memory = NativeMemoryProjection::default();
     let memory_origins = native_memory.origins.clone();
@@ -2504,7 +2533,8 @@ fn all_tools_with_runtime_on_thread(
             security.clone(),
         )
         .with_subagent_caller(is_subagent_caller)
-        .with_execution_capability(execution_capability.clone());
+        .with_execution_capability(execution_capability.clone())
+        .with_session_memory(Arc::clone(&session_memory));
         capability_slots.push(tool.capabilities_slot());
         Arc::new(tool)
     });
@@ -3483,18 +3513,24 @@ fn all_tools_with_runtime_on_thread(
             Arc::new(SopListTool::new(Arc::clone(sop_engine)))
         );
         if let Some(ref sop_audit) = sop_audit {
+            // The audit logger follows the session too: once it is pinned to an
+            // owner, run payloads and step outputs are audited on that owner's
+            // plane rather than through the shared logger captured here.
             register_tool!(
                 "sop_execute",
                 Arc::new(
                     SopExecuteTool::new(Arc::clone(sop_engine))
                         .with_audit(Arc::clone(sop_audit))
+                        .with_session_memory(Arc::clone(&session_memory))
                         .with_initiator(agent_alias),
                 )
             );
             register_tool!(
                 "sop_advance",
                 Arc::new(
-                    SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                    SopAdvanceTool::new(Arc::clone(sop_engine))
+                        .with_audit(Arc::clone(sop_audit))
+                        .with_session_memory(Arc::clone(&session_memory)),
                 )
             );
             register_tool!(
@@ -3502,27 +3538,40 @@ fn all_tools_with_runtime_on_thread(
                 Arc::new(
                     SopApproveTool::new(Arc::clone(sop_engine))
                         .with_agent_alias(agent_alias)
-                        .with_audit(Arc::clone(sop_audit)),
+                        .with_audit(Arc::clone(sop_audit))
+                        .with_session_memory(Arc::clone(&session_memory)),
                 )
             );
         } else {
             register_tool!(
                 "sop_execute",
-                Arc::new(SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),)
+                Arc::new(
+                    SopExecuteTool::new(Arc::clone(sop_engine))
+                        .with_session_memory(Arc::clone(&session_memory))
+                        .with_initiator(agent_alias),
+                )
             );
             register_tool!(
                 "sop_advance",
-                Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine)))
+                Arc::new(
+                    SopAdvanceTool::new(Arc::clone(sop_engine))
+                        .with_session_memory(Arc::clone(&session_memory)),
+                )
             );
             register_tool!(
                 "sop_approve",
-                Arc::new(SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),)
+                Arc::new(
+                    SopApproveTool::new(Arc::clone(sop_engine))
+                        .with_session_memory(Arc::clone(&session_memory))
+                        .with_agent_alias(agent_alias),
+                )
             );
         }
         register_tool!(
             "sop_status",
             Arc::new(
                 SopStatusTool::new(Arc::clone(sop_engine))
+                    .with_session_memory(Arc::clone(&session_memory))
                     .with_collector(crate::sop::SopMetricsCollector::shared()),
             )
         );
@@ -3682,6 +3731,7 @@ fn all_tools_with_runtime_on_thread(
                     channel_room_handle,
                     reaction_handle,
                     poll_handle: root_config.tools.is_enabled("poll").then_some(poll_handle),
+                    session_memory: Some(session_memory),
                     escalate_handle,
                 });
             }
@@ -3918,6 +3968,7 @@ fn all_tools_with_runtime_on_thread(
         channel_room_handle,
         reaction_handle,
         poll_handle: root_config.tools.is_enabled("poll").then_some(poll_handle),
+        session_memory: Some(session_memory),
         escalate_handle,
         delegate_tool: built_delegate_tool,
     })
@@ -9564,6 +9615,22 @@ mod native_memory_binding_tests {
             self.calls.lock().push("ensure_agent_uuid");
             Ok("forwarded-value".into())
         }
+    }
+
+    #[tokio::test]
+    async fn native_memory_binding_forwards_the_principal_scope() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let shared: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let security = Arc::new(SecurityPolicy::default());
+        let binding = NativeMemoryBinding::new(Arc::clone(&shared), Arc::clone(&security));
+        assert!(binding.principal_scope().is_none());
+        let scope = PrincipalScope::new("user:alice");
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&shared),
+            scope.clone(),
+        ));
+        binding.bind(&shared, routed, &security).unwrap();
+        assert_eq!(binding.principal_scope(), Some(scope));
     }
 
     #[tokio::test]
