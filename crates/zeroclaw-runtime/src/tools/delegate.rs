@@ -5073,23 +5073,10 @@ impl DelegateTool {
             .map(|config| config.agent_workspace_dir(agent_alias))
             .or_else(|| self.agent_workspace(agent_alias));
         if let Some(target_workspace) = target_workspace {
-            let identity_files = [
-                "AGENTS.md",
-                "SOUL.md",
-                "IDENTITY.md",
-                "USER.md",
-                "BOOTSTRAP.md",
-            ];
-            for filename in identity_files {
-                let path = target_workspace.join(filename);
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    let trimmed = contents.trim();
-                    if !trimmed.is_empty() {
-                        enriched.push_str(trimmed);
-                        enriched.push_str("\n\n");
-                    }
-                }
-            }
+            // Match the direct-agent prompt path: same PERSONALITY_FILES set,
+            // order, and per-file MAX_FILE_CHARS truncation.
+            let profile = crate::agent::personality::load_personality(&target_workspace);
+            enriched.push_str(&profile.render());
         }
 
         let trimmed = enriched.trim().to_string();
@@ -13264,6 +13251,75 @@ target = "memory_recall"
             "{bg_result:?}"
         );
         assert!(bg_result.error.is_none(), "{bg_result:?}");
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_prompt_includes_tools_md_from_personality_files() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let target_ws = tmp.path().join("target-workspace");
+        std::fs::create_dir_all(&target_ws).unwrap();
+        std::fs::write(target_ws.join("SOUL.md"), "soul-marker").unwrap();
+        std::fs::write(target_ws.join("TOOLS.md"), "tools-marker-unique").unwrap();
+        std::fs::write(target_ws.join("HEARTBEAT.md"), "heartbeat-marker").unwrap();
+        std::fs::write(target_ws.join("MEMORY.md"), "memory-marker").unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let tool = DelegateTool::new(config.agents.clone(), None, test_security())
+            .with_root_config(Arc::clone(&config));
+        let agent_config = config.agents.get("target").cloned().unwrap();
+
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "target",
+                &agent_config,
+                "model-test",
+                &[],
+                tmp.path(),
+                true,
+                None,
+                None,
+            )
+            .expect("prompt should render");
+
+        assert!(
+            prompt.contains("tools-marker-unique"),
+            "delegate prompt must include TOOLS.md from PERSONALITY_FILES; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("heartbeat-marker"),
+            "delegate prompt must include HEARTBEAT.md; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("memory-marker"),
+            "delegate prompt must include MEMORY.md; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("soul-marker"),
+            "delegate prompt must still include SOUL.md; got: {prompt}"
+        );
+        let soul_pos = prompt.find("soul-marker").expect("soul");
+        let tools_pos = prompt.find("tools-marker-unique").expect("tools");
+        assert!(
+            soul_pos < tools_pos,
+            "PERSONALITY_FILES order puts SOUL.md before TOOLS.md; got: {prompt}"
+        );
     }
 
     #[tokio::test]
