@@ -11461,6 +11461,7 @@ mod tool_lifecycle_abandonment_tests {
                 zeroclaw_config::schema::ModelContextWindowSource::Configured;
         }
         run_tool_call_loop(ToolLoop {
+            capability_binding: None,
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -11487,6 +11488,7 @@ mod tool_lifecycle_abandonment_tests {
                 strict_tool_parsing: false,
                 parallel_tools,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits,
                 context_limits_resolver: None,
                 receipt_generator: None,
