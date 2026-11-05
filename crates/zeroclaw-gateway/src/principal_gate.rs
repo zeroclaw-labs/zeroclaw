@@ -2216,7 +2216,7 @@ mod tests {
     #[tokio::test]
     async fn bearer_client_keys_follow_persisted_forwarded_header_trust() {
         for (initial_trust, updated_trust, peer, forwarded) in [
-            (true, false, remote(), "127.0.0.1"),
+            (true, false, remote(), "203.0.113.8"),
             (false, true, loopback(), "203.0.113.7"),
         ] {
             let tmp = tempfile::tempdir().unwrap();
@@ -2229,9 +2229,9 @@ mod tests {
             let (router, _, limits) = router_authority_and_limits_for(config, initial_trust);
             let headers = [("x-forwarded-for", forwarded)];
 
-            // At startup each case resolves to loopback. Persisting the
-            // opposite policy must make this same router bill the remote
-            // address, without rebuilding either its routes or its ledger.
+            // The initial key is a different forwarded address or loopback.
+            // Persisting the opposite policy must make this same router bill
+            // 203.0.113.7, without rebuilding its routes or its ledger.
             let (status, _, _) = send_from(
                 &router,
                 Some(peer),
