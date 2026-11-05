@@ -18,6 +18,12 @@
 //!
 //! In-process connections are counted separately from socket clients, so an
 //! `--ephemeral` daemon still exits when its last real client leaves.
+//!
+//! The socket listener's connection limits deliberately do not apply here:
+//! there is no initialize deadline and no connection cap, because the only
+//! peer is this process's own gateway code. A caller of
+//! [`InprocConnector::connect`] that opens connections on behalf of remote
+//! users must bound them itself before it dials.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
