@@ -8727,6 +8727,13 @@ impl RpcDispatcher {
             zeroclaw_api::grants::Resource::Sessions,
             zeroclaw_api::grants::Verb::Create,
         )?;
+        // Closing is a session update. Refuse before creating or executing if
+        // the caller cannot perform every effect of this composite operation.
+        self.require_additional_grant(
+            Method::SessionRunOnce,
+            zeroclaw_api::grants::Resource::Sessions,
+            zeroclaw_api::grants::Verb::Update,
+        )?;
         // The session is closed when the turn ends, so the call must not
         // adopt one that already exists under a caller-chosen id. This early
         // check gives a clear error; the create-only session/new below is what
@@ -8784,8 +8791,9 @@ impl RpcDispatcher {
             .await;
 
         let close = serde_json::json!({ "session_id": session_id });
-        if let Err(e) = Box::pin(self.handle_session_close_bound(&close, created_generation)).await
-        {
+        let close_result =
+            Box::pin(self.handle_session_close_bound(&close, created_generation)).await;
+        if let Err(e) = &close_result {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -8800,6 +8808,15 @@ impl RpcDispatcher {
         }
 
         let (result, usage) = turn?;
+        close_result.map_err(|error| {
+            rpc_err(
+                error.code,
+                format!(
+                    "Turn completed, but could not close transient session {session_id}: {}",
+                    error.message,
+                ),
+            )
+        })?;
         to_result(SessionRunOnceResult {
             session_id: result.session_id,
             stop_reason: result.stop_reason,
@@ -48605,22 +48622,56 @@ mod tests {
 
     #[tokio::test]
     async fn session_run_once_runs_one_turn_and_closes_its_session() {
-        for (remote, explicit_id) in [(false, true), (true, true), (true, false)] {
+        for (remote, explicit_id, revoke_cleanup) in [
+            (false, true, false),
+            (true, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
             use wiremock::matchers::method;
             use wiremock::{Mock, MockServer, ResponseTemplate};
 
             let server = MockServer::start().await;
             Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "output_text": "pong",
-                    "output": [],
-                    "usage": {"input_tokens": 5, "output_tokens": 2}
-                })))
+                .respond_with(|request: &wiremock::Request| {
+                    let request: Value = serde_json::from_slice(&request.body).unwrap();
+                    let response = json!({
+                        "output_text": "pong", "output": [],
+                        "usage": {"input_tokens": 5, "output_tokens": 2}
+                    });
+                    if request["stream"] == true {
+                        // Honor streaming so the fixture does not trigger the
+                        // provider's non-streaming fallback and a second request.
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string(format!(
+                                "data: {}\n\ndata: {}\n\n",
+                                json!({"type":"response.output_text.delta", "delta":"pong"}),
+                                json!({"type":"response.completed", "response":response}),
+                            ))
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(response)
+                    }
+                })
                 .mount(&server)
                 .await;
 
             let tmp = tempfile::TempDir::new().unwrap();
             let mut config = session_cwd_config(&tmp, 4242, None);
+            config
+                .permission_profiles
+                .get_mut("session-scoped")
+                .unwrap()
+                .grants
+                .insert(
+                    zeroclaw_api::grants::Resource::Sessions,
+                    vec![
+                        zeroclaw_api::grants::Verb::Read,
+                        zeroclaw_api::grants::Verb::Create,
+                        zeroclaw_api::grants::Verb::Execute,
+                        zeroclaw_api::grants::Verb::Update,
+                    ],
+                );
             config
                 .providers
                 .models
@@ -48645,6 +48696,40 @@ mod tests {
                     .expect_err("ordinary remote explicit IDs remain resumes");
                 assert_eq!(denied.code, SESSION_NOT_OWNED);
             }
+            if remote && explicit_id && !revoke_cleanup {
+                republish_session_scoped(&ctx, |profile| {
+                    profile
+                        .grants
+                        .get_mut(&zeroclaw_api::grants::Resource::Sessions)
+                        .unwrap()
+                        .retain(|verb| *verb != zeroclaw_api::grants::Verb::Update);
+                });
+                let denied = rpc(&mut operator, &mut rx, 90, "session/run-once",
+                    json!({"agent_alias":"test-agent", "session_id":"no-cleanup-grant", "prompt":"ping"})).await;
+                assert_eq!(denied["error"]["code"], FORBIDDEN, "{denied}");
+                assert!(
+                    denied["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("sessions:update")
+                );
+                assert!(
+                    ctx.sessions
+                        .get_generation("no-cleanup-grant")
+                        .await
+                        .is_none()
+                );
+                use zeroclaw_infra::session_backend::SessionBackend;
+                assert!(!backend.session_exists("rpc_no-cleanup-grant"));
+                assert!(server.received_requests().await.unwrap().is_empty());
+                republish_session_scoped(&ctx, |profile| {
+                    profile
+                        .grants
+                        .get_mut(&zeroclaw_api::grants::Resource::Sessions)
+                        .unwrap()
+                        .push(zeroclaw_api::grants::Verb::Update);
+                });
+            }
             let mut params = json!({"agent_alias":"test-agent", "prompt":"ping"});
             if explicit_id {
                 params["session_id"] = json!("s-once");
@@ -48657,8 +48742,68 @@ mod tests {
                 "params": params,
             })
             .to_string();
-            operator.process_line(&line).await;
+            let mut retained = None;
+            if revoke_cleanup {
+                let (entered, release, _) = ctx.sessions.set_test_removal_signal_pause();
+                // Wire dispatch spawns this composite operation and returns;
+                // wait for the spawned handler's real cleanup boundary.
+                operator.process_line(&line).await;
+                tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+                    .await
+                    .expect("run-once reaches its real close boundary");
+                let generation = ctx.sessions.get_generation("s-once").await.unwrap();
+                let agent = ctx.sessions.get_agent("s-once").await.unwrap();
+                use zeroclaw_infra::session_backend::SessionBackend;
+                let transcript = backend.load("rpc_s-once");
+                assert!(
+                    transcript
+                        .iter()
+                        .any(|message| message.content.contains("pong"))
+                );
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+                republish_session_scoped(&ctx, |profile| {
+                    profile
+                        .grants
+                        .get_mut(&zeroclaw_api::grants::Resource::Sessions)
+                        .unwrap()
+                        .retain(|verb| *verb != zeroclaw_api::grants::Verb::Update);
+                });
+                retained = Some((generation, agent, transcript));
+                release.notify_one();
+            } else {
+                operator.process_line(&line).await;
+            }
             let (response, notifications) = response_and_notifications(&mut rx, 1).await;
+
+            if let Some((generation, agent, transcript)) = retained {
+                assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+                assert!(response.get("result").is_none(), "{response}");
+                assert!(
+                    response["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Turn completed")
+                );
+                assert_eq!(
+                    turn_complete_for(&notifications, "s-once")["params"]["outcome"],
+                    "completed"
+                );
+                assert_eq!(
+                    ctx.sessions.get_generation("s-once").await,
+                    Some(generation)
+                );
+                assert!(Arc::ptr_eq(
+                    &ctx.sessions.get_agent("s-once").await.unwrap(),
+                    &agent
+                ));
+                use zeroclaw_infra::session_backend::SessionBackend;
+                assert_eq!(
+                    serde_json::to_value(backend.load("rpc_s-once")).unwrap(),
+                    serde_json::to_value(transcript).unwrap(),
+                );
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+                continue;
+            }
 
             assert_eq!(response["result"]["content"], json!("pong"), "{response}");
             assert_eq!(response["result"]["stop_reason"], json!("end_turn"));
@@ -48687,7 +48832,8 @@ mod tests {
                 .is_empty(),
                 "the transcript stays in the durable store after the close"
             );
-            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1, "{requests:?}");
             if remote {
                 use zeroclaw_infra::session_backend::SessionBackend;
                 assert_eq!(
