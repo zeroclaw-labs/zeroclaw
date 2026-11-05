@@ -1184,6 +1184,24 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Update a previously sent draft message with the in-progress answer plus
+    /// the model's reasoning, rendered in this channel's own markup.
+    ///
+    /// Only channels that opted into reasoning disclosure are called with a
+    /// non-empty `reasoning`. Reasoning is draft-only chrome: it must never
+    /// reach the finalized message, which is written by [`Self::finalize_draft`]
+    /// from the answer alone. The default ignores the reasoning and edits the
+    /// draft with the plain answer, exactly like [`Self::update_draft`].
+    async fn update_draft_with_reasoning(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        answer: &str,
+        _reasoning: &str,
+    ) -> anyhow::Result<()> {
+        self.update_draft(recipient, message_id, answer).await
+    }
+
     /// Show a progress/status update (e.g. tool execution status).
     async fn update_draft_progress(
         &self,
