@@ -61,9 +61,9 @@ fn gateway_steering_input(content: String) -> SteeringInput {
 }
 
 #[derive(Debug, Deserialize)]
-struct ConnectParams {
+pub(crate) struct ConnectParams {
     #[serde(rename = "type")]
-    msg_type: String,
+    pub(crate) msg_type: String,
     /// Client-chosen session ID for memory persistence
     #[serde(default)]
     session_id: Option<String>,
@@ -75,11 +75,11 @@ struct ConnectParams {
     capabilities: Vec<String>,
     /// Project root / working directory for this session.
     #[serde(default, alias = "workspaceDir", alias = "workspace_dir")]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
 }
 
 /// The sub-protocol we support for the chat WebSocket.
-const WS_PROTOCOL: &str = "zeroclaw.v1";
+pub(crate) const WS_PROTOCOL: &str = "zeroclaw.v1";
 
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
@@ -141,10 +141,37 @@ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) ->
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
     dashboard: Option<Extension<Arc<crate::dashboard_session::DashboardAuth>>>,
+    core: Option<Extension<crate::core_rpc::CoreRpc>>,
     Query(params): Query<WsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // A scoped dashboard session chats through the core, as its own
+    // principal, whenever this gateway runs inside the daemon: the core
+    // applies the account's grants and keeps the conversation as its own.
+    // The socket closes when the session ends or no longer admits it. An
+    // administrator session keeps the in-process chat below.
+    if state.pairing.require_pairing()
+        && extract_ws_token(&headers, params.token.as_deref()).is_none()
+        && let Some(caller) = crate::dashboard_core::core_caller(
+            &state,
+            &headers,
+            core,
+            dashboard.clone(),
+            crate::dashboard_core::Reach::ScopedOnly,
+        )
+    {
+        let watch = dashboard.as_ref().map(|Extension(auth)| {
+            crate::dashboard_session::SessionWatch::new(
+                Arc::clone(auth),
+                Arc::clone(&caller.session),
+                false,
+                &state,
+            )
+        });
+        return crate::chat_core::ws_chat_through_core(caller, state, params, &headers, ws, watch)
+            .await;
+    }
     // A signed-in dashboard session presents no token; the session layer
     // classified it for this upgrade, the dashboard's own origin included.
     // The in-process chat runs as the operator, so only an administrator
@@ -253,7 +280,7 @@ pub async fn handle_ws_chat(
     .into_response()
 }
 
-fn websocket_ping_interval(
+pub(crate) fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tokio::time::Interval> {
     let seconds = config.gateway.websocket_ping_interval_secs;
@@ -281,8 +308,11 @@ const WS_CLOSE_HANDSHAKE_GRACE: Duration = Duration::from_secs(2);
 /// message with a refusal, and clients reconnect on a close, not on an error
 /// frame. The peer's close is awaited briefly: dropping the socket straight
 /// after sending can reset the connection and lose the frame.
-async fn close_for_reconnect<S, R>(sender: &mut S, receiver: &mut R, reason: &'static str)
-where
+pub(crate) async fn close_for_reconnect<S, R>(
+    sender: &mut S,
+    receiver: &mut R,
+    reason: &'static str,
+) where
     S: futures_util::Sink<Message> + Unpin,
     R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
@@ -388,13 +418,13 @@ where
 /// waits for a new signal rather than reading the current value: the channel
 /// outlives one gateway instance, so a value left by an earlier stop says
 /// nothing about this one. Never resolves if the signal can no longer arrive.
-async fn gateway_stop_signal(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+pub(crate) async fn gateway_stop_signal(stopping: &mut tokio::sync::watch::Receiver<bool>) {
     if stopping.changed().await.is_err() {
         std::future::pending::<()>().await;
     }
 }
 
-async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
+pub(crate) async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
     if let Some(interval) = interval.as_mut() {
         interval.tick().await;
     } else {
@@ -1649,7 +1679,7 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
-fn history_trimmed_ws_frame(
+pub(crate) fn history_trimmed_ws_frame(
     dropped_messages: usize,
     dropped_turns: usize,
     kept_turns: usize,
@@ -1738,7 +1768,7 @@ fn needs_onboarding_ws_error(
     }))
 }
 
-fn first_chat_message_content(text: &str) -> Option<String> {
+pub(crate) fn first_chat_message_content(text: &str) -> Option<String> {
     let parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
     (parsed["type"].as_str() == Some("message"))
         .then(|| parsed["content"].as_str().unwrap_or("").to_string())

@@ -28,6 +28,11 @@ use zeroclaw_runtime::rpc::inproc::InprocConnector;
 #[derive(Clone, Default)]
 pub struct CoreRpc {
     client: Arc<RwLock<Option<Arc<RpcClient>>>>,
+    /// This generation's in-process connector, once attached. Each
+    /// dashboard chat dials a connection of its own through it.
+    connector: Arc<std::sync::OnceLock<InprocConnector>>,
+    /// What each account holds on the core in this generation.
+    pub(crate) accounts: crate::dashboard_core::Accounts,
 }
 
 impl CoreRpc {
@@ -41,10 +46,17 @@ impl CoreRpc {
         self.client.read().await.is_some()
     }
 
+    /// The generation's in-process connector, when this gateway runs inside
+    /// the daemon.
+    pub(crate) fn connector(&self) -> Option<&InprocConnector> {
+        self.connector.get()
+    }
+
     /// Dial the core through `connector`, presenting `options` in every
     /// handshake, and keep the handle current across reconnects until the
     /// generation is cancelled.
     pub fn attach_inproc(&self, connector: InprocConnector, options: ConnectOptions) {
+        let _ = self.connector.set(connector.clone());
         let slot = Arc::clone(&self.client);
         zeroclaw_spawn::spawn!(maintain(connector, options, slot));
     }
