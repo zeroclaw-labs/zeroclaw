@@ -48,19 +48,15 @@ schemas. This crate knows how to run plugins, not what they do.
 - Config schema definitions (those go in `zeroclaw-config`)
 - Plugin registry client or distribution (future separate crate)
 
-## Proposed registry placement exception
+## Proposed placement exception
 
-**Pending Core approval; inactive.** For #12216 only, permit the existing
-`src/registry.rs` utilities and their focused tests (including
-`tests/registry_literal_compat.rs`) to add multi-registry selection, metadata
-caching, source-set validation and publisher-bound lookup/command suggestions.
-This does not expand fetching, installation or execution authority, or waive
-the registry/distribution exclusion for other work.
+This request is inactive until Core confirms the scope and destination and its
+approving review is recorded below, before this proposal merges ahead of #12216.
+The registry/distribution exclusion above remains in place for other work.
 
-Proposed destination: the planned separate registry owner, subject to Core
-confirmation. Review when registry/skills extraction is designed or before
-expanding this scope. Record the approving Core review and confirmed destination
-here before this separate proposal merges, ahead of #12216.
+| Scope | Destination | Approved by | Expires or reviewed |
+| --- | --- | --- | --- |
+| #12216 multi-registry selection, metadata caching, source-set validation and publisher-bound lookup/command suggestions in `src/registry.rs` and focused tests, including `tests/registry_literal_compat.rs`; no expansion of fetching, installation or execution authority | Proposed separate registry owner; Core must confirm the registry/skills split | Pending Core approval; record the approving review before merge | Review at registry/skills extraction design or before expanding scope |
 
 ## Related ADRs
 
