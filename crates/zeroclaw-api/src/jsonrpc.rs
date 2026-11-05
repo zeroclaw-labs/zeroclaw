@@ -652,10 +652,15 @@ mod tests {
         ))
         .unwrap();
         let limit = encoded.len() as u64;
-        let refused = outbound
-            .request_bounded("echo", params.clone(), limit)
-            .await
-            .unwrap_err();
+        // Bounded wait: if the frame check ever let this through, the
+        // request would sit queued with no reply and the test would hang.
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            outbound.request_bounded("echo", params.clone(), limit),
+        )
+        .await
+        .expect("an oversized request is refused at once, not queued")
+        .unwrap_err();
         assert_eq!(refused.code, error_codes::INVALID_PARAMS);
         assert_eq!(refused.data.unwrap()["reason"], "frame_too_large");
         assert_eq!(outbound.pending_count(), 0);
