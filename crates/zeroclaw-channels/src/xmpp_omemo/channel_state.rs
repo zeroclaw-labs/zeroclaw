@@ -193,6 +193,10 @@ impl ChannelState {
             [1; 32],
             b"synthetic input",
         )?;
+        tx.execute(
+            "INSERT INTO seen(sender,id) VALUES('alice@example.test',?1)",
+            [id],
+        )?;
         tx.commit()?;
         ensure!(
             inbox::admit(db, "alice@example.test", id)?,
