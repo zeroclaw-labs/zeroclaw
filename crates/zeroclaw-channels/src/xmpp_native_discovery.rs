@@ -29,6 +29,7 @@ enum Reply {
     Absent,
 }
 async fn exchange<R>(
+    channel: &XmppChannel,
     source: &mut R,
     requests: &mpsc::Sender<Outbound>,
     pending: &mut VecDeque<Stanza>,
@@ -55,6 +56,8 @@ where
                 Err(ReadError::SoftTimeout) => continue,
                 Err(error) => bail!("XMPP discovery read failed: {error}"),
             };
+            // Keep the deadline observable even during a continuously ready flood.
+            tokio::task::yield_now().await;
             match stanza {
                 Stanza::Iq(Iq::Result {
                     id: reply,
@@ -81,8 +84,6 @@ where
                     } = iq
                     {
                         if reply != id {
-                            ensure!(pending.len() < 32, "XMPP discovery receive queue full");
-                            pending.push_back(Stanza::Iq(iq));
                             continue;
                         }
                         ensure!(
@@ -104,10 +105,34 @@ where
                     ensure!(missing && absent, rejected_reply(expected, own));
                     return Ok(Reply::Absent);
                 }
-                stanza => {
-                    ensure!(pending.len() < 32, "XMPP discovery receive queue full");
-                    pending.push_back(stanza);
+                Stanza::Message(message) => {
+                    let authorized = message
+                        .from
+                        .as_ref()
+                        .is_some_and(|from| channel.allowed(&from.to_bare().to_string()))
+                        && message.to.as_ref().is_none_or(|to| to.to_bare() == *own);
+                    if !authorized {
+                        continue;
+                    }
+                    if pending.len() < 32 {
+                        pending.push_back(Stanza::Message(message));
+                    } else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            ),
+                            "XMPP discovery receive queue full; message dropped before admission"
+                        );
+                    }
                 }
+                Stanza::Iq(Iq::Get {
+                    from, id, payload, ..
+                }) if payload.is("ping", "urn:xmpp:ping") => {
+                    channel.enqueue_ping_reply(from, id, requests)?;
+                }
+                _ => {}
             }
         }
     })
@@ -121,6 +146,7 @@ where
     })?
 }
 async fn fetch<R>(
+    channel: &XmppChannel,
     source: &mut R,
     requests: &mpsc::Sender<Outbound>,
     pending: &mut VecDeque<Stanza>,
@@ -147,7 +173,10 @@ where
         id: id.clone(),
         payload,
     };
-    let reply = exchange(source, requests, pending, iq, peer, own, &id, missing).await?;
+    let reply = exchange(
+        channel, source, requests, pending, iq, peer, own, &id, missing,
+    )
+    .await?;
     let parsed = (|| -> anyhow::Result<Option<String>> {
         let payload = match reply {
             Reply::Absent => return Ok(None),
@@ -186,6 +215,7 @@ where
     }
 }
 async fn publish<R>(
+    channel: &XmppChannel,
     source: &mut R,
     requests: &mpsc::Sender<Outbound>,
     pending: &mut VecDeque<Stanza>,
@@ -242,6 +272,7 @@ where
         )
         .build();
     exchange(
+        channel,
         source,
         requests,
         pending,
@@ -261,6 +292,7 @@ where
     Ok(())
 }
 pub(super) async fn announce<R>(
+    channel: &XmppChannel,
     source: &mut R,
     requests: &mpsc::Sender<Outbound>,
     pending: &mut VecDeque<Stanza>,
@@ -282,6 +314,7 @@ where
         })?
         .public_bundle()?;
     publish(
+        channel,
         source,
         requests,
         pending,
@@ -291,6 +324,7 @@ where
     )
     .await?;
     let existing = fetch(
+        channel,
         source,
         requests,
         pending,
@@ -308,6 +342,7 @@ where
     )?;
     list.include_own(bundle.device)?;
     publish(
+        channel,
         source,
         requests,
         pending,
@@ -319,6 +354,7 @@ where
     Ok(())
 }
 pub(super) async fn peer_bundle<R>(
+    channel: &XmppChannel,
     source: &mut R,
     requests: &mpsc::Sender<Outbound>,
     pending: &mut VecDeque<Stanza>,
@@ -330,6 +366,7 @@ where
     R: Stream<Item = Result<Stanza, ReadError>> + Unpin,
 {
     let list = fetch(
+        channel,
         source,
         requests,
         pending,
@@ -348,6 +385,7 @@ where
         crate::xmpp_omemo::RejectedInbound
     );
     fetch(
+        channel,
         source,
         requests,
         pending,
@@ -361,6 +399,7 @@ where
     .ok_or_else(|| crate::xmpp_omemo::RejectedInbound.into())
 }
 pub(super) async fn refresh<R>(
+    channel: &XmppChannel,
     source: &mut R,
     requests: &mpsc::Sender<Outbound>,
     pending: &mut VecDeque<Stanza>,
@@ -382,6 +421,7 @@ where
         })?
         .public_bundle()?;
     publish(
+        channel,
         source,
         requests,
         pending,
@@ -418,6 +458,7 @@ mod exchange_tests {
     use super::*;
     #[tokio::test]
     async fn rejects_spoofed_iq_and_preserves_interleaved_messages() {
+        let channel = &fixture_channel();
         let own: jid::BareJid = "bob@example.test".parse().unwrap();
         let peer: jid::BareJid = "alice@example.test".parse().unwrap();
         for (from, to) in [
@@ -440,6 +481,7 @@ mod exchange_tests {
             };
             assert!(
                 exchange(
+                    channel,
                     &mut source,
                     &requests,
                     &mut pending,
@@ -455,7 +497,8 @@ mod exchange_tests {
         }
         let (requests, _rx) = mpsc::channel(2);
         let mut pending = VecDeque::new();
-        let incoming = Message::new(Some(own.clone().into()));
+        let mut incoming = Message::new(Some(own.clone().into()));
+        incoming.from = Some(peer.clone().into());
         let mut source = futures_util::stream::iter(vec![
             Ok(Stanza::Message(incoming)),
             Ok(Stanza::Iq(Iq::Result {
@@ -473,6 +516,7 @@ mod exchange_tests {
         };
         assert!(
             exchange(
+                channel,
                 &mut source,
                 &requests,
                 &mut pending,
@@ -495,6 +539,7 @@ mod absence_tests {
     use super::*;
     #[tokio::test]
     async fn empty_success_is_not_a_missing_device_list() {
+        let channel = &fixture_channel();
         let own: jid::BareJid = "bob@example.test".parse().unwrap();
         let (requests, mut received) = mpsc::channel(2);
         let (replies, receiver) = mpsc::channel(1);
@@ -526,6 +571,7 @@ mod absence_tests {
         let (_, result) = tokio::join!(
             server,
             fetch(
+                channel,
                 &mut source,
                 &requests,
                 &mut pending,
@@ -548,6 +594,7 @@ mod publication_tests {
     use super::*;
     #[tokio::test]
     async fn publication_requires_readable_public_keys_and_propagates_refusal() {
+        let channel = &fixture_channel();
         for refused in [false, true] {
             let own: jid::BareJid = "bob@example.test".parse().unwrap();
             let (requests, mut received) = mpsc::channel(2);
@@ -606,6 +653,7 @@ mod publication_tests {
             let (_, result) = tokio::join!(
                 server,
                 publish(
+                    channel,
                     &mut source,
                     &requests,
                     &mut pending,
@@ -625,5 +673,158 @@ mod publication_tests {
                 result.unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+fn fixture_channel() -> XmppChannel {
+    XmppChannel::new(
+        XmppConfig {
+            username: "bob@example.test".into(),
+            ..Default::default()
+        },
+        "fixture".into(),
+        PathBuf::new(),
+        Arc::new(|| vec!["alice@example.test".into()]),
+    )
+}
+
+#[cfg(test)]
+mod discovery_queue_tests {
+    use super::*;
+    fn message(from: &str, to: &str, id: &str) -> Stanza {
+        let mut message = Message::new(Some(to.parse().unwrap()));
+        message.from = Some(from.parse().unwrap());
+        message.id = Some(Id(id.into()));
+        Stanza::Message(message)
+    }
+    fn reply() -> Stanza {
+        Stanza::Iq(Iq::Result {
+            from: None,
+            to: None,
+            id: "fixture-query".into(),
+            payload: None,
+        })
+    }
+    fn request() -> Iq {
+        Iq::Get {
+            from: None,
+            to: None,
+            id: "fixture-query".into(),
+            payload: Element::builder("items", PUBSUB).build(),
+        }
+    }
+    #[tokio::test]
+    async fn unauthorized_flood_and_full_authorized_queue_do_not_abort_discovery() {
+        let channel = fixture_channel();
+        let own = "bob@example.test".parse().unwrap();
+        let mut stanzas = Vec::new();
+        for n in 0..128 {
+            stanzas.push(Ok(message(
+                "mallory@example.test/phone",
+                "bob@example.test",
+                &format!("denied-{n}"),
+            )));
+            stanzas.push(Ok(message(
+                "alice@example.test/phone",
+                "another@example.test",
+                &format!("wrong-target-{n}"),
+            )));
+            stanzas.push(Ok(Stanza::Iq(Iq::Result {
+                from: Some("mallory@example.test".parse().unwrap()),
+                to: None,
+                id: "unrelated".into(),
+                payload: None,
+            })));
+        }
+        let error: Element="<iq xmlns='jabber:client' type='error' id='unrelated'><error type='cancel'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>".parse().unwrap();
+        stanzas.push(Ok(Stanza::Iq(Iq::try_from(error).unwrap())));
+        for n in 0..64 {
+            stanzas.push(Ok(message(
+                "alice@example.test/phone",
+                "bob@example.test",
+                &format!("allowed-{n}"),
+            )));
+        }
+        stanzas.push(Ok(reply()));
+        let mut source = futures_util::stream::iter(stanzas);
+        let (requests, _rx) = mpsc::channel(2);
+        let mut pending = VecDeque::new();
+        assert!(
+            exchange(
+                &channel,
+                &mut source,
+                &requests,
+                &mut pending,
+                request(),
+                &own,
+                &own,
+                "fixture-query",
+                false
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(pending.len(), 32);
+        for (n, stanza) in pending.into_iter().enumerate() {
+            let Stanza::Message(message) = stanza else {
+                panic!("Unrelated IQ consumed the message queue")
+            };
+            assert_eq!(message.id, Some(Id(format!("allowed-{n}"))));
+        }
+    }
+    #[tokio::test]
+    async fn discovery_resolves_live_peer_policy_for_every_buffered_message() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        let channel = XmppChannel::new(
+            XmppConfig {
+                username: "bob@example.test".into(),
+                ..Default::default()
+            },
+            "fixture".into(),
+            PathBuf::new(),
+            Arc::new(move || {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    vec!["alice@example.test".into()]
+                } else {
+                    Vec::new()
+                }
+            }),
+        );
+        let own = "bob@example.test".parse().unwrap();
+        let mut source = futures_util::stream::iter(vec![
+            Ok(message(
+                "alice@example.test/phone",
+                "bob@example.test",
+                "before-revocation",
+            )),
+            Ok(message(
+                "alice@example.test/phone",
+                "bob@example.test",
+                "after-revocation",
+            )),
+            Ok(reply()),
+        ]);
+        let (requests, _rx) = mpsc::channel(2);
+        let mut pending = VecDeque::new();
+        assert!(
+            exchange(
+                &channel,
+                &mut source,
+                &requests,
+                &mut pending,
+                request(),
+                &own,
+                &own,
+                "fixture-query",
+                false
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(pending.len(), 1);
     }
 }

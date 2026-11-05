@@ -383,7 +383,8 @@ impl XmppChannel {
             .discovery_request(&account, xml, &pins())?;
         let content = if let Some((device, _)) = missing {
             let bundle =
-                discovery::peer_bundle(source, requests, pending, own, &sender, device).await?;
+                discovery::peer_bundle(self, source, requests, pending, own, &sender, device)
+                    .await?;
             if !self.allowed(&account) {
                 return Ok(None);
             }
@@ -398,7 +399,7 @@ impl XmppChannel {
                     anyhow::Error::msg("Encrypted state lock poisoned")
                 })?
                 .receive_first(&account, &id, xml, &bundle, &pins())?;
-            discovery::refresh(source, requests, pending, own, state).await?;
+            discovery::refresh(self, source, requests, pending, own, state).await?;
             content
         } else {
             state
@@ -675,7 +676,8 @@ impl XmppChannel {
             let mut pending = std::collections::VecDeque::new();
             #[cfg(target_os = "linux")]
             if let Some(state) = &receive_crypto {
-                discovery::announce(&mut source, &requests, &mut pending, &own, state).await?;
+                discovery::announce(self, &mut source, &requests, &mut pending, &own, state)
+                    .await?;
             }
             *self.outbound.lock().map_err(|_| {
                 ::zeroclaw_log::record!(

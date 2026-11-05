@@ -233,3 +233,9 @@ list and bundle. These public keys are readable without roster subscriptions;
 message admission still requires the live peer allowlist and fingerprint pins.
 A server refusal fails startup explicitly. Existing nodes with incompatible
 publication policy must be reconciled by their owner before restarting.
+
+During key discovery, inbound messages are checked against the live peer policy
+before entering the bounded receive queue. Unrelated protocol traffic does not
+consume message slots. A full queue drops excess messages before admission and
+logs the overload without disconnecting the alias; it does not report those
+messages as accepted.
