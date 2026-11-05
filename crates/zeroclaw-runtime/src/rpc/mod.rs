@@ -10,6 +10,7 @@ pub mod git;
 pub mod inproc;
 pub mod local;
 pub mod locales;
+pub mod orphans;
 pub mod session;
 pub mod subscription;
 pub mod transport;
