@@ -9236,6 +9236,68 @@ mod tests {
         );
     }
 
+    // Real lossy WebPs, 2x2 pixels, encoded by libwebp through Pillow 10.4.0
+    // (`quality=50, method=6`): a bare `VP8` still, a `VP8X` still with an
+    // `ALPH` chunk, and a two-frame animation. Unlike the header-only fixtures
+    // above, the decoder can decode these, so they pin that the canvas check
+    // does not refuse files the decoder accepts.
+    const LOSSY_STILL: &[u8] = include_bytes!("testdata/lossy_still_2x2.webp");
+    const LOSSY_ALPHA: &[u8] = include_bytes!("testdata/lossy_alpha_2x2.webp");
+    const LOSSY_ANIMATION: &[u8] = include_bytes!("testdata/lossy_anim_2x2.webp");
+
+    #[tokio::test]
+    async fn real_lossy_webps_pass_the_canvas_check_and_decode() {
+        for (name, webp, frames) in [
+            ("still", LOSSY_STILL, 1),
+            ("still with alpha", LOSSY_ALPHA, 1),
+            ("animation", LOSSY_ANIMATION, 2),
+        ] {
+            ensure_decode_within_per_image_cap("real.webp", "image/webp", webp)
+                .unwrap_or_else(|error| panic!("{name}: the gate refused it: {error}"));
+            if let Err(failure) =
+                validate_image_content("real.webp", "image/webp", webp, u64::MAX).await
+            {
+                panic!("{name}: the validator refused it: {failure}");
+            }
+            if frames == 1 {
+                let image = image::load_from_memory_with_format(webp, image::ImageFormat::WebP)
+                    .unwrap_or_else(|error| panic!("{name}: does not decode: {error}"));
+                assert_eq!((image.width(), image.height()), (2, 2), "{name}");
+            } else {
+                let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(webp))
+                    .expect("the animation parses");
+                let decoded: Vec<_> = image::AnimationDecoder::into_frames(decoder).collect();
+                assert_eq!(decoded.len(), frames, "{name}");
+                for frame in decoded {
+                    frame.unwrap_or_else(|error| panic!("{name}: frame fails: {error}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_lossy_webp_with_an_enlarged_bitstream_header_is_refused() {
+        // The same real files with only the VP8 header's width and height
+        // rewritten to 16383. With a `VP8X` canvas of 2x2 around it the header
+        // contradicts the canvas; a bare `VP8` file has no canvas, so its
+        // header is the size and the per-image cap refuses it instead.
+        for (name, webp, message) in [
+            ("still", LOSSY_STILL, "exceeds per-image limit"),
+            ("still with alpha", LOSSY_ALPHA, "declares 16383x16383"),
+            ("animation", LOSSY_ANIMATION, "declares 16383x16383"),
+        ] {
+            let start_code = webp
+                .windows(3)
+                .position(|window| window == [0x9d, 0x01, 0x2a])
+                .expect("the file holds a VP8 start code");
+            let mut tampered = webp.to_vec();
+            tampered[start_code + 3..start_code + 7].copy_from_slice(&[0xff, 0x3f, 0xff, 0x3f]);
+            let error = ensure_decode_within_per_image_cap("real.webp", "image/webp", &tampered)
+                .expect_err(name);
+            assert!(error.to_string().contains(message), "{name}: {error}");
+        }
+    }
+
     #[test]
     fn vp8_dimension_check_refuses_structures_it_cannot_read() {
         // Calls the helper directly: `projected_allocation` would stop at these

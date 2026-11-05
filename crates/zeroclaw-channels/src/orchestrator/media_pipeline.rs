@@ -781,6 +781,32 @@ mod tests {
         }
     }
 
+    /// A real lossy WebP with an alpha plane, 2x2, encoded by libwebp through
+    /// Pillow 10.4.0 (`quality=50, method=6`). The other WebP fixtures here are
+    /// written by `image`, which only encodes lossless.
+    #[cfg(feature = "image-normalization")]
+    const LOSSY_ALPHA_WEBP: &[u8] = include_bytes!("../testdata/lossy_alpha_2x2.webp");
+
+    #[cfg(feature = "image-normalization")]
+    #[tokio::test]
+    async fn real_lossy_webp_still_converts_to_png() {
+        let png = webp_to_png(LOSSY_ALPHA_WEBP).expect("a well-formed lossy WebP converts");
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("the output is a PNG");
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
+
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+        let sticker = MediaAttachment {
+            file_name: "sticker.webp".to_string(),
+            data: LOSSY_ALPHA_WEBP.to_vec(),
+            mime_type: Some("image/webp".to_string()),
+            marker: None,
+        };
+        let result = pipeline.process("what is this?", &[sticker]).await;
+        assert!(result.contains("[IMAGE:data:image/png;base64,"), "{result}");
+    }
+
     #[cfg(feature = "image-normalization")]
     #[tokio::test]
     async fn webp_whose_bitstream_outgrows_its_canvas_is_dropped_before_decode() {
