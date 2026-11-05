@@ -1223,13 +1223,7 @@ impl ScopedToolRegistry {
                                 "MCP deferred: pre-activated tool(s) via tool_filter_groups mode=always"
                             );
                         }
-                        // Pre-activated tools stay listed, like every
-                        // activated tool: the section depends only on the
-                        // catalog and access policy, so later activations
-                        // leave the system prompt unchanged (#11703). Its
-                        // wording tells the model to call a tool that is
-                        // already callable directly, so `mode = "always"`
-                        // still saves the first-turn tool_search round-trip.
+                        // Pre-activated tools stay listed so activation never changes the prompt.
                         deferred_section = tools::build_deferred_tools_section_filtered(
                             &filtered_deferred,
                             mcp_policy.as_ref(),

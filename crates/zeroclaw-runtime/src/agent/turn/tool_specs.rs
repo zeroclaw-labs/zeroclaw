@@ -337,8 +337,6 @@ mod tests {
         );
     }
 
-    /// #11703: activating deferred tools changes only the request's tool
-    /// specs, not the discovery section of the system prompt.
     #[tokio::test]
     async fn activation_adds_request_specs_without_changing_discovery_prompt() {
         use zeroclaw_tools::mcp_deferred::DeferredMcpToolStub;
