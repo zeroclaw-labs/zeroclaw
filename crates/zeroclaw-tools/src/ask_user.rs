@@ -188,13 +188,16 @@ impl Tool for AskUserTool {
         //   - default impl / no native UI → "caller should fall back to send+listen"
         //   - ACP/RPC after Decline|Cancel → also `Ok(None)`
         // Only free-form-capable channels may take the send+listen fallback.
-        // Structured-only channels (ACP, RPC Code tab, WS approval) must return
-        // at once: their `listen` never delivers a reply, so fallthrough either
-        // hangs until timeout or returns a misleading "channel closed" error.
-        // There `Ok(None)` is almost always the user dismissing the prompt,
-        // which is an answer, not a tool failure: report it as a successful
-        // "no answer" so the card does not show an error and the agent is not
-        // told to retry.
+        // Structured-only channels (ACP, RPC Code tab) must return at once:
+        // their `listen` never delivers a reply, so fallthrough either hangs
+        // until timeout or returns a misleading "channel closed" error. There
+        // `Ok(None)` means the prompt was shown and then closed without a
+        // choice (the user dismissed it, or the client withdrew it), which is
+        // an answer, not a tool failure: report it as a successful "no answer"
+        // so the card does not show an error and the agent is not told to
+        // retry. A structured-only channel that cannot draw a choice prompt at
+        // all (the web dashboard, for now) must return `Err` instead, so a
+        // question nobody saw is never reported as dismissed.
         if let Some(ref choices_vec) = choices
             && !choices_vec.is_empty()
         {
@@ -753,7 +756,7 @@ mod tests {
         assert!(result.error.is_none());
         assert_eq!(
             result.output,
-            "DISMISSED: the user closed the question without choosing."
+            "DISMISSED: the question was closed without a choice."
         );
         assert!(
             !*ch.listen_called.lock(),

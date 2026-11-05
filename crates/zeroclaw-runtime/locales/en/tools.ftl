@@ -6,7 +6,7 @@
 # Literal { and } in values must be escaped as {"{"}  and  {"}"} respectively.
 
 # Keep the DISMISSED status marker literal when translating the surrounding text.
-tool-ask-user-result-dismissed = DISMISSED: the user closed the question without choosing.
+tool-ask-user-result-dismissed = DISMISSED: the question was closed without a choice.
 
 tool-backup = Create, list, verify, and restore shared data directory backups
 
