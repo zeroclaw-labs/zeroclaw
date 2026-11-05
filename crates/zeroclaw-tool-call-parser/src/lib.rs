@@ -3663,7 +3663,7 @@ I will now call the tool with this payload:
 
     #[test]
     fn parse_tool_calls_handles_lfm_special_token_function_style() {
-        // Regression for #12235: LFM2.5 (and similar chat-template models) emit
+        // Regression: LFM2.5 (and similar chat-template models) emit
         // special-token envelopes with Python-like kwargs when the request did
         // not carry a native tools array. Text fallback must still execute them.
         let response = "<|tool_call_start|>[file_read(path='/root/zc-repro/data/estado.txt')]<|tool_call_end|>";
