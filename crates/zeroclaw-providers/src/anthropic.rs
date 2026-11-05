@@ -11258,7 +11258,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 }
 
-/// Regression for #12236: a cached client's pooled connection must not be
+/// Regression: a cached client's pooled connection must not be
 /// driven by another runtime. With `test-disable-http-idle-pool`, each request
 /// opens its connection on the runtime that sends it, so B succeeds even when
 /// A ends mid-flight.
@@ -11323,7 +11323,10 @@ mod cross_runtime_pool_regression {
     fn runtime_a(
         url: String,
         timeout_secs: u64,
-    ) -> (tokio::sync::oneshot::Sender<()>, std::thread::JoinHandle<()>) {
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = std::thread::spawn(move || {

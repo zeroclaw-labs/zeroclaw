@@ -11880,7 +11880,6 @@ fn runtime_proxy_current_generation() -> u64 {
     }
 }
 
-
 fn maybe_disable_http_idle_pool(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     // Test builds share one cached Client across many short-lived tokio
     // runtimes. Keep-alive reuse then lets request B ride a connection whose
@@ -12058,9 +12057,8 @@ pub fn build_runtime_proxy_client_with_timeouts(
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
-    let builder = maybe_disable_http_idle_pool(
-        config.apply_to_reqwest_builder(builder, service_key),
-    );
+    let builder =
+        maybe_disable_http_idle_pool(config.apply_to_reqwest_builder(builder, service_key));
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
             WARN,
@@ -12096,9 +12094,8 @@ pub fn build_runtime_proxy_client_with_read_timeout(
     let builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .read_timeout(std::time::Duration::from_secs(read_timeout_secs));
-    let builder = maybe_disable_http_idle_pool(
-        config.apply_to_reqwest_builder(builder, service_key),
-    );
+    let builder =
+        maybe_disable_http_idle_pool(config.apply_to_reqwest_builder(builder, service_key));
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
             WARN,
