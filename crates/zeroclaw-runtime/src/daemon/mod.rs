@@ -786,8 +786,14 @@ pub async fn run_with_authority(
     // gateway serves /pair, rotation, and revocation from THIS instance
     // and the RPC native auth provider verifies against it, so a pairing
     // change reaches both surfaces immediately (no boot-time snapshot).
+    // Code lifetime and brute-force limits are read from this generation's
+    // live `[gateway.pairing_dashboard]` on every use, for /pair and
+    // certificate enrollment alike.
     let pairing_guard = std::sync::Arc::new(
-        zeroclaw_config::pairing::PairingGuard::from_gateway_config(&config.gateway),
+        zeroclaw_config::pairing::PairingGuard::from_gateway_config(&config.gateway)
+            .with_live_limits(zeroclaw_config::pairing::PairingLimits::live(
+                live_config_authority.live_handle(),
+            )),
     );
 
     // One inbound-auth state for this daemon generation. The RPC context

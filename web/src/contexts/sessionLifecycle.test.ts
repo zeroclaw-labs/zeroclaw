@@ -1006,6 +1006,50 @@ test('session switch disconnects both the effect-owned and replacement sockets',
   await unmount(mounted.renderer);
 });
 
+test('a socket closed mid-turn stops the turn and reloads the transcript when it reopens', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  assert.equal(mounted.context().typing, true);
+
+  // The session ends mid-turn (4401); the turn finishes on the server.
+  runtime.queueMessages('A', () => Promise.resolve({
+    session_id: 'A',
+    session_persistence: true,
+    messages: [
+      { role: 'user', content: 'hello', created_at: null },
+      { role: 'assistant', content: 'finished while away', created_at: null },
+    ],
+  }));
+  const callsBefore = runtime.messageCalls.length;
+  await act(async () => { runtime.sockets[0]!.emitClose(4401); });
+  assert.equal(mounted.context().typing, false);
+  // A session close code is the auth layer's to explain, not a config error.
+  assert.equal(mounted.context().error, null);
+
+  // The client reconnects (after re-auth) and the transcript catches up.
+  await openSocket(runtime, 0);
+  await settle();
+  assert.equal(runtime.messageCalls.length, callsBefore + 1);
+  assert.ok(mounted.context().messages.some((m) => m.content === 'finished while away'));
+  await unmount(mounted.renderer);
+});
+
+test('a socket closed while idle reconnects without reloading the transcript', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  const callsBefore = runtime.messageCalls.length;
+  await act(async () => { runtime.sockets[0]!.emitClose(1001); });
+  await openSocket(runtime, 0);
+  await settle();
+  assert.equal(runtime.messageCalls.length, callsBefore);
+  await unmount(mounted.renderer);
+});
+
 test('F5 while a detached turn is still running keeps the prompt the browser already showed', async () => {
   // First page load: conversation A is empty on the server.
   const runtime1 = new FakeSessionRuntime();
