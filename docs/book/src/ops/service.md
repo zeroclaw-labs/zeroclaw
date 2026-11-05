@@ -52,7 +52,17 @@ How the daemon comes back after a refusal depends on what was running it:
 - Under the Windows `ONLOGON` task, which has no restart-on-failure policy, the daemon stays down until you restart it manually or the next logon.
 - When ZeroCode started the daemon itself, which it does by spawning an ephemeral daemon whenever it finds no local endpoint, ZeroCode owns that child and replaces it itself instead of waiting on a service manager. It makes a single automatic respawn attempt per disconnect, and flags the daemon as needing attention if that attempt does not come back.
 
-Conversation memory and session state are written to SQLite incrementally during operation, not buffered until shutdown, so a clean stop does not depend on a flush step. Tool receipts are in-band HMAC tokens in the conversation, not a separate on-disk log. A hard `SIGKILL` skips the clean channel teardown but does not corrupt already-committed memory; only an agent turn that was mid-write is lost.
+Conversation memory is written to SQLite as it is produced, not buffered until shutdown, so a clean stop does not depend on a flush step. Session transcripts differ by surface. A channel conversation stores the inbound message when it arrives and the reply when the turn ends. A gateway WebSocket chat turn marks its session `running` when it starts and writes the transcript once, when the turn ends, including the prompt that started it. Tool receipts are in-band HMAC tokens in the conversation, not a separate on-disk log. A hard `SIGKILL` skips the clean teardown but does not corrupt already-committed data; what is lost is the turn that was in flight, and for a gateway chat turn that includes its prompt.
+
+### Stop timeout
+
+A stop request does not cut gateway work off. After `SIGINT` or `SIGTERM` the daemon stops admitting new agent turns, tears down its other components, and then waits for the gateway turns it had already admitted to finish and persist before it exits. That wait has no deadline of its own; while it lasts the daemon logs a warning every 30 seconds naming the agents with pending work. The service manager's stop budget is therefore what bounds it:
+
+- systemd: the installed unit sets `TimeoutStopSec=600` (systemd's default is 90 seconds) and `KillMode=mixed`, so the stop signal goes to the daemon alone. With the default kill mode systemd would signal every process in the unit at once, including the MCP servers and shell commands the draining turns still depend on.
+- OpenRC: the init script sets `retry="TERM/600/KILL/5"`.
+- launchd: not changed. The LaunchAgent runs the daemon under a wrapper that forwards the signal and kills the daemon 10 seconds later, so a long turn is still lost on macOS.
+
+When the budget runs out the service manager sends `SIGKILL`, and the in-flight turn is lost as described above. The cost of the larger budget is that a turn which never finishes delays a stop or restart by up to ten minutes, and `zeroclaw service stop` waits with it; an idle daemon stops as quickly as before. A service installed by an earlier version keeps its old settings until you run `zeroclaw service install` again, or, on systemd, add a drop-in with the values you want. The wait covers turns admitted through the gateway; channel turns follow the channel server's own teardown.
 
 ## Manual start for debugging
 
