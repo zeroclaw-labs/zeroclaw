@@ -895,6 +895,12 @@ pub struct RpcDispatcher {
     /// The transport-intrinsic credential (kernel peer uid on local
     /// sockets), presented during `initialize` when no explicit token is.
     transport_credential: crate::security::auth_provider::Credential,
+    /// The OIDC provider, as it was configured when the bearer was issued,
+    /// that this connection's bearer is bound to. Set by the side that opens
+    /// the connection, never by the client: every `initialize` on it is
+    /// verified with [`crate::rpc::auth::RpcInboundAuth::authenticate_bound`],
+    /// so a provider repointed since then never receives the bearer.
+    auth_binding: Option<crate::rpc::auth::OidcBinding>,
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
@@ -1057,6 +1063,7 @@ impl RpcDispatcher {
             auth: None,
             transport_kind: crate::rpc::transport::TransportKind::Local,
             transport_credential: crate::security::auth_provider::Credential::None,
+            auth_binding: None,
             tui_id: None,
             tui_epoch: None,
             peer_label,
@@ -1117,6 +1124,14 @@ impl RpcDispatcher {
     ) -> Self {
         self.transport_kind = kind;
         self.transport_credential = credential;
+        self
+    }
+
+    /// Bind this connection's bearer to one OIDC provider; see the
+    /// `auth_binding` field.
+    #[must_use]
+    pub fn with_auth_binding(mut self, binding: Option<crate::rpc::auth::OidcBinding>) -> Self {
+        self.auth_binding = binding;
         self
     }
 
@@ -2873,6 +2888,7 @@ impl RpcDispatcher {
             auth: self.auth.clone(),
             transport_kind: self.transport_kind,
             transport_credential: self.transport_credential.clone(),
+            auth_binding: self.auth_binding.clone(),
             tui_id: self.tui_id.clone(),
             // Same connection, so the same registration: this handle shares the
             // parent's epoch rather than claiming one of its own. It never runs
@@ -3607,17 +3623,38 @@ impl RpcDispatcher {
         // authority — a credential is re-presented on every initialize, so
         // reconnect can never outlive or bypass the authentication that
         // created it.
-        let connection_auth = match self
-            .ctx
-            .auth
-            .authenticate(
-                self.transport_kind,
-                self.transport_credential.clone(),
-                req.auth_token.as_deref(),
-                req.auth_provider.as_deref(),
-            )
-            .await
-        {
+        let verified = match (
+            &self.auth_binding,
+            req.auth_token.as_deref(),
+            req.auth_provider.as_deref(),
+        ) {
+            // A bound connection presents its bearer only to the provider it
+            // is bound to, and nothing else.
+            (Some(binding), Some(token), Some(provider)) => {
+                self.ctx
+                    .auth
+                    .authenticate_bound(self.transport_kind, token, provider, binding)
+                    .await
+            }
+            (Some(_), _, _) => {
+                return Err(rpc_err(
+                    AUTH_REQUIRED,
+                    "This connection requires its bound bearer and provider",
+                ));
+            }
+            (None, token, provider) => {
+                self.ctx
+                    .auth
+                    .authenticate(
+                        self.transport_kind,
+                        self.transport_credential.clone(),
+                        token,
+                        provider,
+                    )
+                    .await
+            }
+        };
+        let connection_auth = match verified {
             Ok(auth) => auth,
             Err(denied) => return Err(rpc_err(denied.code, denied.message)),
         };

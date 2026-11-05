@@ -364,6 +364,26 @@ impl InprocConnector {
     /// Open one in-process connection and return the client's half. `None`
     /// when admission is sealed or the generation is cancelled.
     pub async fn connect(&self) -> Option<DuplexStream> {
+        self.connect_with(None).await.map(|(stream, _)| stream)
+    }
+
+    /// [`Self::connect`] for a connection whose bearer is bound to one OIDC
+    /// provider as it was configured when the bearer was issued: every
+    /// `initialize` on it is verified against that binding, so a provider
+    /// repointed or removed since then never receives the bearer. With the
+    /// client's half comes [`Served`], which resolves once the daemon's task
+    /// for the connection has ended.
+    pub async fn connect_bound(
+        &self,
+        binding: super::auth::OidcBinding,
+    ) -> Option<(DuplexStream, Served)> {
+        self.connect_with(Some(binding)).await
+    }
+
+    async fn connect_with(
+        &self,
+        binding: Option<super::auth::OidcBinding>,
+    ) -> Option<(DuplexStream, Served)> {
         let ctx = {
             let mut rx = self.inner.ctx.subscribe();
             loop {
@@ -411,14 +431,45 @@ impl InprocConnector {
         let (client_half, server_half) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
         let conn_cancel = self.inner.cancel.child_token();
         let activity = super::ConnectionActivity::new(Arc::clone(&self.inner.connections));
+        let ended = CancellationToken::new();
         // Reap the connections that already ended so the set only holds live
         // tasks; `JoinSet` keeps finished entries until polled.
         while registry.tasks.try_join_next().is_some() {}
-        registry
-            .tasks
-            .spawn(serve(ctx, server_half, conn_cancel, activity));
+        registry.tasks.spawn(serve(
+            ctx,
+            server_half,
+            conn_cancel,
+            activity,
+            binding,
+            ended.clone().drop_guard(),
+        ));
         drop(registry);
-        Some(client_half)
+        Some((client_half, Served(ended)))
+    }
+}
+
+/// Resolves once the daemon's task for one in-process connection has ended,
+/// or was aborted at drain. A client that gives up on the connection, or
+/// drops its half, does not end that task: an `initialize` still verifying a
+/// bearer runs to completion first. Prompt tasks the connection started hold
+/// their own share of the activity count and can outlive the task in a forced
+/// teardown; the generation's drain waits for those separately.
+#[derive(Clone)]
+#[must_use]
+pub struct Served(CancellationToken);
+
+impl Served {
+    /// Wait until the daemon's task for the connection has ended.
+    pub async fn wait(&self) {
+        // Cancelled only by the connection task's drop guard, when the task
+        // ends or is aborted.
+        self.0.cancelled().await;
+    }
+}
+
+impl std::fmt::Debug for Served {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Served")
     }
 }
 
@@ -431,14 +482,18 @@ async fn serve(
     stream: DuplexStream,
     conn_cancel: CancellationToken,
     activity: super::ConnectionActivity,
+    binding: Option<super::auth::OidcBinding>,
+    ended: tokio_util::sync::DropGuard,
 ) {
     // Admitted under the lock but cancelled before this task ran: do not
     // start a dispatcher for a generation that is already retiring. The
     // activity token drops here, so the drain sees this task end.
     if conn_cancel.is_cancelled() {
+        drop(activity);
+        drop(ended);
         return;
     }
-    let _count_guard = activity.clone();
+    let count_guard = activity.clone();
     let mut transport = InprocTransport::new(stream, conn_cancel.clone());
     let writer_tx = transport.writer();
     let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
@@ -450,7 +505,8 @@ async fn serve(
         None,
     )
     .with_connection_activity(activity)
-    .with_transport(transport.kind(), transport.credential());
+    .with_transport(transport.kind(), transport.credential())
+    .with_auth_binding(binding);
     tokio::select! {
         () = dispatcher.run(&mut transport) => {}
         () = conn_cancel.cancelled() => {}
@@ -459,6 +515,11 @@ async fn serve(
     if let Some((tui_id, tui_epoch)) = dispatcher.tui_registration() {
         ctx.tui_registry.unregister(tui_id, tui_epoch);
     }
+    // The task's own share of the activity count is released before `Served` resolves.
+    drop(dispatcher);
+    drop(transport);
+    drop(count_guard);
+    drop(ended);
 }
 
 #[cfg(test)]
@@ -631,6 +692,219 @@ mod tests {
 
         cancel.cancel();
         drop(writer);
+    }
+
+    /// A mock identity provider that verifies `corp-at` for `alice` in the
+    /// `ops` group, by introspection.
+    async fn introspecting_idp() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "introspection_endpoint": format!("{issuer}/introspect"),
+            })))
+            .mount(&server)
+            .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true,
+                "token_type": "Bearer",
+                "client_id": "daemon-client",
+                "iss": issuer,
+                "sub": "alice",
+                "aud": "zeroclaw",
+                "exp": now + 600,
+                "groups": ["ops"],
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn oidc_entry(issuer: &str) -> zeroclaw_config::schema::OidcConfig {
+        zeroclaw_config::schema::OidcConfig {
+            issuer: issuer.to_string(),
+            audience: "zeroclaw".into(),
+            client_id: "daemon".into(),
+            client_secret: Some("s3cret".into()),
+            validation: zeroclaw_config::schema::OidcValidation::Introspection,
+            claim_path: "groups".into(),
+            profile_map: std::collections::HashMap::from([("ops".into(), "operator".into())]),
+            interactive_clients: vec!["daemon-client".into()],
+            ..zeroclaw_config::schema::OidcConfig::default()
+        }
+    }
+
+    async fn introspections(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path() == "/introspect")
+            .count()
+    }
+
+    /// A connection bound to one OIDC provider, as it was configured when its
+    /// bearer was issued, presents the bearer only to that provider: once the
+    /// provider by that name names another issuer, `initialize` is refused
+    /// before the bearer is sent anywhere.
+    #[tokio::test]
+    async fn a_bound_duplex_never_sends_its_bearer_to_a_repointed_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The bearer came from `issued`; the policy now points `corp` at
+        // `other`, which would accept it.
+        let (issued, other) = (introspecting_idp().await, introspecting_idp().await);
+        let mut config = base_config(tmp.path());
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.oidc.insert("corp".into(), oidc_entry(&other.uri()));
+        let now_bound = crate::rpc::auth::OidcBinding::of(&config.oidc["corp"]);
+        let issued_bound = crate::rpc::auth::OidcBinding::of(&oidc_entry(&issued.uri()));
+        let ctx = with_tui_signing(ctx_for(config), tmp.path());
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let params = InitializeParams {
+            auth_token: Some("corp-at".to_string()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..initialize_params()
+        };
+
+        let (stream, _) = connector
+            .connect_bound(issued_bound)
+            .await
+            .expect("bound connector connects");
+        let (read_half, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await;
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED,
+            "a bearer bound to another provider is refused: {frame}"
+        );
+        assert_eq!(
+            introspections(&other).await,
+            0,
+            "the repointed provider got it"
+        );
+        assert_eq!(introspections(&issued).await, 0, "nothing was sent at all");
+        drop(writer);
+
+        // Bound to the provider as it is now, the same bearer verifies.
+        let (stream, _) = connector
+            .connect_bound(now_bound)
+            .await
+            .expect("bound connector connects");
+        let (read_half, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+        let frame = read_frame(&mut reader).await;
+        assert!(frame["error"].is_null(), "unexpected RPC error: {frame}");
+        assert_eq!(introspections(&other).await, 1);
+        cancel.cancel();
+        drop(writer);
+    }
+
+    /// A client that gives up on a bound connection while its bearer is
+    /// still being verified does not end the daemon's work on it: `Served`
+    /// resolves only once the verification is over and the connection is no
+    /// longer counted.
+    #[tokio::test]
+    async fn a_bound_connection_is_served_until_the_daemon_is_done_with_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspecting_idp().await;
+        let verifying_for = Duration::from_millis(1500);
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "active": false }))
+                    .set_delay(verifying_for),
+            )
+            .with_priority(1)
+            .mount(&idp)
+            .await;
+        let mut config = base_config(tmp.path());
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.oidc.insert("corp".into(), oidc_entry(&idp.uri()));
+        let binding = crate::rpc::auth::OidcBinding::of(&config.oidc["corp"]);
+        let ctx = with_tui_signing(ctx_for(config), tmp.path());
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        connector.bind(ctx);
+        let params = InitializeParams {
+            auth_token: Some("corp-at".to_string()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..initialize_params()
+        };
+
+        let (stream, served) = connector
+            .connect_bound(binding)
+            .await
+            .expect("bound connector connects");
+        let started = std::time::Instant::now();
+        let (_, mut writer) = tokio::io::split(stream);
+        writer
+            .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while introspections(&idp).await == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the daemon starts verifying the bearer");
+        // The client gives up on the connection.
+        drop(writer);
+
+        let mut served = std::pin::pin!(served.wait());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut served)
+                .await
+                .is_err(),
+            "served while the bearer was still being verified"
+        );
+        tokio::time::timeout(Duration::from_secs(10), &mut served)
+            .await
+            .expect("served once the verification is over");
+        assert!(
+            started.elapsed() >= verifying_for,
+            "served after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(connector.connection_count(), 0, "nothing of it is counted");
+        cancel.cancel();
     }
 
     /// The duplex is a non-local caller, so the remote identity fence applies
