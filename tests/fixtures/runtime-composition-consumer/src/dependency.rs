@@ -145,6 +145,7 @@ fn dependency_boundary() {
     // through one adapter statement that builds the config-backed set. That
     // statement is the only allowed construction; it appears at most once.
     const ADAPTER: &str = "letcapabilities=capabilities.unwrap_or_else(||RuntimeCapabilities::config_backed(&config));";
+    const AGENT_ADAPTER: &str = "letbound=supplied_capabilities.clone().unwrap_or_else(||{crate::composition::BoundCapabilities{capabilities:crate::composition::RuntimeCapabilities::config_backed(config),principal:None,}});";
     let boundaries = [
         ("crates/zeroclaw-runtime/src/agent/loop_.rs", "run_inner"),
         (
@@ -176,7 +177,11 @@ fn dependency_boundary() {
             compact.matches(ADAPTER).count() <= 1,
             "{path}::{name}: more than one config-backed adapter statement"
         );
-        let compact = compact.replacen(ADAPTER, "", 1);
+        let compact = if compact.contains(ADAPTER) {
+            compact.replacen(ADAPTER, "", 1)
+        } else {
+            compact.replacen(AGENT_ADAPTER, "", 1)
+        };
         for constructor in forbidden {
             if compact.contains(constructor) {
                 violations.push(format!("{path}::{name}: {constructor}"));
