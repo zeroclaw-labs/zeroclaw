@@ -2953,6 +2953,40 @@ mod tests {
     }
 
     #[test]
+    fn load_report_surfaces_malformed_manifest_instead_of_dropping_it() {
+        // Regression for #9786: an unknown trigger field used to disappear
+        // from `sop list` / `sop validate` with no diagnostic. The report path
+        // must name the directory and carry the parse error.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("repro-bad-trigger");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(
+            bad.join("SOP.toml"),
+            r#"[sop]
+name = "repro-bad-trigger"
+description = "unknown field on a trigger"
+version = "1.0.0"
+
+[[triggers]]
+type = "channel"
+topic = "git.main:pull_request.opened"
+"#,
+        )
+        .unwrap();
+        std::fs::write(bad.join("SOP.md"), "- next: done\n").unwrap();
+
+        let (loaded, failures) =
+            load_sops_from_directory_report(dir.path(), SopExecutionMode::Supervised);
+        assert!(loaded.is_empty(), "malformed SOP must not load silently");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "repro-bad-trigger");
+        assert!(
+            !failures[0].1.is_empty(),
+            "load failure must carry a parse reason"
+        );
+    }
+
+    #[test]
     fn rename_sop_changes_only_the_manifest_name() {
         let dir = tempfile::tempdir().unwrap();
         let sop = authoring_sop(vec![titled_step(1, "First")]);
