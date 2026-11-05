@@ -1,6 +1,6 @@
 //! `config migrate` must surface load-time IgnoredEnvOverride notices.
 //!
-//! Regression for #12221: startup skips migration_notices when the command is
+//! Regression: startup skips migration_notices when the command is
 //! `config migrate` (it reports its own file-change notices), but retired
 //! ZEROCLAW_* env overrides never appear in migrate_file_in_place's report.
 
@@ -83,9 +83,9 @@ fn config_migrate_json_already_current_includes_env_notice() {
         .as_array()
         .expect("notices array on already-current JSON");
     assert!(
-        notices.iter().any(|n| {
-            n["kind"] == "ignored_env_override" && n["variable"] == retired
-        }),
+        notices
+            .iter()
+            .any(|n| { n["kind"] == "ignored_env_override" && n["variable"] == retired }),
         "expected ignored_env_override for {retired}, got {notices:?}"
     );
 }
