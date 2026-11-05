@@ -52,6 +52,16 @@ while this SOP's execution slots are full:
 | `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
 | `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
 
+A second ceiling lives on the daemon config, not on the SOP file:
+
+| Config | Default | Effect |
+|---|---:|---|
+| `sop.max_concurrent_total` | `4` | Global cap on *all* SOP runs executing at once across every SOP. A per-SOP `max_concurrent` cannot exceed this in practice: when the global pool is full, further triggers are deferred under `parallel`/`hold`, dropped under `drop`, or — if this SOP already has an active run — coalesced onto that run under `coalesce` (absorbed, not deferred for retry), even when the SOP still has free per-SOP slots. Set it with `zeroclaw config set sop.max_concurrent_total <n>` or by editing `[sop]` in `config.toml`. |
+
+`zeroclaw sop show` prints both the SOP's declared `max_concurrent` and the
+effective cap `min(max_concurrent, sop.max_concurrent_total)` so the binding
+limit is visible next to the authored one.
+
 An optional `[decision]` table lets a decision model gate each matched event
 and choose the run's execution mode. See [Decision models](./decision-models.md).
 
