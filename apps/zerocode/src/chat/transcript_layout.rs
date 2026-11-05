@@ -139,12 +139,15 @@ impl TranscriptLayoutCache {
         self.layout.dirty = LinesDirty::Full;
     }
 
-    /// Link targets changed but the text did not. Any pending content change
-    /// already forces a full rebuild with the usual selection reset, so this
-    /// only marks a clean layout.
+    /// Link targets changed but the text did not. Promote incremental rebuilds
+    /// to full so pending path styling reaches already-cached lines.
     pub(super) fn invalidate_restyle(&mut self) {
-        if self.layout.dirty == LinesDirty::Clean {
-            self.layout.dirty = LinesDirty::Restyle;
+        match self.layout.dirty {
+            LinesDirty::Clean => self.layout.dirty = LinesDirty::Restyle,
+            LinesDirty::Appended | LinesDirty::TailChanged(_) => {
+                self.layout.dirty = LinesDirty::Full;
+            }
+            LinesDirty::Full | LinesDirty::Restyle => {}
         }
     }
 
@@ -375,5 +378,70 @@ impl TranscriptLayoutCache {
                 .cached_screen_ranges
                 .push((entry_idx, screen_lo, screen_hi, content_width));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalidate_restyle_promotes_appended_to_full() {
+        let mut cache = TranscriptLayoutCache::new();
+        cache.layout.dirty = LinesDirty::Appended;
+        cache.invalidate_restyle();
+        assert_eq!(
+            cache.layout.dirty,
+            LinesDirty::Full,
+            "Appended should be promoted to Full when restyle is requested"
+        );
+    }
+
+    #[test]
+    fn invalidate_restyle_promotes_tail_changed_to_full() {
+        let mut cache = TranscriptLayoutCache::new();
+        cache.layout.dirty = LinesDirty::TailChanged(5);
+        cache.invalidate_restyle();
+        assert_eq!(
+            cache.layout.dirty,
+            LinesDirty::Full,
+            "TailChanged should be promoted to Full when restyle is requested"
+        );
+    }
+
+    #[test]
+    fn invalidate_restyle_marks_clean_as_restyle() {
+        let mut cache = TranscriptLayoutCache::new();
+        cache.layout.dirty = LinesDirty::Clean;
+        cache.invalidate_restyle();
+        assert_eq!(
+            cache.layout.dirty,
+            LinesDirty::Restyle,
+            "Clean should be marked as Restyle"
+        );
+    }
+
+    #[test]
+    fn invalidate_restyle_preserves_full() {
+        let mut cache = TranscriptLayoutCache::new();
+        cache.layout.dirty = LinesDirty::Full;
+        cache.invalidate_restyle();
+        assert_eq!(
+            cache.layout.dirty,
+            LinesDirty::Full,
+            "Full should remain Full"
+        );
+    }
+
+    #[test]
+    fn invalidate_restyle_preserves_restyle() {
+        let mut cache = TranscriptLayoutCache::new();
+        cache.layout.dirty = LinesDirty::Restyle;
+        cache.invalidate_restyle();
+        assert_eq!(
+            cache.layout.dirty,
+            LinesDirty::Restyle,
+            "Restyle should remain Restyle"
+        );
     }
 }

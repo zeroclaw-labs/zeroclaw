@@ -2472,7 +2472,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/version/check", get(version::handle_version_check))
-        .route("/api/version/upgrade", post(version::handle_version_upgrade))
+        .route(
+            "/api/version/upgrade",
+            post(version::handle_version_upgrade),
+        )
         .route(
             "/api/version/upgrade/status",
             get(version::handle_version_upgrade_status),
@@ -2490,10 +2493,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             "/api/sops/{name}/graph",
             get(api_sop_author::handle_sop_graph),
         )
-        .route(
-            "/api/sops/{name}/run",
-            post(api_sop_author::handle_sop_run),
-        )
+        .route("/api/sops/{name}/run", post(api_sop_author::handle_sop_run))
         .route(
             "/api/sops/{name}/rename",
             post(api_sop_author::handle_sop_rename),
@@ -2629,14 +2629,26 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(api::handle_api_sessions_list))
-        .route("/api/sessions/running", get(api::handle_api_sessions_running))
+        .route(
+            "/api/sessions/running",
+            get(api::handle_api_sessions_running),
+        )
         .route(
             "/api/sessions/{id}/messages",
             get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
         )
-        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
-        .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
-        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        .route(
+            "/api/sessions/{id}",
+            delete(api::handle_api_session_delete).put(api::handle_api_session_rename),
+        )
+        .route(
+            "/api/sessions/{id}/state",
+            get(api::handle_api_session_state),
+        )
+        .route(
+            "/api/sessions/{id}/abort",
+            post(api::handle_api_session_abort),
+        )
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
