@@ -150,7 +150,7 @@ fn dependency_boundary() {
         ),
         (
             "crates/zeroclaw-runtime/src/agent/agent.rs",
-            "build_with_capabilities",
+            "from_config_with_context_body",
         ),
         (
             "crates/zeroclaw-runtime/src/agent/turn/mod.rs",
