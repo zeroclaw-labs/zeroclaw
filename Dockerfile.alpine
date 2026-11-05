@@ -55,6 +55,7 @@ COPY vendor/ vendor/
 COPY wit/ wit/
 COPY --parents crates/*/Cargo.toml ./
 COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
+COPY --parents tests/fixtures/*/Cargo.toml ./
 COPY --parents crates/zeroclaw-macros/src/ ./
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
@@ -84,6 +85,11 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay
     && mkdir -p crates/zeroclaw-plugins/examples \
     && echo "fn main() {}" > crates/zeroclaw-plugins/examples/sign_manifest.rs \
     && for d in crates/*/tests/fixtures/*/; do \
+        [ -f "${d}Cargo.toml" ] || continue; \
+        mkdir -p "${d}src"; \
+        printf '' > "${d}src/lib.rs"; \
+    done \
+    && for d in tests/fixtures/*/; do \
         [ -f "${d}Cargo.toml" ] || continue; \
         mkdir -p "${d}src"; \
         printf '' > "${d}src/lib.rs"; \
