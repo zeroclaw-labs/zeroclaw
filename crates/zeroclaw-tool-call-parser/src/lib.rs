@@ -1485,6 +1485,28 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     calls
 }
 
+/// LFM / chat-template tool calls wrapped in special tokens, e.g.
+/// `<|tool_call_start|>[file_read(path='/tmp/x')]<|tool_call_end|>`.
+/// Models emit this when tools were described in the prompt rather than as a
+/// native `tools` array; the text-fallback path must still execute them.
+fn parse_special_token_tool_calls(response: &str) -> Vec<ParsedToolCall> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<\|tool_call_start\|>(.*?)<\|tool_call_end\|>")
+            .expect("SPECIAL_TOKEN_TOOL_CALL_RE regex must compile")
+    });
+    let mut calls = Vec::new();
+    for cap in RE.captures_iter(response) {
+        let mut inner = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        if inner.starts_with('[') && inner.ends_with(']') && inner.len() >= 2 {
+            inner = inner[1..inner.len() - 1].trim();
+        }
+        if let Some(call) = parse_glm_shortened_body(inner) {
+            calls.push(call);
+        }
+    }
+    calls
+}
+
 fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
@@ -1724,6 +1746,51 @@ fn default_param_for_tool(tool: &str) -> &'static str {
     }
 }
 
+/// Parse `key="value"` / `key='value'` pairs from a function-style argument list.
+fn parse_function_style_kwargs(
+    value_part: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut args = serde_json::Map::new();
+    let mut rest = value_part.trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+        if rest.is_empty() {
+            break;
+        }
+        let Some(eq_pos) = rest.find('=') else {
+            break;
+        };
+        let key = rest[..eq_pos]
+            .trim()
+            .trim_matches(|c: char| c == ',' || c == ';');
+        if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            break;
+        }
+        let after_eq = rest[eq_pos + 1..].trim_start();
+        let (value, consumed) =
+            if let Some(quote) = after_eq.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                let body = &after_eq[quote.len_utf8()..];
+                let Some(end) = body.find(quote) else {
+                    break;
+                };
+                (
+                    body[..end].to_string(),
+                    quote.len_utf8() + end + quote.len_utf8(),
+                )
+            } else {
+                let end = after_eq.find(',').unwrap_or(after_eq.len());
+                let value = after_eq[..end].trim().to_string();
+                if value.is_empty() {
+                    break;
+                }
+                (value, end)
+            };
+        args.insert(key.to_string(), serde_json::Value::String(value));
+        rest = after_eq[consumed..].trim_start();
+    }
+    if args.is_empty() { None } else { Some(args) }
+}
+
 fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     let body = body.trim();
     if body.is_empty() {
@@ -1772,40 +1839,15 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
 
     let tool_name = map_tool_name_alias(tool_raw);
 
-    // Try attribute-style: `key="value" key2="value2"`
-    if value_part.contains("=\"") {
-        let mut args = serde_json::Map::new();
-        // Simple attribute parser: key="value" pairs
-        let mut rest = value_part;
-        while let Some(eq_pos) = rest.find("=\"") {
-            let key_start = rest[..eq_pos]
-                .rfind(|c: char| c.is_whitespace())
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            let key = rest[key_start..eq_pos]
-                .trim()
-                .trim_matches(|c: char| c == ',' || c == ';');
-            let after_quote = &rest[eq_pos + 2..];
-            if let Some(end_quote) = after_quote.find('"') {
-                let value = &after_quote[..end_quote];
-                if !key.is_empty() {
-                    args.insert(
-                        key.to_string(),
-                        serde_json::Value::String(value.to_string()),
-                    );
-                }
-                rest = &after_quote[end_quote + 1..];
-            } else {
-                break;
-            }
-        }
-        if !args.is_empty() {
-            return Some(ParsedToolCall {
-                name: tool_name.to_string(),
-                arguments: serde_json::Value::Object(args),
-                tool_call_id: None,
-            });
-        }
+    // Try attribute / kwargs style: key="value", key='value', or key=bare
+    if value_part.contains('=')
+        && let Some(args) = parse_function_style_kwargs(value_part)
+    {
+        return Some(ParsedToolCall {
+            name: tool_name.to_string(),
+            arguments: serde_json::Value::Object(args),
+            tool_call_id: None,
+        });
     }
 
     // Try YAML-style multi-line: each line is `key: value`
@@ -2473,6 +2515,23 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                     }
                 }
             }
+            if !cleaned_text.trim().is_empty() {
+                text_parts.push(cleaned_text.trim().to_string());
+            }
+            remaining = "";
+        }
+    }
+
+    if calls.is_empty() {
+        let special_calls = parse_special_token_tool_calls(remaining);
+        if !special_calls.is_empty() {
+            // Drop every special-token envelope from the visible text.
+            static STRIP_RE: LazyLock<Regex> = LazyLock::new(|| {
+                Regex::new(r"(?s)<\|tool_call_start\|>.*?<\|tool_call_end\|>")
+                    .expect("SPECIAL_TOKEN_STRIP_RE regex must compile")
+            });
+            let cleaned_text = STRIP_RE.replace_all(remaining, "").to_string();
+            calls.extend(special_calls);
             if !cleaned_text.trim().is_empty() {
                 text_parts.push(cleaned_text.trim().to_string());
             }
@@ -3600,6 +3659,34 @@ I will now call the tool with this payload:
             calls[0].arguments.get("message").unwrap().as_str().unwrap(),
             "Hello! How can I assist you today?"
         );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_lfm_special_token_function_style() {
+        // Regression for #12235: LFM2.5 (and similar chat-template models) emit
+        // special-token envelopes with Python-like kwargs when the request did
+        // not carry a native tools array. Text fallback must still execute them.
+        let response = "<|tool_call_start|>[file_read(path='/root/zc-repro/data/estado.txt')]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(
+            text.is_empty(),
+            "envelope must not leak as visible text: {text:?}"
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(
+            calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            Some("/root/zc-repro/data/estado.txt")
+        );
+    }
+
+    #[test]
+    fn parse_function_style_kwargs_accepts_single_and_double_quotes() {
+        let double = parse_function_style_kwargs(r#"path="/tmp/a", mode="r""#).expect("double");
+        assert_eq!(double.get("path").and_then(|v| v.as_str()), Some("/tmp/a"));
+        assert_eq!(double.get("mode").and_then(|v| v.as_str()), Some("r"));
+        let single = parse_function_style_kwargs("path='/tmp/b'").expect("single");
+        assert_eq!(single.get("path").and_then(|v| v.as_str()), Some("/tmp/b"));
     }
 
     #[test]
