@@ -126,7 +126,14 @@ fn resolve_dispatch_tool<'a>(
         name,
         tool_call_id,
     ) {
-        Some(resolved) if is_excluded_tool(resolved.tool().name(), dispatch.excluded_tools) => {
+        // A wrapper, such as a skill's builtin tool, is excluded with the tool it runs.
+        Some(resolved)
+            if is_excluded_tool(resolved.tool().name(), dispatch.excluded_tools)
+                || resolved
+                    .tool()
+                    .wrapped_tool_name()
+                    .is_some_and(|target| is_excluded_tool(target, dispatch.excluded_tools)) =>
+        {
             DispatchResolution::Unavailable
         }
         Some(resolved) => DispatchResolution::Available(resolved),
@@ -1049,6 +1056,64 @@ mod tests {
         assert_eq!(
             outcome.output,
             "Tool not available in this turn: extract_text"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_blocks_a_skill_wrapper_of_an_excluded_tool() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let target: Arc<dyn Tool> =
+            Arc::new(CountingTool::new("http_request", Arc::clone(&invocations)));
+        let manifest = crate::skills::SkillTool {
+            name: "fetch".into(),
+            description: "skill wrapper".into(),
+            kind: "builtin".into(),
+            command: String::new(),
+            args: std::collections::HashMap::new(),
+            target: Some("http_request".into()),
+            locked_args: std::collections::HashMap::new(),
+            timeout_secs: None,
+        };
+        let wrapper = crate::tools::SkillBuiltinTool::new(
+            "ops",
+            &manifest,
+            target,
+            std::collections::HashMap::new(),
+        );
+
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+        let excluded = vec!["http_request".to_string()];
+        let outcome = execute_one_tool(
+            "ops__fetch",
+            serde_json::json!({}),
+            Some("call-1"),
+            ToolDispatchContext {
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(wrapper),
+                ]),
+                activated_tools: None,
+                excluded_tools: &excluded,
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("an excluded wrapper should return an unavailable outcome");
+
+        assert!(!outcome.success);
+        assert_eq!(
+            outcome.output,
+            "Tool not available in this turn: ops__fetch"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
     }

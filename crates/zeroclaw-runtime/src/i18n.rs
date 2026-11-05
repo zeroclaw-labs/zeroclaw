@@ -1889,6 +1889,27 @@ mod tests {
     }
 
     #[test]
+    fn skill_wrapper_refusal_formats_in_all_locales() {
+        let args = [("tool", "ops__fetch"), ("target", "http_request")];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let value = format_ftl_message(source, locale, "skill-tool-target-excluded", &args)
+                .unwrap_or_else(|| panic!("skill-tool-target-excluded should format in {locale}"));
+            for expected in ["ops__fetch", "http_request"] {
+                assert!(
+                    value.contains(expected),
+                    "skill-tool-target-excluded in {locale} should preserve {expected:?}; got: {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cli_approval_prompt_strings_format_in_all_locales() {
         let tool = "shell";
         let cases = [

@@ -1064,6 +1064,7 @@ cli-config-review-hint = Exécutez `zeroclaw config list` pour vérifier, puis d
 cli-config-catalog-unavailable-manual = {"  "}⚠ Le catalogue de {$provider} est indisponible ({$error}) ; saisissez manuellement l’identifiant du modèle.
 model-switch-catalog-failed = Impossible de charger le catalogue du profil de fournisseur configuré {$provider} : {$error}
 model-switch-provider-not-allowed = La politique active de routage selon l'effort n'autorise pas le passage au fournisseur {$provider}.
+skill-tool-target-excluded = Outil indisponible pour ce tour : {$tool} exécute {$target}, que ce canal exclut.
 cli-config-backed-up = Sauvegardé vers { $path }
 cli-config-kept-original = L’original du schéma V{$version} a été conservé dans {$path}, lisible par vous seul. Il n’est jamais remplacé et contient encore les secrets que la migration a supprimés ; supprimez-le lorsque vous n’avez plus besoin de revenir à une version antérieure de ZeroClaw.
 cli-plugin-name-version = Plugin : { $name } v{ $version }
