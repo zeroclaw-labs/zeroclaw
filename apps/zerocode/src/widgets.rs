@@ -131,14 +131,16 @@ impl CtxBar {
         }
     }
 
-    /// `~` when the displayed count is an estimate, otherwise a space.
+    /// `~` when the displayed count is derived, otherwise a space.
     ///
-    /// A dedicated marker column keeps the estimated and measured forms the
-    /// same width, so turning provenance on cannot shift the rest of the
-    /// status bar.
+    /// Both a local estimate and a calibrated mix of provider usage plus a
+    /// local estimate are derived. Rendering either unmarked would present
+    /// them with the same authority as a provider-reported count. A dedicated
+    /// marker column keeps the derived and measured forms the same width, so
+    /// turning provenance on cannot shift the rest of the status bar.
     fn approx_marker(&self) -> &'static str {
         match self.input_tokens_source.as_deref() {
-            Some("estimate") => "~",
+            Some("estimate" | "calibrated") => "~",
             _ => " ",
         }
     }
@@ -285,6 +287,24 @@ mod context_bar_tests {
         assert!(
             rendered.contains(" ctx:  100,000 / 200,000"),
             "measured form reserves the marker column so widths stay stable: {rendered}"
+        );
+    }
+
+    #[test]
+    fn calibrated_count_renders_an_approximation_marker() {
+        let rendered = render(CtxBar::new(
+            Some(90_000),
+            Some("calibrated".to_string()),
+            Some(128_000),
+            Some(200_000),
+        ));
+        assert!(
+            rendered.contains(" ctx: ~ 90,000 / 200,000"),
+            "a calibrated post-trim count must be marked approximate: {rendered}"
+        );
+        assert!(
+            rendered.contains("~45%"),
+            "a calibrated percentage must be marked approximate: {rendered}"
         );
     }
 
