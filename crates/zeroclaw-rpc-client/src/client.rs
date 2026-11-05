@@ -971,6 +971,32 @@ mod tests {
         assert_eq!(client.state(), ConnectionState::Connected);
     }
 
+    /// The client refuses a request whose encoded frame would exceed the
+    /// shared frame limit before writing it, and the connection stays usable.
+    #[tokio::test]
+    async fn an_oversized_request_is_refused_before_it_is_written() {
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        let _seen = fake_daemon(server_half, None);
+        let client = RpcClient::connect_over(client_half, ConnectOptions::default())
+            .await
+            .expect("handshake");
+        let blob = "x".repeat(usize::try_from(MAX_FRAME_BYTES).expect("limit fits in usize"));
+        let refused = client
+            .request(Method::Status, json!({ "blob": blob }))
+            .await
+            .expect_err("an oversized frame is refused");
+        let ClientError::Rpc(error) = refused else {
+            panic!("expected an RPC error, got {refused:?}");
+        };
+        assert_eq!(error.code, zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS);
+        assert_eq!(error.data.expect("error data")["reason"], "frame_too_large");
+        let status = client
+            .request(Method::Status, json!({}))
+            .await
+            .expect("the connection is still usable");
+        assert_eq!(status["active_sessions"], json!(0));
+    }
+
     #[tokio::test]
     async fn notifications_and_inbound_requests_are_routed_and_answered() {
         let (client_half, server_half) = tokio::io::duplex(64 * 1024);
