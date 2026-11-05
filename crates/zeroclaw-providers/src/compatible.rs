@@ -73,6 +73,15 @@ pub struct OpenAiCompatibleModelProvider {
     native_tool_calling: bool,
     /// HTTP request timeout in seconds for LLM API calls. Default: 120.
     timeout_secs: u64,
+    /// Whether the operator explicitly selected a total request timeout.
+    /// Streaming clients keep the historical no-total-timeout baseline when
+    /// this is false, while an explicit finite value applies to streaming too.
+    timeout_configured: bool,
+    timeout_disabled: bool,
+    /// Optional HTTP response-read idle timeout. `None` uses the streaming
+    /// baseline; `read_timeout_disabled` explicitly removes that baseline.
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
@@ -537,6 +546,10 @@ pub struct OpenAiCompatibleBuilder {
     /// `None` preserves the default derived from `merge_system_into_user`.
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
+    timeout_configured: bool,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
     reasoning_effort: Option<String>,
     /// Set to `true` by
@@ -683,7 +696,34 @@ impl OpenAiCompatibleBuilder {
     pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
         if timeout_secs > 0 {
             self.timeout_secs = Some(timeout_secs);
+            self.timeout_configured = true;
+            self.timeout_disabled = false;
         }
+        self
+    }
+
+    /// Disable the compatible adapter's total request timeout while retaining
+    /// independent connect/read-idle and outer cancellation boundaries.
+    pub fn without_timeout(mut self) -> Self {
+        self.timeout_secs = None;
+        self.timeout_configured = true;
+        self.timeout_disabled = true;
+        self
+    }
+
+    /// Override the per-read idle timeout for response bodies and streams.
+    pub fn read_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        if timeout_secs > 0 {
+            self.read_timeout_secs = Some(timeout_secs);
+            self.read_timeout_disabled = false;
+        }
+        self
+    }
+
+    /// Disable the adapter's default stream read-idle bound.
+    pub fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_secs = None;
+        self.read_timeout_disabled = true;
         self
     }
 
@@ -880,6 +920,10 @@ impl OpenAiCompatibleBuilder {
             native_tool_calling,
             merge_system_into_user,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_configured: self.timeout_configured,
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
             extra_headers: self.extra_headers,
             reasoning_effort: self.reasoning_effort,
             reasoning_effort_passthrough: self.reasoning_effort_passthrough,
@@ -924,6 +968,10 @@ impl OpenAiCompatibleModelProvider {
             merge_system_into_user_preserve_native: false,
             native_tool_calling_override: None,
             timeout_secs: None,
+            timeout_configured: false,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
             reasoning_effort_passthrough: false,
@@ -1053,10 +1101,19 @@ impl OpenAiCompatibleModelProvider {
                 }
             }
 
-            let builder = Client::builder()
-                .timeout(std::time::Duration::from_secs(timeout))
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .default_headers(headers);
+            let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+            let builder = if self.timeout_disabled {
+                builder
+            } else {
+                builder.timeout(std::time::Duration::from_secs(timeout))
+            };
+            let builder = builder.default_headers(headers);
+            let builder = match self.read_timeout_secs {
+                Some(read_timeout) if !self.read_timeout_disabled => {
+                    builder.read_timeout(std::time::Duration::from_secs(read_timeout))
+                }
+                _ => builder,
+            };
             let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
@@ -1078,6 +1135,35 @@ impl OpenAiCompatibleModelProvider {
             });
         }
 
+        if self.timeout_disabled || self.read_timeout_disabled || self.read_timeout_secs.is_some() {
+            let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+            let builder = if self.timeout_disabled {
+                builder
+            } else {
+                builder.timeout(std::time::Duration::from_secs(timeout))
+            };
+            let builder = if let Some(read_timeout) = self.read_timeout_secs {
+                builder.read_timeout(std::time::Duration::from_secs(read_timeout))
+            } else {
+                builder
+            };
+            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                builder,
+                "model_provider.compatible",
+            );
+            return builder.build().unwrap_or_else(|error| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": super::format_error_chain(&error)})
+                        ),
+                    "Failed to build provider client with configured read timeout: "
+                );
+                Client::new()
+            });
+        }
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.compatible",
             timeout,
@@ -1128,10 +1214,24 @@ impl OpenAiCompatibleModelProvider {
                 }
             }
 
-            let builder = Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration())
-                .default_headers(headers);
+            let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+            let builder = if self.timeout_configured && !self.timeout_disabled {
+                builder.timeout(std::time::Duration::from_secs(self.timeout_secs))
+            } else {
+                builder
+            };
+            let builder = if self.read_timeout_disabled {
+                builder
+            } else {
+                builder.read_timeout(
+                    self.read_timeout_secs
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or_else(|| {
+                            super::stream_idle_timeout(self.timeout_secs).duration()
+                        }),
+                )
+            };
+            let builder = builder.default_headers(headers);
             let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
@@ -1152,9 +1252,21 @@ impl OpenAiCompatibleModelProvider {
             });
         }
 
-        let builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
+        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let builder = if self.timeout_configured && !self.timeout_disabled {
+            builder.timeout(std::time::Duration::from_secs(self.timeout_secs))
+        } else {
+            builder
+        };
+        let builder = if self.read_timeout_disabled {
+            builder
+        } else {
+            builder.read_timeout(
+                self.read_timeout_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or_else(|| super::stream_idle_timeout(self.timeout_secs).duration()),
+            )
+        };
         let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");

@@ -700,6 +700,14 @@ pub struct ModelProviderRuntimeOptions {
     /// HTTP request timeout in seconds for LLM model_provider API calls.
     /// `None` uses the model_provider's built-in default (120s for compatible model_providers).
     pub provider_timeout_secs: Option<u64>,
+    /// Explicitly disable the compatible adapter's total request timeout.
+    pub provider_timeout_disabled: bool,
+    /// Optional per-read idle timeout for streaming and HTTP response bodies.
+    /// `None` keeps the adapter's existing idle policy unless disabled below.
+    pub provider_read_timeout_secs: Option<u64>,
+    /// Explicitly disable the adapter's read-idle timeout. This is distinct
+    /// from `None`, which means inherit the adapter baseline.
+    pub provider_read_timeout_disabled: bool,
     /// Extra HTTP headers to include in model_provider API requests.
     pub extra_headers: std::collections::HashMap<String, String>,
     /// Custom API path suffix for OpenAI-compatible model_providers
@@ -786,6 +794,9 @@ impl Default for ModelProviderRuntimeOptions {
             reasoning_effort: None,
             reasoning_effort_passthrough: false,
             provider_timeout_secs: None,
+            provider_timeout_disabled: false,
+            provider_read_timeout_secs: None,
+            provider_read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
@@ -833,6 +844,9 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         reasoning_effort: config.runtime.reasoning_effort.clone(),
         reasoning_effort_passthrough: entry.is_some_and(|e| e.reasoning_effort_passthrough),
         provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        provider_timeout_disabled: false,
+        provider_read_timeout_secs: None,
+        provider_read_timeout_disabled: false,
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
         api_path: None,
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
@@ -2120,6 +2134,16 @@ pub fn ensure_known_model_entry_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
 ) -> anyhow::Result<()> {
+    if config
+        .providers
+        .models
+        .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
+            name.trim(),
+        ))
+        .is_some()
+    {
+        return Ok(());
+    }
     if let Some((family, alias)) = config.providers.models.profile_ref(name)
         && !family.contains(':')
         && config.providers.models.find(family, alias).is_some()

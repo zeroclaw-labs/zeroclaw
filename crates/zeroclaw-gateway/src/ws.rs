@@ -438,7 +438,9 @@ async fn ws_consolidation_model(
     String,
     zeroclaw_api::model_provider::CallSampling,
 )> {
-    config.resolve_model_selection(provider_ref)?;
+    if !config.is_configured_model_ref(provider_ref) {
+        return None;
+    }
     let sampling = zeroclaw_providers::temperature::Temperature::default()
         .for_call(Some(Arc::clone(&config)), provider_ref);
     let runtime = zeroclaw_providers::model::build_model_nonblocking(

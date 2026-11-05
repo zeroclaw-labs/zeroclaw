@@ -28,9 +28,7 @@ impl Temperature {
     }
 
     pub fn resolve(self, config: Option<&Config>, selection_ref: &str) -> Option<f64> {
-        let configured = config
-            .and_then(|config| config.resolve_model_selection(selection_ref))
-            .and_then(|selection| selection.temperature());
+        let configured = config.and_then(|config| config.resolve_model_temperature(selection_ref));
         self.override_value.or(configured).map(|value| {
             if self.adjustment == 0.0 {
                 value
@@ -59,8 +57,7 @@ impl Temperature {
     ) -> CallSampling {
         let default = if config
             .as_deref()
-            .and_then(|config| config.resolve_model_selection(selection_ref))
-            .is_some()
+            .is_some_and(|config| config.is_configured_model_ref(selection_ref))
         {
             self.resolve(config.as_deref(), selection_ref)
         } else {
@@ -70,7 +67,7 @@ impl Temperature {
             return CallSampling::Explicit(default);
         };
         CallSampling::for_selection(default, move |candidate| {
-            if config.resolve_model_selection(candidate).is_some() {
+            if config.is_configured_model_ref(candidate) {
                 self.resolve(Some(&config), candidate)
             } else {
                 fallback

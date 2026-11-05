@@ -2887,6 +2887,9 @@ fn resolve_models_command(
     raw: &str,
 ) -> ModelsCommandResolution {
     let candidate = raw.trim();
+    if config.is_configured_model_ref(candidate) && config.resolve_model_id(candidate).is_some() {
+        return ModelsCommandResolution::Resolved(candidate.to_string());
+    }
     if let Some((family, alias)) = config.providers.models.profile_ref(candidate) {
         return match config.providers.models.find(family, alias) {
             Some(_) if config.resolve_model_selection(candidate).is_some() => {
@@ -2952,6 +2955,9 @@ fn resolved_runtime_model_provider_ref(
             "agents.{agent_alias}.model_provider is empty; runtime reload requires a dotted `<type>.<alias>` provider reference"
         );
     }
+    if config.is_configured_model_ref(configured) {
+        return Ok(configured.to_owned());
+    }
     let (model_provider, _) = model_provider_entry_for_ref(config, configured)?;
     Ok(model_provider)
 }
@@ -2984,6 +2990,25 @@ fn runtime_defaults_from_config(
     config: &Config,
     model_provider: &str,
 ) -> anyhow::Result<ChannelRuntimeDefaults> {
+    if config.is_configured_model_ref(model_provider.trim())
+        && let Some(model) = config.resolve_model_id(model_provider.trim())
+    {
+        let api_key = config.provider_registry().ok().and_then(|registry| {
+            registry
+                .resolve_chat(&zeroclaw_config::provider_registry::ModelRef::from(
+                    model_provider.trim(),
+                ))
+                .ok()
+                .and_then(|resolved| resolved.selection.connection.api_key())
+                .map(str::to_owned)
+        });
+        return Ok(ChannelRuntimeDefaults {
+            default_model_provider: model_provider.trim().to_owned(),
+            model,
+            temperature: config.resolve_model_temperature(model_provider),
+            api_key,
+        });
+    }
     let (default_model_provider, entry) = model_provider_entry_for_ref(config, model_provider)?;
     // Resolve explicit and implicit nested model entries together with their
     // sampling defaults.
@@ -5899,6 +5924,37 @@ async fn resolve_classifier_route(
     let provider_str = provider_ref.as_str().trim();
     if provider_str.is_empty() {
         return None;
+    }
+
+    if defaults_snapshot
+        .config
+        .is_configured_model_ref(provider_str)
+    {
+        let model = defaults_snapshot.config.resolve_model_id(provider_str)?;
+        let provider = match get_or_create_provider(ctx, provider_str, None, defaults_snapshot)
+            .await
+        {
+            Ok(provider) => provider,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "provider": provider_str,
+                            "error": error.to_string(),
+                        })),
+                    "Failed to initialize canonical classifier provider; falling back to main agent provider"
+                );
+                return None;
+            }
+        };
+        return Some((
+            provider,
+            model,
+            zeroclaw_providers::temperature::Temperature::default()
+                .for_call(Some(Arc::clone(&defaults_snapshot.config)), provider_str),
+        ));
     }
 
     let (type_key, alias_key) = match defaults_snapshot

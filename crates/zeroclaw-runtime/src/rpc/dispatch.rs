@@ -1000,6 +1000,15 @@ fn memory_embeddings_use_provider(
     config: &zeroclaw_config::schema::Config,
     model_provider_ref: &str,
 ) -> bool {
+    if config
+        .memory
+        .embedding_model_ref
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|reference| reference == model_provider_ref)
+    {
+        return true;
+    }
     // Compare on the provider-profile portion so a three-segment
     // `<type>.<alias>.<model>` embedding ref still matches the edited profile.
     profile_ref_of(config, &config.memory.embedding_provider) == model_provider_ref
@@ -10264,12 +10273,7 @@ impl RpcDispatcher {
         // Match daemon-boot resolution (`create_memory_with_storage_and_routes`
         // is called with `api_key = None`): keys come from the per-route /
         // `[memory]` override or the referenced profile, never an inherited seed.
-        let resolved = zeroclaw_memory::resolve_embedding_settings(
-            &config.memory,
-            &config.embedding_routes,
-            None,
-            Some(&config.providers.models),
-        );
+        let resolved = zeroclaw_memory::resolve_embedding_settings_from_config(config, None);
         // 1. Install-wide RPC memory handle.
         if let Some(memory) = ctx.memory.as_ref() {
             memory.refresh_embedder(

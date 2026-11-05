@@ -4700,6 +4700,19 @@ impl Config {
         // them from the typed maps, never from flattened property paths.
         if source == crate::traits::AliasSource::ModelProviders {
             let mut refs = Vec::new();
+            if self.providers.models.has_canonical_models()
+                && let Ok(registry) = self.provider_registry()
+            {
+                refs.extend(
+                    registry
+                        .models
+                        .iter()
+                        .filter(|(_, model)| {
+                            model.capability() == crate::provider_registry::Capability::Chat
+                        })
+                        .map(|(model_ref, _)| model_ref.to_string()),
+                );
+            }
             for (family, alias, profile) in self.providers.models.iter_entries() {
                 refs.push(format!("{family}.{alias}"));
                 refs.extend(
@@ -4766,9 +4779,85 @@ impl Config {
     /// [`Self::resolve_default_model_selection`].
     #[must_use]
     pub fn resolve_default_model(&self) -> Option<String> {
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Some(model) = registry.models.values().find(|model| {
+                model.capability() == crate::provider_registry::Capability::Chat
+                    && model
+                        .upstream_model()
+                        .is_some_and(|value| !value.trim().is_empty())
+            })
+        {
+            return model
+                .upstream_model()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
         self.resolve_default_model_selection()
             .and_then(|selection| selection.model_id)
             .map(|model| model.trim().to_string())
+    }
+
+    /// Resolve a model ID from either the canonical exact-key registry or the
+    /// legacy family/alias maps. Canonical keys are checked first and are
+    /// never split on `.`.
+    #[must_use]
+    pub fn resolve_model_id(&self, model_ref: &str) -> Option<String> {
+        let model_ref = model_ref.trim();
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(selection) =
+                registry.resolve_chat(&crate::provider_registry::ModelRef::from(model_ref))
+        {
+            return selection
+                .upstream_model()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
+        self.resolve_model_selection(model_ref)
+            .and_then(|selection| selection.model_id)
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty())
+    }
+
+    /// Resolve a model's configured temperature from the canonical registry,
+    /// falling back to the legacy selection lens. Explicit Clear means the
+    /// request omits temperature and therefore resolves to `None`.
+    #[must_use]
+    pub fn resolve_model_temperature(&self, model_ref: &str) -> Option<f64> {
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(selection) =
+                registry.resolve_chat(&crate::provider_registry::ModelRef::from(model_ref.trim()))
+        {
+            return selection
+                .options
+                .temperature
+                .as_ref()
+                .and_then(|value| match value {
+                    crate::provider_registry::Override::Set(value) => Some(*value),
+                    crate::provider_registry::Override::Clear => None,
+                });
+        }
+        self.resolve_model_selection(model_ref)
+            .and_then(|selection| selection.temperature())
+    }
+
+    /// Test whether a reference names a canonical model or a legacy model
+    /// profile/entry. Callers that only need admission should use this instead
+    /// of destructuring the legacy `ModelSelection` type.
+    #[must_use]
+    pub fn is_configured_model_ref(&self, model_ref: &str) -> bool {
+        let model_ref = model_ref.trim();
+        (self.providers.models.has_canonical_models()
+            && self
+                .providers
+                .models
+                .canonical_model(&crate::provider_registry::ModelRef::from(model_ref))
+                .is_some())
+            || self.resolve_model_selection(model_ref).is_some()
     }
 
     /// Resolve the risk profile for an explicit agent alias.
@@ -4988,8 +5077,21 @@ impl Config {
     #[must_use]
     pub fn configured_model_context_window(&self, agent_alias: &str) -> Option<usize> {
         // Provider config (config.toml) is the source of truth for this value.
-        self.agent(agent_alias)
-            .and_then(|agent| self.resolve_model_selection(&agent.model_provider))
+        let agent = self.agent(agent_alias)?;
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(selection) = registry.resolve_chat(&crate::provider_registry::ModelRef::from(
+                agent.model_provider.as_str(),
+            ))
+        {
+            return match selection.selection.model {
+                crate::provider_registry::ModelDefinition::Chat(model) => {
+                    model.metadata.context_window
+                }
+                _ => None,
+            };
+        }
+        self.resolve_model_selection(&agent.model_provider)
             .and_then(|selection| selection.configured_context_window())
     }
 
@@ -5014,8 +5116,7 @@ impl Config {
             };
         };
         let model = self
-            .resolve_model_selection(agent.model_provider.as_str())
-            .and_then(|selection| selection.model_id)
+            .resolve_model_id(agent.model_provider.as_str())
             .unwrap_or_default();
         self.resolved_model_context_window_for_route(agent.model_provider.as_str(), &model)
     }
@@ -5043,6 +5144,41 @@ impl Config {
         model_provider_ref: &str,
         selected_model: &str,
     ) -> ResolvedModelContextWindow {
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(selection) = registry.resolve_chat(&crate::provider_registry::ModelRef::from(
+                model_provider_ref.trim(),
+            ))
+        {
+            let configured_window = match selection.selection.model {
+                crate::provider_registry::ModelDefinition::Chat(model) => {
+                    let resolved_model = model
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    if selected_model.trim().is_empty()
+                        || resolved_model.is_none()
+                        || resolved_model == Some(selected_model.trim())
+                    {
+                        model.metadata.context_window
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            return configured_window.map_or(
+                ResolvedModelContextWindow {
+                    tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                    source: ModelContextWindowSource::CompatibilityFallback,
+                },
+                |tokens| ResolvedModelContextWindow {
+                    tokens,
+                    source: ModelContextWindowSource::Configured,
+                },
+            );
+        }
         let selection = self.resolve_model_selection(model_provider_ref);
         let selected_model = selected_model.trim();
         let configured_window = selection.and_then(|selection| {
@@ -13293,6 +13429,12 @@ pub struct MemoryConfig {
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
+    /// Canonical logical model reference from `[providers.models]`. When set,
+    /// the embedding connection, upstream model, credential, and dimensions
+    /// are resolved from the provider registry; the legacy provider/model
+    /// fields remain the explicit V4 migration fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model_ref: Option<String>,
     /// Embedding model identifier — must match a model your chosen embedding model_provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings: the change is detected at startup and stale vectors are cleared automatically; run `zeroclaw memory reindex` to re-embed (or set `auto_reindex_on_identity_change`).
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
@@ -13913,6 +14055,7 @@ impl Default for MemoryConfig {
             daily_retention_days: default_zero_retention(),
             core_retention_days: default_zero_retention(),
             embedding_provider: default_embedding_provider(),
+            embedding_model_ref: None,
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
             auto_reindex_on_identity_change: false,
@@ -23452,6 +23595,105 @@ impl Config {
         out
     }
 
+    /// Return unknown leaves inside canonical model option patches. The
+    /// options patch structs intentionally ignore unrecognized leaves so a
+    /// typo cannot abort an otherwise valid config; the startup loader calls
+    /// this scanner once to make that loss visible. It operates on TOML
+    /// tables directly, preserving quoted dotted registry keys as one key.
+    pub fn unknown_canonical_option_fields(raw_toml: &str) -> Vec<String> {
+        fn option_fields(capability: &str) -> &'static [&'static str] {
+            match capability {
+                "chat" => crate::provider_registry::ChatOptionsPatch::FIELDS,
+                "tts" => crate::provider_registry::TtsOptionsPatch::FIELDS,
+                "asr" => crate::provider_registry::AsrOptionsPatch::FIELDS,
+                _ => &[],
+            }
+        }
+        fn key_segment(key: &str) -> String {
+            toml_edit::Key::new(key).to_string()
+        }
+        fn scan_options(
+            options: Option<&toml::Value>,
+            capability: &str,
+            path: &str,
+            out: &mut Vec<String>,
+        ) {
+            let Some(options) = options.and_then(toml::Value::as_table) else {
+                return;
+            };
+            let known = option_fields(capability);
+            for field in options
+                .keys()
+                .filter(|field| !known.contains(&field.as_str()))
+            {
+                out.push(format!("{path}.options.{}", key_segment(field)));
+            }
+        }
+
+        let Ok(raw) = raw_toml.parse::<toml::Table>() else {
+            return Vec::new();
+        };
+        let Some(providers) = raw.get("providers").and_then(toml::Value::as_table) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+
+        if let Some(models) = providers.get("models").and_then(toml::Value::as_table) {
+            for (model_ref, model) in models {
+                let Some(model) = model.as_table() else {
+                    continue;
+                };
+                let Some(capability) = model.get("capability").and_then(toml::Value::as_str) else {
+                    continue;
+                };
+                let path = format!("providers.models.{}", key_segment(model_ref));
+                scan_options(model.get("options"), capability, &path, &mut out);
+            }
+        }
+        if let Some(presets) = providers
+            .get("model_presets")
+            .and_then(toml::Value::as_table)
+        {
+            for (preset_name, value) in presets {
+                let Some(preset_table) = value.as_table() else {
+                    continue;
+                };
+                let Some(capability) = preset_table.get("capability").and_then(toml::Value::as_str)
+                else {
+                    continue;
+                };
+                let path = format!("providers.model_presets.{}", key_segment(preset_name));
+                scan_options(preset_table.get("options"), capability, &path, &mut out);
+            }
+        }
+        if let Some(connections) = providers.get("connections").and_then(toml::Value::as_table) {
+            for (connection_name, value) in connections {
+                let Some(connection_table) = value.as_table() else {
+                    continue;
+                };
+                let Some(api) = connection_table.get("api").and_then(toml::Value::as_table) else {
+                    continue;
+                };
+                for (capability, api_value) in api {
+                    let path = format!(
+                        "providers.connections.{}.api.{}",
+                        key_segment(connection_name),
+                        key_segment(capability)
+                    );
+                    scan_options(
+                        api_value.as_table().and_then(|table| table.get("options")),
+                        capability,
+                        &path,
+                        &mut out,
+                    );
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Return extra-nested model-provider alias tables that look like a
     /// misplaced provider config, e.g.
     /// `[providers.models.zai.default.default]`.
@@ -23751,6 +23993,15 @@ impl Config {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"key": key})),
                     "Unknown config key ignored: \"\". Check config.toml for typos or deprecated options."
+                );
+            }
+            for path in Self::unknown_canonical_option_fields(&contents) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"path": path})),
+                    "Unknown canonical model option ignored; check the capability option name"
                 );
             }
             // Unknown provider families are dropped by serde, so an alias
@@ -24239,7 +24490,7 @@ impl Config {
                 "memory.search_mode is {search_mode:?} on sqlite memory, but no effective \
                  embedding provider is configured; vector search is skipped and \
                  recall falls back to keyword-only behavior. Configure \
-                 memory.embedding_provider or a valid memory.embedding_model \
+                 memory.embedding_model_ref, memory.embedding_provider, or a valid memory.embedding_model \
                  hint route, or set memory.search_mode = \"bm25\"."
             ),
             "memory.search_mode",
@@ -24256,6 +24507,23 @@ impl Config {
     }
 
     fn memory_has_effective_embedder(&self) -> bool {
+        if let Some(model_ref) = self
+            .memory
+            .embedding_model_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && let Ok(registry) = self.provider_registry()
+            && let Ok(resolved) =
+                registry.resolve_embedding(&crate::provider_registry::ModelRef::from(model_ref))
+            && !resolved.model.trim().is_empty()
+            && resolved
+                .dimensions
+                .unwrap_or(self.memory.embedding_dimensions)
+                > 0
+        {
+            return true;
+        }
         let fallback = || Self::memory_embedding_settings_have_effective_embedder(&self.memory);
         let Some(hint) = self
             .memory

@@ -1,6 +1,62 @@
 # Provider Configuration
 
-Every model provider lives at `[providers.models.<type>.<alias>]`. `<type>` is a canonical family slot (see the [Catalog](./catalog.md#all-slots) for every slot with its endpoint). `<alias>` is your operator-assigned instance name, pick any descriptive name (`home`, `work`, `cn`, `gpt5`, ...).
+The canonical layout separates reusable connections from logical models. A
+model reference is an exact TOML key, so a name such as `chat.gateway.prod`
+keeps both dots as part of the reference. The older family/alias layout below
+remains the migration reference for existing V4 files.
+
+## Canonical connections and models
+
+Put shared endpoint and authentication settings in a connection, then bind
+each logical model to that connection. Connections can advertise more than one
+capability; each model still declares its own capability and upstream model ID.
+Presets and fallback routes are independent registries and use the same exact
+model references.
+
+```toml
+[providers.connections."gateway.prod"]
+kind = "openai-compatible"
+uri = "https://gateway.example.com/v1"
+capabilities = ["chat", "embedding", "tts", "asr"]
+auth = { mode = "api_key", api_key = "<API_KEY>" }
+
+[providers.connections."gateway.prod".api.chat]
+wire_api = "chat_completions"
+request_timeout_secs = 120
+read_timeout_secs = 300
+
+[providers.model_presets."chat.balanced"]
+capability = "chat"
+options = { temperature = 0.5, max_tokens = 4096 }
+
+[providers.models."chat.fast"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o-mini"
+preset = "chat.balanced"
+metadata = { context_window = 128000 }
+
+[providers.models."embedding.semantic"]
+capability = "embedding"
+provider = "gateway.prod"
+model = "text-embedding-3-small"
+metadata = { dimensions = 1536 }
+
+[providers.fallback]
+"chat.fast" = ["chat.backup"]
+
+[memory]
+embedding_model_ref = "embedding.semantic"
+```
+
+`connections.<name>.uri` is the shared endpoint; capability tables derive
+their paths and do not define a second URI. API defaults are applied first,
+then the API preset/options, model preset/options, and finally invocation
+overrides. `request_timeout_secs` is the total request bound and
+`read_timeout_secs` is the response-read idle bound; they are independent.
+For fields that support explicit clearing, the string `"null"` means clear and
+inheritance is represented by leaving the field unset. A literal string value
+`"null"` uses `{ value = "null" }` where that field supports the escape.
 
 ## Minimal working example
 

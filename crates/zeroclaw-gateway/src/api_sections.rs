@@ -171,6 +171,10 @@ fn quickstart_agent_missing_requirements(
     let model_ref = agent.model_provider.trim();
     if model_ref.is_empty() {
         missing.push(format!("Set a model provider for agent `{alias}`."));
+    } else if cfg.is_configured_model_ref(model_ref) {
+        if cfg.resolve_model_id(model_ref).is_none() {
+            missing.push(format!("Choose a model for model provider `{model_ref}`."));
+        }
     } else if let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) {
         // Resolve through the selection so a nested-only profile (model ids
         // under `[providers.models.<family>.<alias>.models.*]`) still counts.
@@ -609,8 +613,7 @@ fn alias_effective_model(
     family: &str,
     alias: &str,
 ) -> Option<String> {
-    cfg.resolve_model_selection(&format!("{family}.{alias}"))
-        .and_then(|selection| selection.model_id)
+    cfg.resolve_model_id(&format!("{family}.{alias}"))
 }
 
 fn storage_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {

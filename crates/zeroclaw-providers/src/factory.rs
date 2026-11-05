@@ -301,6 +301,15 @@ pub fn apply_compat_options(
     if let Some(t) = opts.provider_timeout_secs {
         b = b.timeout_secs(t);
     }
+    if opts.provider_timeout_disabled {
+        b = b.without_timeout();
+    }
+    if let Some(t) = opts.provider_read_timeout_secs {
+        b = b.read_timeout_secs(t);
+    }
+    if opts.provider_read_timeout_disabled {
+        b = b.without_read_timeout();
+    }
     if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
@@ -2130,10 +2139,35 @@ pub fn dispatch_model_ref(
         ModelDefinition::Chat(model) => model.metadata.vision,
         _ => None,
     };
-    runtime.provider_timeout_secs = resolved.request_timeout_secs.and_then(|value| match value {
-        Override::Set(value) => Some(value.get()),
-        Override::Clear => None,
-    });
+    runtime.provider_timeout_secs =
+        resolved
+            .request_timeout_secs
+            .as_ref()
+            .and_then(|value| match value {
+                Override::Set(value) => Some(value.get()),
+                Override::Clear => None,
+            });
+    runtime.provider_timeout_disabled = matches!(
+        resolved.request_timeout_secs.as_ref(),
+        Some(Override::Clear)
+    );
+    // Canonical chat configuration has an independent read-idle baseline.
+    // Materialize the compatible driver's 300-second default here instead of
+    // deriving it from request_timeout_secs; legacy family construction keeps
+    // its historical max(300, timeout) behavior in the adapter.
+    runtime.provider_read_timeout_secs = resolved
+        .read_timeout_secs
+        .as_ref()
+        .and_then(|value| match value {
+            Override::Set(value) => Some(value.get()),
+            Override::Clear => None,
+        })
+        .or_else(|| {
+            (!matches!(resolved.read_timeout_secs.as_ref(), Some(Override::Clear)))
+                .then_some(crate::STREAM_IDLE_TIMEOUT.as_secs())
+        });
+    runtime.provider_read_timeout_disabled =
+        matches!(resolved.read_timeout_secs.as_ref(), Some(Override::Clear));
     runtime.extra_headers = resolved
         .selection
         .connection

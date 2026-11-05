@@ -335,15 +335,12 @@ pub async fn handle_api_status(
                     Some(agent.model_provider.as_str().to_string())
                 };
                 let resolved = config.resolved_model_provider_for_agent(alias);
-                let selection = config.resolve_model_selection(agent.model_provider.as_str());
-                let model = selection
-                    .as_ref()
-                    .and_then(|s| s.model_id.clone())
+                let model = config
+                    .resolve_model_id(agent.model_provider.as_str())
                     .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.model.clone()))
                     .unwrap_or_default();
-                let temperature: Option<f64> = selection
-                    .as_ref()
-                    .and_then(|s| s.temperature())
+                let temperature: Option<f64> = config
+                    .resolve_model_temperature(agent.model_provider.as_str())
                     .or_else(|| resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature));
                 let backend_kind = agent.memory.backend;
                 let backend = serde_json::to_value(backend_kind)

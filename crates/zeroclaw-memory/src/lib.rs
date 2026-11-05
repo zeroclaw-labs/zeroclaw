@@ -320,6 +320,29 @@ pub fn resolve_embedding_settings(
     }
 }
 
+/// Resolve embedding settings from the full loaded config. Canonical logical
+/// model bindings take precedence; the legacy helper remains available for
+/// callers that only have the old `[memory]` and route sections.
+pub fn resolve_embedding_settings_from_config(
+    config: &Config,
+    api_key: Option<&str>,
+) -> EmbeddingSettings {
+    if let Some(resolved) = resolve_canonical_embedding_config(config, api_key) {
+        return EmbeddingSettings {
+            model_provider: resolved.model_provider,
+            model: resolved.model,
+            dimensions: resolved.dimensions,
+            api_key: resolved.api_key,
+        };
+    }
+    resolve_embedding_settings(
+        &config.memory,
+        &config.embedding_routes,
+        api_key,
+        Some(&config.providers.models),
+    )
+}
+
 fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -400,6 +423,145 @@ fn resolve_embedding_config(
         inherited_api_key,
         providers,
     )
+}
+
+/// Resolve the new logical embedding model binding without flattening its
+/// connection into the legacy `[memory]` provider/model fields. The returned
+/// value is an admission snapshot for this construction only; the registry
+/// remains the source of truth for subsequent refreshes.
+fn resolve_canonical_embedding_config(
+    config: &Config,
+    inherited_api_key: Option<&str>,
+) -> Option<ResolvedEmbeddingConfig> {
+    let model_ref = config
+        .memory
+        .embedding_model_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let registry = match config.provider_registry() {
+        Ok(registry) => registry,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "memory.embedding_model_ref_invalid",
+                        "model_ref": model_ref,
+                        "error": error.to_string(),
+                    })),
+                "Canonical embedding model could not be admitted; using legacy memory embedding settings"
+            );
+            return None;
+        }
+    };
+    let resolved = match registry.resolve_embedding(
+        &zeroclaw_config::provider_registry::ModelRef::from(model_ref),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "memory.embedding_model_ref_invalid",
+                        "model_ref": model_ref,
+                        "error": error.to_string(),
+                    })),
+                "Canonical embedding model could not be resolved; using legacy memory embedding settings"
+            );
+            return None;
+        }
+    };
+    let model = resolved.model.trim();
+    if model.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"model_ref": model_ref})),
+            "Canonical embedding model has no upstream model ID; using legacy memory embedding settings"
+        );
+        return None;
+    }
+
+    let connection = resolved.selection.connection;
+    let provider = match connection {
+        zeroclaw_config::provider_registry::ProviderConnection::OpenAi(_) => connection
+            .uri()
+            .map(|uri| format!("custom:{}", uri.trim_end_matches('/')))
+            .unwrap_or_else(|| "openai".to_owned()),
+        zeroclaw_config::provider_registry::ProviderConnection::OpenRouter(_) => connection
+            .uri()
+            .map(|uri| format!("custom:{}", uri.trim_end_matches('/')))
+            .unwrap_or_else(|| "openrouter".to_owned()),
+        zeroclaw_config::provider_registry::ProviderConnection::OpenAiCompatible(_)
+        | zeroclaw_config::provider_registry::ProviderConnection::Custom(_) => {
+            let Some(uri) = connection
+                .uri()
+                .map(str::trim)
+                .filter(|uri| !uri.is_empty())
+            else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_ref": model_ref})),
+                    "Canonical embedding connection has no URI; using legacy memory embedding settings"
+                );
+                return None;
+            };
+            format!("custom:{}", uri.trim_end_matches('/'))
+        }
+        _ => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model_ref": model_ref,
+                        "kind": connection.kind(),
+                    })),
+                "Canonical embedding connection kind has no OpenAI-compatible embedding adapter; using legacy memory embedding settings"
+            );
+            return None;
+        }
+    };
+    let dimensions = resolved
+        .dimensions
+        .unwrap_or(config.memory.embedding_dimensions);
+    if dimensions == 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"model_ref": model_ref})),
+            "Canonical embedding model has no positive vector dimension; using legacy memory embedding settings"
+        );
+        return None;
+    }
+    let explicit_key = config
+        .memory
+        .embedding_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    Some(ResolvedEmbeddingConfig {
+        model_provider: provider,
+        model: model.to_owned(),
+        dimensions,
+        api_key: explicit_key
+            .map(ToOwned::to_owned)
+            .or_else(|| connection.api_key().map(ToOwned::to_owned))
+            .or_else(|| {
+                inherited_api_key
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            }),
+    })
 }
 
 fn resolve_provider_ref(
@@ -521,13 +683,15 @@ pub fn create_memory_from_config(
     config: &Config,
     api_key: Option<&str>,
 ) -> anyhow::Result<Box<dyn Memory>> {
-    create_memory_with_storage_and_routes(
+    let canonical_embedding = resolve_canonical_embedding_config(config, api_key);
+    create_memory_with_storage_and_routes_inner(
         &config.memory,
         &config.embedding_routes,
         config.resolve_active_storage(),
         &config.data_dir,
         api_key,
         Some(&config.providers.models),
+        canonical_embedding.as_ref(),
     )
 }
 
@@ -566,9 +730,31 @@ pub fn create_memory_with_storage_and_routes(
     api_key: Option<&str>,
     providers: Option<&ModelProviders>,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    create_memory_with_storage_and_routes_inner(
+        config,
+        embedding_routes,
+        active_storage,
+        workspace_dir,
+        api_key,
+        providers,
+        None,
+    )
+}
+
+fn create_memory_with_storage_and_routes_inner(
+    config: &MemoryConfig,
+    embedding_routes: &[EmbeddingRouteConfig],
+    active_storage: ActiveStorage<'_>,
+    workspace_dir: &Path,
+    api_key: Option<&str>,
+    providers: Option<&ModelProviders>,
+    canonical_embedding: Option<&ResolvedEmbeddingConfig>,
+) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
-    let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key, providers);
+    let resolved_embedding = canonical_embedding
+        .cloned()
+        .unwrap_or_else(|| resolve_embedding_config(config, embedding_routes, api_key, providers));
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
     if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
