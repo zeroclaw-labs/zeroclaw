@@ -578,15 +578,15 @@ use zeroclaw_config::schema::{
     MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
     MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
     NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
-    ZerorouterModelProviderConfig,
+    NvidiaModelProviderConfig, ObscurifyModelProviderConfig, OllamaModelProviderConfig,
+    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -660,6 +660,13 @@ impl CompatFamilySpec for AtlasCloudModelProviderConfig {
     const DISPLAY: &'static str = "Atlas Cloud";
     const DEFAULT_URL: &'static str = "https://api.atlascloud.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
+}
+impl CompatFamilySpec for ObscurifyModelProviderConfig {
+    const DISPLAY: &'static str = "Obscurify.ai";
+    const DEFAULT_URL: &'static str = "https://obscurify.ai/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    // `GET /v1/models` is served without a key.
     const PUBLIC_MODEL_LISTING: bool = true;
 }
 impl CompatFamilySpec for ZerorouterModelProviderConfig {
@@ -2489,6 +2496,21 @@ mod tests {
         assert_eq!(
             get_default_url("atlascloud"),
             Some("https://api.atlascloud.ai/v1")
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn obscurify_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{ModelEndpoint, ObscurifyEndpoint};
+        assert_eq!(
+            <ObscurifyModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            ObscurifyEndpoint::default().uri(),
+            "schema ObscurifyEndpoint and factory DEFAULT_URL disagree"
+        );
+        assert_eq!(
+            get_default_url("obscurify"),
+            Some("https://obscurify.ai/v1")
         );
     }
 
