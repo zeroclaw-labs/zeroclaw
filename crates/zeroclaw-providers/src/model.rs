@@ -245,6 +245,74 @@ fn build_provider(
     reliable: bool,
 ) -> anyhow::Result<crate::ResolvedModelProviderRef> {
     let selection_ref = selection_ref.trim();
+
+    // Canonical V5 model references are exact registry keys. They must be
+    // admitted before the V4 family/alias parser, which intentionally treats
+    // dots as legacy profile boundaries. The initial migration boundary uses
+    // the new resolver for both transport construction and the exact-key
+    // fallback graph. The legacy family/alias parser is only considered when
+    // this lookup does not find a canonical model.
+    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(selection_ref);
+    if config
+        .providers
+        .models
+        .canonical_model(&canonical_ref)
+        .is_some()
+    {
+        let options = crate::provider_runtime_options_for_bare_family(config);
+        let registry = config.provider_registry()?;
+        let mut reliable_candidates = Vec::new();
+        let mut raw_candidates = Vec::new();
+        let mut refs = vec![canonical_ref.clone()];
+        refs.extend(registry.fallback_targets(&canonical_ref)?.iter().cloned());
+        for candidate_ref in refs {
+            let provider = crate::factory::dispatch_model_ref(config, &candidate_ref, &options)?;
+            let upstream_model = registry
+                .resolve_chat(&candidate_ref)?
+                .upstream_model()
+                .unwrap_or(candidate_ref.as_str())
+                .to_owned();
+            if reliable {
+                let provider: std::sync::Arc<dyn ModelProvider> = provider.into();
+                reliable_candidates.push(
+                    crate::reliable::ReliableModelProviderEntry::new_pinned(
+                        candidate_ref.as_str(),
+                        candidate_ref.as_str(),
+                        candidate_ref.as_str(),
+                        &upstream_model,
+                        Box::new(provider),
+                    )
+                    .with_selection_ref(candidate_ref.as_str()),
+                );
+            } else {
+                raw_candidates.push((upstream_model, provider));
+            }
+        }
+        let provider: Box<dyn ModelProvider> = if reliable {
+            Box::new(
+                crate::reliable::ReliableModelProvider::new_with_entries(
+                    selection_ref,
+                    reliable_candidates,
+                    config.reliability.provider_retries,
+                    config.reliability.provider_backoff_ms,
+                )
+                .with_api_keys(config.reliability.api_keys.clone()),
+            )
+        } else {
+            raw_candidates
+                .into_iter()
+                .next()
+                .map(|(_, provider)| provider)
+                .ok_or_else(|| anyhow::Error::msg("canonical model has no provider candidate"))?
+        };
+        let model = overrides.model.map(str::to_owned).or_else(|| {
+            registry
+                .resolve_chat(&canonical_ref)
+                .ok()
+                .and_then(|resolved| resolved.upstream_model().map(str::to_owned))
+        });
+        return Ok(crate::ResolvedModelProviderRef { provider, model });
+    }
     crate::ensure_known_model_entry_ref(config, selection_ref)?;
     let selection = config.resolve_model_selection(selection_ref);
     let model = overrides

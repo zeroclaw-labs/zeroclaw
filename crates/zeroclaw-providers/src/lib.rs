@@ -2116,7 +2116,7 @@ fn create_resilient_model_provider_from_ref_with_model_override(
 
 /// A configured profile may have a dotted alias, but any suffix beyond that
 /// alias selects a model entry. Never turn a missing entry into a profile call.
-pub(crate) fn ensure_known_model_entry_ref(
+pub fn ensure_known_model_entry_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
 ) -> anyhow::Result<()> {

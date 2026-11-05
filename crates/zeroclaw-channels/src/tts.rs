@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use reqwest::header::HeaderValue;
 
+use zeroclaw_config::provider_registry::{
+    ModelDefinition, Override, ProviderConnection, ResolvedTts,
+};
 use zeroclaw_config::schema::{Config, TtsProviderConfig};
 
 /// Maximum text length before synthesis is rejected (default: 4096 chars).
@@ -1005,6 +1008,79 @@ impl TtsProvider for PiperTtsProvider {
     }
 }
 
+fn tts_override<T: Clone>(value: &Option<Override<T>>) -> Option<T> {
+    match value {
+        Some(Override::Set(value)) => Some(value.clone()),
+        Some(Override::Clear) | None => None,
+    }
+}
+
+fn canonical_tts_endpoint(uri: Option<&str>) -> Option<String> {
+    uri.map(|uri| {
+        let uri = uri.trim_end_matches('/');
+        if uri.ends_with("/audio/speech") {
+            uri.to_owned()
+        } else {
+            format!("{uri}/audio/speech")
+        }
+    })
+}
+
+/// Construct one TTS adapter from an admitted canonical model.  The registry
+/// has already merged connection API defaults, presets and model options, so
+/// this function only translates the resolved values into the existing wire
+/// adapters.  It intentionally does not inspect the legacy `[providers.tts]`
+/// maps.
+fn build_canonical_tts_provider(
+    model_ref: &str,
+    resolved: &ResolvedTts<'_>,
+) -> Result<(Box<dyn TtsProvider>, Option<String>)> {
+    let mut config = TtsProviderConfig {
+        api_key: resolved
+            .selection
+            .connection
+            .api_key()
+            .map(ToOwned::to_owned),
+        model: resolved
+            .selection
+            .model
+            .upstream_model()
+            .map(ToOwned::to_owned),
+        voice: resolved.options.voice.clone(),
+        speed: tts_override(&resolved.options.speed),
+        stability: tts_override(&resolved.options.stability),
+        similarity_boost: tts_override(&resolved.options.similarity_boost),
+        language_code: resolved.options.language.clone(),
+        binary_path: resolved
+            .selection
+            .connection
+            .tts_command()
+            .map(ToOwned::to_owned),
+        response_format: tts_override(&resolved.options.format),
+        uri: canonical_tts_endpoint(resolved.selection.connection.uri()),
+    };
+
+    let provider: Box<dyn TtsProvider> = match resolved.selection.connection {
+        ProviderConnection::OpenAi(_)
+        | ProviderConnection::OpenAiCompatible(_)
+        | ProviderConnection::Custom(_) => Box::new(OpenAiTtsProvider::new(model_ref, &config)?),
+        ProviderConnection::ElevenLabs(_) => {
+            Box::new(ElevenLabsTtsProvider::new(model_ref, &config)?)
+        }
+        ProviderConnection::Google(_) => Box::new(GoogleTtsProvider::new(model_ref, &config)?),
+        ProviderConnection::Edge(_) => Box::new(EdgeTtsProvider::new(model_ref, &config)?),
+        ProviderConnection::Piper(_) => Box::new(PiperTtsProvider::new(model_ref, &config)),
+        other => {
+            return Err(anyhow::Error::msg(format!(
+                "canonical TTS model `{model_ref}` uses unsupported connection kind `{}`",
+                other.kind()
+            )));
+        }
+    };
+    let voice = config.voice.take();
+    Ok((provider, voice))
+}
+
 // ── TtsManager ───────────────────────────────────────────────────
 
 async fn write_audio_and_wait_with_output(
@@ -1098,6 +1174,53 @@ impl TtsManager {
         let mut tts_providers: HashMap<String, Box<dyn TtsProvider>> = HashMap::new();
         let mut voice_by_alias: HashMap<String, String> = HashMap::new();
 
+        // Canonical model references are exact TOML keys.  Register them
+        // before the legacy family maps so a new model such as
+        // `voice.gateway.prod` is never split or shadowed by a dotted legacy
+        // profile parser.
+        if config.providers.models.has_canonical_models() {
+            let registry = config.provider_registry().map_err(|error| {
+                anyhow::Error::msg(format!("invalid canonical provider registry: {error}"))
+            })?;
+            for (model_ref, model) in &registry.models {
+                if !matches!(model, ModelDefinition::Tts(_)) {
+                    continue;
+                }
+                let result = registry.resolve_tts(model_ref).and_then(|resolved| {
+                    build_canonical_tts_provider(model_ref.as_str(), &resolved).map_err(|error| {
+                        zeroclaw_config::provider_registry::RegistryError::new(
+                            ["providers", "models", model_ref.as_str()],
+                            error.to_string(),
+                        )
+                    })
+                });
+                match result {
+                    Ok((provider, voice)) => {
+                        let key = model_ref.to_string();
+                        if let Some(voice) = voice {
+                            voice_by_alias.insert(key.clone(), voice);
+                        }
+                        tts_providers.insert(key, provider);
+                    }
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": error.to_string(),
+                                "model_ref": model_ref.as_str(),
+                            })),
+                            "canonical TTS model skipped (config error)"
+                        );
+                    }
+                }
+            }
+        }
+
         // Typed dispatch over the TtsProviders container's named slots. The
         // unknown-type warn-and-skip arm is gone — the typed container can't
         // hold an unrecognized family.
@@ -1117,14 +1240,16 @@ impl TtsManager {
             };
             match result {
                 Ok(p) => {
-                    tts_providers.insert(dotted.clone(), p);
+                    tts_providers.entry(dotted.clone()).or_insert(p);
                     if let Some(voice) = instance
                         .voice
                         .as_deref()
                         .map(str::trim)
                         .filter(|v| !v.is_empty())
                     {
-                        voice_by_alias.insert(dotted, voice.to_string());
+                        voice_by_alias
+                            .entry(dotted)
+                            .or_insert_with(|| voice.to_string());
                     }
                 }
                 Err(e) => {

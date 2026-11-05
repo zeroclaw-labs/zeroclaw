@@ -1,0 +1,114 @@
+//! One field definition for API defaults, named presets and model patches.
+
+use serde::{Deserialize, Serialize};
+
+use super::Override;
+use crate::schema::{CacheTtl, ToolResultImagePolicy};
+
+macro_rules! options_patch {
+    ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
+        #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+        #[serde(default)]
+        pub struct $name {
+            $(#[serde(skip_serializing_if = "Option::is_none")]
+            pub $field: Option<$type>,)*
+        }
+
+        impl $name {
+            /// Field names and patch decoding are generated from the same
+            /// declaration. Only the load report uses this for diagnostics.
+            pub const FIELDS: &'static [&'static str] = &[$(stringify!($field)),*];
+
+            pub fn overlay(&mut self, higher: &Self) {
+                $(if higher.$field.is_some() {
+                    self.$field.clone_from(&higher.$field);
+                })*
+            }
+
+            pub fn is_empty(&self) -> bool {
+                true $(&& self.$field.is_none())*
+            }
+        }
+    };
+}
+
+options_patch!(ChatOptionsPatch {
+    temperature: Override<f64>,
+    max_tokens: Override<u32>,
+    think: Override<bool>,
+    cache_ttl: Override<CacheTtl>,
+    native_tools: bool,
+    chat_template_kwargs: serde_json::Value,
+    provider_extra: serde_json::Value,
+    merge_system_into_user: bool,
+    replay_assistant_reasoning: bool,
+    tool_result_image_policy: ToolResultImagePolicy,
+    thinking_passthrough: bool,
+    reasoning_effort_passthrough: bool,
+    cache_passthrough: bool,
+});
+
+options_patch!(TtsOptionsPatch {
+    voice: String,
+    language: String,
+    speed: Override<f64>,
+    stability: Override<f64>,
+    similarity_boost: Override<f64>,
+    format: Override<String>,
+});
+
+options_patch!(AsrOptionsPatch {
+    language: Override<String>,
+    initial_prompt: Override<String>,
+});
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Preset<O: Default> {
+    #[serde(default)]
+    pub options: O,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(tag = "capability", rename_all = "lowercase")]
+pub enum ModelPreset {
+    Chat(Preset<ChatOptionsPatch>),
+    Tts(Preset<TtsOptionsPatch>),
+    Asr(Preset<AsrOptionsPatch>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_keeps_clear_false_and_zero_until_final_resolution() {
+        let mut low: ChatOptionsPatch =
+            toml::from_str("temperature = 0.7\nthink = true\nmax_tokens = 32").unwrap();
+        let high: ChatOptionsPatch =
+            toml::from_str("temperature = 0.0\nthink = false\nmax_tokens = \"null\"").unwrap();
+        low.overlay(&high);
+        assert_eq!(low.temperature, Some(Override::Set(0.0)));
+        assert_eq!(low.think, Some(Override::Set(false)));
+        assert_eq!(low.max_tokens, Some(Override::Clear));
+        low.overlay(&ChatOptionsPatch::default());
+        assert_eq!(low.max_tokens, Some(Override::Clear));
+        low.overlay(&toml::from_str("max_tokens = 64").unwrap());
+        assert_eq!(low.max_tokens, Some(Override::Set(64)));
+    }
+
+    #[test]
+    fn empty_patch_contains_no_business_defaults() {
+        assert!(ChatOptionsPatch::default().is_empty());
+        assert!(TtsOptionsPatch::default().is_empty());
+        assert!(AsrOptionsPatch::default().is_empty());
+        assert!(
+            toml::to_string(&ChatOptionsPatch::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

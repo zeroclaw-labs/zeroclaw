@@ -2077,6 +2077,104 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
     }
 }
 
+/// Construct a chat provider from the canonical exact-key registry. This is
+/// the migration boundary used by new consumers; the legacy family/alias
+/// dispatcher remains available only for V4 configuration adapters.
+pub fn dispatch_model_ref(
+    config: &zeroclaw_config::schema::Config,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    options: &ModelProviderRuntimeOptions,
+) -> Result<Box<dyn ModelProvider>> {
+    use zeroclaw_config::provider_registry::{ModelDefinition, Override, ProviderConnection};
+
+    let registry = config
+        .provider_registry()
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    let resolved = registry
+        .resolve_chat(model_ref)
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    let mut runtime = options.clone();
+    let model_options = &resolved.options;
+    if let Some(Override::Set(value)) = &model_options.max_tokens {
+        runtime.provider_max_tokens = Some(*value);
+    }
+    if let Some(Override::Clear) = &model_options.max_tokens {
+        runtime.provider_max_tokens = None;
+    }
+    if let Some(Override::Set(value)) = &model_options.cache_ttl {
+        runtime.cache_ttl = Some(*value);
+    }
+    if let Some(Override::Clear) = &model_options.cache_ttl {
+        runtime.cache_ttl = None;
+    }
+    runtime.native_tools = model_options.native_tools;
+    runtime.think = model_options.think.as_ref().and_then(|value| match value {
+        Override::Set(value) => Some(*value),
+        Override::Clear => None,
+    });
+    runtime.merge_system_into_user = model_options.merge_system_into_user.unwrap_or(false);
+    runtime.replay_assistant_reasoning = model_options.replay_assistant_reasoning;
+    runtime.thinking_passthrough = model_options.thinking_passthrough.unwrap_or(false);
+    runtime.reasoning_effort_passthrough =
+        model_options.reasoning_effort_passthrough.unwrap_or(false);
+    runtime.cache_passthrough = model_options.cache_passthrough.unwrap_or(false);
+    runtime.provider_extra = model_options.provider_extra.clone();
+    runtime.chat_template_kwargs = model_options.chat_template_kwargs.clone();
+    runtime.tool_result_image_policy = model_options.tool_result_image_policy.unwrap_or_default();
+    runtime.wire_api = resolved.wire_api.map(|wire| wire.as_str().to_owned());
+    runtime.provider_context_window = match resolved.selection.model {
+        ModelDefinition::Chat(model) => model.metadata.context_window,
+        _ => None,
+    };
+    runtime.vision = match resolved.selection.model {
+        ModelDefinition::Chat(model) => model.metadata.vision,
+        _ => None,
+    };
+    runtime.provider_timeout_secs = resolved.request_timeout_secs.and_then(|value| match value {
+        Override::Set(value) => Some(value.get()),
+        Override::Clear => None,
+    });
+    runtime.extra_headers = resolved
+        .selection
+        .connection
+        .extra_headers()
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    runtime.tls_ca_cert_path = resolved
+        .selection
+        .connection
+        .tls_ca_cert_path()
+        .map(str::to_owned);
+
+    let provider_kind = resolved.selection.connection.kind();
+    let supported = matches!(
+        resolved.selection.connection,
+        ProviderConnection::OpenAiCompatible(_)
+            | ProviderConnection::Custom(_)
+            | ProviderConnection::Ollama(_)
+            | ProviderConnection::Groq(_)
+    );
+    if !supported {
+        anyhow::bail!(
+            "canonical model `{}` uses connection kind `{provider_kind}`; its factory adapter is not migrated yet",
+            model_ref.as_str()
+        );
+    }
+    dispatch_family_factory(
+        None,
+        provider_kind,
+        model_ref.as_str(),
+        resolved.selection.connection.api_key(),
+        resolved.selection.connection.uri(),
+        &runtime,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

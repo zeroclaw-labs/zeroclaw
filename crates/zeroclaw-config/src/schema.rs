@@ -216,12 +216,13 @@ pub struct Config {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
-    /// All configured provider profiles, grouped by category under a
-    /// single `[providers]` root. Categories today: `models`, `tts`,
-    /// `transcription`. Shape: `[providers.<category>.<type>.<alias>]`,
-    /// e.g. `[providers.models.anthropic.default]`,
-    /// `[providers.tts.openai.default]`,
-    /// `[providers.transcription.groq.default]`.
+    /// All configured provider connections and capability model identities
+    /// under one `[providers]` root. New configuration uses exact-key tables
+    /// such as `[providers.connections."gateway.prod"]`,
+    /// `[providers.models."chat.main"]`, `[providers.model_presets."chat.fast"]`
+    /// and `[providers.fallback]`. The typed `tts`/`transcription` maps remain
+    /// only as the explicit V4 migration adapter while consumers move to the
+    /// canonical registry.
     #[serde(default)]
     #[nested]
     pub providers: crate::providers::Providers,
@@ -5444,6 +5445,29 @@ impl Config {
     ) -> Vec<ConfiguredModelEntry> {
         let filter = provider_override.map(str::trim).filter(|p| !p.is_empty());
         let mut entries = Vec::new();
+        // Canonical V5 models are already complete model references.  List
+        // them before the legacy family maps and compare filters against the
+        // exact key or its referenced connection; never split a dotted key.
+        if self.providers.models.has_canonical_models()
+            && let Ok(registry) = self.provider_registry()
+        {
+            for (model_ref, model) in &registry.models {
+                if model.capability() != crate::provider_registry::Capability::Chat {
+                    continue;
+                }
+                let provider_ref = model_ref.to_string();
+                let connection_ref = model.provider().to_string();
+                if filter.is_some_and(|f| f != provider_ref && f != connection_ref) {
+                    continue;
+                }
+                entries.push(ConfiguredModelEntry {
+                    provider_ref,
+                    profile_ref: connection_ref,
+                    model_alias: None,
+                    model_id: model.upstream_model().map(str::to_owned),
+                });
+            }
+        }
         for (ty, alias, entry) in self.providers.models.iter_entries() {
             let profile_ref = format!("{ty}.{alias}");
             let selected_model_alias = filter
@@ -26124,6 +26148,20 @@ impl Config {
             if value.is_empty() {
                 continue;
             }
+            if let Some(model) = self
+                .providers
+                .models
+                .canonical_model(&crate::provider_registry::ModelRef::from(value))
+            {
+                if model.capability() != crate::provider_registry::Capability::Chat {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("runtime_profiles.{palias}.context_compression.summary_provider"),
+                        "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} must reference a chat model",
+                    );
+                }
+                continue;
+            }
             // Accepts `<type>.<alias>` or a three-segment `<type>.<alias>.<model>`
             // (the model entry, if named, must exist under the profile).
             match self.providers.models.profile_ref(value) {
@@ -26188,6 +26226,20 @@ impl Config {
                     format!("agents.{alias}.model_provider"),
                     "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
                 );
+            }
+            if let Some(model) = self
+                .providers
+                .models
+                .canonical_model(&crate::provider_registry::ModelRef::from(mp))
+            {
+                if model.capability() != crate::provider_registry::Capability::Chat {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.model_provider"),
+                        "agents.{alias}.model_provider = {mp:?} must reference a chat model",
+                    );
+                }
+                continue;
             }
             match self.providers.models.profile_ref(mp) {
                 Some((ty, inner)) => {
@@ -26296,6 +26348,37 @@ impl Config {
             ];
             for (section_prefix, field, value) in typed_provider_refs {
                 if value.is_empty() {
+                    continue;
+                }
+                // V5 capability models are exact registry keys.  A key may
+                // contain dots, so resolve it before entering the legacy
+                // family/alias parser.  The consumer field still constrains
+                // the capability; a chat model cannot silently become an
+                // ASR or TTS backend merely because its name exists.
+                let expected_capability = match *field {
+                    "tts_provider" => Some(crate::provider_registry::Capability::Tts),
+                    "transcription_provider" => Some(crate::provider_registry::Capability::Asr),
+                    "classifier_provider" | "summary_provider" => {
+                        Some(crate::provider_registry::Capability::Chat)
+                    }
+                    _ => None,
+                };
+                if let Some(model) = self
+                    .providers
+                    .models
+                    .canonical_model(&crate::provider_registry::ModelRef::from(*value))
+                {
+                    if let Some(expected) = expected_capability
+                        && model.capability() != expected
+                    {
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("agents.{alias}.{field}"),
+                            "agents.{alias}.{field} = {value:?} references capability {:?}, expected {:?}",
+                            model.capability(),
+                            expected,
+                        );
+                    }
                     continue;
                 }
                 // classifier_provider / summary_provider point into
@@ -55707,5 +55790,17 @@ model = "gpt-4o"
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+}
+
+impl Config {
+    /// Resolve the canonical provider/model registry for one admission. The
+    /// returned view is rebuilt from the current config and must not be stored
+    /// as a second long-lived configuration snapshot.
+    pub fn provider_registry(
+        &self,
+    ) -> Result<crate::provider_registry::ProviderRegistry, crate::provider_registry::RegistryError>
+    {
+        self.providers.canonical_registry()
     }
 }

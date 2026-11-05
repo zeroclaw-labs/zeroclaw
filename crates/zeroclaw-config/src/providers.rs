@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use zeroclaw_macros::Configurable;
 
+use super::provider_registry::{
+    Capability, ModelDefinition, ModelPreset, ModelRef, ProviderConnection, ProviderId,
+    ProviderRegistry,
+};
 use super::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
     AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
@@ -230,7 +234,7 @@ macro_rules! for_each_model_provider_slot {
 macro_rules! emit_model_providers_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
         /// Typed model provider container with one alias map per provider family.
-        #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+        #[derive(Debug, Clone, Default, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[prefix = "providers.models"]
         #[application = "model_provider_refresh"]
@@ -240,12 +244,76 @@ macro_rules! emit_model_providers_struct {
                 #[nested]
                 pub $field: HashMap<String, $cfg_ty>,
             )+
+            /// Canonical V5 model definitions. This is an in-memory bridge
+            /// while the old typed family consumers are migrated; it is the
+            /// only map written for the new `[providers.models]` shape.
+            #[serde(skip)]
+            pub(crate) canonical_models: BTreeMap<ModelRef, ModelDefinition<serde_json::Value>>,
+        }
+
+        impl serde::Serialize for ModelProviders {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                if !self.canonical_models.is_empty() {
+                    return self.canonical_models.serialize(serializer);
+                }
+                let mut map = serializer.serialize_map(None)?;
+                $(if !self.$field.is_empty() { map.serialize_entry($type_str, &self.$field)?; })+
+                map.end()
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for ModelProviders {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let raw = serde_json::Value::deserialize(deserializer)?;
+                let object = raw.as_object().ok_or_else(|| serde::de::Error::custom("providers.models must be a TOML table"))?;
+                let known = [$($type_str),+];
+                let canonical = object.keys().any(|key| !known.contains(&key.as_str()))
+                    || object.values().any(|value| {
+                        value
+                            .as_object()
+                            .is_some_and(|entry| entry.contains_key("capability"))
+                    });
+                if canonical {
+                    let mut models = BTreeMap::new();
+                    for (key, value) in object {
+                        let model = serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?;
+                        models.insert(ModelRef::from(key.clone()), model);
+                    }
+                    return Ok(Self { $($field: HashMap::new(),)+ canonical_models: models });
+                }
+                Ok(Self {
+                    $($field: object.get($type_str).cloned().map(serde_json::from_value).transpose().map_err(serde::de::Error::custom)?.unwrap_or_default(),)+
+                    canonical_models: BTreeMap::new(),
+                })
+            }
         }
     };
 }
 for_each_model_provider_slot!(emit_model_providers_struct);
 
 impl ModelProviders {
+    /// Exact V5 model lookup. The key is never split on `.`.
+    pub fn canonical_model(
+        &self,
+        model_ref: &ModelRef,
+    ) -> Option<&ModelDefinition<serde_json::Value>> {
+        self.canonical_models.get(model_ref)
+    }
+
+    pub fn has_canonical_models(&self) -> bool {
+        !self.canonical_models.is_empty()
+    }
+
+    /// Whether the canonical exact-key map contains at least one model for a
+    /// capability. Consumers use this to decide whether an enabled subsystem
+    /// can rely on canonical registration before falling back to legacy maps.
+    pub fn has_canonical_capability(&self, capability: Capability) -> bool {
+        self.canonical_models
+            .values()
+            .any(|model| model.capability() == capability)
+    }
+
     /// Iterate every entry across every typed slot in a deterministic
     /// order: slot order (as declared by `for_each_model_provider_slot!`)
     /// first, then alias order within each slot. The alias maps are
@@ -857,7 +925,7 @@ mod tests {
 }
 
 /// Top-level wrapper for every configured provider category.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers"]
 pub struct Providers {
@@ -875,6 +943,93 @@ pub struct Providers {
     #[serde(default)]
     #[nested]
     pub transcription: TranscriptionProviders,
+
+    /// Canonical V5 connections. They are parsed at the provider root and are
+    /// intentionally excluded from the legacy configurable property surface;
+    /// edits use the registry boundary instead of synthesizing dotted paths.
+    #[serde(skip)]
+    pub connections: std::collections::BTreeMap<ProviderId, ProviderConnection>,
+    #[serde(skip)]
+    pub model_presets: std::collections::BTreeMap<super::provider_registry::PresetId, ModelPreset>,
+    #[serde(skip)]
+    pub fallback: std::collections::BTreeMap<ModelRef, Vec<ModelRef>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct ProvidersWire {
+    models: ModelProviders,
+    tts: TtsProviders,
+    transcription: TranscriptionProviders,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    connections: std::collections::BTreeMap<ProviderId, ProviderConnection>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    model_presets: std::collections::BTreeMap<super::provider_registry::PresetId, ModelPreset>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    fallback: std::collections::BTreeMap<ModelRef, Vec<ModelRef>>,
+}
+
+impl Serialize for Providers {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ProvidersWire {
+            models: self.models.clone(),
+            tts: self.tts.clone(),
+            transcription: self.transcription.clone(),
+            connections: self.connections.clone(),
+            model_presets: self.model_presets.clone(),
+            fallback: self.fallback.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Providers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ProvidersWire::deserialize(deserializer)?;
+        let mut providers = Self {
+            models: wire.models,
+            tts: wire.tts,
+            transcription: wire.transcription,
+            connections: wire.connections,
+            model_presets: wire.model_presets,
+            fallback: wire.fallback,
+        };
+        if !providers.models.canonical_models.is_empty()
+            || !providers.connections.is_empty()
+            || !providers.model_presets.is_empty()
+            || !providers.fallback.is_empty()
+        {
+            let raw_models = std::mem::take(&mut providers.models.canonical_models);
+            let registry = ProviderRegistry::from_raw_parts(
+                providers.connections.clone(),
+                raw_models.clone(),
+                providers.model_presets.clone(),
+                providers.fallback.clone(),
+            )
+            .map_err(serde::de::Error::custom)?;
+            providers.connections = registry.connections;
+            providers.model_presets = registry.model_presets;
+            providers.fallback = registry.fallback;
+            providers.models.canonical_models = raw_models;
+        }
+        Ok(providers)
+    }
+}
+
+impl Providers {
+    /// Build the validated canonical registry for a consumer admission. This
+    /// view is materialized on demand and is never stored as a second config
+    /// snapshot.
+    pub fn canonical_registry(
+        &self,
+    ) -> Result<ProviderRegistry, super::provider_registry::RegistryError> {
+        ProviderRegistry::from_raw_parts(
+            self.connections.clone(),
+            self.models.canonical_models.clone(),
+            self.model_presets.clone(),
+            self.fallback.clone(),
+        )
+    }
 }
 
 macro_rules! emit_model_cost_rates_struct {
@@ -1085,3 +1240,51 @@ for_each_transcription_provider_slot!(
     emit_transcription_cost_rates_struct,
     super::schema::TranscriptionCostRates
 );
+
+#[cfg(test)]
+mod canonical_registry_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_model_keys_keep_dots_as_exact_keys() {
+        let providers: Providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "openai-compatible"
+capabilities = ["chat"]
+[connections."gateway.prod".auth]
+mode = "api_key"
+api_key = "test-key"
+
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("canonical provider registry should deserialize");
+        assert!(
+            providers
+                .models
+                .canonical_model(&ModelRef::from("chat.fast.us"))
+                .is_some()
+        );
+        assert!(
+            providers
+                .models
+                .canonical_model(&ModelRef::from("chat"))
+                .is_none()
+        );
+        let registry = providers
+            .canonical_registry()
+            .expect("canonical registry should validate");
+        assert!(
+            registry
+                .selection(
+                    &ModelRef::from("chat.fast.us"),
+                    super::super::provider_registry::Capability::Chat
+                )
+                .is_ok()
+        );
+    }
+}
