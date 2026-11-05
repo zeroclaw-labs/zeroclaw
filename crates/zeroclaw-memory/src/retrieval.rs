@@ -24,7 +24,8 @@
 //! documented limitation of the opt-in cache.
 
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, PrincipalScope,
+    ProceduralMessage, StoreOptions,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -306,6 +307,111 @@ impl RetrievalPipeline {
 impl Memory for RetrievalPipeline {
     fn name(&self) -> &str {
         self.memory.name()
+    }
+
+    // Private recalls bypass the shared-plane hot cache. Its key has no
+    // principal dimension, so caching them there would cross owner boundaries.
+    async fn store_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let result = self
+            .memory
+            .store_for_principal(scope, key, content, category, session_id)
+            .await;
+        self.invalidate_cache();
+        result
+    }
+
+    async fn recall_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.memory
+            .recall_for_principal(scope, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn list_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.memory
+            .list_for_principal(scope, category, session_id)
+            .await
+    }
+
+    async fn get_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        self.memory.get_for_principal(scope, key).await
+    }
+
+    async fn forget_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let result = self.memory.forget_for_principal(scope, key).await;
+        if !matches!(&result, Ok(false)) {
+            self.invalidate_cache();
+        }
+        result
+    }
+
+    async fn count_for_principal(&self, scope: &PrincipalScope) -> anyhow::Result<usize> {
+        self.memory.count_for_principal(scope).await
+    }
+
+    async fn export_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        filter: &ExportFilter,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.memory.export_for_principal(scope, filter).await
+    }
+
+    async fn purge_namespace_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        namespace: &str,
+    ) -> anyhow::Result<usize> {
+        let result = self
+            .memory
+            .purge_namespace_for_principal(scope, namespace)
+            .await;
+        if !matches!(&result, Ok(0)) {
+            self.invalidate_cache();
+        }
+        result
+    }
+
+    async fn purge_session_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        session_id: &str,
+    ) -> anyhow::Result<usize> {
+        let result = self
+            .memory
+            .purge_session_for_principal(scope, session_id)
+            .await;
+        if !matches!(&result, Ok(0)) {
+            self.invalidate_cache();
+        }
+        result
     }
 
     async fn store(
@@ -989,6 +1095,49 @@ mod tests {
         assert_ne!(base, different_until);
         assert_ne!(absent_since, empty_since);
         assert_ne!(delimiter_in_query, delimiter_in_limit_shape);
+    }
+
+    #[tokio::test]
+    async fn cached_pipeline_keeps_private_recalls_per_owner() {
+        // The hot cache key has no owner dimension, so private recalls must
+        // not go through it: two owners asking the same query each see only
+        // their own rows, and a shared recall of that query sees neither.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sqlite: Arc<dyn Memory> = Arc::new(SqliteMemory::new("sqlite", tmp.path()).unwrap());
+        let pipeline = RetrievalPipeline::new(sqlite, cached_config());
+        let alice = PrincipalScope::new("user:alice");
+        let bob = PrincipalScope::new("user:bob");
+        pipeline
+            .store_for_principal(&alice, "a", "cacheprobe alice", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        pipeline
+            .store_for_principal(&bob, "b", "cacheprobe bob", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let contents = |entries: Vec<MemoryEntry>| -> Vec<String> {
+            entries.into_iter().map(|entry| entry.content).collect()
+        };
+        for _ in 0..2 {
+            let seen_by_alice = pipeline
+                .recall_for_principal(&alice, "cacheprobe", 10, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(contents(seen_by_alice), ["cacheprobe alice"]);
+            let seen_by_bob = pipeline
+                .recall_for_principal(&bob, "cacheprobe", 10, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(contents(seen_by_bob), ["cacheprobe bob"]);
+            let shared = Memory::recall(&pipeline, "cacheprobe", 10, None, None, None)
+                .await
+                .unwrap();
+            assert!(
+                shared.is_empty(),
+                "shared recall saw private rows: {shared:?}"
+            );
+        }
     }
 
     #[tokio::test]
