@@ -1,6 +1,10 @@
+import concurrent.futures
 import importlib.machinery
 import importlib.util
 import pathlib
+import io
+import threading
+import time
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -18,6 +22,7 @@ class FakeMaster:
 
     def __init__(self, command, **kwargs):
         self.command, self.returncode = command, (255 if self.fail else None)
+        self.stderr = io.BytesIO()
         self.starts.append(self)
         if not self.fail:
             pathlib.Path(command[command.index('-S') + 1]).touch()
@@ -138,14 +143,66 @@ class TaskTransportTests(unittest.TestCase):
         self.assertEqual(host, 'siem')
         self.assertEqual(commands, ['hostname'])
 
-    def test_aliases_share_transport_but_identity_routes_do_not(self):
+    def test_aliases_and_identity_routes_have_separate_transports(self):
         from types import SimpleNamespace
         config = 'hostname host.example.test\nport 22\nuser operator\nidentityagent /private/agent\nidentityfile key-a.pub\nidentityfile key-b.pub\n'
         with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(stdout=config)):
             first = module.ssh_config([], 'alias-a')
-            self.assertEqual(first, module.ssh_config([], 'alias-b'))
+            self.assertNotEqual(first, module.ssh_config([], 'alias-b'))
         with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(stdout=config.replace('key-a.pub', 'different.pub'))):
             self.assertNotEqual(first, module.ssh_config([], 'alias-a'))
+
+
+    def test_trust_changes_never_reuse_a_permissive_master(self):
+        from types import SimpleNamespace
+        for field in ['stricthostkeychecking', 'userknownhostsfile', 'globalknownhostsfile',
+                      'verifyhostkeydns', 'checkhostip', 'hostkeyalgorithms']:
+            with self.subTest(field=field):
+                with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(stdout=field+' weak\n')):
+                    weak = module.ssh_config([], 'same')
+                with patch.object(module.subprocess, 'run', return_value=SimpleNamespace(stdout=field+' strict\n')):
+                    self.assertNotEqual(weak, module.ssh_config([], 'same'))
+
+    def test_stderr_is_drained_and_bounded(self):
+        log = module.BoundedLog()
+        log.attach(io.BytesIO(b'x' * 2_000_000 + b'END'))
+        log.reader.join(timeout=2)
+        self.assertFalse(log.reader.is_alive())
+        self.assertLessEqual(len(log.data), log.LIMIT)
+        self.assertTrue(log.detail().endswith('END'))
+        log.close()
+        self.assertTrue(log.closed)
+        self.assertEqual(log.data, b'')
+
+    def test_slow_destination_does_not_block_other_keys_or_cleanup(self):
+        class SlowMaster(FakeMaster):
+            def __init__(self, command, **kwargs):
+                super().__init__(command, **kwargs)
+                if command[-1] == 'slow':
+                    pathlib.Path(command[command.index('-S') + 1]).unlink()
+        errors = []
+        def connect(key):
+            try: self.pool.acquire(key, [], 'slow')
+            except RuntimeError: errors.append(key)
+        with patch.object(module.subprocess, 'Popen', SlowMaster):
+            threads = [threading.Thread(target=connect, args=(key,)) for key in ['a','b']]
+            for t in threads: t.start()
+            deadline = time.monotonic()+2
+            while len(FakeMaster.starts)<2 and time.monotonic()<deadline: time.sleep(.01)
+            start = time.monotonic()
+            self.pool.acquire('fast', [], 'fast')
+            self.assertLess(time.monotonic()-start, 1)
+            self.assertEqual(len(FakeMaster.starts), 3)
+            self.pool.close()
+            for t in threads: t.join(timeout=2)
+            self.assertTrue(all(not t.is_alive() for t in threads))
+            self.assertEqual(sorted(errors), ['a','b'])
+
+    def test_overlapping_first_connections_for_one_key_spawn_only_once(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(lambda _: self.pool.acquire('same', [], 'host'), range(8)))
+        self.assertEqual(len(set(results)), 1)
+        self.assertEqual(len(FakeMaster.starts), 1)
 
 
 if __name__ == '__main__': unittest.main()
