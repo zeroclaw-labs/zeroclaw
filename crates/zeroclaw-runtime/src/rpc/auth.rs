@@ -818,7 +818,7 @@ impl RpcInboundAuth {
                 // no compatibility path, roster or not.
                 TransportKind::Inproc => {
                     return Err(AuthDenied::auth_required(
-                        crate::i18n::get_required_cli_string("rpc-auth-required-token"),
+                        crate::i18n::get_required_cli_string("rpc-auth-inproc-token-required"),
                     ));
                 }
             }
@@ -1015,6 +1015,14 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(denied.code, AUTH_REQUIRED);
+        // The refusal names the one way in: a duplex has no peer uid, so
+        // pointing at a mapped local uid would send the caller nowhere.
+        assert_eq!(
+            denied.message,
+            crate::i18n::get_required_cli_string("rpc-auth-inproc-token-required")
+        );
+        assert!(denied.message.contains("auth_token"), "{}", denied.message);
+        assert!(!denied.message.contains("uid"), "{}", denied.message);
     }
 
     #[tokio::test]
