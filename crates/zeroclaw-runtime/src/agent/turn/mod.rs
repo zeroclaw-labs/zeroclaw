@@ -11394,6 +11394,7 @@ mod sop_step_reassembly_tests {
                     config: &config,
                     capabilities: None,
                     live_config: None,
+                    memory_owner: None,
                 }),
                 None,
                 &mut exec_cache,
