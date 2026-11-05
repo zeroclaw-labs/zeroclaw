@@ -49245,6 +49245,80 @@ mod tests {
         }
     }
 
+    /// Abort decides at its final boundary, under the incarnation and
+    /// cancellation locks, by the authority in force then. A revoked
+    /// `sessions:delete` grant, or an administrator demoted while aborting
+    /// another principal's turn, leaves the turn running; an unrelated
+    /// publication does not.
+    #[tokio::test]
+    async fn abort_decides_by_current_authority_at_its_final_boundary() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        for change in ["revoke", "demote", "unrelated"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let sid = "abort-effect";
+            let owner = if change == "demote" {
+                "user:bob"
+            } else {
+                "user:alice"
+            };
+            let (ctx, _backend, _key) =
+                append_review_fixture(&tmp, sid, owner, change == "demote").await;
+            // Abort takes the operator verb `session/kill` uses. Each
+            // republication starts from the fixture's config, so every one
+            // but the revocation grants it again.
+            let grant_delete = |profile: &mut zeroclaw_config::schema::PermissionProfileConfig| {
+                profile
+                    .grants
+                    .get_mut(&Resource::Sessions)
+                    .unwrap()
+                    .push(Verb::Delete);
+            };
+            republish_session_scoped(&ctx, grant_delete);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let generation = ctx.sessions.get_generation(sid).await.unwrap();
+            let token = tokio_util::sync::CancellationToken::new();
+            ctx.sessions.register_cancel_token_for_generation_for_test(
+                sid,
+                generation,
+                token.clone(),
+            );
+            let params = json!({"session_id": sid});
+            let (entered, release) = ctx.sessions.set_test_control_pause();
+            let mut request = Box::pin(alice.handle_session_abort(&params));
+            tokio::select! {
+                result = &mut request => panic!("abort returned before its final boundary: {result:?}"),
+                _ = entered.notified() => {},
+            }
+            match change {
+                "revoke" => republish_session_scoped(&ctx, |_| {}),
+                "demote" => republish_session_scoped(&ctx, |profile| {
+                    grant_delete(profile);
+                    profile.admin = false;
+                }),
+                _ => republish_session_scoped(&ctx, |profile| {
+                    grant_delete(profile);
+                    profile.grants.insert(Resource::Memory, vec![Verb::Read]);
+                }),
+            }
+            release.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+                .await
+                .expect("abort completes after its pause");
+            if change == "unrelated" {
+                result.expect("an unrelated publication preserves the abort");
+                assert!(token.is_cancelled());
+                assert_eq!(
+                    ctx.sessions.take_cancel_cause(sid),
+                    Some(crate::rpc::session::CancelCause::OperatorAbort)
+                );
+            } else {
+                assert_eq!(result.expect_err(change).code, FORBIDDEN, "{change}");
+                assert!(!token.is_cancelled(), "{change}: the turn keeps running");
+                assert_eq!(ctx.sessions.take_cancel_cause(sid), None, "{change}");
+            }
+        }
+    }
+
     /// A remote abort or rename is decided again at its final boundary: a
     /// same-generation resume by another TUI in between refuses it, while the
     /// same TUI reconnecting keeps it.
