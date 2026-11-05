@@ -8708,7 +8708,9 @@ mod tests {
     async fn served_by_c_anthropic_server() -> wiremock::MockServer {
         use wiremock::{Mock, MockServer, matchers::method};
 
-        let server = MockServer::start().await;
+        // A dedicated endpoint must not reuse a pooled connection dispatched by
+        // another Tokio test runtime that has already been dropped.
+        let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
