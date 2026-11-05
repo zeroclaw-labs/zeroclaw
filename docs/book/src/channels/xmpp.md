@@ -220,3 +220,16 @@ hook cancellation, and cancellation while queued) are recorded as terminal
 control outcomes without inventing a runtime-history link. An aborted/crashed
 execution remains admitted and unknown. Reviewed release must never be used to
 claim that returned processing proves successful tools or external delivery.
+
+### Connection interruptions and key publication
+
+The channel retains its exclusive encrypted store while reconnecting, so agent
+and control completion receipts can be recorded even while the socket is offline.
+Offline inbox administration requires stopping the channel owner, not merely
+disconnecting it. Uncertain admitted execution remains protected from release.
+
+Legacy OMEMO publication requests `pubsub#access_model=open` for the public device
+list and bundle. These public keys are readable without roster subscriptions;
+message admission still requires the live peer allowlist and fingerprint pins.
+A server refusal fails startup explicitly. Existing nodes with incompatible
+publication policy must be reconciled by their owner before restarting.

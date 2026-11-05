@@ -178,6 +178,41 @@ impl ChannelState {
         tx.commit()?;
         Ok(pin)
     }
+    #[cfg(test)]
+    pub(crate) fn stage_admitted_fixture(&mut self, id: &str, runtime: bool) -> Result<()> {
+        use crate::xmpp_omemo::inbox::{self, RuntimeLink};
+        let db = self.owner.connection();
+        let tx = db.transaction()?;
+        inbox::stage(
+            &tx,
+            &self.cipher,
+            &self.account,
+            "alice@example.test",
+            id,
+            101,
+            [1; 32],
+            b"synthetic input",
+        )?;
+        tx.commit()?;
+        ensure!(
+            inbox::admit(db, "alice@example.test", id)?,
+            "Fixture admission failed"
+        );
+        if runtime {
+            inbox::bind_runtime(
+                db,
+                &self.cipher,
+                &self.account,
+                "alice@example.test",
+                id,
+                RuntimeLink {
+                    agent: "fixture-owner".into(),
+                    history_key: "fixture-history".into(),
+                },
+            )?;
+        }
+        Ok(())
+    }
     pub fn public_bundle(&mut self) -> Result<crate::xmpp_omemo::bundle::PublicBundle> {
         crate::xmpp_omemo::prekey_inventory::replenish(
             self.owner.connection(),

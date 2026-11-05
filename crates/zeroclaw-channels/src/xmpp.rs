@@ -503,6 +503,35 @@ impl XmppChannel {
             .await?;
         Ok(stream)
     }
+    // The channel owns durable receipts; the listener owns only socket I/O.
+    // Reconnect reuses this exclusive store rather than opening another owner.
+    #[cfg(target_os = "linux")]
+    fn crypto_owner(&self) -> anyhow::Result<Option<CryptoOwner>> {
+        if !self.config.omemo_enabled {
+            return Ok(None);
+        }
+        let mut owner = self
+            .encrypted
+            .lock()
+            .map_err(|_| anyhow::Error::msg("Encrypted state lock poisoned"))?;
+        if owner.is_none() {
+            *owner = Some(Arc::new(Mutex::new(
+                crate::xmpp_omemo::channel_state::ChannelState::open_or_initialize(
+                    &self.storage,
+                    &self.config.username,
+                    Arc::new(VaultInboxCipher {
+                        store: zeroclaw_config::secrets::SecretStore::new(
+                            self.inbox_vault.as_ref().context("Missing inbox vault")?,
+                            true,
+                        ),
+                        alias: self.alias.clone(),
+                    }),
+                    self.config.max_message_chars,
+                )?,
+            )));
+        }
+        Ok(owner.clone())
+    }
     async fn run(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let own = self.validate()?;
         if tokio_xmpp::rustls::crypto::CryptoProvider::get_default().is_none() {
@@ -526,37 +555,9 @@ impl XmppChannel {
         .await
         .context("XMPP TLS/authentication deadline exceeded")??;
         #[cfg(target_os = "linux")]
-        let crypto = if self.config.omemo_enabled {
-            Some(Arc::new(Mutex::new(
-                crate::xmpp_omemo::channel_state::ChannelState::open_or_initialize(
-                    &self.storage,
-                    &self.config.username,
-                    Arc::new(VaultInboxCipher {
-                        store: zeroclaw_config::secrets::SecretStore::new(
-                            self.inbox_vault.as_ref().context("Missing inbox vault")?,
-                            true,
-                        ),
-                        alias: self.alias.clone(),
-                    }),
-                    self.config.max_message_chars,
-                )?,
-            )))
-        } else {
-            None
-        };
+        let crypto = self.crypto_owner()?;
         #[cfg(target_os = "linux")]
         let receive_crypto = crypto.clone();
-        #[cfg(target_os = "linux")]
-        {
-            *self.encrypted.lock().map_err(|_| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
-                    "Encrypted state lock poisoned"
-                );
-                anyhow::Error::msg("Encrypted state lock poisoned")
-            })? = crypto.clone();
-        }
         let db = if self.config.omemo_enabled {
             None
         } else {
@@ -838,10 +839,6 @@ impl Channel for XmppChannel {
                 if let Ok(mut sender) = self.0.outbound.lock() {
                     *sender = None;
                 }
-                #[cfg(target_os = "linux")]
-                if let Ok(mut state) = self.0.encrypted.lock() {
-                    *state = None;
-                }
             }
         }
         let _reset = Reset(self);
@@ -1064,6 +1061,95 @@ impl Channel for XmppChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disconnected_listener_keeps_runtime_and_control_receipts_releasable()
+    -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir_in("/var/tmp")?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let vault = zeroclaw_config::secrets::SecretStore::new(directory.path(), true);
+        vault.encrypt("synthetic initialization")?;
+        let channel = XmppChannel::new(
+            XmppConfig {
+                username: "bob@example.test".into(),
+                password: "synthetic".into(),
+                server: "127.0.0.1".into(),
+                port: 0,
+                omemo_enabled: true,
+                connect_timeout_secs: 1,
+                ..Default::default()
+            },
+            "private".into(),
+            directory.path().into(),
+            Arc::new(|| vec!["alice@example.test".into()]),
+        )
+        .with_pin_resolver(Arc::new(Vec::new))
+        .with_inbox_vault(Some(directory.path().into()));
+        let owner = channel.crypto_owner()?.unwrap();
+        for id in ["runtime", "queued", "interrupted"] {
+            owner
+                .lock()
+                .unwrap()
+                .stage_admitted_fixture(id, id == "runtime")?;
+        }
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(channel.listen(tx).await.is_err());
+        assert!(!channel.health_check().await);
+        let message = |id: &str| ChannelMessage {
+            id: id.into(),
+            sender: "alice@example.test".into(),
+            content: "synthetic input".into(),
+            channel: "xmpp".into(),
+            ..Default::default()
+        };
+        channel.inbound_returned(&message("runtime")).await?;
+        channel
+            .inbound_control_returned(&message("queued"), "queued_cancelled")
+            .await?;
+        assert!(Arc::ptr_eq(&owner, &channel.crypto_owner()?.unwrap()));
+        assert!(
+            crate::xmpp_omemo::private_store::PrivateStore::open_existing(&channel.storage)
+                .is_err()
+        );
+        let storage = channel.storage.clone();
+        drop(owner);
+        drop(channel);
+        for id in ["runtime", "queued", "interrupted"] {
+            let args = vec![
+                "inspect".into(),
+                directory.path().to_string_lossy().into_owned(),
+                storage.to_string_lossy().into_owned(),
+                "private".into(),
+                "bob@example.test".into(),
+                "alice@example.test".into(),
+                id.into(),
+            ];
+            let record = super::inbox_admin::run(&args)?;
+            assert_eq!(
+                record["phase"],
+                if id == "interrupted" {
+                    "admitted"
+                } else {
+                    "returned"
+                }
+            );
+            let mut release = args;
+            release[0] = "release-returned".into();
+            release.extend([
+                record["review_token"].as_str().unwrap().into(),
+                "synthetic reviewed completion".into(),
+            ]);
+            let result = super::inbox_admin::run(&release);
+            if id == "interrupted" {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result?["released"], true);
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn expired_and_cancelled_sends_never_reach_socket() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};

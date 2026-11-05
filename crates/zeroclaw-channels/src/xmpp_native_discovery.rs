@@ -210,6 +210,36 @@ where
                 )
                 .build(),
         )
+        .append(
+            Element::builder("publish-options", PUBSUB)
+                .append(
+                    Element::builder("x", "jabber:x:data")
+                        .attr("type".try_into()?, "submit")
+                        .append(
+                            Element::builder("field", "jabber:x:data")
+                                .attr("var".try_into()?, "FORM_TYPE")
+                                .attr("type".try_into()?, "hidden")
+                                .append(
+                                    Element::builder("value", "jabber:x:data")
+                                        .append("http://jabber.org/protocol/pubsub#publish-options")
+                                        .build(),
+                                )
+                                .build(),
+                        )
+                        .append(
+                            Element::builder("field", "jabber:x:data")
+                                .attr("var".try_into()?, "pubsub#access_model")
+                                .append(
+                                    Element::builder("value", "jabber:x:data")
+                                        .append("open")
+                                        .build(),
+                                )
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
         .build();
     exchange(
         source,
@@ -226,7 +256,8 @@ where
         &id,
         false,
     )
-    .await?;
+    .await
+    .context("Server refused readable OMEMO key publication")?;
     Ok(())
 }
 pub(super) async fn announce<R>(
@@ -275,17 +306,16 @@ where
             .as_deref()
             .unwrap_or("<list xmlns='eu.siacs.conversations.axolotl'/>"),
     )?;
-    if list.include_own(bundle.device)? {
-        publish(
-            source,
-            requests,
-            pending,
-            own,
-            &format!("{LEGACY}.devicelist"),
-            &list.xml(),
-        )
-        .await?;
-    }
+    list.include_own(bundle.device)?;
+    publish(
+        source,
+        requests,
+        pending,
+        own,
+        &format!("{LEGACY}.devicelist"),
+        &list.xml(),
+    )
+    .await?;
     Ok(())
 }
 pub(super) async fn peer_bundle<R>(
@@ -510,5 +540,90 @@ mod absence_tests {
             result.is_err(),
             "Malformed success would erase existing devices"
         );
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    #[tokio::test]
+    async fn publication_requires_readable_public_keys_and_propagates_refusal() {
+        for refused in [false, true] {
+            let own: jid::BareJid = "bob@example.test".parse().unwrap();
+            let (requests, mut received) = mpsc::channel(2);
+            let (replies, receiver) = mpsc::channel(1);
+            let mut source = Box::pin(futures_util::stream::unfold(
+                receiver,
+                |mut rx: mpsc::Receiver<Result<Stanza, ReadError>>| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                },
+            ));
+            let server = async {
+                let (id, payload) = match received.recv().await.unwrap() {
+                    Outbound::Control(stanza) => match *stanza {
+                        Stanza::Iq(Iq::Set { id, payload, .. }) => (id, payload),
+                        _ => panic!("Unexpected publication stanza"),
+                    },
+                    _ => panic!("Unexpected publication write"),
+                };
+                assert!(payload.get_child("publish", PUBSUB).is_some());
+                let form = payload
+                    .get_child("publish-options", PUBSUB)
+                    .unwrap()
+                    .get_child("x", "jabber:x:data")
+                    .unwrap();
+                assert_eq!(form.attr("type"), Some("submit"));
+                let values: Vec<_> = form
+                    .children()
+                    .map(|field| {
+                        (
+                            field.attr("var").unwrap().to_owned(),
+                            field.get_child("value", "jabber:x:data").unwrap().text(),
+                        )
+                    })
+                    .collect();
+                assert!(values.contains(&(
+                    "FORM_TYPE".into(),
+                    "http://jabber.org/protocol/pubsub#publish-options".into()
+                )));
+                assert!(values.contains(&("pubsub#access_model".into(), "open".into())));
+                let stanza = if refused {
+                    let xml = format!(
+                        "<iq xmlns='jabber:client' type='error' id='{id}'><error type='cancel'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"
+                    );
+                    Stanza::Iq(Iq::try_from(xml.parse::<Element>().unwrap()).unwrap())
+                } else {
+                    Stanza::Iq(Iq::Result {
+                        from: None,
+                        to: None,
+                        id,
+                        payload: None,
+                    })
+                };
+                replies.send(Ok(stanza)).await.unwrap();
+            };
+            let mut pending = VecDeque::new();
+            let (_, result) = tokio::join!(
+                server,
+                publish(
+                    &mut source,
+                    &requests,
+                    &mut pending,
+                    &own,
+                    "eu.siacs.conversations.axolotl.devicelist",
+                    "<list xmlns='eu.siacs.conversations.axolotl'/>"
+                )
+            );
+            if refused {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Server refused readable OMEMO key publication")
+                );
+            } else {
+                result.unwrap();
+            }
+        }
     }
 }

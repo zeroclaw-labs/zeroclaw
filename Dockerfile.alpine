@@ -55,6 +55,8 @@ COPY vendor/ vendor/
 COPY wit/ wit/
 COPY --parents crates/*/Cargo.toml ./
 COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
+# Root workspace fixtures must also exist during dependency prefetch.
+COPY tests/fixtures/runtime-composition-consumer/ tests/fixtures/runtime-composition-consumer/
 COPY --parents crates/zeroclaw-macros/src/ ./
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml

@@ -89,15 +89,23 @@ def rejected_prekey_packet(wire,variant):
             altered=bytearray(wire);altered[offset-1]^=1;return bytes(altered)
     raise AssertionError('Synthetic first contact lacks the requested field')
 
-async def seed_public_fixture(f,mode,port):
+async def seed_public_fixture(f,mode,port,fresh):
     ready=asyncio.get_running_loop().create_future()
     context=ssl.create_default_context(cafile=str(server/'certs/cert.pem'))
     client=ClientXMPP('bob@example.test/public-fixture-setup',accounts['bob'],ssl_context=context)
     client.enable_direct_tls=mode=='direct';client.enable_starttls=mode=='starttls';client.enable_plaintext=False
     async def started(_):
         try:
-            await publish_fixture(client,'eu.siacs.conversations.axolotl.bundles:202',ET.fromstring(f['reference_bundle_xml']))
-            await publish_fixture(client,'eu.siacs.conversations.axolotl.devicelist',ET.fromstring("<list xmlns='eu.siacs.conversations.axolotl'><device id='303' label='Outro cliente existente'/></list>"))
+            # Each scenario starts with absent bot nodes, including the fresh-account case.
+            for node in ['eu.siacs.conversations.axolotl.bundles:202','eu.siacs.conversations.axolotl.devicelist']:
+                iq=client.Iq();iq['type']='set'
+                owner=ET.Element('{http://jabber.org/protocol/pubsub#owner}pubsub')
+                ET.SubElement(owner,'{http://jabber.org/protocol/pubsub#owner}delete',{'node':node});iq.append(owner)
+                try:await iq.send(timeout=10)
+                except IqError as error:
+                    if error.iq['error']['condition']!='item-not-found':raise
+            if not fresh:
+                await publish_fixture(client,'eu.siacs.conversations.axolotl.devicelist',ET.fromstring("<list xmlns='eu.siacs.conversations.axolotl'><device id='303' label='Outro cliente existente'/></list>"))
             ready.set_result(True)
         except Exception as error:ready.set_exception(error)
     client.add_event_handler('session_start',started);client.connect(host='127.0.0.1',port=port)
@@ -121,7 +129,7 @@ async def main():
             fixture=folder/(label+'.json');report=folder/(label+'-native.json')
             create=await asyncio.create_subprocess_exec(os.sys.executable,str(root/'reference_fixture.py'),str(fixture),'--payload',*(['--fresh-db'] if fresh else []),stdout=asyncio.subprocess.DEVNULL)
             assert await create.wait()==0
-            f=json.loads(fixture.read_text());await seed_public_fixture(f,mode,port);env=os.environ.copy()
+            f=json.loads(fixture.read_text());await seed_public_fixture(f,mode,port,fresh);env=os.environ.copy()
             env.update(SSL_CERT_FILE=str(server/'certs/cert.pem'),ZEROCLAW_NATIVE_OMEMO_FIXTURE=str(fixture),ZEROCLAW_NATIVE_OMEMO_RESULT=str(report),ZEROCLAW_NATIVE_OMEMO_ACCOUNTS=str(server/'fixture-accounts.json'),ZEROCLAW_NATIVE_OMEMO_TLS_MODE=mode,ZEROCLAW_NATIVE_OMEMO_FRESH="1" if fresh else "0")
             native=await asyncio.create_subprocess_exec('cargo','test','--locked','-j4','-p','zeroclaw-channels','--no-default-features','--features','channel-xmpp','native_omemo_actual_channel_shared_runtime_and_socket_ack','--','--ignored','--nocapture',cwd=workspace,env=env,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,start_new_session=True)
             clients=[]
@@ -170,6 +178,14 @@ async def main():
                     client=Client(name);clients.append(client);client.connect(host='127.0.0.1',port=port)
                 await asyncio.wait_for(asyncio.gather(*ready.values()),10)
                 by_name={c.name:c for c in clients}
+                # No roster subscription exists. Fetch the production-published keys
+                # as the contact, rather than relying on server-admin fixture setup.
+                for node,content in [('eu.siacs.conversations.axolotl.devicelist','list'),('eu.siacs.conversations.axolotl.bundles:202','bundle')]:
+                    iq=by_name['alice'].Iq();iq['type']='get';iq['to']='bob@example.test'
+                    pubsub=ET.Element('{http://jabber.org/protocol/pubsub}pubsub')
+                    ET.SubElement(pubsub,'{http://jabber.org/protocol/pubsub}items',{'node':node});iq.append(pubsub)
+                    result=await iq.send(timeout=10)
+                    assert result.xml.find('.//{eu.siacs.conversations.axolotl}'+content) is not None
                 if fresh:
                     await remove_fixture_bundle(by_name['alice'])
                     await publish_fixture(by_name['alice'],'eu.siacs.conversations.axolotl.devicelist',ET.fromstring("<list xmlns='eu.siacs.conversations.axolotl'><device id='101'/></list>"))
@@ -236,7 +252,7 @@ async def main():
                 iq.append(ET.fromstring("<pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='eu.siacs.conversations.axolotl.devicelist'/></pubsub>"))
                 response=await iq.send(timeout=10)
                 devices={int(d.get('id')):d.get('label') for d in response.xml.findall('.//{eu.siacs.conversations.axolotl}device')}
-                assert devices=={202:None,303:'Outro cliente existente'}
+                assert devices==({202:None} if fresh else {202:None,303:'Outro cliente existente'})
                 result['other_devices_and_labels_preserved']=True
                 summary['outcomes'].append(dict(tls_mode=mode,python_decrypted_actual_runtime_reply=True,**{k:v for k,v in result.items() if k!='tls_mode'}))
             finally:

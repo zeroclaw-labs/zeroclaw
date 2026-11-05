@@ -104,6 +104,8 @@ COPY --parents crates/zeroclaw-macros/src/ ./
 # editing this file — cargo fails the workspace load if any member manifest is
 # missing, and every such member lives at crates/*/tests/fixtures/*/.
 COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
+# Root workspace fixtures must also exist during dependency prefetch.
+COPY tests/fixtures/runtime-composition-consumer/ tests/fixtures/runtime-composition-consumer/
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # apps/zerocode: TUI app not shipped in the server image; copy only its manifest

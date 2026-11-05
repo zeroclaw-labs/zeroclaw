@@ -266,6 +266,7 @@ async fn native_omemo_actual_channel_shared_runtime_and_socket_ack() -> Result<(
         !channel.health_check().await,
         "Cancelled channel remained online"
     );
+    drop(channel); // Offline administration requires the whole channel owner to stop.
     let mut restored = crate::xmpp_omemo::private_store::PrivateStore::open_existing(&storage)?;
     let db = restored.connection();
     let pending: i64 =
