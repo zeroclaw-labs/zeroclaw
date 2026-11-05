@@ -631,10 +631,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             );
             println!(
                 "{}",
-                get_required_cli_string_with_args(
-                    "cli-cron-agent",
-                    &[("v", &job.agent_alias)]
-                )
+                get_required_cli_string_with_args("cli-cron-agent", &[("v", &job.agent_alias)])
             );
             println!(
                 "{}",

@@ -5838,9 +5838,11 @@ mod tests {
             msg.contains("declarative") && msg.contains("cron_jobs"),
             "unexpected error: {msg}"
         );
-        assert_eq!(get_job(&config, "decl-job").unwrap().agent_alias, "test-agent");
+        assert_eq!(
+            get_job(&config, "decl-job").unwrap().agent_alias,
+            "test-agent"
+        );
     }
-
 
     #[test]
     fn reschedule_after_run_persists_last_status_and_last_run() {
