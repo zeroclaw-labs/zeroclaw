@@ -127,10 +127,26 @@ where
                         );
                     }
                 }
-                Stanza::Iq(Iq::Get {
-                    from, id, payload, ..
-                }) if payload.is("ping", "urn:xmpp:ping") => {
-                    channel.enqueue_ping_reply(from, id, requests)?;
+                Stanza::Iq(iq) => {
+                    if let Iq::Get { from, payload, .. } = &iq
+                        && payload.is("ping", "urn:xmpp:ping")
+                        && channel.ping_sender_allowed(from.as_ref())?
+                    {
+                        // Preserve the reader's ordering: a pong must not overtake
+                        // completion of the input whose discovery is in flight.
+                        if pending.len() < 32 {
+                            pending.push_back(Stanza::Iq(iq));
+                        } else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                ),
+                                "XMPP discovery receive queue full; control stanza dropped"
+                            );
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -826,5 +842,66 @@ mod discovery_queue_tests {
         );
         assert_eq!(reads.load(Ordering::SeqCst), 2);
         assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authorized_pings_wait_for_discovery_and_remain_bounded() {
+        let channel = fixture_channel();
+        let own = "bob@example.test".parse().unwrap();
+        let ping = |sender: &str, id: String| {
+            Stanza::Iq(Iq::Get {
+                from: Some(sender.parse().unwrap()),
+                to: None,
+                id,
+                payload: Element::builder("ping", "urn:xmpp:ping").build(),
+            })
+        };
+        let mut stanzas = Vec::new();
+        for n in 0..128 {
+            stanzas.push(Ok(ping(
+                "mallory@example.test/phone",
+                format!("denied-{n}"),
+            )));
+        }
+        for n in 0..64 {
+            stanzas.push(Ok(ping("alice@example.test/phone", format!("barrier-{n}"))));
+        }
+        stanzas.push(Ok(reply()));
+        let mut source = futures_util::stream::iter(stanzas);
+        let (requests, mut received) = mpsc::channel(2);
+        let mut pending = VecDeque::new();
+        assert!(
+            exchange(
+                &channel,
+                &mut source,
+                &requests,
+                &mut pending,
+                request(),
+                &own,
+                &own,
+                "fixture-query",
+                false
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(pending.len(), 32);
+        let Outbound::Control(query) = received.try_recv().unwrap() else {
+            panic!("Missing discovery request")
+        };
+        assert!(matches!(*query,Stanza::Iq(Iq::Get {id,..}) if id=="fixture-query"));
+        assert!(
+            received.try_recv().is_err(),
+            "Pong overtook the discovery result"
+        );
+        let Some(Stanza::Iq(Iq::Get { from, id, .. })) = pending.pop_front() else {
+            panic!("Missing authorized deferred ping")
+        };
+        assert_eq!(id, "barrier-0");
+        channel.enqueue_ping_reply(from, id, &requests).unwrap();
+        let Outbound::Control(response) = received.try_recv().unwrap() else {
+            panic!("Missing deferred response")
+        };
+        assert!(matches!(*response,Stanza::Iq(Iq::Result {id,..}) if id=="barrier-0"));
     }
 }

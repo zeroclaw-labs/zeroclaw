@@ -235,7 +235,8 @@ A server refusal fails startup explicitly. Existing nodes with incompatible
 publication policy must be reconciled by their owner before restarting.
 
 During key discovery, inbound messages are checked against the live peer policy
-before entering the bounded receive queue. Unrelated protocol traffic does not
-consume message slots. A full queue drops excess messages before admission and
+before entering the bounded receive queue. Unrelated responses and unauthorized traffic do not
+consume queue slots. Authorized pings wait for the active discovery exchange
+before the reader answers them. A full queue drops excess messages before admission and
 logs the overload without disconnecting the alias; it does not report those
 messages as accepted.

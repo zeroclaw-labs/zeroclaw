@@ -138,20 +138,22 @@ impl XmppChannel {
         self.inbox_vault = root;
         self
     }
+    fn ping_sender_allowed(&self, from: Option<&jid::Jid>) -> anyhow::Result<bool> {
+        let own = self.config.username.parse::<jid::BareJid>()?;
+        Ok(from.is_none_or(|sender| {
+            let bare = sender.to_bare();
+            bare == own
+                || (bare.node().is_none() && bare.domain() == own.domain())
+                || self.allowed(&bare.to_string())
+        }))
+    }
     fn enqueue_ping_reply(
         &self,
         from: Option<jid::Jid>,
         id: String,
         requests: &mpsc::Sender<Outbound>,
     ) -> anyhow::Result<()> {
-        let own = self.config.username.parse::<jid::BareJid>()?;
-        let authorized = from.as_ref().is_none_or(|sender| {
-            let bare = sender.to_bare();
-            bare == own
-                || (bare.node().is_none() && bare.domain() == own.domain())
-                || self.allowed(&bare.to_string())
-        });
-        if authorized {
+        if self.ping_sender_allowed(from.as_ref())? {
             let response = Outbound::Control(Box::new(Stanza::Iq(Iq::Result {
                 from: None,
                 to: from,
