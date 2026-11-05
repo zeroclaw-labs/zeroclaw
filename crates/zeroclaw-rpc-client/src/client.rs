@@ -988,7 +988,10 @@ mod tests {
         let ClientError::Rpc(error) = refused else {
             panic!("expected an RPC error, got {refused:?}");
         };
-        assert_eq!(error.code, zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS);
+        assert_eq!(
+            error.code,
+            zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS
+        );
         assert_eq!(error.data.expect("error data")["reason"], "frame_too_large");
         let status = client
             .request(Method::Status, json!({}))
