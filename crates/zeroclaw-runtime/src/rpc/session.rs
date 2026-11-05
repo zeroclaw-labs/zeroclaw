@@ -2199,13 +2199,6 @@ impl SessionStore {
         self.signal_cancellation(id, CancelCause::OperatorAbort)
     }
 
-    /// [`Self::abort_session`] bound to the live session incarnation the
-    /// caller was authorized against: a turn belonging to any other
-    /// incarnation under the same id (a same-id successor) is left running.
-    pub fn abort_session_for_generation(&self, id: &str, session_generation: Option<u64>) -> bool {
-        self.signal_cancellation_for_generation(id, session_generation, CancelCause::OperatorAbort)
-    }
-
     /// Signal only the session incarnation observed by the caller.
     ///
     /// Holding the session map lock across the generation check and token

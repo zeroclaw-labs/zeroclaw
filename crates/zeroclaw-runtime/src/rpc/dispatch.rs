@@ -4650,13 +4650,17 @@ impl RpcDispatcher {
         create_only: Option<&parking_lot::Mutex<Option<u64>>>,
     ) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        // A create-only call never resumes, so a supplied id that names no
+        // live session yet is not a resume the caller must already own.
         let expected_generation = match req.session_id.as_deref() {
-            Some(session_id) => self.capture_session_access(session_id).await?,
-            None => None,
+            Some(session_id) if create_only.is_none() => {
+                self.capture_session_access(session_id).await?
+            }
+            _ => None,
         };
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let chat_mode = req.chat_mode.clone().unwrap_or(ChatMode::Chat);
-        let resuming = req.session_id.is_some();
+        let resuming = req.session_id.is_some() && create_only.is_none();
         let mut authorized_resume = None;
         // Check the selected existing session's owner before admission. The
         // durable owner used for restoration is selected again after admission,
@@ -8243,17 +8247,24 @@ impl RpcDispatcher {
             .authorize_session_owner(&req.session_id, Method::SessionAbort)
             .await?;
         self.ctx.sessions.wait_test_control_pause().await;
-        // The ownership lookup awaited: re-resolve the caller now, and cancel
-        // only a turn of the incarnation that was authorized, never a same-id
-        // successor.
-        let grants = self.recheck_authority_after_admission(Method::SessionAbort)?;
-        self.require_ownership_under(grants.as_ref(), record.as_ref())?;
+        // The ownership lookup awaited: decide again under the incarnation and
+        // cancellation locks, by the authority in force now, and cancel only a
+        // turn of the incarnation that was authorized, never a same-id
+        // successor. A remote caller must also still be the TUI that owns it.
         let session_generation = record.as_ref().and_then(|rec| rec.live_generation);
-        if !self
+        let signalled = self
             .ctx
             .sessions
-            .abort_session_for_generation(&req.session_id, session_generation)
-        {
+            .signal_cancellation_authorized(
+                &req.session_id,
+                session_generation,
+                self.resume_access_fence(session_generation),
+                crate::rpc::session::CancelCause::OperatorAbort,
+                |owner| self.session_effect_lease(Method::SessionAbort, owner),
+            )
+            .await?
+            .ok_or_else(|| self.stale_session_incarnation_error())?;
+        if !signalled {
             return Err(rpc_err(
                 SESSION_NOT_FOUND,
                 "No active turn for this session",
@@ -8528,6 +8539,13 @@ impl RpcDispatcher {
             .ctx
             .sessions
             .with_session_effect(sid, |session| {
+                if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                    && !session
+                        .as_ref()
+                        .is_some_and(|s| s.owner_tui_id == self.tui_id)
+                {
+                    return Err(self.stale_session_incarnation_error());
+                }
                 if session.as_ref().map(|s| s.generation) != expected_generation
                     || session.as_ref().is_some_and(|s| {
                         s.owner_principal_id.as_deref() != expected_owner
@@ -8614,15 +8632,34 @@ impl RpcDispatcher {
                 })
                 .map_err(session_effect_io_error)
         };
-        let work = || backend.set_session_name_authorized(&key, name, &authorize);
-        let result = if tokio::runtime::Handle::current().runtime_flavor()
-            == tokio::runtime::RuntimeFlavor::MultiThread
-        {
-            tokio::task::block_in_place(work)
-        } else {
-            work()
-        };
-        result.map_err(|error| session_effect_error(error.into(), "Failed to rename session"))?;
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("rename-effect")
+            .await;
+        self.ctx
+            .sessions
+            .with_session_effect(&req.session_id, |session| {
+                if self.access_policy == RpcAccessPolicy::RemoteSessionOwner
+                    && !session.as_ref().is_some_and(|live| {
+                        Some(live.generation) == record.as_ref().and_then(|r| r.live_generation)
+                            && live.owner_tui_id == self.tui_id
+                            && live.owner_principal_id.as_deref() == expected_owner
+                    })
+                {
+                    return Err(self.stale_session_incarnation_error());
+                }
+                let work = || backend.set_session_name_authorized(&key, name, &authorize);
+                let result = if tokio::runtime::Handle::current().runtime_flavor()
+                    == tokio::runtime::RuntimeFlavor::MultiThread
+                {
+                    tokio::task::block_in_place(work)
+                } else {
+                    work()
+                };
+                result
+                    .map_err(|error| session_effect_error(error.into(), "Failed to rename session"))
+            })
+            .await?;
         to_result(SessionRenameResult {
             session_id: req.session_id.clone(),
             name: name.to_string(),
@@ -48524,58 +48561,101 @@ mod tests {
 
     #[tokio::test]
     async fn session_run_once_runs_one_turn_and_closes_its_session() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (remote, explicit_id) in [(false, true), (true, true), (true, false)] {
+            use wiremock::matchers::method;
+            use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "output_text": "pong",
-                "output": [],
-                "usage": {"input_tokens": 5, "output_tokens": 2}
-            })))
-            .mount(&server)
-            .await;
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "output_text": "pong",
+                    "output": [],
+                    "usage": {"input_tokens": 5, "output_tokens": 2}
+                })))
+                .mount(&server)
+                .await;
 
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = session_cwd_config(&tmp, 4242, None);
-        config
-            .providers
-            .models
-            .ensure("openai", "test-provider")
-            .expect("the fixture provider exists")
-            .uri = Some(server.uri());
-        let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
-        let (mut operator, mut rx) = local_operator(&ctx).await;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = session_cwd_config(&tmp, 4242, None);
+            config
+                .providers
+                .models
+                .ensure("openai", "test-provider")
+                .expect("the fixture provider exists")
+                .uri = Some(server.uri());
+            let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
+            let (mut operator, mut rx) = if remote {
+                let (mut caller, rx) = roster_peer(&ctx, 4242).await;
+                caller.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+                caller.tui_id = Some("run-once-owner".into());
+                (caller, rx)
+            } else {
+                local_operator(&ctx).await
+            };
+            if remote {
+                let denied = operator
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias":"test-agent", "session_id":"ordinary-missing",
+                    }))
+                    .await
+                    .expect_err("ordinary remote explicit IDs remain resumes");
+                assert_eq!(denied.code, SESSION_NOT_OWNED);
+            }
+            let mut params = json!({"agent_alias":"test-agent", "prompt":"ping"});
+            if explicit_id {
+                params["session_id"] = json!("s-once");
+            }
 
-        let line = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "session/run-once",
-            "params": {"agent_alias": "test-agent", "prompt": "ping", "session_id": "s-once"},
-        })
-        .to_string();
-        operator.process_line(&line).await;
-        let (response, notifications) = response_and_notifications(&mut rx, 1).await;
+            let line = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/run-once",
+                "params": params,
+            })
+            .to_string();
+            operator.process_line(&line).await;
+            let (response, notifications) = response_and_notifications(&mut rx, 1).await;
 
-        assert_eq!(response["result"]["content"], json!("pong"), "{response}");
-        assert_eq!(response["result"]["stop_reason"], json!("end_turn"));
-        assert_eq!(
-            response["result"]["usage"]["input_tokens"],
-            json!(5),
-            "{response}"
-        );
-        let done = turn_complete_for(&notifications, "s-once");
-        assert_eq!(done["params"]["outcome"], json!("completed"), "{done}");
-        assert!(
-            ctx.sessions.get_agent("s-once").await.is_none(),
-            "run-once closes its transient session"
-        );
-        assert!(
-            !zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), "rpc_s-once")
+            assert_eq!(response["result"]["content"], json!("pong"), "{response}");
+            assert_eq!(response["result"]["stop_reason"], json!("end_turn"));
+            assert_eq!(
+                response["result"]["usage"]["input_tokens"],
+                json!(5),
+                "{response}"
+            );
+            let sid = response["result"]["session_id"]
+                .as_str()
+                .expect("created session ID");
+            if explicit_id {
+                assert_eq!(sid, "s-once");
+            }
+            let done = turn_complete_for(&notifications, sid);
+            assert_eq!(done["params"]["outcome"], json!("completed"), "{done}");
+            assert!(
+                ctx.sessions.get_agent(sid).await.is_none(),
+                "run-once closes its transient session"
+            );
+            assert!(
+                !zeroclaw_infra::session_backend::SessionBackend::load(
+                    backend.as_ref(),
+                    &format!("rpc_{sid}")
+                )
                 .is_empty(),
-            "the transcript stays in the durable store after the close"
-        );
+                "the transcript stays in the durable store after the close"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            if remote {
+                use zeroclaw_infra::session_backend::SessionBackend;
+                assert_eq!(
+                    backend
+                        .get_session_metadata(&format!("rpc_{sid}"))
+                        .unwrap()
+                        .principal_id
+                        .as_deref(),
+                    Some("user:alice")
+                );
+            }
+        }
     }
 
     // ── Turns with no viewer, and detached turns ──────────────────────
@@ -48975,14 +49055,145 @@ mod tests {
         }
     }
 
+    /// A remote abort or rename is decided again at its final boundary: a
+    /// same-generation resume by another TUI in between refuses it, while the
+    /// same TUI reconnecting keeps it.
+    #[tokio::test]
+    async fn remote_mutations_refuse_same_generation_tui_transfer() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+        for method in [Method::SessionAbort, Method::SessionRename] {
+            for transfer in [true, false] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let sid = "remote-effect";
+                let (ctx, backend, key) =
+                    append_review_fixture(&tmp, sid, "user:alice", false).await;
+                if method == Method::SessionAbort {
+                    // Abort takes the operator verb `session/kill` uses.
+                    republish_session_scoped(&ctx, |profile| {
+                        profile
+                            .grants
+                            .get_mut(&zeroclaw_api::grants::Resource::Sessions)
+                            .unwrap()
+                            .push(zeroclaw_api::grants::Verb::Delete);
+                    });
+                }
+                let (mut remote, _rx) = roster_peer(&ctx, 4242).await;
+                remote.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+                remote.tui_id = Some("original-owner".into());
+                ctx.sessions
+                    .resume_existing(
+                        sid,
+                        "test-agent",
+                        &ChatMode::Chat,
+                        remote.tui_id.clone(),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let generation = ctx.sessions.get_generation(sid).await.unwrap();
+                let agent = ctx.sessions.get_agent(sid).await.unwrap();
+                let token = tokio_util::sync::CancellationToken::new();
+                ctx.sessions.register_cancel_token_for_generation_for_test(
+                    sid,
+                    generation,
+                    token.clone(),
+                );
+                let params = json!({"session_id":sid, "name":"accepted name"});
+                remote
+                    .ensure_method_session_access(method, &params)
+                    .await
+                    .unwrap();
+                let (entered, release) = if method == Method::SessionAbort {
+                    ctx.sessions.set_test_control_pause()
+                } else {
+                    ctx.sessions.set_test_effect_pause("rename-effect")
+                };
+                let mut request = Box::pin(async {
+                    if method == Method::SessionAbort {
+                        remote.handle_session_abort(&params).await
+                    } else {
+                        remote.handle_session_rename(&params).await
+                    }
+                });
+                tokio::select! {
+                    result = &mut request => panic!("mutation returned before final boundary: {result:?}"),
+                    _ = entered.notified() => {},
+                }
+                ctx.sessions
+                    .resume_existing(
+                        sid,
+                        "test-agent",
+                        &ChatMode::Chat,
+                        Some(
+                            if transfer {
+                                "successor-owner"
+                            } else {
+                                "original-owner"
+                            }
+                            .into(),
+                        ),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(ctx.sessions.get_generation(sid).await, Some(generation));
+                assert!(Arc::ptr_eq(
+                    &ctx.sessions.get_agent(sid).await.unwrap(),
+                    &agent
+                ));
+                assert_eq!(
+                    ctx.sessions
+                        .session_owner_principal(sid)
+                        .await
+                        .flatten()
+                        .as_deref(),
+                    Some("user:alice")
+                );
+                release.notify_one();
+                let result = request.await;
+                if transfer {
+                    assert_eq!(result.unwrap_err().code, SESSION_NOT_OWNED);
+                    assert!(!token.is_cancelled());
+                    assert_eq!(ctx.sessions.take_cancel_cause(sid), None);
+                    assert_eq!(backend.get_session_name(&key).unwrap(), None);
+                } else {
+                    result.expect("same-TUI reconnect retains mutation authority");
+                    if method == Method::SessionAbort {
+                        assert!(token.is_cancelled());
+                        assert_eq!(
+                            ctx.sessions.take_cancel_cause(sid),
+                            Some(crate::rpc::session::CancelCause::OperatorAbort)
+                        );
+                    } else {
+                        assert!(!token.is_cancelled());
+                        assert_eq!(
+                            backend.get_session_name(&key).unwrap().as_deref(),
+                            Some("accepted name")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// An append decides again under the live Agent lock and the store's
     /// write lock. A revocation, demotion or owner change that lands while it
-    /// waits for the Agent refuses both history writes and the event; an
-    /// unrelated publication does not.
+    /// waits for the Agent refuses both history writes and the event, and so
+    /// does a remote caller whose TUI lost the session in the meantime; an
+    /// unrelated publication or the same TUI reconnecting does not.
     #[tokio::test]
     async fn append_rechecks_authority_and_owner_after_the_real_agent_lock() {
         use zeroclaw_infra::session_backend::SessionBackend;
-        for change in ["revoke", "demote", "owner", "unrelated"] {
+        for change in [
+            "revoke",
+            "demote",
+            "owner",
+            "tui",
+            "tui-unchanged",
+            "unrelated",
+        ] {
             let tmp = tempfile::TempDir::new().unwrap();
             let sid = "append-effect";
             let owner = if change == "demote" {
@@ -48998,10 +49209,30 @@ mod tests {
             // This chat-only fixture must not yield in the unrelated ACP owner
             // lookup before it reaches the Agent lock we deliberately hold.
             fixture.acp_session_store = None;
-            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let (mut alice, _rx) = roster_peer(&ctx, 4242).await;
+            if change.starts_with("tui") {
+                alice.access_policy = RpcAccessPolicy::RemoteSessionOwner;
+                alice.tui_id = Some("original-tui".into());
+                ctx.sessions
+                    .resume_existing(
+                        sid,
+                        "test-agent",
+                        &ChatMode::Chat,
+                        alice.tui_id.clone(),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
             let agent = ctx.sessions.get_agent(sid).await.unwrap();
             let held = agent.lock().await;
             let params = json!({"session_id": sid, "content": APPENDED});
+            alice
+                .ensure_method_session_access(Method::SessionAppend, &params)
+                .await
+                .unwrap();
+            let original_generation = ctx.sessions.get_generation(sid).await;
             let mut request = Box::pin(tokio::task::coop::unconstrained(
                 alice.handle_session_append(&params),
             ));
@@ -49021,6 +49252,27 @@ mod tests {
                 }),
                 "demote" => republish_session_scoped(&ctx, |profile| profile.admin = false),
                 "owner" => backend.set_session_principal(&key, "user:bob").unwrap(),
+                "tui" | "tui-unchanged" => {
+                    ctx.sessions
+                        .resume_existing(
+                            sid,
+                            "test-agent",
+                            &ChatMode::Chat,
+                            Some(
+                                if change == "tui" {
+                                    "successor-tui"
+                                } else {
+                                    "original-tui"
+                                }
+                                .into(),
+                            ),
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(ctx.sessions.get_generation(sid).await, original_generation);
+                }
                 _ => republish_session_scoped(&ctx, |profile| {
                     profile.grants.insert(
                         zeroclaw_api::grants::Resource::Memory,
@@ -49032,13 +49284,21 @@ mod tests {
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
                 .await
                 .expect("append completes after releasing its lock");
-            if change == "unrelated" {
+            if change == "unrelated" || change == "tui-unchanged" {
                 result.expect("an unrelated publication preserves permission");
                 assert!(durable_holds(&backend, &key, APPENDED));
                 assert!(live_holds(&ctx, sid, APPENDED).await);
                 assert_eq!(received.try_recv().unwrap()["content"], APPENDED);
             } else {
-                assert_eq!(result.expect_err(change).code, FORBIDDEN, "{change}");
+                assert_eq!(
+                    result.expect_err(change).code,
+                    if change == "tui" {
+                        SESSION_NOT_OWNED
+                    } else {
+                        FORBIDDEN
+                    },
+                    "{change}"
+                );
                 assert!(
                     !durable_holds(&backend, &key, APPENDED),
                     "{change}: durable"
