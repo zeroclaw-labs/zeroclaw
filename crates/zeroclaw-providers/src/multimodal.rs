@@ -3040,20 +3040,31 @@ fn image_format_for_mime(source: &str, mime: &str) -> anyhow::Result<image::Imag
     }
 }
 
-/// Extra bytes per pixel a **still** WebP decode holds on top of its output
-/// buffer, covering the worst case across alpha and non-alpha shapes.
+/// Extra bytes per pixel a **still, non-alpha** WebP decode holds on top of its
+/// output buffer.
 ///
-/// - *Non-alpha* (`Rgb8`, 3 B/px output): lossless decode allocates a
-///   `width * height * 4` RGBA scratch and converts it to the 3 B/px output.
-///   Scratch = 4 B/px.
-/// - *Alpha* (`Rgba8`, 4 B/px output): `read_alpha_chunk` lossless branch
-///   allocates a `width * height * 4` RGBA buffer and a separate
-///   `width * height * 1` green plane, both live alongside the 4 B/px output.
-///   Scratch = 4 + 1 = 5 B/px.
-///
-/// 5 is used here so a single constant covers both shapes without needing to
-/// inspect `has_alpha` at projection time.
+/// Lossless decode allocates a `width * height * 4` RGBA scratch and converts
+/// it to the 3 B/px (`Rgb8`) output: scratch = 4 B/px. A lossy decode holds the
+/// VP8 planes instead, 1.5 B/px. 5 covers both with room to spare. A still
+/// with alpha is charged [`WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL`].
 const WEBP_STILL_SCRATCH_BYTES_PER_PIXEL: u64 = 5;
+
+/// Extra bytes per pixel a **still WebP with alpha** (`Rgba8`, 4 B/px output)
+/// holds on top of its output buffer.
+///
+/// In the lossy-with-`ALPH` path the decoded VP8 frame stays alive while the
+/// output and the alpha are produced (`image-webp` 0.2.4 `src/decoder.rs`,
+/// `read_image`: `Vp8Decoder::decode_frame` .. `read_alpha_chunk`):
+///
+/// - the VP8 Y/U/V planes, 1.5 B/px (sized from the bitstream header, which
+///   `ensure_vp8_matches_enclosing_canvas` holds to the canvas);
+/// - `read_alpha_chunk`'s lossless branch, a 4 B/px RGBA buffer plus a 1 B/px
+///   green plane.
+///
+/// 1.5 + 4 + 1 = 6.5, rounded up to 7. Measured on real files at 10.5 B/px in
+/// total (`tests/webp_alloc_budget.rs`), which the earlier 5 (derived for the
+/// lossless branch alone, 9 B/px in total) did not cover.
+const WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL: u64 = 7;
 
 /// Extra bytes per pixel an **animated** WebP decode holds on top of its
 /// output buffer, covering the worst case across alpha and non-alpha shapes.
@@ -3561,7 +3572,8 @@ const WEBP_ANIMATED_SCRATCH_MODEL: AnimationScratchModel = AnimationScratchModel
 ///   (`Rgb8`). `ImageDecoder::total_bytes` is exactly that allocation, so it is
 ///   used directly rather than re-derived.
 /// - **Temporaries.** WebP decoding holds scratch buffers alongside the output;
-///   see [`WEBP_STILL_SCRATCH_BYTES_PER_PIXEL`] and
+///   see [`WEBP_STILL_SCRATCH_BYTES_PER_PIXEL`],
+///   [`WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL`] and
 ///   [`WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL`] for the per-shape derivation.
 ///   No other supported format allocates a full-canvas temporary beyond the
 ///   buffer `total_bytes` already describes.
@@ -3608,11 +3620,14 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
             let animated = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
                 .map(|decoder| decoder.has_animation())
                 .unwrap_or(true);
-            pixels.saturating_mul(if animated {
+            let scratch_per_pixel = if animated {
                 WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL
+            } else if image::ImageDecoder::color_type(&decoder).has_alpha() {
+                WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL
             } else {
                 WEBP_STILL_SCRATCH_BYTES_PER_PIXEL
-            })
+            };
+            pixels.saturating_mul(scratch_per_pixel)
         }
         image::ImageFormat::Gif => {
             // Every GIF is validated through the animation path, where the
@@ -8845,27 +8860,26 @@ mod tests {
     #[tokio::test]
     async fn ensure_decode_within_per_image_cap_flips_where_the_validator_does() {
         // A still WebP projects to output + scratch per pixel: 3 + 5 without
-        // alpha (cap crossed between 2896 and 2897 px per side) and 4 + 5 with
-        // the VP8X alpha flag (between 2730 and 2731). The sanity asserts tie
+        // alpha (cap crossed between 2896 and 2897 px per side) and 4 + 7 with
+        // the VP8X alpha flag (between 2469 and 2470). The sanity asserts tie
         // those sides to the constants, so a change to either fails here
         // rather than silently moving the boundary under the cases below.
-        let projected = |side: u32, output_bytes_per_pixel: u64| {
-            u64::from(side)
-                * u64::from(side)
-                * (output_bytes_per_pixel + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL)
-        };
-        assert!(projected(2896, 3) < MAX_DECODED_IMAGE_ALLOC_BYTES);
-        assert!(projected(2897, 3) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
-        assert!(projected(2730, 4) < MAX_DECODED_IMAGE_ALLOC_BYTES);
-        assert!(projected(2731, 4) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
+        let projected = |side: u32, per_pixel: u64| u64::from(side) * u64::from(side) * per_pixel;
+        let plain = 3 + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL;
+        let with_alpha = 4 + WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL;
+        assert!(projected(2896, plain) < MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2897, plain) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2469, with_alpha) < MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2470, with_alpha) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
 
         let cases = [
             (1000, false, false),
             (2896, false, false),
             (2897, false, true),
             (4000, false, true),
-            (2730, true, false),
-            (2731, true, true),
+            (2469, true, false),
+            (2470, true, true),
+            (2730, true, true),
         ];
         for (side, alpha, over_cap) in cases {
             let mut webp = webp_with_canvas(side, false);
@@ -9599,7 +9613,7 @@ mod tests {
             "old 4B/px scratch would have admitted this: {old_proj} < {MAX_DECODED_IMAGE_ALLOC_BYTES}"
         );
         // Sanity: the corrected projection refuses it.
-        let new_proj = 2800u64 * 2800 * (4 + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL);
+        let new_proj = 2800u64 * 2800 * (4 + WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL);
         assert!(
             new_proj >= MAX_DECODED_IMAGE_ALLOC_BYTES,
             "new scratch must project above the cap: {new_proj} vs {MAX_DECODED_IMAGE_ALLOC_BYTES}"
