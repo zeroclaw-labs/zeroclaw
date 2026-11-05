@@ -699,6 +699,7 @@ mod graceful_summary_metering_tests {
                 &mut false,
                 None,
                 &crate::observability::NoopObserver,
+                None,
             )
             .await
             .unwrap();
@@ -757,6 +758,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .unwrap();

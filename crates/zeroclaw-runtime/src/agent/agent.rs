@@ -7744,6 +7744,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
@@ -8064,6 +8065,7 @@ mod tests {
             &config,
             None,
             false,
+            None,
             None,
             None,
             None,

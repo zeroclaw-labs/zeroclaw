@@ -93,7 +93,7 @@ use crate::agent::tool_execution::{
 use crate::live_config_authority::AgentExecutionAdmission;
 use crate::security::ingress::{IngressPolicy, ingress_policy, steering_policy};
 use crate::util::truncate_with_ellipsis;
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write as _;
 use std::sync::Arc;

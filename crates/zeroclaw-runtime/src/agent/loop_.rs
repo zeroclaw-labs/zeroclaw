@@ -3926,10 +3926,6 @@ async fn process_message_inner(
         let observer: Arc<dyn Observer> = Arc::clone(&capabilities.observer);
         // What operations started inside this turn inherit: a spawned
         // sub-agent, a delegate, a peer turn, a cross-agent SOP step.
-        let bound_capabilities = crate::composition::BoundCapabilities {
-            capabilities: capabilities.clone(),
-            principal: principal.clone(),
-        };
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);

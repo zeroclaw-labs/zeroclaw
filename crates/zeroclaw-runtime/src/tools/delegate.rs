@@ -613,7 +613,11 @@ impl DelegateTool {
         let mut tool = Self::new(HashMap::new(), None, security);
         tool.root_config = Some(config);
         tool.caller_alias = caller_alias.to_owned();
-        tool.parent_tools = context.parent_tools;
+        tool.parent_tools = OwnedParentTools {
+            tools: context.parent_tools,
+            origins: Default::default(),
+            memory_policies: None,
+        };
         tool.runtime = Some(context.runtime);
         tool.workspace_dir = context.workspace_dir;
         tool.memory = Some(context.memory);
