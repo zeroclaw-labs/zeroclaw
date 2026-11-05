@@ -59058,7 +59058,17 @@ Done."#;
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn channel_recovery_summary_native_result_survives_sqlite_reload_once() {
+        assert_channel_recovery_resume(true, true).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn channel_recovery_summary_prompt_result_survives_sqlite_reload_once() {
+        assert_channel_recovery_resume(false, true).await;
+    }
+
     struct RecoveryResumeProvider {
+        summarize: bool,
         calls: AtomicUsize,
         native: bool,
         resumed: Mutex<Vec<ChatMessage>>,
@@ -59096,6 +59106,7 @@ Done."#;
         ) -> anyhow::Result<String> {
             match self.calls.fetch_add(1, Ordering::SeqCst) {
                 0 => Ok(tool_call_payload()),
+                1 if self.summarize => Ok("Summary of the completed operation.".into()),
                 1 => std::future::pending().await,
                 _ => {
                     *self.resumed.lock().unwrap() = messages.to_vec();
@@ -59132,6 +59143,12 @@ Done."#;
                     usage: None,
                     reasoning_content: None,
                 }),
+                1 if self.summarize => Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("Summary of the completed operation.".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }),
                 1 => std::future::pending().await,
                 _ => {
                     *self.resumed.lock().unwrap() = request.messages.to_vec();
@@ -59146,9 +59163,10 @@ Done."#;
         }
     }
 
-    async fn assert_channel_recovery_resume(native: bool) {
+    async fn assert_channel_recovery_resume(native: bool, summarize: bool) {
         let channel = Arc::new(RecordingChannel::default());
         let provider = Arc::new(RecoveryResumeProvider {
+            summarize,
             calls: AtomicUsize::new(0),
             native,
             resumed: Mutex::new(Vec::new()),
@@ -59168,6 +59186,9 @@ Done."#;
         {
             let c = Arc::get_mut(&mut ctx).unwrap();
             c.message_timeout_secs = 1;
+            if summarize {
+                c.max_tool_iterations = 1;
+            }
             c.pacing.message_timeout_scale_max = Some(1);
             c.workspace_dir = Arc::new(tmp.path().to_path_buf());
             c.session_store = Some(Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap()));
@@ -59182,18 +59203,29 @@ Done."#;
         };
         process_channel_message(ctx.clone(), message.clone(), CancellationToken::new()).await;
         assert_eq!(executions.load(Ordering::SeqCst), 1);
-        assert!(
-            channel
-                .sent_messages
-                .lock()
-                .await
-                .iter()
-                .any(
-                    |m| m.ends_with(&zeroclaw_runtime::i18n::get_required_cli_string(
-                        "channel-runtime-request-timeout"
-                    ))
-                )
-        );
+        if summarize {
+            assert!(
+                channel
+                    .sent_messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|m| m.contains("Summary of the completed operation."))
+            );
+        } else {
+            assert!(
+                channel
+                    .sent_messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(
+                        |m| m.ends_with(&zeroclaw_runtime::i18n::get_required_cli_string(
+                            "channel-runtime-task-deadline"
+                        ))
+                    )
+            );
+        }
         // Force reload from the session backend rather than reusing the cache.
         ctx.conversation_histories.lock().unwrap().clear();
         let followup = ChannelMessage {
@@ -59208,11 +59240,22 @@ Done."#;
             history.iter().any(|m| m.content.contains("65000")),
             "completed result missing: {history:?}"
         );
-        assert!(
+        assert_eq!(
             history
                 .iter()
-                .any(|m| m.content.contains("do not repeat completed changes"))
+                .filter(|m| m.role == if native { "tool" } else { "user" }
+                    && m.content.contains("65000"))
+                .count(),
+            1,
+            "results duplicated after SQLite reload: {history:?}"
         );
+        if !summarize {
+            assert!(
+                history
+                    .iter()
+                    .any(|m| m.content.contains("do not repeat completed changes"))
+            );
+        }
         if native {
             assert!(
                 history
@@ -59230,12 +59273,12 @@ Done."#;
 
     #[tokio::test(start_paused = true)]
     async fn channel_recovery_resumes_native_results_after_deadline() {
-        assert_channel_recovery_resume(true).await;
+        assert_channel_recovery_resume(true, false).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn channel_recovery_resumes_prompt_results_after_deadline() {
-        assert_channel_recovery_resume(false).await;
+        assert_channel_recovery_resume(false, false).await;
     }
 }
 
