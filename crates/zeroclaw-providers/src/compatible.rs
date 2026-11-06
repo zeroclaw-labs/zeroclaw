@@ -2994,6 +2994,13 @@ fn sse_bytes_to_events_for_contract(
             }
         }
 
+        // Some compatible endpoints close after a complete terminal sentinel
+        // without a final newline. Do not infer completion from an unfinished
+        // JSON response, partial sentinel, or trailing incomplete UTF-8 bytes.
+        if utf8_buf.is_empty() && buffer.strip_prefix("data:").map(str::trim) == Some("[DONE]") {
+            saw_completion = true;
+        }
+
         if !emitted_tool_calls {
             for tool_call in tool_calls.drain(..).filter_map(|tool_call| {
                 tool_call.into_provider_tool_call(
@@ -9898,6 +9905,36 @@ mod tests {
             matches!(events.last(), Some(Ok(StreamEvent::Final))),
             "got: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn eof_after_done_without_newline_preserves_content_and_usage() {
+        let events = collect_stream_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\ndata: [DONE]",
+        ).await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "complete sentinel must terminate: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Ok(StreamEvent::TextDelta(c)) if c.delta == "hi"))
+        );
+        assert!(events.iter().any(|e| matches!(e, Ok(StreamEvent::Usage(u)) if u.input_tokens == Some(7) && u.output_tokens == Some(2))));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Final))));
+    }
+
+    #[tokio::test]
+    async fn eof_with_partial_terminal_data_is_still_truncated() {
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DON",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\"}]}",
+        ] {
+            let events = collect_stream_events(body).await;
+            assert!(!events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))));
+            assert!(matches!(events.last(), Some(Err(_))));
+        }
     }
 
     #[tokio::test]
