@@ -57,7 +57,9 @@ the existing peer modality and per-turn voice routing. Non-streaming sends
 synthesize after the response is complete. Rejected or empty speech and
 synthesis/upload failures retain the existing voice-error logging behavior.
 Explicit voice finalization transfers the prepared job before cancelling the
-draft placeholder. If speculative synthesis failed, final delivery makes one
+draft placeholder. A failed preview deletion is logged and cannot veto the
+final reply. If pacing drops a final operation, it also cancels the owned draft
+and prepared speech. If speculative synthesis failed, final delivery makes one
 fresh synthesis attempt using only the approved final text; it never uploads
 partially prepared audio. A failed final attempt is logged without further retries.
 

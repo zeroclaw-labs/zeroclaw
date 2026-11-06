@@ -22,15 +22,12 @@ enum PacedOp {
     SendFinal(SendMessage),
     /// A terminal draft write. Dispatches to `inner.finalize_draft` so the
     /// channel edits the existing draft rather than posting a new message.
-    FinalizeVoiceDraft {
-        message: SendMessage,
-        message_id: String,
-    },
     FinalizeDraft {
         recipient: String,
         message_id: String,
         text: String,
         suppress_voice: bool,
+        force_voice: bool,
     },
 }
 
@@ -38,9 +35,7 @@ impl PacedOp {
     /// The recipient key this op paces against.
     fn recipient(&self) -> &str {
         match self {
-            Self::Send(message)
-            | Self::SendFinal(message)
-            | Self::FinalizeVoiceDraft { message, .. } => &message.recipient,
+            Self::Send(message) | Self::SendFinal(message) => &message.recipient,
             Self::FinalizeDraft { recipient, .. } => recipient,
         }
     }
@@ -48,9 +43,7 @@ impl PacedOp {
     /// Character count of the payload, for the overflow-drop log.
     fn payload_chars(&self) -> usize {
         match self {
-            Self::Send(message)
-            | Self::SendFinal(message)
-            | Self::FinalizeVoiceDraft { message, .. } => message.content.chars().count(),
+            Self::Send(message) | Self::SendFinal(message) => message.content.chars().count(),
             Self::FinalizeDraft { text, .. } => text.chars().count(),
         }
     }
@@ -60,18 +53,21 @@ impl PacedOp {
         match self {
             Self::Send(message) => inner.send(&message).await,
             Self::SendFinal(message) => inner.send_final(&message).await,
-            Self::FinalizeVoiceDraft {
-                message,
-                message_id,
-            } => inner.finalize_voice_draft(&message, &message_id).await,
             Self::FinalizeDraft {
                 recipient,
                 message_id,
                 text,
                 suppress_voice,
+                force_voice,
             } => {
                 inner
-                    .finalize_draft(&recipient, &message_id, &text, suppress_voice)
+                    .finalize_draft_with_modality(
+                        &recipient,
+                        &message_id,
+                        &text,
+                        suppress_voice,
+                        force_voice,
+                    )
                     .await
             }
         }
@@ -188,6 +184,7 @@ impl PacedChannel {
     async fn paced_dispatch(&self, op: PacedOp) -> Result<()> {
         let recipient_key = op.recipient().to_string();
 
+        let mut dropped = None;
         let decision: (Option<PacedOp>, Option<oneshot::Receiver<Result<()>>>, bool) = {
             let mut map = self.recipients.lock().await;
             map.evict_if_over_cap();
@@ -227,6 +224,7 @@ impl PacedChannel {
                         })),
                     "paced channel queue full: dropping newest outbound message"
                 );
+                dropped = Some(op);
                 (None, None, false)
             } else {
                 let (tx, rx) = oneshot::channel();
@@ -238,6 +236,17 @@ impl PacedChannel {
                 (None, Some(rx), spawn)
             }
         };
+
+        // Release owned draft resources after dropping the queue lock. A
+        // dropped final operation must not leave its synthesis worker waiting.
+        if let Some(PacedOp::FinalizeDraft {
+            recipient,
+            message_id,
+            ..
+        }) = dropped
+        {
+            self.inner.cancel_draft(&recipient, &message_id).await?;
+        }
 
         let (immediate, awaited, spawn_worker) = decision;
         if let Some(op) = immediate {
@@ -425,14 +434,6 @@ impl Channel for PacedChannel {
         self.inner.update_draft(recipient, message_id, text).await
     }
 
-    async fn finalize_voice_draft(&self, message: &SendMessage, message_id: &str) -> Result<()> {
-        self.paced_dispatch(PacedOp::FinalizeVoiceDraft {
-            message: message.clone(),
-            message_id: message_id.to_owned(),
-        })
-        .await
-    }
-
     async fn prepare_voice_draft(
         &self,
         recipient: &str,
@@ -519,6 +520,29 @@ impl Channel for PacedChannel {
             message_id: message_id.to_string(),
             text: text.to_string(),
             suppress_voice,
+            force_voice: false,
+        })
+        .await
+    }
+
+    fn supports_voice_draft_finalization(&self) -> bool {
+        self.inner.supports_voice_draft_finalization()
+    }
+
+    async fn finalize_draft_with_modality(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+        force_voice: bool,
+    ) -> Result<()> {
+        self.paced_dispatch(PacedOp::FinalizeDraft {
+            recipient: recipient.to_owned(),
+            message_id: message_id.to_owned(),
+            text: text.to_owned(),
+            suppress_voice,
+            force_voice,
         })
         .await
     }
@@ -668,6 +692,7 @@ mod tests {
         final_sends: AtomicUsize,
         finalize_drafts: AtomicUsize,
         voice_finalizes: AtomicUsize,
+        cancellations: AtomicUsize,
     }
 
     impl Attributable for CountingChannel {
@@ -689,14 +714,29 @@ mod tests {
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        async fn finalize_voice_draft(
+        fn supports_voice_draft_finalization(&self) -> bool {
+            true
+        }
+        async fn finalize_draft_with_modality(
             &self,
-            message: &SendMessage,
+            recipient: &str,
             message_id: &str,
+            text: &str,
+            suppress_voice: bool,
+            force_voice: bool,
         ) -> Result<()> {
-            assert!(message.force_voice);
-            assert_eq!(message_id, "voice-draft");
-            self.voice_finalizes.fetch_add(1, Ordering::SeqCst);
+            if force_voice {
+                assert!(!suppress_voice);
+                assert_eq!(message_id, "voice-draft");
+                self.voice_finalizes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            } else {
+                self.finalize_draft(recipient, message_id, text, suppress_voice)
+                    .await
+            }
+        }
+        async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> Result<()> {
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn send_final(&self, _message: &SendMessage) -> Result<()> {
@@ -835,6 +875,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let cfg = PacingFixture {
             interval_secs: 0,
@@ -854,6 +895,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // Use 1h to make the wait long enough that we can assert the
@@ -883,6 +925,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // 1h interval again — we only ever send once per recipient, so
@@ -914,6 +957,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -945,6 +989,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -1002,6 +1047,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // 1h floor: the first op fires immediately, so no real time elapses.
@@ -1036,6 +1082,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let paced = PacedChannel::wrap(
             counting.clone(),
@@ -1045,15 +1092,67 @@ mod tests {
             },
         );
         paced
-            .finalize_voice_draft(
-                &SendMessage::new("final text", "alice").force_voice(),
-                "voice-draft",
-            )
+            .finalize_draft_with_modality("alice", "voice-draft", "final text", false, true)
             .await
             .unwrap();
         assert_eq!(counting.voice_finalizes.load(Ordering::SeqCst), 1);
         assert_eq!(counting.final_sends.load(Ordering::SeqCst), 0);
         assert_eq!(counting.sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn speech_queue_overflow_cancels_owned_draft_without_delivering() {
+        let counting = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
+        });
+        let paced = Arc::new(PacedChannel {
+            inner: counting.clone(),
+            min_interval: Duration::from_secs(3600),
+            queue_depth: 1,
+            recipients: Arc::new(Mutex::new(RecipientMap::new())),
+        });
+        paced
+            .send(&SendMessage::new("first", "alice"))
+            .await
+            .unwrap();
+        let queued_channel = paced.clone();
+        let queued = zeroclaw_spawn::spawn!(async move {
+            queued_channel
+                .send(&SendMessage::new("queued", "alice"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while paced
+                .recipients
+                .lock()
+                .await
+                .inner
+                .get("alice")
+                .unwrap()
+                .queue
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        paced
+            .finalize_draft_with_modality("alice", "voice-draft", "final", false, true)
+            .await
+            .unwrap();
+        paced
+            .finalize_draft("alice", "text-draft", "final", false)
+            .await
+            .unwrap();
+        assert_eq!(counting.cancellations.load(Ordering::SeqCst), 2);
+        assert_eq!(counting.voice_finalizes.load(Ordering::SeqCst), 0);
+        assert_eq!(counting.finalize_drafts.load(Ordering::SeqCst), 0);
+        queued.abort();
     }
 
     #[tokio::test]
@@ -1063,6 +1162,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -1151,6 +1251,7 @@ mod tests {
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
             voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {

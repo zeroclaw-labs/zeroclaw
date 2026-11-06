@@ -11149,13 +11149,15 @@ async fn process_channel_message_body(
                 } else if let Some(ref draft_id) = draft_message_id {
                     // Same-channel voice delivery transfers any prepared audio
                     // before releasing draft ownership.
-                    if force_voice_override {
+                    if force_voice_override && !channel.supports_voice_draft_finalization() {
+                        // Preserve the legacy path for adapters without prepared
+                        // voice support; optional preview cleanup is best-effort.
+                        let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
                         channel
-                            .finalize_voice_draft(
+                            .send_final(
                                 &SendMessage::new(&delivered_response, &delivery_recipient)
                                     .force_voice()
                                     .in_thread(msg.thread_ts.clone()),
-                                draft_id,
                             )
                             .await
                             .map(|()| ReplyDelivery::Complete)
@@ -11180,11 +11182,12 @@ async fn process_channel_message_body(
                             delivered_response.clone()
                         };
                         match channel
-                            .finalize_draft(
+                            .finalize_draft_with_modality(
                                 &delivery_recipient,
                                 draft_id,
                                 &draft_final_response,
                                 suppress,
+                                force_voice_override,
                             )
                             .await
                         {
@@ -55739,18 +55742,25 @@ Done."#;
     #[tokio::test]
     #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
     async fn speech_stream_reaches_tts_before_final_and_uploads_one_telegram_voice_note() {
-        assert_speech_reply_through_routing(false).await;
+        assert_speech_reply_through_routing(false, false).await;
     }
 
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
     async fn speech_stream_recovers_after_speculative_tts_failure() {
-        assert_speech_reply_through_routing(true).await;
+        assert_speech_reply_through_routing(true, false).await;
     }
 
     #[cfg(feature = "channel-telegram")]
-    async fn assert_speech_reply_through_routing(fail_first: bool) {
+    #[tokio::test]
+    #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
+    async fn speech_final_reply_survives_preview_deletion_timeout() {
+        assert_speech_reply_through_routing(false, true).await;
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    async fn assert_speech_reply_through_routing(fail_first: bool, fail_cleanup: bool) {
         use wiremock::{
             Mock, MockServer, Request, ResponseTemplate,
             matchers::{method, path, path_regex},
@@ -55793,6 +55803,17 @@ Done."#;
             )
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .expect(if fail_cleanup { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})))
+            .mount(&server)
+            .await;
         let mut config = Config::default();
         config.tts.enabled = true;
         config.agents.insert(
@@ -55822,7 +55843,15 @@ Done."#;
                 false,
             )
             .with_api_base(server.uri())
-            .with_streaming(StreamMode::MultiMessage, 0)
+            .with_streaming(
+                if fail_cleanup {
+                    StreamMode::Partial
+                } else {
+                    StreamMode::MultiMessage
+                },
+                0,
+            )
+            .with_fixture_timeout(Duration::from_secs(1))
             .with_voice_peer_resolver(Arc::new(|| vec!["-1001234567890".into()]))
             .with_tts(&config),
         );
@@ -55885,10 +55914,24 @@ Done."#;
 
     #[tokio::test]
     async fn speech_preparation_reads_live_text_only_and_redirect_routes() {
-        use zeroclaw_config::multi_agent::OutputModality;
         use zeroclaw_runtime::agent::loop_::StreamDelta;
         let recording = Arc::new(DraftRecordingChannel::new(false, false));
         let routing: tools::TurnRoutingHandle = Arc::new(Mutex::new(Vec::new()));
+        let channel_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        channel_map.write().insert(
+            "telegram.other".into(),
+            recording.clone() as Arc<dyn Channel>,
+        );
+        let route_tool = tools::SendViaTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            channel_map,
+            Arc::new(|| {
+                HashMap::from([(
+                    "other".into(),
+                    voice_peer_group("telegram.other", &["other-peer"]),
+                )])
+            }),
+        );
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let draft_channel = recording.clone();
         let draft_routing = routing.clone();
@@ -55906,42 +55949,23 @@ Done."#;
             Some(draft_routing),
             rx,
         ));
-        for (route, allowed) in [
+        for (arguments, allowed) in [
             (None, true),
+            (Some(serde_json::json!({"modality": "text"})), false),
             (
-                Some(tools::TurnRoutingEntry {
-                    channel: None,
-                    recipient: None,
-                    modality: OutputModality::Text,
-                }),
+                Some(serde_json::json!({"target": "other", "modality": "voice"})),
                 false,
             ),
-            (
-                Some(tools::TurnRoutingEntry {
-                    channel: Some("other".into()),
-                    recipient: None,
-                    modality: OutputModality::Voice,
-                }),
-                false,
-            ),
-            (
-                Some(tools::TurnRoutingEntry {
-                    channel: None,
-                    recipient: Some("other-peer".into()),
-                    modality: OutputModality::Voice,
-                }),
-                false,
-            ),
-            (
-                Some(tools::TurnRoutingEntry {
-                    channel: None,
-                    recipient: None,
-                    modality: OutputModality::Voice,
-                }),
-                true,
-            ),
+            (Some(serde_json::json!({"modality": "voice"})), true),
         ] {
-            *routing.lock().unwrap() = route.into_iter().collect();
+            routing.lock().unwrap().clear();
+            if let Some(arguments) = arguments {
+                let result = tools::TURN_ROUTING
+                    .scope(Some(routing.clone()), route_tool.execute(arguments))
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+            }
             let before = recording.voice_preparations.lock().await.len();
             tx.send(StreamDelta::Text(
                 "A sufficiently long sentence for speech preparation. ".into(),

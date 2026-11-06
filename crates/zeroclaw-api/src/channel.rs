@@ -1303,16 +1303,23 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
-    /// Deliver an explicitly voice-routed final reply while relinquishing its
-    /// draft. Adapters with prepared speech can transfer that work directly;
-    /// the default retains ordinary cancellation followed by final delivery.
-    async fn finalize_voice_draft(
+    /// Whether force-voice routing can retain this adapter's prepared draft.
+    fn supports_voice_draft_finalization(&self) -> bool {
+        false
+    }
+
+    /// Finalize with an explicit voice request, retaining speculative audio.
+    /// Adapters opting in must honor both flags; suppression takes precedence.
+    async fn finalize_draft_with_modality(
         &self,
-        message: &SendMessage,
+        recipient: &str,
         message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+        _force_voice: bool,
     ) -> anyhow::Result<()> {
-        self.cancel_draft(&message.recipient, message_id).await?;
-        self.send_final(message).await
+        self.finalize_draft(recipient, message_id, text, suppress_voice)
+            .await
     }
 
     /// Cancel and remove a previously sent draft message if the channel supports it.

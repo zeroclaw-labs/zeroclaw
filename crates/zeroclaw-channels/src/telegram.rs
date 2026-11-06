@@ -3353,6 +3353,18 @@ impl TelegramChannel {
 
     /// Override the Telegram Bot API base URL.
     /// Useful for local Bot API servers or testing.
+    #[cfg(test)]
+    pub(crate) fn with_fixture_timeout(mut self, timeout: Duration) -> Self {
+        self.fixture_http_client = Some(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(timeout)
+                .build()
+                .unwrap(),
+        );
+        self
+    }
+
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = normalize_telegram_api_base(&api_base);
         self
@@ -8477,22 +8489,36 @@ impl Channel for TelegramChannel {
         }
     }
 
-    async fn finalize_voice_draft(
+    fn supports_voice_draft_finalization(&self) -> bool {
+        true
+    }
+
+    async fn finalize_draft_with_modality(
         &self,
-        message: &SendMessage,
+        recipient: &str,
         message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+        force_voice: bool,
     ) -> anyhow::Result<()> {
-        // Move the owned job out before cancellation releases draft resources.
+        if suppress_voice || !force_voice {
+            return self
+                .finalize_draft(recipient, message_id, text, suppress_voice)
+                .await;
+        }
         let job = self
             .voice_drafts
             .lock()
-            .remove(&Self::multi_draft_key(&message.recipient, message_id));
-        self.cancel_draft(&message.recipient, message_id).await?;
-        if message.suppress_voice {
-            return self.send_final(message).await;
+            .remove(&Self::multi_draft_key(recipient, message_id));
+        // Cleanup cannot veto final speech, and the job is already owned here.
+        if let Err(error) = self.cancel_draft(recipient, message_id).await {
+            ::zeroclaw_log::record!(WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
+                "Voice draft preview cleanup failed; continuing final delivery"
+            );
         }
-        let content = strip_tool_call_tags(&message.content);
-        self.queue_voice_reply(&message.recipient, &content, job, message.force_voice);
+        self.queue_voice_reply(recipient, &strip_tool_call_tags(text), job, true);
         Ok(())
     }
 
