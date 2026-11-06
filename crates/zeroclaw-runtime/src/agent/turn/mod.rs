@@ -607,7 +607,11 @@ impl ToolProtocolPrompts {
 }
 
 tokio::task_local! {
-    static TOOL_PROTOCOL_PROMPTS: Arc<ToolProtocolPrompts>;
+    static TOOL_PROTOCOL_PROMPTS: Option<Arc<ToolProtocolPrompts>>;
+}
+
+fn current_tool_protocol_prompts() -> Option<Arc<ToolProtocolPrompts>> {
+    TOOL_PROTOCOL_PROMPTS.try_with(Clone::clone).ok().flatten()
 }
 
 /// Scope complete prompt variants around an Agent turn. This remains transient
@@ -616,7 +620,14 @@ pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
     prompts: Arc<ToolProtocolPrompts>,
     future: F,
 ) -> F::Output {
-    TOOL_PROTOCOL_PROMPTS.scope(prompts, future).await
+    TOOL_PROTOCOL_PROMPTS.scope(Some(prompts), future).await
+}
+
+/// Hide the enclosing turn's prompt variants from `future`. Task-locals follow
+/// awaits, so a child loop (a delegate, a subagent) would otherwise swap the
+/// parent's prompt, or its tool section, into its own requests.
+pub(crate) async fn without_tool_protocol_prompts<F: std::future::Future>(future: F) -> F::Output {
+    TOOL_PROTOCOL_PROMPTS.scope(None, future).await
 }
 
 fn refresh_scoped_tool_protocol_prompt(
@@ -624,7 +635,7 @@ fn refresh_scoped_tool_protocol_prompt(
     request_messages: &mut [ChatMessage],
     use_native_tools: bool,
 ) {
-    let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+    if let Some(prompts) = current_tool_protocol_prompts() {
         // History keeps the swapped prompt without re-capping it; only the
         // provider-bound copy is capped. A capped native request is rebuilt
         // from the complete native prompt, never from a capped text history.
@@ -679,7 +690,7 @@ fn refresh_scoped_tool_protocol_prompt(
                 );
             }
         }
-    });
+    }
 }
 
 fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
@@ -771,9 +782,8 @@ fn apply_builtin_prompt_scope(
                         .strip_prefix(canonical)
                         .map(str::to_owned)
                         .or_else(|| {
-                            let refresh_cap = TOOL_PROTOCOL_PROMPTS
-                                .try_with(|prompts| prompts.max_chars)
-                                .unwrap_or(max_system_prompt_chars);
+                            let refresh_cap = current_tool_protocol_prompts()
+                                .map_or(max_system_prompt_chars, |prompts| prompts.max_chars);
                             let capped = crate::agent::system_prompt::finalize_system_prompt(
                                 canonical.to_owned(),
                                 refresh_cap,
@@ -1745,11 +1755,7 @@ async fn run_tool_call_loop_impl<'a>(
     let max_system_prompt_chars = config
         .zip(agent_alias)
         .map(|(config, alias)| config.effective_max_system_prompt_chars(alias))
-        .or_else(|| {
-            TOOL_PROTOCOL_PROMPTS
-                .try_with(|prompts| prompts.max_chars)
-                .ok()
-        })
+        .or_else(|| current_tool_protocol_prompts().map(|prompts| prompts.max_chars))
         .unwrap_or(0);
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
@@ -2288,7 +2294,7 @@ async fn run_tool_call_loop_impl<'a>(
         // the channel loop's existing hook/protocol behavior rather than
         // silently widening this delegation-focused repair into channel prompt
         // reconciliation.
-        let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
+        let uses_scoped_tool_protocol = current_tool_protocol_prompts().is_some();
         let protocol_model = if uses_scoped_tool_protocol {
             provider_dispatch_model
         } else {
@@ -4800,12 +4806,19 @@ async fn drive_live_sop_actions(
                             // awaited after it, so a temporary would be dropped
                             // while the future still borrows it.
                             let mut nested_memory_preamble: Option<MemoryPreamble> = None;
+                            // Same-agent steps share the turn's prompt; a
+                            // cross-agent step's transcript has its own.
+                            let step_protocol_prompts = if owned.is_some() {
+                                None
+                            } else {
+                                current_tool_protocol_prompts()
+                            };
                             let step_result = ::zeroclaw_log::scope!(
                                 sop_run_id: run_id.as_str(),
                                 =>
                                 crate::sop::executor::scope_step_call_sink(
                                     step_call_sink.clone(),
-                                    Box::pin(run_tool_call_loop(ToolLoop {
+                                    TOOL_PROTOCOL_PROMPTS.scope(step_protocol_prompts, Box::pin(run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -4932,7 +4945,7 @@ async fn drive_live_sop_actions(
                                     // The step runs on the queuing loop's
                                     // binding, same-agent or cross-agent.
                                     capability_binding,
-                                    })),
+                                    }))),
                                 )
                             )
                             .await;
@@ -10200,6 +10213,77 @@ mod sop_step_reassembly_tests {
         assert_eq!(result.status, crate::sop::types::SopStepStatus::Completed);
         assert_eq!(result.output, "child-done");
         assert_eq!(result.effective_agent.as_deref(), Some("stepper"));
+    }
+
+    /// The parent turn's scoped prompt variants never reach a cross-agent step.
+    #[tokio::test]
+    async fn cross_agent_step_ignores_parent_tool_protocol_prompts() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+            capabilities: None,
+        };
+        let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut exec_cache = std::collections::HashMap::new();
+        exec_cache.insert(
+            "stepper".to_string(),
+            seeded_owned(
+                Arc::clone(&requests),
+                Vec::new(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+                None,
+            ),
+        );
+        let parent_provider = TextProvider;
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent system prompt")];
+        let parent_prompt = "PARENT_IDENTITY\n\n## Tools\n\nPARENT_TOOLS\n\n## Safety\n\nrules";
+        let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(
+            parent_prompt.to_string(),
+            parent_prompt.to_string(),
+            64_000,
+        ));
+
+        scope_tool_protocol_prompts(
+            prompts,
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &parent_provider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("outer"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await;
+
+        let captured = requests.lock().expect("capture lock");
+        assert!(!captured.is_empty(), "the child provider must have run");
+        for (messages, _tools, _temperature) in captured.iter() {
+            assert!(
+                messages
+                    .iter()
+                    .all(|m| !m.content.contains("PARENT_IDENTITY")
+                        && !m.content.contains("PARENT_TOOLS")),
+                "parent prompt content reached the child provider: {messages:?}"
+            );
+        }
+        drop(captured);
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
+        );
     }
 
     /// The child registry and the child's own `tool_filter_groups` govern the

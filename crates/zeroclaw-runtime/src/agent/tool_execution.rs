@@ -458,9 +458,11 @@ async fn execute_one_tool_with_provenance(
     }
 
     let context = ToolExecutionContext::new(cancellation_token.cloned());
-    let execute = context
-        .run(tool.execute_with_context(call_arguments.clone(), &context))
-        .instrument(tool_span.clone());
+    // A tool may run its own turn loop, which must not inherit this turn's prompts.
+    let execute = crate::agent::turn::without_tool_protocol_prompts(
+        context.run(tool.execute_with_context(call_arguments.clone(), &context)),
+    )
+    .instrument(tool_span.clone());
     let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
     } else {
