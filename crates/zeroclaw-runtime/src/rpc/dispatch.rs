@@ -913,12 +913,12 @@ pub struct RpcDispatcher {
     /// The transport-intrinsic credential (kernel peer uid on local
     /// sockets), presented during `initialize` when no explicit token is.
     transport_credential: crate::security::auth_provider::Credential,
-    /// The OIDC provider, as it was configured when the bearer was issued,
+    /// The signed-in principal and the OIDC provider as configured at sign-in,
     /// that this connection's bearer is bound to. Set by the side that opens
     /// the connection, never by the client: every `initialize` on it is
     /// verified with [`crate::rpc::auth::RpcInboundAuth::authenticate_bound`],
     /// so a provider repointed since then never receives the bearer.
-    auth_binding: Option<crate::rpc::auth::OidcBinding>,
+    auth_binding: Option<super::inproc::OidcSessionBinding>,
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
@@ -1148,7 +1148,7 @@ impl RpcDispatcher {
     /// Bind this connection's bearer to one OIDC provider; see the
     /// `auth_binding` field.
     #[must_use]
-    pub fn with_auth_binding(mut self, binding: Option<crate::rpc::auth::OidcBinding>) -> Self {
+    pub fn with_auth_binding(mut self, binding: Option<super::inproc::OidcSessionBinding>) -> Self {
         self.auth_binding = binding;
         self
     }
@@ -3641,7 +3641,7 @@ impl RpcDispatcher {
             (Some(binding), Some(token), Some(provider)) => {
                 self.ctx
                     .auth
-                    .authenticate_bound(self.transport_kind, token, provider, binding)
+                    .authenticate_bound(self.transport_kind, token, provider, &binding.provider)
                     .await
             }
             (Some(_), _, _) => {
@@ -3666,6 +3666,17 @@ impl RpcDispatcher {
             Ok(auth) => auth,
             Err(denied) => return Err(rpc_err(denied.code, denied.message)),
         };
+
+        if self
+            .auth_binding
+            .as_ref()
+            .is_some_and(|binding| binding.principal_id != connection_auth.principal.id)
+        {
+            return Err(rpc_err(
+                AUTH_REQUIRED,
+                crate::i18n::get_required_cli_string("rpc-auth-credential-rejected"),
+            ));
+        }
 
         // TUI identity: reconnect with previous credentials or generate new
         let tui_id = if let (Some(claimed_id), Some(sig)) =

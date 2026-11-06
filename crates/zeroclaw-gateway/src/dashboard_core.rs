@@ -459,13 +459,13 @@ impl CoreBinding {
 }
 
 /// What a chat presents to the core: the token the session signed in with,
-/// and the provider it was issued by. Every connection a chat opens is bound
+/// and its verified provider and principal. Every connection a chat opens is bound
 /// to that provider, so a provider repointed since the sign-in never
 /// receives the token.
 #[derive(Clone)]
 pub(crate) struct CoreCredential {
     pub(crate) bearer: zeroize::Zeroizing<String>,
-    pub(crate) pin: zeroclaw_runtime::rpc::auth::OidcBinding,
+    pub(crate) binding: zeroclaw_runtime::rpc::inproc::OidcSessionBinding,
 }
 
 /// What a core connection holds while the core may still be verifying its
@@ -494,7 +494,7 @@ async fn handshake(
     kept: Option<&Kept>,
 ) -> Result<(Result<RpcClient, ClientError>, Served), CoreFailure> {
     let (stream, served) = connector
-        .connect_bound(credential.pin.clone())
+        .connect_bound(credential.binding.clone())
         .await
         .ok_or(CoreFailure::Unavailable)?;
     let succeeded = CancellationToken::new();
@@ -1344,6 +1344,10 @@ impl CoreCaller {
     /// `GET /api/sessions`: the session's open chats. None can be reopened;
     /// a conversation ends with its chat.
     fn sessions_list(&self) -> Response {
+        use zeroclaw_api::grants::{Resource, Verb};
+        if !self.session.grants.permits(Resource::Sessions, Verb::Read) {
+            return chat_not_permitted();
+        }
         Json(json!({ "sessions": self.binding.listed() })).into_response()
     }
 
@@ -5000,6 +5004,84 @@ mod tests {
                     && String::from_utf8_lossy(&request.body).contains(&format!("token={token}"))
             })
             .count()
+    }
+
+    #[tokio::test]
+    async fn the_core_cannot_open_a_chat_as_a_different_principal() {
+        let fixture = Fixture::new().await;
+        let router = fixture.router();
+        let addr = serve(router.clone()).await;
+        let (cookie, session) = fixture.sign_in("alice").await;
+
+        // The provider and client still match the sign-in, but the next
+        // introspection of its bearer returns another account.
+        Mock::given(http_method("POST"))
+            .and(http_path("/introspect"))
+            .and(body_string_contains("token=tok-alice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "active": true, "token_type": "Bearer", "client_id": "gw",
+                "iss": fixture._idp.uri(), "aud": "zeroclaw",
+                "sub": "root", "groups": ["admins"], "exp": unix_now() + 600,
+            })))
+            .with_priority(1)
+            .mount(&fixture._idp)
+            .await;
+
+        let result = open_chat(addr, &cookie, "support", "first").await;
+        let Err(tokio_tungstenite::tungstenite::Error::Http(response)) = result else {
+            panic!("a changed principal must be refused before the socket opens");
+        };
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(fixture.store.list_ids().await.is_empty());
+        let (status, _) = call(
+            &router,
+            "GET",
+            "/api/sessions",
+            Some((&cookie, &session)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "the sign-in has ended");
+    }
+
+    #[tokio::test]
+    async fn listing_a_live_chat_requires_the_current_session_read_grant() {
+        let fixture = Fixture::new().await;
+        let router = fixture.router();
+        let (cookie, session) = fixture.sign_in("alice").await;
+        let chat = core_caller_for(&fixture, &session)
+            .open_chat("support", None)
+            .await
+            .expect("the account may open a chat");
+        let (status, body) = call(
+            &router,
+            "GET",
+            "/api/sessions",
+            Some((&cookie, &session)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed(&body).as_slice(),
+            std::slice::from_ref(&chat.core_id)
+        );
+
+        fixture.narrow_profile("chat-user", |profile| {
+            without_session_verb(profile, Verb::Read)
+        });
+        let (status, body) = call(
+            &router,
+            "GET",
+            "/api/sessions",
+            Some((&cookie, &session)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["reason"], "not_permitted");
+        assert!(body.get("sessions").is_none());
+        chat.close().await;
     }
 
     #[tokio::test]

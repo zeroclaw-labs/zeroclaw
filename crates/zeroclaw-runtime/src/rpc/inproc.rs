@@ -368,21 +368,22 @@ impl InprocConnector {
     }
 
     /// [`Self::connect`] for a connection whose bearer is bound to one OIDC
-    /// provider as it was configured when the bearer was issued: every
+    /// provider and to the principal that signed in. Every
     /// `initialize` on it is verified against that binding, so a provider
-    /// repointed or removed since then never receives the bearer. With the
+    /// repointed or removed since then never receives the bearer and a different
+    /// principal cannot register or resume a TUI. With the
     /// client's half comes [`Served`], which resolves once the daemon's task
     /// for the connection has ended.
     pub async fn connect_bound(
         &self,
-        binding: super::auth::OidcBinding,
+        binding: OidcSessionBinding,
     ) -> Option<(DuplexStream, Served)> {
         self.connect_with(Some(binding)).await
     }
 
     async fn connect_with(
         &self,
-        binding: Option<super::auth::OidcBinding>,
+        binding: Option<OidcSessionBinding>,
     ) -> Option<(DuplexStream, Served)> {
         let ctx = {
             let mut rx = self.inner.ctx.subscribe();
@@ -448,6 +449,13 @@ impl InprocConnector {
     }
 }
 
+/// The provider and principal established when the dashboard accepted the bearer.
+#[derive(Clone)]
+pub struct OidcSessionBinding {
+    pub provider: super::auth::OidcBinding,
+    pub principal_id: zeroclaw_api::principal::PrincipalId,
+}
+
 /// Resolves once the daemon's task for one in-process connection has ended,
 /// or was aborted at drain. A client that gives up on the connection, or
 /// drops its half, does not end that task: an `initialize` still verifying a
@@ -482,7 +490,7 @@ async fn serve(
     stream: DuplexStream,
     conn_cancel: CancellationToken,
     activity: super::ConnectionActivity,
-    binding: Option<super::auth::OidcBinding>,
+    binding: Option<OidcSessionBinding>,
     ended: tokio_util::sync::DropGuard,
 ) {
     // Admitted under the lock but cancelled before this task ran: do not
@@ -744,6 +752,13 @@ mod tests {
         }
     }
 
+    fn alice_binding(provider: crate::rpc::auth::OidcBinding) -> OidcSessionBinding {
+        OidcSessionBinding {
+            principal_id: zeroclaw_api::principal::PrincipalId::for_oidc(&provider.issuer, "alice"),
+            provider,
+        }
+    }
+
     async fn introspections(server: &wiremock::MockServer) -> usize {
         server
             .received_requests()
@@ -778,7 +793,7 @@ mod tests {
         let ctx = with_tui_signing(ctx_for(config), tmp.path());
         let cancel = CancellationToken::new();
         let connector = InprocConnector::new(cancel.clone());
-        connector.bind(ctx);
+        connector.bind(Arc::clone(&ctx));
         let params = InitializeParams {
             auth_token: Some("corp-at".to_string()),
             auth_provider: Some("oidc.corp".to_string()),
@@ -786,7 +801,7 @@ mod tests {
         };
 
         let (stream, _) = connector
-            .connect_bound(issued_bound)
+            .connect_bound(alice_binding(issued_bound))
             .await
             .expect("bound connector connects");
         let (read_half, mut writer) = tokio::io::split(stream);
@@ -811,7 +826,7 @@ mod tests {
 
         // Bound to the provider as it is now, the same bearer verifies.
         let (stream, _) = connector
-            .connect_bound(now_bound)
+            .connect_bound(alice_binding(now_bound.clone()))
             .await
             .expect("bound connector connects");
         let (read_half, mut writer) = tokio::io::split(stream);
@@ -823,6 +838,42 @@ mod tests {
         let frame = read_frame(&mut reader).await;
         assert!(frame["error"].is_null(), "unexpected RPC error: {frame}");
         assert_eq!(introspections(&other).await, 1);
+
+        // Even a valid TUI signature cannot move the original registration
+        // to a connection bound to another principal.
+        let initialized: InitializeResult =
+            serde_json::from_value(frame["result"].clone()).unwrap();
+        let resume = InitializeParams {
+            tui_id: initialized.tui_id,
+            tui_sig: initialized.tui_sig,
+            ..params
+        };
+        let other_account = OidcSessionBinding {
+            principal_id: zeroclaw_api::principal::PrincipalId::for_oidc(&other.uri(), "bob"),
+            provider: now_bound,
+        };
+        let (impostor, served) = connector.connect_bound(other_account).await.unwrap();
+        let (read_half, mut attempt) = tokio::io::split(impostor);
+        let mut replies = BufReader::new(read_half);
+        attempt
+            .write_all(rpc_request(Method::Initialize, &resume, 2).as_bytes())
+            .await
+            .unwrap();
+        let denied = read_frame(&mut replies).await;
+        assert_eq!(
+            denied["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED
+        );
+        drop(attempt);
+        drop(replies);
+        served.wait().await;
+        assert!(
+            ctx.tui_registry
+                .list()
+                .iter()
+                .any(|entry| Some(&entry.tui_id) == resume.tui_id.as_ref()),
+            "a refused reconnect must leave the original registration live"
+        );
         cancel.cancel();
         drop(writer);
     }
@@ -869,7 +920,7 @@ mod tests {
         };
 
         let (stream, served) = connector
-            .connect_bound(binding)
+            .connect_bound(alice_binding(binding))
             .await
             .expect("bound connector connects");
         let started = std::time::Instant::now();

@@ -1005,7 +1005,10 @@ impl DashboardAuth {
         self.sessions.sessions.lock().get(&session.key).map(|held| {
             crate::dashboard_core::CoreCredential {
                 bearer: held.bearer.clone(),
-                pin: held.provider.binding(),
+                binding: zeroclaw_runtime::rpc::inproc::OidcSessionBinding {
+                    provider: held.provider.binding(),
+                    principal_id: held.auth.principal.id.clone(),
+                },
             }
         })
     }
