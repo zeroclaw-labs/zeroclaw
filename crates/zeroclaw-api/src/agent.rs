@@ -247,6 +247,45 @@ pub enum TurnEvent {
         /// `input_tokens`) or no estimate could be formed.
         estimated_input_tokens: Option<u64>,
     },
+    /// A tool call made by a foreground delegate sub-agent, forwarded to the
+    /// parent turn so a client can show what a running child is doing.
+    ///
+    /// Live only: it is never written to history or the turn checkpoint, and
+    /// it carries summaries, not the child's full arguments or output.
+    DelegateActivity(DelegateActivity),
+}
+
+/// One child tool call start or finish, attributed to the parent's delegate
+/// call. See [`TurnEvent::DelegateActivity`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DelegateActivity {
+    /// The parent turn's `delegate` tool call this activity belongs to.
+    pub parent_tool_call_id: String,
+    /// The delegate agent that made the call.
+    pub agent: String,
+    /// Nesting below the parent's delegate call: 0 for its direct child,
+    /// 1 for a child of that child, and so on.
+    pub depth: u32,
+    /// The child's own tool call id, shared by its start and finish.
+    pub tool_call_id: String,
+    pub tool_name: String,
+    #[serde(flatten)]
+    pub phase: DelegateActivityPhase,
+}
+
+/// Whether a [`DelegateActivity`] reports a call starting or finishing.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum DelegateActivityPhase {
+    Started {
+        /// Secret-redacted, bounded summary of the call's arguments.
+        arguments_summary: String,
+    },
+    Finished {
+        success: bool,
+        /// Bounded, credential-scrubbed preview of the call's output.
+        output_preview: String,
+    },
 }
 
 /// Provider-facing context captured at a trim boundary. This remains attached
