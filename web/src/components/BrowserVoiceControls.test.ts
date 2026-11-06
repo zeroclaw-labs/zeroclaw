@@ -156,8 +156,12 @@ test('clicking the active microphone keeps the final transcript emitted on stop'
   const transcripts: string[] = [];
   const renderer = await mount(text => transcripts.push(text));
   const mic = () => renderer.root.findAllByType('button')[0]!;
+  const icon = () => mic().findByType('svg').props.className;
+  assert.match(icon(), /lucide-mic-off/);
   await act(async () => { await mic().props.onClick(); });
+  assert.match(icon(), /lucide-mic(?: |$)/);
   await act(async () => { await mic().props.onClick(); });
+  assert.match(icon(), /lucide-mic-off/);
   assert.deepEqual(transcripts, ['Final after stop']);
   assert.equal(aborted, 0);
   assert.equal(mic().props['aria-pressed'], false);

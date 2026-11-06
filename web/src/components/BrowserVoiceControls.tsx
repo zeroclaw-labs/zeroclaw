@@ -201,7 +201,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const css = 'touch-manipulation select-none p-2 rounded-lg border border-pc-border hover:bg-pc-hover text-pc-text-secondary disabled:opacity-40';
   if (!ready || (!prefs.dictation && !prefs.reading)) return null;
   return <div ref={root} className="flex flex-wrap items-center gap-1 max-w-48">
-    {prefs.dictation && <button type="button" className={css} aria-label={t('voice.microphone')} title={t('voice.microphone')} aria-pressed={listening} onClick={() => void toggleMicrophone()}>{listening ? <MicOff size={20} /> : <Mic size={20} />}</button>}
+    {prefs.dictation && <button type="button" className={listening ? css + ' bg-pc-accent/20 ring-2 ring-pc-accent' : css} aria-label={t('voice.microphone')} title={t('voice.microphone')} aria-pressed={listening} onClick={() => void toggleMicrophone()}>{listening ? <Mic size={20} /> : <MicOff size={20} />}</button>}
     {prefs.dictation && typeof navigator.mediaDevices?.enumerateDevices === 'function' && (
       <button type="button" className={css} aria-label={t('voice.choose_input')} title={t('voice.choose_input')}
         aria-expanded={showInputs} disabled={listening} onClick={() => {
