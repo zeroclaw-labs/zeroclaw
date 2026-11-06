@@ -10,6 +10,7 @@ use zeroclaw_api::channel::{
 
 struct PendingApproval {
     sender: oneshot::Sender<ChannelApprovalResponse>,
+    strict_session_prompt_approval: bool,
     alias: String,
     destination: String,
 }
@@ -36,6 +37,7 @@ pub async fn register_pending_approval_for_test(
         Entry::Vacant(entry) => {
             entry.insert(PendingApproval {
                 sender,
+                strict_session_prompt_approval: false,
                 alias: alias.to_string(),
                 destination: WhatsAppChannel::canonical_approval_destination(destination),
             });
@@ -141,6 +143,7 @@ async fn run_approval_lifecycle<F, Fut>(
     alias: &str,
     destination: &str,
     approval_timeout_secs: u64,
+    strict_session_prompt_approval: bool,
     send: F,
 ) -> anyhow::Result<zeroclaw_api::channel::AttributedApprovalResponse>
 where
@@ -154,6 +157,7 @@ where
             token.clone(),
             PendingApproval {
                 sender: tx_approval,
+                strict_session_prompt_approval,
                 alias: alias.to_string(),
                 destination: WhatsAppChannel::canonical_approval_destination(destination),
             },
@@ -322,6 +326,15 @@ impl WhatsAppChannel {
             || pending.destination != responder
             || pending.destination != reply_target
             || !self.is_number_allowed(&responder)
+        {
+            return true;
+        }
+
+        // Session-prompt approvals are deliberately one-shot: a legacy or
+        // stale `always` reply must be suppressed without consuming the
+        // parked request, leaving the operator a valid one-time choice.
+        if pending.strict_session_prompt_approval
+            && matches!(response, ChannelApprovalResponse::AlwaysApprove)
         {
             return true;
         }
@@ -1079,18 +1092,26 @@ impl Channel for WhatsAppChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        // The text transport has no verified literal confirmation renderer.
+        if zeroclaw_api::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         let token = crate::util::new_approval_token();
-        let text = crate::util::build_yesno_approval_prompt(
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
+        let text = crate::util::build_yesno_approval_prompt_with_policy(
             &token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            strict_session_prompt_approval,
         );
         let attributed = run_approval_lifecycle(
             token,
             &self.alias,
             recipient,
             self.approval_timeout_secs,
+            strict_session_prompt_approval,
             || async { self.send(&SendMessage::new(text, recipient)).await },
         )
         .await?;
@@ -1145,6 +1166,38 @@ impl Channel for WhatsAppChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn strict_approval_is_denied_before_registration() {
+        let channel = WhatsAppChannel::new(
+            "test-token".into(),
+            "123".into(),
+            "verify".into(),
+            "strict-denial-test",
+            Arc::new(Vec::new),
+        );
+        let request = ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("123", &request)
+                .await
+                .expect("strict denial")
+                .is_none()
+        );
+        assert!(
+            !PENDING_APPROVALS
+                .lock()
+                .await
+                .values()
+                .any(|pending| pending.alias == "strict-denial-test")
+        );
+    }
 
     fn make_channel() -> WhatsAppChannel {
         WhatsAppChannel::new(
@@ -3103,6 +3156,7 @@ mod tests {
     fn test_pending_approval(sender: oneshot::Sender<ChannelApprovalResponse>) -> PendingApproval {
         PendingApproval {
             sender,
+            strict_session_prompt_approval: false,
             alias: TEST_APPROVAL_ALIAS.to_string(),
             destination: TEST_APPROVAL_DESTINATION.to_string(),
         }
@@ -3111,6 +3165,7 @@ mod tests {
     async fn run_test_approval_lifecycle<F, Fut>(
         token: String,
         approval_timeout_secs: u64,
+        strict_session_prompt_approval: bool,
         send: F,
     ) -> anyhow::Result<zeroclaw_api::channel::AttributedApprovalResponse>
     where
@@ -3122,6 +3177,7 @@ mod tests {
             TEST_APPROVAL_ALIAS,
             TEST_APPROVAL_DESTINATION,
             approval_timeout_secs,
+            strict_session_prompt_approval,
             send,
         )
         .await
@@ -3182,7 +3238,7 @@ mod tests {
     async fn send_failure_leaves_no_live_token() {
         let token = "sendfl";
 
-        let result = run_test_approval_lifecycle(token.to_string(), 300, || async {
+        let result = run_test_approval_lifecycle(token.to_string(), 300, false, || async {
             anyhow::bail!("simulated transport failure")
         })
         .await;
@@ -3202,7 +3258,7 @@ mod tests {
         let task = zeroclaw_spawn::spawn!(async move {
             // A send that succeeds, then a wait long enough that the abort
             // below lands while the lifecycle is parked on the receiver.
-            run_test_approval_lifecycle("cancel".to_string(), 300, || async { Ok(()) }).await
+            run_test_approval_lifecycle("cancel".to_string(), 300, false, || async { Ok(()) }).await
         });
 
         wait_until_registered(token).await;
@@ -3289,7 +3345,7 @@ mod tests {
         let token = "opappr";
 
         let task = zeroclaw_spawn::spawn!(async move {
-            run_test_approval_lifecycle("opappr".to_string(), 300, || async { Ok(()) }).await
+            run_test_approval_lifecycle("opappr".to_string(), 300, false, || async { Ok(()) }).await
         });
 
         wait_until_registered(token).await;
@@ -3318,6 +3374,78 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn strict_always_webhook_reply_is_rejected_without_consuming() {
+        let token = "strict";
+        let (tx, mut rx) = oneshot::channel();
+        PENDING_APPROVALS.lock().await.insert(
+            token.to_string(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: true,
+                alias: "test".to_string(),
+                destination: "+123".to_string(),
+            },
+        );
+        let channel = WhatsAppChannel::new(
+            "access-token".to_string(),
+            "endpoint".to_string(),
+            "verify-token".to_string(),
+            "test",
+            Arc::new(|| vec!["+123".to_string()]),
+        );
+
+        assert!(
+            channel
+                .resolve_pending_approval(
+                    token,
+                    ChannelApprovalResponse::AlwaysApprove,
+                    "+123",
+                    "+123",
+                )
+                .await
+        );
+        assert!(PENDING_APPROVALS.lock().await.contains_key(token));
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            channel
+                .resolve_pending_approval(token, ChannelApprovalResponse::Approve, "+123", "+123",)
+                .await
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn consumed_webhook_reply_with_dead_receiver_is_not_unknown_chat() {
+        let token = "receiver-gone";
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        PENDING_APPROVALS.lock().await.insert(
+            token.to_string(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+                alias: "test".to_string(),
+                destination: "+123".to_string(),
+            },
+        );
+        let channel = WhatsAppChannel::new(
+            "access-token".to_string(),
+            "endpoint".to_string(),
+            "verify-token".to_string(),
+            "test",
+            Arc::new(|| vec!["+123".to_string()]),
+        );
+
+        assert!(
+            channel
+                .resolve_pending_approval(token, ChannelApprovalResponse::Approve, "+123", "+123",)
+                .await
+        );
+        assert!(!PENDING_APPROVALS.lock().await.contains_key(token));
+    }
+
     /// The success arm must DISARM, not merely finish.
     ///
     /// A guard still armed after a resolved approval spawns a removal for a
@@ -3339,7 +3467,7 @@ mod tests {
         let token = "reuse1";
 
         let task = zeroclaw_spawn::spawn!(async move {
-            run_test_approval_lifecycle("reuse1".to_string(), 300, || async { Ok(()) }).await
+            run_test_approval_lifecycle("reuse1".to_string(), 300, false, || async { Ok(()) }).await
         });
         wait_until_registered(token).await;
 
@@ -3376,7 +3504,7 @@ mod tests {
         let token = "unrch";
 
         let task = zeroclaw_spawn::spawn!(async move {
-            run_test_approval_lifecycle("unrch".to_string(), 300, || async { Ok(()) }).await
+            run_test_approval_lifecycle("unrch".to_string(), 300, false, || async { Ok(()) }).await
         });
 
         wait_until_registered(token).await;
@@ -3404,9 +3532,10 @@ mod tests {
     async fn an_unanswered_prompt_is_attributed_timed_out() {
         let token = "tmout";
 
-        let attributed = run_test_approval_lifecycle(token.to_string(), 0, || async { Ok(()) })
-            .await
-            .expect("a timeout is a decision, not an error");
+        let attributed =
+            run_test_approval_lifecycle(token.to_string(), 0, false, || async { Ok(()) })
+                .await
+                .expect("a timeout is a decision, not an error");
 
         assert_eq!(attributed.response, ChannelApprovalResponse::Deny);
         assert_eq!(
@@ -3473,7 +3602,7 @@ mod tests {
         );
 
         let task = zeroclaw_spawn::spawn!(async move {
-            run_approval_lifecycle("bound1".to_string(), "ops", "+111", 300, || async {
+            run_approval_lifecycle("bound1".to_string(), "ops", "+111", 300, false, || async {
                 Ok(())
             })
             .await

@@ -692,6 +692,7 @@ mod tests {
             reasoning_content: None,
         });
         history.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: id,
             content: format!("result {index}"),
             tool_name: "shell".into(),

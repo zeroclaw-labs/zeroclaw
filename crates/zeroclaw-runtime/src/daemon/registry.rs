@@ -92,6 +92,9 @@ pub type GatewayStarter = Box<
             // pairing, revocation and policy changes act on both surfaces at
             // once. `None` only for standalone gateways.
             Option<DaemonInboundAuthority>,
+            // One daemon generation's gateway lifecycle authority, shared
+            // with RPC deletion. `None` only for standalone gateways.
+            Option<zeroclaw_infra::gateway_session::GatewaySessionCoordination>,
             Option<GatewayReadinessReporter>,
         ) -> StarterFuture
         + Send
@@ -291,7 +294,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _, _, _gateway_sessions, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {
@@ -369,7 +372,7 @@ mod tests {
 
         let gateway: GatewayStarter = Box::new({
             let expected_handle = expected_handle.clone();
-            move |_, _, _, received_authority, _, _, _, _, _| {
+            move |_, _, _, received_authority, _, _, _, _, _gateway_sessions, _| {
                 assert!(
                     expected_handle.same_storage(&received_authority.live_handle()),
                     "gateway starter must receive the daemon generation's authority"
@@ -395,6 +398,7 @@ mod tests {
             0,
             Config::default(),
             authority.clone(),
+            None,
             None,
             None,
             None,

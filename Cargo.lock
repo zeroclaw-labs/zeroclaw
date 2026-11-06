@@ -14235,6 +14235,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-util",
  "url",
  "zeroclaw-api",
  "zeroclaw-log",
