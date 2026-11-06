@@ -1566,6 +1566,8 @@ async fn deliver_if_configured(
 /// Delivery function type — takes owned values so the returned future is 'static.
 /// The fourth `Option<String>` is the optional thread/conversation id propagated
 /// to channels whose outbound `thread_id` is distinct from the recipient (webhook).
+/// The last `Option<Vec<String>>` is the sender's mention policy (see
+/// `SendMessage::allowed_mentions`); `None` keeps the channel's default.
 pub type DeliveryFn = Box<
     dyn Fn(
             Config,
@@ -1573,6 +1575,7 @@ pub type DeliveryFn = Box<
             String,
             Option<String>,
             String,
+            Option<Vec<String>>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         + Send
         + Sync,
@@ -1593,6 +1596,20 @@ pub async fn deliver_announcement(
     thread_id: Option<&str>,
     output: &str,
 ) -> Result<()> {
+    deliver_announcement_with_mentions(config, channel, target, thread_id, output, None).await
+}
+
+/// [`deliver_announcement`] with an explicit mention policy for channels whose
+/// content can ping users (see `SendMessage::allowed_mentions`). `None` keeps
+/// the channel's default handling.
+pub async fn deliver_announcement_with_mentions(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    thread_id: Option<&str>,
+    output: &str,
+    allowed_mentions: Option<Vec<String>>,
+) -> Result<()> {
     if let Some(f) = DELIVERY_FN.get() {
         f(
             config.clone(),
@@ -1600,6 +1617,7 @@ pub async fn deliver_announcement(
             target.to_string(),
             thread_id.map(str::to_string),
             output.to_string(),
+            allowed_mentions,
         )
         .await
     } else {
@@ -4066,28 +4084,33 @@ mod tests {
         // so repeated calls across tests are safe and the first writer wins. The
         // handler honours the `fail-delivery` failure contract used by the
         // delivery-classification tests so it composes regardless of order.
-        register_delivery_fn(Box::new(|_config, channel, _target, _thread, output| {
-            Box::pin(async move {
-                if channel == "paused-admission-delivery" {
-                    DELIVERY_ENTERED.notify_one();
-                    DELIVERY_RELEASE.notified().await;
-                }
-                if channel == "fail-delivery" {
-                    anyhow::bail!("synthetic delivery failure");
-                }
-                if channel == COUNT_CHANNEL {
-                    DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                if channel == CONTEXT_FAILURE_CHANNEL {
-                    assert_eq!(
-                        output,
-                        crate::i18n::get_required_cli_string("turn-context-window-exceeded-error")
-                    );
-                    CONTEXT_FAILURES_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                Ok(())
-            })
-        }));
+        register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread, output, _mentions| {
+                Box::pin(async move {
+                    if channel == "paused-admission-delivery" {
+                        DELIVERY_ENTERED.notify_one();
+                        DELIVERY_RELEASE.notified().await;
+                    }
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    if channel == COUNT_CHANNEL {
+                        DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if channel == CONTEXT_FAILURE_CHANNEL {
+                        assert_eq!(
+                            output,
+                            crate::i18n::get_required_cli_string(
+                                "turn-context-window-exceeded-error"
+                            )
+                        );
+                        CONTEXT_FAILURES_DELIVERED
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                })
+            },
+        ));
     }
 
     #[tokio::test]

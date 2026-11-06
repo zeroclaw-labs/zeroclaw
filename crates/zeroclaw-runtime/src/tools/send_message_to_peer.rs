@@ -9,7 +9,7 @@ use crate::control_plane::{
     ControlPlaneHandle, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
     control_plane as global_control_plane,
 };
-use crate::cron::scheduler::deliver_announcement;
+use crate::cron::scheduler::{deliver_announcement, deliver_announcement_with_mentions};
 use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 use crate::peers::resolve_peer_set;
 use anyhow::Result;
@@ -25,7 +25,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_config::multi_agent::{PeerRouteLookup, lookup_peer_route};
 use zeroclaw_config::schema::Config;
+use zeroclaw_tools::send_via::discord_routed_content;
 
 const PEER_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const PEER_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -398,6 +400,78 @@ impl Tool for SendMessageToPeerTool {
             });
         }
 
+        // Discord external peers are user allowlist entries, but Discord
+        // delivery posts to a channel or thread ID. Deliver to the route the
+        // operator configured for the peer; without one, sending would fail
+        // with an opaque "Unknown Channel" error, so reject it with guidance.
+        if channel_ref_is_discord(&channel) {
+            let sender_groups = self
+                .config
+                .peer_groups
+                .iter()
+                .filter(|(_, group)| group.agents.iter().any(|a| a.as_str() == self.sender_alias))
+                .map(|(name, group)| (name.as_str(), group));
+            let route = match lookup_peer_route(sender_groups, &channel, &target) {
+                PeerRouteLookup::Routed(route) => route,
+                PeerRouteLookup::Unrouted => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(crate::i18n::get_required_cli_string_with_args(
+                            "peer-delivery-discord-external-peer",
+                            &[("target", &format!("{target:?}"))],
+                        )),
+                    });
+                }
+                PeerRouteLookup::Conflict(groups) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(crate::i18n::get_required_cli_string_with_args(
+                            "peer-delivery-route-conflict",
+                            &[
+                                ("target", &format!("{target:?}")),
+                                ("channel", &channel),
+                                ("groups", &groups.join(", ")),
+                            ],
+                        )),
+                    });
+                }
+            };
+            let (content, allowed_mentions) = discord_routed_content(&route, &message);
+            return Ok(
+                match deliver_announcement_with_mentions(
+                    &self.config,
+                    &channel,
+                    &route.destination,
+                    None,
+                    &content,
+                    Some(allowed_mentions),
+                )
+                .await
+                {
+                    Ok(()) => ToolResult {
+                        success: true,
+                        output: crate::i18n::get_required_cli_string_with_args(
+                            "peer-delivery-routed",
+                            &[
+                                ("target", &format!("{target:?}")),
+                                ("channel", &channel),
+                                ("destination", &route.destination),
+                            ],
+                        )
+                        .into(),
+                        error: None,
+                    },
+                    Err(e) => ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("delivery failed: {e:#}")),
+                    },
+                },
+            );
+        }
+
         match deliver_announcement(&self.config, &channel, &target, None, &message).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
@@ -411,6 +485,16 @@ impl Tool for SendMessageToPeerTool {
             }),
         }
     }
+}
+
+/// Whether a `<type>.<alias>` channel ref (or a bare type) names a Discord
+/// channel. Mirrors the case-insensitive type match used by announcement
+/// delivery.
+fn channel_ref_is_discord(channel: &str) -> bool {
+    channel
+        .split_once('.')
+        .map_or(channel, |(channel_type, _)| channel_type)
+        .eq_ignore_ascii_case("discord")
 }
 
 fn peer_acceptance_output(recipient_alias: &str, task_id: &str) -> String {
@@ -1123,6 +1207,338 @@ mod tests {
             peer_acceptance_output("recipient", task_id),
             "accepted for in-process delivery to peer agent \"recipient\" (task_id=task-123)"
         );
+    }
+
+    /// A Discord external peer is a user ID, while announcement delivery on
+    /// Discord posts to a channel ID. The send must fail with an actionable
+    /// error before reaching delivery, not surface Discord's opaque 404.
+    #[tokio::test]
+    async fn discord_external_peer_is_rejected_before_channel_delivery() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "aa".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "friends".to_string(),
+            PeerGroupConfig {
+                channel: "discord.prod".into(),
+                agents: vec![AgentAlias::new("aa")],
+                external_peers: vec![PeerUsername::new("123456789012345678")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "aa");
+
+        let result = tool
+            .execute(json!({
+                "channel": "discord.prod",
+                "target": "123456789012345678",
+                "message": "hello",
+            }))
+            .await
+            .expect("validation failures are reported as a ToolResult");
+
+        assert!(
+            !result.success,
+            "a Discord user target must not report delivery"
+        );
+        let error = result.error.expect("rejection must carry an error");
+        assert_eq!(
+            error,
+            crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-discord-external-peer",
+                &[("target", "\"123456789012345678\"")],
+            ),
+            "the rejection must come from the Fluent catalogue"
+        );
+        assert!(error.contains("\"123456789012345678\""), "{error}");
+        assert!(error.contains("user ID"), "{error}");
+        assert!(error.contains("channel or thread"), "{error}");
+        assert!(!error.contains("delivery failed"), "{error}");
+    }
+
+    /// The Discord guard is scoped to Discord: an external peer on another
+    /// channel type passes validation and reaches announcement delivery. Unit
+    /// tests register no delivery handler, so delivery is a logged no-op that
+    /// returns `Ok`; the `delivered to external peer` output is produced only
+    /// by that delivery arm, so an earlier rejection (unknown target, Discord
+    /// guard) cannot pass.
+    #[tokio::test]
+    async fn non_discord_external_peer_still_reaches_delivery() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "aa".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "friends".to_string(),
+            PeerGroupConfig {
+                channel: "telegram.prod".into(),
+                agents: vec![AgentAlias::new("aa")],
+                external_peers: vec![PeerUsername::new("@operator")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "aa");
+
+        let result = tool
+            .execute(json!({
+                "channel": "telegram.prod",
+                "target": "@operator",
+                "message": "hello",
+            }))
+            .await
+            .expect("delivery outcomes are reported as a ToolResult");
+
+        assert!(
+            result.success,
+            "a non-Discord external peer must reach delivery: {:?}",
+            result.error
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            result.output.to_string(),
+            "delivered to external peer \"@operator\" on telegram.prod"
+        );
+    }
+
+    const ROUTED_PEER: &str = "123456789012345678";
+
+    /// A test peer group: `(name, channel, agents, ignore, route destination)`.
+    type RouteGroupSpec<'a> = (
+        &'a str,
+        &'a str,
+        &'a [&'a str],
+        &'a [&'a str],
+        Option<&'a str>,
+    );
+
+    /// Agent `aa` on `discord.prod`; each group in `groups` lists `ROUTED_PEER`.
+    fn discord_route_tool(groups: &[RouteGroupSpec<'_>]) -> SendMessageToPeerTool {
+        let mut config = Config::default();
+        for alias in ["aa", "bb"] {
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    channels: vec!["discord.prod".into()],
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        for (name, channel, agents, ignore, destination) in groups {
+            config.peer_groups.insert(
+                (*name).to_string(),
+                PeerGroupConfig {
+                    channel: (*channel).into(),
+                    agents: agents.iter().map(|a| AgentAlias::new(*a)).collect(),
+                    external_peers: vec![PeerUsername::new(ROUTED_PEER)],
+                    ignore: ignore.iter().map(|p| PeerUsername::new(*p)).collect(),
+                    routes: destination
+                        .iter()
+                        .map(|d| {
+                            (
+                                ROUTED_PEER.to_string(),
+                                zeroclaw_config::multi_agent::PeerRouteConfig {
+                                    destination: (*d).to_string(),
+                                    mention: true,
+                                },
+                            )
+                        })
+                        .collect(),
+                    ..PeerGroupConfig::default()
+                },
+            );
+        }
+        SendMessageToPeerTool::new(Arc::new(config), "aa")
+    }
+
+    async fn send_to_routed_peer(tool: &SendMessageToPeerTool) -> ToolResult {
+        tool.execute(json!({
+            "channel": "discord.prod",
+            "target": ROUTED_PEER,
+            "message": "hello",
+        }))
+        .await
+        .expect("delivery outcomes are reported as a ToolResult")
+    }
+
+    /// A routed Discord peer reaches delivery, and the result names the
+    /// destination so the agent does not think it sent a direct message.
+    #[tokio::test]
+    async fn discord_routed_peer_is_delivered_to_its_destination() {
+        let tool = discord_route_tool(&[(
+            "bots",
+            "discord.prod",
+            &["aa"],
+            &[],
+            Some("444444444444444444"),
+        )]);
+        let result = send_to_routed_peer(&tool).await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output.to_string(),
+            crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-routed",
+                &[
+                    ("target", &format!("{ROUTED_PEER:?}")),
+                    ("channel", "discord.prod"),
+                    ("destination", "444444444444444444"),
+                ],
+            )
+        );
+        assert!(result.output.to_string().contains("444444444444444444"));
+    }
+
+    /// Only the sender's own peer groups are searched: a route configured in a
+    /// group the sender does not belong to does not apply.
+    #[tokio::test]
+    async fn discord_route_in_a_group_without_the_sender_is_not_used() {
+        let tool = discord_route_tool(&[
+            ("mine", "discord.prod", &["aa"], &[], None),
+            (
+                "theirs",
+                "discord.prod",
+                &["bb"],
+                &[],
+                Some("444444444444444444"),
+            ),
+        ]);
+        let result = send_to_routed_peer(&tool).await;
+        assert!(!result.success);
+        let error = result.error.expect("an unrouted peer is rejected");
+        assert!(error.contains("with no route"), "{error}");
+    }
+
+    /// A route does not let an ignored peer through.
+    #[tokio::test]
+    async fn discord_route_does_not_make_an_ignored_peer_reachable() {
+        let tool = discord_route_tool(&[
+            (
+                "bots",
+                "discord.prod",
+                &["aa"],
+                &[],
+                Some("444444444444444444"),
+            ),
+            ("deny", "discord.prod", &["aa"], &[ROUTED_PEER], None),
+        ]);
+        let result = send_to_routed_peer(&tool).await;
+        assert!(!result.success, "an ignored peer must not be delivered to");
+        assert!(result.output.to_string().is_empty());
+        // Depending on peer-group order, the resolved peer set may or may not
+        // drop the ignored peer, so the send is rejected either there or at
+        // route lookup, which excludes ignored peers itself. It is never
+        // delivered.
+        let error = result.error.expect("an ignored peer is rejected");
+        assert!(
+            error.contains("is not on agent \"aa\"'s resolved peer set")
+                || error.contains("is a Discord external peer (a user ID) with no route"),
+            "{error}"
+        );
+    }
+
+    /// What the routed send hands to channel delivery: the route's
+    /// destination, the mention-prefixed body, and a mention policy naming only
+    /// the peer. `DELIVERY_FN` is process-global and other tests install their
+    /// own handler, so the recorder runs in an isolated child test process.
+    #[tokio::test]
+    async fn discord_routed_send_hands_destination_and_mention_policy_to_delivery() {
+        const CHILD_ENV: &str = "ZEROCLAW_PEER_ROUTE_DELIVERY_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .arg("tools::send_message_to_peer::tests::discord_routed_send_hands_destination_and_mention_policy_to_delivery")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .await
+                .unwrap();
+            assert!(
+                status.success(),
+                "isolated routed delivery test failed: {status}"
+            );
+            return;
+        }
+
+        type Delivered = (String, String, Option<String>, String, Option<Vec<String>>);
+        static DELIVERED: std::sync::Mutex<Vec<Delivered>> = std::sync::Mutex::new(Vec::new());
+        crate::cron::scheduler::register_delivery_fn(Box::new(
+            |_config, channel, target, thread, output, mentions| {
+                DELIVERED
+                    .lock()
+                    .unwrap()
+                    .push((channel, target, thread, output, mentions));
+                Box::pin(async { Ok(()) })
+            },
+        ));
+
+        let tool = discord_route_tool(&[(
+            "bots",
+            "discord.prod",
+            &["aa"],
+            &[],
+            Some("444444444444444444"),
+        )]);
+        let result = send_to_routed_peer(&tool).await;
+        assert!(result.success, "{:?}", result.error);
+
+        let delivered = DELIVERED.lock().unwrap();
+        assert_eq!(
+            *delivered,
+            vec![(
+                "discord.prod".to_string(),
+                "444444444444444444".to_string(),
+                None,
+                format!("<@{ROUTED_PEER}> hello"),
+                Some(vec![ROUTED_PEER.to_string()]),
+            )]
+        );
+    }
+
+    /// Groups covering the channel by bare type and by dotted alias that route
+    /// the peer differently fail closed and are both named.
+    #[tokio::test]
+    async fn discord_conflicting_routes_fail_closed_naming_both_groups() {
+        let tool = discord_route_tool(&[
+            ("typed", "discord", &["aa"], &[], Some("444444444444444444")),
+            (
+                "dotted",
+                "discord.prod",
+                &["aa"],
+                &[],
+                Some("555555555555555555"),
+            ),
+        ]);
+        let result = send_to_routed_peer(&tool).await;
+        assert!(!result.success);
+        let error = result.error.expect("conflicting routes are rejected");
+        assert_eq!(
+            error,
+            crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-route-conflict",
+                &[
+                    ("target", &format!("{ROUTED_PEER:?}")),
+                    ("channel", "discord.prod"),
+                    ("groups", "dotted, typed"),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn channel_ref_is_discord_matches_type_case_insensitively() {
+        assert!(channel_ref_is_discord("discord.prod"));
+        assert!(channel_ref_is_discord("Discord.prod"));
+        assert!(channel_ref_is_discord("discord"));
+        assert!(!channel_ref_is_discord("telegram.discord"));
+        assert!(!channel_ref_is_discord("discordish.prod"));
     }
 
     #[test]

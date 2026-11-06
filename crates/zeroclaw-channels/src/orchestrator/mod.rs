@@ -11074,8 +11074,15 @@ async fn process_channel_message_body(
                         let _ = orig_ch.cancel_draft(&msg.reply_target, draft_id).await;
                     }
                     let suppress = suppress_voice_override.unwrap_or(false);
-                    let mut send_msg = SendMessage::new(&delivered_response, &delivery_recipient)
-                        .in_thread(msg.thread_ts.clone());
+                    // A reply redirected to an external peer's route carries the
+                    // route's mention policy.
+                    let (routed_response, allowed_mentions) = match turn_route.as_ref() {
+                        Some(route) => route.routed_content(&delivered_response),
+                        None => (delivered_response.clone(), None),
+                    };
+                    let mut send_msg = SendMessage::new(&routed_response, &delivery_recipient)
+                        .in_thread(msg.thread_ts.clone())
+                        .with_allowed_mentions(allowed_mentions);
                     if suppress {
                         send_msg = send_msg.suppress_voice();
                     } else if force_voice_override {
@@ -17902,6 +17909,20 @@ pub async fn deliver_announcement(
     thread_id: Option<String>,
     output: &str,
 ) -> anyhow::Result<()> {
+    deliver_announcement_with_mentions(config, channel, target, thread_id, output, None).await
+}
+
+/// [`deliver_announcement`] with an explicit mention policy for channels whose
+/// content can ping users; see `SendMessage::allowed_mentions`. `None` keeps
+/// the channel's default handling.
+pub async fn deliver_announcement_with_mentions(
+    config: &zeroclaw_config::schema::Config,
+    channel: &str,
+    target: &str,
+    thread_id: Option<String>,
+    output: &str,
+    allowed_mentions: Option<Vec<String>>,
+) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
 
     let safe_output = redact_channel_outbound_leaks(
@@ -17911,7 +17932,11 @@ pub async fn deliver_announcement(
     );
     let safe_output = ensure_nonempty_channel_reply(safe_output, output, channel, target);
 
-    let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
+    let make_msg = |s: &str| {
+        SendMessage::new(s, target)
+            .in_thread(thread_id.clone())
+            .with_allowed_mentions(allowed_mentions.clone())
+    };
 
     // Snapshot out of the sync RwLock before awaiting. Use the live
     // channel instance when available — critical for Matrix E2EE which
@@ -22446,6 +22471,53 @@ temperature = 0.3
             "channels the agent is not bound to stay out of its map"
         );
         assert!(live_channel_map_for_agent(&config, "unknown").is_empty());
+    }
+
+    #[tokio::test]
+    async fn announcement_delivery_hands_the_mention_policy_to_the_live_channel() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let recorder = Arc::new(SendMessageRecordingChannel {
+            channel_name: "discord",
+            ..SendMessageRecordingChannel::default()
+        });
+        let (_published, _lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "Discord",
+            alias: Some("main".to_string()),
+            channel: Arc::clone(&recorder) as Arc<dyn Channel>,
+        }]);
+        let config = Config::default();
+
+        deliver_announcement_with_mentions(
+            &config,
+            "discord.main",
+            "333333333333333333",
+            None,
+            "routed",
+            Some(vec!["111111111111111111".to_string()]),
+        )
+        .await
+        .unwrap();
+        deliver_announcement(&config, "discord.main", "333333333333333333", None, "plain")
+            .await
+            .unwrap();
+
+        let sent = recorder.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].recipient, "333333333333333333");
+        assert_eq!(
+            sent[0].allowed_mentions,
+            Some(vec!["111111111111111111".to_string()])
+        );
+        assert_eq!(
+            sent[1].allowed_mentions, None,
+            "an ordinary announcement keeps the channel's default handling"
+        );
     }
 
     #[tokio::test]
@@ -43427,6 +43499,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ignore: Vec::new(),
             output_modality: OutputModality::default(),
             admin_for_agent_scope,
+            routes: Default::default(),
         }
     }
 
@@ -44551,6 +44624,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ignore: Vec::new(),
             output_modality: OutputModality::default(),
             admin_for_agent_scope,
+            routes: Default::default(),
         }
     }
 
