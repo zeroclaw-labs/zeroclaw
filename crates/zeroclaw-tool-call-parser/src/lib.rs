@@ -1968,14 +1968,11 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     // When the call looks like named arguments, a parse failure must reject the
     // whole call — do not reinterpret broken kwargs as a raw single value.
     if allow_kwargs && value_part.contains('=') {
-        return match parse_function_style_kwargs(value_part) {
-            Some(args) => Some(ParsedToolCall {
-                name: tool_name.to_string(),
-                arguments: serde_json::Value::Object(args),
-                tool_call_id: None,
-            }),
-            None => None,
-        };
+        return parse_function_style_kwargs(value_part).map(|args| ParsedToolCall {
+            name: tool_name.to_string(),
+            arguments: serde_json::Value::Object(args),
+            tool_call_id: None,
+        });
     }
 
     // Try YAML-style multi-line: each line is `key: value`
