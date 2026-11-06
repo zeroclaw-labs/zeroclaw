@@ -1,12 +1,16 @@
 use crate::helpers::filesystem_boundary::{
     FilesystemBoundaryError, create_dir_path_nofollow, open_absolute_dir_nofollow,
-    write_file_atomic,
+    open_file_nofollow, write_file_atomic,
 };
 use async_trait::async_trait;
 use cap_std::fs::Dir;
 use serde_json::json;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+use zeroclaw_api::local_file_diff::{
+    MAX_FILE_DIFF_BYTES, MAX_FILE_DIFF_LINES, current_capture, is_diff_text,
+};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -280,6 +284,22 @@ impl Tool for FileWriteTool {
         let capability_relative = capability_relative.to_path_buf();
         let file_name = file_name.to_os_string();
         let display_path = path.to_owned();
+        // Task-local context does not propagate into spawn_blocking. Clone only
+        // the invocation's admitted handle, never a long-lived capture flag.
+        let local_diff_capture = current_capture().filter(|_| {
+            encoding == "utf8"
+                && content.len() <= MAX_FILE_DIFF_BYTES
+                && content.lines().count() <= MAX_FILE_DIFF_LINES
+                && is_diff_text(content)
+        });
+        let canonical_workspace = if local_diff_capture.is_some() {
+            tokio::fs::canonicalize(&self.security.workspace_dir)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let security = self.security.clone();
         tokio::task::spawn_blocking(move || {
             let parent_dir = match create_dir_beneath(&capability_root, &capability_relative) {
                 Ok(dir) => dir,
@@ -297,7 +317,9 @@ impl Tool for FileWriteTool {
 
             // The returned parent handle is the bound authority. Re-resolving
             // the ambient pathname here would reintroduce a post-mutation race.
-            match parent_dir.symlink_metadata(&file_name) {
+            // Ordinary output retains only this pre-write metadata observation.
+            // It is not an atomic snapshot of what a concurrent writer replaces.
+            let previous_bytes = match parent_dir.symlink_metadata(&file_name) {
                 Ok(meta) if meta.is_symlink() => {
                     return Ok(ToolResult {
                         success: false,
@@ -309,10 +331,21 @@ impl Tool for FileWriteTool {
                         )),
                     });
                 }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(meta) => Some(meta.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(error.into()),
-            }
+            };
+
+            let captured_previous = local_diff_capture.as_ref().and_then(|_| {
+                let workspace = canonical_workspace.as_ref()?;
+                if !prospective_target.starts_with(workspace)
+                    || !security.is_resolved_path_readable(&prospective_target)
+                    || excluded_diff_path(&prospective_target)
+                {
+                    return None;
+                }
+                capture_previous_text(&parent_dir, Path::new(&file_name), previous_bytes)
+            });
 
             if let Err(error) = write_file_atomic(&parent_dir, Path::new(&file_name), &bytes) {
                 if error.is_denied() {
@@ -324,14 +357,89 @@ impl Tool for FileWriteTool {
                 }
                 return Err(error.into());
             }
+            // Publish only after a successful replace. Collection failures never
+            // change the authorized write or expose old text in its result.
+            if let (Some(capture), Some(previous), Ok(written)) = (
+                local_diff_capture,
+                captured_previous,
+                std::str::from_utf8(&bytes),
+            ) {
+                capture.record(previous, written.to_owned());
+            }
+            let new_bytes = bytes.len().to_string();
+            let output = match previous_bytes {
+                Some(previous_bytes) => crate::i18n::get_required_tool_string_with_args(
+                    "tool-file-write-result-existing",
+                    &[
+                        ("bytes", &new_bytes),
+                        ("path", &display_path),
+                        ("previous_bytes", &previous_bytes.to_string()),
+                    ],
+                ),
+                None => crate::i18n::get_required_tool_string_with_args(
+                    "tool-file-write-result-absent",
+                    &[("bytes", &new_bytes), ("path", &display_path)],
+                ),
+            };
             Ok(ToolResult {
                 success: true,
-                output: format!("Written {} bytes to {display_path}", bytes.len()).into(),
+                output: output.into(),
                 error: None,
             })
         })
         .await?
     }
+}
+
+fn excluded_diff_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        ".env" | ".secret_key" | "credentials.json" | "auth.json" | "id_rsa" | "id_ed25519"
+    ) || name.starts_with(".env.")
+        || matches!(
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("pem" | "key" | "p12" | "pfx")
+        )
+}
+
+fn capture_previous_text(parent: &Dir, leaf: &Path, previous_bytes: Option<u64>) -> Option<String> {
+    let Some(previous_bytes) = previous_bytes else {
+        return Some(String::new());
+    };
+    if previous_bytes > MAX_FILE_DIFF_BYTES as u64 {
+        return None;
+    }
+    let file = open_file_nofollow(parent, leaf).ok()?;
+    let metadata = file.metadata().ok()?;
+    if metadata.len() > MAX_FILE_DIFF_BYTES as u64 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return None;
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_FILE_DIFF_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_FILE_DIFF_BYTES {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    if text.lines().count() > MAX_FILE_DIFF_LINES || !is_diff_text(&text) {
+        return None;
+    }
+    Some(text)
 }
 
 fn create_dir_beneath(root: &Path, relative: &Path) -> anyhow::Result<Dir> {
@@ -360,6 +468,9 @@ fn tool_text_arg(key: &str, name: &str, value: &str) -> String {
 mod tests {
     use super::*;
     use crate::wrappers::{PathGuardedTool, RateLimitedTool};
+    use zeroclaw_api::local_file_diff::{
+        LOCAL_FILE_DIFF_CAPTURE, LocalFileDiff, LocalFileDiffCapture,
+    };
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -408,6 +519,277 @@ mod tests {
             ..SecurityPolicy::default()
         });
         FileWriteTool::new_with_persistence(security, false)
+    }
+
+    async fn execute_with_diff_capture(
+        tool: &FileWriteTool,
+        args: serde_json::Value,
+    ) -> (anyhow::Result<ToolResult>, Option<LocalFileDiff>) {
+        let capture = LocalFileDiffCapture::new();
+        let result = LOCAL_FILE_DIFF_CAPTURE
+            .scope(Some(capture.clone()), tool.execute(args))
+            .await;
+        (result, capture.take())
+    }
+
+    #[tokio::test]
+    async fn file_write_local_diff_keeps_previous_text_out_of_result() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = "private-removed-sentinel\nunchanged\n";
+        let written = "replacement\nunchanged\n";
+        std::fs::write(root.path().join("notes.txt"), previous).unwrap();
+        let tool = test_tool(root.path().to_path_buf());
+
+        let (result, diff) =
+            execute_with_diff_capture(&tool, json!({"path": "notes.txt", "content": written}))
+                .await;
+        let result = result.unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        let diff = diff.unwrap();
+        assert_eq!(diff.previous(), previous);
+        assert_eq!(diff.written(), written);
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("private-removed-sentinel")
+        );
+        assert!(!format!("{result:?}").contains("private-removed-sentinel"));
+        assert!(!format!("{diff:?}").contains("private-removed-sentinel"));
+        assert!(
+            result
+                .output
+                .contains("Previous contents are omitted from this result.")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_local_diff_distinguishes_absent_and_empty_files() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = test_tool(root.path().to_path_buf());
+        std::fs::write(root.path().join("empty.txt"), []).unwrap();
+
+        for (path, expected) in [
+            ("nested/new.txt", "Before write: file absent."),
+            ("empty.txt", "Before write: existing file, 0 bytes."),
+        ] {
+            let (result, diff) =
+                execute_with_diff_capture(&tool, json!({"path": path, "content": "new"})).await;
+            let result = result.unwrap();
+            assert!(result.success, "error: {:?}", result.error);
+            assert!(result.output.contains(expected));
+            let diff = diff.unwrap();
+            assert_eq!(diff.previous(), "");
+            assert_eq!(diff.written(), "new");
+        }
+    }
+
+    #[tokio::test]
+    async fn file_write_local_diff_requires_invocation_context() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("notes.txt"), "private-old-sentinel").unwrap();
+        let tool = test_tool(root.path().to_path_buf());
+        assert!(current_capture().is_none());
+        let result = tool
+            .execute(json!({"path": "notes.txt", "content": "first"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("private-old-sentinel")
+        );
+
+        // An explicitly disabled nested invocation must not use an outer sink.
+        let capture = LocalFileDiffCapture::new();
+        let result = LOCAL_FILE_DIFF_CAPTURE
+            .scope(
+                Some(capture.clone()),
+                LOCAL_FILE_DIFF_CAPTURE.scope(
+                    None,
+                    tool.execute(json!({"path": "notes.txt", "content": "second"})),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(capture.take().is_none());
+    }
+
+    #[tokio::test]
+    async fn file_write_local_diff_skips_foreign_readable_and_write_only_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let foreign = root.path().join("foreign");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let foreign = foreign.canonicalize().unwrap();
+        let target = foreign.join("notes.txt");
+
+        for read_allowed in [true, false] {
+            std::fs::write(&target, "private-foreign-sentinel").unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                workspace_dir: workspace.clone(),
+                allowed_roots: if read_allowed {
+                    vec![foreign.clone()]
+                } else {
+                    vec![]
+                },
+                allowed_roots_write_only: if read_allowed {
+                    vec![]
+                } else {
+                    vec![foreign.clone()]
+                },
+                ..SecurityPolicy::default()
+            });
+            assert_eq!(security.is_resolved_path_readable(&target), read_allowed);
+            let tool = FileWriteTool::new(security);
+            let (result, diff) = execute_with_diff_capture(
+                &tool,
+                json!({"path": target.to_string_lossy(), "content": "replacement"}),
+            )
+            .await;
+            let result = result.unwrap();
+            assert!(result.success, "error: {:?}", result.error);
+            assert!(diff.is_none());
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("private-foreign-sentinel")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_write_local_diff_skips_binary_large_and_control_text() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = test_tool(root.path().to_path_buf());
+        let cases = [
+            (vec![0xff, 0xfe], "new".to_owned()),
+            (b"old\0value".to_vec(), "new".to_owned()),
+            (b"old\x1bvalue".to_vec(), "new".to_owned()),
+            (vec![b'x'; MAX_FILE_DIFF_BYTES + 1], "new".to_owned()),
+            (
+                "x\n".repeat(MAX_FILE_DIFF_LINES + 1).into_bytes(),
+                "new".to_owned(),
+            ),
+            (b"old".to_vec(), "new\0value".to_owned()),
+            (b"old".to_vec(), "new\u{0085}value".to_owned()),
+            (b"old".to_vec(), "x".repeat(MAX_FILE_DIFF_BYTES + 1)),
+            (b"old".to_vec(), "x\n".repeat(MAX_FILE_DIFF_LINES + 1)),
+        ];
+        for (previous, written) in cases {
+            std::fs::write(root.path().join("notes.txt"), previous).unwrap();
+            let (result, diff) =
+                execute_with_diff_capture(&tool, json!({"path": "notes.txt", "content": written}))
+                    .await;
+            let result = result.unwrap();
+            assert!(result.success, "error: {:?}", result.error);
+            assert!(diff.is_none());
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+                written
+            );
+        }
+
+        use base64::Engine;
+        std::fs::write(root.path().join("notes.txt"), "old").unwrap();
+        let (result, diff) = execute_with_diff_capture(
+            &tool,
+            json!({
+                "path": "notes.txt", "content": base64::engine::general_purpose::STANDARD.encode(b"new"),
+                "encoding": "base64"
+            }),
+        )
+        .await;
+        assert!(result.unwrap().success);
+        assert!(
+            diff.is_none(),
+            "even textual base64 writes have no local diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_local_diff_skips_credential_and_key_files() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = test_tool(root.path().to_path_buf());
+        for path in [
+            ".env",
+            ".env.local",
+            ".ENV.production",
+            ".secret_key",
+            "credentials.json",
+            "auth.json",
+            "id_rsa",
+            "id_ed25519",
+            "cert.pem",
+            "private.key",
+            "identity.p12",
+            "identity.pfx",
+            "CERT.PEM",
+        ] {
+            std::fs::write(root.path().join(path), "private-key-sentinel").unwrap();
+            let (result, diff) =
+                execute_with_diff_capture(&tool, json!({"path": path, "content": "replacement"}))
+                    .await;
+            let result = result.unwrap();
+            assert!(result.success, "{path}: {:?}", result.error);
+            assert!(diff.is_none(), "{path} must not retain previous contents");
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("private-key-sentinel")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_local_diff_skips_hardlinked_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, "private-linked-sentinel").unwrap();
+        std::fs::hard_link(&outside, workspace.join("linked.txt")).unwrap();
+        let tool = test_tool(workspace.clone());
+        let (result, diff) = execute_with_diff_capture(
+            &tool,
+            json!({"path": "linked.txt", "content": "replacement"}),
+        )
+        .await;
+        assert!(result.unwrap().success);
+        assert!(diff.is_none());
+        assert_eq!(
+            std::fs::read_to_string(outside).unwrap(),
+            "private-linked-sentinel"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("linked.txt")).unwrap(),
+            "replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_local_diff_failure_has_no_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("occupied")).unwrap();
+        let tool = test_tool(root.path().to_path_buf());
+        let (result, diff) =
+            execute_with_diff_capture(&tool, json!({"path": "occupied", "content": "replacement"}))
+                .await;
+        assert!(!result.unwrap().success);
+        assert!(diff.is_none());
+        assert!(root.path().join("occupied").is_dir());
+    }
+
+    #[test]
+    fn file_write_local_diff_old_read_failure_skips_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = open_absolute_dir_nofollow(&root.path().canonicalize().unwrap()).unwrap();
+        assert!(capture_previous_text(&parent, Path::new("missing.txt"), Some(12)).is_none());
     }
 
     #[cfg(target_os = "windows")]
@@ -485,6 +867,12 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("8 bytes"));
+        assert!(result.output.contains("Before write: file absent."));
+        assert!(
+            result
+                .output
+                .contains("Previous contents are omitted from this result.")
+        );
 
         let content = tokio::fs::read_to_string(dir.join("out.txt"))
             .await
@@ -572,10 +960,11 @@ mod tests {
 
     #[tokio::test]
     async fn file_write_overwrites_existing() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_overwrite");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("exist.txt"), "old")
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        // This unlabelled value would evade credential-pattern redaction.
+        let previous = "private-deleted-value";
+        tokio::fs::write(dir.join("exist.txt"), previous)
             .await
             .unwrap();
 
@@ -585,13 +974,51 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
+        assert!(result.output.contains("Written 3 bytes"));
+        assert!(
+            result
+                .output
+                .contains(&format!("existing file, {} bytes", previous.len()))
+        );
+        assert!(
+            result
+                .output
+                .contains("Previous contents are omitted from this result.")
+        );
+        assert!(!serde_json::to_string(&result).unwrap().contains(previous));
 
         let content = tokio::fs::read_to_string(dir.join("exist.txt"))
             .await
             .unwrap();
         assert_eq!(content, "new");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        // Later mutation cannot rewrite the already returned history evidence.
+        tokio::fs::write(dir.join("exist.txt"), "later content")
+            .await
+            .unwrap();
+        assert!(
+            result
+                .output
+                .contains(&format!("existing file, {} bytes", previous.len()))
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_empty_existing_file_is_not_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("empty.bin"), []).unwrap();
+        let result = test_tool(temp.path().to_path_buf())
+            .execute(json!({"path": "empty.bin", "content": "AAEC", "encoding": "base64"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Written 3 bytes"));
+        assert!(result.output.contains("existing file, 0 bytes"));
+        assert!(!result.output.contains("file absent"));
+        assert_eq!(
+            std::fs::read(temp.path().join("empty.bin")).unwrap(),
+            [0, 1, 2]
+        );
     }
 
     #[tokio::test]

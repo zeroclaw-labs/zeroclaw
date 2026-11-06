@@ -94,6 +94,8 @@ tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ 
 tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
 
 tool-file-write = Write contents to a file in the workspace
+tool-file-write-result-existing = Written { $bytes } bytes to { $path }. Before write: existing file, { $previous_bytes } bytes. Previous contents are omitted from this result.
+tool-file-write-result-absent = Written { $bytes } bytes to { $path }. Before write: file absent. Previous contents are omitted from this result.
 tool-file-write-error-path-blocked = Path blocked by security policy: '{ $path }'
 tool-file-write-error-missing-parent = Invalid path: missing parent directory
 tool-file-write-error-no-existing-parent = Failed to resolve an existing parent directory

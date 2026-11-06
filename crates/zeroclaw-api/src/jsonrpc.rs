@@ -329,6 +329,12 @@ impl RpcOutbound {
         self.writer_tx.send(json).await.is_ok()
     }
 
+    /// Enqueue a raw JSON line immediately. Returns `false` and drops the line
+    /// when the writer queue is full or closed.
+    pub fn try_send_raw(&self, json: String) -> bool {
+        self.writer_tx.try_send(json).is_ok()
+    }
+
     /// Reserve frame capacity before a caller performs its final authorization.
     /// Sending through the returned permit is synchronous.
     pub async fn reserve_frame(&self) -> Option<mpsc::OwnedPermit<String>> {
