@@ -20,6 +20,9 @@ pub mod login_relink;
 pub(crate) mod model_picker_delivery;
 pub mod orchestrator;
 pub mod paced_channel;
+/// Sentence and paragraph boundaries for streaming voice replies.
+#[cfg(feature = "channel-telegram")]
+pub(crate) mod speech_segment;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
