@@ -600,7 +600,8 @@ async fn handle_alias_task(
     }
 
     let session_id = format!("a2a_{alias}_{}", Uuid::new_v4());
-    match run_gateway_chat_with_tools(&state, &prompt, Some(&session_id), Some(&alias)).await {
+    match run_gateway_chat_with_tools(&state, &prompt, Some(&session_id), Some(&alias), false).await
+    {
         Ok(outcome) => {
             // v1.0 wire: Task uses TaskState enum (SCREAMING_SNAKE_CASE) and
             // flattened Part (no `kind`); the SendMessage result is a

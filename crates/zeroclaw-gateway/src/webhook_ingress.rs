@@ -629,6 +629,7 @@ async fn process_verified_message(
         &msg.content,
         Some(&session_id),
         agent_override,
+        true,
     ))
     .await
     {
