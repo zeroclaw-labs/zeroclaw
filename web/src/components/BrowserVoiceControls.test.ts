@@ -8,6 +8,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 const values = new Map<string, string>([['zeroclaw_token', 'synthetic-paired-device']]);
 const storage = { getItem: (k: string) => values.get(k) ?? null, setItem: (k: string, v: string) => values.set(k, v), removeItem: (k: string) => values.delete(k) };
 let spoken: string[] = [];
+let spokenUtterance: FakeUtterance | undefined;
 let aborted = 0;
 let capture: FakeRecognition;
 let localStatus = 'available';
@@ -28,10 +29,13 @@ class FakeRecognition {
   }
   abort() { aborted++; }
 }
-class FakeUtterance { constructor(public text: string) {} }
+class FakeUtterance {
+  onend: (() => void) | null = null;
+  constructor(public text: string) {}
+}
 const speech = Object.assign(new EventTarget(), {
   getVoices: () => [{ voiceURI: 'synthetic-local-voice', name: 'Test local voice', lang: 'en-US', localService: true }],
-  cancel: () => {}, speak: (u: FakeUtterance) => spoken.push(u.text),
+  cancel: () => {}, speak: (u: FakeUtterance) => { spokenUtterance = u; spoken.push(u.text); },
 });
 const fakeWindow = Object.assign(new EventTarget(), {
   location: { protocol: 'https:', host: 'zc.example', hostname: 'zc.example', port: '', pathname: '/', search: '' },
@@ -237,6 +241,34 @@ test('a trim notice is silent and the reply waits for an active microphone to st
   assert.deepEqual(spoken, []);
   await act(async () => { await button(0).props.onClick(); });
   assert.deepEqual(spoken, ['Two plus two is four.']);
+  await act(async () => { renderer.unmount(); });
+});
+
+test('continuous reading plays every waiting reply in order without replaying history or notices', async () => {
+  const renderer = await mount();
+  const speaker = () => renderer.root.findAllByType('button')[1]!;
+  await act(async () => {
+    speaker().props.onKeyDown({ key: 'Enter', shiftKey: true, preventDefault() {} });
+  });
+  const old = reply('old', 'Historical reply');
+  await act(async () => {
+    renderer.update(createElement(Controls, { messages: [old, reply('a', 'First reply')],
+      hydrated: true, typing: false, onTranscript() {} }));
+  });
+  assert.deepEqual(spoken, ['First reply']);
+  const messages = [old, reply('a', 'First reply'),
+    { ...reply('notice', 'History was trimmed'), ephemeral: true, notice: true },
+    reply('b', 'Second reply'), reply('c', 'Third reply')];
+  await act(async () => {
+    renderer.update(createElement(Controls, { messages, hydrated: true, typing: false, onTranscript() {} }));
+  });
+  assert.deepEqual(spoken, ['First reply']);
+  await act(async () => { spokenUtterance?.onend?.(); });
+  assert.deepEqual(spoken, ['First reply', 'Second reply']);
+  await act(async () => { spokenUtterance?.onend?.(); });
+  assert.deepEqual(spoken, ['First reply', 'Second reply', 'Third reply']);
+  await act(async () => { spokenUtterance?.onend?.(); });
+  assert.deepEqual(spoken, ['First reply', 'Second reply', 'Third reply']);
   await act(async () => { renderer.unmount(); });
 });
 

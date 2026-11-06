@@ -65,11 +65,13 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     }
     if (typing) return;
     const unseen = replies.filter(m => !m.fromHistory && !baseline.current!.has(m.id));
-    const newest = unseen[unseen.length - 1];
-    // Temporary capture, preference refresh, or speech in progress must not
-    // consume the reply. Their completion causes the effect to try again.
-    if (newest && (!ready || listening || speaking || !speak(newest.content))) return;
-    baseline.current = ids;
+    const next = unseen[0];
+    // Only consume the reply whose playback actually started. Later replies
+    // stay pending until the current utterance ends.
+    if (next) {
+      if (!ready || listening || speaking || !speak(next.content)) return;
+      baseline.current.add(next.id);
+    }
   });
   // Cancel synchronously at commit so a late recognition event cannot reach a new draft.
   useLayoutEffect(() => {
