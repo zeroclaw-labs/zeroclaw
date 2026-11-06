@@ -271,11 +271,9 @@ impl Tool for CronUpdateTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(
-                    "cron_update cannot change a job's owning agent; reassignment is \
-                     operator-only (zeroclaw cron update --agent)"
-                        .to_string(),
-                ),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "cli-cron-update-owner-forbidden",
+                )),
             });
         }
 
@@ -422,14 +420,12 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!result.success, "owner change must be rejected");
-            assert!(
-                result
-                    .error
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("owning agent"),
-                "{:?}",
-                result.error
+            assert_eq!(
+                result.error.as_deref(),
+                Some(
+                    crate::i18n::get_required_cli_string("cli-cron-update-owner-forbidden")
+                        .as_str()
+                )
             );
         }
 

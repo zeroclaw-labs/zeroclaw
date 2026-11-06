@@ -547,6 +547,7 @@ cli-cron-agent = {"  "}Agent : {$v}
 cli-cron-updated = ✅ Tâche cron {$id} mise à jour
 cli-cron-owner-empty = Tâche cron '{$id}' : l'alias de l'agent ne peut pas être vide
 cli-cron-owner-declarative = Tâche cron '{$id}' : l'agent propriétaire d'une tâche déclarative est défini par [agents.<alias>].cron_jobs dans config.toml, pas par la base de données. Déplacez l'id entre les listes cron_jobs des agents et redémarrez le démon.
+cli-cron-update-owner-forbidden = cron_update ne peut pas changer l'agent propriétaire d'une tâche. Demandez à un opérateur de la réaffecter avec `zeroclaw cron update <id> --agent <alias>`.
 cli-cron-update-no-field = Au moins un des paramètres --expression, --tz, --command, --name, --allowed-tool, --uses-memory ou une option de livraison (--channel, --to, --thread, --best-effort, --no-best-effort) doit être fourni
 cli-cron-removed = ✅ Tâche cron {$id} supprimée
 cli-cron-paused = ⏸️  Tâche cron {$id} en pause
