@@ -425,7 +425,13 @@ fn delete_model_alias(
 
     let applied = report.scrubs.clone();
     let target = format!("{family}.{profile_alias}.{model_alias}");
-    if cfg.providers.models.profile_ref(&target) == Some((family, profile_alias)) {
+    if cfg.providers.models.profile_ref(&target) == Some((family, profile_alias))
+        && cfg
+            .providers
+            .models
+            .canonical_model(&crate::provider_registry::ModelRef::from(target.as_str()))
+            .is_none()
+    {
         scrub_model_alias_refs(cfg, &target);
     }
 
@@ -1021,6 +1027,19 @@ fn rewrite_model_alias_refs(
     if cfg.providers.models.profile_ref(&old_target) != Some((family, profile_alias)) {
         return Vec::new();
     }
+    // Exact canonical model keys take precedence over legacy profile/model
+    // interpretations. A colliding canonical key must never be rewritten by
+    // a legacy alias rename.
+    if cfg
+        .providers
+        .models
+        .canonical_model(&crate::provider_registry::ModelRef::from(
+            old_target.as_str(),
+        ))
+        .is_some()
+    {
+        return Vec::new();
+    }
     let new_target = format!("{family}.{profile_alias}.{new}");
     let mut dirty = Vec::new();
     for (name, agent) in cfg.agents.iter_mut() {
@@ -1134,7 +1153,17 @@ fn rewrite_model_provider_refs(
             ));
         }
     }
+    let canonical_refs: std::collections::HashSet<String> = cfg
+        .providers
+        .models
+        .canonical_models
+        .keys()
+        .map(|reference| reference.as_str().to_string())
+        .collect();
     if rewrite_fallback_graph(cfg, |reference| {
+        if canonical_refs.contains(reference.trim()) {
+            return None;
+        }
         retarget_profile_ref(reference, &old_target, &new_target, references)
     }) {
         dirty.push("providers.fallback".to_string());
