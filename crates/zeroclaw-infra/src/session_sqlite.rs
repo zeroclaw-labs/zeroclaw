@@ -1399,6 +1399,23 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    /// One UPDATE of the existing metadata row, never an upsert: a deleted
+    /// session gets no row back, and the messages are left as they are.
+    fn set_session_trim_breadcrumb_if_exists(
+        &self,
+        session_key: &str,
+        present: bool,
+    ) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn
+            .execute(
+                "UPDATE session_metadata SET trim_breadcrumb = ?2 WHERE session_key = ?1",
+                params![session_key, i64::from(present)],
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(updated > 0)
+    }
+
     fn write_as_owner(
         &self,
         session_key: &str,
@@ -4763,6 +4780,80 @@ mod tests {
             .unwrap();
         assert!(!store.append_if_exists("k", &closure).unwrap());
         assert_eq!(store.load("k").len(), 1);
+        assert!(store.get_session_metadata("k").is_none());
+    }
+
+    /// `set_session_trim_breadcrumb_if_exists` records the flag only on a
+    /// session that exists, and leaves its messages as they are. For a key
+    /// that was never a session, or whose session was deleted, it writes
+    /// nothing: no session and no stray flag.
+    #[test]
+    fn set_trim_breadcrumb_if_exists_never_recreates_a_removed_session() {
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = TempDir::new().unwrap();
+            let store: Box<dyn SessionBackend> = if backend_name == "sqlite" {
+                Box::new(SqliteSessionBackend::new(tmp.path()).unwrap())
+            } else {
+                Box::new(SessionStore::new(tmp.path()).unwrap())
+            };
+
+            assert!(
+                !store
+                    .set_session_trim_breadcrumb_if_exists("never", true)
+                    .unwrap(),
+                "{backend_name}"
+            );
+            assert!(!store.session_exists("never"), "{backend_name}");
+            assert_eq!(
+                store.get_session_trim_breadcrumb("never").unwrap(),
+                None,
+                "{backend_name}"
+            );
+
+            store.append("k", &ChatMessage::user("one")).unwrap();
+            store.append("k", &ChatMessage::assistant("two")).unwrap();
+            assert!(
+                store
+                    .set_session_trim_breadcrumb_if_exists("k", true)
+                    .unwrap(),
+                "{backend_name}"
+            );
+            assert_eq!(
+                store.get_session_trim_breadcrumb("k").unwrap(),
+                Some(true),
+                "{backend_name}"
+            );
+            assert_eq!(store.load("k").len(), 2, "{backend_name}");
+
+            assert!(store.delete_session("k").unwrap(), "{backend_name}");
+            assert!(
+                !store
+                    .set_session_trim_breadcrumb_if_exists("k", false)
+                    .unwrap(),
+                "{backend_name}: deletion wins"
+            );
+            assert!(!store.session_exists("k"), "{backend_name}");
+            assert_eq!(
+                store.get_session_trim_breadcrumb("k").unwrap(),
+                None,
+                "{backend_name}"
+            );
+        }
+
+        // Message rows without their metadata row are not a session either.
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        store.append("k", &ChatMessage::user("orphaned")).unwrap();
+        store
+            .conn
+            .lock()
+            .execute("DELETE FROM session_metadata WHERE session_key = 'k'", [])
+            .unwrap();
+        assert!(
+            !store
+                .set_session_trim_breadcrumb_if_exists("k", true)
+                .unwrap()
+        );
         assert!(store.get_session_metadata("k").is_none());
     }
 }

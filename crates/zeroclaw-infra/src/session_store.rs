@@ -1038,6 +1038,20 @@ impl SessionBackend for SessionStore {
         Ok(true)
     }
 
+    fn set_session_trim_breadcrumb_if_exists(
+        &self,
+        session_key: &str,
+        present: bool,
+    ) -> std::io::Result<bool> {
+        // The same probe under the same guard as `append_if_exists`.
+        let _guard = self.mutation_guard()?;
+        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+            return Ok(false);
+        }
+        self.set_trim_breadcrumb_unlocked(session_key, present)?;
+        Ok(true)
+    }
+
     fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
         self.get_trim_breadcrumb(session_key)
     }

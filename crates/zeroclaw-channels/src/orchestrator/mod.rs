@@ -17190,10 +17190,13 @@ fn hydrate_session_transcript(
     // reconciliation instead of converging.
     if truncated || durable_crumb != Some(crumb_present) {
         let persist_result = match owner {
-            // Without an owner, only in a session that still exists, and as
-            // one replacement even when only the flag changed: on SQLite a
-            // flag write alone recreates the session's row.
-            None => store.replace_conversation_state_if_exists(session_key, &msgs, crumb_present),
+            // Without an owner, only in a session that still exists. A
+            // flag-only correction writes just the flag, so a message
+            // appended since the read above survives.
+            None if truncated => {
+                store.replace_conversation_state_if_exists(session_key, &msgs, crumb_present)
+            }
+            None => store.set_session_trim_breadcrumb_if_exists(session_key, crumb_present),
             Some(_) => write_owned_transcript(
                 store,
                 session_key,
@@ -24832,8 +24835,9 @@ temperature = 0.3
     /// Startup restoration reads A's old transcript, and cleanup then removes
     /// the session before restoration writes to it: hygiene archives the
     /// JSONL pair, or the stale-session sweep deletes the SQLite rows. The
-    /// write is the capped transcript when A's is over the cap, or the closure
-    /// of its unanswered last turn. Restoration holds no claim, so the write
+    /// write is the capped transcript when A's is over the cap, the closure of
+    /// its unanswered last turn, or else the trim breadcrumb flag it has not
+    /// recorded yet. Restoration holds no claim, so the write
     /// must not recreate the session: recreated, it would hold A's messages
     /// with no owner, and once A is disabled and its channel goes to B, the
     /// sole enabled agent, B's next turn would adopt them as legacy history
@@ -24845,18 +24849,13 @@ temperature = 0.3
 
         for backend_name in ["jsonl", "sqlite"] {
             for attributed in [true, false] {
-                for over_cap in [true, false] {
+                for shape in ["over the cap", "unanswered", "flag only"] {
                     let case = format!(
-                        "{backend_name}/{}/{}",
+                        "{backend_name}/{}/{shape}",
                         if attributed {
                             "attributed"
                         } else {
                             "channel-only"
-                        },
-                        if over_cap {
-                            "over the cap"
-                        } else {
-                            "unanswered"
                         }
                     );
                     let tmp = tempfile::tempdir().unwrap();
@@ -24897,7 +24896,7 @@ temperature = 0.3
                     {
                         let store =
                             zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
-                        let turns = if over_cap {
+                        let turns = if shape == "over the cap" {
                             MAX_CHANNEL_HISTORY / 2 + 5
                         } else {
                             2
@@ -24916,7 +24915,7 @@ temperature = 0.3
                                 )
                                 .unwrap();
                         }
-                        if !over_cap {
+                        if shape == "unanswered" {
                             store
                                 .append(&key, &ChatMessage::user("A_OLD_SECRET unanswered"))
                                 .unwrap();
@@ -25011,6 +25010,11 @@ temperature = 0.3
                         !store.session_exists(&key),
                         "{case}: restoration must not recreate the session cleanup removed"
                     );
+                    assert_eq!(
+                        store.get_session_trim_breadcrumb(&key).unwrap(),
+                        None,
+                        "{case}: nor leave a flag behind for it"
+                    );
                     assert_eq!(restored, None, "{case}: nothing is left to restore");
                     assert!(
                         owner
@@ -25069,6 +25073,140 @@ temperature = 0.3
                     );
                 }
             }
+        }
+    }
+
+    /// Startup restoration reads A's short transcript, whose trim breadcrumb
+    /// flag was never recorded, so its only reconciliation write is that
+    /// flag. Before the write, an authorized writer appends to the session,
+    /// as `sessions_send` does. Restoration holds no claim and nothing holds
+    /// storage across its read, so the flag write must leave the transcript
+    /// as it now stands: replacing it with the earlier read would erase the
+    /// message the writer was told it had sent. Nor may it touch what a
+    /// rewrite would reset: the messages' SQLite timestamps, the session's
+    /// last activity (the stale-session clock) and the JSONL transcript's
+    /// mtime (hygiene's archive clock).
+    #[test]
+    fn startup_flag_reconciliation_keeps_a_message_appended_after_its_read() {
+        use zeroclaw_infra::session_backend::{ScopedSessionAccess, SessionContext};
+
+        for backend_name in ["jsonl", "sqlite"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let key = "webhook_a_alice";
+            {
+                let store = zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+                store.append(key, &ChatMessage::user("A asks")).unwrap();
+                store
+                    .append(key, &ChatMessage::assistant("A replies"))
+                    .unwrap();
+                store
+                    .set_session_context(
+                        key,
+                        SessionContext {
+                            channel_id: Some("webhook.a"),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                store.set_session_agent_alias(key, "agent-a").unwrap();
+            }
+
+            // A restart: reopen the store and restore from what it holds.
+            let store: Arc<dyn SessionBackend> =
+                zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            assert_eq!(
+                store.get_session_trim_breadcrumb(key).unwrap(),
+                None,
+                "{backend_name}: the flag is unrecorded, so restoration writes it"
+            );
+            let owner = Arc::new(ChannelRuntimeContext {
+                session_store: Some(Arc::clone(&store)),
+                agent_alias: Arc::new("agent-a".into()),
+                conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                    std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+                ))),
+                ..(*router_test_ctx()).clone()
+            });
+            let agent_ctxs = HashMap::from([("agent-a".to_string(), Arc::clone(&owner))]);
+            let metadata = store
+                .list_sessions_with_metadata()
+                .into_iter()
+                .find(|metadata| metadata.key == key)
+                .unwrap();
+            let transcript = tmp
+                .path()
+                .join("sessions")
+                .join(format!("{}.jsonl", sanitize_session_key(key)));
+            let activity = {
+                let store = Arc::clone(&store);
+                let transcript = transcript.clone();
+                move || {
+                    (
+                        store
+                            .get_session_metadata(key)
+                            .map(|metadata| metadata.last_activity),
+                        store
+                            .load_with_timestamps(key)
+                            .into_iter()
+                            .map(|message| message.created_at)
+                            .collect::<Vec<_>>(),
+                        std::fs::metadata(&transcript)
+                            .and_then(|file| file.modified())
+                            .ok(),
+                    )
+                }
+            };
+            let after_send = Arc::new(Mutex::new(None));
+            let send = AfterHydrationLoad::run({
+                let store = Arc::clone(&store);
+                let after_send = Arc::clone(&after_send);
+                let activity = activity.clone();
+                move |loaded| {
+                    let granted = store
+                        .append_with_authority(
+                            loaded,
+                            &ChatMessage::user("sent after the read"),
+                            "agent-a",
+                            &move |effect| effect(&BTreeSet::from(["webhook.a".to_string()])),
+                        )
+                        .unwrap();
+                    assert_eq!(granted, ScopedSessionAccess::Granted(()), "{backend_name}");
+                    *after_send.lock().unwrap() = Some(activity());
+                }
+            });
+            let restored = hydrate_persisted_session_history(
+                store.as_ref(),
+                &metadata,
+                &agent_ctxs,
+                &HashMap::new(),
+            );
+            drop(send);
+            let after_send = after_send
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the send must run inside restoration");
+            assert_eq!(restored, Some(false), "{backend_name}");
+            assert_eq!(
+                store.get_session_trim_breadcrumb(key).unwrap(),
+                Some(false),
+                "{backend_name}: restoration records the flag"
+            );
+            let durable: Vec<String> = store
+                .load(key)
+                .into_iter()
+                .map(|message| message.content)
+                .collect();
+            assert_eq!(
+                durable,
+                ["A asks", "A replies", "sent after the read"],
+                "{backend_name}: the flag write must keep the message appended after the read"
+            );
+            assert_eq!(
+                activity(),
+                after_send,
+                "{backend_name}: the flag write must keep timestamps, last activity and mtime"
+            );
         }
     }
 

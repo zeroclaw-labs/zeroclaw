@@ -683,6 +683,25 @@ pub trait SessionBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Record the trim breadcrumb flag only if the session still exists, with
+    /// the same contract as [`append_if_exists`](Self::append_if_exists).
+    /// Unlike a replacement, it leaves the transcript as it stands, so a
+    /// message appended after the caller read the transcript survives.
+    ///
+    /// The default implementation is check-then-act and only best-effort.
+    /// Both built-in backends override it atomically.
+    fn set_session_trim_breadcrumb_if_exists(
+        &self,
+        session_key: &str,
+        present: bool,
+    ) -> std::io::Result<bool> {
+        if !self.session_exists(session_key) {
+            return Ok(false);
+        }
+        self.set_session_trim_breadcrumb(session_key, present)?;
+        Ok(true)
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,
