@@ -6479,6 +6479,10 @@ async fn run_draft_updater_with_leak_detection(
 ) {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
     let mut accumulated = String::new();
+    // A Status/FlushBarrier creates the boundary between assistant text phases.
+    // Derive the current phase from the canonical accumulation rather than
+    // retaining a second text buffer for speculative speech.
+    let mut speech_phase_start = 0;
     // Watermark of narration already run through outbound policy this stream, so
     // a completed turn crosses the (non-idempotent) hook exactly once across the
     // `Status` and `FlushBarrier` events.
@@ -6528,6 +6532,7 @@ async fn run_draft_updater_with_leak_detection(
                     )
                     .await;
                 }
+                speech_phase_start = accumulated.len();
                 let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
                 if let Err(e) = channel
                     .update_draft_progress(&reply_target, &draft_id, &visible)
@@ -6546,6 +6551,7 @@ async fn run_draft_updater_with_leak_detection(
             // Matrix has its own disclosure policy in
             // `run_matrix_single_message_draft_updater`.
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
+                speech_phase_start = accumulated.len();
                 if let Some(text) = event.legacy_status() {
                     let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
                     if let Err(e) = channel
@@ -6570,6 +6576,39 @@ async fn run_draft_updater_with_leak_detection(
             StreamDelta::Reasoning(_) => {}
             StreamDelta::Text(text) => {
                 accumulated.push_str(&text);
+                // Hooks can make non-idempotent decisions about a completed
+                // response. Do not disclose speculative text to a TTS provider
+                // before that decision; finalization will synthesize it instead.
+                if outbound_hooks.is_none() {
+                    let phase = &accumulated[speech_phase_start..];
+                    let mut speech = redact_channel_outbound_leaks(
+                        &sanitize_streaming_draft_text(phase, &known_tool_names),
+                        &leak_detection,
+                        content_format,
+                    );
+                    // The display sanitizer trims trailing whitespace, but the
+                    // speech segmenter needs the observed sentence/paragraph
+                    // delimiter. Restore only this structural whitespace, never
+                    // any stripped or redacted content.
+                    if !speech.is_empty() {
+                        speech.truncate(speech.trim_end().len());
+                        speech.push_str(&phase[phase.trim_end().len()..]);
+                    }
+                    if let Err(error) = channel
+                        .prepare_voice_draft(&reply_target, &draft_id, &speech)
+                        .await
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                            "Voice draft preparation failed"
+                        );
+                    }
+                }
                 let visible = redact_channel_outbound_leaks(
                     &sanitize_streaming_draft_text(&accumulated, &known_tool_names),
                     &leak_detection,
@@ -6614,6 +6653,7 @@ async fn run_draft_updater_with_leak_detection(
                     )
                     .await;
                 }
+                speech_phase_start = accumulated.len();
                 StreamDelta::ack_flush_barrier(&ack);
             }
         }
@@ -25799,6 +25839,7 @@ api_key = "anthropic-key"
         /// Text handed to `update_draft`, in order, so a test can assert on
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
+        voice_preparations: tokio::sync::Mutex<Vec<String>>,
         draft_updates: tokio::sync::Mutex<Vec<String>>,
         /// When set, `update_draft`/`finalize_draft` faithfully model the real
         /// Discord/Matrix MultiMessage confirmed-prefix bookkeeping: each
@@ -25851,6 +25892,7 @@ api_key = "anthropic-key"
                 delivery_events: tokio::sync::Mutex::new(Vec::new()),
                 stall_start_typing: false,
                 stall_stop_typing: false,
+                voice_preparations: tokio::sync::Mutex::new(Vec::new()),
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
                 cumulative_offset: false,
                 multi_confirmed_prefix: std::sync::Mutex::new(String::new()),
@@ -26343,6 +26385,16 @@ api_key = "anthropic-key"
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .len()
+        }
+
+        async fn prepare_voice_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.voice_preparations.lock().await.push(text.to_owned());
+            Ok(())
         }
 
         async fn update_draft(
@@ -55612,6 +55664,199 @@ Done."#;
     /// asserts on the strings handed to `update_draft` and
     /// `update_draft_progress`. Unlike the per-frame tests above, this one
     /// fails if the sanitizer call is ever dropped from the wiring.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
+    async fn speech_stream_reaches_tts_before_final_and_uploads_one_telegram_voice_note() {
+        use wiremock::{
+            Mock, MockServer, Request, ResponseTemplate,
+            matchers::{method, path, path_regex},
+        };
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, OpenAITtsProviderConfig, StreamMode, TtsProviderConfig,
+        };
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let server = MockServer::start().await;
+        let (tts_tx, mut tts_rx) = tokio::sync::mpsc::unbounded_channel();
+        Mock::given(method("POST"))
+            .and(path("/speech"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                tts_tx.send(body["input"].as_str().unwrap().to_owned()).ok();
+                ResponseTemplate::new(200)
+                    .set_body_bytes(crate::tts::speech::tests::silence_wav(2400))
+            })
+            .mount(&server)
+            .await;
+        let (voice_tx, mut voice_rx) = tokio::sync::mpsc::unbounded_channel();
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendVoice$"))
+            .respond_with(move |request: &Request| {
+                voice_tx.send(request.body.clone()).ok();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok":true,"result":{"message_id":2}}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok":true,"result":{"message_id":1}})),
+            )
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.tts.enabled = true;
+        config.agents.insert(
+            "fixture".into(),
+            AliasedAgentConfig {
+                tts_provider: "openai.fixture".into(),
+                channels: vec!["telegram.fixture".into()],
+                ..Default::default()
+            },
+        );
+        config.providers.tts.openai.insert(
+            "fixture".into(),
+            OpenAITtsProviderConfig {
+                base: TtsProviderConfig {
+                    api_key: Some("fixture".into()),
+                    uri: Some(format!("{}/speech", server.uri())),
+                    response_format: Some("wav".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let telegram = Arc::new(
+            crate::telegram::TelegramChannel::new(
+                "fixture".into(),
+                "fixture",
+                Arc::new(Vec::new),
+                false,
+            )
+            .with_api_base(server.uri())
+            .with_streaming(StreamMode::MultiMessage, 0)
+            .with_voice_peer_resolver(Arc::new(|| vec!["123".into()]))
+            .with_tts(&config),
+        );
+        let draft = telegram
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let channel: Arc<dyn Channel> = telegram.clone();
+        let updater_draft = draft.clone();
+        let updater = zeroclaw_spawn::spawn!(run_draft_updater(
+            channel,
+            "123".into(),
+            updater_draft,
+            no_tools(),
+            true,
+            None,
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            "telegram".into(),
+            rx,
+        ));
+        let opener =
+            "The opening sentence is long enough to synthesize before generation has finished.";
+        tx.send(StreamDelta::Text(format!("{opener} ")))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), tts_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            opener
+        );
+        assert!(
+            voice_rx.try_recv().is_err(),
+            "speculation must never upload a partial voice note"
+        );
+        tx.send(StreamDelta::Text(
+            "The final paragraph completes the response.".into(),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        updater.await.unwrap();
+        let final_text = format!("{opener} The final paragraph completes the response.");
+        telegram
+            .finalize_draft("123", &draft, &final_text, false)
+            .await
+            .unwrap();
+        let upload = tokio::time::timeout(Duration::from_secs(5), voice_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(upload.windows(4).any(|window| window == b"OggS"));
+        assert_eq!(
+            tts_rx.recv().await.as_deref(),
+            Some("The final paragraph completes the response.")
+        );
+        assert!(
+            tts_rx.try_recv().is_err(),
+            "the early sentence must be reused"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("/sendVoice"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn speech_preparation_uses_only_safe_current_phase_and_waits_for_hooks() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        for hooks_enabled in [false, true] {
+            let recording = Arc::new(DraftRecordingChannel::new(false, false));
+            let channel: Arc<dyn Channel> = recording.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            for event in [
+                StreamDelta::Text("First narration.".into()),
+                StreamDelta::Status("Tool status is never speech.".into()),
+                StreamDelta::Reasoning("Hidden reasoning is never speech.".into()),
+                StreamDelta::Text(
+                    "<tool_result>{\"private\":1}</tool_result>Safe final response.".into(),
+                ),
+            ] {
+                tx.send(event).await.unwrap();
+            }
+            drop(tx);
+            let hooks = hooks_enabled.then(|| Arc::new(zeroclaw_runtime::hooks::HookRunner::new()));
+            run_draft_updater(
+                channel,
+                "peer".into(),
+                "draft".into(),
+                no_tools(),
+                false,
+                hooks,
+                zeroclaw_config::schema::LeakDetectionConfig::default(),
+                String::new(),
+                rx,
+            )
+            .await;
+            let prepared = recording.voice_preparations.lock().await;
+            if hooks_enabled {
+                assert!(
+                    prepared.is_empty(),
+                    "outbound hooks must decide before TTS receives text"
+                );
+            } else {
+                assert_eq!(prepared.len(), 2);
+                assert_eq!(prepared[0], "First narration.");
+                assert!(prepared[1].contains("Safe final response."));
+                assert!(!prepared[1].contains("private"));
+                assert!(!prepared[1].contains("First narration"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn draft_updater_never_hands_scratchpad_to_the_transport() {
         let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));

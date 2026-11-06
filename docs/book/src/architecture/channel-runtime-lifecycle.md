@@ -203,6 +203,17 @@ Review streaming changes by asking:
 - does the user-visible behavior stay consistent across direct messages,
   group chats, and threaded replies?
 
+### Speculative speech
+
+The shared draft updater calls `Channel::prepare_voice_draft` only for sanitized,
+leak-checked text in the current assistant phase and only when outbound hooks
+are absent. This optional capability prepares audio without sending it. The
+pacing wrapper forwards preparation immediately; it still paces final delivery.
+Telegram owns one worker per draft identity. Finalization must compare with the
+authorized final text and cancellation must drop the worker. Hook-enabled turns
+prepare speech only after final approval. See
+[Telegram voice preparation](../channels/telegram.md#streaming-voice-preparation).
+
 ## Health and backoff
 
 Long-running listeners must fail in a way operators can understand. Retryable

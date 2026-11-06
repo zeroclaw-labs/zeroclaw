@@ -30,6 +30,37 @@ There is no `allowed_users` field under `[channels.telegram.<alias>]`.
 Authorization lives in [Peer Groups](./peer-groups.md); that page is the
 canonical reference for peer-group fields, matching, and multi-agent behavior.
 
+## Streaming voice preparation
+
+When Telegram draft streaming and voice replies are enabled, speech synthesis
+can start while the model is still generating text. The opening chunk is a
+sentence grown to at least 60 characters when possible, capped at 280; later
+chunks follow paragraphs with a 1,200-character ceiling. Smaller configured
+TTS limits cap these boundaries as well, including unbroken Unicode text.
+Incomplete paragraphs remain buffered until their boundary or finalization.
+
+Each draft owns one synthesis worker. Token updates replace a bounded latest
+text snapshot rather than creating an unbounded work queue. Only sanitized,
+leak-checked assistant text enters preparation; reasoning and tool-status text
+do not. A new assistant phase or rewritten final response discards incompatible
+speculative audio. Cancellation drops the draft's worker. With outbound hooks
+enabled, synthesis waits for final approval so a hook can reject or rewrite the
+text before it reaches the TTS provider.
+
+Finalization waits for the worker, reuses matching completed clips and encodes
+one OGG/Opus file for one Telegram voice upload. There is no quiet-period timer
+and no shared audio buffer between replies. Text delivery still follows
+the existing peer modality and per-turn voice routing. Non-streaming sends
+synthesize after the response is complete. Rejected or empty speech and
+synthesis/upload failures retain the existing voice-error logging behavior.
+
+This reduces the remaining synthesis work after generation, rather than
+removing it: a slower TTS backend can build a backlog, and the final encode and
+upload still take time. ffmpeg with libopus remains required. Audio staging uses
+private temporary files and, on Unix, a directory created with mode `0700`;
+owned temporary paths are removed on success, error or task cancellation.
+No separate live-call transport is introduced.
+
 ## 1. Create a Telegram bot
 
 1. Open [@BotFather](https://t.me/BotFather) in Telegram.

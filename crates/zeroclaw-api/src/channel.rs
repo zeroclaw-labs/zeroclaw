@@ -1184,6 +1184,22 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Prepare audio for the current assistant text phase without delivering it.
+    /// The caller supplies sanitized, leak-checked text and skips this hook when
+    /// outbound hooks still need to approve or rewrite the completed response.
+    /// Finalization remains authoritative: adapters must discard speculative
+    /// audio that does not match the approved final text. Draft cancellation
+    /// must also cancel preparation. Status, reasoning and tool events never
+    /// enter this method. Default: no audio preparation.
+    async fn prepare_voice_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Show a progress/status update (e.g. tool execution status).
     async fn update_draft_progress(
         &self,

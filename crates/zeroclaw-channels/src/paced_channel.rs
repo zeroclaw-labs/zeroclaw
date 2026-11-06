@@ -413,6 +413,17 @@ impl Channel for PacedChannel {
         self.inner.update_draft(recipient, message_id, text).await
     }
 
+    async fn prepare_voice_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        self.inner
+            .prepare_voice_draft(recipient, message_id, text)
+            .await
+    }
+
     async fn update_draft_progress(
         &self,
         recipient: &str,
