@@ -55,6 +55,7 @@ worse than one it answers five seconds late.
 - **Inbound:** kind-1 (text), kind-4 (DM, NIP-04), and kind-1059 (gift-wrap, NIP-17).
 - **Outbound:** same kinds. Zap handling is experimental.
 - **Relays:** the agent connects to all listed relays; use 3–5 for reliability. If `relays` is omitted, ZeroClaw connects to a built-in set of popular public relays.
+- **Acknowledgement reactions:** opt-in via `channels.nostr.<alias>.ack_reactions = true` (default off; unlike other channels it does not inherit `[channels].ack_reactions`). When on, each accepted NIP-17 DM gets one NIP-25 reaction on receipt, picked at random from the same set Telegram uses (⚡️ 👌 👀 🔥 👍). The reaction is gift-wrapped to the sender (`e` = inner rumor id, `p` = sender, `k` = rumor kind), so nothing public is published. As on Telegram, there is no completion reaction. Legacy NIP-04 DMs are not reacted to. Amethyst and Nostur show these reactions; clients that only keep kind-14 rumors (e.g. YakiHonne) ignore them.
 
 ## Twitter / X
 
