@@ -72,6 +72,10 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         // Atlas Cloud exposes a no-auth OpenAI-compatible `/models` endpoint.
         // `list_models_for_family` handles that path before using this tuple.
         "atlascloud" => (None, None),
+        // LLMTR's public `/v1/models` is read by the constructed provider
+        // (`PUBLIC_MODEL_LISTING`). No models.dev or OpenRouter fallback, and
+        // no second live fetch in this table.
+        "llmtr" => (None, None),
         "synthetic" => (Some("synthetic"), None),
         "opencode" => (Some("opencode"), None),
         "atomic_chat" => (Some("atomic-chat"), None),
@@ -498,6 +502,13 @@ mod tests {
     #[test]
     fn atlascloud_family_uses_provider_catalog_source() {
         let (md, or) = catalog_source_for("atlascloud").expect("atlascloud is canonical");
+        assert_eq!(md, None);
+        assert_eq!(or, None);
+    }
+
+    #[test]
+    fn llmtr_family_uses_provider_catalog_source() {
+        let (md, or) = catalog_source_for("llmtr").expect("llmtr is canonical");
         assert_eq!(md, None);
         assert_eq!(or, None);
     }
