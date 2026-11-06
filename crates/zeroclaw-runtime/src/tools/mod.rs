@@ -2552,6 +2552,10 @@ fn all_tools_with_runtime_on_thread(
         Arc::new(tool)
     });
     register_tool!(
+        "sessions_prompt",
+        Arc::new(sessions_prompt::SessionsPromptTool::new(agent_alias))
+    );
+    register_tool!(
         "model_routing_config",
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),

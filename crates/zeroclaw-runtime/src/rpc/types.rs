@@ -282,6 +282,11 @@ rpc_type! {
         /// entries — markers are appended to the prompt before the turn runs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub attachments: Vec<FileEntry>,
+        /// Runtime-provided provenance: the calling agent's alias when this
+        /// prompt was injected by `sessions_prompt`. Client connections must
+        /// not set this field; daemon-initiated turns populate it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub injected_by: Option<String>,
     }
 }
 

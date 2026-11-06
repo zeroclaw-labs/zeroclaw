@@ -7409,19 +7409,28 @@ impl RpcDispatcher {
                 }
             }),
         );
-        tokio::pin!(turn);
-        let mut outcome = tokio::select! {
-            biased;
-            _ = self.connection_cancel.cancelled() => {
-                self.ctx.sessions.record_cancel_cause_if_absent(
-                    sid,
-                    crate::rpc::session::CancelCause::ConnectionClosed,
-                );
-                cancel.cancel();
-                turn.await
+        
+        // Scope the session_prompt runner so the turn's tool loop can prompt other sessions.
+        let turn_future = async {
+            tokio::pin!(turn);
+            tokio::select! {
+                biased;
+                _ = self.connection_cancel.cancelled() => {
+                    self.ctx.sessions.record_cancel_cause_if_absent(
+                        sid,
+                        crate::rpc::session::CancelCause::ConnectionClosed,
+                    );
+                    cancel.cancel();
+                    turn.await
+                }
+                outcome = &mut turn => outcome,
             }
-            outcome = &mut turn => outcome,
         };
+        let mut outcome = crate::tools::sessions_prompt::scope_session_prompt_runner(
+            Some(self.session_prompt_runner()),
+            turn_future,
+        )
+        .await;
 
         let refused_preparation = preparation_error
             .lock()
