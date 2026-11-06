@@ -871,9 +871,27 @@ mod tests {
             entry.version = raw.into();
             let mut named_entry = ordinary.clone();
             named_entry.name = raw.into();
+            for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+                assert!(
+                    registry_install_command_for(dialect, &named_entry, None, None, true).is_some()
+                );
+            }
+            // A name's final backslash becomes internal when @version is appended.
+            if !raw.ends_with('\\') {
+                assert_eq!(
+                    registry_install_command_for(
+                        ShellDialect::Windows,
+                        &named_entry,
+                        None,
+                        None,
+                        true
+                    ),
+                    None,
+                    "name {raw:?}"
+                );
+            }
             for (entry, origin, dir) in [
                 (&entry, None, None),
-                (&named_entry, None, None),
                 (&ordinary, Some(raw), None),
                 (&ordinary, None, Some(Path::new(raw))),
             ] {
@@ -889,6 +907,15 @@ mod tests {
                 }
             }
         }
+        let mut named_entry = ordinary.clone();
+        named_entry.name = "calendar\\".into();
+        named_entry.version = "1".into();
+        assert_eq!(
+            registry_install_command_for(ShellDialect::Windows, &named_entry,
+                Some("https://registry.invalid/index?team=one&channel=stable"),
+                Some(Path::new("C:/profiles/team one")), true),
+            Some(r#"zeroclaw --config-dir "C:/profiles/team one" plugin install "calendar\@1" --registry "https://registry.invalid/index?team=one&channel=stable" --no-verify"#.into())
+        );
         // Separators, caret and parentheses remain data inside the shared
         // double-quoted subset. They do not by themselves require suppression.
         for raw in [

@@ -1301,6 +1301,15 @@ mod tests {
                 &[("name", "weather-tool")],
                 &["weather-tool"],
             ),
+            ("cli-plugin-registry-command-unavailable", &[], &[]),
+            (
+                "cli-quickstart-plugins-load-check-command-unavailable",
+                &[
+                    ("name", "weather-tool"),
+                    ("error", "failed to load WASM component"),
+                ],
+                &["weather-tool", "failed to load WASM component"],
+            ),
             // Quickstart has no `--no-verify`; a package that does not load
             // names the install command that accepts it anyway, addressed to
             // the configuration Quickstart wrote.
@@ -1706,6 +1715,7 @@ mod tests {
             .filter(|id| {
                 *id == "cli-quickstart-row-plugins"
                     || *id == "cli-plugin-egress-withheld"
+                    || *id == "cli-plugin-registry-command-unavailable"
                     || id.starts_with("cli-quickstart-plugins-")
             })
             .collect();

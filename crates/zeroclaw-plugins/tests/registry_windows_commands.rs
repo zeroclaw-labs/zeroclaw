@@ -163,7 +163,10 @@ fn registry_windows_native_shells_have_no_recipe_for_unsafe_values() {
             "1\r\necho ZC_REGISTRY_HARMLESS_MARKER_12216",
             "1\\",
         ] {
-            for slot in 0..4 {
+            // Trailing name backslashes are internal to name@version; the
+            // dedicated positive case below executes that rendered command.
+            let slots = if raw.ends_with('\\') { 3 } else { 4 };
+            for slot in 0..slots {
                 let fixture = Fixture::new();
                 let mut plugin = entry(if slot == 0 { raw } else { "1" });
                 if slot == 3 {
@@ -189,6 +192,41 @@ fn registry_windows_native_shells_have_no_recipe_for_unsafe_values() {
                     "unavailable must not launch zeroclaw"
                 );
             }
+        }
+        for delayed in [false, true] {
+            let fixture = Fixture::new();
+            let mut plugin = entry("1");
+            plugin.name = "calendar\\".into();
+            let origin = "https://registry.invalid/index?team=one&channel=stable";
+            let config = "C:/profiles/team one";
+            let line = registry_install_command_for(
+                ShellDialect::Windows,
+                &plugin,
+                Some(origin),
+                Some(Path::new(config)),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                line,
+                r#"zeroclaw --config-dir "C:/profiles/team one" plugin install "calendar\@1" --registry "https://registry.invalid/index?team=one&channel=stable" --no-verify"#
+            );
+            let output = fixture.run(shell, &line, delayed);
+            assert!(output.status.success(), "{shell}: {output:?}");
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(MARKER));
+            assert_eq!(
+                fixture.args(),
+                vec![
+                    "--config-dir",
+                    config,
+                    "plugin",
+                    "install",
+                    r"calendar\@1",
+                    "--registry",
+                    origin,
+                    "--no-verify"
+                ]
+            );
         }
     }
 }
