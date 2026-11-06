@@ -13,6 +13,11 @@ let capture: FakeRecognition;
 let localStatus = 'available';
 class FakeRecognition {
   static available = async () => localStatus;
+  static install = async (options: { langs: string[]; processLocally?: boolean }) => {
+    assert.deepEqual(options, { langs: ['en-US'], processLocally: true });
+    localStatus = 'available';
+    return true;
+  };
   lang = ''; continuous = false; interimResults = false; processLocally = false;
   onresult: Function | null = null; onerror: Function | null = null; onend: Function | null = null;
   constructor() { capture = this; }
@@ -149,6 +154,19 @@ test('keyboard continuous mode reads only completed new assistant replies', asyn
   assert.deepEqual(spoken, []);
   await act(async () => { renderer.update(createElement(Controls, { messages, hydrated: true, typing: false, onTranscript() {} })); });
   assert.deepEqual(spoken, ['Completed answer']);
+  await act(async () => { renderer.unmount(); });
+});
+
+test('the language download explicitly requests local recognition', async () => {
+  localStatus = 'downloadable';
+  const { default: Settings } = await import('./BrowserVoiceSettings.tsx');
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Settings), options); });
+  const install = renderer.root.findAllByType('button')
+    .find(button => button.props.children === 'Download local language pack');
+  assert.ok(install);
+  await act(async () => { await install.props.onClick(); });
+  assert.equal(localStatus, 'available');
   await act(async () => { renderer.unmount(); });
 });
 

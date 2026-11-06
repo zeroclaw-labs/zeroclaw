@@ -88,11 +88,20 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     if (!Constructor || !window.isSecureContext) { setError(t('voice.unsupported')); return; }
     const version = ++generation.current;
     setListening(true);
-    if (prefs.recognition === 'local' && await localRecognitionStatus(prefs.language) !== 'available') {
-      if (version === generation.current) { setListening(false); setError(t('voice.local_unavailable')); }
+    if (prefs.recognition === 'local') {
+      const status = await localRecognitionStatus(prefs.language);
+      if (version !== generation.current) return;
+      if (status !== 'available') {
+        setListening(false);
+        setError(t(status === 'downloadable' ? 'voice.pack_required'
+          : status === 'downloading' ? 'voice.status_downloading' : 'voice.local_unavailable'));
+        return;
+      }
+    }
+    if (version !== generation.current || !visible()) {
+      if (version === generation.current) setListening(false);
       return;
     }
-    if (version !== generation.current || !visible()) { if (version === generation.current) setListening(false); return; }
     const capture = new Constructor();
     if (prefs.recognition === 'local' && !('processLocally' in capture)) {
       setListening(false); setError(t('voice.local_unavailable')); return;

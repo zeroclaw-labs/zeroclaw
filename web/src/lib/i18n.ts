@@ -539,7 +539,8 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.speech_error": "Could not read the reply. Check the selected voice.",
     "voice.microphone": "Start or stop dictation",
     "voice.speaker": "Read reply / control automatic reading",
-    "voice.local_unavailable": "Local dictation is unavailable for this language. Download its pack in Settings or explicitly select browser-service mode.",
+    "voice.local_unavailable": "This browser cannot run local dictation for the selected language.",
+    "voice.pack_required": "Install this language pack in Settings → Other → Browser Voice and Audio, then click the microphone again.",
     "voice.capture_error": "Dictation failed. Check microphone permission and browser support.",
 
     // Plugin package catalog
@@ -11029,7 +11030,8 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.speech_error": "Não foi possível ler a resposta. Confira a voz selecionada.",
     "voice.microphone": "Iniciar ou parar ditado",
     "voice.speaker": "Ler resposta / controlar leitura automática",
-    "voice.local_unavailable": "Ditado local indisponível neste idioma. Baixe o pacote em Configurações ou escolha explicitamente o serviço do navegador.",
+    "voice.local_unavailable": "Este navegador não consegue executar o ditado local no idioma selecionado.",
+    "voice.pack_required": "Baixe o pacote em Configurações → Other → Voz e áudio do navegador e clique no microfone novamente.",
     "voice.capture_error": "Falha no ditado. Confira a permissão do microfone e o suporte do navegador.",
 
     'sidebar.update_available': "Atualização disponível",
@@ -11077,7 +11079,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.integrations': 'Integrações',
     'nav.skills': 'Habilidades',
     'nav.memory': 'Memória',
-    'nav.config': 'Config',
+    'nav.config': 'Configurações',
     'nav.cost': 'Rastreador de Custos',
     'nav.logs': 'Logs',
     'nav.doctor': 'Diagnóstico',

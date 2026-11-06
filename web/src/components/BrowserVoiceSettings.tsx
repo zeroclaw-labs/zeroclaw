@@ -65,8 +65,9 @@ export default function BrowserVoiceSettings() {
   };
   const install = async () => {
     setInstalling(true);
+    setError('');
     try {
-      const ok = await recognitionConstructor()?.install?.({ langs: [prefs.language] });
+      const ok = await recognitionConstructor()?.install?.({ langs: [prefs.language], processLocally: true });
       if (!ok) setError(t('voice.install_error'));
       setLocalStatus(await localRecognitionStatus(prefs.language));
     } catch { setError(t('voice.install_error')); }

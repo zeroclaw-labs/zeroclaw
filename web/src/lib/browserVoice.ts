@@ -122,7 +122,7 @@ export interface Recognition {
 export type RecognitionConstructor = {
   new(): Recognition;
   available?: (options: { langs: string[]; processLocally: boolean }) => Promise<string>;
-  install?: (options: { langs: string[] }) => Promise<boolean>;
+  install?: (options: { langs: string[]; processLocally: true }) => Promise<boolean>;
 };
 export function recognitionConstructor(): RecognitionConstructor | undefined {
   const w = window as unknown as { SpeechRecognition?: RecognitionConstructor; webkitSpeechRecognition?: RecognitionConstructor };

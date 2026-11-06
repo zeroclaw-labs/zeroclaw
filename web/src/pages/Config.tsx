@@ -55,6 +55,7 @@ import CostRatesEditor, {
 } from "../components/sections/CostRatesEditor";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import { useLocaleContext } from "@/App";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -101,7 +102,25 @@ export default function Config() {
   const lockedSection = location.pathname.startsWith("/setup/")
     ? sectionParam
     : undefined;
-  const [sections, setSections] = useState<SectionInfo[]>([]);
+  const setup = location.pathname.startsWith("/setup/");
+  const [schemaSections, setSchemaSections] = useState<SectionInfo[]>([]);
+  useLocaleContext();
+  const voiceLabel = t("voice.settings");
+  const voiceHelp = t("voice.help_intro");
+  const sections = useMemo<SectionInfo[]>(() => setup ? schemaSections : [
+    ...schemaSections,
+    {
+      key: VOICE_SECTION,
+      label: voiceLabel,
+      help: voiceHelp,
+      group: "Other",
+      has_picker: false,
+      completed: false,
+      ready: true,
+      is_quickstart: false,
+      cost_category: "",
+    },
+  ], [schemaSections, setup, voiceLabel, voiceHelp]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -126,27 +145,11 @@ export default function Config() {
     getSections()
       .then((resp) => {
         if (cancelled) return;
-        // This editor uses the paired-device API instead of the daemon schema.
-        const available = [...resp.sections];
-        if (!location.pathname.startsWith("/setup/")) {
-          const voiceSection: SectionInfo = {
-            key: VOICE_SECTION,
-            label: t("voice.settings"),
-            help: t("voice.help_intro"),
-            group: "Other",
-            has_picker: false,
-            completed: false,
-            ready: true,
-            is_quickstart: false,
-            cost_category: "",
-          };
-          available.push(voiceSection);
-        }
-        setSections(available);
-        const initialKey =
-          sectionParam && available.find((s) => s.key === sectionParam)
-            ? sectionParam
-            : (available[0]?.key ?? null);
+        setSchemaSections(resp.sections);
+        const initialKey = sectionParam && (
+          (!setup && sectionParam === VOICE_SECTION) ||
+          resp.sections.some((section) => section.key === sectionParam)
+        ) ? sectionParam : (resp.sections[0]?.key ?? null);
         setActiveKey(initialKey);
       })
       .catch((e) => {
