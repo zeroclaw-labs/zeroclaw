@@ -1250,7 +1250,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type QuickstartPluginCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [QuickstartPluginCase<'_>; 46] = [
+        let cases: [QuickstartPluginCase<'_>; 48] = [
             // Any failure to fetch the registry index is printed as it reads.
             (
                 "cli-quickstart-plugins-registry-unavailable",
