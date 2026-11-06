@@ -158,6 +158,17 @@ fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, pat
                 format!("warning: ignored `{variable}`, which sets a retired config key: {reason}"),
             )
         }
+        MigrationNotice::Lowered { path: key, reason } => {
+            let reason = match crate::config::migration::capped_reason_id(reason) {
+                Some(id) => t(id, reason),
+                None => reason.to_string(),
+            };
+            ta(
+                "cli-config-capped-key-lowered",
+                &[("key", key), ("path", path), ("reason", &reason)],
+                format!("warning: lowered config key `{key}` in {path} to its maximum: {reason}"),
+            )
+        }
     }
 }
 
@@ -2230,7 +2241,7 @@ async fn run_quickstart_cli(
                     "{}",
                     t(
                         "cli-quickstart-cancelled",
-                        "Quickstart cancelled. No config written."
+                        "Quickstart cancelled. Nothing was configured."
                     )
                 );
                 return Ok(());
@@ -17669,6 +17680,20 @@ mod tests {
                     "{locale}: missing `{}` for {:?}",
                     key.reason_id,
                     key.path
+                );
+            }
+        }
+        // Lowered values: each reason, and the notice line that carries it.
+        let capped = crate::config::migration::CAPPED_KEYS
+            .iter()
+            .map(|key| key.reason_id)
+            .chain(["cli-config-capped-key-lowered"]);
+        for id in capped {
+            for (locale, cli_ftl) in locales {
+                let entry = format!("{id} = ");
+                assert!(
+                    cli_ftl.lines().any(|line| line.starts_with(&entry)),
+                    "{locale}: missing `{id}`"
                 );
             }
         }
