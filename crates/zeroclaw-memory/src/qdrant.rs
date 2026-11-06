@@ -700,22 +700,8 @@ impl Memory for QdrantMemory {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
-        // Rebuild from the freshly-resolved settings and swap in place. The
-        // Qdrant collection was created for the old vector dimensions; a
-        // dimension change still needs a manual reindex/collection rebuild, but
-        // the live handle no longer embeds against a stale endpoint/key
-        let embedder: Arc<dyn EmbeddingProvider> =
-            Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
-                model_provider,
-                api_key,
-                model,
-                dimensions,
-            ));
         self.swap_embedder(embedder);
     }
 
@@ -1446,10 +1432,12 @@ mod tests {
 
         Memory::refresh_embedder(
             &mem,
-            "openai",
-            Some("sk-test"),
-            "text-embedding-3-small",
-            1536,
+            std::sync::Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
+                "openai",
+                Some("sk-test"),
+                "text-embedding-3-small",
+                1536,
+            )),
         );
 
         assert_eq!(

@@ -387,9 +387,10 @@ macro_rules! provider_connections {
             pub fn capabilities(&self) -> &CapabilitySet { match self { $(Self::$variant(c) => &c.capabilities,)* } }
             pub fn supports(&self, capability: Capability) -> bool {
                 if capability == Capability::Decision {
-                    return !self.decision_wire_apis().is_empty();
+                    return self.capabilities().contains(&Capability::Decision)
+                        && !self.decision_wire_apis().is_empty();
                 }
-                match self { $(Self::$variant(_) => [$(Capability::$capability),*].contains(&capability),)* }
+                self.capabilities().contains(&capability)
             }
             /// Native decision protocols implemented by this connection kind,
             /// in default preference order. This declaration also determines
@@ -630,7 +631,7 @@ provider_connections! {
     Lmstudio(HttpChatConnection) = "lmstudio" [Chat] decision [OpenAiDecisions, SystemOne],
     Llamacpp(HttpChatConnection) = "llamacpp" [Chat] decision [SystemOne],
     Sglang(HttpChatConnection) = "sglang" [Chat] decision [SystemOne],
-    Vllm(HttpChatConnection) = "vllm" [Chat] decision [OpenAiDecisions, SystemOne],
+    Vllm(HttpChatConnection) = "vllm" [Chat, Embedding, Asr] decision [OpenAiDecisions, SystemOne],
     Osaurus(HttpChatConnection) = "osaurus" [Chat],
     Litellm(HttpChatConnection) = "litellm" [Chat] decision [OpenAiDecisions, SystemOne],
     Lepton(HttpChatConnection) = "lepton" [Chat],
@@ -827,6 +828,18 @@ impl ConnectionSettings for HttpChatConnection {
     fn decision_api(&self) -> Option<&DecisionApiConfig> {
         self.api.decision.as_ref()
     }
+    fn tts_defaults(&self) -> Option<(Option<&PresetId>, &TtsOptionsPatch)> {
+        self.api
+            .tts
+            .as_ref()
+            .map(|api| (api.preset.as_ref(), &api.options))
+    }
+    fn asr_defaults(&self) -> Option<(Option<&PresetId>, &AsrOptionsPatch)> {
+        self.api
+            .asr
+            .as_ref()
+            .map(|api| (api.preset.as_ref(), &api.options))
+    }
     fn configured_apis(&self) -> Vec<Capability> {
         let mut out = Vec::new();
         if self.api.chat.is_some() {
@@ -834,6 +847,12 @@ impl ConnectionSettings for HttpChatConnection {
         }
         if self.api.decision.is_some() {
             out.push(Capability::Decision);
+        }
+        if self.api.tts.is_some() {
+            out.push(Capability::Tts);
+        }
+        if self.api.asr.is_some() {
+            out.push(Capability::Asr);
         }
         out
     }

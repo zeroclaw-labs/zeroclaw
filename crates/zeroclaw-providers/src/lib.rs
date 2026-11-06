@@ -30,6 +30,7 @@ pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
 pub mod pricing;
+mod protocols;
 pub mod reliable;
 pub mod router;
 pub mod safeguard_notice;
@@ -38,7 +39,9 @@ pub mod telnyx;
 pub mod temperature;
 pub mod traits;
 pub mod transcription;
+pub(crate) mod transport;
 pub mod tts;
+mod vendors;
 pub mod vision_override;
 
 pub use anthropic::AnthropicRefusalError;

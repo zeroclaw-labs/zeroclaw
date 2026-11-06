@@ -58,8 +58,12 @@ Structure:
   provider-internal helpers
 - `anthropic.rs`, `openai.rs`, `ollama.rs`, …: one file per native provider
 - `compatible.rs`: a single OpenAI-compatible implementation reused by 20+ providers (Groq, Mistral, xAI, Venice, etc.)
-- `tts.rs`, `transcription.rs`, `embedding.rs`, `decision.rs`: concrete TTS,
-  ASR, embedding, and decision-model providers plus their construction managers
+- `tts.rs`, `transcription.rs`, `embedding.rs`, `decision.rs`: capability
+  factories and vendor adapters. Shared OpenAI-compatible wire construction
+  consumes resolved transport settings; vendor-specific adapters own only their
+  protocol fields and authentication details.
+- `transport.rs`: the common resolved HTTP transport used by capability
+  adapters. Consumers never rebuild provider URLs, credentials, or headers.
 - `router.rs`: hint-based per-call model route selection
 - `reliable.rs`: retry / backoff / cooldown and ordered model-provider fallback wrapper
 - `streaming.rs`: SSE parsing, token estimation, tool-call deltas

@@ -581,13 +581,9 @@ impl Memory for RetrievalPipeline {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
-        self.memory
-            .refresh_embedder(model_provider, api_key, model, dimensions);
+        self.memory.refresh_embedder(embedder);
         // A swapped embedder changes what vector recall would return; a
         // cached result from the old embedder must not outlive the swap.
         self.invalidate_cache();
@@ -1530,7 +1526,12 @@ mod tests {
         assert_eq!(p.cache_size(), 0, "store_procedural must invalidate");
 
         let p = primed_pipeline().await;
-        Memory::refresh_embedder(&p, "openai", None, "model", 8);
+        Memory::refresh_embedder(
+            &p,
+            std::sync::Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
+                "openai", None, "model", 8,
+            )),
+        );
         assert_eq!(p.cache_size(), 0, "refresh_embedder must invalidate");
     }
 

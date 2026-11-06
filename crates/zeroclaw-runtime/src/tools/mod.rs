@@ -1156,13 +1156,10 @@ impl Memory for NativeMemoryBinding {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
         let actual = self.begin_operation();
-        actual.refresh_embedder(model_provider, api_key, model, dimensions)
+        actual.refresh_embedder(embedder)
     }
 
     async fn recall_namespaced(
@@ -9189,15 +9186,11 @@ mod native_memory_binding_tests {
 
         fn refresh_embedder(
             &self,
-            model_provider: &str,
-            api_key: Option<&str>,
-            model: &str,
-            dimensions: usize,
+            embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
         ) {
-            assert_eq!(model_provider, "sentinel");
-            assert_eq!(api_key, Some("sentinel"));
-            assert_eq!(model, "sentinel");
-            assert_eq!(dimensions, 3);
+            assert_eq!(embedder.name(), "openai");
+            assert_eq!(embedder.identity().model, "sentinel");
+            assert_eq!(embedder.dimensions(), 3);
             self.calls.lock().push("refresh_embedder");
         }
 
@@ -9518,7 +9511,14 @@ mod native_memory_binding_tests {
         );
         assert_eq!(binding.stats().await.unwrap().total_rows, 7);
         assert_eq!(binding.reindex().await.unwrap(), 7);
-        binding.refresh_embedder("sentinel", Some("sentinel"), "sentinel", 3);
+        binding.refresh_embedder(std::sync::Arc::from(
+            zeroclaw_providers::embedding::create_embedding_provider(
+                "openai",
+                Some("sentinel"),
+                "sentinel",
+                3,
+            ),
+        ));
         assert!(
             binding
                 .recall_namespaced(
@@ -9698,7 +9698,9 @@ mod native_memory_binding_tests {
         );
         // The synchronous mutator must also make later rebinding ineligible.
         let fresh = NativeMemoryBinding::new(Arc::clone(&original), Arc::clone(&security));
-        fresh.refresh_embedder("none", None, "none", 0);
+        fresh.refresh_embedder(std::sync::Arc::new(
+            zeroclaw_providers::embedding::NoopEmbedding,
+        ));
         assert_eq!(
             fresh
                 .bind(&original, other, &security)

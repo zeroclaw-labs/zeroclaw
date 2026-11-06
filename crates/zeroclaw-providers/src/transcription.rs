@@ -15,6 +15,8 @@ use zeroclaw_config::provider_registry::{
 use zeroclaw_config::providers::{TranscriptionProviderEntry, TranscriptionProviders};
 use zeroclaw_config::schema::{Config, TranscriptionConfig};
 
+use crate::transport::HttpTransportConfig;
+
 /// Maximum upload size accepted by most Whisper-compatible APIs (25 MB).
 const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
@@ -23,6 +25,39 @@ const TRANSCRIPTION_TIMEOUT_SECS: u64 = 120;
 
 const GOOGLE_STT_ENDPOINT: &str = "https://speech.googleapis.com/v1/speech:recognize";
 const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
+
+/// Canonical construction input for HTTP transcription protocols. The
+/// connection resolver has already selected endpoint, authentication, headers
+/// and timeout policy; protocol adapters only consume this value.
+#[derive(Clone)]
+pub(crate) struct AsrProviderConfig {
+    pub transport: HttpTransportConfig,
+    pub model: Option<String>,
+    pub language: Option<String>,
+    pub initial_prompt: Option<String>,
+}
+
+impl AsrProviderConfig {
+    pub fn from_resolved(resolved: &ResolvedAsr<'_>) -> anyhow::Result<Self> {
+        Ok(Self {
+            transport: HttpTransportConfig::from_connection(
+                resolved.selection.connection,
+                resolved.request_timeout_secs.clone(),
+            )?,
+            model: resolved
+                .selection
+                .model
+                .upstream_model()
+                .map(ToOwned::to_owned),
+            language: asr_override(&resolved.options.language),
+            initial_prompt: asr_override(&resolved.options.initial_prompt),
+        })
+    }
+
+    fn endpoint(&self) -> Result<String> {
+        self.transport.endpoint("audio/transcriptions")
+    }
+}
 
 // ── Audio utilities ─────────────────────────────────────────────
 
@@ -120,39 +155,32 @@ fn non_empty_prompt(prompt: Option<&str>) -> Option<String> {
 /// Groq Whisper API transcription_provider (default, backward-compatible with existing config).
 pub struct GroqProvider {
     alias: String,
-    api_url: String,
-    model: String,
-    api_key: String,
-    language: Option<String>,
-    initial_prompt: Option<String>,
+    client: crate::protocols::openai::audio::TranscriptionClient,
 }
 
 impl GroqProvider {
-    fn from_canonical(
-        alias: &str,
-        api_key: Option<&str>,
-        api_url: Option<&str>,
-        model: Option<&str>,
-        language: Option<String>,
-        initial_prompt: Option<String>,
-    ) -> Result<Self> {
-        let api_key = api_key
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .context("Missing API key for canonical Groq transcription model")?;
+    fn from_canonical_config(alias: &str, config: &AsrProviderConfig) -> Result<Self> {
+        anyhow::ensure!(
+            config
+                .transport
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()),
+            "Missing API key for canonical Groq transcription model"
+        );
         Ok(Self {
             alias: alias.to_owned(),
-            api_url: api_url
-                .map(str::to_owned)
-                .unwrap_or_else(|| "https://api.groq.com/openai/v1/audio/transcriptions".into()),
-            model: model
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("whisper-large-v3-turbo")
-                .to_owned(),
-            api_key,
-            language,
-            initial_prompt: initial_prompt.and_then(|prompt| non_empty_prompt(Some(&prompt))),
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                transport: config.transport.clone(),
+                endpoint: config.endpoint()?,
+                model: config
+                    .model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| "whisper-large-v3-turbo".into()),
+                language: config.language.clone(),
+                initial_prompt: non_empty_prompt(config.initial_prompt.as_deref()),
+            },
         })
     }
 
@@ -170,11 +198,13 @@ impl GroqProvider {
 
         Ok(Self {
             alias: alias.to_string(),
-            api_url: config.api_url.clone(),
-            model: config.model.clone(),
-            api_key,
-            language: config.language.clone(),
-            initial_prompt: non_empty_prompt(config.initial_prompt.as_deref()),
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                endpoint: config.api_url.clone(),
+                model: config.model.clone(),
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                language: config.language.clone(),
+                initial_prompt: non_empty_prompt(config.initial_prompt.as_deref()),
+            },
         })
     }
 
@@ -197,15 +227,17 @@ impl GroqProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
-            api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
-            model: cfg
-                .model
-                .clone()
-                .filter(|model| !model.trim().is_empty())
-                .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
-            api_key,
-            language: cfg.base.language.clone(),
-            initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                endpoint: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                model: cfg
+                    .model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                language: cfg.base.language.clone(),
+                initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
+            },
         })
     }
 }
@@ -217,36 +249,7 @@ impl AsrProvider for GroqProvider {
     }
 
     async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
-        let (normalized_name, mime) = validate_audio(audio_data, file_name)?;
-
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.groq");
-
-        let file_part = Part::bytes(audio_data.to_vec())
-            .file_name(normalized_name)
-            .mime_str(mime)?;
-
-        let mut form = Form::new()
-            .part("file", file_part)
-            .text("model", self.model.clone())
-            .text("response_format", "json");
-
-        if let Some(ref lang) = self.language {
-            form = form.text("language", lang.clone());
-        }
-        if let Some(ref prompt) = self.initial_prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
-        let resp = client
-            .post(&self.api_url)
-            .bearer_auth(&self.api_key)
-            .multipart(form)
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
-            .send()
-            .await
-            .context("Failed to send transcription request to Groq")?;
-
-        parse_whisper_response(resp).await
+        self.client.transcribe(audio_data, file_name).await
     }
 }
 
@@ -255,40 +258,24 @@ impl AsrProvider for GroqProvider {
 /// OpenAI Whisper API transcription_provider.
 pub struct OpenAiWhisperProvider {
     alias: String,
-    api_url: String,
-    api_key: String,
-    model: String,
-    language: Option<String>,
-    initial_prompt: Option<String>,
+    client: crate::protocols::openai::audio::TranscriptionClient,
 }
 
 impl OpenAiWhisperProvider {
-    fn from_canonical(
-        alias: &str,
-        api_key: Option<&str>,
-        api_url: Option<&str>,
-        model: Option<&str>,
-        language: Option<String>,
-        initial_prompt: Option<String>,
-    ) -> Result<Self> {
-        let api_key = api_key
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .context("Missing API key for canonical OpenAI transcription model")?;
+    fn from_canonical_config(alias: &str, config: &AsrProviderConfig) -> Result<Self> {
         Ok(Self {
             alias: alias.to_owned(),
-            api_url: api_url.map_or_else(
-                || "https://api.openai.com/v1/audio/transcriptions".into(),
-                ToOwned::to_owned,
-            ),
-            api_key,
-            model: model
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("whisper-1")
-                .to_owned(),
-            language,
-            initial_prompt: initial_prompt.and_then(|prompt| non_empty_prompt(Some(&prompt))),
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                transport: config.transport.clone(),
+                endpoint: config.endpoint()?,
+                model: config
+                    .model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| "whisper-1".into()),
+                language: config.language.clone(),
+                initial_prompt: non_empty_prompt(config.initial_prompt.as_deref()),
+            },
         })
     }
 
@@ -306,11 +293,13 @@ impl OpenAiWhisperProvider {
 
         Ok(Self {
             alias: alias.to_string(),
-            api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
-            api_key,
-            model: config.model.clone(),
-            language: None,
-            initial_prompt: None,
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string(),
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                model: config.model.clone(),
+                language: None,
+                initial_prompt: None,
+            },
         })
     }
 
@@ -333,15 +322,17 @@ impl OpenAiWhisperProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
-            api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
-            api_key,
-            model: cfg
-                .model
-                .clone()
-                .filter(|model| !model.trim().is_empty())
-                .unwrap_or_else(|| "whisper-1".to_string()),
-            language: cfg.base.language.clone(),
-            initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
+            client: crate::protocols::openai::audio::TranscriptionClient {
+                endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string(),
+                transport: HttpTransportConfig::with_base_url("", Some(api_key)),
+                model: cfg
+                    .model
+                    .clone()
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| "whisper-1".to_string()),
+                language: cfg.base.language.clone(),
+                initial_prompt: non_empty_prompt(cfg.base.initial_prompt.as_deref()),
+            },
         })
     }
 }
@@ -353,35 +344,7 @@ impl AsrProvider for OpenAiWhisperProvider {
     }
 
     async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
-        let (normalized_name, mime) = validate_audio(audio_data, file_name)?;
-
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.openai");
-
-        let file_part = Part::bytes(audio_data.to_vec())
-            .file_name(normalized_name)
-            .mime_str(mime)?;
-
-        let mut form = Form::new()
-            .part("file", file_part)
-            .text("model", self.model.clone())
-            .text("response_format", "json");
-        if let Some(language) = &self.language {
-            form = form.text("language", language.clone());
-        }
-        if let Some(prompt) = &self.initial_prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
-        let resp = client
-            .post(&self.api_url)
-            .bearer_auth(&self.api_key)
-            .multipart(form)
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
-            .send()
-            .await
-            .context("Failed to send transcription request to OpenAI")?;
-
-        parse_whisper_response(resp).await
+        self.client.transcribe(audio_data, file_name).await
     }
 }
 
@@ -1068,23 +1031,7 @@ impl AsrProvider for LocalWhisperProvider {
 // ── Shared response parsing ─────────────────────────────────────
 
 async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("Transcription API error ({}): {}", status, body.trim());
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .context("Failed to parse transcription response")?;
-
-    let text = body["text"]
-        .as_str()
-        .context("Transcription response missing 'text' field")?
-        .to_string();
-
-    Ok(text)
+    crate::protocols::openai::audio::transcription_text(resp).await
 }
 
 fn asr_override<T: Clone>(value: &Option<Override<T>>) -> Option<T> {
@@ -1094,17 +1041,6 @@ fn asr_override<T: Clone>(value: &Option<Override<T>>) -> Option<T> {
     }
 }
 
-fn canonical_transcription_endpoint(uri: Option<&str>) -> Option<String> {
-    uri.map(|uri| {
-        let uri = uri.trim_end_matches('/');
-        if uri.ends_with("/audio/transcriptions") {
-            uri.to_owned()
-        } else {
-            format!("{uri}/audio/transcriptions")
-        }
-    })
-}
-
 /// Construct one ASR adapter from an admitted canonical model. The
 /// connection supplies transport/authentication and the resolver supplies
 /// inherited model options; legacy provider maps are not consulted.
@@ -1112,33 +1048,24 @@ fn build_canonical_transcription_provider(
     model_ref: &str,
     resolved: &ResolvedAsr<'_>,
 ) -> Result<Box<dyn AsrProvider>> {
+    let api_key = resolved.selection.connection.api_key();
     let model = resolved.selection.model.upstream_model();
     let language = asr_override(&resolved.options.language);
-    let initial_prompt = asr_override(&resolved.options.initial_prompt);
-    let api_key = resolved.selection.connection.api_key();
-    let api_url = canonical_transcription_endpoint(resolved.selection.connection.uri());
 
     match resolved.selection.connection {
-        ProviderConnection::Groq(_) => GroqProvider::from_canonical(
-            model_ref,
-            api_key,
-            api_url.as_deref(),
-            model,
-            language,
-            initial_prompt,
-        )
-        .map(|provider| Box::new(provider) as Box<dyn AsrProvider>),
+        ProviderConnection::Groq(_) => {
+            let config = AsrProviderConfig::from_resolved(resolved)?;
+            GroqProvider::from_canonical_config(model_ref, &config)
+                .map(|provider| Box::new(provider) as Box<dyn AsrProvider>)
+        }
         ProviderConnection::OpenAi(_)
         | ProviderConnection::OpenAiCompatible(_)
-        | ProviderConnection::Custom(_) => OpenAiWhisperProvider::from_canonical(
-            model_ref,
-            api_key,
-            api_url.as_deref(),
-            model,
-            language,
-            initial_prompt,
-        )
-        .map(|provider| Box::new(provider) as Box<dyn AsrProvider>),
+        | ProviderConnection::Custom(_)
+        | ProviderConnection::Vllm(_) => {
+            let config = AsrProviderConfig::from_resolved(resolved)?;
+            OpenAiWhisperProvider::from_canonical_config(model_ref, &config)
+                .map(|provider| Box::new(provider) as Box<dyn AsrProvider>)
+        }
         ProviderConnection::Deepgram(_) => {
             DeepgramProvider::from_canonical(model_ref, api_key, model, language)
                 .map(|provider| Box::new(provider) as Box<dyn AsrProvider>)
@@ -2094,7 +2021,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(groq.model, "whisper-large-v3-turbo");
+        assert_eq!(groq.client.model, "whisper-large-v3-turbo");
 
         let mut openai = OpenAiWhisperProvider::from_typed_config(
             "default",
@@ -2104,8 +2031,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(openai.model, "whisper-1");
-        assert_eq!(openai.language.as_deref(), Some("it"));
+        assert_eq!(openai.client.model, "whisper-1");
+        assert_eq!(openai.client.language.as_deref(), Some("it"));
 
         let mut deepgram = DeepgramProvider::from_typed_config(
             "default",
@@ -2126,7 +2053,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        openai.api_url = format!("{}/openai", server.uri());
+        openai.client.endpoint = format!("{}/openai", server.uri());
         deepgram.api_url = format!("{}/deepgram", server.uri());
         openai.transcribe(b"audio", "voice.wav").await.unwrap();
         deepgram.transcribe(b"audio", "voice.wav").await.unwrap();
@@ -2218,11 +2145,11 @@ mod tests {
         .unwrap();
 
         for provider in [&mut legacy_groq, &mut typed_groq] {
-            provider.api_url = format!("{}/groq", server.uri());
+            provider.client.endpoint = format!("{}/groq", server.uri());
             provider.transcribe(b"audio", "voice.wav").await.unwrap();
         }
         for provider in [&mut typed_openai, &mut blank_openai] {
-            provider.api_url = format!("{}/openai", server.uri());
+            provider.client.endpoint = format!("{}/openai", server.uri());
             provider.transcribe(b"audio", "voice.wav").await.unwrap();
         }
 

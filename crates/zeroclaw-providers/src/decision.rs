@@ -4,76 +4,48 @@
 //! Responses structured outputs belong to the chat adapters, not this module.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question, Usage};
-use zeroclaw_config::provider_registry::{Override, ResolvedDecision};
+use zeroclaw_config::provider_registry::ResolvedDecision;
 use zeroclaw_config::schema::DecisionWireApi;
+
+use crate::transport::HttpTransportConfig;
 
 const DEFAULT_DECISION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Construction inputs resolved from one admitted provider configuration.
 #[derive(Clone)]
 pub struct DecisionProviderConfig {
-    pub base_url: String,
+    pub(crate) transport: HttpTransportConfig,
     pub model: String,
-    pub api_key: Option<String>,
     pub wire_api: DecisionWireApi,
-    pub extra_headers: BTreeMap<String, String>,
-    pub request_timeout_secs: Option<Override<NonZeroU64>>,
 }
 
 impl DecisionProviderConfig {
     /// Downstream consumers select a model without reconstructing provider
     /// defaults, authentication, or native protocol routing.
     pub fn from_resolved(resolved: &ResolvedDecision<'_>) -> Result<Self> {
-        let connection = resolved.selection.connection;
-        let base_url = connection
-            .uri()
-            .map(str::trim)
-            .filter(|uri| !uri.is_empty())
-            .or_else(|| default_base_url(connection.kind()))
-            .context("decision connection requires a uri")?;
         Ok(Self {
-            base_url: base_url.to_owned(),
+            transport: HttpTransportConfig::from_connection(
+                resolved.selection.connection,
+                resolved.request_timeout_secs.clone(),
+            )?,
             model: resolved.model.to_owned(),
-            api_key: connection.api_key().map(str::to_owned),
             wire_api: resolved.wire_api,
-            extra_headers: connection.extra_headers().cloned().unwrap_or_default(),
-            request_timeout_secs: resolved.request_timeout_secs.clone(),
         })
     }
 
     pub fn legacy_system_one(base_url: &str, model: &str, api_key: Option<String>) -> Self {
         Self {
-            base_url: base_url.to_owned(),
+            transport: HttpTransportConfig::with_base_url(base_url, api_key),
             model: model.to_owned(),
-            api_key,
             wire_api: DecisionWireApi::SystemOne,
-            extra_headers: BTreeMap::new(),
-            request_timeout_secs: None,
         }
-    }
-}
-
-fn default_base_url(provider_kind: &str) -> Option<&'static str> {
-    match provider_kind {
-        "openai" => Some("https://api.openai.com/v1"),
-        "openrouter" => Some("https://openrouter.ai/api/v1"),
-        "fireworks" => Some("https://api.fireworks.ai/inference/v1"),
-        "ollama" => Some("http://localhost:11434/v1"),
-        "lmstudio" => Some("http://localhost:1234/v1"),
-        "vllm" => Some("http://localhost:8000/v1"),
-        "sglang" => Some("http://localhost:30000/v1"),
-        "llamacpp" => Some("http://localhost:8080/v1"),
-        "litellm" => Some("http://localhost:4000/v1"),
-        _ => None,
     }
 }
 
@@ -81,44 +53,12 @@ pub fn build_decision_provider(config: DecisionProviderConfig) -> Result<Box<dyn
     Ok(Box::new(NativeDecisionClient::new(config)?))
 }
 
-fn build_http_client(config: &DecisionProviderConfig) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-    match &config.request_timeout_secs {
-        Some(Override::Set(seconds)) => {
-            builder = builder.timeout(Duration::from_secs(seconds.get()));
-        }
-        Some(Override::Clear) => {}
-        None => {
-            builder = builder.timeout(DEFAULT_DECISION_TIMEOUT);
-        }
-    }
-    let mut headers = reqwest::header::HeaderMap::new();
-    for (name, value) in &config.extra_headers {
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .with_context(|| format!("invalid decision header name `{name}`"))?;
-        let value = HeaderValue::from_str(value)
-            .with_context(|| format!("invalid decision header `{name}` value"))?;
-        headers.insert(name, value);
-    }
-    builder
-        .default_headers(headers)
-        .build()
-        .context("building decision-model HTTP client")
-}
-
-fn endpoint_for(base_url: &str, wire_api: DecisionWireApi) -> String {
+fn endpoint_for(base_url: &str, wire_api: DecisionWireApi) -> Result<String> {
     let path = match wire_api {
         DecisionWireApi::OpenAiDecisions => "decisions",
         DecisionWireApi::SystemOne => "systemone",
     };
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with(&format!("/{path}")) {
-        base.to_owned()
-    } else if base.ends_with("/v1") {
-        format!("{base}/{path}")
-    } else {
-        format!("{base}/v1/{path}")
-    }
+    crate::transport::append_endpoint(base_url, path)
 }
 
 struct NativeDecisionClient {
@@ -131,39 +71,20 @@ struct NativeDecisionClient {
 
 impl NativeDecisionClient {
     fn new(config: DecisionProviderConfig) -> Result<Self> {
+        let endpoint = endpoint_for(&config.transport.base_url, config.wire_api)?;
         Ok(Self {
-            http: build_http_client(&config)?,
-            endpoint: endpoint_for(&config.base_url, config.wire_api),
+            http: config
+                .transport
+                .client(DEFAULT_DECISION_TIMEOUT, "decision")?,
+            endpoint,
             model: config.model,
-            api_key: config.api_key.filter(|key| !key.trim().is_empty()),
+            api_key: config
+                .transport
+                .api_key
+                .filter(|key| !key.trim().is_empty()),
             wire_api: config.wire_api,
         })
     }
-}
-
-fn openai_request(
-    model: &str,
-    state: Value,
-    questions: &BTreeMap<String, Question>,
-) -> Result<Value> {
-    let questions: Vec<Value> = questions.iter().map(|(name, question)| match question {
-        Question::Noul { instructions } => json!({
-            "type": "predicate", "name": name, "instructions": instructions
-        }),
-        Question::Choice { instructions, criteria } => {
-            let choices: Vec<Value> = criteria.iter()
-                .map(|(value, description)| json!({"value": value, "description": description}))
-                .collect();
-            json!({"type": "choice", "name": name, "instructions": instructions, "choices": choices})
-        }
-    }).collect();
-    // Text input is shared by all supported Decisions implementations. JSON
-    // evidence stays text for servers that do not accept input_json parts.
-    let input = match state {
-        Value::String(text) => text,
-        value => serde_json::to_string(&value).context("serializing decision state")?,
-    };
-    Ok(json!({"model": model, "input": input, "questions": questions}))
 }
 
 #[derive(Deserialize)]
@@ -290,7 +211,9 @@ impl DecisionModel for NativeDecisionClient {
 
     async fn ask(&self, state: Value, questions: BTreeMap<String, Question>) -> Result<Answers> {
         let body = match self.wire_api {
-            DecisionWireApi::OpenAiDecisions => openai_request(&self.model, state, &questions)?,
+            DecisionWireApi::OpenAiDecisions => {
+                crate::protocols::openai::decision::request(&self.model, state, &questions)?
+            }
             DecisionWireApi::SystemOne => {
                 json!({ "model": self.model, "state": state, "questions": questions })
             }
@@ -399,22 +322,24 @@ mod tests {
             endpoint_for(
                 "https://example.test/inference/v1/",
                 DecisionWireApi::OpenAiDecisions
-            ),
+            )
+            .unwrap(),
             "https://example.test/inference/v1/decisions"
         );
         assert_eq!(
-            endpoint_for("https://example.test/api/v1", DecisionWireApi::SystemOne),
+            endpoint_for("https://example.test/api/v1", DecisionWireApi::SystemOne).unwrap(),
             "https://example.test/api/v1/systemone"
         );
         assert_eq!(
-            endpoint_for("https://example.test", DecisionWireApi::OpenAiDecisions),
+            endpoint_for("https://example.test", DecisionWireApi::OpenAiDecisions).unwrap(),
             "https://example.test/v1/decisions"
         );
         assert_eq!(
             endpoint_for(
                 "https://example.test/v1/systemone",
                 DecisionWireApi::SystemOne
-            ),
+            )
+            .unwrap(),
             "https://example.test/v1/systemone"
         );
     }
@@ -476,11 +401,11 @@ model = "native-decision-model"
                 .mount(&server)
                 .await;
             // Substitute the mock host for fixed public endpoints too.
-            config.base_url = format!("{}/{kind}/v1", server.uri());
+            config.transport.base_url = format!("{}/{kind}/v1", server.uri());
             config
+                .transport
                 .extra_headers
                 .insert("X-Decision-Test".to_owned(), "native".to_owned());
-            config.request_timeout_secs = Some(Override::Clear);
             let client = build_decision_provider(config).unwrap();
             let result = client
                 .ask(json!({"event": "test"}), questions())

@@ -44,6 +44,10 @@ read_timeout_secs = 300
 wire_api = "openai_decisions"
 request_timeout_secs = 30
 
+[providers.connections."gateway.prod".api.tts]
+
+[providers.connections."gateway.prod".api.asr]
+
 [providers.model_presets."chat.balanced"]
 capability = "chat"
 options = { temperature = 0.5, max_tokens = 4096 }
@@ -86,6 +90,12 @@ documented development defaults (Ollama `11434`, LM Studio `1234`, vLLM
 `8000`, SGLang `30000`, llama.cpp `8080`, and LiteLLM `4000`) when `uri` is
 omitted. `custom`, `openai-compatible`, and `system-one` connections must
 provide `uri`.
+The OpenAI-compatible capability adapters derive the standard audio paths
+from the same connection URI: `/v1/audio/speech` for TTS and
+`/v1/audio/transcriptions` for ASR. This applies to OpenAI, `custom`,
+`openai-compatible`, and vLLM connections when the server exposes those
+endpoints. The request body remains the native OpenAI speech or transcription
+contract; it is not simulated through chat completions.
 For fields that support explicit clearing, the string `"null"` means clear and
 inheritance is represented by leaving the field unset. A literal string value
 `"null"` uses `{ value = "null" }` where that field supports the escape.

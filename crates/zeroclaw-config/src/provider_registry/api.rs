@@ -164,7 +164,9 @@ api_tables!(ChatApi {
 });
 api_tables!(ChatDecisionApi {
     chat: ChatApiConfig,
-    decision: DecisionApiConfig
+    decision: DecisionApiConfig,
+    tts: TtsApiConfig,
+    asr: AsrApiConfig
 });
 api_tables!(OpenAiApi {
     chat: ChatApiConfig,

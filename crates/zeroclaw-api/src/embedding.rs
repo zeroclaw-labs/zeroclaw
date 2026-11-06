@@ -29,6 +29,16 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Vector dimensions returned by this provider.
     fn dimensions(&self) -> usize;
 
+    /// Vector-space identity used by storage and refresh consumers. Concrete
+    /// adapters include endpoint identity without exposing credentials.
+    fn identity(&self) -> EmbeddingIdentity {
+        EmbeddingIdentity {
+            provider: self.name().to_owned(),
+            model: String::new(),
+            dimensions: self.dimensions(),
+        }
+    }
+
     /// Embed a batch of texts.
     async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;
 

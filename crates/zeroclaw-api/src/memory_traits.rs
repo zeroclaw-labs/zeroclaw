@@ -629,21 +629,13 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// change, so a long-lived memory handle (e.g. the install-wide RPC memory
     /// handle) stops using stale endpoint/key values without a daemon restart.
     ///
-    /// The arguments are the already-resolved embedding settings — the literal
-    /// provider (`openai` / `openrouter` / `custom:<url>`), key, model, and
-    /// dimensions produced by the memory crate's embedding resolver from the
-    /// canonical config. The impl rebuilds its embedder from them and swaps it
-    /// in place; no provider state is duplicated into a separate cache.
+    /// Construction belongs to the provider crate. The caller supplies one
+    /// prepared provider, preserving connection headers, TLS and protocol
+    /// settings across both initial construction and runtime refresh.
     ///
     /// Default: no-op. Backends that do not embed, or cannot swap their
     /// embedder in place, keep the default.
-    fn refresh_embedder(
-        &self,
-        _model_provider: &str,
-        _api_key: Option<&str>,
-        _model: &str,
-        _dimensions: usize,
-    ) {
+    fn refresh_embedder(&self, _embedder: std::sync::Arc<dyn crate::embedding::EmbeddingProvider>) {
     }
 
     /// Recall memories scoped to a specific namespace.

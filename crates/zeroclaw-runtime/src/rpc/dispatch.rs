@@ -1000,14 +1000,23 @@ fn memory_embeddings_use_provider(
     config: &zeroclaw_config::schema::Config,
     model_provider_ref: &str,
 ) -> bool {
-    if config
+    if let Some(reference) = config
         .memory
         .embedding_model_ref
         .as_deref()
         .map(str::trim)
-        .is_some_and(|reference| reference == model_provider_ref)
+        .filter(|value| !value.is_empty())
     {
-        return true;
+        return reference == model_provider_ref
+            || config.provider_registry().ok().is_some_and(|registry| {
+                registry
+                    .resolve_embedding(&zeroclaw_config::provider_registry::ModelRef::from(
+                        reference,
+                    ))
+                    .is_ok_and(|resolved| {
+                        resolved.selection.provider_id.as_str() == model_provider_ref
+                    })
+            });
     }
     // Compare on the provider-profile portion so a three-segment
     // `<type>.<alias>.<model>` embedding ref still matches the edited profile.
@@ -10273,34 +10282,35 @@ impl RpcDispatcher {
         // Match daemon-boot resolution (`create_memory_with_storage_and_routes`
         // is called with `api_key = None`): keys come from the per-route /
         // `[memory]` override or the referenced profile, never an inherited seed.
-        let resolved = zeroclaw_memory::resolve_embedding_settings_from_config(config, None);
+        let embedder = match zeroclaw_memory::build_embedder_from_config(config, None) {
+            Ok(embedder) => embedder,
+            Err(error) => {
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error_key": "memory.embedder_refresh_failed", "error": error.to_string()})), "failed to prepare memory embedder refresh");
+                return;
+            }
+        };
         // 1. Install-wide RPC memory handle.
         if let Some(memory) = ctx.memory.as_ref() {
-            memory.refresh_embedder(
-                &resolved.model_provider,
-                resolved.api_key.as_deref(),
-                &resolved.model,
-                resolved.dimensions,
-            );
+            memory.refresh_embedder(Arc::clone(&embedder));
         }
         let ctx = Arc::clone(ctx);
         zeroclaw_spawn::spawn!(async move {
-            Self::refresh_live_agent_memory(ctx, resolved).await;
+            Self::refresh_live_agent_memory(ctx, embedder).await;
         });
     }
 
     async fn refresh_live_agent_memory(
         ctx: Arc<RpcContext>,
-        resolved: zeroclaw_memory::EmbeddingSettings,
+        embedder: Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
         for session_id in ctx.sessions.list_ids().await {
             if let Some(agent) = ctx.sessions.get_agent(&session_id).await {
-                agent.lock().await.refresh_memory_embedder(
-                    &resolved.model_provider,
-                    resolved.api_key.as_deref(),
-                    &resolved.model,
-                    resolved.dimensions,
-                );
+                agent
+                    .lock()
+                    .await
+                    .refresh_memory_embedder(Arc::clone(&embedder));
             }
         }
     }

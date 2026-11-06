@@ -378,17 +378,13 @@ impl Memory for LucidMemory {
 
     fn refresh_embedder(
         &self,
-        model_provider: &str,
-        api_key: Option<&str>,
-        model: &str,
-        dimensions: usize,
+        embedder: std::sync::Arc<dyn zeroclaw_api::embedding::EmbeddingProvider>,
     ) {
         // Lucid delegates all local storage/embedding to the wrapped SQLite
         // backend, so forward the refresh there Without this, a
         // Lucid-backed handle (including the install-wide RPC handle when
         // `backend = lucid`) would keep a stale embedder.
-        self.local
-            .refresh_embedder(model_provider, api_key, model, dimensions);
+        self.local.refresh_embedder(embedder);
     }
 
     async fn store(
@@ -678,10 +674,12 @@ mod tests {
 
         Memory::refresh_embedder(
             &lucid,
-            "openai",
-            Some("sk-test"),
-            "text-embedding-3-small",
-            1536,
+            std::sync::Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
+                "openai",
+                Some("sk-test"),
+                "text-embedding-3-small",
+                1536,
+            )),
         );
 
         assert_eq!(
