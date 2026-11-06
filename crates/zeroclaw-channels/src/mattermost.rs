@@ -3257,6 +3257,7 @@ mod tests {
         )
         .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
+            default_provider: None,
             api_key: Some("test_key".to_string()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "whisper-large-v3".to_string(),
@@ -3291,6 +3292,7 @@ mod tests {
         )
         .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
+            default_provider: None,
             api_key: Some(String::new()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "whisper-large-v3".to_string(),
@@ -3483,6 +3485,7 @@ mod tests {
         )
         .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
+            default_provider: None,
             api_key: Some("test_key".to_string()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "whisper-large-v3".to_string(),
@@ -3555,6 +3558,7 @@ mod tests {
             )
             .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
+                default_provider: None,
                 api_key: None,
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
@@ -3622,6 +3626,7 @@ mod tests {
             )
             .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
+                default_provider: None,
                 api_key: None,
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
@@ -3681,6 +3686,7 @@ mod tests {
             )
             .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
+                default_provider: None,
                 api_key: None,
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
