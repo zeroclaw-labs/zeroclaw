@@ -54789,6 +54789,55 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn redacted_prompt_history_retires_only_when_complete() {
+            use zeroclaw_api::model_provider::ChatMessage;
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_acp_test_config(&tmp);
+            config.channels.session_prompts_enabled = true;
+            let (ctx, backend, _acp) = persistence_enforcement_ctx(config);
+            let mut client = remote(&ctx, "tui_private");
+            let session = open(&client).await;
+            let key = format!("rpc_{session}");
+            let history = vec![
+                ChatMessage::user("remember this task"),
+                ChatMessage::assistant(
+                    r#"<tool_call>{"name":"session_prompt_set","arguments":{"id":"task","content":"PRIVATE_MARKER"}}</tool_call>"#,
+                ),
+                ChatMessage::user(
+                    "[Tool results]\n<tool_result name=\"session_prompt_set\">ok</tool_result>",
+                ),
+                ChatMessage::assistant("Done."),
+            ];
+            ctx.sessions.seed_history(&session, &history).await;
+            assert!(replace_rpc_chat_conversation_state(
+                backend.as_ref(),
+                &session,
+                &key,
+                &history[..3],
+                false,
+                true,
+            ));
+            disconnect(&ctx, &mut client).await;
+            let later = Instant::now() + TIMEOUT;
+            assert!(retire_orphaned_sessions(&ctx, later).await.is_empty());
+            assert!(replace_rpc_chat_conversation_state(
+                backend.as_ref(),
+                &session,
+                &key,
+                &history,
+                false,
+                true,
+            ));
+            assert!(
+                stored_contents(&backend, &key)
+                    .iter()
+                    .all(|s| !s.contains("PRIVATE_MARKER"))
+            );
+            assert_eq!(retire_orphaned_sessions(&ctx, later).await, vec![session]);
+        }
+
+        #[tokio::test]
         async fn a_history_its_store_lacks_keeps_the_session_until_it_is_stored() {
             let tmp = tempfile::TempDir::new().unwrap();
             let (ctx, backend, _acp) = persistence_enforcement_ctx(make_acp_test_config(&tmp));

@@ -192,7 +192,13 @@ async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool 
     let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
         return false;
     };
-    let live = zeroclaw_providers::durable_chat_messages(agent.history());
+    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+    // RPC persistence stores the export projection, including prompt privacy
+    // redaction. Compare against that same view while keeping history intact.
+    let live = crate::agent::prompt::redact_session_prompt_history_for_export(
+        &durable,
+        ctx.config.read().channels.session_prompts_enabled,
+    );
     drop(agent);
     let Some(backend) = ctx.session_backend.as_ref() else {
         return live.is_empty();
