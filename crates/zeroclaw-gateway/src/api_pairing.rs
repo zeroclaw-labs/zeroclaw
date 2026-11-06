@@ -556,6 +556,7 @@ pub(crate) fn revocation_not_admitted(
 
 /// Recheck the operator under the config writer before either device route
 /// removes a credential. Keep the verified cookie for a rotation's later mint.
+#[allow(clippy::result_large_err)]
 async fn revoke_operator_device(
     state: &AppState,
     headers: &HeaderMap,
