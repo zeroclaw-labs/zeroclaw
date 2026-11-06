@@ -295,6 +295,11 @@ mod tests {
     use super::{compiled_channels, configured_uncompiled_channels, is_channel_type_compiled};
     use std::collections::BTreeSet;
 
+    #[test]
+    fn empty_qr_pairing_channel_is_not_supported() {
+        assert!(super::qr_pairing_channel("").is_none());
+    }
+
     #[cfg(feature = "default-channels")]
     #[test]
     fn channel_type_compilation_tracks_enabled_features() {
