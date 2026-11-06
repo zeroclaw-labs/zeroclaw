@@ -5152,11 +5152,6 @@ impl Config {
         }
     }
 
-    /// One warning per cron job id that more than one enabled agent claims:
-    /// such a job is refused at runtime rather than run under an arbitrary
-    /// claimant, and that should surface at validation time, not in the
-    /// scheduler's poll log.
-
     /// One warning per agent whose explicit `delegates` roster can never fire
     /// because the resolved risk profile forbids delegation, or because a
     /// closed `allowed_tools` list omits `delegate`. The configuration is
@@ -5176,10 +5171,7 @@ impl Config {
             let grant_count = agent.delegates.len();
             let policy_blocks = !profile.delegation_policy.permits();
             let tools_block = !profile.allowed_tools.is_empty()
-                && !profile
-                    .allowed_tools
-                    .iter()
-                    .any(|name| name == "delegate");
+                && !profile.allowed_tools.iter().any(|name| name == "delegate");
             if !policy_blocks && !tools_block {
                 continue;
             }
@@ -5205,6 +5197,10 @@ impl Config {
         }
     }
 
+    /// One warning per cron job id that more than one enabled agent claims:
+    /// such a job is refused at runtime rather than run under an arbitrary
+    /// claimant, and that should surface at validation time, not in the
+    /// scheduler's poll log.
     fn collect_cron_claim_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
@@ -42646,10 +42642,8 @@ model = "gpt-4o-mini"
         .expect("dead-grant fixture loads");
         suppress_semantic_memory_warning(&mut config);
 
-        let warnings = warnings_with_code(
-            &config,
-            crate::validation_warnings::DEAD_DELEGATE_GRANTS,
-        );
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let w = &warnings[0];
         assert_eq!(w.path, "agents.projects_assistant.delegates");
@@ -42692,15 +42686,12 @@ model = "gpt-4o-mini"
         suppress_semantic_memory_warning(&mut config);
 
         assert!(
-            warnings_with_code(
-                &config,
-                crate::validation_warnings::DEAD_DELEGATE_GRANTS,
-            )
-            .is_empty()
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS,)
+                .is_empty()
         );
     }
 
-#[test]
+    #[test]
     async fn collect_warnings_flags_disabled_audit_dropping_certificate_record() {
         let mut config: Config = toml::from_str(
             r#"
