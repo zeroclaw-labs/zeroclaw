@@ -36,6 +36,7 @@ pub mod principal_plane;
 pub mod qdrant;
 pub mod redact;
 pub mod rerank;
+pub mod rerank_external;
 pub mod response_cache;
 pub mod retrieval;
 pub mod scanned;
@@ -67,6 +68,7 @@ pub use postgres::PostgresMemory;
 pub use principal_plane::PrincipalPlaneMemory;
 pub use qdrant::QdrantMemory;
 pub use rerank::{RerankConfig, RerankStrategy};
+pub use rerank_external::{ExternalRerankSettings, RerankFailure};
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};

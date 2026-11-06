@@ -49,7 +49,7 @@ pub const DEFAULT_MAX_TOTAL_CHARS: usize = 4_000;
 /// it from the agent's resolved memory config; the per-turn half (origin,
 /// session scope, spawn-site suppression) arrives via
 /// [`resolve_inject_policy`]'s arguments.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MemoryInjectConfig {
     /// Entries requested from each `recall` call.
     pub limit: usize,
@@ -74,6 +74,10 @@ pub struct MemoryInjectConfig {
     pub rerank: rerank::RerankConfig,
     /// Prefix each entry with its storage date (`[from YYYY-MM-DD]`).
     pub date_stamp: bool,
+    /// Rerank endpoint for the external strategy. Set only when the stage is
+    /// on, the strategy is `external` and an endpoint is configured; without
+    /// it the external strategy behaves as `none`.
+    pub external_rerank: Option<zeroclaw_memory::ExternalRerankSettings>,
 }
 
 impl Default for MemoryInjectConfig {
@@ -88,6 +92,7 @@ impl Default for MemoryInjectConfig {
             candidate_multiplier: 1,
             rerank: rerank::RerankConfig::disabled(DEFAULT_RECALL_LIMIT, 0.0),
             date_stamp: true,
+            external_rerank: None,
         }
     }
 }
@@ -106,16 +111,37 @@ impl MemoryInjectConfig {
         } else {
             limit
         };
+        let rerank = build_rerank_config(memory, limit);
+        let external_rerank = (memory.rerank_enabled
+            && rerank.strategy == rerank::RerankStrategy::External)
+            .then(|| external_rerank_settings(&memory.external_rerank))
+            .flatten();
         Self {
             limit,
             min_relevance_score: memory.min_relevance_score,
             rerank_enabled: memory.rerank_enabled,
             candidate_multiplier: memory.candidate_multiplier.max(1),
-            rerank: build_rerank_config(memory, limit),
+            rerank,
             date_stamp: memory.recall_date_stamp,
+            external_rerank,
             ..Default::default()
         }
     }
+}
+
+fn external_rerank_settings(
+    external: &zeroclaw_config::schema::MemoryExternalRerankConfig,
+) -> Option<zeroclaw_memory::ExternalRerankSettings> {
+    let endpoint = external.endpoint.trim();
+    if endpoint.is_empty() {
+        return None;
+    }
+    Some(zeroclaw_memory::ExternalRerankSettings {
+        endpoint: endpoint.to_string(),
+        model: external.model.trim().to_string(),
+        timeout: std::time::Duration::from_millis(external.timeout_ms.max(1)),
+        max_candidates: external.max_candidates.max(1),
+    })
 }
 
 /// Materialize the rerank stage config from the canonical memory config.
@@ -129,6 +155,7 @@ fn build_rerank_config(
         "mmr" => rerank::RerankStrategy::Mmr {
             lambda: memory.mmr_lambda,
         },
+        "external" => rerank::RerankStrategy::External,
         "none" | "" => rerank::RerankStrategy::None,
         other => {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
@@ -340,12 +367,20 @@ pub async fn render_memory_context(
         // caps the rendered block. The eligibility predicate mirrors the
         // renderer's skip set so ineligible rows are dropped before the trim,
         // not after, letting over-fetched candidates fill the freed slots.
-        entries = rerank::run(entries, &cfg.rerank, |entry| {
+        let is_eligible = |entry: &MemoryEntry| {
             if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
                 return false;
             }
             !should_skip_entry(&entry.key, &entry.content)
-        });
+        };
+        entries = match (&cfg.external_rerank, cfg.rerank.strategy) {
+            (Some(external), rerank::RerankStrategy::External) => {
+                external
+                    .rerank_pool(entries, &cfg.rerank, is_eligible, user_msg, turn.turn_id)
+                    .await
+            }
+            _ => rerank::run(entries, &cfg.rerank, is_eligible),
+        };
     } else {
         // Older non-Core memories score lower; Core is evergreen.
         decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
@@ -1403,7 +1438,7 @@ mod tests {
                 TurnOrigin::Interactive,
                 true,
                 false,
-                flags_off,
+                flags_off.clone(),
                 GOLDEN_FULL,
             ),
             (
@@ -1411,7 +1446,7 @@ mod tests {
                 TurnOrigin::Channel,
                 false,
                 false,
-                flags_off,
+                flags_off.clone(),
                 GOLDEN_NO_CONVERSATION,
             ),
             (
@@ -1419,7 +1454,7 @@ mod tests {
                 TurnOrigin::Cron,
                 true,
                 false,
-                flags_off,
+                flags_off.clone(),
                 GOLDEN_NO_CONVERSATION,
             ),
             (
@@ -1427,7 +1462,7 @@ mod tests {
                 TurnOrigin::Daemon,
                 false,
                 false,
-                flags_off,
+                flags_off.clone(),
                 GOLDEN_NO_CONVERSATION,
             ),
             (
@@ -1435,7 +1470,7 @@ mod tests {
                 TurnOrigin::SubTurn,
                 true,
                 false,
-                flags_off,
+                flags_off.clone(),
                 "",
             ),
             // The cron `uses_memory = false` spawn-site opt-out arrives here
@@ -1445,7 +1480,7 @@ mod tests {
                 TurnOrigin::Cron,
                 true,
                 true,
-                flags_off,
+                flags_off.clone(),
                 "",
             ),
             (
@@ -1455,7 +1490,7 @@ mod tests {
                 false,
                 MemoryInjectConfig {
                     max_entries: 2,
-                    ..flags_off
+                    ..flags_off.clone()
                 },
                 GOLDEN_TIGHT_ENTRY_BUDGET,
             ),
@@ -1466,7 +1501,7 @@ mod tests {
                 false,
                 MemoryInjectConfig {
                     max_total_chars: 100,
-                    ..flags_off
+                    ..flags_off.clone()
                 },
                 GOLDEN_TIGHT_CHAR_BUDGET,
             ),
@@ -1475,7 +1510,7 @@ mod tests {
                 TurnOrigin::Interactive,
                 true,
                 false,
-                rerank_on,
+                rerank_on.clone(),
                 GOLDEN_RERANK,
             ),
             (
@@ -1483,7 +1518,7 @@ mod tests {
                 TurnOrigin::Cron,
                 true,
                 false,
-                rerank_on,
+                rerank_on.clone(),
                 GOLDEN_RERANK_NO_CONVERSATION,
             ),
         ];
@@ -2037,5 +2072,310 @@ mod tests {
             .find("supporting_match: ")
             .expect("the weaker relevant entry survives the configured floor");
         assert!(best < supporting, "BM25 relevance order survives blending");
+    }
+
+    // ── external rerank ───────────────────────────────────────────────────
+
+    mod external_rerank {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn meta() -> TurnMeta<'static> {
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            }
+        }
+
+        /// Four eligible facts in falling score order, plus entries that must
+        /// never reach the endpoint: one under the floor, one Conversation
+        /// entry for a turn that excludes them, and one autosave key.
+        fn pool(now: chrono::DateTime<chrono::Utc>) -> Vec<MemoryEntry> {
+            vec![
+                scored_entry(
+                    "a",
+                    "alpha project budget",
+                    MemoryCategory::Daily,
+                    Some(0.9),
+                    None,
+                    now,
+                ),
+                scored_entry(
+                    "b",
+                    "bravo supplier invoice",
+                    MemoryCategory::Daily,
+                    Some(0.8),
+                    None,
+                    now,
+                ),
+                scored_entry(
+                    "c",
+                    "charlie travel booking",
+                    MemoryCategory::Daily,
+                    Some(0.7),
+                    None,
+                    now,
+                ),
+                scored_entry(
+                    "d",
+                    "delta webinar speakers",
+                    MemoryCategory::Daily,
+                    Some(0.6),
+                    None,
+                    now,
+                ),
+                scored_entry(
+                    "low",
+                    "echo below the floor",
+                    MemoryCategory::Daily,
+                    Some(0.05),
+                    None,
+                    now,
+                ),
+                scored_entry(
+                    "chat",
+                    "foxtrot conversation line",
+                    MemoryCategory::Conversation,
+                    Some(0.95),
+                    None,
+                    now,
+                ),
+                scored_entry(
+                    "user_msg_1",
+                    "golf raw autosave",
+                    MemoryCategory::Conversation,
+                    Some(0.99),
+                    None,
+                    now,
+                ),
+            ]
+        }
+
+        fn cfg(strategy: rerank::RerankStrategy, endpoint: Option<String>) -> MemoryInjectConfig {
+            MemoryInjectConfig {
+                limit: 2,
+                min_relevance_score: 0.3,
+                rerank_enabled: true,
+                candidate_multiplier: 4,
+                rerank: rerank::RerankConfig {
+                    strategy,
+                    threshold: 2,
+                    importance_weight: 0.2,
+                    recency_weight: 0.1,
+                    min_relevance_score: 0.3,
+                    final_limit: 2,
+                    candidate_pool_cap: 8,
+                },
+                external_rerank: endpoint.map(|endpoint| zeroclaw_memory::ExternalRerankSettings {
+                    endpoint,
+                    model: String::new(),
+                    timeout: std::time::Duration::from_millis(300),
+                    max_candidates: 16,
+                }),
+                ..Default::default()
+            }
+        }
+
+        async fn render(cfg: &MemoryInjectConfig) -> String {
+            let mem = FixtureMemory::with(pool(chrono::Utc::now()));
+            render_memory_context(
+                &mem,
+                &RecordingObserver::default(),
+                "which supplier sent the invoice",
+                &[],
+                cfg,
+                true,
+                meta(),
+            )
+            .await
+        }
+
+        /// The block the `none` strategy renders for the same pool: what every
+        /// failure must reproduce exactly.
+        async fn local_block() -> String {
+            render(&cfg(rerank::RerankStrategy::None, None)).await
+        }
+
+        fn reply(order: &[(usize, f64)]) -> serde_json::Value {
+            serde_json::json!({
+                "results": order
+                    .iter()
+                    .map(|(index, score)| serde_json::json!({"index": index, "relevance_score": score}))
+                    .collect::<Vec<_>>()
+            })
+        }
+
+        async fn server_answering(template: ResponseTemplate) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/rerank"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            server
+        }
+
+        fn sent_documents(server_requests: &[wiremock::Request]) -> Vec<String> {
+            assert_eq!(server_requests.len(), 1, "one rerank call per render");
+            let body: serde_json::Value =
+                serde_json::from_slice(&server_requests[0].body).expect("json request");
+            body["documents"]
+                .as_array()
+                .expect("documents array")
+                .iter()
+                .map(|doc| doc.as_str().unwrap().to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn the_endpoint_order_decides_the_selection() {
+            let server = server_answering(ResponseTemplate::new(200).set_body_json(reply(&[
+                (3, 0.9),
+                (2, 0.7),
+                (0, 0.2),
+                (1, 0.1),
+            ])))
+            .await;
+            let context = render(&cfg(rerank::RerankStrategy::External, Some(server.uri()))).await;
+
+            let d = context
+                .find("] d: ")
+                .expect("endpoint's first pick renders");
+            let c = context
+                .find("] c: ")
+                .expect("endpoint's second pick renders");
+            assert!(d < c, "{context}");
+            assert!(
+                !context.contains("] a: ") && !context.contains("] b: "),
+                "{context}"
+            );
+            assert_ne!(context, local_block().await);
+        }
+
+        #[tokio::test]
+        async fn only_eligible_candidates_above_the_floor_are_sent() {
+            let server = server_answering(
+                ResponseTemplate::new(200).set_body_json(reply(&[(0, 0.9), (1, 0.8)])),
+            )
+            .await;
+            render(&cfg(rerank::RerankStrategy::External, Some(server.uri()))).await;
+
+            let requests = server.received_requests().await.expect("recorded");
+            let documents = sent_documents(&requests);
+            assert_eq!(
+                documents,
+                vec![
+                    "alpha project budget",
+                    "bravo supplier invoice",
+                    "charlie travel booking",
+                    "delta webinar speakers",
+                ]
+            );
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body["query"], "which supplier sent the invoice");
+            assert_eq!(body["top_n"], 4);
+            assert!(body.get("model").is_none(), "an empty model is omitted");
+        }
+
+        #[tokio::test]
+        async fn max_candidates_bounds_what_is_sent() {
+            let server = server_answering(
+                ResponseTemplate::new(200).set_body_json(reply(&[(1, 0.9), (0, 0.8)])),
+            )
+            .await;
+            let mut config = cfg(rerank::RerankStrategy::External, Some(server.uri()));
+            if let Some(external) = config.external_rerank.as_mut() {
+                external.max_candidates = 2;
+            }
+            let context = render(&config).await;
+
+            let requests = server.received_requests().await.expect("recorded");
+            assert_eq!(
+                sent_documents(&requests),
+                vec!["alpha project budget", "bravo supplier invoice"]
+            );
+            let b = context.find("] b: ").expect("reordered head renders");
+            let a = context.find("] a: ").expect("reordered head renders");
+            assert!(b < a, "{context}");
+        }
+
+        #[tokio::test]
+        async fn every_failure_renders_the_local_block() {
+            let local = local_block().await;
+            let failures = [
+                (
+                    "timeout",
+                    ResponseTemplate::new(200)
+                        .set_body_json(reply(&[(3, 0.9)]))
+                        .set_delay(std::time::Duration::from_millis(1_500)),
+                ),
+                ("server error", ResponseTemplate::new(500)),
+                (
+                    "malformed body",
+                    ResponseTemplate::new(200).set_body_string("not json"),
+                ),
+                (
+                    "wrong shape",
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})),
+                ),
+                (
+                    "out-of-range index",
+                    ResponseTemplate::new(200).set_body_json(reply(&[(3, 0.9), (9, 0.8)])),
+                ),
+                (
+                    "duplicate index",
+                    ResponseTemplate::new(200).set_body_json(reply(&[(3, 0.9), (3, 0.8)])),
+                ),
+            ];
+            for (name, template) in failures {
+                let server = server_answering(template).await;
+                let context =
+                    render(&cfg(rerank::RerankStrategy::External, Some(server.uri()))).await;
+                assert_eq!(context, local, "{name}");
+            }
+
+            // Transport: nothing listens on the address.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = format!("http://{}", listener.local_addr().unwrap());
+            drop(listener);
+            let context = render(&cfg(rerank::RerankStrategy::External, Some(closed))).await;
+            assert_eq!(context, local, "transport error");
+        }
+
+        #[tokio::test]
+        async fn the_external_strategy_without_an_endpoint_renders_the_local_block() {
+            let context = render(&cfg(rerank::RerankStrategy::External, None)).await;
+            assert_eq!(context, local_block().await);
+        }
+
+        #[test]
+        fn from_memory_config_builds_endpoint_settings_only_for_the_external_stage() {
+            let mut memory = zeroclaw_config::schema::MemoryConfig::default();
+            memory.external_rerank.endpoint = " http://127.0.0.1:8098 ".into();
+            memory.external_rerank.timeout_ms = 900;
+            memory.external_rerank.max_candidates = 12;
+
+            memory.rerank_strategy = "external".into();
+            let off = MemoryInjectConfig::from_memory_config(&memory, 5);
+            assert!(off.external_rerank.is_none(), "stage off sends nothing");
+
+            memory.rerank_enabled = true;
+            let on = MemoryInjectConfig::from_memory_config(&memory, 5);
+            assert_eq!(on.rerank.strategy, rerank::RerankStrategy::External);
+            let external = on.external_rerank.expect("settings for the external stage");
+            assert_eq!(external.endpoint, "http://127.0.0.1:8098");
+            assert_eq!(external.timeout, std::time::Duration::from_millis(900));
+            assert_eq!(external.max_candidates, 12);
+
+            memory.rerank_strategy = "mmr".into();
+            let mmr = MemoryInjectConfig::from_memory_config(&memory, 5);
+            assert!(
+                mmr.external_rerank.is_none(),
+                "another strategy sends nothing"
+            );
+        }
     }
 }
