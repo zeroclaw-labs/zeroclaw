@@ -320,6 +320,12 @@ mod tests {
         assert!(cosine_similarity(&a, &b).abs() < f32::EPSILON);
     }
 
+    #[test]
+    fn cosine_mismatched_lengths_are_symmetric() {
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 2.0], &[1.0]), 0.0);
+    }
+
     // ── Edge cases: vec↔bytes serialization ──────────────────────
 
     #[test]
