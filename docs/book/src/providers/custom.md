@@ -80,6 +80,19 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct
 
 Slots `lmstudio`, `osaurus`, `litellm` follow the same pattern, see the [catalog](./catalog.md).
 
+## Reasoning field name: `reasoning_key`
+
+A tool-calling turn replays a thinking model's scratchpad back to the endpoint as `reasoning_content`. Some backends (notably certain vLLM builds) only accept the shorter `reasoning` alias and reject or drop the canonical key. Rename it on the wire:
+
+```toml
+[providers.models.vllm.default]
+uri           = "http://10.0.0.15:8000/v1"
+model         = "Qwen/Qwen3-32B"
+reasoning_key = "reasoning"
+```
+
+Honored on the chat-completions wire only (`custom`, generic openai-compatible, every compat slot). Aliases with `wire_api = "responses"` and branded slots with their own client (`openai`, `openrouter`, `anthropic`, `gemini`, …) ignore it silently.
+
 ## Wire protocol: `wire_api = "responses"`
 
 New **OpenAI** provider slots that are *written to config* (`providers.models.openai.<alias>`, as created by `zeroclaw quickstart` or the gateway/config UI) default to `wire_api = "responses"` because OpenAI's recent GPT models use `POST /v1/responses` as the primary wire. Other bring-your-own-endpoint slots (`custom`, `llamacpp`, and OpenAI-compatible vendors) still default to the chat-completions wire; an endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit `wire_api = "responses"` opt-in on the alias entry.
