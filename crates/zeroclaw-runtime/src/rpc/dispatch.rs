@@ -1963,8 +1963,9 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryAuthorit
         {
             let lease = self.admission.dispatcher.ctx.auth.hold_authority();
             let grants = self.current_under(&lease)?;
-            if self.admission.dispatcher.access_policy == RpcAccessPolicy::TrustedLocal
-                || grants.as_ref().is_some_and(|grants| grants.admin)
+            if grants.as_ref().is_some_and(|grants| grants.admin)
+                || (grants.is_none()
+                    && self.admission.dispatcher.access_policy == RpcAccessPolicy::TrustedLocal)
             {
                 return Ok(());
             }
@@ -31693,6 +31694,29 @@ mod tests {
                     serde_json::to_value(&before).unwrap()
                 );
                 if demote {
+                    let record = alice
+                        .authorize_session_owner("actor", Method::SessionPrompt)
+                        .await
+                        .unwrap();
+                    let port = alice
+                        .native_session_command(
+                            "actor",
+                            "actor",
+                            record.as_ref(),
+                            Method::SessionPrompt,
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        port.history_reader()
+                            .unwrap()
+                            .history("victim", 10)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "a narrowed local principal cannot bypass tool withholding through its reader"
+                    );
                     assert_session_data_tools_withheld(&agent, "victim").await;
                     set_alice_administrator(&ctx, true);
                     let regrant = install_principal_history_probe(&agent).await;
@@ -32396,7 +32420,7 @@ mod tests {
                     .expect("create disposable agent");
                 config.save().await.expect("seed persisted agent config");
                 let (fixture, _) = make_native_test_dispatcher(config);
-                let ctx = fixture.ctx;
+                let ctx = Arc::clone(&fixture.ctx);
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
                 let mut dispatcher =
                     RpcDispatcher::new(ctx, tx, "test-peer-agent-delete-stack:pid=1".into());
