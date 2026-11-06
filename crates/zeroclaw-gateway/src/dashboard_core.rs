@@ -5567,4 +5567,65 @@ mod tests {
         assert!(!fixture.store.list_ids().await.contains(&core_id));
         drop(chat);
     }
+
+    // ── Tools a member's chat is offered ─────────────────────────────────
+
+    /// The tool names the model was offered on the requests whose body
+    /// carries `marker`.
+    async fn offered_tools(model: &MockServer, marker: &str) -> Vec<String> {
+        let requests = model.received_requests().await.unwrap_or_default();
+        let mut offered = Vec::new();
+        for request in requests
+            .iter()
+            .filter(|request| String::from_utf8_lossy(&request.body).contains(marker))
+        {
+            let body: Value = serde_json::from_slice(&request.body).expect("a JSON request");
+            for tool in body["tools"].as_array().into_iter().flatten() {
+                if let Some(name) = tool["function"]["name"].as_str() {
+                    offered.push(name.to_string());
+                }
+            }
+        }
+        offered
+    }
+
+    /// A member whose profile holds `tools:execute` with wildcard tool and
+    /// agent selectors still reaches the core as a non-admin principal, so
+    /// its chat is offered none of the tools that list, read or write other
+    /// sessions. Its own session tool and its other tools stay.
+    #[tokio::test]
+    async fn a_wildcard_member_chat_is_not_offered_other_sessions_tools() {
+        let fixture = Fixture::with_config(|config| {
+            let chatters = config
+                .permission_profiles
+                .get_mut("chat-user")
+                .expect("the fixture's chat profile");
+            chatters.allowed_tools = vec!["*".to_string()];
+            chatters.allowed_agents = vec!["*".to_string()];
+            chatters.grants.insert(Resource::Tools, vec![Verb::Execute]);
+        })
+        .await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &alice, "support", "web-1")
+            .await
+            .expect("alice may chat");
+        let _ = socket.next().await;
+        let marker = "which tools may I use";
+        assert_eq!(chat_once(&mut socket, marker).await["type"], "done");
+
+        let offered = offered_tools(&fixture._model, marker).await;
+        for kept in ["sessions_current", "file_read"] {
+            assert!(
+                offered.iter().any(|name| name == kept),
+                "{kept} is offered: {offered:?}"
+            );
+        }
+        for withheld in ["sessions_list", "sessions_history", "sessions_send"] {
+            assert!(
+                !offered.iter().any(|name| name == withheld),
+                "{withheld} is withheld: {offered:?}"
+            );
+        }
+    }
 }
