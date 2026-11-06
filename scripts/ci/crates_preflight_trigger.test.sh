@@ -68,6 +68,10 @@ commit 2.0.0 "# feature edit" >/dev/null
 git checkout -q --detach "$bumped"
 git merge -q --no-ff --no-edit feature
 expect "run=false" pull_request "$fork"
+# Unlike a pull request, a merge queue compares against its event base even
+# on a merge commit. Reusing HEAD^1 here would hide the queued version bump.
+expect $'run=true\ntag=v2.0.1' merge_group "$fork"
+expect "run=false" merge_group "$bumped"
 
 git checkout -q -b release "$bumped"
 commit 2.0.2 >/dev/null
