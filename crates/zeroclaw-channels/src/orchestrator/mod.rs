@@ -17021,6 +17021,18 @@ struct HydratedSession {
 #[derive(Debug)]
 struct HydrationFailed;
 
+#[cfg(test)]
+type HydrationLoadHook = Box<dyn FnMut(&str)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run on this thread, with the session key, once
+    /// [`hydrate_session_transcript`] has read a non-empty transcript and
+    /// before it reconciles it.
+    static AFTER_HYDRATION_LOAD: std::cell::RefCell<Option<HydrationLoadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Load one session's transcript for startup hydration: apply the
 /// `MAX_CHANNEL_HISTORY` cap, close a trailing orphaned user turn, and
 /// resolve breadcrumb ownership.
@@ -17046,7 +17058,10 @@ struct HydrationFailed;
 /// `owner` is the agent whose claimed turn is reloading the transcript. The
 /// read and every reconciliation write then happen only while the session is
 /// still that agent's (see [`load_owned_transcript`]). Startup restoration,
-/// which resolves the owner itself, passes `None`.
+/// which resolves the owner itself but holds no claim, passes `None`. Its
+/// writes then never create a session: if cleanup removes the session after
+/// the read, deletion wins, and the result is `Ok(None)`, as if the
+/// transcript had not been there.
 fn hydrate_session_transcript(
     store: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
@@ -17071,6 +17086,12 @@ fn hydrate_session_transcript(
     if msgs.is_empty() {
         return Ok(None);
     }
+    #[cfg(test)]
+    AFTER_HYDRATION_LOAD.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(session_key);
+        }
+    });
     // A transient read failure must not silently collapse into "no record"
     // and fall through to legacy text inference: that would let a
     // user-controlled first message that happens to collide with the
@@ -17111,24 +17132,33 @@ fn hydrate_session_transcript(
     let mut orphan_closed = false;
     if msgs.last().is_some_and(|msg| msg.role == "user") {
         let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
-        if let Err(e) = write_owned_transcript(
-            store,
-            session_key,
-            owner,
-            zeroclaw_infra::session_backend::OwnedSessionWrite::Append(&closure),
-        ) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                &format!("Failed to persist orphan closure for {session_key}")
-            );
-            // A closure the store never accepted must not be published in
-            // the returned transcript: the live cache would then hold an
-            // assistant row durable storage does not have, diverging until
-            // the next authoritative replacement. Fail closed instead and
-            // leave the session unreconciled for the next turn to retry.
-            return Err(HydrationFailed);
+        // Without an owner, only to a session that still exists.
+        let persisted = match owner {
+            None => store.append_if_exists(session_key, &closure),
+            Some(_) => write_owned_transcript(
+                store,
+                session_key,
+                owner,
+                zeroclaw_infra::session_backend::OwnedSessionWrite::Append(&closure),
+            ),
+        };
+        match persisted {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    &format!("Failed to persist orphan closure for {session_key}")
+                );
+                // A closure the store never accepted must not be published in
+                // the returned transcript: the live cache would then hold an
+                // assistant row durable storage does not have, diverging until
+                // the next authoritative replacement. Fail closed instead and
+                // leave the session unreconciled for the next turn to retry.
+                return Err(HydrationFailed);
+            }
         }
         msgs.push(closure);
         orphan_closed = true;
@@ -17159,19 +17189,30 @@ fn hydrate_session_transcript(
     // restart reloads the untruncated transcript and repeats this
     // reconciliation instead of converging.
     if truncated || durable_crumb != Some(crumb_present) {
-        let persist_result = write_owned_transcript(
-            store,
-            session_key,
-            owner,
-            if truncated {
-                zeroclaw_infra::session_backend::OwnedSessionWrite::ReplaceConversationState {
-                    messages: &msgs,
-                    breadcrumb_present: crumb_present,
-                }
-            } else {
-                zeroclaw_infra::session_backend::OwnedSessionWrite::SetTrimBreadcrumb(crumb_present)
-            },
-        );
+        let persist_result = match owner {
+            // Without an owner, only in a session that still exists, and as
+            // one replacement even when only the flag changed: on SQLite a
+            // flag write alone recreates the session's row.
+            None => store.replace_conversation_state_if_exists(session_key, &msgs, crumb_present),
+            Some(_) => write_owned_transcript(
+                store,
+                session_key,
+                owner,
+                if truncated {
+                    zeroclaw_infra::session_backend::OwnedSessionWrite::ReplaceConversationState {
+                        messages: &msgs,
+                        breadcrumb_present: crumb_present,
+                    }
+                } else {
+                    zeroclaw_infra::session_backend::OwnedSessionWrite::SetTrimBreadcrumb(
+                        crumb_present,
+                    )
+                },
+            ),
+        };
+        if let Ok(false) = persist_result {
+            return Ok(None);
+        }
         if let Err(e) = persist_result {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -24768,6 +24809,265 @@ temperature = 0.3
                     cached("agent-b", "legacy-bare"),
                     "{backend_name}/{binding}: a bare row still uses the bare entry"
                 );
+            }
+        }
+    }
+
+    /// Clears the after-load hook when a test ends, even by panicking.
+    struct AfterHydrationLoad;
+
+    impl AfterHydrationLoad {
+        fn run(hook: impl FnMut(&str) + 'static) -> Self {
+            AFTER_HYDRATION_LOAD.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for AfterHydrationLoad {
+        fn drop(&mut self) {
+            AFTER_HYDRATION_LOAD.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Startup restoration reads A's old transcript, and cleanup then removes
+    /// the session before restoration writes to it: hygiene archives the
+    /// JSONL pair, or the stale-session sweep deletes the SQLite rows. The
+    /// write is the capped transcript when A's is over the cap, or the closure
+    /// of its unanswered last turn. Restoration holds no claim, so the write
+    /// must not recreate the session: recreated, it would hold A's messages
+    /// with no owner, and once A is disabled and its channel goes to B, the
+    /// sole enabled agent, B's next turn would adopt them as legacy history
+    /// and send them to B's model. The row is either attributed to A or
+    /// carries only A's channel.
+    #[tokio::test]
+    async fn startup_restoration_never_recreates_a_session_cleanup_removed() {
+        use zeroclaw_infra::session_backend::SessionContext;
+
+        for backend_name in ["jsonl", "sqlite"] {
+            for attributed in [true, false] {
+                for over_cap in [true, false] {
+                    let case = format!(
+                        "{backend_name}/{}/{}",
+                        if attributed {
+                            "attributed"
+                        } else {
+                            "channel-only"
+                        },
+                        if over_cap {
+                            "over the cap"
+                        } else {
+                            "unanswered"
+                        }
+                    );
+                    let tmp = tempfile::tempdir().unwrap();
+                    let mut config = Config::default();
+                    config.agents.clear();
+                    config.agents.insert(
+                        "agent-a".into(),
+                        zeroclaw_config::schema::AliasedAgentConfig {
+                            enabled: true,
+                            channels: vec!["webhook.a".into()],
+                            ..Default::default()
+                        },
+                    );
+                    config.agents.insert(
+                        "agent-b".into(),
+                        zeroclaw_config::schema::AliasedAgentConfig {
+                            enabled: false,
+                            ..Default::default()
+                        },
+                    );
+                    config.channels.webhook.insert(
+                        "a".into(),
+                        zeroclaw_config::schema::WebhookConfig {
+                            enabled: true,
+                            ..Default::default()
+                        },
+                    );
+                    let msg = ChannelMessage {
+                        id: "b-1".into(),
+                        sender: "alice".into(),
+                        reply_target: "alice".into(),
+                        content: "What did we talk about?".into(),
+                        channel: "webhook".into(),
+                        channel_alias: Some("a".into()),
+                        ..Default::default()
+                    };
+                    let key = runtime_conversation_history_key(&router_test_ctx(), &msg);
+                    {
+                        let store =
+                            zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+                        let turns = if over_cap {
+                            MAX_CHANNEL_HISTORY / 2 + 5
+                        } else {
+                            2
+                        };
+                        for turn in 0..turns {
+                            store
+                                .append(
+                                    &key,
+                                    &ChatMessage::user(format!("A_OLD_SECRET ask {turn}")),
+                                )
+                                .unwrap();
+                            store
+                                .append(
+                                    &key,
+                                    &ChatMessage::assistant(format!("A_OLD_SECRET reply {turn}")),
+                                )
+                                .unwrap();
+                        }
+                        if !over_cap {
+                            store
+                                .append(&key, &ChatMessage::user("A_OLD_SECRET unanswered"))
+                                .unwrap();
+                        }
+                        store
+                            .set_session_context(
+                                &key,
+                                SessionContext {
+                                    channel_id: Some("webhook.a"),
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap();
+                        if attributed {
+                            store.set_session_agent_alias(&key, "agent-a").unwrap();
+                        }
+                    }
+                    if backend_name == "jsonl" {
+                        // Past hygiene's archive window.
+                        let transcript = tmp
+                            .path()
+                            .join("sessions")
+                            .join(format!("{}.jsonl", sanitize_session_key(&key)));
+                        std::fs::File::options()
+                            .append(true)
+                            .open(&transcript)
+                            .unwrap()
+                            .set_modified(
+                                SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60),
+                            )
+                            .unwrap();
+                    }
+
+                    // A restart: reopen the store and restore from what it holds.
+                    let store: Arc<dyn SessionBackend> =
+                        zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+                    let provider = Arc::new(HistoryCaptureModelProvider::default());
+                    let owner_by_channel_key = config
+                        .active_agent_channel_bindings()
+                        .owner_by_channel_key();
+                    let live_config = zeroclaw_config::live::LiveConfig::new(config);
+                    let owner = Arc::new(ChannelRuntimeContext {
+                        session_store: Some(Arc::clone(&store)),
+                        agent_alias: Arc::new("agent-a".into()),
+                        model_provider: provider.clone(),
+                        max_tool_iterations: 1,
+                        live_config: live_config.handle(),
+                        ..(*router_test_ctx()).clone()
+                    });
+                    let agent_ctxs = HashMap::from([("agent-a".to_string(), Arc::clone(&owner))]);
+                    let metadata = store
+                        .list_sessions_with_metadata()
+                        .into_iter()
+                        .find(|metadata| metadata.key == key)
+                        .unwrap();
+                    let cleaned = Arc::new(AtomicBool::new(false));
+                    let cleanup = AfterHydrationLoad::run({
+                        let store = Arc::clone(&store);
+                        let workspace = tmp.path().to_path_buf();
+                        let cleaned = Arc::clone(&cleaned);
+                        let case = case.clone();
+                        move |loaded| {
+                            if backend_name == "jsonl" {
+                                let memory = zeroclaw_config::schema::MemoryConfig {
+                                    hygiene_enabled: true,
+                                    archive_after_days: 7,
+                                    ..Default::default()
+                                };
+                                zeroclaw_memory::hygiene::run_if_due(&memory, &workspace).unwrap();
+                            } else {
+                                store.cleanup_stale(0).unwrap();
+                            }
+                            assert!(
+                                !store.session_exists(loaded),
+                                "{case}: cleanup must remove the session restoration read"
+                            );
+                            cleaned.store(true, Ordering::SeqCst);
+                        }
+                    });
+                    let restored = hydrate_persisted_session_history(
+                        store.as_ref(),
+                        &metadata,
+                        &agent_ctxs,
+                        &owner_by_channel_key,
+                    );
+                    drop(cleanup);
+                    assert!(
+                        cleaned.load(Ordering::SeqCst),
+                        "{case}: cleanup must run inside restoration"
+                    );
+                    assert!(
+                        !store.session_exists(&key),
+                        "{case}: restoration must not recreate the session cleanup removed"
+                    );
+                    assert_eq!(restored, None, "{case}: nothing is left to restore");
+                    assert!(
+                        owner
+                            .conversation_histories
+                            .lock()
+                            .unwrap()
+                            .peek(&key)
+                            .is_none(),
+                        "{case}"
+                    );
+
+                    let mut reassigned = live_config.snapshot();
+                    reassigned.agents.get_mut("agent-a").unwrap().enabled = false;
+                    let agent_b = reassigned.agents.get_mut("agent-b").unwrap();
+                    agent_b.enabled = true;
+                    agent_b.channels = vec!["webhook.a".into()];
+                    live_config
+                        .publish(live_config.next_revision().unwrap(), reassigned)
+                        .unwrap();
+                    let sole = Arc::new(ChannelRuntimeContext {
+                        agent_alias: Arc::new("agent-b".into()),
+                        conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+                        ))),
+                        ..(*owner).clone()
+                    });
+                    process_channel_message(
+                        Arc::clone(&sole),
+                        msg.clone(),
+                        CancellationToken::new(),
+                    )
+                    .await;
+                    let seen = |needle: &str| {
+                        provider
+                            .calls
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .flatten()
+                            .any(|(_, text)| text.contains(needle))
+                    };
+                    assert!(
+                        !seen("A_OLD_SECRET"),
+                        "{case}: B's model must never see A's messages"
+                    );
+                    // Non-vacuous: nothing of A's is left on the key, so B
+                    // starts the conversation afresh.
+                    assert!(
+                        seen("What did we talk about?"),
+                        "{case}: B's turn must still reach its model"
+                    );
+                    assert_eq!(
+                        store.get_session_agent_alias(&key).unwrap().as_deref(),
+                        Some("agent-b"),
+                        "{case}"
+                    );
+                }
             }
         }
     }

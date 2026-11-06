@@ -663,6 +663,26 @@ pub trait SessionBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Append one message only if the session still exists, with the same
+    /// contract as
+    /// [`replace_conversation_state_if_exists`](Self::replace_conversation_state_if_exists):
+    /// `Ok(false)` means the session was already gone and nothing was
+    /// written, so no transcript, row or sidecar is recreated for the key.
+    /// For a writer that holds no claim on the session, such as startup
+    /// restoration closing a turn it read earlier, where cleanup removing
+    /// the session in between must win.
+    ///
+    /// The default implementation is check-then-act and only best-effort.
+    /// Both built-in backends override it with the same atomic probe and
+    /// write that their `replace_conversation_state_if_exists` uses.
+    fn append_if_exists(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        if !self.session_exists(session_key) {
+            return Ok(false);
+        }
+        self.append(session_key, message)?;
+        Ok(true)
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,

@@ -1025,6 +1025,19 @@ impl SessionBackend for SessionStore {
         Ok(true)
     }
 
+    fn append_if_exists(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        // The same probe under the same guard as
+        // `replace_conversation_state_if_exists`. Hygiene's archive and
+        // `delete_session` hold that guard too, so once either has removed
+        // the transcript, the append writes nothing.
+        let _guard = self.mutation_guard()?;
+        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+            return Ok(false);
+        }
+        self.append_unlocked(session_key, message)?;
+        Ok(true)
+    }
+
     fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
         self.get_trim_breadcrumb(session_key)
     }

@@ -1373,6 +1373,32 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    /// The existence probe and the append share one IMMEDIATE transaction:
+    /// a delete on another connection either commits first, and the append
+    /// writes nothing, or waits until the append has committed.
+    fn append_if_exists(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
+                params![session_key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        let now = Utc::now().to_rfc3339();
+        Self::append_on(&tx, session_key, message, &now).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
     fn write_as_owner(
         &self,
         session_key: &str,
@@ -4684,5 +4710,59 @@ mod tests {
             assert_eq!(legacy.agent_alias, None, "{backend_name}");
             assert_eq!(legacy.channel_id, None, "{backend_name}");
         }
+    }
+
+    /// `append_if_exists` writes only to a session that exists. For a key
+    /// that was never a session, or whose session was deleted, it writes
+    /// nothing and recreates nothing.
+    #[test]
+    fn append_if_exists_never_recreates_a_removed_session() {
+        let closure = ChatMessage::assistant("closure");
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = TempDir::new().unwrap();
+            let store: Box<dyn SessionBackend> = if backend_name == "sqlite" {
+                Box::new(SqliteSessionBackend::new(tmp.path()).unwrap())
+            } else {
+                Box::new(SessionStore::new(tmp.path()).unwrap())
+            };
+
+            assert!(
+                !store.append_if_exists("never", &closure).unwrap(),
+                "{backend_name}"
+            );
+            assert!(!store.session_exists("never"), "{backend_name}");
+            assert!(
+                store.get_session_metadata("never").is_none(),
+                "{backend_name}"
+            );
+
+            store.append("k", &ChatMessage::user("open turn")).unwrap();
+            assert!(
+                store.append_if_exists("k", &closure).unwrap(),
+                "{backend_name}"
+            );
+            assert_eq!(store.load("k").len(), 2, "{backend_name}");
+
+            assert!(store.delete_session("k").unwrap(), "{backend_name}");
+            assert!(
+                !store.append_if_exists("k", &closure).unwrap(),
+                "{backend_name}: deletion wins"
+            );
+            assert!(!store.session_exists("k"), "{backend_name}");
+            assert!(store.load("k").is_empty(), "{backend_name}");
+        }
+
+        // Message rows without their metadata row are not a session either.
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        store.append("k", &ChatMessage::user("orphaned")).unwrap();
+        store
+            .conn
+            .lock()
+            .execute("DELETE FROM session_metadata WHERE session_key = 'k'", [])
+            .unwrap();
+        assert!(!store.append_if_exists("k", &closure).unwrap());
+        assert_eq!(store.load("k").len(), 1);
+        assert!(store.get_session_metadata("k").is_none());
     }
 }
