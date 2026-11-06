@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["UpdateRecovery"],"fn":["migrate_plugins_dir"],"struct":["AdmittedComponent","AdmittedSource","PluginHost","ReplacedPackage"]};

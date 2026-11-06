@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PROVIDER_IMAGE_MIME_TYPES"],"enum":["MarkerKind","MediaKind"],"fn":["image_mime_from_extension","image_mime_from_magic","is_provider_image_mime","provider_loadable_image_mime_for"],"struct":["MediaAttachment","RenderedMarker"]};

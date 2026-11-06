@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["defaults"],"struct":["BoundCapabilities","MemoryRequest","NativeRecipeInputs","ProviderRequest","RuntimeCapabilities","ToolRequest"],"trait":["ChannelSource","MemorySource","ProviderSource","ToolSource"],"type":["CapabilitySlot","NativeRegistryRecipe"]};

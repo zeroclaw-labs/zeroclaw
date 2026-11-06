@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PluginEventError","PluginEventResolution"],"struct":["PluginEventEnvelope","PluginEventRouteResolver","PluginEventRouter","ResolvedPluginEventRoute"],"trait":["PluginEventDispatcher"]};

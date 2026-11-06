@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ChannelKind","CronKind","MemoryKind","ModelProviderKind","ProviderKind","Role","ToolKind","ToolProvenance","TranscriptionProviderKind","TtsProviderKind","TunnelProviderKind"],"mod":["channel_kind_opt_serde"],"struct":["ChannelKindIter"],"trait":["Attributable"]};

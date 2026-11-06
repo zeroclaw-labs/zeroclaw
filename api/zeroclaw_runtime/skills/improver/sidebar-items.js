@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["extract_skill_executions_from_history","extract_skill_slugs_from_history","validate_skill_content"],"struct":["SkillImprover"]};

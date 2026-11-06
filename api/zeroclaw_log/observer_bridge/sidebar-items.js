@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["clear_observer_bridge","set_observer_bridge"]};

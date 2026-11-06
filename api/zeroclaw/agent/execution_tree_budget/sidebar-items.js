@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ExecutionTreeBudgetRole","ExecutionTreeReservation"],"struct":["ExecutionTreeBudget","ExecutionTreeBudgetExhausted"]};

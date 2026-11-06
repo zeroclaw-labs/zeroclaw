@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["RouteResolutionKind"],"struct":["CostOptimizedStrategy","ModelRouteResolver","ResolvedModelRoute","Route","RouterModelProvider"]};

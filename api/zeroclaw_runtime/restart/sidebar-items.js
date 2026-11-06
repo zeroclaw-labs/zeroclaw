@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DESKTOP_RESTART_EXIT_CODE","DESKTOP_RESTART_MARKER_ENV","DESKTOP_SUPERVISED_ENV"],"fn":["desktop_restart_requested","is_desktop_supervised","launch_command_recorded","record_launch","recorded_launch_executable","request_desktop_restart","request_respawn","request_shutdown","respawn_if_requested","respawn_requested","shutdown_notify"]};

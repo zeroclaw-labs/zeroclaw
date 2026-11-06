@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["contains_generated_toml_block","missing_protected_literal","preservation_prompt","protected_literals"],"struct":["ProtectedLiteral"]};

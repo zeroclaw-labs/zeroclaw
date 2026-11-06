@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DENY_PREFIX"],"enum":["Match"],"fn":["grants_anyone","is_identity_allowed","is_identity_allowed_by","is_identity_denied_by","is_user_allowed","is_user_allowed_by","pairing_deny_conflict"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["MatchStrategy"],"fn":["matches","matches_any"],"struct":["EventPattern","RoutineEvent"]};

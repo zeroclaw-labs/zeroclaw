@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["UPLOAD_BODY_CEILING_BYTES"],"enum":["UploadReject"],"fn":["classify_upload","handle_upload"],"struct":["UploadQuery","UploadResponse"]};

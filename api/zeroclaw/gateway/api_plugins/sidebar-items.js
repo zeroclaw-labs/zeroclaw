@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PluginCatalogIssueCode","PluginCatalogIssueSource"],"fn":["list_plugins"],"struct":["AvailablePluginPackage","InstalledPluginPackage","PluginCatalogEntry","PluginCatalogIssue","PluginsResponse"]};

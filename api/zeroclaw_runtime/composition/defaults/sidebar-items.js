@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["native_compat_registry"],"struct":["ConfigMemory","ConfigProviders","NoOutboundChannels","NoSuppliedTools"]};
