@@ -41,27 +41,32 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   };
   const stopAll = () => { stopCapture(); stopSpeech(); };
   const speak = (text: string) => {
-    if (!ready || !prefs.reading || !visible() || recognition.current) return;
+    if (!ready || !prefs.reading || !visible() || recognition.current) return false;
     const voice = voices.find(v => v.voiceURI === prefs.voice);
-    if (!voice || !('speechSynthesis' in window)) { setError(t('voice.select_voice')); return; }
+    if (!voice || !('speechSynthesis' in window)) { setError(t('voice.select_voice')); return false; }
     stopSpeech();
     const next = new SpeechSynthesisUtterance(text);
     next.voice = voice; next.lang = prefs.language; next.rate = prefs.rate;
     next.onend = () => { utterance.current = null; setSpeaking(false); };
     next.onerror = () => { utterance.current = null; setSpeaking(false); setError(t('voice.speech_error')); };
     utterance.current = next; setSpeaking(true); setError(''); window.speechSynthesis.speak(next);
+    return true;
   };
   const replies = messages.filter(m => m.role === 'agent' && !m.toolCall && !m.ephemeral && !m.notice && m.content.trim());
   const latest = replies[replies.length - 1];
   useEffect(() => {
     if (!hydrated) { baseline.current = null; return; }
-    if (typing) return;
     const ids = new Set(replies.map(m => m.id));
-    if (baseline.current !== null && continuous && ready && prefs.reading) {
-      const unseen = replies.filter(m => !m.fromHistory && !baseline.current!.has(m.id));
-      const newest = unseen[unseen.length - 1];
-      if (newest) speak(newest.content);
+    if (baseline.current === null || !continuous || !prefs.reading || !visible()) {
+      baseline.current = ids;
+      return;
     }
+    if (typing) return;
+    const unseen = replies.filter(m => !m.fromHistory && !baseline.current!.has(m.id));
+    const newest = unseen[unseen.length - 1];
+    // Temporary capture, preference refresh, or speech in progress must not
+    // consume the reply. Their completion causes the effect to try again.
+    if (newest && (!ready || listening || speaking || !speak(newest.content))) return;
     baseline.current = ids;
   });
   // Cancel synchronously at commit so a late recognition event cannot reach a new draft.

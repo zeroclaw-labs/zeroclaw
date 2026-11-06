@@ -200,6 +200,27 @@ test('configuration includes the usage guide and server-side device persistence 
   }
 });
 
+test('a trim notice is silent and the reply waits for an active microphone to stop', async () => {
+  const renderer = await mount();
+  const button = (index: number) => renderer.root.findAllByType('button')[index]!;
+  await act(async () => {
+    button(1).props.onKeyDown({ key: 'Enter', shiftKey: true, preventDefault() {} });
+    await button(0).props.onClick();
+  });
+  const messages = [
+    reply('old', 'Historical reply'),
+    { ...reply('trim', 'Earlier conversation history was trimmed'), notice: true, ephemeral: true },
+    reply('answer', 'Two plus two is four.'),
+  ];
+  await act(async () => {
+    renderer.update(createElement(Controls, { messages, hydrated: true, typing: false, onTranscript() {} }));
+  });
+  assert.deepEqual(spoken, []);
+  await act(async () => { await button(0).props.onClick(); });
+  assert.deepEqual(spoken, ['Two plus two is four.']);
+  await act(async () => { renderer.unmount(); });
+});
+
 test('reloaded history with regenerated IDs is never treated as a live reply', async () => {
   const renderer = await mount();
   const speaker = () => renderer.root.findAllByType('button')[1]!;
