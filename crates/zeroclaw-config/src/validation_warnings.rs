@@ -37,6 +37,9 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 /// are not checked; see [`crate::opt_in_tools`].
 pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
 
+/// Stable code for delegate grants that a forbidden delegation_policy can never fire.
+pub const DEAD_DELEGATE_GRANTS: &str = "dead_delegate_grants";
+
 /// Stable code for a half-configured email outbound pair: the channel loads and
 /// stays inbound-only even though the operator configured sending.
 pub const EMAIL_SMTP_PARTIALLY_CONFIGURED: &str = "email_smtp_partially_configured";
