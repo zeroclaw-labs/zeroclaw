@@ -25,6 +25,7 @@ import {
   Search,
   Monitor,
   ArrowRight,
+  WalletCards,
 } from "lucide-react";
 import type {
   StatusResponse,
@@ -35,6 +36,7 @@ import type {
   SessionMessageRow,
   ProcessStats,
   TuiEntry,
+  OpenRouterCredits,
 } from "@/types/api";
 import {
   getStatus,
@@ -50,6 +52,7 @@ import {
   getQuickstartState,
   getTuis,
   listProps,
+  getOpenRouterCredits,
 } from "@/lib/api";
 import { resolveModelToProviderType } from "@/lib/configuredModels";
 import DoctorFixModal from "@/components/DoctorFixModal";
@@ -281,6 +284,43 @@ function ProcessCpuCard({ process }: { process?: ProcessStats }) {
   );
 }
 
+function OpenRouterCreditsCard({
+  credits,
+}: {
+  credits: OpenRouterCredits;
+}) {
+  return (
+    <div className="card p-5 animate-slide-in-up">
+      <div className="flex items-center gap-3 mb-3">
+        <div
+          className="p-2 rounded-2xl"
+          style={{
+            background: "rgba(var(--pc-accent-rgb), 0.08)",
+            color: "#38bdf8",
+          }}
+        >
+          <WalletCards className="h-5 w-5" />
+        </div>
+        <span
+          className="text-xs uppercase tracking-wider font-medium"
+          style={{ color: "var(--pc-text-muted)" }}
+        >
+          {t("dashboard.openrouter_balance")}
+        </span>
+      </div>
+      <p
+        className="text-lg font-semibold truncate font-mono"
+        style={{ color: "var(--pc-text-primary)" }}
+      >
+        {formatUSD(credits.remaining_credits)}
+      </p>
+      <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>
+        {formatUSD(credits.total_usage)} {t("dashboard.openrouter_used_of")} {formatUSD(credits.total_credits)}
+      </p>
+    </div>
+  );
+}
+
 function formatLocalDateTime(iso: string): string {
   try {
     const d = new Date(iso);
@@ -427,12 +467,14 @@ const TABS: { id: TabId; labelKey: string; icon: typeof LayoutDashboard }[] = [
 function OverviewTab({
   status,
   cost,
+  openRouterCredits,
   tuis,
   showAllChannels,
   setShowAllChannels,
 }: {
   status: StatusResponse;
   cost: CostSummary;
+  openRouterCredits: OpenRouterCredits | null;
   tuis: TuiEntry[];
   showAllChannels: boolean;
   setShowAllChannels: (fn: (v: boolean) => boolean) => void;
@@ -517,6 +559,9 @@ function OverviewTab({
         )}
         <ProcessRamCard process={status.process} />
         <ProcessCpuCard process={status.process} />
+        {openRouterCredits && (
+          <OpenRouterCreditsCard credits={openRouterCredits} />
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 stagger-children">
@@ -1737,6 +1782,7 @@ export default function Dashboard() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [tuis, setTuis] = useState<TuiEntry[]>([]);
+  const [openRouterCredits, setOpenRouterCredits] = useState<OpenRouterCredits | null>(null);
   const [costWindow, setCostWindow] = useState<CostWindow>("today");
   const [error, setError] = useState<string | null>(null);
   const [showAllChannels, setShowAllChannels] = useState(false);
@@ -1784,6 +1830,23 @@ export default function Dashboard() {
     },
     5000,
     [costWindow],
+  );
+
+  // Account credit checks are remote and change much more slowly than local
+  // process health. A missing/inactive/failed integration resolves to null and
+  // leaves no empty or error card behind.
+  usePolling(
+    (isStale) => {
+      getOpenRouterCredits()
+        .then((credits) => {
+          if (!isStale()) setOpenRouterCredits(credits);
+        })
+        .catch(() => {
+          if (!isStale()) setOpenRouterCredits(null);
+        });
+    },
+    300000,
+    [],
   );
 
   if (error) {
@@ -1871,6 +1934,7 @@ export default function Dashboard() {
         <OverviewTab
           status={status}
           cost={cost}
+          openRouterCredits={openRouterCredits}
           tuis={tuis}
           showAllChannels={showAllChannels}
           setShowAllChannels={setShowAllChannels}
