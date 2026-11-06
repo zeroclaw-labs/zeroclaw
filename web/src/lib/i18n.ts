@@ -541,11 +541,6 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.speaker": "Read reply / control automatic reading",
     "voice.local_unavailable": "This browser cannot run local dictation for the selected language.",
     "voice.pack_required": "Install this language pack in Settings → Other → Browser Voice and Audio, then click the microphone again.",
-    "voice.choose_input": "Choose microphone",
-    "voice.default_input": "Browser default",
-    "voice.unnamed_input": "Microphone",
-    "voice.allow_inputs": "Allow microphone access to list devices",
-    "voice.input_error": "Could not open the selected microphone. Check site permissions and your audio device.",
     "voice.no_transcript": "No speech was transcribed. Check the selected language and microphone, then try again.",
     "voice.capture_error": "Dictation failed. Check microphone permission and browser support.",
 
@@ -11038,11 +11033,6 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.speaker": "Ler resposta / controlar leitura automática",
     "voice.local_unavailable": "Este navegador não consegue executar o ditado local no idioma selecionado.",
     "voice.pack_required": "Baixe o pacote em Configurações → Other → Voz e áudio do navegador e clique no microfone novamente.",
-    "voice.choose_input": "Selecionar microfone",
-    "voice.default_input": "Padrão do navegador",
-    "voice.unnamed_input": "Microfone",
-    "voice.allow_inputs": "Permitir acesso para listar microfones",
-    "voice.input_error": "Não foi possível abrir o microfone selecionado. Confira a permissão do site e o dispositivo de áudio.",
     "voice.no_transcript": "Nenhuma fala foi transcrita. Confira o idioma e o microfone selecionados e tente novamente.",
     "voice.capture_error": "Falha no ditado. Confira a permissão do microfone e o suporte do navegador.",
 

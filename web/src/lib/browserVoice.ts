@@ -115,7 +115,7 @@ export interface Recognition {
   onresult: ((event: { resultIndex: number; results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null;
   onerror: ((event: { error: string }) => void) | null;
   onend: (() => void) | null;
-  start(track?: MediaStreamTrack): void;
+  start(): void;
   stop(): void;
   abort(): void;
 }

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ChevronDown, Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
 import { localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
@@ -14,10 +14,6 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
   const [error, setError] = useState('');
-  const [showInputs, setShowInputs] = useState(false);
-  const [inputs, setInputs] = useState<MediaDeviceInfo[]>([]);
-  const [inputId, setInputId] = useState('');
-  const inputStream = useRef<MediaStream | null>(null);
   const root = useRef<HTMLDivElement>(null);
   const recognition = useRef<Recognition | null>(null);
   const finishing = useRef(false);
@@ -34,10 +30,6 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     }
     setSpeaking(false);
   };
-  const releaseInput = () => {
-    inputStream.current?.getTracks().forEach(track => track.stop());
-    inputStream.current = null;
-  };
   const stopCapture = () => {
     generation.current++;
     finishing.current = false;
@@ -45,7 +37,6 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
       recognition.current.onresult = null; recognition.current.onerror = null;
       recognition.current.onend = null; recognition.current.abort(); recognition.current = null;
     }
-    releaseInput();
     setListening(false);
   };
   const stopAll = () => { stopCapture(); stopSpeech(); };
@@ -92,23 +83,6 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     if (!prefs.dictation) stopCapture();
     if (!prefs.reading) stopSpeech();
   }, [prefs.dictation, prefs.reading]);
-  const listInputs = async () => {
-    try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      setInputs(devices.filter(device => device.kind === 'audioinput' && device.deviceId && device.deviceId !== 'default'));
-    } catch {
-      setError(t('voice.input_error'));
-    }
-  };
-  const revealInputs = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      try { await listInputs(); }
-      finally { stream.getTracks().forEach(track => track.stop()); }
-    } catch {
-      setError(t('voice.input_error'));
-    }
-  };
   const toggleMicrophone = async () => {
     if (recognition.current) {
       if (finishing.current) return;
@@ -164,33 +138,12 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     capture.onend = () => {
       if (generation.current !== version) return;
       recognition.current = null;
-      releaseInput();
       finishing.current = false;
       setListening(false);
       if (!receivedText && visible()) setError(t('voice.no_transcript'));
     };
-    let track: MediaStreamTrack | undefined;
-    if (inputId) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: inputId } } });
-        if (version !== generation.current || !visible()) {
-          stream.getTracks().forEach(entry => entry.stop());
-          if (version === generation.current) setListening(false);
-          return;
-        }
-        inputStream.current = stream;
-        track = stream.getAudioTracks()[0];
-        if (!track) throw new Error('Missing audio track');
-      } catch {
-        if (version === generation.current) { stopCapture(); setError(t('voice.input_error')); }
-        return;
-      }
-    }
     recognition.current = capture;
-    try {
-      if (track) capture.start(track);
-      else capture.start();
-    } catch { stopCapture(); setError(t('voice.capture_error')); }
+    try { capture.start(); } catch { stopCapture(); setError(t('voice.capture_error')); }
   };
   const shortPress = () => {
     if (longPressed.current) { longPressed.current = false; return; }
@@ -202,29 +155,6 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   if (!ready || (!prefs.dictation && !prefs.reading)) return null;
   return <div ref={root} className="flex flex-wrap items-center gap-1 max-w-48">
     {prefs.dictation && <button type="button" className={listening ? css + ' bg-pc-accent/20 ring-2 ring-pc-accent' : css} aria-label={t('voice.microphone')} title={t('voice.microphone')} aria-pressed={listening} onClick={() => void toggleMicrophone()}>{listening ? <Mic size={20} /> : <MicOff size={20} />}</button>}
-    {prefs.dictation && typeof navigator.mediaDevices?.enumerateDevices === 'function' && (
-      <button type="button" className={css} aria-label={t('voice.choose_input')} title={t('voice.choose_input')}
-        aria-expanded={showInputs} disabled={listening} onClick={() => {
-          setShowInputs(!showInputs);
-          if (!showInputs) { setError(''); void listInputs(); }
-        }}><ChevronDown size={16} /></button>
-    )}
-    {prefs.dictation && showInputs && (
-      <div className="flex flex-col gap-1 w-full">
-        <select aria-label={t('voice.choose_input')} value={inputId} disabled={listening}
-          className="max-w-full rounded border border-pc-border bg-pc-base p-1 text-xs"
-          onChange={event => { setInputId(event.target.value); setError(''); setShowInputs(false); }}>
-          <option value="">{t('voice.default_input')}</option>
-          {inputs.map((device, i) => <option key={device.deviceId} value={device.deviceId}>
-            {device.label || t('voice.unnamed_input') + ' ' + (i + 1)}
-          </option>)}
-        </select>
-        {(!inputs.length || inputs.some(device => !device.label)) && (
-          <button type="button" className={css + ' text-xs'} disabled={listening}
-            onClick={() => { setError(''); void revealInputs(); }}>{t('voice.allow_inputs')}</button>
-        )}
-      </div>
-    )}
     {prefs.reading && <button type="button" className={`${css} ${continuous ? 'bg-pc-accent/20 ring-2 ring-pc-accent' : ''}`} aria-label={t('voice.speaker')} title={t('voice.gesture')} aria-pressed={continuous} aria-busy={speaking}
       onPointerDown={event => {
         if (event.button !== 0) return;
