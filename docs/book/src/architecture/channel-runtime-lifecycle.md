@@ -36,7 +36,8 @@ mini-orchestrator.
 | Surface | Owner | Review rule |
 | --- | --- | --- |
 | Platform listener or channel inbound adapter | Channel module or channel plugin | Keep signature checks, payload decoding, platform retries, provider verification, challenge handling, and `ChannelMessage` construction local to the transport adapter. |
-| Gateway webhook route | Gateway handler | Keep route hosting, proxying, timeout behavior, fast acknowledgement, and generic HTTP response policy local to the gateway. Do not grow new platform-specific parsing there except as documented transition debt. |
+| Built-in gateway webhook route | Gateway handler | Keep route hosting, proxying, timeout behavior, fast acknowledgement, and generic HTTP response policy local to the gateway. Do not grow new platform-specific parsing there except as documented transition debt. |
+| Channel-plugin webhook route (`/plugin/{path}`) | Gateway handler, core plugin webhook ingress, and channel plugin | The gateway keeps HTTP concerns, the core ingress owns admission, queueing, the deadline, and dedup, and the plugin owns vendor authentication and parsing. See [Channel-plugin webhooks](#channel-plugin-webhooks). |
 | Normalized inbound message | `ChannelMessage` from `zeroclaw-api` | Preserve sender, reply target, channel, alias, thread, attachments, subject, passive context, and conversation scope. Add structured metadata rather than hiding routing signals in user-visible text. |
 | Agent ownership for a channel alias | `start_channels` / `AgentRouter` and active channel bindings | Resolve the owning agent from configured bindings. Do not silently fall back to an unrelated agent when a channel is unowned or disabled. |
 | Message dispatch and cancellation | Shared channel dispatch loop | Reuse in-flight tracking, `/stop`, sender/thread cancellation, max in-flight limits, and worker concurrency. |
@@ -168,6 +169,28 @@ handlers separately:
   the build when a handler bypasses the authenticated funnel. This requirement
   does not make the helper the target channel lifecycle.
 
+### Channel-plugin webhooks
+
+Channel plugins that declare webhook ingress do not go through the built-in
+handlers or `dispatch_verified_webhook`: their verified messages enter the
+shared channel dispatch loop through the plugin channel's listener. Three
+owners split the request:
+
+- the gateway hosts `/plugin/{path}` and keeps the HTTP concerns: the shared
+  webhook rate limit, the 64 KiB body ceiling, the `GET`/`POST` method check,
+  and the mapping from each outcome to a fixed status and body;
+- the core plugin webhook ingress (`zeroclaw_infra::plugin_webhook`), one per
+  daemon generation, owns route admission against the routes the channel
+  supervisor publishes, each route's bounded queue, the request deadline, and
+  message dedup for that generation;
+- the channel plugin owns vendor authentication, payload parsing, and
+  challenge replies in its `parse-webhook` export.
+
+The [Gateway HTTP API](../gateway/api.md#channel-plugin-webhook-ingress) lists
+the public responses, and the
+[Plugin protocol](../developing/plugin-protocol.md#channel-webhook-ingress)
+describes the guest contract.
+
 ## Reload and listener lifecycle
 
 Channel config can be saved before the running listener sees it. The daemon
@@ -259,3 +282,6 @@ Key code entry points:
 - Runtime generic process entry point:
   `crates/zeroclaw-runtime/src/agent/loop_.rs`
 - Gateway webhook/chat path: `crates/zeroclaw-gateway/src/lib.rs`
+- Channel-plugin webhooks: `crates/zeroclaw-gateway/src/plugin_webhook.rs`
+  (HTTP adapter) and `crates/zeroclaw-infra/src/plugin_webhook.rs` (core
+  ingress)
