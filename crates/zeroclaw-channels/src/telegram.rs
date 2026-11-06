@@ -4686,6 +4686,55 @@ impl TelegramChannel {
         Some(Self::normalize_incoming_content(caption, bot_username))
     }
 
+    /// Whether an inbound parser would admit `message` under the mention-only
+    /// gate. Reply-voice preparation consults this before fetching a quoted
+    /// recording: an admission decision broader than the parsers spends a
+    /// download (and possibly a transcription) on an update that is dropped
+    /// afterwards.
+    ///
+    /// The decision mirrors the parser branches exactly:
+    /// - the text parser sees messages with `text` and admits addressed ones,
+    ///   plus unaddressed text under passive group context;
+    /// - the media parsers (`check_media_mention_gate`) see photo/document
+    ///   and voice/audio messages and admit only a caption that mentions the
+    ///   bot or answers it directly — a captionless reply to the bot admits
+    ///   nothing, and no passive fallback exists there;
+    /// - anything neither parser can see admits nothing.
+    ///
+    /// Call only under `mention_only` in a group chat, the condition both
+    /// parser gates key on.
+    fn reply_prep_parser_admission(&self, message: &serde_json::Value) -> bool {
+        if let Some(text) = message.get("text").and_then(serde_json::Value::as_str) {
+            let bot_username_guard = self.bot_username.lock();
+            let Some(bot_username) = bot_username_guard.as_ref() else {
+                // Without the bot's username the text parser drops every
+                // group message in a mention_only chat.
+                return false;
+            };
+            if Self::contains_bot_mention(text, bot_username) {
+                return true;
+            }
+            drop(bot_username_guard);
+            if let Some(bot_id) = *self.bot_id.lock()
+                && Self::is_reply_to_bot(message, bot_id)
+            {
+                return true;
+            }
+            return Self::should_record_passive_group_context(
+                self.passive_group_context,
+                true,
+                false,
+            );
+        }
+        if Self::parse_attachment_metadata(message).is_none()
+            && Self::parse_voice_metadata(message).is_none()
+        {
+            return false;
+        }
+        let caption = message.get("caption").and_then(serde_json::Value::as_str);
+        self.check_media_mention_gate(message, caption).is_some()
+    }
+
     /// Single-identifier convenience kept for the unit tests; the polling
     /// path authorizes the whole identity set at once.
     #[cfg(test)]
@@ -6117,55 +6166,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return;
         }
 
-        let (username, sender_id, _) = Self::extract_sender_info(message);
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        // Authorize with the same identity set the parsers use: the display
+        // fallback "unknown" from `extract_sender_info` is not a real
+        // identity and must not match an allowlisted username.
+        let identities = Self::authorization_identities(message);
+        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
             return;
         }
 
-        // Mirror the parser admission rules for this update before any
-        // network I/O: in a mention_only group the recording is only fetched
-        // when the current message would also be processed — it addresses the
-        // bot (@mention in text or caption, or a direct reply to the bot), or
-        // it is admitted as passive group context. Otherwise every parser
-        // drops this update and the download plus any transcription would be
-        // spent on a message the bot must ignore. Lock order matches
-        // `check_media_mention_gate` (bot username, then bot id).
-        let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
-            let admitted = {
-                let bot_username = self.bot_username.lock();
-                match bot_username.as_ref() {
-                    Some(username) => {
-                        let body = message
-                            .get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .or_else(|| message.get("caption").and_then(serde_json::Value::as_str));
-                        let mentioned =
-                            body.is_some_and(|b| Self::contains_bot_mention(b, username));
-                        let reply_to_bot = {
-                            let bot_id = *self.bot_id.lock();
-                            bot_id.is_some_and(|id| Self::is_reply_to_bot(message, id))
-                        };
-                        mentioned || reply_to_bot
-                    }
-                    // Without the bot's username the parsers drop every group
-                    // message in a mention_only chat, so nothing may be fetched.
-                    None => false,
-                }
-            };
-            if !admitted
-                && !Self::should_record_passive_group_context(
-                    self.passive_group_context,
-                    is_group,
-                    false,
-                )
-            {
-                return;
-            }
+        // Admit only updates the inbound parsers themselves would process.
+        // Passive group context admits text observations only; media replies
+        // must clear the media gate (a mention or a captioned reply to the
+        // bot), so no download or transcription is spent on an update every
+        // parser drops.
+        if self.mention_only
+            && Self::is_group_message(message)
+            && !self.reply_prep_parser_admission(message)
+        {
+            return;
         }
 
         let reply_mid = match reply.get("message_id").and_then(serde_json::Value::as_i64) {
@@ -19440,6 +19458,147 @@ mod tests {
             ch.voice_file_paths.lock().contains_key("-100200300:42"),
             "addressed reply should cache the quoted recording path"
         );
+    }
+
+    #[tokio::test]
+    async fn prepopulate_skips_rejected_media_reply_even_with_passive_context() {
+        use wiremock::MockServer;
+
+        // mention_only group with passive group context on: an unmentioned
+        // captioned photo reply is still dropped by every media parser (the
+        // media gate has no passive fallback), so the quoted recording must
+        // not be fetched or transcribed.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_passive_group_context(true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 23,
+                "photo": [{ "file_id": "p1", "file_size": 10 }],
+                "caption": "look at this",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        ch.prepopulate_voice_reply_context(&update).await;
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "a media reply the gate drops must not touch the network"
+        );
+        assert!(ch.voice_file_paths.lock().is_empty());
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepopulate_skips_captionless_media_reply_to_bot() {
+        use wiremock::MockServer;
+
+        // A captionless photo that answers the bot's message directly is not
+        // admitted by the media parsers (their reply-to-bot bypass still
+        // requires a caption), so preparation must not treat reply-to-bot as
+        // enough on its own.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(7);
+        }
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 24,
+                "photo": [{ "file_id": "p1", "file_size": 10 }],
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "id": 7, "username": "mybot" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        ch.prepopulate_voice_reply_context(&update).await;
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "a captionless media reply must not touch the network"
+        );
+        assert!(ch.voice_file_paths.lock().is_empty());
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepopulate_rejects_display_fallback_identity() {
+        use wiremock::MockServer;
+
+        // A sender without a username used to be authorized through the
+        // "unknown" display fallback, so an allowlisted "unknown" admitted
+        // any username-less sender. Only real identities count: the numeric
+        // id 777 is not allowed, so nothing may be fetched.
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["unknown".into()]),
+            true,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 25,
+                "text": "@mybot привет",
+                "from": { "id": 777 },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob" },
+                    "voice": { "file_id": "abc", "duration": 5 }
+                }
+            }
+        });
+
+        ch.prepopulate_voice_reply_context(&update).await;
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "a sender known only by a fabricated identity must not touch the network"
+        );
+        assert!(ch.voice_file_paths.lock().is_empty());
+        assert!(ch.voice_transcriptions.lock().is_empty());
     }
 
     #[tokio::test]
