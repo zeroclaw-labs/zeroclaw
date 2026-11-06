@@ -1341,8 +1341,7 @@ mod tests {
                 &forbidden,
                 home,
             )
-            .err()
-            .expect("root resolution errors must reject construction");
+            .expect_err("root resolution errors must reject construction");
             assert_eq!(error.kind(), expected_kind);
             if expected_kind == std::io::ErrorKind::Other {
                 assert!(error.to_string().contains("symlink limit exceeded"));
@@ -1366,8 +1365,7 @@ mod tests {
                 &[],
                 Some(fixture.path()),
             )
-            .err()
-            .expect("fixed credential resolution errors must reject construction");
+            .expect_err("fixed credential resolution errors must reject construction");
             assert_eq!(error.kind(), expected_kind);
             std::fs::remove_file(alias).unwrap();
         }
