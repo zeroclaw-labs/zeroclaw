@@ -10,7 +10,7 @@ If you're running WSL2, you can follow the [Linux setup](./linux.md) instead; `i
 
 ### Option 1: Prebuilt binary (recommended)
 
-Download the latest Windows release zip, extract `zeroclaw.exe`, and put it on your `PATH`.
+Download the latest Windows release zip, verify its `SHA256SUMS` entry, extract `zeroclaw.exe`, and put it on your `PATH`. Both downloads use the same resolved release tag. A missing or mismatched checksum stops installation before extraction.
 
 From a PowerShell prompt:
 
@@ -19,7 +19,9 @@ From a PowerShell prompt:
 # Installation and PATH setup are idempotent. If zeroclaw is already at the
 # latest release and on the user PATH, those steps are skipped; Quickstart
 # still runs at the end.
-$ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
+$ErrorActionPreference = 'Stop'
+$tag = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name
+$ver = $tag.TrimStart('v')
 $dst = "$env:USERPROFILE\.zeroclaw\bin"
 $exe = "$dst\zeroclaw.exe"
 
@@ -28,10 +30,50 @@ $current = if (Test-Path $exe) {
 } else { '' }
 
 if ($current -ne $ver) {
-    $url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
-    New-Item -ItemType Directory -Force -Path $dst | Out-Null
-    Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zeroclaw.zip" -UseBasicParsing
-    Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
+    & {
+        param(
+            [string]$ReleaseTag,
+            [string]$DestinationPath = (Join-Path $env:USERPROFILE '.zeroclaw/bin')
+        )
+
+        $ErrorActionPreference = 'Stop'
+        if (-not $ReleaseTag) {
+            $ReleaseTag = (Invoke-RestMethod -Uri 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name
+        }
+        if ($ReleaseTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw 'The release response did not contain a valid version tag.'
+        }
+
+        $asset = 'zeroclaw-x86_64-pc-windows-msvc.zip'
+        $releaseUrl = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/$ReleaseTag"
+        $workDir = Join-Path ([IO.Path]::GetTempPath()) ('zeroclaw-install-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $workDir | Out-Null
+        try {
+            $archive = Join-Path $workDir $asset
+            $manifest = Join-Path $workDir 'SHA256SUMS'
+            Invoke-WebRequest -Uri "$releaseUrl/SHA256SUMS" -OutFile $manifest -UseBasicParsing
+            Invoke-WebRequest -Uri "$releaseUrl/$asset" -OutFile $archive -UseBasicParsing
+
+            $entrySuffix = '[ *]' + [regex]::Escape($asset) + '$'
+            $entries = @(Get-Content -LiteralPath $manifest | Where-Object { $_ -cmatch $entrySuffix })
+            if ($entries.Count -ne 1) {
+                throw "SHA256SUMS must contain exactly one checksum for $asset."
+            }
+            if ($entries[0] -cnotmatch ('^[0-9a-fA-F]{64} ' + $entrySuffix)) {
+                throw "Invalid SHA256SUMS entry for $asset."
+            }
+            $expected = $entries[0].Substring(0, 64)
+            $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+            if ($actual -ne $expected) {
+                throw "SHA256 mismatch for $asset. The archive was not extracted."
+            }
+
+            Write-Host "SHA256 verified: $asset ($ReleaseTag)"
+            Expand-Archive -LiteralPath $archive -DestinationPath $DestinationPath -Force
+        } finally {
+            Remove-Item -LiteralPath $workDir -Recurse -Force
+        }
+    } -ReleaseTag $tag -DestinationPath $dst
 }
 
 $environment = [Environment]
@@ -58,6 +100,8 @@ zeroclaw --version    # matches the latest release
 ```
 
 ### Option 2: `setup.bat` (from a release)
+
+Run from a repository checkout or unpacked source archive, which includes `scripts/install_windows_prebuilt.ps1`. Verification or download failure stops this mode; choose `--dist` explicitly if you want to build from source instead.
 
 ```cmd
 setup.bat --prebuilt

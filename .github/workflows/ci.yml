@@ -612,6 +612,12 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Test Windows prebuilt verification (PowerShell 5.1)
+        shell: powershell
+        run: ./scripts/ci/windows_prebuilt.test.ps1
+      - name: Test Windows prebuilt verification (PowerShell 7)
+        shell: pwsh
+        run: ./scripts/ci/windows_prebuilt.test.ps1
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.98.0

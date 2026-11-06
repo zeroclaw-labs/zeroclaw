@@ -312,11 +312,25 @@ fn render_windows_prebuilt_block(routes: &[InstallRoute]) -> anyhow::Result<Stri
         .filter(|subcommand| !subcommand.is_empty() && !subcommand.contains(char::is_whitespace))
         .ok_or_else(|| anyhow::Error::msg("Windows Quickstart command must be one subcommand"))?;
 
+    let installer = include_str!("../../../scripts/install_windows_prebuilt.ps1")
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("        {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     Ok(r#"```powershell
 # Installation and PATH setup are idempotent. If zeroclaw is already at the
 # latest release and on the user PATH, those steps are skipped; Quickstart
 # still runs at the end.
-$ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
+$ErrorActionPreference = 'Stop'
+$tag = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name
+$ver = $tag.TrimStart('v')
 $dst = "$env:USERPROFILE\.zeroclaw\bin"
 $exe = "$dst\zeroclaw.exe"
 
@@ -325,10 +339,9 @@ $current = if (Test-Path $exe) {
 } else { '' }
 
 if ($current -ne $ver) {
-    $url = "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v$ver/zeroclaw-x86_64-pc-windows-msvc.zip"
-    New-Item -ItemType Directory -Force -Path $dst | Out-Null
-    Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\zeroclaw.zip" -UseBasicParsing
-    Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
+    & {
+__WINDOWS_PREBUILT_INSTALLER__
+    } -ReleaseTag $tag -DestinationPath $dst
 }
 
 $environment = [Environment]
@@ -342,7 +355,8 @@ if (($env:Path -split ';') -notcontains $dst) {
 
 & $exe __QUICKSTART_SUBCOMMAND__
 ```"#
-        .replace("__QUICKSTART_SUBCOMMAND__", quickstart_subcommand))
+        .replace("__QUICKSTART_SUBCOMMAND__", quickstart_subcommand)
+        .replace("__WINDOWS_PREBUILT_INSTALLER__", &installer))
 }
 
 pub fn render_windows_guide(_root: &Path, current: &str) -> anyhow::Result<String> {
@@ -454,7 +468,7 @@ mod tests {
             ("install guard", "if ($current -ne $ver) {", "if ($false) {"),
             (
                 "archive extraction",
-                "    Expand-Archive -Force -Path \"$env:TEMP\\zeroclaw.zip\" -DestinationPath $dst",
+                "            Expand-Archive -LiteralPath $archive -DestinationPath $DestinationPath -Force",
                 "    # archive extraction removed",
             ),
             (
