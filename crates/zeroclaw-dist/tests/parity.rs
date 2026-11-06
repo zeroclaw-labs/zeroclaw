@@ -53,19 +53,10 @@ const KNOWN_UPDATE_EXTRA_TARGETS: &[(&str, &str)] = &[
 
 /// Published targets `src/commands/update.rs target_triple_for` cannot emit.
 ///
-/// The musl entries are more severe than ordinary unsupported targets: the
-/// updater currently maps those hosts to the corresponding glibc triples
-/// because its resolver has no libc input. The follow-up updater PR must make
-/// libc part of resolution before it consumes this canonical registry.
+/// Musl Linux hosts are resolved via `cfg!(target_env = "musl")` and are no
+/// longer listed here. Remaining entries need architecture/OS match arms in a
+/// follow-up updater change.
 const KNOWN_UPDATE_MISSING_TARGETS: &[(&str, &str)] = &[
-    (
-        "x86_64-unknown-linux-musl",
-        "update.rs has no libc input and mis-resolves x86_64 musl hosts to the glibc target; the follow-up updater PR must detect libc",
-    ),
-    (
-        "aarch64-unknown-linux-musl",
-        "update.rs has no libc input and mis-resolves aarch64 musl hosts to the glibc target; the follow-up updater PR must detect libc",
-    ),
     (
         "armv7-unknown-linux-gnueabihf",
         "update.rs receives the generic arm architecture and returns no target; the follow-up updater PR must distinguish supported ARM variants",
