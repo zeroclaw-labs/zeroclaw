@@ -150,12 +150,12 @@ Branch protection on `master`:
 
 ## Definition of Ready (DoR)
 
-Before requesting review, the PR has all of these:
+Before substantive review, the PR has all of these:
 
-- PR template fully completed.
+- A linked issue and a clear account of the agreed problem being addressed.
 - Scope boundary explicit (what changed / what did not).
 - Validation evidence attached, actual command output, not "CI will check."
-- Security & privacy, compatibility, and (for risky paths) rollback fields completed.
+- Security, compatibility, and rollback evidence needed to assess the changed behavior, without requiring template formatting at this stage.
 - Privacy and data-hygiene rules satisfied, neutral, project-scoped test wording. See [Privacy](../contributing/privacy.md).
 - Identity-like wording, where unavoidable, uses ZeroClaw / project-native labels.
 
@@ -168,6 +168,8 @@ Before merge:
 - Risk labels match the actual diff and consequence rather than broad component location. See [Labels](./labels.md).
 - Migration / compatibility impact is documented.
 - Rollback path is concrete and fast.
+- [Final administrative review](#final-administrative-review) is complete.
+- New integrations have the explicit maintainer decisions required by the [review protocol](../contributing/pr-review-protocol.md#integration-decisions), and posted integration holds have verified maintainer dismissals.
 
 ## Maintainer merge checklist
 
@@ -181,8 +183,21 @@ Every merge:
 - Agent-workflow notes are sufficient for reproducibility (if AI-assisted).
 - Rollback plan is explicit.
 - Commit title follows Conventional Commits.
+- Final administrative review and integration decisions are verified on the current head; a positive substantive review is not sufficient by itself.
 
 Squash-merge with full commit history preserved in the body. The `squash-merge` skill produces both the purple **Merged** badge and the conventional-commits formatted body, see [Skills](./skills.md) for invocation.
+
+## Final administrative review
+
+This is the merge-side owner for labels, milestones, PR-template compliance, and queue bookkeeping, separated from substantive review by [RFC #11876](https://github.com/zeroclaw-labs/zeroclaw/issues/11876). The planned merge workflow will invoke `pr-template-review`; until that skill exists, the current merge skill and human merge checklist perform these checks directly. Do not call an unavailable skill or treat its absence as completion.
+
+- Compare the live body with `.github/pull_request_template.md` and run the [template and public-artifact checks](../contributing/pr-review-protocol.md#template-and-public-artifact-checks). Required substance must be supported; harmless formatting cleanup can be handled by an authorized maintainer.
+- Apply [label policy](./labels.md) to the real diff and live review state. Labels are maintainer metadata, not author work when the author lacks permission. Use `needs-author-action` only for an actual author-owned next step, not a maintainer integration decision.
+- Check milestone placement against [named milestone policy](#named-milestone-policy) and the current release-line evidence used by `squash-merge`. Preserve approved cohort placement and explicit release holds; do not restore the old review skill's semver-only fallback or hardcoded owner mentions.
+- When a tracker exists, update only the relevant entry using its current public format and preserve other content. Fetch the latest body before an authorized edit; if no tracker applies, record that disposition without creating one by default.
+- Derive queue status from live GitHub review, issue, check, and merge state using [review queue discipline](#review-sla-and-queue-discipline). Do not create a second per-session handoff ledger as authority for the queue.
+
+Metadata edits and public comments remain separate authorized actions. Show concrete proposed edits and honor existing authorization within its scope. Re-read the current head and changed decision evidence before the merge packet; a pending maintainer integration decision must not be silently reconciled as an ordinary resolved code finding.
 
 ## AI / Agent contribution policy
 
