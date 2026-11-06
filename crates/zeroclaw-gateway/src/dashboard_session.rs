@@ -788,6 +788,36 @@ impl DashboardAuth {
             .map_err(|StoreFull| SignInRefusal::Full)
     }
 
+    /// Check a cookie at an operator mutation under the config writer. A stale
+    /// binding needs asynchronous verification outside that lock (None).
+    pub(crate) fn operator_at_write(
+        &self,
+        state: &AppState,
+        session: &SessionAuth,
+        _commit: &crate::ConfigWriteGuard,
+    ) -> Option<Result<(), (StatusCode, Json<serde_json::Value>)>> {
+        if let Some(rejection) = session.ended_now() {
+            return Some(Err(rejection.body()));
+        }
+        let offered = provider_for(&offered_providers(state), &session.alias);
+        if !self
+            .sessions
+            .sessions
+            .lock()
+            .get(&session.key)
+            .is_some_and(|stored| offered.as_ref() == Some(&stored.provider))
+        {
+            self.sessions.remove_key(&session.key);
+            return Some(Err(SessionRejection::Invalid.body()));
+        }
+        let grants = self.inbound.current_grants(&session.connection).ok()?;
+        Some(if grants.admin {
+            Ok(())
+        } else {
+            Err(operator_required())
+        })
+    }
+
     /// Check again, from a long-lived socket, the session a request admitted
     /// earlier: the same checks as for a request.
     pub(crate) async fn recheck(&self, state: &AppState, session: &SessionAuth) -> DashboardCaller {
@@ -4110,6 +4140,125 @@ mod tests {
         let response = answer.await.unwrap();
         let status = response.status();
         (status, json(response).await)
+    }
+
+    async fn check_cookie_device_write_after_publication(rotate: bool) {
+        enum Change {
+            Demote,
+            Unoffer,
+            Unrelated,
+        }
+        for change in [Change::Demote, Change::Unoffer, Change::Unrelated] {
+            let server = idp(&["admins", "ops"], "gw").await;
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = sign_in_config(&server.uri());
+            config.config_path = tmp.path().join("config.toml");
+            config.data_dir = tmp.path().join("data");
+            let pairing = Arc::new(PairingGuard::new(
+                true,
+                &config.gateway.paired_tokens,
+                PairingCodePolicy::default(),
+            ));
+            let rpc = Arc::new(RpcInboundAuth::from_config(&config, Arc::clone(&pairing)).unwrap());
+            let fixture = fixture_with(
+                config.clone(),
+                Arc::clone(&pairing),
+                Arc::new(GatewayInboundAuth::from_shared(Arc::clone(&rpc))),
+                Arc::new(DashboardSessions::default()),
+            );
+            let signed = sign_in(&fixture, &server).await;
+            let registry = Arc::new(crate::api_pairing::DeviceRegistry::new(tmp.path()));
+            registry
+                .reconcile_from_token_hashes(&pairing.tokens())
+                .unwrap();
+            let device = registry.list().unwrap().pop().unwrap();
+            let state = AppState {
+                device_registry: Some(Arc::clone(&registry)),
+                ..fixture.state.clone()
+            };
+            let router = Router::new()
+                .route(
+                    "/api/devices/{id}",
+                    axum::routing::delete(crate::api_pairing::revoke_device),
+                )
+                .route(
+                    "/api/devices/{id}/token/rotate",
+                    axum::routing::post(crate::api_pairing::rotate_token),
+                )
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    DashboardLayer {
+                        state: state.clone(),
+                        auth: Arc::clone(&fixture.auth),
+                    },
+                    layer,
+                ));
+            let (method, path) = if rotate {
+                ("POST", format!("/api/devices/{}/token/rotate", device.id))
+            } else {
+                ("DELETE", format!("/api/devices/{}", device.id))
+            };
+            let req = request(
+                method,
+                &path,
+                loopback(),
+                &[
+                    ("origin", OWN_ORIGIN),
+                    ("cookie", &signed.cookie_header()),
+                    ("x-zeroclaw-csrf", &signed.csrf),
+                ],
+            );
+            // Admission uses the just-verified admin session. Its first wait is the
+            // commit we hold. Publish a new policy before letting the route write.
+            let commit = state.begin_config_commit().await.unwrap();
+            let mut response = Box::pin(send(&router, req));
+            assert!(futures_util::poll!(&mut response).is_pending());
+            let mut next = config.clone();
+            match change {
+                Change::Demote => next = test_support::without_admin_mapping(&next),
+                Change::Unoffer => next.gateway.dashboard_sign_in.oidc.clear(),
+                Change::Unrelated => {
+                    next.permission_profiles
+                        .insert("unrelated".into(), Default::default());
+                }
+            }
+            commit
+                .publish(commit.next_revision().unwrap(), next.clone())
+                .unwrap();
+            rpc.publish_accepted(&next, rpc.accepted_revision() + 1)
+                .unwrap();
+            drop(commit);
+            let response = response.await;
+            let status = response.status();
+            let body = json(response).await;
+            if !matches!(change, Change::Unrelated) {
+                let (expected, reason) = match change {
+                    Change::Demote => (StatusCode::FORBIDDEN, "operator_required"),
+                    Change::Unoffer => (StatusCode::UNAUTHORIZED, "session_invalid"),
+                    Change::Unrelated => unreachable!(),
+                };
+                assert_eq!(status, expected, "{body}");
+                assert_eq!(body["reason"], reason);
+                assert_eq!(registry.list().unwrap()[0].id, device.id);
+                assert!(pairing.is_authenticated("zc_paired"));
+                assert!(pairing.pairing_code().is_none());
+            } else {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert!(registry.list().unwrap().is_empty());
+                assert!(!pairing.is_authenticated("zc_paired"));
+                assert_eq!(body["pairing_code"].is_string(), rotate);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn device_delete_rechecks_cookie_operator_after_the_writer_wait() {
+        check_cookie_device_write_after_publication(false).await;
+    }
+
+    #[tokio::test]
+    async fn device_rotate_rechecks_cookie_operator_after_the_writer_wait() {
+        check_cookie_device_write_after_publication(true).await;
     }
 
     /// A config write admitted while its session was live, whose body was

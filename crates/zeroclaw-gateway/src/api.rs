@@ -5898,6 +5898,7 @@ pub(crate) mod tests {
 
         let response = rotate_device_token(
             State(state.clone()),
+            None,
             bearer_headers(&old_token),
             Path(device_id.clone()),
         )
@@ -5923,6 +5924,7 @@ pub(crate) mod tests {
 
         let response = rotate_device_token(
             State(state.clone()),
+            None,
             bearer_headers(&old_token),
             Path(device_id),
         )
@@ -5979,6 +5981,7 @@ pub(crate) mod tests {
 
         let response = revoke_device(
             State(state.clone()),
+            None,
             bearer_headers(&old_token),
             Path(device_id),
         )
@@ -6018,6 +6021,7 @@ pub(crate) mod tests {
                 Box::pin(async {
                     rotate_device_token(
                         State(state.clone()),
+                        None,
                         bearer_headers(&old_token),
                         Path(device_id.clone()),
                     )
@@ -6028,6 +6032,7 @@ pub(crate) mod tests {
                 Box::pin(async {
                     revoke_device(
                         State(state.clone()),
+                        None,
                         bearer_headers(&old_token),
                         Path(device_id.clone()),
                     )
@@ -6127,7 +6132,7 @@ pub(crate) mod tests {
                 let token_b = token_b.clone();
                 let device_a = device_a.clone();
                 async move {
-                    revoke_device(State(state), bearer_headers(&token_b), Path(device_a))
+                    revoke_device(State(state), None, bearer_headers(&token_b), Path(device_a))
                         .await
                         .into_response()
                 }
@@ -6139,11 +6144,11 @@ pub(crate) mod tests {
                 async move {
                     let path = Path("dev-b".to_string());
                     if rotate {
-                        rotate_device_token(State(state), bearer_headers(&token_a), path)
+                        rotate_device_token(State(state), None, bearer_headers(&token_a), path)
                             .await
                             .into_response()
                     } else {
-                        revoke_device(State(state), bearer_headers(&token_a), path)
+                        revoke_device(State(state), None, bearer_headers(&token_a), path)
                             .await
                             .into_response()
                     }
@@ -6185,11 +6190,11 @@ pub(crate) mod tests {
             let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
             let call = |state: AppState, token: String, device_id: String| async move {
                 if rotate {
-                    rotate_device_token(State(state), bearer_headers(&token), Path(device_id))
+                    rotate_device_token(State(state), None, bearer_headers(&token), Path(device_id))
                         .await
                         .into_response()
                 } else {
-                    revoke_device(State(state), bearer_headers(&token), Path(device_id))
+                    revoke_device(State(state), None, bearer_headers(&token), Path(device_id))
                         .await
                         .into_response()
                 }
@@ -6244,6 +6249,7 @@ pub(crate) mod tests {
 
         let response = rotate_device_token(
             State(state.clone()),
+            None,
             bearer_headers(&token),
             Path("does-not-exist".into()),
         )
@@ -6268,6 +6274,7 @@ pub(crate) mod tests {
 
         let response = rotate_device_token(
             State(state.clone()),
+            None,
             bearer_headers(&token),
             Path(device_id.clone()),
         )
@@ -6342,12 +6349,12 @@ pub(crate) mod tests {
         let h2 = bearer_headers(&admin_token);
         let (r1, r2) = tokio::join!(
             async move {
-                rotate_device_token(State(s1), h1, Path("dev-a".into()))
+                rotate_device_token(State(s1), None, h1, Path("dev-a".into()))
                     .await
                     .into_response()
             },
             async move {
-                rotate_device_token(State(s2), h2, Path("dev-b".into()))
+                rotate_device_token(State(s2), None, h2, Path("dev-b".into()))
                     .await
                     .into_response()
             },

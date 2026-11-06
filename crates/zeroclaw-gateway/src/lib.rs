@@ -5526,16 +5526,17 @@ async fn handle_admin_paircode_new(
                 });
                 return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
             };
-            let (reauthorized, config_write_guard) =
-                match api_pairing::revoke_device_credential(&state, registry, device_id, || {
-                    require_gateway_admin_token(&state, &headers)
-                })
-                .await
-                {
-                    Ok(revoked) => revoked,
-                    Err(e) => return Ok(admin_revocation_not_admitted(e)),
-                };
-            let revoked = reauthorized?;
+            let config_write_guard = match state.begin_config_commit().await {
+                Ok(commit) => commit,
+                Err(e) => return Ok(admin_revocation_not_admitted(e)),
+            };
+            let revoked = api_pairing::revoke_device_credential(
+                &state,
+                registry,
+                device_id,
+                &config_write_guard,
+                || require_gateway_admin_token(&state, &headers),
+            )?;
             match revoked {
                 Ok(true) => {}
                 Ok(false) => {
