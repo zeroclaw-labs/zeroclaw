@@ -1276,17 +1276,6 @@ impl AgentLifecycleCoordinator {
             .map_or(0, |state| state.active_turns)
     }
 
-    /// Read the admitted work owned by this generation across all aliases and
-    /// transports. Admission reservations count as busy while construction runs.
-    pub fn has_active_work(&self) -> bool {
-        let state = self.state.lock();
-        state.closing
-            || state
-                .aliases
-                .values()
-                .any(|alias| alias.active_turns > 0 || alias.reservations > 0)
-    }
-
     /// Prevent this generation from admitting new sessions, turns, or
     /// destructive work before ingress shutdown begins.
     pub fn close_generation(&self) {

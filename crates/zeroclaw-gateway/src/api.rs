@@ -2144,6 +2144,23 @@ pub async fn handle_api_session_rename(
     }
 }
 
+// Config owns the current aliases; deletion cannot retire an alias with active
+// work. Lifecycle leases own activity, independent of transport or persistence.
+fn runtime_work_is_busy(state: &AppState) -> bool {
+    use zeroclaw_runtime::live_config_authority::AgentDeleteBlocker;
+    state.config.read().agents.keys().any(|alias| {
+        state.agent_lifecycle.active_turn_count(alias) > 0
+            || matches!(
+                state.agent_lifecycle.delete_blocker(alias),
+                Some(
+                    AgentDeleteBlocker::Reservations { .. }
+                        | AgentDeleteBlocker::Deleting { .. }
+                        | AgentDeleteBlocker::GenerationClosing
+                )
+            )
+    })
+}
+
 /// GET /api/sessions/running — list sessions currently in "running" state
 pub async fn handle_api_sessions_running(
     State(state): State<AppState>,
@@ -2155,7 +2172,7 @@ pub async fn handle_api_sessions_running(
 
     // Runtime admission owns activity for every transport; persisted session
     // metadata alone only covers a subset of active callers.
-    let busy = state.agent_lifecycle.has_active_work();
+    let busy = runtime_work_is_busy(&state);
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
             "busy": busy,
@@ -3266,10 +3283,15 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn api_sessions_running_reports_runtime_work_without_persisted_sessions() {
-        let state = test_state(config_with_telegram("default"));
+        let mut config = config_with_telegram("default");
+        config.agents.insert(
+            "test-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let state = test_state(config);
         assert!(state.session_backend.is_none());
         // These leases are the same source used by web, RPC and channel turns.
-        let lease = state.agent_lifecycle.reserve_turn("channel-agent").unwrap();
+        let lease = state.agent_lifecycle.reserve_turn("test-agent").unwrap();
         let response = handle_api_sessions_running(State(state.clone()), HeaderMap::new())
             .await
             .into_response();
@@ -3290,12 +3312,12 @@ pub(crate) mod tests {
         assert_eq!(body["busy"], false);
         let reservation = state
             .agent_lifecycle
-            .reserve_admission("rpc-agent")
+            .reserve_admission("test-agent")
             .unwrap();
-        assert!(state.agent_lifecycle.has_active_work());
+        assert!(runtime_work_is_busy(&state));
         drop(reservation);
         state.agent_lifecycle.close_generation();
-        assert!(state.agent_lifecycle.has_active_work());
+        assert!(runtime_work_is_busy(&state));
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
