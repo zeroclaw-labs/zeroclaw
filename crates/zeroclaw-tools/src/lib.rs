@@ -233,7 +233,10 @@ mod session_tool_marker_guard {
         let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
         let cross_session: Vec<Box<dyn Tool>> = vec![
-            Box::new(crate::sessions::SessionsListTool::new(backend.clone())),
+            Box::new(crate::sessions::SessionsListTool::new(
+                backend.clone(),
+                security.clone(),
+            )),
             Box::new(crate::sessions::SessionsHistoryTool::new(
                 backend.clone(),
                 security.clone(),

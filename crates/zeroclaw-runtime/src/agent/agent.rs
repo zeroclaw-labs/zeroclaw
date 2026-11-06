@@ -11717,9 +11717,10 @@ mod tests {
             );
             let tools: Vec<Box<dyn Tool>> = vec![
                 Box::new(crate::tools::ArcToolRef(Arc::clone(&history))),
-                Box::new(zeroclaw_tools::sessions::SessionsListTool::new(Arc::clone(
-                    &sessions,
-                ))),
+                Box::new(zeroclaw_tools::sessions::SessionsListTool::new(
+                    Arc::clone(&sessions),
+                    Arc::clone(&send_security),
+                )),
                 Box::new(zeroclaw_tools::sessions::SessionsSendTool::new(
                     Arc::clone(&sessions),
                     Arc::clone(&send_security),
