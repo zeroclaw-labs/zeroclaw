@@ -3925,6 +3925,12 @@ impl Chat {
             // so a selection, open menu or half-finished click survives.
             state.mark_path_links_restyle();
         }
+        // Mark parked sessions too: a path check finishing while another
+        // session is active leaves them with stale cached lines, and
+        // switching back restores that cache without marking dirty.
+        for state in &mut self.background {
+            state.mark_path_links_restyle();
+        }
     }
 
     fn drain_path_open_notices(&mut self) {
@@ -34717,6 +34723,55 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "the pane must not answer requests behind the app router"
+        );
+    }
+
+    #[test]
+    fn refresh_resolved_path_links_marks_parked_sessions_for_restyle() {
+        use crate::chat::transcript_layout::LinesDirty;
+
+        let (mut chat, _rx) = test_chat();
+
+        // Set up active session
+        let mut active_state = state();
+        active_state.session_id = "active-session".to_string();
+        active_state.transcript_layout.fixture_mut().dirty = LinesDirty::Clean;
+
+        // Set up parked session in background
+        let mut parked_state = state();
+        parked_state.session_id = "parked-session".to_string();
+        parked_state.transcript_layout.fixture_mut().dirty = LinesDirty::Clean;
+
+        chat.phase = ChatPhase::Active(Box::new(active_state));
+        chat.background.push(parked_state);
+
+        // Record initial generation
+        let initial_gen = crate::path_open::path_links_generation();
+        chat.path_links_generation = initial_gen;
+
+        // Simulate a path check completing (increments generation)
+        crate::path_open::increment_path_links_generation();
+
+        // Refresh should mark both active and parked sessions
+        chat.refresh_resolved_path_links();
+
+        // Verify active session was marked
+        if let ChatPhase::Active(state) = &chat.phase {
+            assert_ne!(
+                state.transcript_layout.view().dirty,
+                LinesDirty::Clean,
+                "active session must be marked for restyle after path check"
+            );
+        } else {
+            panic!("expected Active phase");
+        }
+
+        // Verify parked session was also marked
+        assert_eq!(chat.background.len(), 1, "parked session must still exist");
+        assert_ne!(
+            chat.background[0].transcript_layout.view().dirty,
+            LinesDirty::Clean,
+            "parked session must be marked for restyle so switching back shows clickable paths"
         );
     }
 }

@@ -424,6 +424,12 @@ pub(crate) fn wait_for_path_checks() {
     EXISTS_PROBE.wait_idle();
 }
 
+/// Increment the generation counter to simulate a path check completing.
+#[cfg(test)]
+pub(crate) fn increment_path_links_generation() {
+    EXISTS_PROBE.generation.fetch_add(1, Ordering::AcqRel);
+}
+
 /// True when handing `path` to the platform launcher could execute code:
 /// app bundles, executable files, and script/installer extensions.
 pub(crate) fn may_launch(path: &Path) -> bool {
