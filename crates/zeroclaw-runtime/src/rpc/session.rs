@@ -293,10 +293,33 @@ type GatedOpPause = (
 #[cfg(test)]
 type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
+#[cfg(test)]
+type RetirementCommitHook = Box<dyn FnMut(bool) + Send>;
+
+#[cfg(test)]
+type PromptRehydrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
+#[cfg(test)]
+type RemovalSignalPause = (
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+);
+
 type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 
 #[cfg(test)]
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
+/// A live session owned by a TUI identity: what deciding whether to retire it
+/// as orphaned needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedSession {
+    pub id: String,
+    pub generation: u64,
+    pub owner_tui_id: String,
+    pub last_active: Instant,
+}
 
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
@@ -353,6 +376,18 @@ pub struct SessionStore {
     /// commit that reaches it.
     #[cfg(test)]
     test_upload_written_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only pause in orphan retirement, after a session is judged due
+    /// and before it is removed. Taken by the first retirement that reaches it.
+    #[cfg(test)]
+    test_retirement_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause inside the removal step of orphan retirement, while it
+    /// holds the session map. Taken by the first removal that reaches it.
+    #[cfg(test)]
+    test_retirement_removal_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only observer immediately before and after the synchronous
+    /// retirement removal, after its final eligibility check.
+    #[cfg(test)]
+    test_retirement_commit_hook: std::sync::Mutex<Option<RetirementCommitHook>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -426,6 +461,12 @@ impl SessionStore {
             test_upload_effect_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_upload_written_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_retirement_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_retirement_removal_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_retirement_commit_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -1799,6 +1840,80 @@ impl SessionStore {
         read(&sessions)
     }
 
+    /// Every live session that has an owning TUI identity.
+    pub async fn owned_sessions(&self) -> Vec<OwnedSession> {
+        self.sessions
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(id, session)| Self::owned(id, session))
+            .collect()
+    }
+
+    /// Remove the live session `expected.id` for orphan retirement, only if it
+    /// is still exactly the session that was judged: the same incarnation,
+    /// owner and last activity, with no turn in flight, and `still_eligible`
+    /// still holds. Lock order is session map, then TUI presence: rebinding,
+    /// activity and registration cannot land between the final decision and
+    /// removal. No await occurs while presence is held. Returns the detached
+    /// agent after both guards are released.
+    pub(crate) async fn remove_if_unchanged(
+        &self,
+        expected: &OwnedSession,
+        registry: &super::tui_identity::TuiRegistry,
+        still_eligible: impl FnOnce(Option<super::tui_identity::TuiDeparture>) -> bool,
+    ) -> Option<Arc<Mutex<Agent>>> {
+        let mut sessions = self.sessions.lock().await;
+        self.wait_test_retirement_removal_pause().await;
+        let unchanged = sessions
+            .get(&expected.id)
+            .and_then(|current| Self::owned(&expected.id, current))
+            .is_some_and(|current| current == *expected);
+        if !unchanged || self.has_inflight_turn(&expected.id) {
+            return None;
+        }
+        let removed = registry.with_departure(&expected.owner_tui_id, |departure| {
+            if !still_eligible(departure) {
+                return None;
+            }
+            #[cfg(test)]
+            let mut commit_hook = self.test_retirement_commit_hook.lock().unwrap().take();
+            #[cfg(test)]
+            if let Some(hook) = commit_hook.as_mut() {
+                hook(false);
+            }
+            let removed = sessions.remove(&expected.id)?;
+            #[cfg(test)]
+            if let Some(hook) = commit_hook.as_mut() {
+                hook(true);
+            }
+            Some(removed)
+        })?;
+        drop(sessions);
+        if let Some(notify) = removed.pending_generation.as_ref() {
+            notify.notify_waiters();
+        }
+        Some(Arc::clone(&removed.agent))
+    }
+
+    /// The live session `id`, if it has an owning TUI identity.
+    pub async fn owned_session(&self, id: &str) -> Option<OwnedSession> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|session| Self::owned(id, session))
+    }
+
+    fn owned(id: &str, session: &RpcSession) -> Option<OwnedSession> {
+        session.owner_tui_id.as_ref().map(|owner| OwnedSession {
+            id: id.to_string(),
+            generation: session.generation,
+            owner_tui_id: owner.clone(),
+            last_active: session.last_active,
+        })
+    }
+
     pub async fn list_ids_for_owner(&self, owner_tui_id: &str) -> Vec<String> {
         self.sessions
             .lock()
@@ -1896,6 +2011,172 @@ impl SessionStore {
             )))
         })
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_prompt_registration_pause(&self) {
+        let (entered, release) = {
+            let guard = self.test_prompt_registration_pause.lock().unwrap();
+            match &*guard {
+                Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
+                None => return,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    /// Park a prompt once, right after its final authorization under the
+    /// Agent lock and before any effect it gates: the running state, an ACP
+    /// turn checkpoint, and the hand-off to the execution task.
+    #[cfg(test)]
+    pub(crate) async fn wait_test_prompt_execution_pause(&self) {
+        let pause = self.test_prompt_execution_pause.lock().unwrap().take();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_prompt_execution_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_prompt_execution_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_prompt_registration_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_prompt_registration_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_prompt_rehydration_pause(&self) {
+        let (entered, release) = {
+            let guard = self.test_prompt_rehydration_pause.lock().unwrap();
+            match &*guard {
+                Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
+                None => return,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_prompt_rehydration_pause(&self) -> PromptRehydrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_prompt_rehydration_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_removal_signal_pause(&self) {
+        let (entered, release) = {
+            let guard = self.test_removal_signal_pause.lock().unwrap();
+            match &*guard {
+                Some((entered, release, _)) => (Arc::clone(entered), Arc::clone(release)),
+                None => return,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_removal_signal_pause(&self) -> RemovalSignalPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let attempted = Arc::new(tokio::sync::Notify::new());
+        *self.test_removal_signal_pause.lock().unwrap() = Some((
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&attempted),
+        ));
+        (entered, release, attempted)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_test_removal_signal_attempted(&self) {
+        if let Some((_, _, attempted)) = self.test_removal_signal_pause.lock().unwrap().as_ref() {
+            attempted.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_retirement_pause(&self) {
+        let Some((entered, release)) = self.test_retirement_pause.lock().unwrap().take() else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_retirement_pause(&self) {}
+
+    #[cfg(test)]
+    async fn wait_test_retirement_removal_pause(&self) {
+        let Some((entered, release)) = self.test_retirement_removal_pause.lock().unwrap().take()
+        else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    async fn wait_test_retirement_removal_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_retirement_removal_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_retirement_removal_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_retirement_commit_hook(&self, hook: impl FnMut(bool) + Send + 'static) {
+        *self.test_retirement_commit_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_retirement_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_retirement_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_control_pause(&self) {
+        let Some((entered, release)) = self.test_control_pause.lock().unwrap().take() else {
+            return;
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_control_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_control_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
     }
 
     pub fn remove_cancel_token(&self, id: &str, generation: u64) {

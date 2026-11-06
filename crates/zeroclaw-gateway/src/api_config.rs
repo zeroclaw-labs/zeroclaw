@@ -3503,7 +3503,6 @@ mod tests {
             native_sessions: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,

@@ -442,6 +442,7 @@ async fn exercise(entry: &str, native: bool) -> (Evidence, NativeTraps, tempfile
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("the owned SOP step assembles");
