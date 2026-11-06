@@ -1,7 +1,8 @@
 //! JSONL-based session persistence for channel conversations.
 
 use crate::session_backend::{
-    ScopedSessionAccess, SessionBackend, SessionContext, SessionMetadata, check_session_ownership,
+    OwnedSessionWrite, ScopedSessionAccess, SessionBackend, SessionContext, SessionMetadata,
+    check_claimed_owner, check_session_ownership,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -195,6 +196,67 @@ impl SessionStore {
         self.write_metadata_unlocked(session_key, &metadata)
     }
 
+    /// Admit a claimed turn's later write or read (see
+    /// [`check_claimed_owner`]). With `reestablish`, an absent session is
+    /// first recorded as `agent_alias`'s, with its empty transcript. The
+    /// caller holds the mutation guard.
+    fn admit_claimed_owner_unlocked(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        reestablish: bool,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        let metadata = self.read_metadata(session_key)?;
+        // A transcript without a sidecar is an unattributed session, not an
+        // absent one.
+        let ownership =
+            (metadata.is_some() || self.session_path(session_key).exists()).then(|| {
+                let metadata = metadata.unwrap_or_default();
+                (metadata.agent_alias, metadata.channel_id)
+            });
+        let admission = check_claimed_owner(
+            ownership
+                .as_ref()
+                .map(|(agent, channel)| (agent.as_deref(), channel.as_deref())),
+            agent_alias,
+        )?;
+        if reestablish && admission == ScopedSessionAccess::Missing {
+            self.update_metadata_unlocked(session_key, |metadata| {
+                metadata.agent_alias = Some(agent_alias.to_string());
+            })?;
+            return Ok(ScopedSessionAccess::Granted(()));
+        }
+        Ok(admission)
+    }
+
+    fn set_session_context_unlocked(
+        &self,
+        session_key: &str,
+        context: &SessionContext<'_>,
+    ) -> std::io::Result<()> {
+        fn normalize(value: Option<&str>) -> Option<String> {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        }
+
+        let channel_id = normalize(context.channel_id);
+        let room_id = normalize(context.room_id);
+        let sender_id = normalize(context.sender_id);
+        self.update_metadata_unlocked(session_key, |metadata| {
+            if channel_id.is_some() {
+                metadata.channel_id = channel_id;
+            }
+            if room_id.is_some() {
+                metadata.room_id = room_id;
+            }
+            if sender_id.is_some() {
+                metadata.sender_id = sender_id;
+            }
+        })
+    }
+
     fn metadata_for_session(&self, session_key: &str) -> Option<SessionMetadata> {
         let session_path = self.session_path(session_key);
         let metadata_path = self.metadata_path(session_key);
@@ -255,6 +317,14 @@ impl SessionStore {
     /// store has been migrated to SQLite.
     pub fn set_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
         let _guard = self.mutation_guard()?;
+        self.set_trim_breadcrumb_unlocked(session_key, present)
+    }
+
+    fn set_trim_breadcrumb_unlocked(
+        &self,
+        session_key: &str,
+        present: bool,
+    ) -> std::io::Result<()> {
         std::fs::write(
             self.trim_breadcrumb_path(session_key),
             if present { b"1" as &[u8] } else { b"0" },
@@ -386,6 +456,10 @@ impl SessionStore {
     /// O(n) but rollbacks are rare.
     pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
+        self.remove_last_unlocked(session_key)
+    }
+
+    fn remove_last_unlocked(&self, session_key: &str) -> std::io::Result<bool> {
         let mut messages = self.load(session_key);
         if messages.is_empty() {
             return Ok(false);
@@ -846,6 +920,61 @@ impl SessionBackend for SessionStore {
         result
     }
 
+    fn write_as_owner(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        write: OwnedSessionWrite<'_>,
+    ) -> std::io::Result<ScopedSessionAccess<bool>> {
+        let guard = self.mutation_guard()?;
+        let reestablish = !matches!(write, OwnedSessionWrite::RemoveLast);
+        match self.admit_claimed_owner_unlocked(session_key, agent_alias, reestablish)? {
+            ScopedSessionAccess::Granted(()) => {}
+            ScopedSessionAccess::Missing => return Ok(ScopedSessionAccess::Missing),
+            ScopedSessionAccess::Denied(denial) => return Ok(ScopedSessionAccess::Denied(denial)),
+        }
+        let changed = match write {
+            OwnedSessionWrite::Append(message) => {
+                self.append_unlocked(session_key, message)?;
+                true
+            }
+            OwnedSessionWrite::RemoveLast => self.remove_last_unlocked(session_key)?,
+            OwnedSessionWrite::ReplaceConversationState {
+                messages,
+                breadcrumb_present,
+            } => {
+                self.replace_locked(&guard, session_key, messages, breadcrumb_present)?;
+                true
+            }
+            OwnedSessionWrite::SetTrimBreadcrumb(present) => {
+                self.set_trim_breadcrumb_unlocked(session_key, present)?;
+                true
+            }
+            OwnedSessionWrite::SetContext(context) => {
+                self.set_session_context_unlocked(session_key, &context)?;
+                true
+            }
+        };
+        Ok(ScopedSessionAccess::Granted(changed))
+    }
+
+    fn try_load_as_owner(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        let _guard = self.mutation_lock.lock();
+        Ok(
+            match self.admit_claimed_owner_unlocked(session_key, agent_alias, false)? {
+                ScopedSessionAccess::Granted(()) => {
+                    ScopedSessionAccess::Granted(self.try_load(session_key)?)
+                }
+                ScopedSessionAccess::Missing => ScopedSessionAccess::Missing,
+                ScopedSessionAccess::Denied(denial) => ScopedSessionAccess::Denied(denial),
+            },
+        )
+    }
+
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         self.remove_last(session_key)
     }
@@ -1111,27 +1240,8 @@ impl SessionBackend for SessionStore {
         session_key: &str,
         context: SessionContext<'_>,
     ) -> std::io::Result<()> {
-        fn normalize(value: Option<&str>) -> Option<String> {
-            value
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        }
-
-        let channel_id = normalize(context.channel_id);
-        let room_id = normalize(context.room_id);
-        let sender_id = normalize(context.sender_id);
-        self.update_metadata(session_key, |metadata| {
-            if channel_id.is_some() {
-                metadata.channel_id = channel_id;
-            }
-            if room_id.is_some() {
-                metadata.room_id = room_id;
-            }
-            if sender_id.is_some() {
-                metadata.sender_id = sender_id;
-            }
-        })
+        let _guard = self.mutation_guard()?;
+        self.set_session_context_unlocked(session_key, &context)
     }
 
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {

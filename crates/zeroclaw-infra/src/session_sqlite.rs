@@ -1,8 +1,9 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    ScopedSessionAccess, SessionBackend, SessionContext, SessionMetadata, SessionQuery,
-    SessionState, check_session_ownership,
+    OwnedSessionWrite, ScopedSessionAccess, SessionBackend, SessionContext, SessionMetadata,
+    SessionOwnershipDenial, SessionQuery, SessionState, check_claimed_owner,
+    check_session_ownership,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -1040,6 +1041,68 @@ impl SqliteSessionBackend {
         .map_err(std::io::Error::other)
     }
 
+    fn remove_last_on(conn: &Connection, session_key: &str) -> std::io::Result<bool> {
+        let last_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let Some(id) = last_id else {
+            return Ok(false);
+        };
+
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
+            .map_err(std::io::Error::other)?;
+
+        // Update metadata count
+        conn.execute(
+            "UPDATE session_metadata SET message_count = MAX(0, message_count - 1)
+             WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        Ok(true)
+    }
+
+    /// Admit a claimed turn's later write or read (see
+    /// [`check_claimed_owner`]). With `reestablish`, an absent session is
+    /// first recorded as `agent_alias`'s. Message rows without a metadata row
+    /// are not an absent session.
+    fn admit_claimed_owner(
+        conn: &Connection,
+        session_key: &str,
+        agent_alias: &str,
+        reestablish: bool,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        let ownership = Self::session_ownership(conn, session_key)?;
+        if ownership.is_none() && Self::has_messages(conn, session_key)? {
+            return Ok(ScopedSessionAccess::Denied(
+                SessionOwnershipDenial::Unattributed,
+            ));
+        }
+        let admission = check_claimed_owner(
+            ownership
+                .as_ref()
+                .map(|(agent, channel)| (agent.as_deref(), channel.as_deref())),
+            agent_alias,
+        )?;
+        if reestablish && admission == ScopedSessionAccess::Missing {
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
+                 VALUES (?1, ?2, ?2, 0, ?3)",
+                params![session_key, now, agent_alias],
+            )
+            .map_err(std::io::Error::other)?;
+            return Ok(ScopedSessionAccess::Granted(()));
+        }
+        Ok(admission)
+    }
+
     /// Whether any message row exists for `session_key`, with or without its
     /// metadata row.
     fn has_messages(conn: &Connection, session_key: &str) -> std::io::Result<bool> {
@@ -1310,33 +1373,75 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
-    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let conn = self.conn.lock();
-
-        let last_id: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
-                params![session_key],
-                |row| row.get(0),
-            )
-            .ok();
-
-        let Some(id) = last_id else {
-            return Ok(false);
-        };
-
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
+    fn write_as_owner(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        write: OwnedSessionWrite<'_>,
+    ) -> std::io::Result<ScopedSessionAccess<bool>> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(std::io::Error::other)?;
+        let reestablish = !matches!(write, OwnedSessionWrite::RemoveLast);
+        match Self::admit_claimed_owner(&tx, session_key, agent_alias, reestablish)? {
+            ScopedSessionAccess::Granted(()) => {}
+            ScopedSessionAccess::Missing => return Ok(ScopedSessionAccess::Missing),
+            ScopedSessionAccess::Denied(denial) => return Ok(ScopedSessionAccess::Denied(denial)),
+        }
+        let changed = match write {
+            OwnedSessionWrite::Append(message) => {
+                let now = Utc::now().to_rfc3339();
+                Self::append_on(&tx, session_key, message, &now).map_err(std::io::Error::other)?;
+                true
+            }
+            OwnedSessionWrite::RemoveLast => Self::remove_last_on(&tx, session_key)?,
+            OwnedSessionWrite::ReplaceConversationState {
+                messages,
+                breadcrumb_present,
+            } => {
+                Self::rewrite_messages_on(&tx, session_key, messages)
+                    .map_err(std::io::Error::other)?;
+                Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
+                    .map_err(std::io::Error::other)?;
+                true
+            }
+            OwnedSessionWrite::SetTrimBreadcrumb(present) => {
+                Self::set_session_trim_breadcrumb_on(&tx, session_key, present)
+                    .map_err(std::io::Error::other)?;
+                true
+            }
+            OwnedSessionWrite::SetContext(context) => {
+                Self::set_session_context_on(&tx, session_key, &context)?;
+                true
+            }
+        };
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(ScopedSessionAccess::Granted(changed))
+    }
 
-        // Update metadata count
-        conn.execute(
-            "UPDATE session_metadata SET message_count = MAX(0, message_count - 1)
-             WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
+    fn try_load_as_owner(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let access = match Self::admit_claimed_owner(&tx, session_key, agent_alias, false)? {
+            ScopedSessionAccess::Granted(()) => {
+                ScopedSessionAccess::Granted(Self::load_messages(&tx, session_key)?)
+            }
+            ScopedSessionAccess::Missing => ScopedSessionAccess::Missing,
+            ScopedSessionAccess::Denied(denial) => ScopedSessionAccess::Denied(denial),
+        };
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(access)
+    }
 
-        Ok(true)
+    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+        Self::remove_last_on(&self.conn.lock(), session_key)
     }
 
     /// Efficiently update the last message in-place (single UPDATE instead of
@@ -2098,7 +2203,16 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         context: SessionContext<'_>,
     ) -> std::io::Result<()> {
-        let conn = self.conn.lock();
+        Self::set_session_context_on(&self.conn.lock(), session_key, &context)
+    }
+}
+
+impl SqliteSessionBackend {
+    fn set_session_context_on(
+        conn: &Connection,
+        session_key: &str,
+        context: &SessionContext<'_>,
+    ) -> std::io::Result<()> {
         fn normalize(v: Option<&str>) -> Option<&str> {
             v.map(str::trim).filter(|s| !s.is_empty())
         }
@@ -4488,5 +4602,87 @@ mod tests {
                 .unwrap(),
             SessionOwnerClaim::Claimed
         );
+    }
+
+    /// A claimed turn's later writes and reads stay with its agent, on both
+    /// backends. A session that disappeared is recorded as the agent's again
+    /// before the write; one another agent owns, or one with no attribution,
+    /// refuses the write and the read and is left as it was.
+    #[test]
+    fn writes_as_owner_keep_or_reestablish_the_claimed_owner() {
+        use crate::session_backend::{OwnedSessionWrite, SessionOwnershipDenial};
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = TempDir::new().unwrap();
+            let store: Box<dyn SessionBackend> = if backend_name == "sqlite" {
+                Box::new(SqliteSessionBackend::new(tmp.path()).unwrap())
+            } else {
+                Box::new(SessionStore::new(tmp.path()).unwrap())
+            };
+            let turn = ChatMessage::user("agent A's turn");
+
+            assert_eq!(
+                store
+                    .write_as_owner("k", "agent-a", OwnedSessionWrite::Append(&turn))
+                    .unwrap(),
+                ScopedSessionAccess::Granted(true),
+                "{backend_name}"
+            );
+            assert_eq!(
+                store.get_session_agent_alias("k").unwrap().as_deref(),
+                Some("agent-a"),
+                "{backend_name}: an absent session is recorded as the writer's"
+            );
+            assert!(
+                matches!(
+                    store.try_load_as_owner("k", "agent-a").unwrap(),
+                    ScopedSessionAccess::Granted(history) if history.len() == 1
+                ),
+                "{backend_name}"
+            );
+            assert_eq!(
+                store
+                    .write_as_owner("never", "agent-a", OwnedSessionWrite::RemoveLast)
+                    .unwrap(),
+                ScopedSessionAccess::Missing,
+                "{backend_name}: removing from an absent session creates nothing"
+            );
+            assert!(!store.session_exists("never"), "{backend_name}");
+
+            let foreign = SessionOwnershipDenial::ForeignAgent("agent-a".into());
+            assert_eq!(
+                store
+                    .write_as_owner("k", "agent-b", OwnedSessionWrite::Append(&turn))
+                    .unwrap(),
+                ScopedSessionAccess::Denied(foreign.clone()),
+                "{backend_name}"
+            );
+            assert!(
+                matches!(
+                    store.try_load_as_owner("k", "agent-b").unwrap(),
+                    ScopedSessionAccess::Denied(denial) if denial == foreign
+                ),
+                "{backend_name}"
+            );
+            assert_eq!(store.load("k").len(), 1, "{backend_name}");
+
+            store.append("legacy", &turn).unwrap();
+            assert_eq!(
+                store
+                    .write_as_owner(
+                        "legacy",
+                        "agent-a",
+                        OwnedSessionWrite::SetContext(SessionContext {
+                            channel_id: Some("discord.ops"),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap(),
+                ScopedSessionAccess::Denied(SessionOwnershipDenial::Unattributed),
+                "{backend_name}: a session with no attribution is nobody's to write"
+            );
+            let legacy = store.get_session_metadata("legacy").unwrap();
+            assert_eq!(legacy.agent_alias, None, "{backend_name}");
+            assert_eq!(legacy.channel_id, None, "{backend_name}");
+        }
     }
 }

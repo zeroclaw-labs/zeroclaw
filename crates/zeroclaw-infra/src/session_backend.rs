@@ -189,6 +189,81 @@ pub enum SessionOwnerClaim {
     Foreign(SessionOwnershipDenial),
 }
 
+/// One transcript write that a turn makes after claiming its session; see
+/// [`SessionBackend::write_as_owner`].
+#[derive(Debug, Clone)]
+pub enum OwnedSessionWrite<'a> {
+    /// Append one message.
+    Append(&'a ChatMessage),
+    /// Remove the last message.
+    RemoveLast,
+    /// Replace the transcript and its trim breadcrumb flag together, as
+    /// [`SessionBackend::replace_conversation_state`] does.
+    ReplaceConversationState {
+        messages: &'a [ChatMessage],
+        breadcrumb_present: bool,
+    },
+    /// Record the trim breadcrumb flag.
+    SetTrimBreadcrumb(bool),
+    /// Record routing context, as [`SessionBackend::set_session_context`] does.
+    SetContext(SessionContext<'a>),
+}
+
+/// Admit a claimed turn's later write or read: `Granted` while `agent_alias`
+/// is the persisted agent owner, `Missing` when the session is absent
+/// (`ownership` is `None`), otherwise `Denied`. Unlike a claim, no channel
+/// grant or adoption applies: the turn's claim recorded the agent.
+pub(crate) fn check_claimed_owner(
+    ownership: Option<(Option<&str>, Option<&str>)>,
+    agent_alias: &str,
+) -> std::io::Result<ScopedSessionAccess<()>> {
+    if agent_alias.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "empty session owner",
+        ));
+    }
+    let Some((owner_agent, owner_channel)) = ownership else {
+        return Ok(ScopedSessionAccess::Missing);
+    };
+    let owner_agent = owner_agent.filter(|owner| !owner.is_empty());
+    let owner_channel = owner_channel.filter(|channel| !channel.is_empty());
+    if owner_agent == Some(agent_alias) {
+        return Ok(ScopedSessionAccess::Granted(()));
+    }
+    Ok(ScopedSessionAccess::Denied(
+        check_session_ownership(owner_agent, owner_channel, agent_alias, &BTreeSet::new())
+            .err()
+            .unwrap_or(SessionOwnershipDenial::Unattributed),
+    ))
+}
+
+/// Make `write` with no ownership condition, through the backend's ordinary
+/// operations. Returns whether it changed anything: for `RemoveLast`, whether
+/// a message was removed; otherwise `true`.
+pub fn apply_session_write<B: SessionBackend + ?Sized>(
+    backend: &B,
+    session_key: &str,
+    write: OwnedSessionWrite<'_>,
+) -> std::io::Result<bool> {
+    match write {
+        OwnedSessionWrite::Append(message) => backend.append(session_key, message).map(|()| true),
+        OwnedSessionWrite::RemoveLast => backend.remove_last(session_key),
+        OwnedSessionWrite::ReplaceConversationState {
+            messages,
+            breadcrumb_present,
+        } => backend
+            .replace_conversation_state(session_key, messages, breadcrumb_present)
+            .map(|()| true),
+        OwnedSessionWrite::SetTrimBreadcrumb(present) => backend
+            .set_session_trim_breadcrumb(session_key, present)
+            .map(|()| true),
+        OwnedSessionWrite::SetContext(context) => backend
+            .set_session_context(session_key, context)
+            .map(|()| true),
+    }
+}
+
 /// A caller-owned, synchronous authority hold. Storage knows no runtime policy.
 pub trait SessionEffectGuard {}
 impl<T> SessionEffectGuard for T {}
@@ -280,6 +355,44 @@ pub trait SessionBackend: Send + Sync {
         Ok(ScopedSessionAccess::Denied(
             SessionOwnershipDenial::AtomicCheckUnavailable,
         ))
+    }
+
+    /// Make one write of the conversation `agent_alias` claimed, in the same
+    /// critical section as a check that `agent_alias` is still its persisted
+    /// agent owner.
+    ///
+    /// A turn claims its session before it writes, but the session can be
+    /// archived or deleted in between. An unconditional write would then
+    /// recreate it with no owner, and a sole enabled agent adopts a session
+    /// with no owner. So an absent session is first recorded as
+    /// `agent_alias`'s again; `RemoveLast` on one is `Missing`. Any other
+    /// persisted ownership refuses the write with `Denied`, and nothing is
+    /// written. `Granted` carries what [`apply_session_write`] returns.
+    ///
+    /// The default makes the write unconditionally, which suits a backend
+    /// that persists no ownership. Both persistent backends override it.
+    fn write_as_owner(
+        &self,
+        session_key: &str,
+        _agent_alias: &str,
+        write: OwnedSessionWrite<'_>,
+    ) -> std::io::Result<ScopedSessionAccess<bool>> {
+        apply_session_write(self, session_key, write).map(ScopedSessionAccess::Granted)
+    }
+
+    /// Read the conversation `agent_alias` claimed, as strictly as
+    /// [`try_load`](Self::try_load), in the same critical section as a check
+    /// that `agent_alias` is still its persisted agent owner. An absent
+    /// session is `Missing`; any other persisted ownership is `Denied`.
+    ///
+    /// The default reads unconditionally, which suits a backend that persists
+    /// no ownership. Both persistent backends override it.
+    fn try_load_as_owner(
+        &self,
+        session_key: &str,
+        _agent_alias: &str,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        self.try_load(session_key).map(ScopedSessionAccess::Granted)
     }
 
     /// List metadata with the same persisted/live policy boundary as history.

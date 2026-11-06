@@ -3957,6 +3957,67 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
+/// The agent whose claim a channel context's transcript reads and writes
+/// stay with: the context's agent. A context with no agent has no claim (an
+/// inbound turn's claim refuses it first), so its reads and writes are
+/// unconditional.
+fn claimed_session_owner(ctx: &ChannelRuntimeContext) -> Option<&str> {
+    Some(ctx.agent_alias.as_str()).filter(|alias| !alias.is_empty())
+}
+
+/// Refusal of a claimed turn's read or write because the session is no
+/// longer its agent's: it disappeared after the claim and another agent
+/// claimed it, or its attribution changed.
+fn session_owner_moved(
+    session_key: &str,
+    denial: &zeroclaw_infra::session_backend::SessionOwnershipDenial,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("session {session_key} is no longer owned by this turn's agent: {denial:?}"),
+    )
+}
+
+/// Read a transcript strictly, as `try_load` does, and only while `owner` is
+/// its persisted owner (see `SessionBackend::try_load_as_owner`). An absent
+/// session reads as empty; one another owner holds is an error.
+fn load_owned_transcript(
+    store: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    owner: Option<&str>,
+) -> std::io::Result<Vec<ChatMessage>> {
+    use zeroclaw_infra::session_backend::ScopedSessionAccess;
+    let Some(owner) = owner else {
+        return store.try_load(session_key);
+    };
+    match store.try_load_as_owner(session_key, owner)? {
+        ScopedSessionAccess::Granted(messages) => Ok(messages),
+        ScopedSessionAccess::Missing => Ok(Vec::new()),
+        ScopedSessionAccess::Denied(denial) => Err(session_owner_moved(session_key, &denial)),
+    }
+}
+
+/// Make one transcript write, only while `owner` is the session's persisted
+/// owner (see `SessionBackend::write_as_owner`). Returns what
+/// `apply_session_write` does; a session another owner holds is an error and
+/// nothing is written.
+fn write_owned_transcript(
+    store: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    owner: Option<&str>,
+    write: zeroclaw_infra::session_backend::OwnedSessionWrite<'_>,
+) -> std::io::Result<bool> {
+    use zeroclaw_infra::session_backend::ScopedSessionAccess;
+    let Some(owner) = owner else {
+        return zeroclaw_infra::session_backend::apply_session_write(store, session_key, write);
+    };
+    match store.write_as_owner(session_key, owner, write)? {
+        ScopedSessionAccess::Granted(changed) => Ok(changed),
+        ScopedSessionAccess::Missing => Ok(false),
+        ScopedSessionAccess::Denied(denial) => Err(session_owner_moved(session_key, &denial)),
+    }
+}
+
 /// Reload the durable transcript into the cache when it is missing, before
 /// anything is appended to it. Returns `false` when the transcript exists but
 /// cannot be verified, in which case nothing may be appended. The caller must
@@ -3982,7 +4043,8 @@ fn hydrate_sender_history_if_missing(ctx: &ChannelRuntimeContext, sender_key: &s
         // the cache missing so the next turn retries hydration.
         let mut hydration_unavailable = false;
         if missing && let Some(ref store) = ctx.session_store {
-            match hydrate_session_transcript(store.as_ref(), sender_key) {
+            match hydrate_session_transcript(store.as_ref(), sender_key, claimed_session_owner(ctx))
+            {
                 Ok(Some(hydrated)) => {
                     ctx.history_crumb_flags
                         .lock()
@@ -4012,7 +4074,11 @@ fn hydrate_sender_history_if_missing(ctx: &ChannelRuntimeContext, sender_key: &s
                     // become an empty cache — leave the cache missing so the
                     // next turn retries hydration instead of running with
                     // only the new message.
-                    match store.try_load(sender_key) {
+                    match load_owned_transcript(
+                        store.as_ref(),
+                        sender_key,
+                        claimed_session_owner(ctx),
+                    ) {
                         Ok(fallback) if !fallback.is_empty() => {
                             match resolve_cold_crumb_provenance_result(
                                 Some(store.as_ref()),
@@ -4121,17 +4187,50 @@ fn append_sender_turn(
         return None;
     }
 
-    // Persist to JSONL before adding to in-memory history.
-    if let Some(ref store) = ctx.session_store
-        && let Err(e) = store.append(sender_key, &turn)
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to persist session turn"
-        );
+    // Persist before adding to in-memory history, and only into this agent's
+    // own session: the claim at the start of the turn does not hold the
+    // session until now.
+    if let Some(ref store) = ctx.session_store {
+        let written = match claimed_session_owner(ctx) {
+            Some(owner) => store.write_as_owner(
+                sender_key,
+                owner,
+                zeroclaw_infra::session_backend::OwnedSessionWrite::Append(&turn),
+            ),
+            None => store
+                .append(sender_key, &turn)
+                .map(|()| zeroclaw_infra::session_backend::ScopedSessionAccess::Granted(true)),
+        };
+        match written {
+            Ok(zeroclaw_infra::session_backend::ScopedSessionAccess::Granted(_)) => {}
+            Ok(refused) => {
+                // The session changed hands after this turn claimed it. The
+                // message belongs to neither the cache nor the new owner's
+                // transcript.
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "history_key": sender_key,
+                            "routed_agent": ctx.agent_alias.as_str(),
+                            "ownership": format!("{refused:?}"),
+                            "error_key": "session_owner_conflict",
+                        })),
+                    "Session is no longer owned by this turn's agent; not recording the message"
+                );
+                return None;
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Failed to persist session turn"
+                );
+            }
+        }
     }
 
     let max_history = channel_history_cap(ctx);
@@ -4183,9 +4282,15 @@ fn append_bound_exchange(
     let mut kept = messages.len();
     let mut failure = None;
     if let Some(ref store) = ctx.session_store {
+        let owner = claimed_session_owner(ctx);
         kept = 0;
         for message in messages {
-            if let Err(e) = store.append(sender_key, message) {
+            if let Err(e) = write_owned_transcript(
+                store.as_ref(),
+                sender_key,
+                owner,
+                zeroclaw_infra::session_backend::OwnedSessionWrite::Append(message),
+            ) {
                 failure = Some(e);
                 break;
             }
@@ -4193,8 +4298,19 @@ fn append_bound_exchange(
         }
         if failure.is_some() {
             // The persist lock is held, so the rows just written are still
-            // the last ones of this history.
-            while kept > 0 && matches!(store.remove_last(sender_key), Ok(true)) {
+            // the last ones of this history, unless the session has changed
+            // hands, in which case nothing of it is taken.
+            while kept > 0
+                && matches!(
+                    write_owned_transcript(
+                        store.as_ref(),
+                        sender_key,
+                        owner,
+                        zeroclaw_infra::session_backend::OwnedSessionWrite::RemoveLast,
+                    ),
+                    Ok(true)
+                )
+            {
                 kept -= 1;
             }
         }
@@ -4454,9 +4570,15 @@ fn resync_sender_history_after_trim(
         // mean the transcript half landed and the breadcrumb half did not
         // (or vice versa), so on error we reload the backend's actual
         // current state below instead of assuming nothing changed.
-        if let Err(e) =
-            store.replace_conversation_state(sender_key, &published_turns, breadcrumb_present)
-        {
+        if let Err(e) = write_owned_transcript(
+            store.as_ref(),
+            sender_key,
+            claimed_session_owner(ctx),
+            zeroclaw_infra::session_backend::OwnedSessionWrite::ReplaceConversationState {
+                messages: &published_turns,
+                breadcrumb_present,
+            },
+        ) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -4466,20 +4588,27 @@ fn resync_sender_history_after_trim(
             );
             match store.get_session_trim_breadcrumb(sender_key) {
                 Ok(reloaded_breadcrumb) => {
-                    let reloaded_turns = store.load(sender_key);
-                    let reloaded_breadcrumb =
-                        reloaded_breadcrumb.unwrap_or(crumb_present_before_loop);
-                    let mut histories = ctx
-                        .conversation_histories
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    histories.put(sender_key.to_string(), reloaded_turns);
-                    drop(histories);
-                    let mut flags = ctx
-                        .history_crumb_flags
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    flags.put(sender_key.to_string(), reloaded_breadcrumb);
+                    // Only this agent's own transcript is reloaded. One that
+                    // can't be read as its own is left out of the cache.
+                    if let Ok(reloaded_turns) = load_owned_transcript(
+                        store.as_ref(),
+                        sender_key,
+                        claimed_session_owner(ctx),
+                    ) {
+                        let reloaded_breadcrumb =
+                            reloaded_breadcrumb.unwrap_or(crumb_present_before_loop);
+                        let mut histories = ctx
+                            .conversation_histories
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        histories.put(sender_key.to_string(), reloaded_turns);
+                        drop(histories);
+                        let mut flags = ctx
+                            .history_crumb_flags
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        flags.put(sender_key.to_string(), reloaded_breadcrumb);
+                    }
                 }
                 Err(e) => {
                     // The provenance read failed outright: `Err(_)` is not
@@ -4687,7 +4816,12 @@ fn rollback_orphan_user_turn(
     // Also remove the orphan turn from the persisted JSONL session store so
     // it doesn't resurface after a daemon restart
     if let Some(ref store) = ctx.session_store
-        && let Err(e) = store.remove_last(sender_key)
+        && let Err(e) = write_owned_transcript(
+            store.as_ref(),
+            sender_key,
+            claimed_session_owner(ctx),
+            zeroclaw_infra::session_backend::OwnedSessionWrite::RemoveLast,
+        )
     {
         ::zeroclaw_log::record!(
             WARN,
@@ -9154,6 +9288,18 @@ backend write the session's .metadata.json sidecar with {\"agent_alias\": \"<ali
 archive the legacy transcript. See docs/book/src/architecture/runtime-state-and-persistence.md, \
 Legacy session attribution.";
 
+#[cfg(test)]
+type InboundClaimHook = Box<dyn FnMut(&str)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run on this thread, with the history key, once an inbound turn has
+    /// claimed its session and stamped its routing context, before the turn
+    /// reads or writes the transcript.
+    static AFTER_INBOUND_SESSION_CLAIM: std::cell::RefCell<Option<InboundClaimHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[must_use]
 fn stamp_session_routing_context(
     ctx: &ChannelRuntimeContext,
@@ -9272,14 +9418,40 @@ fn stamp_session_routing_context(
             return false;
         }
     }
-    if let Err(e) = store.set_session_context(history_key, context) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"history_key": history_key, "e": e.to_string()})),
-            "Failed to stamp session routing context"
-        );
+    // The claim above doesn't hold the session until this write, so the
+    // stamp is made only while this agent still owns it.
+    match store.write_as_owner(
+        history_key,
+        ctx.agent_alias.as_str(),
+        zeroclaw_infra::session_backend::OwnedSessionWrite::SetContext(context),
+    ) {
+        Ok(zeroclaw_infra::session_backend::ScopedSessionAccess::Granted(_)) => {}
+        Ok(refused) => {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "history_key": history_key,
+                        "routed_agent": ctx.agent_alias.as_str(),
+                        "ownership": format!("{refused:?}"),
+                        "error_key": "session_owner_conflict",
+                    })),
+                "Session changed owner after this turn claimed it; refusing the turn"
+            );
+            return false;
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"history_key": history_key, "e": e.to_string()})
+                    ),
+                "Failed to stamp session routing context"
+            );
+        }
     }
     true
 }
@@ -9472,6 +9644,12 @@ async fn process_channel_message_body(
     if !stamp_session_routing_context(ctx.as_ref(), &msg, &history_key) {
         return;
     }
+    #[cfg(test)]
+    AFTER_INBOUND_SESSION_CLAIM.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(&history_key);
+        }
+    });
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
         return;
@@ -16801,7 +16979,7 @@ fn hydrate_persisted_session_history(
     // (`Err`) skip startup installation: the next inbound turn retries
     // hydration (or installs a verified durable fallback) instead of building
     // on unconfirmed state.
-    let hydrated_session = match hydrate_session_transcript(store, &metadata.key) {
+    let hydrated_session = match hydrate_session_transcript(store, &metadata.key, None) {
         Ok(Some(session)) => session,
         _ => return None,
     };
@@ -16864,11 +17042,17 @@ struct HydrationFailed;
 /// part of that reconciliation: publishing a closure that storage never
 /// accepted would leave the live cache ahead of durable storage until the
 /// next authoritative replacement.
+///
+/// `owner` is the agent whose claimed turn is reloading the transcript. The
+/// read and every reconciliation write then happen only while the session is
+/// still that agent's (see [`load_owned_transcript`]). Startup restoration,
+/// which resolves the owner itself, passes `None`.
 fn hydrate_session_transcript(
     store: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
+    owner: Option<&str>,
 ) -> Result<Option<HydratedSession>, HydrationFailed> {
-    let mut msgs = match store.try_load(session_key) {
+    let mut msgs = match load_owned_transcript(store, session_key, owner) {
         Ok(v) => v,
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -16927,7 +17111,12 @@ fn hydrate_session_transcript(
     let mut orphan_closed = false;
     if msgs.last().is_some_and(|msg| msg.role == "user") {
         let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
-        if let Err(e) = store.append(session_key, &closure) {
+        if let Err(e) = write_owned_transcript(
+            store,
+            session_key,
+            owner,
+            zeroclaw_infra::session_backend::OwnedSessionWrite::Append(&closure),
+        ) {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -16970,11 +17159,19 @@ fn hydrate_session_transcript(
     // restart reloads the untruncated transcript and repeats this
     // reconciliation instead of converging.
     if truncated || durable_crumb != Some(crumb_present) {
-        let persist_result = if truncated {
-            store.replace_conversation_state(session_key, &msgs, crumb_present)
-        } else {
-            store.set_session_trim_breadcrumb(session_key, crumb_present)
-        };
+        let persist_result = write_owned_transcript(
+            store,
+            session_key,
+            owner,
+            if truncated {
+                zeroclaw_infra::session_backend::OwnedSessionWrite::ReplaceConversationState {
+                    messages: &msgs,
+                    breadcrumb_present: crumb_present,
+                }
+            } else {
+                zeroclaw_infra::session_backend::OwnedSessionWrite::SetTrimBreadcrumb(crumb_present)
+            },
+        );
         if let Err(e) = persist_result {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -19414,6 +19611,10 @@ fn stale_no_trim_completion_does_not_overwrite_a_newer_trims_flag() {
     backend.append(&sender, &old_turn).expect("seed append");
     backend.append(&sender, &recent_turn).expect("seed append");
 
+    // A channel turn claims its session before it writes to it.
+    backend
+        .set_session_agent_alias(&sender, "test")
+        .expect("claim the session");
     let ctx = test_channel_ctx_with_backend(backend.clone());
 
     // Worker A appends its own inbound message and snapshots the cache.
@@ -19518,6 +19719,10 @@ fn evicted_cache_reloads_durable_transcript_on_next_append() {
         .set_session_trim_breadcrumb(&sender, false)
         .expect("seed breadcrumb flag");
 
+    // A channel turn claims its session before it writes to it.
+    backend
+        .set_session_agent_alias(&sender, "test")
+        .expect("claim the session");
     let ctx = test_channel_ctx_with_backend(backend.clone());
     assert!(
         ctx.conversation_histories
@@ -19603,6 +19808,10 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
         .append(&sender, &retained_turn)
         .expect("seed append");
 
+    // A channel turn claims its session before it writes to it.
+    backend
+        .set_session_agent_alias(&sender, "test")
+        .expect("claim the session");
     let ctx = test_channel_ctx_with_backend(backend.clone());
     ctx.conversation_histories
         .lock()
@@ -19720,6 +19929,10 @@ fn bound_exchange_survives_a_concurrent_channel_turns_trim_resync() {
         .append(&sender, &retained_turn)
         .expect("seed append");
 
+    // A channel turn claims its session before it writes to it.
+    backend
+        .set_session_agent_alias(&sender, "test")
+        .expect("claim the session");
     let ctx = test_channel_ctx_with_backend(backend.clone());
     ctx.conversation_histories
         .lock()
@@ -20283,6 +20496,10 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
     backend.append(&sender, &old_turn).expect("seed append");
     backend.append(&sender, &a_user).expect("seed append");
 
+    // A channel turn claims its session before it writes to it.
+    backend
+        .set_session_agent_alias(&sender, "test")
+        .expect("claim the session");
     let mut ctx = test_channel_ctx_with_backend(backend.clone());
     Arc::get_mut(&mut ctx)
         .expect("sole owner right after construction")
@@ -23474,6 +23691,210 @@ temperature = 0.3
         }
     }
 
+    /// Clears the after-claim hook when a test ends, even by panicking.
+    struct AfterInboundClaim;
+
+    impl AfterInboundClaim {
+        fn run(hook: impl FnMut(&str) + 'static) -> Self {
+            AFTER_INBOUND_SESSION_CLAIM.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for AfterInboundClaim {
+        fn drop(&mut self) {
+            AFTER_INBOUND_SESSION_CLAIM.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// A's turn claims its old session, and cleanup then removes the session
+    /// before the turn's first write: hygiene archives the old JSONL pair, or
+    /// the gateway's stale-session sweep deletes the SQLite rows. The turn's
+    /// writes must not recreate the session without A as its owner. If they
+    /// did, then once A is disabled and its channel goes to B, the sole
+    /// enabled agent, B's next turn would adopt A's new messages as legacy
+    /// history and send them to B's model.
+    #[tokio::test]
+    async fn cleanup_after_a_claim_never_leaves_the_turns_messages_unowned() {
+        for backend_name in ["jsonl", "sqlite"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store: Arc<dyn SessionBackend> =
+                zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            let mut config = Config::default();
+            config.agents.clear();
+            config.agents.insert(
+                "agent-a".into(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    channels: vec!["webhook.a".into()],
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "agent-b".into(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+            );
+            config.channels.webhook.insert(
+                "a".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            let provider = Arc::new(HistoryCaptureModelProvider::default());
+            let live_config = zeroclaw_config::live::LiveConfig::new(config);
+            let owner = Arc::new(ChannelRuntimeContext {
+                session_store: Some(Arc::clone(&store)),
+                agent_alias: Arc::new("agent-a".into()),
+                model_provider: provider.clone(),
+                max_tool_iterations: 1,
+                live_config: live_config.handle(),
+                ..(*router_test_ctx()).clone()
+            });
+            let msg = ChannelMessage {
+                id: "a-1".into(),
+                sender: "alice".into(),
+                reply_target: "alice".into(),
+                content: "A_NEW_SECRET".into(),
+                channel: "webhook".into(),
+                channel_alias: Some("a".into()),
+                ..Default::default()
+            };
+            let key = runtime_conversation_history_key(&owner, &msg);
+            store
+                .append(&key, &ChatMessage::user("A_OLD_SECRET"))
+                .unwrap();
+            store
+                .append(&key, &ChatMessage::assistant("old reply"))
+                .unwrap();
+            store.set_session_agent_alias(&key, "agent-a").unwrap();
+            if backend_name == "jsonl" {
+                // Past hygiene's archive window.
+                let transcript = tmp
+                    .path()
+                    .join("sessions")
+                    .join(format!("{}.jsonl", sanitize_session_key(&key)));
+                std::fs::File::options()
+                    .append(true)
+                    .open(&transcript)
+                    .unwrap()
+                    .set_modified(SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60))
+                    .unwrap();
+            }
+
+            let cleanup = AfterInboundClaim::run({
+                let store = Arc::clone(&store);
+                let workspace = tmp.path().to_path_buf();
+                move |claimed| {
+                    if backend_name == "jsonl" {
+                        let memory = zeroclaw_config::schema::MemoryConfig {
+                            hygiene_enabled: true,
+                            archive_after_days: 7,
+                            ..Default::default()
+                        };
+                        zeroclaw_memory::hygiene::run_if_due(&memory, &workspace).unwrap();
+                    } else {
+                        store.cleanup_stale(0).unwrap();
+                    }
+                    assert!(
+                        !store.session_exists(claimed),
+                        "{backend_name}: cleanup must remove the claimed session"
+                    );
+                }
+            });
+            process_channel_message(Arc::clone(&owner), msg.clone(), CancellationToken::new())
+                .await;
+            drop(cleanup);
+            assert!(
+                provider
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .any(|(_, text)| text.contains("A_NEW_SECRET")),
+                "{backend_name}: A's turn must still run"
+            );
+            assert!(
+                store
+                    .load(&key)
+                    .iter()
+                    .any(|message| message.content.contains("A_NEW_SECRET")),
+                "{backend_name}: A's turn must still be recorded"
+            );
+            let owner_after_turn = store.get_session_agent_alias(&key).unwrap();
+
+            let mut reassigned = live_config.snapshot();
+            reassigned.agents.get_mut("agent-a").unwrap().enabled = false;
+            let agent_b = reassigned.agents.get_mut("agent-b").unwrap();
+            agent_b.enabled = true;
+            agent_b.channels = vec!["webhook.a".into()];
+            live_config
+                .publish(live_config.next_revision().unwrap(), reassigned)
+                .unwrap();
+            provider.calls.lock().unwrap().clear();
+            let sole = Arc::new(ChannelRuntimeContext {
+                agent_alias: Arc::new("agent-b".into()),
+                conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                    std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+                ))),
+                ..(*owner).clone()
+            });
+            process_channel_message(
+                Arc::clone(&sole),
+                ChannelMessage {
+                    id: "b-1".into(),
+                    content: "What did we talk about?".into(),
+                    ..msg.clone()
+                },
+                CancellationToken::new(),
+            )
+            .await;
+            let b_saw_a = provider
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|(_, text)| text.contains("A_NEW_SECRET") || text.contains("A_OLD_SECRET"));
+            assert!(
+                !b_saw_a,
+                "{backend_name}: B's model must never see A's messages"
+            );
+            assert_eq!(
+                owner_after_turn.as_deref(),
+                Some("agent-a"),
+                "{backend_name}: A's turn must keep the session A's"
+            );
+            assert_eq!(
+                store.get_session_agent_alias(&key).unwrap().as_deref(),
+                Some("agent-a"),
+                "{backend_name}"
+            );
+
+            // Non-vacuous: B's own new conversation still reaches the model.
+            process_channel_message(
+                Arc::clone(&sole),
+                ChannelMessage {
+                    id: "b-2".into(),
+                    sender: "bob".into(),
+                    reply_target: "bob".into(),
+                    content: "Hello from bob".into(),
+                    ..msg.clone()
+                },
+                CancellationToken::new(),
+            )
+            .await;
+            assert!(
+                !provider.calls.lock().unwrap().is_empty(),
+                "{backend_name}: B must still answer its own conversations"
+            );
+        }
+    }
+
     /// Two conversations can normalize onto one storage key, and an operator
     /// reassigning a channel points the next message at a transcript another
     /// agent owns. Routing decides which agent answers; it must not decide
@@ -25435,6 +25856,10 @@ api_key = "anthropic-key"
                 &ChatMessage::user("[IMAGE:/tmp/photo.jpg]\n\nDescribe this"),
             )
             .unwrap();
+        // A channel turn claims its session before it writes to it.
+        store
+            .set_session_agent_alias(&sender, "test-agent")
+            .unwrap();
 
         let mut histories =
             lru::LruCache::new(std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap());
@@ -25598,7 +26023,7 @@ api_key = "anthropic-key"
             .unwrap();
         store.set_session_trim_breadcrumb(&sender, false).unwrap();
 
-        let hydrated = hydrate_session_transcript(&store, &sender)
+        let hydrated = hydrate_session_transcript(&store, &sender, None)
             .expect("reconciliation must succeed")
             .expect("session must hydrate");
 
@@ -25636,7 +26061,7 @@ api_key = "anthropic-key"
         }
         store.set_session_trim_breadcrumb(&sender, true).unwrap();
 
-        let hydrated = hydrate_session_transcript(&store, &sender)
+        let hydrated = hydrate_session_transcript(&store, &sender, None)
             .expect("reconciliation must succeed")
             .expect("session must hydrate");
 
@@ -25678,7 +26103,7 @@ api_key = "anthropic-key"
             .unwrap();
         store.set_session_trim_breadcrumb(&sender, true).unwrap();
 
-        let hydrated = hydrate_session_transcript(&store, &sender)
+        let hydrated = hydrate_session_transcript(&store, &sender, None)
             .expect("reconciliation must succeed")
             .expect("session must hydrate");
 
@@ -25753,7 +26178,7 @@ api_key = "anthropic-key"
         }
 
         assert!(
-            hydrate_session_transcript(&backend, "sender").is_err(),
+            hydrate_session_transcript(&backend, "sender", None).is_err(),
             "a failed reconciliation write must be reported, not published as a truncated cache"
         );
     }
@@ -25974,7 +26399,7 @@ api_key = "anthropic-key"
         }
         store.set_session_trim_breadcrumb(&sender, false).unwrap();
 
-        let hydrated = hydrate_session_transcript(&store, &sender)
+        let hydrated = hydrate_session_transcript(&store, &sender, None)
             .expect("reconciliation must succeed")
             .expect("session must hydrate");
 
@@ -26015,7 +26440,7 @@ api_key = "anthropic-key"
         // No set_session_trim_breadcrumb call: this session never recorded
         // a flag, matching a pre-upgrade transcript.
 
-        let hydrated = hydrate_session_transcript(&store, &sender)
+        let hydrated = hydrate_session_transcript(&store, &sender, None)
             .expect("reconciliation must succeed")
             .expect("session must hydrate");
 
@@ -26091,7 +26516,7 @@ api_key = "anthropic-key"
             .unwrap();
         let store = FailingBreadcrumbStore(inner);
 
-        let hydrated = hydrate_session_transcript(&store, &sender);
+        let hydrated = hydrate_session_transcript(&store, &sender, None);
 
         assert!(
             hydrated.is_err(),
@@ -26131,7 +26556,7 @@ api_key = "anthropic-key"
                 "corrupt sidecar {corrupt_contents:?} must not read as a verified flag"
             );
 
-            let hydrated = hydrate_session_transcript(&store, &sender);
+            let hydrated = hydrate_session_transcript(&store, &sender, None);
             assert!(
                 hydrated.is_err(),
                 "hydration must fail closed for a corrupt breadcrumb sidecar {corrupt_contents:?}"
@@ -26189,7 +26614,7 @@ api_key = "anthropic-key"
             .unwrap();
 
         assert!(
-            hydrate_session_transcript(&backend, "sender").is_err(),
+            hydrate_session_transcript(&backend, "sender", None).is_err(),
             "a failed closure append must fail hydration, not publish a phantom assistant row"
         );
         assert_eq!(
