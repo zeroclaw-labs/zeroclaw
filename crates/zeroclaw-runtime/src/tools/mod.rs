@@ -5721,6 +5721,7 @@ permissions = ["http_client"]
             zeroclaw_config::schema::PluginChannelConfig {
                 package: "alpha".to_string(),
                 enabled: true,
+                ..zeroclaw_config::schema::PluginChannelConfig::default()
             },
         )]);
         config.agents = HashMap::from([(

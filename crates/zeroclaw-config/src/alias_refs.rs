@@ -241,8 +241,11 @@ impl CascadeReport {
 pub fn dirty_entry_for(refsite_path: &str) -> String {
     let segs: Vec<&str> = refsite_path.split('.').collect();
     match segs.first().copied() {
-        // agents.<name>.* and peer_groups.<g>.* → the entry root.
-        Some("agents" | "peer_groups") if segs.len() >= 2 => format!("{}.{}", segs[0], segs[1]),
+        // agents.<name>.*, peer_groups.<g>.* and permission_profiles.<p>.* → the
+        // entry root.
+        Some("agents" | "peer_groups" | "permission_profiles") if segs.len() >= 2 => {
+            format!("{}.{}", segs[0], segs[1])
+        }
         // providers.<cat>.<fam>.<alias>.* → the provider entry.
         Some("providers") if segs.len() >= 4 => segs[..4].join("."),
         // Scalars / whole-vector fields (heartbeat.agent, acp.default_agent,
@@ -523,6 +526,9 @@ fn delete_channel(
 fn scrub_channel_refs(cfg: &mut Config, target: &str) {
     for agent in cfg.agents.values_mut() {
         agent.channels.retain(|ch| ch.trim() != target);
+    }
+    for profile in cfg.permission_profiles.values_mut() {
+        profile.allowed_channels.retain(|ch| ch.trim() != target);
     }
     cfg.escalation
         .alert_channels
@@ -912,6 +918,18 @@ fn rewrite_channel_refs(cfg: &mut Config, channel_type: &str, old: &str, new: &s
             dirty.push(format!("peer_groups.{gname}"));
         }
     }
+    for (pname, profile) in cfg.permission_profiles.iter_mut() {
+        let mut touched = false;
+        for ch in profile.allowed_channels.iter_mut() {
+            if ch.trim() == old_target {
+                ch.clone_from(&new_target);
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!("permission_profiles.{pname}"));
+        }
+    }
     let mut alert_touched = false;
     for ch in cfg.escalation.alert_channels.iter_mut() {
         if ch.trim() == old_target {
@@ -985,6 +1003,14 @@ fn sorted_agents(cfg: &Config) -> Vec<(&String, &crate::schema::AliasedAgentConf
     let mut v: Vec<_> = cfg.agents.iter().collect();
     v.sort_by(|a, b| a.0.cmp(b.0));
     v
+}
+
+fn sorted_permission_profiles(
+    cfg: &Config,
+) -> Vec<(&String, &crate::schema::PermissionProfileConfig)> {
+    let mut profiles: Vec<_> = cfg.permission_profiles.iter().collect();
+    profiles.sort_by(|a, b| a.0.cmp(b.0));
+    profiles
 }
 
 fn sorted_peer_groups(cfg: &Config) -> Vec<(&String, &crate::multi_agent::PeerGroupConfig)> {
@@ -1142,6 +1168,20 @@ fn collect_channel_refs(cfg: &Config, channel_type: &str, alias: &str, sites: &m
                     format!("peer_groups.{gname}.channel"),
                     ScrubAction::Refuse,
                     group.channel.as_str(),
+                ));
+            }
+        }
+    }
+    // permission_profiles.<p>.allowed_channels[] — a channel grant. validate()
+    // refuses a name that is not a configured instance, so the grant goes with
+    // the instance; the profile keeps its other entries.
+    for (pname, profile) in sorted_permission_profiles(cfg) {
+        for (i, ch) in profile.allowed_channels.iter().enumerate() {
+            if ch.trim() == target {
+                sites.push(RefSite::soft(
+                    format!("permission_profiles.{pname}.allowed_channels[{i}]"),
+                    ScrubAction::DropFromVec { index: i },
+                    ch.as_str(),
                 ));
             }
         }
@@ -2262,6 +2302,54 @@ mod tests {
     }
 
     #[test]
+    fn cascade_channel_drops_permission_profile_grants() {
+        let mut cfg = empty_config();
+        cfg.create_map_key("channels.discord", "main").unwrap();
+        cfg.create_map_key("channels.discord", "other").unwrap();
+        cfg.permission_profiles.insert(
+            "ops".to_string(),
+            crate::schema::PermissionProfileConfig {
+                allowed_channels: vec![
+                    " discord.main ".to_string(),
+                    "discord.other".to_string(),
+                    "*".to_string(),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let sites = find_all_references(&cfg, &channel_kind(), "main");
+        assert_eq!(
+            sites
+                .iter()
+                .map(|site| site.path.as_str())
+                .collect::<Vec<_>>(),
+            ["permission_profiles.ops.allowed_channels[0]"],
+            "a channel grant is a soft reference"
+        );
+        let report = delete_with_cascade(
+            &mut cfg,
+            &channel_kind(),
+            "main",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("a channel grant never blocks the delete");
+        assert_eq!(
+            cfg.permission_profiles["ops"].allowed_channels,
+            ["discord.other", "*"],
+            "only the deleted instance's grant goes"
+        );
+        assert!(
+            report
+                .dirty_paths()
+                .contains(&"permission_profiles.ops".to_string()),
+            "the changed profile is saved: {:?}",
+            report.dirty_paths()
+        );
+        assert!(find_all_references(&cfg, &channel_kind(), "main").is_empty());
+    }
+
+    #[test]
     fn cascade_channel_refuses_on_hard_peer_group_ref() {
         let mut cfg = empty_config();
         cfg.create_map_key("channels.discord", "main").unwrap();
@@ -2690,6 +2778,43 @@ mod tests {
             "fallback rewritten"
         );
         assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn rename_channel_rewrites_permission_profile_grants() {
+        let mut cfg = empty_config();
+        cfg.create_map_key("channels.discord", "main").unwrap();
+        cfg.permission_profiles.insert(
+            "ops".to_string(),
+            crate::schema::PermissionProfileConfig {
+                allowed_channels: vec!["discord.main".to_string(), "*".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let report = rename_with_cascade(&mut cfg, &channel_kind(), "main", "primary")
+            .expect("a channel grant never blocks the rename");
+        assert_eq!(
+            cfg.permission_profiles["ops"].allowed_channels,
+            ["discord.primary", "*"],
+            "the grant follows the instance to its new name"
+        );
+        assert!(
+            report
+                .dirty_paths
+                .contains(&"permission_profiles.ops".to_string()),
+            "the changed profile is saved: {:?}",
+            report.dirty_paths
+        );
+        assert!(find_all_references(&cfg, &channel_kind(), "main").is_empty());
+    }
+
+    #[test]
+    fn dirty_entry_for_saves_a_permission_profile_whole() {
+        assert_eq!(
+            dirty_entry_for("permission_profiles.ops.allowed_channels[0]"),
+            "permission_profiles.ops"
+        );
     }
 
     #[test]
