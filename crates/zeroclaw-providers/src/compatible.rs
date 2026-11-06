@@ -3914,19 +3914,7 @@ impl OpenAiCompatibleModelProvider {
             return false;
         }
 
-        let lower = error.to_lowercase();
-        [
-            "unknown parameter: tools",
-            "unsupported parameter: tools",
-            "unrecognized field `tools`",
-            "does not support tools",
-            "function calling is not supported",
-            "tool_choice",
-            "tool call validation failed",
-            "was not in request",
-        ]
-        .iter()
-        .any(|hint| lower.contains(hint))
+        super::rejects_native_tool_calling_message(error)
     }
 }
 
@@ -4543,6 +4531,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             if !exact_request_replay
                 && tools_count > 0
+                && self.name != "Custom"
                 && Self::is_native_tool_schema_unsupported(status, &sanitized)
             {
                 let fallback_messages =
@@ -16704,6 +16693,42 @@ mod tests {
                 .downcast_ref::<crate::reliable::ProviderHttpError>()
                 .map(crate::reliable::ProviderHttpError::status),
             Some(400)
+        );
+    }
+
+    #[test]
+    fn native_tool_rejection_matches_the_rendered_provider_http_error() {
+        // The runtime classifies the error the provider actually returns, so
+        // exercise the real `provider_http_error` shape, not a hand-built string.
+        for body in [
+            r#"{"error":{"message":"tools are not supported by this endpoint"}}"#,
+            r#"{"error":{"message":"unknown parameter: tool_choice"}}"#,
+            r#"{"error":"function calling is not supported"}"#,
+        ] {
+            let error = provider_http_error("Custom", reqwest::StatusCode::BAD_REQUEST, body);
+            assert!(
+                crate::rejects_native_tool_calling(error.as_ref()),
+                "rendered: {error}"
+            );
+            assert!(
+                OpenAiCompatibleModelProvider::is_native_tool_schema_unsupported(
+                    reqwest::StatusCode::BAD_REQUEST,
+                    body
+                )
+            );
+        }
+
+        let unrelated = provider_http_error(
+            "Custom",
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"invalid API key"}}"#,
+        );
+        assert!(!crate::rejects_native_tool_calling(unrelated.as_ref()));
+        assert!(
+            !OpenAiCompatibleModelProvider::is_native_tool_schema_unsupported(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "tools are not supported"
+            )
         );
     }
 

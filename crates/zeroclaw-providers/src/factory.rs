@@ -2006,7 +2006,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             .credential(key)
             .auth_style(AuthStyle::Bearer)
             .vision(true);
-        if opts.native_tools != Some(true) {
+        if opts.native_tools == Some(false) {
             b = b.without_native_tools();
         }
         if opts.merge_system_into_user {
@@ -3311,7 +3311,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_factory_disables_native_tools_by_default() {
+    fn custom_factory_enables_native_tools_by_default() {
         use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
         let cfg = CustomModelProviderConfig {
             base: ModelProviderConfig {
@@ -3328,13 +3328,13 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !provider.supports_native_tools(),
-            "custom OpenAI-compatible endpoints must default to prompt-guided tools"
+            provider.supports_native_tools(),
+            "custom OpenAI-compatible endpoints must default to native tool calling"
         );
     }
 
     #[test]
-    fn custom_factory_honors_native_tools_override_true() {
+    fn custom_factory_honors_native_tools_override_false() {
         use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
         let cfg = CustomModelProviderConfig {
             base: ModelProviderConfig {
@@ -3343,15 +3343,15 @@ mod tests {
             },
         };
         let options = ModelProviderRuntimeOptions {
-            native_tools: Some(true),
+            native_tools: Some(false),
             ..Default::default()
         };
         let provider = cfg
             .create_provider("vllm", None, Some("http://10.0.0.15:8000/v1"), &options)
             .unwrap();
         assert!(
-            provider.supports_native_tools(),
-            "custom endpoints with `native_tools = true` must keep native tool calling available"
+            !provider.supports_native_tools(),
+            "custom endpoints with `native_tools = false` must use prompt-guided tools"
         );
     }
 

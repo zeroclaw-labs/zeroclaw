@@ -1139,6 +1139,12 @@ pub struct ModelProviderConfig {
     /// Set this only after confirming the configured endpoint and model
     /// accept the native tool schema. Providers routed through
     /// `wire_api = "responses"` are inherently native and ignore this setting.
+    /// Groq defaults to text-fallback because llama-family Groq models reject
+    /// native tool calls with HTTP 400; `native_tools = true` re-enables native
+    /// tool calling for Groq models that support it. Custom OpenAI-compatible
+    /// aliases default native tool calling on; set `native_tools = false` on
+    /// `[providers.models.custom.<alias>]` to opt out and skip the native
+    /// request.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
