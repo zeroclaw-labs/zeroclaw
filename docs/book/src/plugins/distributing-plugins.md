@@ -220,6 +220,10 @@ source set. Without an environment selection they retain the last deliberately
 refreshed cache, including a previous `--registry` search. Suggested commands
 include each entry's explicit origin rather than passing a JSON array as a URL,
 quoted at the host-aware POSIX/Windows/PowerShell command-rendering boundary.
+A copy-ready Windows install recipe is unavailable if any argument cannot be
+passed literally in both cmd.exe and PowerShell, such as a percent-encoded URL
+or a config path containing a literal percent sign. This does not invalidate
+registry metadata or disable structured installation.
 Successful search and Quickstart labels never print URL userinfo, query or
 fragment bytes; distinct raw URLs retain distinct opaque IDs. This does not
 claim redaction of existing error or executable-command surfaces.

@@ -1504,19 +1504,29 @@ async fn install_one<P: QuickstartPrompter>(
                 true,
             )
         } else {
-            zeroclaw_command(
+            Some(zeroclaw_command(
                 config,
                 &format!("plugin install {} --no-verify", admitted.manifest().name),
-            )
+            ))
         };
-        prompter.say(&indented(&qta(
-            "cli-quickstart-plugins-load-check-failed",
-            &[
-                ("name", &display_name),
-                ("error", &terminal_safe_detail(&format!("{error:#}"))),
-                ("command", &command),
-            ],
-        )));
+        if let Some(command) = command {
+            prompter.say(&indented(&qta(
+                "cli-quickstart-plugins-load-check-failed",
+                &[
+                    ("name", &display_name),
+                    ("error", &terminal_safe_detail(&format!("{error:#}"))),
+                    ("command", &command),
+                ],
+            )));
+        } else {
+            prompter.say(&indented(&qta(
+                "cli-quickstart-plugins-load-check-command-unavailable",
+                &[
+                    ("name", &display_name),
+                    ("error", &terminal_safe_detail(&format!("{error:#}"))),
+                ],
+            )));
+        }
         return Ok(PackageOutcome::Failed {
             name,
             stage: FailureStage::LoadCheck,
@@ -4067,10 +4077,38 @@ permissions = ["http_client"]
             Some(&origin),
             Some(crate::egress_command_config_dir(&workspace.config)),
             true,
-        );
+        )
+        .expect("ordinary registry retry is copy-ready");
         assert!(prompter.output().contains(&expected));
         assert!(expected.contains(&format!("{FIXTURE_NAME}@{FIXTURE_VERSION}")));
         assert!(expected.contains("--registry") && expected.contains("--no-verify"));
+        assert!(workspace.installed_packages().is_empty());
+        server.verify().await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_load_failure_retains_failure_without_unsafe_registry_retry() {
+        let server = MockServer::start().await;
+        serve_valid_archive(&server, 1).await;
+        let mut workspace = Workspace::new();
+        workspace.config.plugins.limits.max_instances = 1;
+        let mut picked = selection(fixture_entry(&server, Some(archive_digest())));
+        picked[0].registry_origin =
+            Some("https://registry.invalid/100%20team&echo=ZC_REGISTRY_MARKER".into());
+        let mut prompter = ScriptedPrompter::new([]);
+        let phase = run(&mut workspace, &picked, &mut prompter).await.unwrap();
+        assert!(matches!(
+            phase.outcomes[0],
+            PackageOutcome::Failed {
+                stage: FailureStage::LoadCheck,
+                ..
+            }
+        ));
+        let output = prompter.output();
+        assert!(!output.contains("ZC_REGISTRY_MARKER"));
+        assert!(!output.contains("--no-verify"));
+        assert!(!output.contains("# PowerShell only"));
         assert!(workspace.installed_packages().is_empty());
         server.verify().await;
     }

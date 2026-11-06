@@ -14,7 +14,7 @@ use zeroclaw_plugins::registry::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallableSkillCapability {
     name: String,
-    source: String,
+    source: Option<String>,
     aliases: Vec<String>,
     install_kind: InstallKind,
 }
@@ -29,20 +29,23 @@ enum InstallKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallSuggestion {
     name: String,
-    source: String,
+    source: Option<String>,
     matched: String,
     install_kind: InstallKind,
 }
 
 impl InstallSuggestion {
     pub fn render_user_message(&self) -> String {
+        let Some(source) = self.source.as_deref() else {
+            return crate::i18n::get_required_cli_string("cli-plugin-registry-command-unavailable");
+        };
         let (message_key, install_command) = match self.install_kind {
             InstallKind::Skill => (
                 "cli-skills-install-suggestion",
-                format!("zeroclaw skills install {}", self.source),
+                format!("zeroclaw skills install {source}"),
             ),
             #[cfg(feature = "plugins-wasm")]
-            InstallKind::Plugin => ("cli-plugin-install-suggestion", self.source.clone()),
+            InstallKind::Plugin => ("cli-plugin-install-suggestion", source.to_string()),
         };
         crate::i18n::get_required_cli_string_with_args(
             message_key,
@@ -239,7 +242,7 @@ fn load_toml_skill_package_metadata(
 
     Some(InstallableSkillCapability {
         name: manifest.skill.name,
-        source: source.to_string(),
+        source: Some(source.to_string()),
         aliases: manifest.skill.aliases,
         install_kind: InstallKind::Skill,
     })
@@ -254,7 +257,7 @@ fn load_markdown_skill_package_metadata(
     let meta = super::parse_simple_frontmatter(&frontmatter);
     Some(InstallableSkillCapability {
         name: meta.name.unwrap_or_else(|| fallback_name.to_string()),
-        source: source.to_string(),
+        source: Some(source.to_string()),
         aliases: Vec::new(),
         install_kind: InstallKind::Skill,
     })
@@ -358,7 +361,7 @@ struct RegistrySkillMeta {
 
 fn is_installed_skill(capability: &InstallableSkillCapability, installed_skills: &[Skill]) -> bool {
     let capability_name = normalize(&capability.name);
-    let capability_source = normalize(&capability.source);
+    let capability_source = normalize(capability.source.as_deref().unwrap_or_default());
     installed_skills.iter().any(|skill| {
         let skill_name = normalize(&skill.name);
         let plugin_skill_name = skill
@@ -386,7 +389,7 @@ fn is_installed_runtime_capability(
     installed_runtime_capabilities: &HashSet<String>,
 ) -> bool {
     std::iter::once(&capability.name)
-        .chain(std::iter::once(&capability.source))
+        .chain(capability.source.iter())
         .chain(capability.aliases.iter())
         .map(|name| normalize(name))
         .filter(|name| !name.is_empty())
@@ -453,7 +456,7 @@ mod tests {
     fn catalog_entry(name: &str, aliases: &[&str]) -> InstallableSkillCapability {
         InstallableSkillCapability {
             name: name.to_string(),
-            source: name.to_string(),
+            source: Some(name.to_string()),
             aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
             install_kind: InstallKind::Skill,
         }
@@ -525,6 +528,34 @@ mod tests {
             let suggestion = suggest_missing_skill_install(prompt, &[], &[], &catalog).unwrap();
             assert!(suggestion.render_user_message().contains(expected));
         }
+    }
+
+    #[cfg(all(windows, feature = "plugins-wasm"))]
+    #[test]
+    fn windows_cached_plugin_suggestion_keeps_metadata_but_has_no_unsafe_recipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: zeroclaw_plugins::registry::RegistryCollection =
+            serde_json::from_value(serde_json::json!({
+                "registries": [{"registry_url":"https://registry.invalid/100%20team", "plugins":[{
+                    "name":"calendar", "version":"1%PATH% & echo ZC_REGISTRY_MARKER",
+                    "description":"personal calendar", "url":"https://download.invalid/p.zip"
+                }]}]
+            }))
+            .unwrap();
+        zeroclaw_plugins::registry::write_cached_registry_collection(dir.path(), &data).unwrap();
+        let catalog = load_cached_installable_plugin_capabilities_for_sources(dir.path(), None);
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "calendar");
+        assert_eq!(catalog[0].source, None);
+        let suggestion =
+            suggest_missing_skill_install("use personal calendar", &[], &[], &catalog).unwrap();
+        let message = suggestion.render_user_message();
+        assert_eq!(
+            message,
+            crate::i18n::get_required_cli_string("cli-plugin-registry-command-unavailable")
+        );
+        assert!(!message.contains("ZC_REGISTRY_MARKER"));
+        assert!(!message.contains("zeroclaw plugin install"));
     }
 
     #[test]
@@ -620,7 +651,7 @@ mod tests {
         .expect("missing high-confidence skill should suggest installation");
 
         assert_eq!(suggestion.name, "calendar");
-        assert_eq!(suggestion.source, "calendar");
+        assert_eq!(suggestion.source.as_deref(), Some("calendar"));
         assert_eq!(suggestion.matched, "google calendar");
         assert!(
             suggestion
@@ -682,7 +713,7 @@ tags = ["scheduling"]
 
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "calendar");
-        assert_eq!(catalog[0].source, "calendar");
+        assert_eq!(catalog[0].source.as_deref(), Some("calendar"));
 
         let body_only_match = suggest_missing_skill_install(
             "please use body only secret phrase for this",
@@ -732,7 +763,7 @@ aliases = ["release check"]
         );
 
         assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].source, "release-check");
+        assert_eq!(catalog[0].source.as_deref(), Some("release-check"));
         assert!(suggestion.is_some());
     }
 
@@ -798,8 +829,14 @@ aliases = ["team calendar"]
 
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "team-calendar");
-        assert_eq!(catalog[0].source, "registry:acme/team-calendar");
-        assert_eq!(suggestion.source, "registry:acme/team-calendar");
+        assert_eq!(
+            catalog[0].source.as_deref(),
+            Some("registry:acme/team-calendar")
+        );
+        assert_eq!(
+            suggestion.source.as_deref(),
+            Some("registry:acme/team-calendar")
+        );
         assert!(
             suggestion
                 .render_user_message()

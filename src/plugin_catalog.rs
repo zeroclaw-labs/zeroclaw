@@ -93,13 +93,14 @@ fn render(entries: &[PluginCatalogEntry<'_>], config_dir: &std::path::Path) {
                 Some(config_dir),
                 false,
             );
-            println!(
-                "{}",
-                get_required_cli_string_with_args(
+            let hint = match command {
+                Some(command) => get_required_cli_string_with_args(
                     "cli-plugin-registry-command",
-                    &[("command", &command)]
-                )
-            );
+                    &[("command", &command)],
+                ),
+                None => get_required_cli_string("cli-plugin-registry-command-unavailable"),
+            };
+            println!("{hint}");
         }
     }
 }

@@ -436,13 +436,16 @@ pub fn registry_origin_label(origin: &str) -> String {
     )
 }
 /// Raw arguments are quoted only once, for the operator's host shell.
+/// Returns `None` when a Windows copy-ready command cannot preserve every
+/// argument in both cmd.exe and PowerShell. This does not reject registry data
+/// or prevent structured installation. Explicit PowerShell is shell-specific.
 pub fn registry_install_command_for(
     dialect: ShellDialect,
     entry: &PluginRegistryEntry,
     origin: Option<&str>,
     config_dir: Option<&Path>,
     no_verify: bool,
-) -> String {
+) -> Option<String> {
     let spec = install_source(entry);
     let dir = config_dir.map(|path| path.to_string_lossy().into_owned());
     let mut values = vec![spec.as_str()];
@@ -452,7 +455,17 @@ pub fn registry_install_command_for(
     if let Some(dir) = dir.as_deref() {
         values.push(dir);
     }
-    let (dialect, marker) = dialect.command_form(&values);
+    // A marked PowerShell recipe is not inert in cmd.exe: separators can run.
+    if dialect == ShellDialect::Windows
+        && !values.iter().all(|value| {
+            windows_form_is_literal(value)
+                // PowerShell also treats these smart double quotes as string
+                // delimiters, even when the opening delimiter is ASCII.
+                && !value.chars().any(|c| matches!(c, '\u{201c}' | '\u{201d}' | '\u{201e}'))
+        })
+    {
+        return None;
+    }
     let arg = |raw: &str| {
         if raw
             .chars()
@@ -464,7 +477,7 @@ pub fn registry_install_command_for(
             dialect.quote_literal(raw)
         }
     };
-    let mut command = format!("{marker}zeroclaw");
+    let mut command = "zeroclaw".to_string();
     if let Some(dir) = dir.as_deref() {
         command.push_str(&format!(" --config-dir {}", dialect.quote_literal(dir)));
     }
@@ -475,7 +488,7 @@ pub fn registry_install_command_for(
     if no_verify {
         command.push_str(" --no-verify");
     }
-    command
+    Some(command)
 }
 /// The quoting dialect of the shell an operator pastes a printed command into.
 ///
@@ -497,9 +510,8 @@ pub enum ShellDialect {
     Posix,
     /// PowerShell (`powershell`, `pwsh`) on its own: single quotes protect
     /// every character but the single quote itself, which is doubled
-    /// (`'it''s'`). This form is never printed unmarked; it is what a
-    /// [`Self::Windows`] line falls back to, behind [`POWERSHELL_ONLY_MARKER`],
-    /// when a value cannot be passed literally from `cmd.exe`.
+    /// (`'it''s'`). Only suitable when the receiving shell is known to be
+    /// PowerShell; it is not a copy-ready Windows console form.
     PowerShell,
     /// A Windows console, whichever of `cmd.exe` and PowerShell is running it:
     /// one double-quoted argument, which both shells hand to the native binary
@@ -533,15 +545,11 @@ pub fn windows_form_is_literal(raw: &str) -> bool {
             .any(|c| matches!(c, '"' | '%' | '!' | '$' | '`') || c.is_control())
 }
 
-/// The prefix of a Windows command line whose value cannot be passed literally
-/// from `cmd.exe`.
+/// Legacy advisory prefix for a shell-specific PowerShell command.
 ///
-/// It begins with `#`, which `cmd.exe` cannot run and PowerShell reads as a
-/// comment to the end of the line, so pasting the whole line into either shell
-/// executes nothing. The command after the marker is the
-/// [`ShellDialect::PowerShell`] form, and the marker says so: the operator
-/// copies that part into PowerShell alone, where single quotes make every byte
-/// literal.
+/// WARNING: this is not an execution guard. cmd.exe does not recognize `#` as
+/// a comment, and separators later in the line can execute. Copy-ready registry
+/// commands return `None` instead of using this fallback.
 pub const POWERSHELL_ONLY_MARKER: &str =
     "# PowerShell only, cmd.exe cannot pass this value literally: ";
 
@@ -562,9 +570,8 @@ impl ShellDialect {
     ///
     /// For [`Self::Windows`] that promise holds only while
     /// [`windows_form_is_literal`] does; a value outside it is rendered in the
-    /// [`Self::PowerShell`] form, and it is the command renderer's job
-    /// ([`Self::command_form`]) to mark the whole line so `cmd.exe` never runs
-    /// it.
+    /// [`Self::PowerShell`] form. That fallback is not safe in cmd.exe;
+    /// copy-ready callers must refuse unsupported Windows values first.
     #[must_use]
     pub fn quote_literal(self, raw: &str) -> String {
         match self {
@@ -581,8 +588,8 @@ impl ShellDialect {
     /// Every dialect but [`Self::Windows`] renders itself, unmarked. A Windows
     /// line renders itself only when every value passes
     /// [`windows_form_is_literal`]; otherwise the line is the PowerShell form
-    /// behind [`POWERSHELL_ONLY_MARKER`], so that no part of it can execute in
-    /// `cmd.exe` and the shell it is meant for is named in the line itself.
+    /// behind [`POWERSHELL_ONLY_MARKER`]. This is legacy advisory labeling,
+    /// not a safety boundary: cmd.exe may execute separators in that line.
     #[must_use]
     pub fn command_form(self, values: &[&str]) -> (Self, &'static str) {
         match self {
@@ -798,29 +805,107 @@ mod tests {
         let entry = &sample_index().plugins[0];
         let origin = "https://registry.example/index?channel=stable&team=one";
         let posix =
-            registry_install_command_for(ShellDialect::Posix, entry, Some(origin), None, false);
+            registry_install_command_for(ShellDialect::Posix, entry, Some(origin), None, false)
+                .unwrap();
         assert!(posix.ends_with(&format!("--registry '{origin}'")));
-        let windows =
-            registry_install_command_for(ShellDialect::Windows, entry, Some(origin), None, false);
-        assert!(windows.ends_with(&format!("--registry \"{origin}\"")));
-        assert!(!windows.starts_with(POWERSHELL_ONLY_MARKER));
-        let tricky = "https://registry.example/index?team=it's%20mine";
-        let powershell =
-            registry_install_command_for(ShellDialect::PowerShell, entry, Some(tricky), None, true);
-        assert!(powershell.contains("team=it''s%20mine'"));
-        let fallback =
-            registry_install_command_for(ShellDialect::Windows, entry, Some(tricky), None, true);
-        assert_eq!(fallback, format!("{POWERSHELL_ONLY_MARKER}{powershell}"));
-        assert!(fallback.ends_with(" --no-verify"));
-        let configured = registry_install_command_for(
+        let windows = registry_install_command_for(
             ShellDialect::Windows,
             entry,
             Some(origin),
-            Some(Path::new("C:/profiles/100%team")),
-            false,
+            Some(Path::new("C:/profiles/team one")),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            windows,
+            format!(
+                r#"zeroclaw --config-dir "C:/profiles/team one" plugin install {} --registry "{origin}" --no-verify"#,
+                install_source(entry),
+            )
         );
-        assert!(configured.starts_with(POWERSHELL_ONLY_MARKER));
-        assert!(configured.contains("--config-dir 'C:/profiles/100%team'"));
+        assert!(
+            !registry_install_command_for(ShellDialect::Windows, entry, Some(origin), None, false,)
+                .unwrap()
+                .contains("--no-verify")
+        );
+        assert_eq!(
+            registry_install_command_for(
+                ShellDialect::Windows,
+                entry,
+                Some(origin),
+                Some(Path::new("C:/profiles/100%team")),
+                false,
+            ),
+            None
+        );
+        let tricky = "https://registry.example/index?team=it's%20mine";
+        let powershell =
+            registry_install_command_for(ShellDialect::PowerShell, entry, Some(tricky), None, true)
+                .unwrap();
+        assert!(powershell.contains("team=it''s%20mine'"));
+        assert!(powershell.ends_with(" --no-verify"));
+        assert_eq!(
+            registry_install_command_for(ShellDialect::Windows, entry, Some(tricky), None, true,),
+            None
+        );
+    }
+
+    #[test]
+    fn registry_copy_ready_boundary_refuses_unsafe_windows_values_only() {
+        let ordinary = sample_index().plugins.remove(0);
+        for raw in [
+            "1%PATH% & echo ZC_REGISTRY_MARKER",
+            "1!PATH!",
+            r#"1" & echo ZC_REGISTRY_MARKER"#,
+            "1$HOME",
+            "1`echo ZC_REGISTRY_MARKER`",
+            "1\u{201c}",
+            "1\u{201d}",
+            "1\u{201e}",
+            "1”; echo ZC_REGISTRY_HARMLESS_MARKER_12216; echo “",
+            "1\rnext",
+            "1\nnext",
+            "1\\",
+        ] {
+            let mut entry = ordinary.clone();
+            entry.version = raw.into();
+            let mut named_entry = ordinary.clone();
+            named_entry.name = raw.into();
+            for (entry, origin, dir) in [
+                (&entry, None, None),
+                (&named_entry, None, None),
+                (&ordinary, Some(raw), None),
+                (&ordinary, None, Some(Path::new(raw))),
+            ] {
+                assert_eq!(
+                    registry_install_command_for(ShellDialect::Windows, entry, origin, dir, true,),
+                    None,
+                    "{raw:?}"
+                );
+                for dialect in [ShellDialect::Posix, ShellDialect::PowerShell] {
+                    assert!(
+                        registry_install_command_for(dialect, entry, origin, dir, true).is_some()
+                    );
+                }
+            }
+        }
+        // Separators, caret and parentheses remain data inside the shared
+        // double-quoted subset. They do not by themselves require suppression.
+        for raw in [
+            "1 & echo ZC_REGISTRY_MARKER",
+            "1|echo ZC_REGISTRY_MARKER",
+            "1;echo ZC_REGISTRY_MARKER",
+            "1^(team)",
+            "1's team",
+            "1café日历",
+        ] {
+            let mut entry = ordinary.clone();
+            entry.version = raw.into();
+            let command =
+                registry_install_command_for(ShellDialect::Windows, &entry, None, None, false)
+                    .unwrap();
+            assert!(command.contains(&format!(r#""{}""#, install_source(&entry))));
+        }
     }
 
     #[test]

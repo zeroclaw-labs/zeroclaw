@@ -573,12 +573,14 @@ path, spaces included, always qualify. When a value does not (it contains `"`,
 shape a hostile manifest would declare), the whole line is printed instead as
 the marker `# PowerShell only, cmd.exe cannot pass this value literally:`
 followed by a space and the PowerShell form, where an embedded quote is
-doubled (`''`). Pasted whole, that
-line runs nothing in either shell (`cmd.exe` cannot run `#`, and PowerShell
-reads it as a comment); copy the command after the marker into PowerShell
-alone. `cmd.exe` has no quoting that keeps such a value literal (`%name%`
-expands inside its double quotes, and a single quote is an ordinary character
-there), so it is never trusted with one.
+doubled (`''`). This legacy marker is advisory, not an execution guard: PowerShell treats
+it as a comment, but cmd.exe does not, and separators later in the line may
+execute. Do not paste a marked PowerShell line into cmd.exe; use only the
+command after the marker in a known PowerShell session. Copy-ready registry
+install commands do not use this fallback: when any argument is outside the
+shared Windows literal subset (including control characters), the install
+recipe is unavailable. The registry entry and structured installation remain
+available. Ordinary spaces and URL query ampersands are still supported.
 
 `zeroclaw plugin list` repeats the same comparison as a standing diagnostic,
 one instance at a time, for every installed plugin holding `http_client`,
