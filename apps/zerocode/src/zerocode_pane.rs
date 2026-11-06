@@ -366,6 +366,10 @@ impl ZerocodePane {
         self.conn_edit.is_some()
     }
 
+    pub(crate) fn capturing_key(&self) -> bool {
+        self.capture.is_some()
+    }
+
     pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
         self.capture.is_some()
             || self.conn_edit.is_some()
