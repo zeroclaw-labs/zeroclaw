@@ -2144,6 +2144,23 @@ pub async fn handle_api_session_rename(
     }
 }
 
+// Config owns the current aliases; deletion cannot retire an alias with active
+// work. Lifecycle leases own activity, independent of transport or persistence.
+fn runtime_work_is_busy(state: &AppState) -> bool {
+    use zeroclaw_runtime::live_config_authority::AgentDeleteBlocker;
+    state.config.read().agents.keys().any(|alias| {
+        state.agent_lifecycle.active_turn_count(alias) > 0
+            || matches!(
+                state.agent_lifecycle.delete_blocker(alias),
+                Some(
+                    AgentDeleteBlocker::Reservations { .. }
+                        | AgentDeleteBlocker::Deleting { .. }
+                        | AgentDeleteBlocker::GenerationClosing
+                )
+            )
+    })
+}
+
 /// GET /api/sessions/running — list sessions currently in "running" state
 pub async fn handle_api_sessions_running(
     State(state): State<AppState>,
@@ -2153,8 +2170,12 @@ pub async fn handle_api_sessions_running(
         return e.into_response();
     }
 
+    // Runtime admission owns activity for every transport; persisted session
+    // metadata alone only covers a subset of active callers.
+    let busy = runtime_work_is_busy(&state);
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
+            "busy": busy,
             "sessions": [],
             "message": "Session persistence is disabled"
         }))
@@ -2175,7 +2196,7 @@ pub async fn handle_api_sessions_running(
         })
         .collect();
 
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+    Json(serde_json::json!({ "busy": busy, "sessions": sessions })).into_response()
 }
 
 /// GET /api/sessions/{id}/state — get session state
@@ -3258,6 +3279,45 @@ pub(crate) mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_sessions_running_reports_runtime_work_without_persisted_sessions() {
+        let mut config = config_with_telegram("default");
+        config.agents.insert(
+            "test-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let state = test_state(config);
+        assert!(state.session_backend.is_none());
+        // These leases are the same source used by web, RPC and channel turns.
+        let lease = state.agent_lifecycle.reserve_turn("test-agent").unwrap();
+        let response = handle_api_sessions_running(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["busy"], true);
+        assert_eq!(body["sessions"], serde_json::json!([]));
+        drop(lease);
+        let response = handle_api_sessions_running(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["busy"], false);
+        let reservation = state
+            .agent_lifecycle
+            .reserve_admission("test-agent")
+            .unwrap();
+        assert!(runtime_work_is_busy(&state));
+        drop(reservation);
+        state.agent_lifecycle.close_generation();
+        assert!(runtime_work_is_busy(&state));
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
