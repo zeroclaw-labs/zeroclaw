@@ -444,6 +444,12 @@ impl AccountedChatScope {
     }
 }
 
+/// The currently selected streaming candidate, before semantic acceptance.
+/// Consumers may resolve its configuration but must not commit attribution.
+pub fn current_provisional_provider_route() -> Option<AcceptedRoute> {
+    crate::reliable::current_provisional_provider_route()
+}
+
 /// Commit a semantically accepted route for the existing fallback presenter.
 ///
 /// Passing `None` clears a prior candidate. Call this only after the runtime

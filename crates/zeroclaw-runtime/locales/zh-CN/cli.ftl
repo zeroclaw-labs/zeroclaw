@@ -951,6 +951,7 @@ cli-config-capped-key-lowered = 警告：已将 {$path} 中的配置键 `{$key}`
 cli-config-capped-reason-pairing-code-ttl = 配对码最长可在 600 秒（10 分钟）内使用
 cli-config-retired-reason-nevis = Nevis IAM 集成已移除；请改为配置 `[oidc.<alias>]` 以及 `[users]` 和 `[permission_profiles]`
 cli-config-retired-reason-agent-tunable = 不再读取写在代理中的运行时调优项；运行时配置文件具有决定权，因此请在该代理的 `[runtime_profiles.<profile>]` 中设置此键
+cli-config-retired-reason-text-tool-parsing = 文本工具调用解析改为按聊天模型配置；请使用 `options.extract_text_tool_calls = false` 替代 `strict_tool_parsing = true`
 cli-config-retired-reason-summary-model = 已弃用的裸模型 ID 没有提供商标识，且从未被读取；它已由 `summary_provider` 取代（上下文压缩本身目前尚未在运行时中实现）
 cli-config-retired-reason-node-transport = 旧版 HMAC 节点传输已移除
 cli-config-retired-reason-wati = WATI 支持已移除；请使用 Cloud API 或 WhatsApp Web 迁移到 `[channels.whatsapp.<alias>]`，然后吊销不再使用的 WATI API 令牌
@@ -1219,7 +1220,6 @@ channel-runtime-fallback-footer =
     切换模型：/models
 channel-runtime-model-fallback-redacted = ⚡ 请求的模型不可用；此回复由备用模型生成。
 delegate-provider-fallback-warning = 警告：委派的代理已通过提供商回退机制恢复。提供商故障详细信息已记录日志，未包含在此结果中。
-turn-tool-protocol-strict-mixed-error = 严格工具解析无法运行混合 native-tool 和 text-only 候选项的回退链。请将每个可到达的候选项配置为使用相同的工具协议，或将 strict_tool_parsing 设置为 false。
 delegate-provider-fallback-header = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }）]
 delegate-provider-fallback-header-agentic = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }，代理式）]
 cli-alias-list-empty = （{$section} 下无条目）

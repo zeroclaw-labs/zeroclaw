@@ -103,6 +103,9 @@ pub struct RetiredKey {
     pub reason_id: &'static str,
 }
 
+const RETIRED_TEXT_TOOL_PARSING: &str = "text tool parsing is configured per chat model; use \
+    `options.extract_text_tool_calls = false` instead of `strict_tool_parsing = true`";
+
 /// Every retired key, applied by the migration chain when it reaches
 /// `retired_in`, and again on every load of a current config so a key that
 /// reappears is dropped with a notice rather than silently ignored. Retiring
@@ -164,8 +167,14 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         retired_in: 4,
         path: &["agents", ANY_KEY, "strict_tool_parsing"],
-        reason: INERT_AGENT_TUNABLE,
-        reason_id: "cli-config-retired-reason-agent-tunable",
+        reason: RETIRED_TEXT_TOOL_PARSING,
+        reason_id: "cli-config-retired-reason-text-tool-parsing",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["runtime_profiles", ANY_KEY, "strict_tool_parsing"],
+        reason: RETIRED_TEXT_TOOL_PARSING,
+        reason_id: "cli-config-retired-reason-text-tool-parsing",
     },
     RetiredKey {
         retired_in: 4,
@@ -7697,6 +7706,10 @@ model = "fast-model"
         (
             "agents.x.strict_tool_parsing",
             "[agents.x]\nstrict_tool_parsing = true\n",
+        ),
+        (
+            "runtime_profiles.x.strict_tool_parsing",
+            "[runtime_profiles.x]\nstrict_tool_parsing = true\n",
         ),
         (
             "runtime_profiles.x.context_compression.summary_model",

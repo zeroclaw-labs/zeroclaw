@@ -494,14 +494,25 @@ pub(crate) async fn finish_after_max_iterations(
     // The summary is raw provider text, and emitting it as a chunk makes this
     // a new automatic display sink: ACP renders `agent_message_chunk` live,
     // while gateway and RPC forward the same chunk without another
-    // normalization step. Apply the display hygiene the ordinary final
-    // response already gets before anything is emitted -- strip hidden think
-    // content and trailing terminal markers, then withhold text that looks
-    // like an internal tool-protocol envelope. The summary call passes
-    // `tools: None`, so the tools-free detector is the matching contract.
-    let display_text = strip_trailing_terminal_markers(&strip_think_tags(&raw_text));
-    let protocol_suppressed =
-        super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
+    // normalization step. Apply the accepted model's extraction policy before
+    // emitting anything, just as for an ordinary final response.
+    let served_ref = summary_attempts
+        .iter()
+        .rev()
+        .find(|attempt| attempt.accepted)
+        .map_or(provider_name, |attempt| attempt.provider_ref.as_str());
+    let extraction: zeroclaw_config::provider_registry::TextExtraction = config
+        .map_or_else(Default::default, |config| {
+            config.model_text_extraction(served_ref)
+        });
+    let display_text = if extraction.reasoning {
+        strip_think_tags(&raw_text)
+    } else {
+        raw_text.clone()
+    };
+    let display_text = strip_trailing_terminal_markers(&display_text);
+    let protocol_suppressed = extraction.tool_calls
+        && super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
     if protocol_suppressed {
         ::zeroclaw_log::record!(
             WARN,

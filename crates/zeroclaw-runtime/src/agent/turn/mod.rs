@@ -743,17 +743,19 @@ fn apply_builtin_prompt_scope(
     effective_names: &HashSet<String>,
     deferred_section: &str,
     use_native_tools: bool,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
     max_system_prompt_chars: usize,
     mut canonical_prompt: Option<&str>,
 ) {
     let names: HashSet<&str> = effective_names.iter().map(String::as_str).collect();
-    let instructions =
-        if use_native_tools || strict_tool_parsing || effective_names.contains("tool_search") {
-            String::new()
-        } else {
-            crate::agent::loop_::build_tool_instructions_for_names(tools_registry, &names)
-        };
+    let instructions = if use_native_tools
+        || text_tool_calls_disabled
+        || effective_names.contains("tool_search")
+    {
+        String::new()
+    } else {
+        crate::agent::loop_::build_tool_instructions_for_names(tools_registry, &names)
+    };
     for message in messages
         .iter_mut()
         .filter(|message| message.role == "system")
@@ -798,7 +800,7 @@ fn apply_builtin_prompt_scope(
         ] {
             if heading != "## Deferred Built-in Tools\n"
                 && (use_native_tools
-                    || strict_tool_parsing
+                    || text_tool_calls_disabled
                     || effective_names.contains("tool_search"))
             {
                 continue;
@@ -1735,7 +1737,7 @@ async fn run_tool_call_loop_impl<'a>(
         activated_tools,
         model_switch_callback,
         pacing,
-        strict_tool_parsing,
+        text_tool_calls_disabled,
         parallel_tools,
         max_tool_result_chars,
         keep_tool_context_turns,
@@ -1930,7 +1932,10 @@ async fn run_tool_call_loop_impl<'a>(
         hooks,
         dedup_exempt_tools,
         pacing,
-        strict_tool_parsing,
+        text_tool_calls_disabled,
+        extract_text_reasoning: config.map_or(true, |config| {
+            config.model_text_extraction(provider_name).reasoning
+        }),
         channel,
         draft_reasoning: knobs.draft_reasoning,
         turn_id,
@@ -2331,6 +2336,12 @@ async fn run_tool_call_loop_impl<'a>(
             provider_request_model,
             active_context_limits,
         );
+        if let Some(config) = config {
+            let extraction = config.model_text_extraction(active_model_provider_name);
+            ctx.extract_text_reasoning = extraction.reasoning;
+            ctx.text_tool_calls_disabled = !extraction.tool_calls;
+        }
+        let text_tool_calls_disabled = ctx.text_tool_calls_disabled;
         ctx.temperature = temperature_input.for_call(
             sampling_config.clone(),
             if vision_model_provider_box.is_some() {
@@ -2355,7 +2366,7 @@ async fn run_tool_call_loop_impl<'a>(
                 if iteration_tool_specs
                     .known_tool_names
                     .contains("tool_search")
-                    && (use_native_tools || !strict_tool_parsing)
+                    && (use_native_tools || !text_tool_calls_disabled)
                 {
                     state.deferred_builtin_prompt_section_filtered(|name| {
                         iteration_tool_specs.known_tool_names.contains(name)
@@ -2395,7 +2406,7 @@ async fn run_tool_call_loop_impl<'a>(
                 &iteration_tool_specs.known_tool_names,
                 section,
                 use_native_tools,
-                strict_tool_parsing,
+                text_tool_calls_disabled,
                 max_system_prompt_chars,
                 turn_state
                     .history
@@ -2566,7 +2577,7 @@ async fn run_tool_call_loop_impl<'a>(
                         &iteration_tool_specs.known_tool_names,
                         section,
                         use_native_tools,
-                        strict_tool_parsing,
+                        text_tool_calls_disabled,
                         max_system_prompt_chars,
                         turn_state
                             .history
@@ -2775,20 +2786,6 @@ async fn run_tool_call_loop_impl<'a>(
             single_tool_limitation_reported = true;
         }
 
-        if strict_tool_parsing
-            && !tool_specs.is_empty()
-            && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
-        {
-            return Err(zeroclaw_providers::ProviderCapabilityError {
-                model_provider: active_model_provider_name.to_string(),
-                capability: "tool_protocol".to_string(),
-                message: crate::i18n::get_required_cli_string(
-                    "turn-tool-protocol-strict-mixed-error",
-                ),
-            }
-            .into());
-        }
-
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
@@ -2850,6 +2847,7 @@ async fn run_tool_call_loop_impl<'a>(
             image_recovery_succeeded,
         } = call_provider(
             &ctx,
+            config,
             active_model_provider,
             active_model_provider_name,
             provider_request_model,
@@ -2946,7 +2944,13 @@ async fn run_tool_call_loop_impl<'a>(
         };
         // Usage frames, recovery arithmetic and the terminal snapshot all
         // consume the accepted selection's freshly resolved limits.
-        let ctx = base_ctx.for_route(&served_provider, served_model_key, served_context_limits);
+        let mut ctx = base_ctx.for_route(&served_provider, served_model_key, served_context_limits);
+        if let Some(config) = config {
+            let extraction =
+                config.model_text_extraction(accepted_selection.unwrap_or(&served_provider));
+            ctx.extract_text_reasoning = extraction.reasoning;
+            ctx.text_tool_calls_disabled = !extraction.tool_calls;
+        }
 
         // Reliable providers classify this before retries and fallback. Keep
         // the turn-level guard for direct/unwrapped providers: a transport
@@ -2954,7 +2958,11 @@ async fn run_tool_call_loop_impl<'a>(
         // This runs before response-success telemetry and history mutation.
         let chat_result = chat_result.and_then(|response| {
             if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
-                && iteration_tool_specs.exceeds_single_tool_round(&response, strict_tool_parsing)
+                && iteration_tool_specs.exceeds_single_tool_round(
+                    &response,
+                    ctx.text_tool_calls_disabled,
+                    ctx.extract_text_reasoning,
+                )
             {
                 return Err(single_tool_round_error());
             }
@@ -3775,7 +3783,7 @@ async fn run_tool_call_loop_impl<'a>(
                 activated_tools,
                 model_switch_callback.clone(),
                 pacing,
-                strict_tool_parsing,
+                text_tool_calls_disabled,
                 parallel_tools,
                 max_tool_result_chars,
                 context_limits,
@@ -4004,7 +4012,7 @@ fn step_needs_reassembly(current_alias: Option<&str>, step_alias: Option<&str>) 
 /// profile under the PARENT surface's interactivity mode, so a live approval
 /// route survives delegation), the deferred-MCP activation set, the step
 /// agent's resolved runtime controls (`ResolvedRuntime`: iteration/result/
-/// context limits, strict parsing, parallelism, dedup exemptions, tool filter
+/// context limits, parallelism, dedup exemptions, tool filter
 /// groups), and the inputs to build the step agent's own system prompt.
 /// `LoopKnobs` deliberately stays parent-threaded: it encodes the calling
 /// surface's shape, not agent policy.
@@ -4356,7 +4364,9 @@ fn build_owned_step_system_prompt(
         &owned.tools_registry,
         excluded_tools,
         owned.activated_tools.as_ref(),
-        owned.agent.resolved.strict_tool_parsing,
+        !config
+            .model_text_extraction(&owned.provider_name)
+            .tool_calls,
         owned.agent.resolved.prompt_injection_mode,
         owned.agent.resolved.compact_context,
         owned.agent.resolved.max_system_prompt_chars,
@@ -4409,7 +4419,7 @@ async fn drive_live_sop_actions(
     // `Arc` here and assert it is untouched after a nested step's switch.
     _model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &zeroclaw_config::schema::PacingConfig,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
     parallel_tools: bool,
     max_tool_result_chars: usize,
     context_limits: zeroclaw_config::schema::ResolvedContextLimits,
@@ -4714,7 +4724,7 @@ async fn drive_live_sop_actions(
                         let (
                             eff_temperature,
                             eff_max_tool_iterations,
-                            eff_strict_tool_parsing,
+                            eff_text_tool_calls_disabled,
                             eff_parallel_tools,
                             eff_max_tool_result_chars,
                             eff_context_limits,
@@ -4724,7 +4734,7 @@ async fn drive_live_sop_actions(
                             Some(o) => (
                                 zeroclaw_providers::temperature::Temperature::default(),
                                 o.agent.resolved.max_tool_iterations,
-                                o.agent.resolved.strict_tool_parsing,
+                                false,
                                 o.agent.resolved.parallel_tools,
                                 o.agent.resolved.max_tool_result_chars,
                                 o.agent.resolved.context_limits(),
@@ -4742,7 +4752,7 @@ async fn drive_live_sop_actions(
                             None => (
                                 temperature,
                                 max_tool_iterations,
-                                strict_tool_parsing,
+                                text_tool_calls_disabled,
                                 parallel_tools,
                                 max_tool_result_chars,
                                 context_limits,
@@ -4907,7 +4917,7 @@ async fn drive_live_sop_actions(
                                             excluded_tools: &sop_excluded_tools,
                                             dedup_exempt_tools: eff_dedup_exempt_tools,
                                             pacing: eff_pacing,
-                                            strict_tool_parsing: eff_strict_tool_parsing,
+                                            text_tool_calls_disabled: eff_text_tool_calls_disabled,
                                             parallel_tools: eff_parallel_tools,
                                             max_tool_result_chars: eff_max_tool_result_chars,
                                             // A live SOP step runs on the caller's
@@ -6769,7 +6779,8 @@ mod active_route_context_tests {
             hooks: None,
             dedup_exempt_tools: &dedup_exempt_tools,
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "vision-route-context",
@@ -7158,7 +7169,7 @@ vision_model_provider = "custom.vision"
                     excluded_tools: &[],
                     dedup_exempt_tools: &[],
                     pacing: &pacing,
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 100_000,
                     keep_tool_context_turns: 2,
@@ -8507,7 +8518,7 @@ mod sop_step_reassembly_tests {
                     excluded_tools: &[],
                     dedup_exempt_tools: &[],
                     pacing: &pacing,
-                    strict_tool_parsing: false,
+                    text_tool_calls_disabled: false,
                     parallel_tools: false,
                     max_tool_result_chars: 30_000,
                     keep_tool_context_turns,
@@ -11375,7 +11386,7 @@ mod tool_lifecycle_abandonment_tests {
                 activated_tools: None,
                 model_switch_callback: None,
                 pacing,
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
                 parallel_tools,
                 max_tool_result_chars: 0,
                 keep_tool_context_turns: 2,

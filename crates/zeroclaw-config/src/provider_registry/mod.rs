@@ -16,7 +16,9 @@ pub use api::*;
 pub use connection::*;
 pub use ids::{ModelRef, PresetId, ProviderId};
 pub use model::*;
-pub use options::{AsrOptionsPatch, ChatOptionsPatch, ModelPreset, Preset, TtsOptionsPatch};
+pub use options::{
+    AsrOptionsPatch, ChatOptionsPatch, ModelPreset, Preset, TextExtraction, TtsOptionsPatch,
+};
 pub use override_value::Override;
 pub use registry::{ModelSelection, ProviderRegistry, RegistryError};
 pub use resolve::{ResolvedAsr, ResolvedChat, ResolvedDecision, ResolvedEmbedding, ResolvedTts};

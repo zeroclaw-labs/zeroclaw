@@ -3857,11 +3857,11 @@ fn system_prompt_for_channel_turn(
 
 fn callable_protocol_exposed_for_channel_turn(
     native_tool_specs_present: bool,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
     system_prompt: &str,
 ) -> bool {
     native_tool_specs_present
-        || (!strict_tool_parsing && text_tool_protocol_advertised(system_prompt))
+        || (!text_tool_calls_disabled && text_tool_protocol_advertised(system_prompt))
 }
 
 fn channel_tool_available_for_turn(
@@ -6213,7 +6213,7 @@ fn sanitize_streaming_draft_text(s: &str, known_tool_names: &HashSet<String>) ->
 
     // Same classifier the delivered message is judged by, for the same reason:
     // XML tags are only one of the shapes protocol arrives in. A provider with
-    // `strict_tool_parsing` enabled forwards deltas without passing them
+    // `text_tool_calls_disabled` enabled forwards deltas without passing them
     // through the runtime's `StreamTextGuard`, so a bare or fenced protocol
     // JSON body reaches this boundary exactly as the model emitted it. The
     // classifier is partial-aware where it matters — an envelope whose JSON has
@@ -9832,7 +9832,9 @@ async fn process_channel_message_body(
         .unwrap_or(false);
     let callable_protocol_exposed = callable_protocol_exposed_for_channel_turn(
         per_turn_native_tool_specs_present,
-        ctx.agent_cfg.resolved.strict_tool_parsing,
+        !ctx.prompt_config
+            .model_text_extraction(route.model_provider.as_str())
+            .tool_calls,
         ctx.system_prompt.as_str(),
     );
     let route_differs_from_startup = route.model_provider.as_str()
@@ -10553,7 +10555,10 @@ async fn process_channel_message_body(
                         excluded_tools,
                         dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
                         pacing: &ctx.pacing,
-                        strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
+                        text_tool_calls_disabled: !runtime_defaults
+                            .config
+                            .model_text_extraction(route.model_provider.as_str())
+                            .tool_calls,
                         parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
                         max_tool_result_chars: ctx.max_tool_result_chars,
                         keep_tool_context_turns: ctx.agent_cfg.resolved.keep_tool_context_turns,
@@ -10740,7 +10745,9 @@ async fn process_channel_message_body(
                             .unwrap_or(false);
                         let callable_protocol_exposed = callable_protocol_exposed_for_channel_turn(
                             switched_native_tool_specs_present,
-                            ctx.agent_cfg.resolved.strict_tool_parsing,
+                            !ctx.prompt_config
+                                .model_text_extraction(route.model_provider.as_str())
+                                .tool_calls,
                             history
                                 .first()
                                 .map_or("", |message| message.content.as_str()),
@@ -16804,14 +16811,14 @@ async fn assemble_channel_agent_tools(
 /// dropping pinned resources.
 fn compose_channel_mcp_prompt_sections(
     native_tools: bool,
-    strict_tool_parsing: bool,
+    text_tool_calls_disabled: bool,
     tool_descs: &mut Vec<(&str, &str)>,
     deferred_section: &mut String,
     pinned_section: &str,
 ) -> bool {
     let expose_text_tool_protocol = apply_text_tool_prompt_policy(
         native_tools,
-        strict_tool_parsing,
+        text_tool_calls_disabled,
         tool_descs,
         deferred_section,
     );
@@ -17276,7 +17283,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
         // text-tool prompt policy below may clear `deferred_section` for a
-        // non-native strict-tool-parsing target.
+        // non-native target with text tool extraction disabled.
         let ChannelAssembledTools {
             tools: built_tools,
             mut deferred_section,
@@ -17431,7 +17438,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         }
         let expose_text_tool_protocol = compose_channel_mcp_prompt_sections(
             native_tools,
-            agent.resolved.strict_tool_parsing,
+            !config.model_text_extraction(&model_provider_ref).tool_calls,
             &mut tool_descs,
             &mut deferred_section,
             &pinned_section,
@@ -29849,7 +29856,7 @@ BTC is currently around $65,000 based on latest tool output."#
     /// `start_channels` performs (`compose_channel_mcp_prompt_sections`). It proves
     /// the production boundary keeps the deferred tool-search listing and the pinned
     /// MCP resource in SEPARATE sections, so strict text-tool suppression
-    /// (`native_tools = false`, `strict_tool_parsing = true`) clears the deferred
+    /// (`native_tools = false`, `text_tool_calls_disabled = true`) clears the deferred
     /// tool instructions while the pinned resource survives into the final prompt.
     /// A regression that re-merges the two sections inside the assembly (or reorders
     /// the suppress/append pair) fails here, unlike a test that hand-builds the
@@ -39258,13 +39265,13 @@ BTC is currently around $65,000 based on latest tool output."#
             ### Available Tools\n\n\
             **read_skill**: Read a skill";
         let read_skill_available = |native_tool_specs_present: bool,
-                                    strict_tool_parsing: bool,
+                                    text_tool_calls_disabled: bool,
                                     excluded_tools: &[String],
                                     system_prompt: &str| {
             channel_tool_available_for_turn(
                 callable_protocol_exposed_for_channel_turn(
                     native_tool_specs_present,
-                    strict_tool_parsing,
+                    text_tool_calls_disabled,
                     system_prompt,
                 ),
                 &tools_registry,
@@ -57243,7 +57250,7 @@ Done."#;
     }
 
     /// Production-boundary regression for the strict-parsing path. With
-    /// `strict_tool_parsing` enabled the runtime forwards deltas without the
+    /// `text_tool_calls_disabled` enabled the runtime forwards deltas without the
     /// `StreamTextGuard`, so a protocol JSON body — bare or fenced, complete or
     /// still arriving — reaches this boundary exactly as emitted. The final
     /// sanitizer suppresses these through the parser's classifier; the draft
@@ -58488,59 +58495,6 @@ Done."#;
         assert!(
             dispatch_channel_sop_event(&router, &msg).await,
             "a git-produced internal marker must select SOP ingress"
-        );
-    }
-
-    /// Pins the contract: the channel tool-loop reads `strict_tool_parsing` and
-    /// `parallel_tools` from `agent_cfg.resolved` (populated), not from
-    /// `prompt_config.agent(alias).resolved` (serde-skipped default).
-    #[test]
-    fn resolved_agent_config_carries_strict_tool_parsing_and_parallel_tools() {
-        let mut prompt_config = zeroclaw_config::schema::Config::default();
-
-        prompt_config.runtime_profiles.insert(
-            "strict-parallel".to_string(),
-            zeroclaw_config::schema::RuntimeProfileConfig {
-                strict_tool_parsing: true,
-                parallel_tools: Some(true),
-                ..Default::default()
-            },
-        );
-
-        let agent_alias = "test-agent";
-        prompt_config.agents.insert(
-            agent_alias.to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::from(
-                    "strict-parallel",
-                ),
-                ..Default::default()
-            },
-        );
-
-        let agent_cfg = prompt_config
-            .resolved_agent_config(agent_alias)
-            .expect("agent must resolve");
-
-        assert!(
-            agent_cfg.resolved.strict_tool_parsing,
-            "resolved.strict_tool_parsing should be true from the runtime profile"
-        );
-        assert!(
-            agent_cfg.resolved.parallel_tools,
-            "resolved.parallel_tools should be true from the runtime profile"
-        );
-
-        let raw_agent = prompt_config
-            .agent(agent_alias)
-            .expect("agent must exist in prompt_config");
-        assert!(
-            !raw_agent.resolved.strict_tool_parsing,
-            "raw agent resolved.strict_tool_parsing should be false (serde-skipped default)"
-        );
-        assert!(
-            !raw_agent.resolved.parallel_tools,
-            "raw agent resolved.parallel_tools should be false (serde-skipped default)"
         );
     }
 

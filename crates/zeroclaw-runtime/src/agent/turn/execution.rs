@@ -253,7 +253,7 @@ pub struct ResolvedAgentExecution<'a> {
     /// Loop-detection / ignore-tools / timing policy.
     pub pacing: &'a PacingConfig,
     /// Reject malformed tool-call protocol.
-    pub strict_tool_parsing: bool,
+    pub text_tool_calls_disabled: bool,
     /// Allow concurrent tool execution.
     pub parallel_tools: bool,
     /// Truncation limit for tool outputs.
@@ -303,7 +303,7 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub excluded_tools: &'a [String],
     pub dedup_exempt_tools: &'a [String],
     pub pacing: &'a PacingConfig,
-    pub strict_tool_parsing: bool,
+    pub text_tool_calls_disabled: bool,
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
@@ -335,7 +335,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             activated_tools: io.activated_tools,
             model_switch_callback: io.model_switch_callback,
             pacing: runtime.pacing,
-            strict_tool_parsing: runtime.strict_tool_parsing,
+            text_tool_calls_disabled: runtime.text_tool_calls_disabled,
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
             keep_tool_context_turns: runtime.keep_tool_context_turns,

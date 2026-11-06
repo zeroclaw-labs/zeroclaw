@@ -950,6 +950,7 @@ cli-config-capped-key-lowered = 警告: {$path} の設定キー `{$key}` を上�
 cli-config-capped-reason-pairing-code-ttl = ペアリングコードを使用できるのは最長 600 秒（10 分）です
 cli-config-retired-reason-nevis = Nevis IAM 連携は削除されました。代わりに `[oidc.<alias>]` と `[users]`、`[permission_profiles]` を設定してください
 cli-config-retired-reason-agent-tunable = エージェント内のランタイム調整値は読み込まれなくなりました。ランタイムプロファイルが優先されるため、このキーはエージェントの `[runtime_profiles.<profile>]` に設定してください
+cli-config-retired-reason-text-tool-parsing = テキスト内のツール呼び出し解析はチャットモデルごとに設定します。`strict_tool_parsing = true` の代わりに `options.extract_text_tool_calls = false` を使用してください
 cli-config-retired-reason-summary-model = プロバイダーを持たない旧来のモデル ID は読み込まれていませんでした。`summary_provider` に置き換えられています（コンテキスト圧縮自体は現在ランタイムに実装されていません）
 cli-config-retired-reason-node-transport = 旧来の HMAC ノードトランスポートは削除されました
 cli-config-retired-reason-wati = WATI のサポートは削除されました。Cloud API または WhatsApp Web を使って `[channels.whatsapp.<alias>]` に移行し、使わなくなった WATI の API トークンを失効させてください
@@ -1218,7 +1219,6 @@ channel-runtime-fallback-footer =
     モデル切り替え: /models
 channel-runtime-model-fallback-redacted = ⚡ 要求されたモデルが利用できなかったため、代替モデルがこの応答を生成しました。
 delegate-provider-fallback-warning = 警告: 委譲されたエージェントは、プロバイダーのフォールバックによって復旧しました。プロバイダーの障害の詳細はログに記録され、この結果からは省略されています。
-turn-tool-protocol-strict-mixed-error = 厳格なツール解析では、native-tool と text-only の候補が混在するフォールバックチェーンを実行できません。到達可能なすべての候補が同じツールプロトコルを使用するよう設定するか、strict_tool_parsing を false に設定してください。
 delegate-provider-fallback-header = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model }, agentic)]
 cli-alias-list-empty = ({$section} の下にエントリがありません)

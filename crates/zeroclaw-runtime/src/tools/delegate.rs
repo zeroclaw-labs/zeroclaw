@@ -2178,7 +2178,6 @@ impl DelegateTool {
             if let Some(max_tool_result_chars) = profile.max_tool_result_chars {
                 resolved.max_tool_result_chars = max_tool_result_chars;
             }
-            resolved.strict_tool_parsing = profile.strict_tool_parsing;
         }
 
         resolved
@@ -2221,7 +2220,6 @@ impl DelegateTool {
             if let Some(max_tool_result_chars) = profile.max_tool_result_chars {
                 resolved.max_tool_result_chars = max_tool_result_chars;
             }
-            resolved.strict_tool_parsing = profile.strict_tool_parsing;
         }
         resolved
     }
@@ -5010,12 +5008,12 @@ impl DelegateTool {
         base: Option<String>,
         mut deferred_section: String,
         native_tools: bool,
-        strict_tool_parsing: bool,
+        text_tool_calls_disabled: bool,
     ) -> Option<String> {
         let mut ignored_tool_descs: Vec<(&str, &str)> = Vec::new();
         apply_text_tool_prompt_policy(
             native_tools,
-            strict_tool_parsing,
+            text_tool_calls_disabled,
             &mut ignored_tool_descs,
             &mut deferred_section,
         );
@@ -5103,8 +5101,12 @@ impl DelegateTool {
         };
 
         let empty_tools: &[Box<dyn Tool>] = &[];
-        let expose_text_tools =
-            sends_native_tool_specs || !agent_config.resolved.strict_tool_parsing;
+        let expose_text_tools = sends_native_tool_specs
+            || config.map_or(true, |config| {
+                config
+                    .model_text_extraction(&agent_config.model_provider)
+                    .tool_calls
+            });
         let prompt_tools = if expose_text_tools {
             sub_tools
         } else {
@@ -5710,7 +5712,13 @@ impl DelegateTool {
             enriched_system_prompt,
             sub_deferred_section,
             native_tools,
-            loop_runtime.strict_tool_parsing,
+            !target_config
+                .or(self.root_config.as_deref())
+                .map_or(true, |config| {
+                    config
+                        .model_text_extraction(&agent_config.model_provider)
+                        .tool_calls
+                }),
         );
         let enriched_system_prompt = match (
             enriched_system_prompt,
@@ -5823,7 +5831,13 @@ impl DelegateTool {
                         excluded_tools: &[],
                         dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
                         pacing: &pacing,
-                        strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                        text_tool_calls_disabled: !target_config
+                            .or(self.root_config.as_deref())
+                            .map_or(true, |config| {
+                                config
+                                    .model_text_extraction(&agent_config.model_provider)
+                                    .tool_calls
+                            }),
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         keep_tool_context_turns: loop_runtime.keep_tool_context_turns,
@@ -13389,68 +13403,51 @@ target = "memory_recall"
     }
 
     #[tokio::test]
-    async fn execute_agentic_strict_tool_parsing_uses_target_agent_policy() {
-        // Strict parsing is target runtime policy. If the parent path leaked its
-        // own prompt/tool settings, text fallback tool calls could execute in a
-        // child that intentionally disabled them.
-        let config = agentic_agent_config();
-        let mut runtime_profiles = agentic_runtime_profiles(10);
-        runtime_profiles
-            .get_mut("agentic_test")
-            .unwrap()
-            .strict_tool_parsing = true;
-        let prompt_tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-        let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_runtime_profiles(runtime_profiles)
-            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+    async fn execute_agentic_uses_target_model_text_extraction_options() {
+        let workspace = TempDir::new().unwrap();
+        let mut target = agentic_agent_config();
+        target.model_provider = "chat.raw".into();
+        let mut root = Config {
+            data_dir: workspace.path().join("data"),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        root.providers = toml::from_str(
+            r#"
+[connections."gateway.test"]
+kind = "custom"
+uri = "https://example.test/v1"
+[models."chat.raw"]
+capability = "chat"
+provider = "gateway.test"
+model = "test-model"
+options = { extract_text_tool_calls = false }
+"#,
+        )
+        .unwrap();
+        root.runtime_profiles = agentic_runtime_profiles(10);
+        root.risk_profiles = agentic_risk_profiles(vec!["echo_tool".into()]);
+        root.agents.insert("agentic".into(), target.clone());
+        let tool = DelegateTool::new(root.agents.clone(), None, test_security())
+            .with_root_config(Arc::new(root))
+            .with_workspace_dir(workspace.path().to_path_buf())
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
-        let mut prompt_config = config.clone();
-        prompt_config.resolved = tool.resolve_loop_runtime("agentic", &config);
 
-        let prompt = tool
-            .build_enriched_system_prompt(
-                "agentic",
-                &prompt_config,
-                "model-test",
-                &prompt_tools,
-                Path::new("/tmp"),
-                false,
-                None,
-                None,
-            )
-            .expect("prompt should render");
-        assert!(
-            !prompt.contains("## Tools"),
-            "strict delegate prompt should not advertise text tool instructions"
-        );
-        assert!(
-            !prompt.contains("echo_tool"),
-            "strict delegate prompt should hide text-only tool schemas"
-        );
-
-        let model_provider = TextFallbackToolModelProvider;
         let result = tool
             .execute_agentic(
                 "agentic",
-                &config,
-                "openrouter",
-                "model-test",
-                &model_provider,
+                &target,
+                "chat.raw",
+                "test-model",
+                &TextFallbackToolModelProvider,
                 "run",
                 Some(0.2),
             )
             .await
             .unwrap();
-
-        assert!(result.success);
-        assert!(
-            result.output.contains("<tool_call>"),
-            "strict subagent should return fallback-looking text unchanged"
-        );
-        assert!(
-            !result.output.contains("echo:ignored"),
-            "strict subagent must not execute text fallback tool calls"
-        );
+        assert!(result.success, "{result:?}");
+        assert!(result.output.contains("<tool_call>"));
+        assert!(!result.output.contains("echo:ignored"));
     }
 
     #[tokio::test]
@@ -20245,7 +20242,6 @@ command = "echo hi"
                 agentic: true,
                 max_tool_iterations: 2,
                 deferred_builtin_tools: true,
-                strict_tool_parsing: false,
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -20848,7 +20844,8 @@ command = "rm independent-delegate-marker"
         }
     }
 
-    // Finding: an independent delegate to a non-native, strict-tool-parsing target must
+    // Finding: an independent delegate to a non-native target with text-tool
+    // extraction disabled must
     // suppress the deferred-MCP prompt section exactly as a fresh target turn does
     // (apply_text_tool_prompt_policy clears it), instead of advertising `tool_search`
     // stubs the target cannot use. compose_independent_system_prompt centralizes that.
@@ -20862,7 +20859,7 @@ command = "rm independent-delegate-marker"
             base(),
             deferred.clone(),
             true, // native_tools
-            true, // strict_tool_parsing (ignored when native)
+            true, // text_tool_calls_disabled (ignored when native)
         )
         .unwrap();
         assert!(
@@ -21382,52 +21379,6 @@ command = "rm independent-delegate-marker"
             "the second routed request must contain the tool result: {bodies:?}"
         );
         assert!(result.error.is_none(), "{result:?}");
-    }
-
-    #[tokio::test]
-    async fn strict_mixed_agentic_delegate_fails_before_provider_dispatch() {
-        let (primary, primary_requests) = start_failing_chat_server(503).await;
-        let (backup, backup_requests) = start_failing_chat_server(503).await;
-        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
-            primary.uri.clone(),
-            backup.uri.clone(),
-            true,
-            Some(true),
-            Some(false),
-        );
-        let mut config = (*fixture_config).clone();
-        config
-            .runtime_profiles
-            .get_mut("review")
-            .expect("review runtime profile")
-            .strict_tool_parsing = true;
-        let tool = fallback_delegate_tool(Arc::new(config), None)
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
-
-        let result = tool
-            .execute(json!({"agent": "target", "prompt": "use the echo tool"}))
-            .await
-            .expect("delegate returns a terminal tool result");
-
-        assert!(!result.success, "strict mixed chain must fail: {result:?}");
-        assert!(
-            result.output.is_empty(),
-            "terminal failure has no output: {result:?}"
-        );
-        let expected =
-            crate::i18n::get_required_cli_string("turn-tool-protocol-strict-mixed-error");
-        let error = result.error.expect("strict mixed chain returns an error");
-        assert!(error.contains(&expected), "unexpected error: {error}");
-        assert_eq!(
-            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "strict mixed validation must precede the primary request"
-        );
-        assert_eq!(
-            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "strict mixed validation must precede fallback dispatch"
-        );
     }
 
     #[tokio::test]

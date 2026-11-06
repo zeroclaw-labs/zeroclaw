@@ -955,6 +955,7 @@ cli-config-capped-key-lowered = avertissement : la clé de configuration `{$key}
 cli-config-capped-reason-pairing-code-ttl = un code d’appairage reste utilisable 600 secondes (10 minutes) au plus
 cli-config-retired-reason-nevis = l’intégration Nevis IAM a été supprimée ; configurez plutôt `[oidc.<alias>]` avec `[users]` et `[permission_profiles]`
 cli-config-retired-reason-agent-tunable = les réglages d’exécution définis dans l’agent ne sont plus lus ; les profils d’exécution font foi, définissez donc cette clé dans le `[runtime_profiles.<profile>]` de l’agent
+cli-config-retired-reason-text-tool-parsing = l’analyse des appels d’outils dans le texte se configure par modèle de chat ; utilisez `options.extract_text_tool_calls = false` à la place de `strict_tool_parsing = true`
 cli-config-retired-reason-summary-model = l’ancien identifiant de modèle seul n’avait pas de fournisseur et n’était jamais lu ; `summary_provider` l’a remplacé (la compression du contexte elle-même n’est pas encore implémentée dans le runtime)
 cli-config-retired-reason-node-transport = l’ancien transport de nœuds HMAC a été supprimé
 cli-config-retired-reason-wati = la prise en charge de WATI a été supprimée ; passez à `[channels.whatsapp.<alias>]` avec la Cloud API ou WhatsApp Web, puis révoquez le jeton d’API WATI inutilisé
@@ -1223,7 +1224,6 @@ channel-runtime-fallback-footer =
     Changer de modèle : /models
 channel-runtime-model-fallback-redacted = ⚡ Le modèle demandé était indisponible ; un modèle de secours a généré cette réponse.
 delegate-provider-fallback-warning = Avertissement : l’agent délégué a repris son exécution grâce à un basculement vers un fournisseur de secours. Les détails de la défaillance du fournisseur ont été consignés et omis de ce résultat.
-turn-tool-protocol-strict-mixed-error = L’analyse stricte des outils ne peut pas exécuter une chaîne de repli qui mélange des candidats native-tool et text-only. Configurez chaque candidat accessible pour utiliser le même protocole d’outils, ou définissez strict_tool_parsing sur false.
 delegate-provider-fallback-header = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model }, agentique)]
 cli-alias-list-empty = (aucune entrée sous {$section})

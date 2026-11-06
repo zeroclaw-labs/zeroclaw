@@ -1118,6 +1118,7 @@ cli-config-capped-key-lowered = warning: lowered config key `{$key}` in {$path} 
 cli-config-capped-reason-pairing-code-ttl = a pairing code stays redeemable for at most 600 seconds (10 minutes)
 cli-config-retired-reason-nevis = the Nevis IAM integration was removed; configure `[oidc.<alias>]` with `[users]` and `[permission_profiles]` instead
 cli-config-retired-reason-agent-tunable = agent-inline runtime tunables are no longer read; runtime profiles are authoritative, so set this key on the agent's `[runtime_profiles.<profile>]` instead
+cli-config-retired-reason-text-tool-parsing = text tool parsing is configured per chat model; use `options.extract_text_tool_calls = false` instead of `strict_tool_parsing = true`
 cli-config-retired-reason-summary-model = the deprecated bare model id had no provider identity and was never read; `summary_provider` replaced it (context compression itself is not currently implemented in the runtime)
 cli-config-retired-reason-node-transport = the legacy HMAC node transport was removed
 cli-config-retired-reason-wati = WATI support was removed; migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token
@@ -1457,7 +1458,6 @@ channel-runtime-safeguard-footer-client-server =
     🛡️ Safety safeguards flagged this request — switched through a fallback chain to **{ $served }** (requested `{ $requested }`).
 
 delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
-turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
 turn-context-hook-mutation-unsafe-error = A before-LLM-call hook changed existing messages in a way that cannot be safely reconciled with a required context-budget trim. Configure the hook to only append messages, or shorten the current turn.
 delegate-provider-fallback-header = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model }, agentic)]

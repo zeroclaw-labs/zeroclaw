@@ -4122,7 +4122,6 @@ pub struct ResolvedRuntime {
     pub context_compact_ratio: Option<f64>,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
-    pub strict_tool_parsing: bool,
     pub tool_call_dedup_exempt: Vec<String>,
     pub tool_filter_groups: Vec<ToolFilterGroup>,
     pub max_system_prompt_chars: usize,
@@ -4316,7 +4315,6 @@ impl Default for ResolvedRuntime {
             context_compact_ratio: None,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
-            strict_tool_parsing: false,
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
@@ -4848,6 +4846,28 @@ impl Config {
             .and_then(|selection| selection.model_id)
             .map(|model| model.trim().to_owned())
             .filter(|model| !model.is_empty())
+    }
+
+    /// Resolve model-owned text extraction after API/preset/model overlays.
+    /// Legacy selections keep both extractors enabled. Exact keys containing
+    /// dots are resolved by the registry without splitting them.
+    #[must_use]
+    pub fn model_text_extraction(
+        &self,
+        model_ref: &str,
+    ) -> crate::provider_registry::TextExtraction {
+        self.provider_registry()
+            .ok()
+            .and_then(|registry| {
+                registry
+                    .resolve_chat(&crate::provider_registry::ModelRef::from(model_ref))
+                    .ok()
+                    .map(|chat| crate::provider_registry::TextExtraction {
+                        reasoning: chat.extract_text_reasoning(),
+                        tool_calls: chat.extract_text_tool_calls(),
+                    })
+            })
+            .unwrap_or_default()
     }
 
     /// Resolve a model's configured temperature from the canonical registry,
@@ -5431,7 +5451,6 @@ impl Config {
             ..ResolvedRuntime::default()
         };
         if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
-            resolved.strict_tool_parsing = profile.strict_tool_parsing;
             resolved.thinking = profile.thinking.clone();
             resolved.history_pruning = profile.history_pruning.clone();
             resolved.eval = profile.eval.clone();
@@ -15656,7 +15675,6 @@ pub struct RuntimeProfileConfig {
     /// the system-prompt builder and the `read_skill` tool-registration gate
     /// consult so they always agree on the effective mode.
     pub prompt_injection_mode: Option<SkillsPromptInjectionMode>,
-    pub strict_tool_parsing: bool,
     #[nested]
     pub thinking: crate::scattered_types::ThinkingConfig,
     #[nested]
@@ -15700,7 +15718,6 @@ impl Default for RuntimeProfileConfig {
             keep_tool_context_turns: None,
             memory_recall_limit: None,
             prompt_injection_mode: None,
-            strict_tool_parsing: false,
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
@@ -35882,7 +35899,6 @@ reasoning_effort = "turbo"
         assert_eq!(cfg.resolved.max_history_messages, 50);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
-        assert!(!cfg.resolved.strict_tool_parsing);
         assert!(cfg.precheck.enabled);
         assert_eq!(cfg.precheck.timeout_secs, 5);
     }
@@ -35940,7 +35956,6 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
-strict_tool_parsing = true
 "#;
         let parsed = parse_test_config(raw);
         let agent = parsed
@@ -35949,7 +35964,6 @@ strict_tool_parsing = true
             .expect("[agents.default] parses into agents map");
         assert_eq!(agent.resolved.max_tool_iterations, 10);
         assert_eq!(agent.resolved.tool_dispatcher, "auto");
-        assert!(!agent.resolved.strict_tool_parsing);
     }
 
     #[test]

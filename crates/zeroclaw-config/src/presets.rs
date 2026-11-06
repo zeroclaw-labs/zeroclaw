@@ -273,7 +273,6 @@ fn local_small_runtime() -> RuntimeProfileConfig {
         keep_tool_context_turns: Some(1),
         memory_recall_limit: Some(3),
         prompt_injection_mode: Some(SkillsPromptInjectionMode::Compact),
-        strict_tool_parsing: true,
         ..RuntimeProfileConfig::default()
     }
 }
@@ -629,7 +628,6 @@ mod tests {
             values.prompt_injection_mode,
             Some(SkillsPromptInjectionMode::Compact)
         );
-        assert!(values.strict_tool_parsing);
     }
 
     #[test]
@@ -666,7 +664,6 @@ mod tests {
             .resolved_agent_config("local_agent")
             .expect("agent should resolve");
 
-        assert!(resolved.resolved.strict_tool_parsing);
         assert_eq!(resolved.resolved.max_tool_iterations, 4);
         assert_eq!(resolved.resolved.max_history_messages, 20);
         assert_eq!(resolved.resolved.max_context_tokens, Some(8_000));

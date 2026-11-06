@@ -301,6 +301,7 @@ pub(crate) fn announce_budget_warning(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
+    config: Option<&zeroclaw_config::schema::Config>,
     active_model_provider: &dyn ModelProvider,
     active_model_provider_name: &str,
     active_model: &str,
@@ -334,7 +335,9 @@ pub(crate) async fn call_provider(
                         ctx.cancellation_token,
                         ctx.on_delta,
                         ctx.event_tx,
-                        ctx.strict_tool_parsing,
+                        ctx.text_tool_calls_disabled,
+                        ctx.extract_text_reasoning,
+                        config,
                         ctx.draft_reasoning,
                         policy,
                         guard_tools,
@@ -768,7 +771,8 @@ mod payload_capture_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning,
             agent_alias: None,
@@ -1247,7 +1251,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -1325,6 +1330,7 @@ mod streaming_fallback_tests {
             let recovery = [ChatMessage::user("image omitted")];
             let call = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -1378,6 +1384,7 @@ mod streaming_fallback_tests {
             Duration::from_secs(11),
             call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -1932,7 +1939,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -1949,6 +1957,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "test-provider",
                         "test-model",
@@ -2048,7 +2057,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2060,6 +2070,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -2111,7 +2122,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2123,6 +2135,7 @@ mod streaming_fallback_tests {
 
         let error = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -2255,7 +2268,8 @@ mod streaming_fallback_tests {
                 hooks: None,
                 dedup_exempt_tools: &[],
                 pacing: &pacing,
-                strict_tool_parsing: false,
+                text_tool_calls_disabled: false,
+                extract_text_reasoning: true,
                 channel: None,
                 draft_reasoning: StreamReasoningMode::Status,
                 turn_id: "test-turn",
@@ -2267,6 +2281,7 @@ mod streaming_fallback_tests {
 
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -2398,6 +2413,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -2475,7 +2491,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2488,6 +2505,7 @@ mod streaming_fallback_tests {
         let (outcome, notice) = zeroclaw_providers::scope_safeguard_fallback(async {
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "requested-provider",
                 "requested-model",
@@ -2588,7 +2606,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2600,6 +2619,7 @@ mod streaming_fallback_tests {
 
         let error = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -2667,7 +2687,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2679,6 +2700,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "requested-provider",
             "requested-model",
@@ -2747,7 +2769,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -2759,6 +2782,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "requested-provider",
             "requested-model",
@@ -2896,6 +2920,7 @@ mod streaming_fallback_tests {
                 let recovery = [ChatMessage::user("inspect")];
                 let outcome = call_provider(
                     &ctx,
+                    None,
                     &provider,
                     "test-provider",
                     "test-model",
@@ -3098,6 +3123,7 @@ mod streaming_fallback_tests {
 
         let call = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -3157,6 +3183,7 @@ mod streaming_fallback_tests {
 
         let outcome = call_provider(
             &ctx,
+            None,
             &provider,
             "test-provider",
             "test-model",
@@ -3211,6 +3238,7 @@ mod streaming_fallback_tests {
 
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -3332,6 +3360,7 @@ mod streaming_fallback_tests {
             let recovery = [ChatMessage::user("inspect")];
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "context-overflow",
                 "test-model",
@@ -3390,6 +3419,7 @@ mod streaming_fallback_tests {
 
             let outcome = call_provider(
                 &ctx,
+                None,
                 &provider,
                 "test-provider",
                 "test-model",
@@ -3538,7 +3568,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -3555,6 +3586,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "router-test",
                         "test-model",
@@ -3652,7 +3684,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -3669,6 +3702,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "router-test",
                         "test-model",
@@ -3919,7 +3953,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -3936,6 +3971,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "router-test",
                         "test-model",
@@ -4004,7 +4040,8 @@ mod streaming_fallback_tests {
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
-            strict_tool_parsing: false,
+            text_tool_calls_disabled: false,
+            extract_text_reasoning: true,
             channel: None,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
@@ -4021,6 +4058,7 @@ mod streaming_fallback_tests {
                     Some(cost_context),
                     call_provider(
                         &ctx,
+                        None,
                         &provider,
                         "router-test",
                         "test-model",

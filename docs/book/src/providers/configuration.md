@@ -128,34 +128,49 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 
 Family-specific entries add their own typed fields on top of these shared fields.
 
+The chat `options` object accepts two ordinary boolean extraction switches:
+
+- `extract_text_reasoning`: remove `<think>...</think>` blocks from textual content. Defaults to `true`; native reasoning fields are unaffected.
+- `extract_text_tool_calls`: recognize XML/JSON tool-call envelopes in textual content. Defaults to `true`; native structured tool calls are unaffected.
+
+Both fields can be shared through `providers.model_presets.<id>.options`, set as
+connection defaults in `api.chat.options`, and overridden in each chat model's
+`options`. They accept `true` or `false`; the `"null"` sentinel is not supported.
+The former runtime-profile `strict_tool_parsing` setting has been removed.
+
 ## Hosting multiple models on one provider entry
 
-A single provider entry is a connection + credential unit. To serve several models over the same endpoint and credential without duplicating the entry, add a `[providers.models.<type>.<alias>.models.<model_alias>]` subtable per model. Each subtable carries its own `id` (the model identifier sent to the provider) plus optional model-side tuning that overlays the entry-level fields: `temperature`, `max_tokens`, `context_window`, `think`, `vision`, `native_tools`, `replay_assistant_reasoning`, `provider_extra`, and `chat_template_kwargs`. Any field left unset falls back to the entry-level value. `fallback_models` and `pricing` remain profile-level concepts and are not supported per nested model entry. Model IDs in `fallback_models` use the selected entry's tuning, including its tool, thinking, token-limit, and extra request options. Use compatible fallback models. A `fallback` reference to another nested model within the same profile is treated as a cycle; use `fallback_models` for alternate model IDs on that connection.
+A connection owns the endpoint and credentials. Independently named chat models
+reference that connection through `provider`, and send their `model` identifier
+to the upstream server. Model options overlay the connection API defaults and
+the selected model preset; explicit `false` overrides an inherited `true`.
 
-Sampling precedence is an explicit CLI/session invocation override, then the selected model entry's `temperature`, then the enclosing profile's `temperature`, then the provider's protocol default. A switch retry, hint route, or cross-profile fallback resolves the target's configured default at dispatch time; automatic cron, heartbeat, SOP and subagent execution do not turn an inherited default into an invocation override. Thinking adjustments apply after selecting the base temperature. Protocol requirements such as Anthropic's enabled-thinking temperature still apply.
-
-`provider_extra` and `chat_template_kwargs` replace the corresponding profile JSON field as a whole when set on a model entry; they do not merge individual keys with that profile field. Explicit `false` capability settings also override a profile's `true`.
-
-An agent addresses a specific model with a three-segment ref `<type>.<alias>.<model_alias>`:
+Consumers reference the exact model key. Dots inside quoted keys are part of the
+name and have no path or qualification semantics:
 
 ```toml
-[providers.models.openai.gw]
-uri = "https://gateway.internal/v1"
-api_key = "sk-..."
+[providers.models."chat.fast"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o-mini"
+options = { temperature = 0.3, extract_text_reasoning = true, extract_text_tool_calls = false }
 
-[providers.models.openai.gw.models.fast]
-id = "gpt-4o-mini"
-temperature = 0.3
-
-[providers.models.openai.gw.models.big]
-id = "gpt-4o"
-max_tokens = 8192
+[providers.models."chat.big"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o"
+options = { max_tokens = 8192 }
 
 [agents.assistant]
-model_provider = "openai.gw.fast"
+model_provider = "chat.fast"
 ```
 
-The legacy two-segment ref `<type>.<alias>` still works. It resolves to `models.default` if present, otherwise to the sole model entry, otherwise to the entry-level `model` field, so existing single-model configs need no change. The optional model tables are additive and do not change the schema version or migrate legacy `model` values.
+An invocation's explicit temperature overrides the selected model's effective
+default. Model switches, hint routes, and fallback candidates resolve their own
+options when dispatched; background execution does not convert inherited
+defaults into invocation overrides. Protocol constraints such as Anthropic's
+enabled-thinking temperature still apply. Configure fallback order separately
+under `providers.fallback`, and pricing under each model's `metadata`.
 
 ## Anthropic thinking passthrough
 

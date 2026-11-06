@@ -2093,8 +2093,12 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // these tags can interfere with `<tool_call>` extraction and must be
     // removed first.
     let cleaned = strip_think_tags(response);
-    let response = cleaned.as_str();
+    parse_tool_calls_from_text(&cleaned)
+}
 
+/// Parse tool-call envelopes without removing textual reasoning. Callers that
+/// own model-specific reasoning policy sanitize the text before this boundary.
+pub fn parse_tool_calls_from_text(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
@@ -3477,6 +3481,16 @@ mod tests {
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(text, "Just a normal response with no tools.");
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_from_text_preserves_reasoning_when_caller_keeps_it() {
+        let response = "<think>reasoning</think>Answer\n<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>";
+        let (text, calls) = parse_tool_calls_from_text(response);
+        assert!(text.contains("<think>reasoning</think>Answer"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(!parse_tool_calls(response).0.contains("<think>"));
     }
 
     #[test]

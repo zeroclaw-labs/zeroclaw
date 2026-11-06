@@ -162,7 +162,7 @@ pub async fn maybe_run_skill_review(
                         excluded_tools: &[],
                         dedup_exempt_tools: &[],
                         pacing,
-                        strict_tool_parsing: false,
+                        text_tool_calls_disabled: false,
                         // lenient for the restricted fork
                         parallel_tools: false,
                         // sequential for the mutation-capable fork

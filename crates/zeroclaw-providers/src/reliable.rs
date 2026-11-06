@@ -234,6 +234,13 @@ pub(crate) fn clear_provisional_provider_route() {
     let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| accounting.lock().accepted_route = None);
 }
 
+pub(crate) fn current_provisional_provider_route() -> Option<AcceptedRoute> {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().accepted_route.clone())
+        .ok()
+        .flatten()
+}
+
 fn record_accepted_attempt(
     entry: &ReliableModelProviderEntry,
     model: &str,

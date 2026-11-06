@@ -47,7 +47,26 @@ options_patch!(ChatOptionsPatch {
     thinking_passthrough: bool,
     reasoning_effort_passthrough: bool,
     cache_passthrough: bool,
+    extract_text_reasoning: bool,
+    extract_text_tool_calls: bool,
 });
+
+/// Effective model-owned textual extraction policy. Missing options inherit;
+/// explicit values are ordinary booleans and never accept the `"null"` sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextExtraction {
+    pub reasoning: bool,
+    pub tool_calls: bool,
+}
+
+impl Default for TextExtraction {
+    fn default() -> Self {
+        Self {
+            reasoning: true,
+            tool_calls: true,
+        }
+    }
+}
 
 options_patch!(TtsOptionsPatch {
     voice: String,
@@ -110,5 +129,63 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn text_extraction_options_are_plain_booleans() {
+        let patch: ChatOptionsPatch =
+            toml::from_str("extract_text_reasoning = false\nextract_text_tool_calls = true")
+                .unwrap();
+        assert_eq!(patch.extract_text_reasoning, Some(false));
+        assert_eq!(patch.extract_text_tool_calls, Some(true));
+        for field in ["extract_text_reasoning", "extract_text_tool_calls"] {
+            assert!(toml::from_str::<ChatOptionsPatch>(&format!("{field} = \"null\"")).is_err());
+        }
+    }
+
+    #[test]
+    fn text_extraction_inherits_api_and_preset_then_model_overrides() {
+        let registry: crate::provider_registry::ProviderRegistry = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+[connections."gateway.prod".api.chat.options]
+extract_text_reasoning = false
+extract_text_tool_calls = false
+
+[model_presets."text.tools"]
+capability = "chat"
+options = { extract_text_tool_calls = true }
+
+[models."chat.inherited"]
+capability = "chat"
+provider = "gateway.prod"
+model = "shared-model"
+
+[models."chat.preset"]
+capability = "chat"
+provider = "gateway.prod"
+model = "shared-model"
+preset = "text.tools"
+
+[models."chat.override"]
+capability = "chat"
+provider = "gateway.prod"
+model = "shared-model"
+preset = "text.tools"
+options = { extract_text_reasoning = true, extract_text_tool_calls = false }
+"#,
+        )
+        .unwrap();
+        for (name, reasoning, tool_calls) in [
+            ("chat.inherited", false, false),
+            ("chat.preset", false, true),
+            ("chat.override", true, false),
+        ] {
+            let resolved = registry.resolve_chat(&name.into()).unwrap();
+            assert_eq!(resolved.extract_text_reasoning(), reasoning);
+            assert_eq!(resolved.extract_text_tool_calls(), tool_calls);
+        }
     }
 }

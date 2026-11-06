@@ -279,6 +279,24 @@ impl ResolvedChat<'_> {
     pub fn upstream_model(&self) -> Option<&str> {
         self.selection.model.upstream_model()
     }
+
+    /// Whether textual `<think>` blocks are extracted from the response.
+    /// Text extraction remains enabled by default for backward compatibility.
+    #[must_use]
+    pub fn extract_text_reasoning(&self) -> bool {
+        self.options
+            .extract_text_reasoning
+            .unwrap_or(super::TextExtraction::default().reasoning)
+    }
+
+    /// Whether textual XML/JSON tool-call envelopes are extracted from the
+    /// response. Native tool calls are unaffected by this setting.
+    #[must_use]
+    pub fn extract_text_tool_calls(&self) -> bool {
+        self.options
+            .extract_text_tool_calls
+            .unwrap_or(super::TextExtraction::default().tool_calls)
+    }
 }
 
 impl ProviderRegistry {

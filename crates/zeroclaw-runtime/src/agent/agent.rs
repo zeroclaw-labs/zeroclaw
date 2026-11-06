@@ -3909,8 +3909,11 @@ impl Agent {
         dispatcher: &dyn ToolDispatcher,
         max_chars: usize,
     ) -> Result<String> {
-        let expose_text_tool_protocol =
-            !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
+        let expose_text_tool_protocol = self.full_config().map_or(true, |config| {
+            config
+                .model_text_extraction(&self.selected_model_provider_ref())
+                .tool_calls
+        }) || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
         // Both arms resolve to `&[Box<dyn Tool>]`: the sealed registry derefs to
         // the same slice the raw `Vec` used to expose, so downstream prompt
@@ -4625,7 +4628,7 @@ impl Agent {
                                 excluded_tools: &[],
                                 dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
                                 pacing: &pacing,
-                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                text_tool_calls_disabled: false,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
                                 keep_tool_context_turns: self
@@ -5279,7 +5282,7 @@ impl Agent {
                                         .resolved
                                         .tool_call_dedup_exempt,
                                     pacing: &pacing,
-                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                    text_tool_calls_disabled: false,
                                     parallel_tools: self.config.resolved.parallel_tools,
                                     max_tool_result_chars: self
                                         .config
@@ -12699,70 +12702,6 @@ mod tests {
         assert_eq!(response, "hello");
     }
 
-    #[tokio::test]
-    async fn direct_agent_strict_tool_parsing_ignores_xml_dispatcher_calls() {
-        let provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
-                text: Some(
-                    r#"<tool_call>{"name":"echo","arguments":{"value":"ignored"}}</tool_call>"#
-                        .into(),
-                ),
-                tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
-            }]),
-        });
-
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let calls = Arc::new(AtomicUsize::new(0));
-        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
-            resolved: zeroclaw_config::schema::ResolvedRuntime {
-                strict_tool_parsing: true,
-                ..Default::default()
-            },
-            ..zeroclaw_config::schema::AliasedAgentConfig::default()
-        };
-        let mut agent = Agent::builder()
-            .model_provider(provider)
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![Box::new(CountingTool {
-                    calls: Arc::clone(&calls),
-                })],
-            ))
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(XmlToolDispatcher))
-            .config(agent_config)
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let system_prompt = agent
-            .build_system_prompt()
-            .expect("system prompt should render");
-        assert!(
-            !system_prompt.contains("## Tools"),
-            "strict parsing should not advertise text tool instructions"
-        );
-        assert!(
-            !system_prompt.contains("<tool_call"),
-            "strict parsing should not advertise XML tool calls"
-        );
-
-        let response = agent.turn("hi").await.unwrap();
-
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(response.contains("<tool_call>"));
-    }
-
     #[test]
     fn native_agent_prompt_omits_duplicate_tools_section() {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -13678,13 +13617,7 @@ mod tests {
             );
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
             let (provider, _) = capturing_provider(false);
-            let config = zeroclaw_config::schema::AliasedAgentConfig {
-                resolved: zeroclaw_config::schema::ResolvedRuntime {
-                    strict_tool_parsing: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let config = zeroclaw_config::schema::AliasedAgentConfig::default();
             let skills = vec![crate::skills::Skill {
                 name: "deploy".into(),
                 description: "Release safely".into(),
@@ -17634,105 +17567,6 @@ mod tests {
             system_prompt.contains("Hook-owned system mutation."),
             "the protocol refresh must preserve hook-owned system changes"
         );
-    }
-
-    #[tokio::test]
-    async fn before_llm_hook_rejects_strict_mixed_selected_route_before_dispatch() {
-        let tmp = tempfile::tempdir().expect("temp workspace");
-        let default_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
-        let native_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
-        let text_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
-        let mixed = zeroclaw_providers::reliable::ReliableModelProvider::new(
-            "mixed",
-            vec![
-                (
-                    "native".into(),
-                    Box::new(HookProtocolCaptureProvider {
-                        supports_native: true,
-                        requests: Arc::clone(&native_requests),
-                    }) as Box<dyn ModelProvider>,
-                ),
-                (
-                    "text".into(),
-                    Box::new(HookProtocolCaptureProvider {
-                        supports_native: false,
-                        requests: Arc::clone(&text_requests),
-                    }) as Box<dyn ModelProvider>,
-                ),
-            ],
-            0,
-            0,
-        );
-        let router = zeroclaw_providers::router::RouterModelProvider::new(
-            "hook-router",
-            vec![
-                (
-                    "default".into(),
-                    Box::new(HookProtocolCaptureProvider {
-                        supports_native: true,
-                        requests: Arc::clone(&default_requests),
-                    }) as Box<dyn ModelProvider>,
-                ),
-                ("mixed".into(), Box::new(mixed) as Box<dyn ModelProvider>),
-            ],
-            vec![(
-                "mixed".into(),
-                zeroclaw_providers::router::Route {
-                    provider_name: "mixed".into(),
-                    model: "mixed-model".into(),
-                },
-            )],
-            "native-model".into(),
-        );
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
-                .expect("memory creation should succeed"),
-        );
-        let mut hooks = crate::hooks::HookRunner::new();
-        hooks.register(Box::new(SelectingBeforeLlmHook {
-            model: "hint:mixed".into(),
-            system_suffix: None,
-        }));
-        let config = zeroclaw_config::schema::AliasedAgentConfig {
-            resolved: zeroclaw_config::schema::ResolvedRuntime {
-                strict_tool_parsing: true,
-                ..Default::default()
-            },
-            ..zeroclaw_config::schema::AliasedAgentConfig::default()
-        };
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(router))
-            .model_provider_name("hook-router".into())
-            .model_name("native-model".into())
-            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
-                vec![Box::new(MockTool)],
-            ))
-            .memory(memory)
-            .observer(Arc::from(crate::observability::NoopObserver {}))
-            .hook_runner(Some(Arc::new(hooks)))
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .config(config)
-            .workspace_dir(tmp.path().to_path_buf())
-            .build()
-            .expect("agent should build");
-
-        let error = agent
-            .turn("use the selected mixed route")
-            .await
-            .expect_err("strict mixed selected route must fail before dispatch");
-        assert!(
-            error
-                .to_string()
-                .contains("Strict tool parsing cannot run a fallback chain"),
-            "unexpected error: {error}"
-        );
-        assert!(default_requests.lock().is_empty());
-        assert!(native_requests.lock().is_empty());
-        assert!(text_requests.lock().is_empty());
     }
 
     #[tokio::test]
@@ -24002,13 +23836,7 @@ model_provider = "custom.only"
             live_config: None,
             live: None,
         };
-        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
-            resolved: zeroclaw_config::schema::ResolvedRuntime {
-                strict_tool_parsing: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig::default();
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
@@ -24199,7 +24027,6 @@ model_provider = "custom.only"
         let cap = 200_000;
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime {
-                strict_tool_parsing: true,
                 max_system_prompt_chars: cap,
                 ..Default::default()
             },
