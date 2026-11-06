@@ -11,6 +11,13 @@
 //! pollute the numbers. Inside this binary the tests take `SERIAL`, so only
 //! one measures at a time.
 //!
+//! What is counted is memory *requested* from the allocator, not memory made
+//! resident. The decoder asks for zeroed planes (`calloc`) and a bitstream that
+//! then fails never touches most of those pages, so a request of hundreds of MiB
+//! can leave the process's resident set small. The per-image cap is read here
+//! as a cap on what the decoder asks for, which is what `Limits` and the gate's
+//! projection also describe; this file does not measure resident memory.
+//!
 //! Real lossy WebPs of several sizes are committed under `tests/testdata/`
 //! (Pillow 10.4.0 / libwebp, `quality=50, method=6`). They are flat colour,
 //! except `lossy_still_noise_256x256.webp`, so their PNG re-encodings are
@@ -76,8 +83,9 @@ static ALLOCATOR: Counting = Counting;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Runs `f` and returns its result with the most bytes that were live at once
-/// during the call, beyond what was live when it started.
+/// Runs `f` and returns its result with the most bytes that were requested and
+/// not yet freed at once during the call, beyond what was live when it started.
+/// Requested, not resident: see the module documentation.
 fn peak_of<T>(f: impl FnOnce() -> T) -> (T, u64) {
     let base = LIVE.load(Relaxed);
     PEAK.store(base, Relaxed);
@@ -235,7 +243,9 @@ fn the_counter_sees_a_known_allocation_and_a_quiet_call() {
 /// If this fails, either the decoder now compares first (and the check in
 /// `projected_allocation` guards a risk that no longer exists), or the counter
 /// is broken. Predictions written before the first run: unmodified header,
-/// a few KiB; 8192 side, about 96 MiB; 16383 side, about 384 MiB.
+/// a few KiB; 8192 side, about 96 MiB; 16383 side, about 384 MiB *requested*.
+/// The file has no pixel data after the header, so the decode fails before the
+/// zeroed planes are touched: these are requested bytes, not resident ones.
 #[test]
 fn canary_the_decoder_allocates_from_the_bitstream_header_not_the_canvas() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -505,6 +515,148 @@ fn an_alpha_still_that_really_decodes_above_the_cap_is_refused() {
         )
     });
     assert!(error.to_string().contains("per-image limit"), "{error}");
+}
+
+/// Mirrors `WEBP_VP8_INPUT_BYTES_MULTIPLIER` in `multimodal.rs`, which is
+/// private.
+const VP8_INPUT_BYTES_MULTIPLIER: u64 = 5;
+
+/// `bytes` with `extra` zero bytes added inside its (bare, first) `VP8 ` chunk.
+/// The bitstream reader ignores what follows the frame it needs, so the file
+/// still decodes; only the size of the chunk changes.
+fn with_padded_vp8_chunk(bytes: &[u8], extra: usize) -> Vec<u8> {
+    assert_eq!(&bytes[12..16], b"VP8 ", "a bare VP8 file is expected");
+    let size = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+    let mut payload = bytes[20..20 + size].to_vec();
+    payload.resize(size + extra, 0);
+    let mut chunk = b"VP8 ".to_vec();
+    chunk.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    chunk.extend_from_slice(&payload);
+    if payload.len() % 2 == 1 {
+        chunk.push(0);
+    }
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&((chunk.len() + 4) as u32).to_le_bytes());
+    out.extend_from_slice(b"WEBP");
+    out.extend_from_slice(&chunk);
+    out
+}
+
+/// What the charge for the size of a `VP8 ` chunk exists for. A 2048 x 2048
+/// still is charged 33,554,432 B by its pixels; padded to 19 MB inside the
+/// chunk it decoded at 71,449,067 B, over the cap, and was admitted.
+/// Predicted before the first run: peak above the cap, and refused now.
+#[test]
+fn a_padded_vp8_chunk_that_decodes_above_the_cap_is_refused() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let padded = with_padded_vp8_chunk(
+        include_bytes!("testdata/lossy_still_2048x2048.webp"),
+        19_000_000,
+    );
+
+    let (decoded, peak) = peak_of(|| ingest_like_webp_to_png(&padded));
+    decoded.expect("the padded file decodes");
+    assert!(
+        peak > PER_IMAGE_CAP,
+        "the premise of this test is gone: the decode peaked at {peak} bytes, under the cap"
+    );
+    let error = gate("padded.webp", &padded)
+        .err()
+        .unwrap_or_else(|| panic!("the gate admitted a file that decodes at {peak} bytes"));
+    assert!(error.to_string().contains("per-image limit"), "{error}");
+}
+
+/// The multiplier is measured, not derived: for chunks of several sizes, the
+/// decode holds the chunk at most three times over, and the gate charges more
+/// than that. The sizes include ones just above a power of two, where growth by
+/// doubling overshoots the most. Predicted before the first run: at most 3.0
+/// times the chunk, and never above the charge.
+#[test]
+fn a_vp8_chunk_is_held_no_more_than_the_gate_charges_for() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let base = include_bytes!("testdata/lossy_still_64x64.webp");
+    let fixture = fixtures()
+        .into_iter()
+        .find(|f| f.name == "lossy_still_64x64.webp")
+        .expect("fixture is listed");
+    let (_, unpadded) = peak_of(|| ingest_like_webp_to_png(base));
+    let mut worst = 0f64;
+    for extra in [
+        100_000usize,
+        1 << 20,
+        (1 << 20) + 1,
+        3_000_000,
+        (1 << 22) + 1,
+        (1 << 23) + 1,
+        16_777_217,
+    ] {
+        let padded = with_padded_vp8_chunk(base, extra);
+        let chunk = u64::from(u32::from_le_bytes([
+            padded[16], padded[17], padded[18], padded[19],
+        ]));
+        let (ingested, ingest) = peak_of(|| ingest_like_webp_to_png(&padded));
+        let (validated, validator) = peak_of(|| decode_like_the_validator(Shape::Still, &padded));
+        ingested.expect("the padded file decodes");
+        validated.expect("the padded file decodes");
+        let peak = ingest.max(validator);
+        worst = worst.max((peak as f64 - unpadded as f64) / chunk as f64);
+        assert!(
+            peak <= fixture.charged() + VP8_INPUT_BYTES_MULTIPLIER * chunk,
+            "chunk of {chunk} bytes: decode peaked at {peak}, above the charge"
+        );
+        assert!(
+            gate("padded.webp", &padded).is_ok()
+                == (fixture.charged() + VP8_INPUT_BYTES_MULTIPLIER * chunk < PER_IMAGE_CAP),
+            "chunk of {chunk} bytes: the gate and the charge disagree on the cap"
+        );
+    }
+    eprintln!("worst (peak - unpadded peak) / chunk = {worst:.3}");
+    assert!(
+        worst <= 3.05,
+        "a chunk is held {worst:.3} times over, above the 3.0 measured"
+    );
+}
+
+/// A lossless still with alpha decodes straight into its 4 B/px output: at
+/// 2500 x 2500 a 4 + 8 charge (75 MB) would refuse it, and the real decode is
+/// about 25 MB. The charge of 8 is for the lossy-with-ALPH path; a lossless
+/// file must not pay it. Predicted before the first run: admitted, peak near
+/// 4 B/px, well under the charge.
+#[test]
+fn a_lossless_alpha_still_is_not_charged_like_a_lossy_one() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let side = 2500u32;
+    let bytes = {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            side,
+            side,
+            image::Rgba([255, 0, 0, 128]),
+        ))
+        .write_to(&mut cursor, image::ImageFormat::WebP)
+        .expect("the lossless encoder writes a WebP");
+        cursor.into_inner()
+    };
+    let charged = u64::from(side) * u64::from(side) * (4 + 5);
+
+    gate("lossless-alpha.webp", &bytes)
+        .expect("a lossless alpha still of 2500 px is under the cap and must be admitted");
+    let (ingested, ingest) = peak_of(|| ingest_like_webp_to_png(&bytes));
+    let (validated, validator) = peak_of(|| decode_like_the_validator(Shape::Alpha, &bytes));
+    ingested.expect("the file decodes");
+    validated.expect("the file decodes");
+    assert!(
+        validator <= charged,
+        "the validator's decode peaked at {validator} bytes, above the {charged} charged"
+    );
+    assert!(
+        ingest <= PER_IMAGE_CAP && validator <= PER_IMAGE_CAP,
+        "ingest {ingest}, validator {validator}: above the cap"
+    );
+    assert!(
+        validator < u64::from(side) * u64::from(side) * (4 + 8) / 2,
+        "the premise is gone: the decode holds {validator} bytes, not about 4 B/px"
+    );
 }
 
 /// A lossy still whose ALPH plane is lossless with predictor and colour

@@ -3040,17 +3040,21 @@ fn image_format_for_mime(source: &str, mime: &str) -> anyhow::Result<image::Imag
     }
 }
 
-/// Extra bytes per pixel a **still, non-alpha** WebP decode holds on top of its
-/// output buffer.
+/// Extra bytes per pixel a **still WebP without alpha, or a lossless still with
+/// alpha**, holds on top of its output buffer.
 ///
 /// Lossless decode allocates a `width * height * 4` RGBA scratch and converts
-/// it to the 3 B/px (`Rgb8`) output: scratch = 4 B/px. A lossy decode holds the
-/// VP8 planes instead, 1.5 B/px. 5 covers both with room to spare. A still
-/// with alpha is charged [`WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL`].
+/// it to the 3 B/px (`Rgb8`) output: scratch = 4 B/px. A lossless still with
+/// alpha decodes straight into its 4 B/px (`Rgba8`) output: measured at 4.0 B/px
+/// in total on 2364 to 2730 px files, so 5 is generous there. A lossy decode
+/// holds the VP8 planes instead, 1.5 B/px. 5 covers all of these with room to
+/// spare. A *lossy* still with alpha is charged
+/// [`WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL`].
 const WEBP_STILL_SCRATCH_BYTES_PER_PIXEL: u64 = 5;
 
-/// Extra bytes per pixel a **still WebP with alpha** (`Rgba8`, 4 B/px output)
-/// holds on top of its output buffer.
+/// Extra bytes per pixel a **lossy still WebP with alpha** (`Rgba8`, 4 B/px
+/// output) holds on top of its output buffer. A lossless still with alpha is
+/// charged [`WEBP_STILL_SCRATCH_BYTES_PER_PIXEL`].
 ///
 /// In the lossy-with-`ALPH` path the decoded VP8 frame stays alive while the
 /// output and the alpha are produced (`image-webp` 0.2.4 `src/decoder.rs`,
@@ -3071,6 +3075,22 @@ const WEBP_STILL_SCRATCH_BYTES_PER_PIXEL: u64 = 5;
 /// was derived for the lossless branch alone (9 B/px in total) and 7 (11 in
 /// total) was exceeded by the transforms case.
 const WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL: u64 = 8;
+
+/// Bytes charged per byte of the largest `VP8 ` bitstream in the file, on top
+/// of the per-pixel charge.
+///
+/// `image-webp` 0.2.4 `vp8.rs` `init_partitions` reads the rest of the chunk
+/// into a `Vec` with `read_to_end` and then copies it into the buffer the
+/// bit reader owns, so a `VP8 ` chunk of any size, whatever the canvas, is held
+/// two to three times over while it decodes. A per-pixel charge cannot see
+/// that: a 2048x2048 file padded to 19 MB inside its `VP8 ` chunk was charged
+/// 33.5 MB and decoded at 71.4 MB. Measured over chunks from 100 KB to 19 MB,
+/// including sizes just above a power of two: 3.00 times the chunk at worst
+/// in the decode itself (`tests/webp_alloc_budget.rs`). The validator also
+/// holds an owned copy of the input while it decodes, as the JPEG branch
+/// below charges: 1 more, 4 in all. 5 leaves a quarter above that; it is a
+/// measured margin, not a proven bound.
+const WEBP_VP8_INPUT_BYTES_MULTIPLIER: u64 = 5;
 
 /// Extra bytes per pixel an **animated** WebP decode holds on top of its
 /// output buffer, covering the worst case across alpha and non-alpha shapes.
@@ -3580,7 +3600,9 @@ const WEBP_ANIMATED_SCRATCH_MODEL: AnimationScratchModel = AnimationScratchModel
 /// - **Temporaries.** WebP decoding holds scratch buffers alongside the output;
 ///   see [`WEBP_STILL_SCRATCH_BYTES_PER_PIXEL`],
 ///   [`WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL`] and
-///   [`WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL`] for the per-shape derivation.
+///   [`WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL`] for the per-shape derivation,
+///   and [`WEBP_VP8_INPUT_BYTES_MULTIPLIER`] for the term in the size of a
+///   lossy bitstream, which no pixel count bounds.
 ///   No other supported format allocates a full-canvas temporary beyond the
 ///   buffer `total_bytes` already describes.
 ///
@@ -3626,14 +3648,17 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
             let animated = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
                 .map(|decoder| decoder.has_animation())
                 .unwrap_or(true);
+            let (has_lossy_chunk, largest_vp8_chunk) = webp_vp8_chunks(bytes);
             let scratch_per_pixel = if animated {
                 WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL
-            } else if image::ImageDecoder::color_type(&decoder).has_alpha() {
+            } else if image::ImageDecoder::color_type(&decoder).has_alpha() && has_lossy_chunk {
                 WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL
             } else {
                 WEBP_STILL_SCRATCH_BYTES_PER_PIXEL
             };
-            pixels.saturating_mul(scratch_per_pixel)
+            pixels
+                .saturating_mul(scratch_per_pixel)
+                .saturating_add(largest_vp8_chunk.saturating_mul(WEBP_VP8_INPUT_BYTES_MULTIPLIER))
         }
         image::ImageFormat::Gif => {
             // Every GIF is validated through the animation path, where the
@@ -3990,6 +4015,46 @@ fn ensure_vp8_matches_enclosing_canvas(
         }
     }
     Ok(())
+}
+
+/// What the projection needs to know about the `VP8 ` bitstreams in a WebP:
+/// whether a top-level `VP8 ` chunk exists (a lossy still; a lossless one has
+/// `VP8L`), and the size of the largest `VP8 ` payload the decoder could be
+/// handed, which is the top-level ones and the sub-chunks of an `ANMF` that
+/// `read_frame` decodes as VP8 (named `VP8 `, or following an `ALPH` whatever
+/// its name).
+///
+/// It walks the same chunks as [`ensure_vp8_matches_enclosing_canvas`], and
+/// that walk is a superset of what the decoder reads. Both answers therefore
+/// err towards the larger charge: a `VP8 ` chunk the decoder would never reach
+/// still counts. The payload is what is present in the file, not the declared
+/// size, because that is what the decoder can read.
+fn webp_vp8_chunks(bytes: &[u8]) -> (bool, u64) {
+    let Some(body) = bytes.get(12..) else {
+        return (false, 0);
+    };
+    let (mut has_lossy_chunk, mut largest) = (false, 0usize);
+    for (fourcc, payload, _) in riff_chunks(body) {
+        match &fourcc {
+            b"VP8 " => {
+                has_lossy_chunk = true;
+                largest = largest.max(payload.len());
+            }
+            b"ANMF" => {
+                let mut after_alpha = false;
+                for (sub_fourcc, sub_payload, _) in
+                    riff_chunks(payload.get(16..).unwrap_or_default())
+                {
+                    if after_alpha || &sub_fourcc == b"VP8 " {
+                        largest = largest.max(sub_payload.len());
+                    }
+                    after_alpha = &sub_fourcc == b"ALPH";
+                }
+            }
+            _ => {}
+        }
+    }
+    (has_lossy_chunk, largest as u64)
 }
 
 /// Header-only per-image gate for callers that decode untrusted image bytes
@@ -8866,29 +8931,54 @@ mod tests {
     #[tokio::test]
     async fn ensure_decode_within_per_image_cap_flips_where_the_validator_does() {
         // A still WebP projects to output + scratch per pixel: 3 + 5 without
-        // alpha (cap crossed between 2896 and 2897 px per side) and 4 + 8 with
-        // the VP8X alpha flag (between 2364 and 2365). The sanity asserts tie
-        // those sides to the constants, so a change to either fails here
-        // rather than silently moving the boundary under the cases below.
-        let projected = |side: u32, per_pixel: u64| u64::from(side) * u64::from(side) * per_pixel;
+        // alpha (cap crossed between 2896 and 2897 px per side), 4 + 5 for a
+        // lossless still with the VP8X alpha flag (between 2730 and 2731) and
+        // 4 + 8 for a lossy one (between 2364 and 2365). The lossy fixtures
+        // also carry a 10-byte `VP8 ` chunk, charged 4 B per byte, which moves
+        // none of these boundaries. The sanity asserts tie those sides to the
+        // constants, so a change to either fails here rather than silently
+        // moving the boundary under the cases below.
+        #[derive(Clone, Copy, Debug)]
+        enum Kind {
+            LosslessPlain,
+            LossyPlain,
+            LosslessAlpha,
+            LossyAlpha,
+        }
+        let projected = |side: u32, per_pixel: u64| {
+            u64::from(side) * u64::from(side) * per_pixel + 10 * WEBP_VP8_INPUT_BYTES_MULTIPLIER
+        };
         let plain = 3 + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL;
-        let with_alpha = 4 + WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL;
+        let lossless_alpha = 4 + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL;
+        let lossy_alpha = 4 + WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL;
         assert!(projected(2896, plain) < MAX_DECODED_IMAGE_ALLOC_BYTES);
         assert!(projected(2897, plain) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
-        assert!(projected(2364, with_alpha) < MAX_DECODED_IMAGE_ALLOC_BYTES);
-        assert!(projected(2365, with_alpha) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2730, lossless_alpha) < MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2731, lossless_alpha) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2364, lossy_alpha) < MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2365, lossy_alpha) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
 
         let cases = [
-            (1000, false, false),
-            (2896, false, false),
-            (2897, false, true),
-            (4000, false, true),
-            (2364, true, false),
-            (2365, true, true),
-            (2730, true, true),
+            (1000, Kind::LosslessPlain, false),
+            (2896, Kind::LosslessPlain, false),
+            (2897, Kind::LosslessPlain, true),
+            (4000, Kind::LosslessPlain, true),
+            (2896, Kind::LossyPlain, false),
+            (2897, Kind::LossyPlain, true),
+            (2730, Kind::LosslessAlpha, false),
+            (2731, Kind::LosslessAlpha, true),
+            (2364, Kind::LossyAlpha, false),
+            (2365, Kind::LossyAlpha, true),
+            (2730, Kind::LossyAlpha, true),
         ];
-        for (side, alpha, over_cap) in cases {
-            let mut webp = webp_with_canvas(side, false);
+        for (side, kind, over_cap) in cases {
+            let alpha = matches!(kind, Kind::LosslessAlpha | Kind::LossyAlpha);
+            let mut webp = match kind {
+                Kind::LosslessPlain | Kind::LosslessAlpha => webp_with_canvas(side, false),
+                Kind::LossyPlain | Kind::LossyAlpha => {
+                    still_lossy_webp((side, side), (side as u16, side as u16))
+                }
+            };
             if alpha {
                 // The VP8X flags byte follows the 12-byte RIFF header and the
                 // 8-byte chunk header; bit 4 is the alpha flag.
@@ -9214,6 +9304,80 @@ mod tests {
                 "{name}: {error}"
             );
         }
+    }
+
+    /// A canvas-sized `VP8 ` chunk of `chunk_len` payload bytes: the VP8X canvas
+    /// and the bitstream header agree on `side` x `side`, and the rest of the
+    /// payload is zeros the gate never reads.
+    fn lossy_still_with_chunk_of(side: u16, chunk_len: usize) -> Vec<u8> {
+        let mut payload = vp8_header_payload(side, side);
+        payload.resize(chunk_len, 0);
+        let mut body = Vec::new();
+        append_webp_chunk(
+            &mut body,
+            b"VP8X",
+            &vp8x_payload(false, (side.into(), side.into())),
+        );
+        append_webp_chunk(&mut body, b"VP8 ", &payload);
+        riff_webp(body)
+    }
+
+    #[test]
+    fn the_size_of_a_vp8_chunk_is_charged_whatever_the_canvas() {
+        // The decoder holds a `VP8 ` chunk several times over while it decodes
+        // (see `WEBP_VP8_INPUT_BYTES_MULTIPLIER`), so the projection adds that
+        // term to the per-pixel charge. A 2048x2048 still is charged 8 B/px,
+        // 33,554,432 B; the term brings it to the cap at the smallest chunk
+        // whose charge reaches it, and the two sizes either side must flip.
+        let side = 2048u16;
+        let per_pixel = 3 + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL;
+        let base = u64::from(side) * u64::from(side) * per_pixel;
+        let boundary =
+            (MAX_DECODED_IMAGE_ALLOC_BYTES - base).div_ceil(WEBP_VP8_INPUT_BYTES_MULTIPLIER);
+        assert!(
+            base + (boundary - 1) * WEBP_VP8_INPUT_BYTES_MULTIPLIER < MAX_DECODED_IMAGE_ALLOC_BYTES
+        );
+        assert!(base + boundary * WEBP_VP8_INPUT_BYTES_MULTIPLIER >= MAX_DECODED_IMAGE_ALLOC_BYTES);
+
+        let admitted = lossy_still_with_chunk_of(side, boundary as usize - 1);
+        ensure_decode_within_per_image_cap("pad.webp", "image/webp", &admitted)
+            .expect("one byte under the boundary is admitted");
+
+        let refused = lossy_still_with_chunk_of(side, boundary as usize);
+        let error = ensure_decode_within_per_image_cap("pad.webp", "image/webp", &refused)
+            .expect_err("the boundary itself is refused");
+        assert!(error.to_string().contains("per-image limit"), "{error}");
+
+        // The same bitstream behind an `ALPH`, in an animation frame: the
+        // sub-chunk after an `ALPH` is decoded as VP8 whatever it is called.
+        let mut frame = vec![0u8; 16];
+        frame[6..9].copy_from_slice(&(u32::from(side) - 1).to_le_bytes()[..3]);
+        frame[9..12].copy_from_slice(&(u32::from(side) - 1).to_le_bytes()[..3]);
+        append_webp_chunk(&mut frame, b"ALPH", &[0, 0]);
+        let mut payload = vp8_header_payload(side, side);
+        payload.resize(2_000_000, 0);
+        append_webp_chunk(&mut frame, b"JUNK", &payload);
+        let mut body = Vec::new();
+        append_webp_chunk(
+            &mut body,
+            b"VP8X",
+            &vp8x_payload(true, (side.into(), side.into())),
+        );
+        append_webp_chunk(&mut body, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+        append_webp_chunk(&mut body, b"ANMF", &frame);
+        let animated = riff_webp(body);
+        // 2048² animated is already over the cap on its own, so the check is
+        // the charge itself, not the verdict. The VP8X alpha flag is unset, so
+        // the output is `Rgb8`, 3 B/px.
+        let charged =
+            projected_allocation("anim.webp", "image/webp", &animated).expect("the header parses");
+        let without_term =
+            u64::from(side) * u64::from(side) * (3 + WEBP_ANIMATED_SCRATCH_BYTES_PER_PIXEL);
+        assert_eq!(
+            charged,
+            without_term + 2_000_000 * WEBP_VP8_INPUT_BYTES_MULTIPLIER,
+            "the chunk after an ALPH counts as a VP8 bitstream whatever its name"
+        );
     }
 
     #[test]
@@ -9591,18 +9755,20 @@ mod tests {
 
     #[tokio::test]
     async fn still_alpha_webp_is_refused_before_allocation_when_peak_exceeds_cap() {
-        // A valid 2800x2800 lossless alpha WebP illustrates the undercount the
-        // prior scratch model had: color_type() returns Rgba8 (4 B/px), so
-        // total_bytes() = 2800²×4 = 31,360,000. The old scratch addend (4 B/px)
-        // gave a projection of 62,720,000, below MAX_DECODED_IMAGE_ALLOC_BYTES
-        // (67,108,864). But read_alpha_chunk's lossless branch allocates another
-        // 2800²×4 RGBA buffer and a 2800²×1 green plane alongside the output, so
-        // the real peak is 2800²×(4+4+1) = 70,560,000. The corrected scratch
-        // (5 B/px) projects 2800²×(4+5) = 70,560,000, now above the cap.
+        // A valid 2800x2800 lossless alpha WebP: color_type() returns Rgba8
+        // (4 B/px), so total_bytes() = 2800²×4 = 31,360,000. The old scratch
+        // addend (4 B/px) gave a projection of 62,720,000, below
+        // MAX_DECODED_IMAGE_ALLOC_BYTES (67,108,864). The scratch for a
+        // lossless still is 5 B/px, which projects 2800²×(4+5) = 70,560,000,
+        // above the cap. That is a generous charge for this file: its real
+        // decode holds about 4 B/px (measured at 2500 px in
+        // `tests/webp_alloc_budget.rs`), so this test pins the projection's
+        // verdict, not the decoder's peak. The lossy-with-ALPH case that really
+        // needs more is covered by the real files in that binary.
         //
-        // The fixture is built from a real encoder so the VP8X alpha flag, ALPH
-        // chunk, and VP8 opaque layer are all consistent with what the decoder
-        // checks — a mismatched fixture would fail in a different place.
+        // The fixture is built from a real encoder so the VP8X alpha flag and
+        // the lossless bitstream are consistent with what the decoder checks —
+        // a mismatched fixture would fail in a different place.
         let alpha_webp = {
             let mut buf = std::io::Cursor::new(Vec::new());
             image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
@@ -9622,7 +9788,7 @@ mod tests {
             "old 4B/px scratch would have admitted this: {old_proj} < {MAX_DECODED_IMAGE_ALLOC_BYTES}"
         );
         // Sanity: the corrected projection refuses it.
-        let new_proj = 2800u64 * 2800 * (4 + WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL);
+        let new_proj = 2800u64 * 2800 * (4 + WEBP_STILL_SCRATCH_BYTES_PER_PIXEL);
         assert!(
             new_proj >= MAX_DECODED_IMAGE_ALLOC_BYTES,
             "new scratch must project above the cap: {new_proj} vs {MAX_DECODED_IMAGE_ALLOC_BYTES}"
