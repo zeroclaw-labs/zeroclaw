@@ -207,6 +207,13 @@ tool-sessions-send-output-appended-alias = Legacy content appended to session '{
 tool-sessions-send-error-append = Failed to append content to session history: { $error }
 tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
 tool-sessions-current-channel = Channel: { $channel }
+tool-sessions-error-foreign-agent = Session '{ $session_id }' is owned by agent '{ $owner }', not '{ $agent }'.
+tool-sessions-error-foreign-channel = Session '{ $session_id }' belongs to channel '{ $channel }', which is not owned by agent '{ $agent }'.
+tool-sessions-error-unattributed = Session '{ $session_id }' has no agent or channel ownership metadata; refusing session operation from agent '{ $agent }'.
+tool-sessions-error-ownership-unverifiable = Session backend cannot atomically verify ownership for '{ $session_id }'; refusing session operation from agent '{ $agent }'.
+tool-sessions-error-no-ownership-metadata = Session '{ $session_id }' exists but has no ownership metadata; refusing session operation from agent '{ $agent }'.
+tool-sessions-error-ownership-check-failed = Session ownership check failed unexpectedly.
+tool-sessions-history-error-read = Failed to read session '{ $session_id }' after ownership verification: { $error }
 
 tool-screenshot = Capture a screenshot of the current screen. Returns the saved file path.
 tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist

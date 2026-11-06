@@ -282,9 +282,9 @@ impl SessionOwnershipScope {
         };
 
         let Some(metadata) = backend.get_session_metadata(&session_key) else {
-            return Err(format!(
-                "Session '{session_id}' exists but has no ownership metadata; refusing session operation from agent '{}'.",
-                self.agent_alias
+            return Err(tool_msg_with_args(
+                "tool-sessions-error-no-ownership-metadata",
+                &[("session_id", session_id), ("agent", &self.agent_alias)],
             ));
         };
 
@@ -299,22 +299,31 @@ impl SessionOwnershipScope {
     }
 
     fn denial_message(&self, session_id: &str, denial: &SessionOwnershipDenial) -> String {
+        let agent = self.agent_alias.as_str();
         match denial {
-            SessionOwnershipDenial::ForeignAgent(owner) => format!(
-                "Session '{session_id}' is owned by agent '{owner}', not '{}'.",
-                self.agent_alias
+            SessionOwnershipDenial::ForeignAgent(owner) => tool_msg_with_args(
+                "tool-sessions-error-foreign-agent",
+                &[
+                    ("session_id", session_id),
+                    ("owner", owner),
+                    ("agent", agent),
+                ],
             ),
-            SessionOwnershipDenial::ForeignChannel(channel_id) => format!(
-                "Session '{session_id}' belongs to channel '{channel_id}', which is not owned by agent '{}'.",
-                self.agent_alias
+            SessionOwnershipDenial::ForeignChannel(channel_id) => tool_msg_with_args(
+                "tool-sessions-error-foreign-channel",
+                &[
+                    ("session_id", session_id),
+                    ("channel", channel_id),
+                    ("agent", agent),
+                ],
             ),
-            SessionOwnershipDenial::Unattributed => format!(
-                "Session '{session_id}' has no agent or channel ownership metadata; refusing session operation from agent '{}'.",
-                self.agent_alias
+            SessionOwnershipDenial::Unattributed => tool_msg_with_args(
+                "tool-sessions-error-unattributed",
+                &[("session_id", session_id), ("agent", agent)],
             ),
-            SessionOwnershipDenial::AtomicCheckUnavailable => format!(
-                "Session backend cannot atomically verify ownership for '{session_id}'; refusing session operation from agent '{}'.",
-                self.agent_alias
+            SessionOwnershipDenial::AtomicCheckUnavailable => tool_msg_with_args(
+                "tool-sessions-error-ownership-unverifiable",
+                &[("session_id", session_id), ("agent", agent)],
             ),
         }
     }
@@ -651,8 +660,9 @@ impl Tool for SessionsHistoryTool {
                         return Ok(ToolResult {
                             success: false,
                             output: ToolOutput::default(),
-                            error: Some(format!(
-                                "Failed to read session '{session_id}' after ownership verification: {error}"
+                            error: Some(tool_msg_with_args(
+                                "tool-sessions-history-error-read",
+                                &[("session_id", session_id), ("error", &error.to_string())],
                             )),
                         });
                     }
@@ -941,7 +951,7 @@ impl Tool for SessionsSendTool {
             }),
             Ok(ScopedSessionAccess::Denied(denial)) => {
                 let error = self.ownership_scope.as_ref().map_or_else(
-                    || "Session ownership check failed unexpectedly.".to_string(),
+                    || tool_msg("tool-sessions-error-ownership-check-failed"),
                     |scope| scope.denial_message(session_id, &denial),
                 );
                 Ok(ToolResult {
@@ -1619,6 +1629,52 @@ mod tests {
     ) -> (TempDir, Arc<dyn SessionBackend>) {
         let (tmp, inner) = seeded_backend();
         (tmp, Arc::new(MetadataBackend::new(inner, metadata)))
+    }
+
+    // ── Ownership refusal text ──────────────────────────────────────
+
+    #[test]
+    fn ownership_refusals_render_from_the_tools_catalogue() {
+        let scope = SessionOwnershipScope::for_agent("agent-a");
+        let cases = [
+            (
+                SessionOwnershipDenial::ForeignAgent("agent-b".to_string()),
+                "Session 'chat_1' is owned by agent 'agent-b', not 'agent-a'.",
+            ),
+            (
+                SessionOwnershipDenial::ForeignChannel("telegram.ops".to_string()),
+                "Session 'chat_1' belongs to channel 'telegram.ops', which is not owned by agent 'agent-a'.",
+            ),
+            (
+                SessionOwnershipDenial::Unattributed,
+                "Session 'chat_1' has no agent or channel ownership metadata; refusing session operation from agent 'agent-a'.",
+            ),
+            (
+                SessionOwnershipDenial::AtomicCheckUnavailable,
+                "Session backend cannot atomically verify ownership for 'chat_1'; refusing session operation from agent 'agent-a'.",
+            ),
+        ];
+        for (denial, english) in cases {
+            assert_eq!(scope.denial_message("chat_1", &denial), english);
+        }
+        assert_eq!(
+            tool_msg_with_args(
+                "tool-sessions-error-no-ownership-metadata",
+                &[("session_id", "chat_1"), ("agent", "agent-a")],
+            ),
+            "Session 'chat_1' exists but has no ownership metadata; refusing session operation from agent 'agent-a'."
+        );
+        assert_eq!(
+            tool_msg_with_args(
+                "tool-sessions-history-error-read",
+                &[("session_id", "chat_1"), ("error", "disk unavailable")],
+            ),
+            "Failed to read session 'chat_1' after ownership verification: disk unavailable"
+        );
+        assert_eq!(
+            tool_msg("tool-sessions-error-ownership-check-failed"),
+            "Session ownership check failed unexpectedly."
+        );
     }
 
     // ── Session ID validation tests ─────────────────────────────────
