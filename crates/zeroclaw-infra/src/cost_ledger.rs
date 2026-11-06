@@ -20,13 +20,19 @@ pub enum Backend {
 }
 
 pub fn resolve_path(workspace_dir: &Path, session_backend: &str) -> Result<PathBuf> {
+    resolve_storage(workspace_dir, session_backend).map(|(path, _)| path)
+}
+
+/// Resolve the ledger and its installation generation. The generation is a
+/// cache key for ledger replacement, not an additional persisted identifier.
+pub fn resolve_storage(workspace_dir: &Path, session_backend: &str) -> Result<(PathBuf, u64)> {
     let sessions = workspace_dir.join("sessions");
     let manifest = sessions.join("session-format.json");
-    let backend = if manifest.exists() {
+    let (backend, generation) = if manifest.exists() {
         let value: serde_json::Value = serde_json::from_slice(
             &fs::read(&manifest).with_context(|| format!("read {}", manifest.display()))?,
         )?;
-        match value.get("phase").and_then(serde_json::Value::as_str) {
+        let backend = match value.get("phase").and_then(serde_json::Value::as_str) {
             Some("ready") => match value.get("backend").and_then(serde_json::Value::as_str) {
                 Some("sqlite") => Backend::Sqlite,
                 Some("jsonl") => Backend::Jsonl,
@@ -34,20 +40,28 @@ pub fn resolve_path(workspace_dir: &Path, session_backend: &str) -> Result<PathB
             },
             Some(phase) => bail!("session format is not ready: {phase}"),
             None => bail!("session format manifest has no phase"),
-        }
+        };
+        let generation = value
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            .context("session format manifest has no generation")?;
+        (backend, generation)
     } else {
         // A tracker can precede lazy session-host initialization. Select the
         // configured backend immediately so its live handles keep the same
         // ledger when the installation manifest is published.
-        match crate::session_events::installation::NativeBackend::parse(session_backend)? {
-            crate::session_events::installation::NativeBackend::Sqlite => Backend::Sqlite,
-            crate::session_events::installation::NativeBackend::Jsonl => Backend::Jsonl,
-        }
+        let backend =
+            match crate::session_events::installation::NativeBackend::parse(session_backend)? {
+                crate::session_events::installation::NativeBackend::Sqlite => Backend::Sqlite,
+                crate::session_events::installation::NativeBackend::Jsonl => Backend::Jsonl,
+            };
+        (backend, 0)
     };
-    Ok(match backend {
+    let path = match backend {
         Backend::Sqlite => sessions.join("session-events.db"),
         Backend::Jsonl => sessions.join("session-events-jsonl").join(JSONL_FILE),
-    })
+    };
+    Ok((path, generation))
 }
 
 pub struct CostLedger {
@@ -626,36 +640,48 @@ mod tests {
 
     #[test]
     fn failed_legacy_import_retains_source_and_resumes_without_duplicates() {
-        for name in ["sqlite", "jsonl"] {
-            let dir = TempDir::new().unwrap();
-            let path = resolve_path(dir.path(), name).unwrap();
-            let legacy = dir.path().join("state/costs.jsonl");
-            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-            let first = legacy_record("a", Some("session"));
-            let second = legacy_record("b", Some("session"));
-            let mut invalid: serde_json::Value = serde_json::from_slice(&second).unwrap();
-            invalid.as_object_mut().unwrap().remove("id");
-            let original = [first.clone(), serde_json::to_vec(&invalid).unwrap()].join(&b'\n');
-            fs::write(&legacy, &original).unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = resolve_path(dir.path(), "sqlite").unwrap();
+        CostLedger::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_import BEFORE INSERT ON session_cost_records
+                 WHEN NEW.record_id='b' BEGIN SELECT RAISE(FAIL, 'injected storage failure'); END;",
+        )
+        .unwrap();
+        let legacy = dir.path().join("state/costs.jsonl");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let first = legacy_record("a", Some("session"));
+        let second = legacy_record("b", Some("session"));
+        let original = [first, second].join(&b'\n');
+        fs::write(&legacy, &original).unwrap();
 
-            for _ in 0..2 {
-                let error = CostLedger::open(&path).err().unwrap();
-                assert!(error.to_string().contains("cost record has no id"));
-                assert_eq!(fs::read(&legacy).unwrap(), original);
-                assert!(!dir.path().join("state/costs.jsonl.backup").exists());
-            }
-
-            fs::write(&legacy, [first, second].join(&b'\n')).unwrap();
-            let ledger = CostLedger::open(&path).unwrap();
-            let records = ledger.read_records().unwrap();
-            assert_eq!(records.len(), 2);
-            for (raw, id) in records.iter().zip(["a", "b"]) {
-                let value: serde_json::Value = serde_json::from_slice(raw).unwrap();
-                assert_eq!(value["id"], id);
-            }
-            assert!(!legacy.exists());
-            assert!(dir.path().join("state/costs.jsonl.backup").exists());
+        for _ in 0..2 {
+            let error = CostLedger::open(&path).err().unwrap();
+            assert!(error.to_string().contains("injected storage failure"));
+            let imported: usize = conn
+                .query_row("SELECT COUNT(*) FROM session_cost_records", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(imported, 1);
+            assert_eq!(fs::read(&legacy).unwrap(), original);
+            assert!(!dir.path().join("state/costs.jsonl.backup").exists());
         }
+
+        conn.execute_batch("DROP TRIGGER reject_import").unwrap();
+        let ledger = CostLedger::open(&path).unwrap();
+        let records = ledger.read_records().unwrap();
+        assert_eq!(records.len(), 2);
+        for (raw, id) in records.iter().zip(["a", "b"]) {
+            let value: serde_json::Value = serde_json::from_slice(raw).unwrap();
+            assert_eq!(value["id"], id);
+        }
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read(dir.path().join("state/costs.jsonl.backup")).unwrap(),
+            original
+        );
     }
 
     #[test]
