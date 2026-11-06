@@ -17,9 +17,24 @@ impl Acp {
         Self { inner }
     }
 
+    #[cfg(test)]
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+        Self::new_with_max_tracked_sessions(
+            rpc,
+            crate::config::DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE,
+        )
+    }
+
+    pub(crate) fn new_with_max_tracked_sessions(
+        rpc: Arc<RpcClient>,
+        max_tracked_sessions_per_pane: usize,
+    ) -> Self {
         Self {
-            inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
+            inner: chat::Chat::new_with_max_tracked_sessions(
+                rpc,
+                chat::PaneKind::Acp,
+                max_tracked_sessions_per_pane,
+            ),
         }
     }
 
