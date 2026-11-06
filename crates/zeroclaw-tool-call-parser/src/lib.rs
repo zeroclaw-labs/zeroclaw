@@ -1500,11 +1500,76 @@ fn parse_special_token_tool_calls(response: &str) -> Vec<ParsedToolCall> {
         if inner.starts_with('[') && inner.ends_with(']') && inner.len() >= 2 {
             inner = inner[1..inner.len() - 1].trim();
         }
-        if let Some(call) = parse_glm_shortened_body(inner) {
-            calls.push(call);
+        let segments = split_top_level_function_calls(inner);
+        let mut segment_calls = Vec::with_capacity(segments.len());
+        let mut ok = true;
+        for segment in segments {
+            match parse_glm_shortened_body(segment) {
+                Some(call) => segment_calls.push(call),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // Only consume the envelope when every listed call parsed cleanly.
+        if ok && !segment_calls.is_empty() {
+            calls.extend(segment_calls);
         }
     }
     calls
+}
+
+/// Split `file_read(...), file_read(...)` on top-level commas outside quotes
+/// and parentheses so a list envelope yields every call, not only the first.
+fn split_top_level_function_calls(inner: &str) -> Vec<&str> {
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, ch) in trimmed.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let part = trimmed[start..i].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = trimmed[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    if parts.is_empty() {
+        vec![trimmed]
+    } else {
+        parts
+    }
 }
 
 fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
@@ -1746,7 +1811,10 @@ fn default_param_for_tool(tool: &str) -> &'static str {
     }
 }
 
-/// Parse `key="value"` / `key='value'` pairs from a function-style argument list.
+/// Parse `key="value"` / `key='value'` / `key=bare` pairs from a function-style
+/// argument list. Escaped quotes inside strings are preserved. Bare values keep
+/// JSON types (`10` stays a number). Incomplete or malformed input returns
+/// `None` instead of a partial argument object.
 fn parse_function_style_kwargs(
     value_part: &str,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -1758,37 +1826,78 @@ fn parse_function_style_kwargs(
             break;
         }
         let Some(eq_pos) = rest.find('=') else {
-            break;
+            // Trailing junk after a complete arg list is a parse failure.
+            return None;
         };
         let key = rest[..eq_pos]
             .trim()
             .trim_matches(|c: char| c == ',' || c == ';');
         if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            break;
+            return None;
         }
         let after_eq = rest[eq_pos + 1..].trim_start();
         let (value, consumed) =
             if let Some(quote) = after_eq.chars().next().filter(|c| *c == '"' || *c == '\'') {
                 let body = &after_eq[quote.len_utf8()..];
-                let Some(end) = body.find(quote) else {
-                    break;
+                let mut out = String::new();
+                let mut chars = body.char_indices();
+                let mut end_byte = None;
+                while let Some((i, ch)) = chars.next() {
+                    if ch == '\\' {
+                        match chars.next() {
+                            Some((_, escaped)) => out.push(escaped),
+                            None => return None, // dangling backslash
+                        }
+                        continue;
+                    }
+                    if ch == quote {
+                        end_byte = Some(i);
+                        break;
+                    }
+                    out.push(ch);
+                }
+                let Some(end) = end_byte else {
+                    return None; // unclosed quote
                 };
                 (
-                    body[..end].to_string(),
+                    serde_json::Value::String(out),
                     quote.len_utf8() + end + quote.len_utf8(),
                 )
             } else {
                 let end = after_eq.find(',').unwrap_or(after_eq.len());
-                let value = after_eq[..end].trim().to_string();
-                if value.is_empty() {
-                    break;
+                let raw = after_eq[..end].trim();
+                if raw.is_empty() {
+                    return None;
                 }
+                let value = parse_bare_kwarg_value(raw);
                 (value, end)
             };
-        args.insert(key.to_string(), serde_json::Value::String(value));
+        args.insert(key.to_string(), value);
+        // Attribute style uses spaces between pairs (`channel="a" message="b"`);
+        // function style uses commas. Both are fine — the next loop iteration
+        // trims whitespace/commas, and non-key junk fails the key=/`=` checks.
         rest = after_eq[consumed..].trim_start();
     }
     if args.is_empty() { None } else { Some(args) }
+}
+
+fn parse_bare_kwarg_value(raw: &str) -> serde_json::Value {
+    match raw {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        "null" => serde_json::Value::Null,
+        _ => {
+            if let Ok(n) = raw.parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else if let Ok(n) = raw.parse::<f64>() {
+                serde_json::Number::from_f64(n)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+            } else {
+                serde_json::Value::String(raw.to_string())
+            }
+        }
+    }
 }
 
 fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
@@ -1808,8 +1917,11 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     // Check attribute-style FIRST: `tool_name key="value" />`
     // Must come before `>` check because `/>` contains `>` and would
     // misparse the tool name in the first branch.
-    let (tool_raw, value_part) = if let Some((tool, args)) = function_style {
-        (tool, args)
+    // `allow_kwargs`: parenthesized function style and attribute style may use
+    // key=value pairs. The raw `tool>value` form must stay on the single-value
+    // path even when the value contains `=` (e.g. `shell>FOO=bar env`).
+    let (tool_raw, value_part, allow_kwargs) = if let Some((tool, args)) = function_style {
+        (tool, args, true)
     } else if body.contains("=\"") {
         // Attribute-style: split at first whitespace to get tool name
         let split_pos = body.find(|c: char| c.is_whitespace()).unwrap_or(body.len());
@@ -1820,7 +1932,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
             .trim_end_matches('>')
             .trim_end_matches('/')
             .trim();
-        (tool, attrs)
+        (tool, attrs, true)
     } else {
         let gt_pos = body.find('>')?;
         // GLM shortened: `tool_name>value`
@@ -1828,7 +1940,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
         let value = body[gt_pos + 1..].trim();
         // Strip trailing self-close markers that some models emit
         let value = value.trim_end_matches("/>").trim_end_matches('/').trim();
-        (tool, value)
+        (tool, value, false)
     };
 
     // Validate tool name: must be alphanumeric + underscore only
@@ -1840,7 +1952,8 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     let tool_name = map_tool_name_alias(tool_raw);
 
     // Try attribute / kwargs style: key="value", key='value', or key=bare
-    if value_part.contains('=')
+    if allow_kwargs
+        && value_part.contains('=')
         && let Some(args) = parse_function_style_kwargs(value_part)
     {
         return Some(ParsedToolCall {
@@ -3687,6 +3800,49 @@ I will now call the tool with this payload:
         assert_eq!(double.get("mode").and_then(|v| v.as_str()), Some("r"));
         let single = parse_function_style_kwargs("path='/tmp/b'").expect("single");
         assert_eq!(single.get("path").and_then(|v| v.as_str()), Some("/tmp/b"));
+    }
+
+    #[test]
+    fn parse_function_style_kwargs_keeps_escaped_quotes_and_bare_types() {
+        let args = parse_function_style_kwargs(r"path='it\'s.txt', offset=10, limit=2")
+            .expect("escaped quote + bare ints");
+        assert_eq!(args.get("path").and_then(|v| v.as_str()), Some("it's.txt"));
+        assert_eq!(args.get("offset").and_then(|v| v.as_i64()), Some(10));
+        assert_eq!(args.get("limit").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn parse_function_style_kwargs_rejects_incomplete_quoted_value() {
+        assert!(
+            parse_function_style_kwargs(r"path='it\'s.txt").is_none(),
+            "unclosed / truncated quote must not yield a partial object"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_preserves_shell_env_assignment_on_single_value_path() {
+        // Regression: value containing `=` must stay on the single-value path.
+        let response = "<tool_call>shell>FOO=bar env</tool_call>";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty(), "{text:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").and_then(|v| v.as_str()),
+            Some("FOO=bar env")
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_lfm_special_token_call_list() {
+        let response = "<|tool_call_start|>[file_read(path='a'), file_read(path='b')]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty(), "{text:?}");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments.get("path").and_then(|v| v.as_str()), Some("a"));
+        assert_eq!(calls[1].name, "file_read");
+        assert_eq!(calls[1].arguments.get("path").and_then(|v| v.as_str()), Some("b"));
     }
 
     #[test]
