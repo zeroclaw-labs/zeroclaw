@@ -6456,6 +6456,7 @@ async fn run_draft_updater(
         turn_flush_narration,
         outbound_hooks,
         outbound_channel,
+        None,
         rx,
     )
     .await;
@@ -6475,6 +6476,7 @@ async fn run_draft_updater_with_leak_detection(
     turn_flush_narration: bool,
     outbound_hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     outbound_channel: String,
+    turn_routing: Option<tools::TurnRoutingHandle>,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
@@ -6579,13 +6581,29 @@ async fn run_draft_updater_with_leak_detection(
                 // Hooks can make non-idempotent decisions about a completed
                 // response. Do not disclose speculative text to a TTS provider
                 // before that decision; finalization will synthesize it instead.
+                let prepare_voice = turn_routing.as_ref().is_none_or(|routing| {
+                    let routes = routing.lock().unwrap_or_else(|error| error.into_inner());
+                    routes.last().is_none_or(|route| {
+                        route.modality != zeroclaw_config::multi_agent::OutputModality::Text
+                            && route.channel.as_deref().is_none_or(str::is_empty)
+                            && route
+                                .recipient
+                                .as_deref()
+                                .is_none_or(|recipient| recipient == reply_target)
+                    })
+                });
                 if outbound_hooks.is_none() {
                     let phase = &accumulated[speech_phase_start..];
-                    let mut speech = redact_channel_outbound_leaks(
-                        &sanitize_streaming_draft_text(phase, &known_tool_names),
-                        &leak_detection,
-                        content_format,
-                    );
+                    let mut speech = if prepare_voice {
+                        redact_channel_outbound_leaks(
+                            &sanitize_streaming_draft_text(phase, &known_tool_names),
+                            &leak_detection,
+                            content_format,
+                        )
+                    } else {
+                        // An explicit text route also cancels any older speculation.
+                        String::new()
+                    };
                     // The display sanitizer trims trailing whitespace, but the
                     // speech segmenter needs the observed sentence/paragraph
                     // delimiter. Restore only this structural whitespace, never
@@ -10238,6 +10256,12 @@ async fn process_channel_message_body(
     // finalize the same cumulative stream they used for paragraph offsets.
     // Other draft modes still finalize the canonical response unchanged.
     let streamed_draft_text = Arc::new(Mutex::new(String::new()));
+    // Fresh per-turn routing handle, scoped into TURN_ROUTING for the duration of
+    // the tool-call loop below. Allocating per turn (rather than clearing a shared
+    // handle) keeps concurrent same-agent turns from reading each other's routes.
+    let turn_routing: tools::TurnRoutingHandle =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
         if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) = (
@@ -10285,6 +10309,7 @@ async fn process_channel_message_body(
                 let streamed_draft_text = Arc::clone(&streamed_draft_text);
                 let leak_detection = ctx.prompt_config.security.leak_detection.clone();
                 let content_format = outbound_content_format_for_channel(&msg.channel);
+                let draft_routing = Arc::clone(&turn_routing);
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
                     run_draft_updater_with_leak_detection(
@@ -10298,6 +10323,7 @@ async fn process_channel_message_body(
                         turn_flush_narration,
                         outbound_hooks,
                         outbound_channel,
+                        Some(draft_routing),
                         rx,
                     )
                     .await;
@@ -10438,12 +10464,6 @@ async fn process_channel_message_body(
             .with_attrs(::serde_json::json!({"elapsed_before_llm_ms": elapsed_before_llm_ms})),
         "starting LLM call"
     );
-    // Fresh per-turn routing handle, scoped into TURN_ROUTING for the duration of
-    // the tool-call loop below. Allocating per turn (rather than clearing a shared
-    // handle) keeps concurrent same-agent turns from reading each other's routes.
-    let turn_routing: tools::TurnRoutingHandle =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-
     let tool_receipts_collector: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let receipt_scope = ctx.receipt_generator.as_ref().map(|generator| {
@@ -11098,7 +11118,8 @@ async fn process_channel_message_body(
                 let is_redirect = turn_route
                     .as_ref()
                     .and_then(|r| r.channel.as_deref())
-                    .is_some();
+                    .is_some()
+                    || delivery_recipient != msg.reply_target;
                 // Preserve the transport result until delivery logging and hooks
                 // distinguish complete, partial, and failed delivery.
                 enum ReplyDelivery {
@@ -11126,17 +11147,15 @@ async fn process_channel_message_body(
                         .await
                         .map(|()| ReplyDelivery::Complete)
                 } else if let Some(ref draft_id) = draft_message_id {
-                    // Same channel with draft. For force-voice routing: cancel the
-                    // draft placeholder and deliver via send_final() so force_voice
-                    // reaches the channel's voice path (finalize_draft has no
-                    // force_voice concept).
+                    // Same-channel voice delivery transfers any prepared audio
+                    // before releasing draft ownership.
                     if force_voice_override {
-                        let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
                         channel
-                            .send_final(
+                            .finalize_voice_draft(
                                 &SendMessage::new(&delivered_response, &delivery_recipient)
                                     .force_voice()
                                     .in_thread(msg.thread_ts.clone()),
+                                draft_id,
                             )
                             .await
                             .map(|()| ReplyDelivery::Complete)
@@ -55665,9 +55684,73 @@ Done."#;
     /// `update_draft_progress`. Unlike the per-frame tests above, this one
     /// fails if the sanitizer call is ever dropped from the wiring.
     #[cfg(feature = "channel-telegram")]
+    struct SpeechReplyModelProvider {
+        continue_reply: Arc<tokio::sync::Notify>,
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    impl zeroclaw_api::attribution::Attributable for SpeechReplyModelProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            DummyModelProvider.role()
+        }
+        fn alias(&self) -> &str {
+            "speech-fixture"
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl ModelProvider for SpeechReplyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("speech fixture requires the streaming path")
+        }
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn stream_chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+            use zeroclaw_api::model_provider::{StreamChunk, StreamEvent};
+            let ready = self.continue_reply.clone();
+            Box::pin(futures_util::stream::once(async { Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                "The opening sentence is long enough to synthesize before generation has finished. ")))
+            }).chain(futures_util::stream::once(async move {
+                ready.notified().await;
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("The final paragraph completes the response.")))
+            })).chain(futures_util::stream::once(async { Ok(StreamEvent::Final) })))
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
     async fn speech_stream_reaches_tts_before_final_and_uploads_one_telegram_voice_note() {
+        assert_speech_reply_through_routing(false).await;
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
+    async fn speech_stream_recovers_after_speculative_tts_failure() {
+        assert_speech_reply_through_routing(true).await;
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    async fn assert_speech_reply_through_routing(fail_first: bool) {
         use wiremock::{
             Mock, MockServer, Request, ResponseTemplate,
             matchers::{method, path, path_regex},
@@ -55675,14 +55758,17 @@ Done."#;
         use zeroclaw_config::schema::{
             AliasedAgentConfig, OpenAITtsProviderConfig, StreamMode, TtsProviderConfig,
         };
-        use zeroclaw_runtime::agent::loop_::StreamDelta;
         let server = MockServer::start().await;
         let (tts_tx, mut tts_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
         Mock::given(method("POST"))
             .and(path("/speech"))
             .respond_with(move |request: &Request| {
                 let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
                 tts_tx.send(body["input"].as_str().unwrap().to_owned()).ok();
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 && fail_first {
+                    return ResponseTemplate::new(500);
+                }
                 ResponseTemplate::new(200)
                     .set_body_bytes(crate::tts::speech::tests::silence_wav(2400))
             })
@@ -55737,33 +55823,24 @@ Done."#;
             )
             .with_api_base(server.uri())
             .with_streaming(StreamMode::MultiMessage, 0)
-            .with_voice_peer_resolver(Arc::new(|| vec!["123".into()]))
+            .with_voice_peer_resolver(Arc::new(|| vec!["-1001234567890".into()]))
             .with_tts(&config),
         );
-        let draft = telegram
-            .send_draft(&SendMessage::new("...", "123"))
-            .await
-            .unwrap()
-            .unwrap();
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let channel: Arc<dyn Channel> = telegram.clone();
-        let updater_draft = draft.clone();
-        let updater = zeroclaw_spawn::spawn!(run_draft_updater(
-            channel,
-            "123".into(),
-            updater_draft,
-            no_tools(),
-            true,
-            None,
-            zeroclaw_config::schema::LeakDetectionConfig::default(),
-            "telegram".into(),
-            rx,
+        let continue_reply = Arc::new(tokio::sync::Notify::new());
+        let ctx = telegram_voice_delivery_ctx(
+            telegram.clone(),
+            Arc::new(SpeechReplyModelProvider {
+                continue_reply: continue_reply.clone(),
+            }),
+            Vec::new(),
+        );
+        let process = zeroclaw_spawn::spawn!(process_channel_message(
+            ctx,
+            telegram_group_message("@alice", "111"),
+            CancellationToken::new(),
         ));
         let opener =
             "The opening sentence is long enough to synthesize before generation has finished.";
-        tx.send(StreamDelta::Text(format!("{opener} ")))
-            .await
-            .unwrap();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(3), tts_rx.recv())
                 .await
@@ -55775,18 +55852,14 @@ Done."#;
             voice_rx.try_recv().is_err(),
             "speculation must never upload a partial voice note"
         );
-        tx.send(StreamDelta::Text(
-            "The final paragraph completes the response.".into(),
-        ))
-        .await
-        .unwrap();
-        drop(tx);
-        updater.await.unwrap();
-        let final_text = format!("{opener} The final paragraph completes the response.");
-        telegram
-            .finalize_draft("123", &draft, &final_text, false)
+        continue_reply.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), process)
             .await
+            .unwrap()
             .unwrap();
+        if fail_first {
+            assert_eq!(tts_rx.recv().await.as_deref(), Some(opener));
+        }
         let upload = tokio::time::timeout(Duration::from_secs(5), voice_rx.recv())
             .await
             .unwrap()
@@ -55808,6 +55881,89 @@ Done."#;
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn speech_preparation_reads_live_text_only_and_redirect_routes() {
+        use zeroclaw_config::multi_agent::OutputModality;
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let recording = Arc::new(DraftRecordingChannel::new(false, false));
+        let routing: tools::TurnRoutingHandle = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let draft_channel = recording.clone();
+        let draft_routing = routing.clone();
+        let task = zeroclaw_spawn::spawn!(run_draft_updater_with_leak_detection(
+            draft_channel,
+            "peer".into(),
+            "draft".into(),
+            no_tools(),
+            Arc::new(Mutex::new(String::new())),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            "telegram".into(),
+            Some(draft_routing),
+            rx,
+        ));
+        for (route, allowed) in [
+            (None, true),
+            (
+                Some(tools::TurnRoutingEntry {
+                    channel: None,
+                    recipient: None,
+                    modality: OutputModality::Text,
+                }),
+                false,
+            ),
+            (
+                Some(tools::TurnRoutingEntry {
+                    channel: Some("other".into()),
+                    recipient: None,
+                    modality: OutputModality::Voice,
+                }),
+                false,
+            ),
+            (
+                Some(tools::TurnRoutingEntry {
+                    channel: None,
+                    recipient: Some("other-peer".into()),
+                    modality: OutputModality::Voice,
+                }),
+                false,
+            ),
+            (
+                Some(tools::TurnRoutingEntry {
+                    channel: None,
+                    recipient: None,
+                    modality: OutputModality::Voice,
+                }),
+                true,
+            ),
+        ] {
+            *routing.lock().unwrap() = route.into_iter().collect();
+            let before = recording.voice_preparations.lock().await.len();
+            tx.send(StreamDelta::Text(
+                "A sufficiently long sentence for speech preparation. ".into(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let prepared = recording.voice_preparations.lock().await;
+                    if let Some(text) = prepared.get(before) {
+                        assert_eq!(!text.is_empty(), allowed);
+                        break;
+                    }
+                    drop(prepared);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -56072,6 +56228,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56152,6 +56309,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56242,6 +56400,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56313,6 +56472,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56384,6 +56544,7 @@ Done."#;
                 false,
                 None,
                 String::new(),
+                None,
                 rx,
             )
             .await;
@@ -56496,6 +56657,7 @@ Done."#;
                 false,
                 None,
                 String::new(),
+                None,
                 rx,
             )
             .await;
@@ -56612,6 +56774,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56763,6 +56926,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;
@@ -56850,6 +57014,7 @@ Done."#;
             false,
             None,
             String::new(),
+            None,
             rx,
         )
         .await;

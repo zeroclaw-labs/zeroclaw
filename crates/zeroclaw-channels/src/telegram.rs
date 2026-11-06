@@ -4226,6 +4226,16 @@ impl TelegramChannel {
                 .lock()
                 .remove(&Self::multi_draft_key(recipient, id))
         });
+        self.queue_voice_reply(recipient, content, job, force);
+    }
+
+    fn queue_voice_reply(
+        &self,
+        recipient: &str,
+        content: &str,
+        job: Option<crate::tts::SpeechJob>,
+        force: bool,
+    ) {
         if !force && !self.is_voice_chat(recipient) {
             return;
         }
@@ -4243,6 +4253,7 @@ impl TelegramChannel {
             );
             return;
         }
+        let had_prepared_job = job.is_some();
         let job = job.unwrap_or_else(|| crate::tts::SpeechJob::start(tts_manager.clone()));
         let text = content.to_owned();
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
@@ -4253,7 +4264,21 @@ impl TelegramChannel {
         let bot_token = self.bot_token.clone();
         let proxy_url = self.proxy_url.clone();
         zeroclaw_spawn::spawn!(async move {
-            match job.finish(&text).await {
+            let mut result = job.finish(&text).await;
+            if had_prepared_job && let Err(error) = &result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
+                    "Speculative TTS failed; synthesizing approved final response"
+                );
+                // At most one fresh final attempt, using the approved text only.
+                // Failed speculative clips never become a partial voice upload.
+                result = crate::tts::SpeechJob::start(tts_manager.clone())
+                    .finish(&text)
+                    .await;
+            }
+            match result {
                 Ok(parts) => {
                     Self::deliver_voice_parts(
                         &api_base,
@@ -8450,6 +8475,25 @@ impl Channel for TelegramChannel {
                 Ok(())
             }
         }
+    }
+
+    async fn finalize_voice_draft(
+        &self,
+        message: &SendMessage,
+        message_id: &str,
+    ) -> anyhow::Result<()> {
+        // Move the owned job out before cancellation releases draft resources.
+        let job = self
+            .voice_drafts
+            .lock()
+            .remove(&Self::multi_draft_key(&message.recipient, message_id));
+        self.cancel_draft(&message.recipient, message_id).await?;
+        if message.suppress_voice {
+            return self.send_final(message).await;
+        }
+        let content = strip_tool_call_tags(&message.content);
+        self.queue_voice_reply(&message.recipient, &content, job, message.force_voice);
+        Ok(())
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {

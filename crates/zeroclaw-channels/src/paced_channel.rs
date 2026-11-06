@@ -22,6 +22,10 @@ enum PacedOp {
     SendFinal(SendMessage),
     /// A terminal draft write. Dispatches to `inner.finalize_draft` so the
     /// channel edits the existing draft rather than posting a new message.
+    FinalizeVoiceDraft {
+        message: SendMessage,
+        message_id: String,
+    },
     FinalizeDraft {
         recipient: String,
         message_id: String,
@@ -34,7 +38,9 @@ impl PacedOp {
     /// The recipient key this op paces against.
     fn recipient(&self) -> &str {
         match self {
-            Self::Send(message) | Self::SendFinal(message) => &message.recipient,
+            Self::Send(message)
+            | Self::SendFinal(message)
+            | Self::FinalizeVoiceDraft { message, .. } => &message.recipient,
             Self::FinalizeDraft { recipient, .. } => recipient,
         }
     }
@@ -42,7 +48,9 @@ impl PacedOp {
     /// Character count of the payload, for the overflow-drop log.
     fn payload_chars(&self) -> usize {
         match self {
-            Self::Send(message) | Self::SendFinal(message) => message.content.chars().count(),
+            Self::Send(message)
+            | Self::SendFinal(message)
+            | Self::FinalizeVoiceDraft { message, .. } => message.content.chars().count(),
             Self::FinalizeDraft { text, .. } => text.chars().count(),
         }
     }
@@ -52,6 +60,10 @@ impl PacedOp {
         match self {
             Self::Send(message) => inner.send(&message).await,
             Self::SendFinal(message) => inner.send_final(&message).await,
+            Self::FinalizeVoiceDraft {
+                message,
+                message_id,
+            } => inner.finalize_voice_draft(&message, &message_id).await,
             Self::FinalizeDraft {
                 recipient,
                 message_id,
@@ -413,6 +425,14 @@ impl Channel for PacedChannel {
         self.inner.update_draft(recipient, message_id, text).await
     }
 
+    async fn finalize_voice_draft(&self, message: &SendMessage, message_id: &str) -> Result<()> {
+        self.paced_dispatch(PacedOp::FinalizeVoiceDraft {
+            message: message.clone(),
+            message_id: message_id.to_owned(),
+        })
+        .await
+    }
+
     async fn prepare_voice_draft(
         &self,
         recipient: &str,
@@ -647,6 +667,7 @@ mod tests {
         sends: AtomicUsize,
         final_sends: AtomicUsize,
         finalize_drafts: AtomicUsize,
+        voice_finalizes: AtomicUsize,
     }
 
     impl Attributable for CountingChannel {
@@ -666,6 +687,16 @@ mod tests {
         }
         async fn send(&self, _message: &SendMessage) -> Result<()> {
             self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn finalize_voice_draft(
+            &self,
+            message: &SendMessage,
+            message_id: &str,
+        ) -> Result<()> {
+            assert!(message.force_voice);
+            assert_eq!(message_id, "voice-draft");
+            self.voice_finalizes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn send_final(&self, _message: &SendMessage) -> Result<()> {
@@ -803,6 +834,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
         });
         let cfg = PacingFixture {
             interval_secs: 0,
@@ -821,6 +853,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // Use 1h to make the wait long enough that we can assert the
@@ -849,6 +882,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // 1h interval again — we only ever send once per recipient, so
@@ -879,6 +913,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -909,6 +944,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -965,6 +1001,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         // 1h floor: the first op fires immediately, so no real time elapses.
@@ -993,11 +1030,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn speech_finalization_preserves_prepared_job_through_pacing() {
+        let counting = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
+        });
+        let paced = PacedChannel::wrap(
+            counting.clone(),
+            &PacingFixture {
+                interval_secs: 3600,
+                depth: 4,
+            },
+        );
+        paced
+            .finalize_voice_draft(
+                &SendMessage::new("final text", "alice").force_voice(),
+                "voice-draft",
+            )
+            .await
+            .unwrap();
+        assert_eq!(counting.voice_finalizes.load(Ordering::SeqCst), 1);
+        assert_eq!(counting.final_sends.load(Ordering::SeqCst), 0);
+        assert_eq!(counting.sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn final_response_dispatches_to_inner_send_final_not_send() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -1085,6 +1150,7 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
