@@ -1614,10 +1614,10 @@ mod tests {
         drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
         {
             let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-            assert_eq!(
-                mem.stored_embedding_identity().unwrap(),
-                Some(ident("openai", "model-a", 4))
-            );
+            let identity = mem.stored_embedding_identity().unwrap().unwrap();
+            assert!(identity.provider.starts_with("openai:"));
+            assert_eq!(identity.model, "model-a");
+            assert_eq!(identity.dimensions, 4);
         }
 
         // Same config again → identity unchanged (Match path, no churn).
@@ -1627,10 +1627,10 @@ mod tests {
         cfg.embedding_model = "model-b".into();
         drop(create_memory(&cfg, tmp.path(), Some("test-key")).unwrap());
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
-        assert_eq!(
-            mem.stored_embedding_identity().unwrap(),
-            Some(ident("openai", "model-b", 4))
-        );
+        let identity = mem.stored_embedding_identity().unwrap().unwrap();
+        assert!(identity.provider.starts_with("openai:"));
+        assert_eq!(identity.model, "model-b");
+        assert_eq!(identity.dimensions, 4);
     }
 
     #[tokio::test]

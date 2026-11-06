@@ -546,13 +546,14 @@ pub fn selection_depends_on_model_ref(
             changed_model_ref,
         ))
         .is_some();
-    if !selection_is_canonical && !changed_is_canonical {
-        if let (Some((selection_family, selection_alias)), Some((changed_family, changed_alias))) = (
+    if !selection_is_canonical
+        && !changed_is_canonical
+        && let (Some((selection_family, selection_alias)), Some((changed_family, changed_alias))) = (
             config.providers.models.profile_ref(selection_ref),
             config.providers.models.profile_ref(changed_model_ref),
-        ) {
-            return selection_family == changed_family && selection_alias == changed_alias;
-        }
+        )
+    {
+        return selection_family == changed_family && selection_alias == changed_alias;
     }
     let Ok(registry) = config.provider_registry() else {
         return false;

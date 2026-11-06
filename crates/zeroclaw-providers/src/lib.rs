@@ -5911,8 +5911,8 @@ mod tests {
             );
             if i + 1 < n {
                 config.providers.fallback.insert(
-                    zeroclaw_config::providers::ModelProviderRef::new(format!("openai.a{i}")),
-                    vec![zeroclaw_config::providers::ModelProviderRef::new(format!(
+                    zeroclaw_config::provider_registry::ModelRef::new(format!("openai.a{i}")),
+                    vec![zeroclaw_config::provider_registry::ModelRef::new(format!(
                         "openai.a{}",
                         i + 1
                     ))],

@@ -2262,8 +2262,13 @@ pub(crate) fn dispatch_model_ref_with_registry(
     // missing config slot, so materialize those provider-specific settings at
     // this boundary before falling back to the common dispatcher.
     if provider_kind == "openai" && resolved.selection.connection.uses_openai_codex_auth() {
-        let mut provider_config = zeroclaw_config::schema::OpenAIModelProviderConfig::default();
-        provider_config.base.requires_openai_auth = true;
+        let provider_config = zeroclaw_config::schema::OpenAIModelProviderConfig {
+            base: zeroclaw_config::schema::ModelProviderConfig {
+                requires_openai_auth: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         return provider_config.create_provider(
             model_ref.as_str(),
             resolved.selection.connection.api_key(),
@@ -2276,8 +2281,10 @@ pub(crate) fn dispatch_model_ref_with_registry(
         && let Some(zeroclaw_config::provider_registry::ChatModelExtra::Anthropic(extra)) =
             model.extra.as_ref()
     {
-        let mut provider_config = zeroclaw_config::schema::AnthropicModelProviderConfig::default();
-        provider_config.server_fallback_models = extra.server_fallback_models.clone();
+        let provider_config = zeroclaw_config::schema::AnthropicModelProviderConfig {
+            server_fallback_models: extra.server_fallback_models.clone(),
+            ..Default::default()
+        };
         return provider_config.create_provider(
             model_ref.as_str(),
             resolved.selection.connection.api_key(),
