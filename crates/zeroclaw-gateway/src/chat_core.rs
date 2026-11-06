@@ -33,7 +33,9 @@ use crate::AppState;
 use crate::dashboard_core::{
     CoreCaller, CoreChat, CoreFailure, agent_not_allowed, chat_not_permitted,
 };
-use crate::dashboard_session::{DashboardAuth, SessionWatch, WS_CLOSE_SESSION_ENDED, session_lost};
+use crate::dashboard_session::{
+    DashboardAuth, SessionWatch, WS_CLOSE_SESSION_ENDED, session_known_lost, session_lost,
+};
 use crate::ws::{
     ConnectParams, WS_PROTOCOL, WsQuery, close_for_reconnect, close_with, gateway_stop_signal,
     history_trimmed_ws_frame, tick_websocket_ping, websocket_ping_interval,
@@ -497,6 +499,13 @@ impl Chat {
         stopping: &mut watch::Receiver<bool>,
         content: &str,
     ) -> TurnEnd {
+        // The session may have ended while the turn waited for its
+        // connection, and a sign-out does not stop the token the chat keeps
+        // for its handshakes. Nothing is awaited from here to the prompt's
+        // first poll, so a session already known to be over sends no prompt.
+        if let Some(code) = session_known_lost(&mut self.watch) {
+            return TurnEnd::Stop(Stop::Close(code));
+        }
         let client = self.core.bound();
         let session_id = self.core.core_id.clone();
         // A fresh receiver sees only what follows this turn's prompt, and the

@@ -743,12 +743,19 @@ impl CoreChat {
     /// honours (`AUTH_REQUIRED`), presenting the chat's own identity, so the
     /// conversation stays the chat's. The old one is not cut off: a turn
     /// running on it ends normally. A second refusal ends the session.
+    ///
+    /// Signing out ends the session, not the token kept here, which may
+    /// still verify: the wait stops when the session ends. Closing the
+    /// conversation reconnects on its own ([`Redial`]), not through this.
     pub(crate) async fn renew(&mut self) -> Result<(), CoreFailure> {
-        let fresh = Arc::new(
-            self.caller
-                .connect(&self.credential, Some(&self.identity), None)
-                .await?,
-        );
+        let ended = self.ended();
+        let fresh = tokio::select! {
+            biased;
+            () = ended.cancelled() => return Err(CoreFailure::SessionEnded),
+            fresh = self.caller.connect(&self.credential, Some(&self.identity), None) => {
+                Arc::new(fresh?)
+            }
+        };
         if !Arc::ptr_eq(&self.client, &self.bound) {
             self.client.shutdown();
         }
@@ -783,16 +790,24 @@ impl CoreChat {
 
     /// Call `method` on the chat's connection. A connection whose binding
     /// lapsed is replaced once with the chat's identity; a second refusal
-    /// ends the session.
+    /// ends the session. Nothing is sent, or sent again after a renewal,
+    /// once the session has ended.
     pub(crate) async fn call<T: DeserializeOwned>(
         &mut self,
         method: Method,
         params: Value,
     ) -> Result<T, CoreFailure> {
+        let ended = self.ended();
+        if ended.is_cancelled() {
+            return Err(CoreFailure::SessionEnded);
+        }
         match self.client.call::<T>(method, params.clone()).await {
             Ok(result) => Ok(result),
             Err(ClientError::Rpc(error)) if error.code == AUTH_REQUIRED => {
                 self.renew().await?;
+                if ended.is_cancelled() {
+                    return Err(CoreFailure::SessionEnded);
+                }
                 self.client
                     .call::<T>(method, params)
                     .await
@@ -5709,5 +5724,258 @@ mod tests {
                 "{withheld} is withheld: {offered:?}"
             );
         }
+    }
+
+    // ── Signing out while a chat waits for its connection ────────────────
+
+    /// How long the tests below hold a handshake at the identity provider.
+    const HELD_HANDSHAKE: Duration = Duration::from_secs(4);
+
+    /// How many requests the model has had whose body carries `marker`.
+    async fn model_requests_with(model: &MockServer, marker: &str) -> usize {
+        model
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| String::from_utf8_lossy(&request.body).contains(marker))
+            .count()
+    }
+
+    /// The fixture, tweaked by `tweak`, with the core having each chat
+    /// connection verify its token again two seconds after its handshake.
+    /// The gateway keeps the default, so the dashboard session itself is
+    /// not verified again meanwhile.
+    async fn revalidating_fixture(tweak: impl FnOnce(&mut Config)) -> Fixture {
+        let fixture = Fixture::with_config(|config| {
+            tweak(config);
+            config
+                .oidc
+                .get_mut("corp")
+                .expect("the fixture's provider")
+                .revalidation_secs = 2;
+        })
+        .await;
+        let mut gateway_policy = fixture.config.clone();
+        gateway_policy
+            .oidc
+            .get_mut("corp")
+            .expect("the fixture's provider")
+            .revalidation_secs = OidcConfig::default().revalidation_secs;
+        fixture
+            .rpc_auth
+            .publish_accepted(&gateway_policy, fixture.rpc_auth.accepted_revision() + 1)
+            .expect("the gateway accepts the policy");
+        fixture
+    }
+
+    /// Past a revalidating fixture's deadline for the chat's connection.
+    const PAST_THE_REVALIDATION: Duration = Duration::from_millis(2500);
+
+    /// Send `frame` on alice's chat while the handshake it leads to is held
+    /// at the identity provider, sign out once the core is verifying it,
+    /// and release it. The chat must end as a sign-out ends it, before the
+    /// handshake would have finished, and `marker` must never reach the
+    /// model: the token the chat keeps still verifies, so only the gateway
+    /// can stop what `frame` asked for reaching the core.
+    async fn sign_out_during_a_held_handshake(
+        fixture: &Fixture,
+        socket: &mut ChatSocket,
+        session: &Arc<SessionAuth>,
+        frame: Value,
+        marker: &str,
+    ) {
+        slow_introspections(fixture, "alice", "chatters", HELD_HANDSHAKE, (1, 1)).await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        socket
+            .send(ClientMessage::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while introspections_of(&fixture._idp, "tok-alice").await <= before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the handshake reaches the identity provider");
+
+        assert!(fixture.auth.end(session), "sign-out");
+        let signed_out = std::time::Instant::now();
+        let (_, code) = read_to_close(socket).await;
+        assert_eq!(code, Some(crate::dashboard_session::WS_CLOSE_SESSION_ENDED));
+        assert!(
+            signed_out.elapsed() < HELD_HANDSHAKE / 2,
+            "the chat waited out the held handshake: {:?}",
+            signed_out.elapsed()
+        );
+        // Past the held handshake's end, nothing it would have carried
+        // reached the model.
+        tokio::time::sleep(HELD_HANDSHAKE + Duration::from_secs(1)).await;
+        assert_eq!(
+            model_requests_with(&fixture._model, marker).await,
+            0,
+            "the core acted for the chat after sign-out"
+        );
+        fixture
+            .assert_nothing_live("signing out closes the chat")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_while_a_turn_rebinds_its_connection_sends_no_prompt() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, alice_session) = fixture.sign_in("alice").await;
+        let (mut socket, core_id) = chat_in(addr, &alice, "web-1").await;
+        // The chat's connection drops between turns, so the next turn's
+        // rebind first renews it: that handshake is the one held.
+        let binding = fixture
+            .auth
+            .core_binding(&alice_session)
+            .expect("signed in");
+        let (client, _) = binding.reach(&core_id).expect("the chat is open");
+        client.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), client.closed())
+            .await
+            .expect("the connection closes");
+        let marker = "sent mid-rebind";
+        let message = json!({ "type": "message", "content": marker });
+        sign_out_during_a_held_handshake(&fixture, &mut socket, &alice_session, message, marker)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_while_a_turn_renews_its_connection_sends_no_prompt() {
+        let fixture = revalidating_fixture(|_| {}).await;
+        let addr = serve(fixture.router()).await;
+        let (alice, alice_session) = fixture.sign_in("alice").await;
+        let (mut socket, _) = chat_in(addr, &alice, "web-1").await;
+        // Past the connection's deadline the core refuses the next prompt
+        // before its turn runs, and the turn renews the connection: that
+        // handshake is the one held.
+        tokio::time::sleep(PAST_THE_REVALIDATION).await;
+        let marker = "sent mid-renewal";
+        let message = json!({ "type": "message", "content": marker });
+        sign_out_during_a_held_handshake(&fixture, &mut socket, &alice_session, message, marker)
+            .await;
+    }
+
+    /// Start a turn on `chat` that asks to read the note, without waiting for
+    /// its end, and return the approval request it raises.
+    async fn ask_for_approval_on(chat: &CoreChat) -> String {
+        let client = chat.bound();
+        let mut updates = client.notifications();
+        let session_id = chat.core_id.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = client
+                .request_with_timeout(
+                    Method::SessionPrompt.wire_name(),
+                    json!({
+                        "session_id": session_id,
+                        "prompt": "please read the note",
+                        "client_turn_generation": 7,
+                    }),
+                    Duration::from_secs(60),
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let note = match updates.recv().await {
+                    Ok(note) => note,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(error) => panic!("the chat's connection closed: {error}"),
+                };
+                if note.method != zeroclaw_rpc_proto::notification::SESSION_UPDATE {
+                    continue;
+                }
+                if let Ok(zeroclaw_rpc_proto::types::SessionUpdateEvent::ApprovalRequest {
+                    request_id,
+                    ..
+                }) = serde_json::from_value(note.params)
+                {
+                    return request_id;
+                }
+            }
+        })
+        .await
+        .expect("the turn asks for approval")
+    }
+
+    #[tokio::test]
+    async fn an_approval_whose_renewal_outlasts_the_session_is_not_sent_again() {
+        let fixture = revalidating_fixture(asking_file_read).await;
+        let note = fixture
+            .config
+            .agent_workspace_dir("support")
+            .join("note.txt");
+        std::fs::create_dir_all(note.parent().expect("a workspace")).unwrap();
+        let (_, session) = fixture.sign_in("alice").await;
+        let caller = core_caller_for(&fixture, &session);
+        // The core's word for the dashboard's "approve".
+        let approve = |chat: &CoreChat, request_id: &str| json!({ "session_id": chat.core_id, "request_id": request_id, "decision": "allow_once" });
+
+        // Approved while the session holds, the read runs and the model sees
+        // what it read.
+        std::fs::write(&note, "the first note's text").unwrap();
+        let mut first = caller.open_chat("support", None).await.expect("opens");
+        let request_id = ask_for_approval_on(&first).await;
+        let params = approve(&first, &request_id);
+        let _: Value = first
+            .call(Method::SessionApprove, params)
+            .await
+            .expect("the approval is taken");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while model_requests_with(&fixture._model, "the first note's text").await == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("an approved read reaches the model");
+        first.close().await;
+
+        // Past its connection's deadline the core refuses the next approval,
+        // and the chat renews the connection before sending it again. That
+        // handshake is held while the user signs out, then released.
+        std::fs::write(&note, "the second note's text").unwrap();
+        let mut chat = caller.open_chat("support", None).await.expect("opens");
+        let request_id = ask_for_approval_on(&chat).await;
+        tokio::time::sleep(PAST_THE_REVALIDATION).await;
+        slow_introspections(&fixture, "alice", "chatters", HELD_HANDSHAKE, (1, 1)).await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        let params = approve(&chat, &request_id);
+        let approving = chat.call::<Value>(Method::SessionApprove, params);
+        let signing_out = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while introspections_of(&fixture._idp, "tok-alice").await <= before {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the renewal reaches the identity provider");
+            assert!(fixture.auth.end(&session), "sign-out");
+            std::time::Instant::now()
+        };
+        let (answered, signed_out) = tokio::join!(approving, signing_out);
+        let waited = signed_out.elapsed();
+        // Past the held handshake's end, the read never ran.
+        tokio::time::sleep(HELD_HANDSHAKE).await;
+        assert_eq!(
+            model_requests_with(&fixture._model, "the second note's text").await,
+            0,
+            "the approval reached the core after sign-out"
+        );
+        assert!(
+            matches!(answered, Err(CoreFailure::SessionEnded)),
+            "{answered:?}"
+        );
+        assert!(
+            waited < HELD_HANDSHAKE / 2,
+            "the approval waited out the held handshake: {waited:?}"
+        );
+        chat.close().await;
+        fixture
+            .assert_nothing_live("a chat closed after sign-out still closes its conversation")
+            .await;
     }
 }

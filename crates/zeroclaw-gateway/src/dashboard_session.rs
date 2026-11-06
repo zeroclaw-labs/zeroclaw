@@ -1599,6 +1599,13 @@ pub(crate) async fn session_lost(watch: &mut Option<SessionWatch>, state: &AppSt
     }
 }
 
+/// [`SessionWatch::known_lost`] for a socket that may have no session: the
+/// close code if what is already known ends it (the session ended or
+/// expired, or its generation stopped), with no recheck and nothing awaited.
+pub(crate) fn session_known_lost(watch: &mut Option<SessionWatch>) -> Option<u16> {
+    watch.as_mut().and_then(SessionWatch::known_lost)
+}
+
 /// [`SessionWatch::admits_now`] for a socket that may have no session; a
 /// socket without one is always admitted here (its own credential check
 /// already ran when it opened).
