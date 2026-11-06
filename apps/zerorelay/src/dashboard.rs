@@ -280,8 +280,13 @@ pub(crate) async fn serve<S>(
     splice(browser, daemon, inner.idle_timeout).await;
 }
 
-/// Copy both ways until either side ends, or nothing has moved either way
-/// for `idle`.
+/// Copy both ways until either side ends, nothing has moved either way for
+/// `idle`, or one side has not taken a write for `idle`.
+///
+/// The write is bounded on its own because the idle timer is not polled while
+/// a write waits: without it, a browser that asks for a page and then stops
+/// reading would hold its dashboard and route slots past `idle`, and enough of
+/// them would make the dashboard busy for everyone else.
 async fn splice<A, B>(a: A, b: B, idle: Duration)
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -298,7 +303,7 @@ where
             read = a_read.read(&mut a_buf) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if b_write.write_all(&a_buf[..n]).await.is_err() {
+                    if !wrote_within(idle, b_write.write_all(&a_buf[..n])).await {
                         break;
                     }
                     deadline = Instant::now() + idle;
@@ -307,7 +312,7 @@ where
             read = b_read.read(&mut b_buf) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if a_write.write_all(&b_buf[..n]).await.is_err() {
+                    if !wrote_within(idle, a_write.write_all(&b_buf[..n])).await {
                         break;
                     }
                     deadline = Instant::now() + idle;
@@ -317,6 +322,14 @@ where
     }
     let _ = a_write.shutdown().await;
     let _ = b_write.shutdown().await;
+}
+
+/// Whether `write` finished, successfully, within `idle`.
+async fn wrote_within(
+    idle: Duration,
+    write: impl std::future::Future<Output = std::io::Result<()>>,
+) -> bool {
+    matches!(tokio::time::timeout(idle, write).await, Ok(Ok(())))
 }
 
 /// Answer a connection the relay will not route: read what the browser sent
@@ -461,5 +474,28 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 404 Not Found\r\n"), "{answer}");
         assert!(answer.contains("connection: close"), "{answer}");
         assert!(answer.contains("There is no dashboard at this address."));
+    }
+
+    #[tokio::test]
+    async fn a_browser_that_stops_reading_is_let_go_after_the_idle_timeout() {
+        // The browser has asked for a page and reads nothing more; the daemon
+        // keeps answering until the relay's write to the browser blocks.
+        let (browser, relay_browser_side) = tokio::io::duplex(1024);
+        let (relay_daemon_side, mut daemon) = tokio::io::duplex(64 * 1024);
+        let answering = tokio::spawn(async move {
+            let chunk = vec![b'x'; 16 * 1024];
+            while daemon.write_all(&chunk).await.is_ok() {}
+        });
+        let idle = Duration::from_millis(200);
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            splice(relay_browser_side, relay_daemon_side, idle),
+        )
+        .await
+        .expect("a browser that stops reading must not hold its slots past the idle timeout");
+        assert!(started.elapsed() >= idle);
+        drop(browser);
+        answering.abort();
     }
 }
