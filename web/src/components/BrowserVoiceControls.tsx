@@ -155,14 +155,14 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   if (!ready || (!prefs.dictation && !prefs.reading)) return null;
   return <div ref={root} className="flex flex-wrap items-center gap-1 max-w-48">
     {prefs.dictation && <button type="button" className={listening ? css + ' bg-pc-accent/20 ring-2 ring-pc-accent' : css} aria-label={t('voice.microphone')} title={t('voice.microphone')} aria-pressed={listening} onClick={() => void toggleMicrophone()}>{listening ? <Mic size={20} /> : <MicOff size={20} />}</button>}
-    {prefs.reading && <button type="button" className={`${css} ${continuous ? 'bg-pc-accent/20 ring-2 ring-pc-accent' : ''}`} aria-label={t('voice.speaker')} title={t('voice.gesture')} aria-pressed={continuous} aria-busy={speaking}
+    {prefs.reading && <button type="button" className={`${css} ${speaking || continuous ? 'bg-pc-accent/20 ring-2 ring-pc-accent' : ''}`} aria-label={t('voice.speaker')} title={t('voice.gesture')} aria-pressed={continuous} aria-busy={speaking}
       onPointerDown={event => {
         if (event.button !== 0) return;
         event.currentTarget.setPointerCapture(event.pointerId); longPressed.current = false;
         timer.current = setTimeout(() => { longPressed.current = true; setOverride(true); }, 600);
       }} onPointerUp={release} onPointerCancel={() => { release(); longPressed.current = true; }} onLostPointerCapture={release}
       onKeyDown={event => { if (event.key === 'Enter' && event.shiftKey) { event.preventDefault(); setOverride(!continuous); stopSpeech(); } }}
-      onContextMenu={event => event.preventDefault()} onClick={shortPress}>{speaking ? <VolumeX size={20} /> : <Volume2 size={20} />}</button>}
+      onContextMenu={event => event.preventDefault()} onClick={shortPress}>{speaking || continuous ? <Volume2 size={20} /> : <VolumeX size={20} />}</button>}
     {error && <span role="alert" className="text-xs text-status-error w-full">{error}</span>}
   </div>;
 }

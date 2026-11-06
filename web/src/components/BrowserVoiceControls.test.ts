@@ -101,6 +101,7 @@ test('short press reads once; hold enables continuous; click disables without pe
   const renderer = await mount();
   assert.deepEqual(spoken, []);
   const speaker = () => renderer.root.findAllByType('button')[1]!;
+  assert.match(speaker().findByType('svg').props.className, /lucide-volume-x/);
   await act(async () => { speaker().props.onClick(); });
   assert.deepEqual(spoken, ['Historical reply']);
   await act(async () => { speaker().props.onClick(); });
