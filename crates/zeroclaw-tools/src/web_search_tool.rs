@@ -194,19 +194,21 @@ impl SerplyConfigParseFailure {
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
 /// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly),
 /// AnySearch (optional API key; anonymous access has a lower quota),
-/// Serply (Google web results, requires API key), and Keenable (keyless public
-/// endpoint; an optional API key lifts rate limits).
+/// Serply (Google web results, requires API key), Keenable (keyless public
+/// endpoint; an optional API key lifts rate limits), and Firecrawl (requires
+/// API key).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
-/// The Bocha, AnySearch, Serply and Keenable keys have no boot-time snapshot at all: they
+/// The Bocha, AnySearch, Serply, Keenable and Firecrawl keys have no boot-time snapshot at all: they
 /// are always resolved from `config.toml` at use time, so their canonical
 /// `[web_search]` fields stay the single source of truth and rotation/removal
 /// takes effect without a restart. The exception is a schema-mirror env
 /// override (`ZEROCLAW_web_search__anysearch_api_key`,
-/// `ZEROCLAW_web_search__serply_api_key`, `ZEROCLAW_web_search__keenable_api_key`):
+/// `ZEROCLAW_web_search__serply_api_key`, `ZEROCLAW_web_search__keenable_api_key`,
+/// `ZEROCLAW_web_search__firecrawl_api_key`):
 /// the loader applies it to the
 /// in-memory `Config` only, so the runtime hands the effective value to the
 /// tool and the resolver uses it instead of the on-disk field for the lifetime
@@ -245,6 +247,11 @@ pub struct WebSearchTool {
     /// change for the life of the process, so this is not a snapshot of
     /// live policy; the disk field stays the source of truth otherwise.
     keenable_api_key_override: Option<String>,
+    /// Effective Firecrawl credential when `ZEROCLAW_web_search__firecrawl_api_key`
+    /// is applied by the config loader: `Some(Some(key))` for a value,
+    /// `Some(None)` for a blank override, `None` when no override is active
+    /// and the key is resolved from `config.toml` at use time.
+    firecrawl_api_key_override: Option<Option<String>>,
 }
 
 impl WebSearchTool {
@@ -268,6 +275,7 @@ impl WebSearchTool {
             config_path: PathBuf::new(),
             secrets_encrypt: false,
             keenable_api_key_override: None,
+            firecrawl_api_key_override: None,
         }
     }
 
@@ -287,6 +295,22 @@ impl WebSearchTool {
                     .clone()
                     .unwrap_or_default()
             })
+    }
+
+    /// Read the Firecrawl credential override state out of a loaded `Config`.
+    ///
+    /// `Some(_)` when the config loader applied
+    /// `ZEROCLAW_web_search__firecrawl_api_key` to the in-memory `Config` (the
+    /// inner value is the effective credential, `None` for a blank override
+    /// that clears it), and `None` when no override is active, in which case
+    /// the tool keeps resolving `[web_search] firecrawl_api_key` from
+    /// `config.toml` at use time.
+    pub fn firecrawl_api_key_override(
+        config: &zeroclaw_config::schema::Config,
+    ) -> Option<Option<String>> {
+        config
+            .prop_is_env_overridden(FIRECRAWL_API_KEY_PROP_PATH)
+            .then(|| config.web_search.firecrawl_api_key.clone())
     }
 
     /// Carry the Keenable env override into the tool. The runtime factory
@@ -322,6 +346,7 @@ impl WebSearchTool {
             config_path,
             secrets_encrypt,
             keenable_api_key_override: None,
+            firecrawl_api_key_override: None,
         }
     }
 
@@ -363,6 +388,19 @@ impl WebSearchTool {
     /// at use time.
     pub fn with_serply_api_key_override(mut self, override_key: Option<Option<String>>) -> Self {
         self.serply_api_key_override =
+            override_key.map(|key| key.filter(|value| !value.is_empty()));
+        self
+    }
+
+    /// Record the schema-mirror env override state for the Firecrawl key.
+    ///
+    /// Pass `Some(value)` when the config loader applied
+    /// `ZEROCLAW_web_search__firecrawl_api_key` (`value` is the in-memory
+    /// credential, `None` for a blank override) and `None` when no override is
+    /// active, in which case the key keeps being resolved from `config.toml`
+    /// at use time.
+    pub fn with_firecrawl_api_key_override(mut self, override_key: Option<Option<String>>) -> Self {
+        self.firecrawl_api_key_override =
             override_key.map(|key| key.filter(|value| !value.is_empty()));
         self
     }
@@ -1709,6 +1747,282 @@ impl WebSearchTool {
         Ok(render_results(results_header(query, "Keenable"), blocks))
     }
 
+    /// Build the "not configured" error for the Firecrawl key, logging which
+    /// lookup produced it (`env_override` or `config`).
+    fn firecrawl_api_key_not_configured(source: &'static str) -> anyhow::Error {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(
+                    ::serde_json::json!({"search_provider": "firecrawl", "source": source})
+                ),
+            "web_search: Firecrawl API key not configured"
+        );
+        anyhow::Error::msg(get_required_tool_string(
+            "tool-web-search-tool-error-firecrawl-api-key-not-configured",
+        ))
+    }
+
+    /// Resolve the Firecrawl API key from `[web_search] firecrawl_api_key`.
+    ///
+    /// Like Serply, there is no boot-time snapshot: the config field is the
+    /// single source of truth and is re-read (and decrypted) on every call, so
+    /// adding, rotating, or removing the key takes effect without a restart.
+    /// An active env override wins outright; a blank override means "not
+    /// configured" rather than silently sending the on-disk value.
+    fn resolve_firecrawl_api_key(&self) -> anyhow::Result<String> {
+        if let Some(override_key) = &self.firecrawl_api_key_override {
+            return override_key
+                .clone()
+                .ok_or_else(|| Self::firecrawl_api_key_not_configured("env_override"));
+        }
+
+        // `WebSearchTool::new` leaves the config path empty: there is nothing
+        // to read, so no key can be configured.
+        if self.config_path.as_os_str().is_empty() {
+            return Err(Self::firecrawl_api_key_not_configured("config"));
+        }
+
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "firecrawl",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for Firecrawl API key"
+            );
+            let path = self.config_path.display().to_string();
+            let error = e.to_string();
+            anyhow::Error::msg(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-firecrawl-config-read",
+                &[("path", &path), ("error", &error)],
+            ))
+        })?;
+
+        // Deliberately not `format!("{e}")`: the parser's message quotes the
+        // offending source line, and a malformed `firecrawl_api_key` line is
+        // the credential itself. Only the stable code and a line number
+        // derived from the error span leave this function.
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            let line = toml_error_line(&contents, &e);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(firecrawl_config_parse_attrs(&self.config_path, line)),
+                "web_search: failed to parse config for Firecrawl API key"
+            );
+            let path = self.config_path.display().to_string();
+            let location = line.map_or_else(String::new, |line| {
+                let line = line.to_string();
+                get_required_tool_string_with_args(
+                    "tool-web-search-tool-error-firecrawl-config-parse-line",
+                    &[("line", &line)],
+                )
+            });
+            anyhow::Error::msg(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-firecrawl-config-parse",
+                &[
+                    ("path", &path),
+                    ("error_code", FIRECRAWL_CONFIG_PARSE_ERROR_CODE),
+                    ("location", &location),
+                ],
+            ))
+        })?;
+
+        let raw_key = config
+            .web_search
+            .firecrawl_api_key
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| Self::firecrawl_api_key_not_configured("config"))?;
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            if plaintext.is_empty() {
+                return Err(anyhow::Error::msg(get_required_tool_string(
+                    "tool-web-search-tool-error-firecrawl-api-key-decrypted-empty",
+                )));
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_key)
+        }
+    }
+
+    /// Build the Firecrawl HTTP client. Redirects are disabled: reqwest drops
+    /// `Authorization` when a redirect leaves the origin, but replaying the
+    /// POST (query included) to whatever origin a response named is still
+    /// unwanted, so a redirect surfaces as its own status and is classified
+    /// like any other non-2xx answer.
+    fn firecrawl_client(&self) -> reqwest::Result<reqwest::Client> {
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .redirect(reqwest::redirect::Policy::none());
+        zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search").build()
+    }
+
+    async fn search_firecrawl(&self, query: &str) -> anyhow::Result<String> {
+        let client = self.firecrawl_client()?;
+        self.search_firecrawl_with_client(&client, FIRECRAWL_SEARCH_URL, query)
+            .await
+    }
+
+    /// Inner Firecrawl request, parameterized on the HTTP client and endpoint
+    /// URL so request-shape tests can target a local mock server. Production
+    /// calls always go through [`Self::search_firecrawl`].
+    ///
+    /// Only the search itself is requested (no `scrapeOptions`): results stay
+    /// snippet-sized like every other provider, and `web_fetch` is the tool
+    /// that reads full pages.
+    async fn search_firecrawl_with_client(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let api_key = self.resolve_firecrawl_api_key()?;
+
+        // An over-long agent query would be rejected outright, so it is cut to
+        // the documented maximum instead.
+        let body = serde_json::json!({
+            "query": query.chars().take(FIRECRAWL_MAX_QUERY_CHARS).collect::<String>(),
+            "limit": self.max_results,
+            "sources": ["web"],
+            "origin": FIRECRAWL_ORIGIN,
+        });
+
+        let response = client
+            .post(url)
+            .bearer_auth(&api_key)
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| transport_search_failure("firecrawl", "request", &err))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_search_failure("firecrawl", status));
+        }
+
+        // The body is provider-controlled and arrives before any of the output
+        // caps apply, so it is read through the shared bounded reader, which
+        // stops pulling from the socket one byte past the limit. An oversized
+        // body is rejected whole: nothing is decoded and nothing is echoed.
+        let body = response_body::read_bounded(response, Some(FIRECRAWL_RESPONSE_LIMIT_BYTES))
+            .await
+            .map_err(|err| match err.downcast_ref::<reqwest::Error>() {
+                Some(err) => transport_search_failure("firecrawl", "response", err),
+                None => bounded_body_search_failure("firecrawl", "body"),
+            })?;
+        if body.overflowed {
+            return Err(bounded_body_search_failure("firecrawl", "oversized"));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body.bytes)
+            .map_err(|_| bounded_body_search_failure("firecrawl", "decode"))?;
+        self.parse_firecrawl_results(&json, query)
+    }
+
+    fn parse_firecrawl_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        // A 2xx can still carry `success: false` with an `error` message. It is
+        // provider-controlled text that returns before the capped success path,
+        // so it is bounded before it reaches the model.
+        if json.get("success").and_then(|s| s.as_bool()) == Some(false) {
+            let message = json.get("error").and_then(|m| m.as_str()).map_or_else(
+                || get_required_tool_string("tool-web-search-tool-firecrawl-no-error-details"),
+                ToOwned::to_owned,
+            );
+            let message = cap_provider_error(&message);
+            return Err(anyhow::Error::msg(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-firecrawl-api",
+                &[("message", &message)],
+            )));
+        }
+
+        let data = json.get("data").ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"search_provider": "firecrawl"})),
+                "web_search: invalid Firecrawl response"
+            );
+            anyhow::Error::msg(get_required_tool_string(
+                "tool-web-search-tool-error-firecrawl-invalid-response",
+            ))
+        })?;
+
+        // Firecrawl omits `data.web` when the query matched no web results.
+        let results = match data.get("web") {
+            None | Some(serde_json::Value::Null) => return Ok(no_results_message(query)),
+            Some(web) => web.as_array().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "firecrawl"})),
+                    "web_search: invalid Firecrawl response"
+                );
+                anyhow::Error::msg(get_required_tool_string(
+                    "tool-web-search-tool-error-firecrawl-invalid-response",
+                ))
+            })?,
+        };
+
+        if results.is_empty() {
+            return Ok(no_results_message(query));
+        }
+
+        let mut blocks: Vec<Vec<String>> = Vec::new();
+
+        // Titles, URLs and descriptions are provider-controlled and can carry
+        // line breaks, which would split a result block or fake a numbered
+        // line. Collapse the whitespace first; a result without a URL is of no
+        // use to the agent, so it is skipped.
+        let results_with_url = results.iter().filter_map(|result| {
+            let field = |name: &str| {
+                result
+                    .get(name)
+                    .and_then(|v| v.as_str())
+                    .map(collapse_whitespace)
+                    .unwrap_or_default()
+            };
+            let url = field("url");
+            (!url.is_empty()).then(|| (field("title"), url, field("description")))
+        });
+
+        for (i, (title, url, description)) in results_with_url.take(self.max_results).enumerate() {
+            let title = if title.is_empty() {
+                get_required_tool_string("tool-web-search-tool-firecrawl-no-title")
+            } else {
+                cap_result_content(&title)
+            };
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
+            if !description.is_empty() {
+                block.push(format!("   {}", cap_result_content(&description)));
+            }
+            blocks.push(block);
+        }
+
+        if blocks.is_empty() {
+            return Ok(no_results_message(query));
+        }
+
+        Ok(render_results(results_header(query, "Firecrawl"), blocks))
+    }
+
     fn parse_brave_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
         let results = json
             .get("web")
@@ -1906,6 +2220,7 @@ const KEENABLE_APP_TITLE: &str = "zeroclaw";
 /// Dotted prop-path of the key field, in the form `Config::prop_is_env_overridden`
 /// takes. Its env-var spelling is `ZEROCLAW_web_search__keenable_api_key`.
 const KEENABLE_API_KEY_PROP_PATH: &str = "web_search.keenable_api_key";
+const FIRECRAWL_API_KEY_PROP_PATH: &str = "web_search.firecrawl_api_key";
 /// Stable code for a `config.toml` that fails to parse while the Keenable key
 /// is being resolved. The parser's own message quotes the offending source
 /// line, which for a broken `keenable_api_key = "..."` line is the credential,
@@ -1916,6 +2231,25 @@ const KEENABLE_CONFIG_PARSE_ERROR_CODE: &str = "web_search.keenable.config_parse
 /// kilobytes; anything past this is not a search response the tool would
 /// render, so it is rejected instead of buffered.
 const KEENABLE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+// ── Firecrawl ────────────────────────────────────────────────────────────────
+
+/// Firecrawl search endpoint (API v2).
+const FIRECRAWL_SEARCH_URL: &str = "https://api.firecrawl.dev/v2/search";
+/// Integration tag Firecrawl accepts in the request body to name the caller.
+const FIRECRAWL_ORIGIN: &str = "zeroclaw";
+/// Longest `query` the search endpoint accepts; a longer one is a 400.
+const FIRECRAWL_MAX_QUERY_CHARS: usize = 500;
+/// Upper bound on a Firecrawl response body, enforced while the body streams
+/// in and before any JSON decoding. A snippet-sized result page is tens of
+/// kilobytes; anything past this is rejected instead of buffered.
+const FIRECRAWL_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+/// Stable code for a `config.toml` that fails to parse while the Firecrawl key
+/// is being resolved. The parser's own message quotes the offending source
+/// line, which for a broken `firecrawl_api_key = "..."` line is the
+/// credential, so only this code and a derived line number reach logs and
+/// tool history.
+const FIRECRAWL_CONFIG_PARSE_ERROR_CODE: &str = "web_search.firecrawl.config_parse_error";
 
 // ── Output caps ──────────────────────────────────────────────────────────────
 //
@@ -2330,6 +2664,22 @@ fn keenable_config_parse_attrs(config_path: &Path, line: Option<usize>) -> serde
     })
 }
 
+/// Collapse every run of whitespace (including line breaks) to one space.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Structured attributes for the Firecrawl config-parse failure record: the
+/// path, the stable error code, and the derived line. No parser output.
+fn firecrawl_config_parse_attrs(config_path: &Path, line: Option<usize>) -> serde_json::Value {
+    serde_json::json!({
+        "path": config_path.display().to_string(),
+        "search_provider": "firecrawl",
+        "error_code": FIRECRAWL_CONFIG_PARSE_ERROR_CODE,
+        "line": line,
+    })
+}
+
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     haystack
         .as_bytes()
@@ -2411,6 +2761,7 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::AnySearch => self.search_anysearch(query).await?,
             WebSearchProviderRoute::Serply => self.search_serply(query).await?,
             WebSearchProviderRoute::Keenable => self.search_keenable(query).await?,
+            WebSearchProviderRoute::Firecrawl => self.search_firecrawl(query).await?,
         };
 
         Ok(ToolResult {
@@ -3209,6 +3560,7 @@ mod tests {
             config_path: PathBuf::new(),
             secrets_encrypt: false,
             keenable_api_key_override: None,
+            firecrawl_api_key_override: None,
         };
         let url = tool.resolve_searxng_instance_url().unwrap();
         assert_eq!(url, "https://searx.example.com");
@@ -4616,6 +4968,33 @@ mod tests {
         // endpoint instead of serving any previously observed value.
         std::fs::write(&config_path, "[web_search]\n").unwrap();
         assert_eq!(tool.resolve_keenable_api_key().unwrap(), None);
+    }
+
+    #[test]
+    fn test_firecrawl_api_key_override_follows_the_loader_override_state() {
+        let mut config = zeroclaw_config::schema::Config::default();
+
+        // No override: the tool keeps resolving the key from config.toml.
+        config.web_search.firecrawl_api_key = Some("stored-key".to_string());
+        assert_eq!(WebSearchTool::firecrawl_api_key_override(&config), None);
+
+        // `ZEROCLAW_web_search__firecrawl_api_key=env-key` applied by the loader.
+        config.web_search.firecrawl_api_key = Some("env-key".to_string());
+        config
+            .env_overridden_paths
+            .insert(FIRECRAWL_API_KEY_PROP_PATH.to_string());
+        assert_eq!(
+            WebSearchTool::firecrawl_api_key_override(&config),
+            Some(Some("env-key".to_string()))
+        );
+
+        // A blank override stays overridden, so the tool must report "not
+        // configured" rather than read the disk key.
+        config.web_search.firecrawl_api_key = None;
+        assert_eq!(
+            WebSearchTool::firecrawl_api_key_override(&config),
+            Some(None)
+        );
     }
 
     #[test]
@@ -6514,5 +6893,689 @@ mod tests {
              1. First Title\n   https://example.com/one\n   First body\n\
              2. Second Title\n   https://example.org/two"
         );
+    }
+
+    // ── Firecrawl ────────────────────────────────────────────────────────────
+
+    /// Build a Firecrawl-routed tool over `config_path`. Like Serply, there is
+    /// no boot-time Firecrawl key parameter: the key always comes from config.
+    fn firecrawl_tool(config_path: PathBuf, secrets_encrypt: bool) -> WebSearchTool {
+        WebSearchTool::new_with_config(
+            "firecrawl".to_string(),
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            secrets_encrypt,
+        )
+    }
+
+    fn firecrawl_tool_with_key(api_key: &str) -> (tempfile::TempDir, WebSearchTool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nfirecrawl_api_key = \"{api_key}\"\n"),
+        )
+        .unwrap();
+        let tool = firecrawl_tool(config_path, false);
+        (tmp, tool)
+    }
+
+    fn firecrawl_test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client builder should succeed without a proxy")
+    }
+
+    #[tokio::test]
+    async fn test_execute_firecrawl_without_api_key() {
+        // No config field: the resolver must error before any network call.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = firecrawl_tool(config_path, false);
+        let err = tool
+            .execute(json!({"query": "test"}))
+            .await
+            .expect_err("a missing key must fail the search");
+        assert!(
+            err.to_string().contains("Firecrawl API key not configured"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_firecrawl_api_key_without_config_path_is_not_configured() {
+        let tool = WebSearchTool::new("firecrawl".to_string(), None, None, 5, 15);
+        let err = tool.resolve_firecrawl_api_key().unwrap_err().to_string();
+        assert!(err.contains("Firecrawl API key not configured"), "{err}");
+    }
+
+    #[test]
+    fn test_resolve_firecrawl_api_key_reads_from_config() {
+        let (_tmp, tool) = firecrawl_tool_with_key("fresh-firecrawl-from-disk");
+        assert_eq!(
+            tool.resolve_firecrawl_api_key().unwrap(),
+            "fresh-firecrawl-from-disk"
+        );
+    }
+
+    #[test]
+    fn test_resolve_firecrawl_api_key_decrypts_encrypted_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("firecrawl-secret-key").unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nfirecrawl_api_key = \"{encrypted}\"\n"),
+        )
+        .unwrap();
+        let tool = firecrawl_tool(config_path, true);
+        assert_eq!(
+            tool.resolve_firecrawl_api_key().unwrap(),
+            "firecrawl-secret-key"
+        );
+    }
+
+    #[test]
+    fn test_resolve_firecrawl_api_key_tracks_rotation_and_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nfirecrawl_api_key = \"initial-key\"\n",
+        )
+        .unwrap();
+        let tool = firecrawl_tool(config_path.clone(), false);
+        assert_eq!(tool.resolve_firecrawl_api_key().unwrap(), "initial-key");
+
+        // Operator rotates the key on disk: the same tool instance must pick
+        // up the new value without a restart.
+        std::fs::write(
+            &config_path,
+            "[web_search]\nfirecrawl_api_key = \"rotated-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(tool.resolve_firecrawl_api_key().unwrap(), "rotated-key");
+
+        // Removing it makes the tool report "not configured".
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let err = tool.resolve_firecrawl_api_key().unwrap_err().to_string();
+        assert!(err.contains("Firecrawl API key not configured"), "{err}");
+    }
+
+    #[test]
+    fn test_resolve_firecrawl_api_key_env_override_without_disk_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = firecrawl_tool(config_path, false)
+            .with_firecrawl_api_key_override(Some(Some("env-only-key".to_string())));
+        assert_eq!(tool.resolve_firecrawl_api_key().unwrap(), "env-only-key");
+    }
+
+    #[test]
+    fn test_resolve_firecrawl_api_key_env_override_wins_over_disk_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nfirecrawl_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        let tool = firecrawl_tool(config_path.clone(), false)
+            .with_firecrawl_api_key_override(Some(Some("env-key".to_string())));
+        assert_eq!(tool.resolve_firecrawl_api_key().unwrap(), "env-key");
+        // The override is process-effective: on-disk edits do not displace it.
+        std::fs::write(
+            &config_path,
+            "[web_search]\nfirecrawl_api_key = \"rotated-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(tool.resolve_firecrawl_api_key().unwrap(), "env-key");
+    }
+
+    #[test]
+    fn test_resolve_firecrawl_api_key_blank_env_override_does_not_fall_back_to_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nfirecrawl_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        // `ZEROCLAW_web_search__firecrawl_api_key=` reaches the tool either as
+        // an explicit `None` (the loader clears the `Option`) or as an empty
+        // string.
+        for blank in [None, Some(String::new())] {
+            let tool = firecrawl_tool(config_path.clone(), false)
+                .with_firecrawl_api_key_override(Some(blank));
+            let err = tool.resolve_firecrawl_api_key().unwrap_err().to_string();
+            assert!(err.contains("Firecrawl API key not configured"), "{err}");
+        }
+    }
+
+    /// A malformed `firecrawl_api_key` line must not surface the line itself:
+    /// not in the resolver error, not in the log attributes, and not in what
+    /// the tool executor hands back to the model.
+    #[tokio::test]
+    async fn test_firecrawl_config_parse_failure_withholds_the_offending_line() {
+        const SECRET: &str = "fc-live-7f3a9c2e-DISTINCTIVE-5b8d1e0f";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        // An unterminated string: the parser quotes this line in its message.
+        let contents = format!("[web_search]\nfirecrawl_api_key = \"{SECRET}\n");
+        std::fs::write(&config_path, &contents).unwrap();
+
+        let parse_err = toml::from_str::<zeroclaw_config::schema::Config>(&contents)
+            .expect_err("an unterminated string must not parse");
+        assert!(
+            parse_err.to_string().contains(SECRET),
+            "premise: the parser message quotes the source line"
+        );
+        let line = toml_error_line(&contents, &parse_err);
+        assert_eq!(line, Some(2));
+
+        let attrs = firecrawl_config_parse_attrs(&config_path, line).to_string();
+        assert!(!attrs.contains(SECRET), "log attributes leak: {attrs}");
+        assert!(attrs.contains(FIRECRAWL_CONFIG_PARSE_ERROR_CODE), "{attrs}");
+
+        let tool = firecrawl_tool(config_path, false);
+        let err = tool
+            .resolve_firecrawl_api_key()
+            .expect_err("a broken config must not resolve a key");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(SECRET), "resolver error leaks: {msg}");
+        assert!(msg.contains(FIRECRAWL_CONFIG_PARSE_ERROR_CODE), "{msg}");
+        assert!(msg.contains("line=2"), "{msg}");
+
+        let err = tool
+            .execute(json!({"query": "what is rust"}))
+            .await
+            .expect_err("execute must surface the parse failure");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(SECRET), "tool error leaks: {msg}");
+        assert!(msg.contains(FIRECRAWL_CONFIG_PARSE_ERROR_CODE), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_firecrawl_request_shape_and_results() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/search"))
+            .and(header("authorization", "Bearer firecrawl-test-key"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(serde_json::json!({
+                "query": "what is rust",
+                "limit": 5,
+                "sources": ["web"],
+                "origin": "zeroclaw",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"web": [
+                    {
+                        "url": "https://www.rust-lang.org/",
+                        "title": "Rust Programming Language",
+                        "description": "A language empowering everyone to build reliable software.",
+                        "position": 1
+                    },
+                    {
+                        "url": "https://doc.rust-lang.org/book/",
+                        "title": "The Rust Programming Language - Book",
+                        "description": "",
+                        "position": 2
+                    }
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = firecrawl_tool_with_key("firecrawl-test-key");
+        let result = tool
+            .search_firecrawl_with_client(
+                &firecrawl_test_client(),
+                &format!("{}/v2/search", server.uri()),
+                "what is rust",
+            )
+            .await
+            .expect("request should succeed against the mock");
+        assert_eq!(
+            result,
+            "Search results for: what is rust (via Firecrawl)\n\
+             1. Rust Programming Language\n   https://www.rust-lang.org/\n   \
+             A language empowering everyone to build reliable software.\n\
+             2. The Rust Programming Language - Book\n   https://doc.rust-lang.org/book/"
+        );
+
+        let recorded = server
+            .received_requests()
+            .await
+            .expect("wiremock should have captured the request");
+        assert_eq!(recorded.len(), 1, "expected exactly one POST /v2/search");
+        // The key travels only in the Authorization header, never the URL or
+        // the body, and no page scraping is requested.
+        assert!(recorded[0].url.query().is_none());
+        let body = String::from_utf8_lossy(&recorded[0].body).to_string();
+        assert!(!body.contains("firecrawl-test-key"), "{body}");
+        assert!(!body.contains("scrapeOptions"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_firecrawl_query_is_cut_to_the_documented_maximum() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"web": []}
+            })))
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = firecrawl_tool_with_key("firecrawl-test-key");
+        // Multibyte so a byte-based cut would split a character.
+        let long_query = "検".repeat(FIRECRAWL_MAX_QUERY_CHARS + 50);
+        tool.search_firecrawl_with_client(
+            &firecrawl_test_client(),
+            &format!("{}/v2/search", server.uri()),
+            &long_query,
+        )
+        .await
+        .unwrap();
+        let recorded = server.received_requests().await.unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&recorded[0].body).unwrap();
+        assert_eq!(
+            sent["query"].as_str().unwrap().chars().count(),
+            FIRECRAWL_MAX_QUERY_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn test_firecrawl_request_carries_env_override_key_not_stored_key() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/search"))
+            .and(header("authorization", "Bearer env-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"web": []}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nfirecrawl_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        let tool = firecrawl_tool(config_path, false)
+            .with_firecrawl_api_key_override(Some(Some("env-key".to_string())));
+
+        tool.search_firecrawl_with_client(
+            &firecrawl_test_client(),
+            &format!("{}/v2/search", server.uri()),
+            "rust",
+        )
+        .await
+        .expect("the request must authenticate with the env-override key");
+        // `expect(1)` on the mock fails the test on drop if the stored key was
+        // sent instead.
+    }
+
+    #[tokio::test]
+    async fn test_firecrawl_limit_follows_max_results() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"web": []}
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nfirecrawl_api_key = \"firecrawl-test-key\"\n",
+        )
+        .unwrap();
+        // The tool bounds `max_results` to 1..=10 at construction.
+        for (max_results, expected) in [(0_usize, 1_u64), (3, 3), (500, 10)] {
+            let tool = WebSearchTool::new_with_config(
+                "firecrawl".to_string(),
+                None,
+                None,
+                None,
+                None,
+                max_results,
+                15,
+                config_path.clone(),
+                false,
+            );
+            tool.search_firecrawl_with_client(
+                &firecrawl_test_client(),
+                &format!("{}/v2/search", server.uri()),
+                "rust",
+            )
+            .await
+            .unwrap();
+            let recorded = server.received_requests().await.unwrap();
+            let sent: serde_json::Value =
+                serde_json::from_slice(&recorded.last().unwrap().body).unwrap();
+            assert_eq!(sent["limit"], expected);
+        }
+    }
+
+    #[test]
+    fn test_parse_firecrawl_results_missing_web_is_no_results() {
+        let tool = WebSearchTool::new("firecrawl".to_string(), None, None, 5, 15);
+        // Firecrawl omits `data.web` when nothing matched.
+        for json in [
+            serde_json::json!({"success": true, "data": {}}),
+            serde_json::json!({"success": true, "data": {"web": null}}),
+            serde_json::json!({"success": true, "data": {"web": []}}),
+        ] {
+            let result = tool.parse_firecrawl_results(&json, "rust").unwrap();
+            assert_eq!(result, "No results found for: rust", "{json}");
+        }
+    }
+
+    #[test]
+    fn test_parse_firecrawl_results_invalid_response() {
+        let tool = WebSearchTool::new("firecrawl".to_string(), None, None, 5, 15);
+        for json in [
+            serde_json::json!({"success": true}),
+            serde_json::json!({"data": {"web": "not-an-array"}}),
+            serde_json::json!([]),
+        ] {
+            let err = tool.parse_firecrawl_results(&json, "rust").unwrap_err();
+            assert!(
+                err.to_string().contains("Invalid Firecrawl API response"),
+                "{json}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_firecrawl_results_success_false_is_a_failure_and_capped() {
+        let tool = WebSearchTool::new("firecrawl".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"success": false, "error": "Invalid query"});
+        let err = tool.parse_firecrawl_results(&json, "rust").unwrap_err();
+        assert!(err.to_string().contains("Invalid query"), "{err}");
+
+        // No message at all still fails, and an oversized one is bounded.
+        let json = serde_json::json!({"success": false});
+        assert!(tool.parse_firecrawl_results(&json, "rust").is_err());
+        let long = "é".repeat(MAX_PROVIDER_ERROR_CHARS + 20_000);
+        let json = serde_json::json!({"success": false, "error": long});
+        let err = tool
+            .parse_firecrawl_results(&json, "rust")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.chars().count() < MAX_PROVIDER_ERROR_CHARS + 100,
+            "{}",
+            err.len()
+        );
+    }
+
+    #[test]
+    fn test_parse_firecrawl_results_defaults_for_missing_fields() {
+        let tool = WebSearchTool::new("firecrawl".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"success": true, "data": {"web": [
+            {"url": "https://example.com/a"},
+            {"title": "", "url": "https://example.com/b", "description": "body"},
+        ]}});
+        let result = tool.parse_firecrawl_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via Firecrawl)\n\
+             1. No title\n   https://example.com/a\n\
+             2. No title\n   https://example.com/b\n   body"
+        );
+    }
+
+    #[test]
+    fn test_parse_firecrawl_results_collapses_multiline_descriptions() {
+        let tool = WebSearchTool::new("firecrawl".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"success": true, "data": {"web": [
+            {"title": "T", "url": "https://example.com/a", "description": "# Heading\n\nFirst line\n  second\tline"},
+        ]}});
+        let result = tool.parse_firecrawl_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via Firecrawl)\n\
+             1. T\n   https://example.com/a\n   # Heading First line second line"
+        );
+    }
+
+    #[test]
+    fn test_parse_firecrawl_results_collapses_title_and_url_and_skips_missing_urls() {
+        let tool = WebSearchTool::new("firecrawl".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"success": true, "data": {"web": [
+            {"title": "Real\n2. Fake Result", "url": "https://example.com/a\n", "description": "ok"},
+            {"title": "No url here", "description": "dropped"},
+            {"title": "Empty url", "url": "  ", "description": "dropped"},
+        ]}});
+        let result = tool.parse_firecrawl_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via Firecrawl)\n\
+             1. Real 2. Fake Result\n   https://example.com/a\n   ok"
+        );
+
+        // Only URL-less results left means no results, not an empty block.
+        let json = serde_json::json!({"success": true, "data": {"web": [{"title": "t"}]}});
+        assert_eq!(
+            tool.parse_firecrawl_results(&json, "rust").unwrap(),
+            "No results found for: rust"
+        );
+    }
+
+    #[test]
+    fn firecrawl_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("firecrawl".to_string(), None, None, 2, 15);
+        let long = "x".repeat(MAX_RESULT_CONTENT_CHARS * 4);
+        let json = serde_json::json!({"success": true, "data": {"web": [
+            {"title": "First Title", "url": "https://example.com/one", "description": long},
+            {"title": "Second Title", "url": "https://example.org/two", "description": "Second body"},
+            {"title": "Third Title", "url": "https://example.net/three", "description": "Dropped by max_results"},
+        ]}});
+        let result = tool.parse_firecrawl_results(&json, "rust").unwrap();
+        assert!(result.starts_with("Search results for: rust (via Firecrawl)\n1. First Title\n"));
+        assert!(result.contains("2. Second Title\n   https://example.org/two\n   Second body"));
+        assert!(!result.contains("Third Title"));
+        for line in result.lines() {
+            assert!(
+                line.chars().count() <= MAX_RESULT_CONTENT_CHARS + 8,
+                "result line exceeds the content cap: {} chars",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_firecrawl_http_failures_are_classified() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (status, expected_status, expected_http) in [
+            (429_u16, "unavailable", "http=429"),
+            (500, "unavailable", "http=500"),
+            (401, "client_error", "http=401"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/search"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(
+                    serde_json::json!({"success": false, "error": "private-body-text"}),
+                ))
+                .mount(&server)
+                .await;
+
+            let (_tmp, tool) = firecrawl_tool_with_key("firecrawl-test-key");
+            let err = tool
+                .search_firecrawl_with_client(
+                    &firecrawl_test_client(),
+                    &format!("{}/v2/search", server.uri()),
+                    "what is rust",
+                )
+                .await
+                .expect_err("a non-2xx answer must surface as an error");
+            let msg = err.to_string();
+            assert!(msg.contains("firecrawl search failed"), "{msg}");
+            assert!(
+                msg.contains(&format!("search_status={expected_status}")),
+                "{msg}"
+            );
+            assert!(msg.contains(expected_http), "{msg}");
+            assert!(!msg.contains("private-body-text"), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_firecrawl_oversized_response_is_rejected_and_query_free() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A 200 whose valid-JSON body exceeds the byte cap must be rejected by
+        // the bounded reader instead of being decoded.
+        let padding = "x".repeat(FIRECRAWL_RESPONSE_LIMIT_BYTES);
+        let body = format!("{{\"success\": true, \"data\": {{}}, \"padding\": \"{padding}\"}}");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/search"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = firecrawl_tool_with_key("firecrawl-test-key");
+        let query = "private-query-marker";
+        let err = tool
+            .search_firecrawl_with_client(
+                &firecrawl_test_client(),
+                &format!("{}/v2/search", server.uri()),
+                query,
+            )
+            .await
+            .expect_err("a body over the byte cap must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("search_status=unavailable, transport=oversized, stage=response"),
+            "{msg}"
+        );
+        assert!(!msg.contains(query), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_firecrawl_non_json_response_is_a_decode_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>gateway</html>"))
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = firecrawl_tool_with_key("firecrawl-test-key");
+        let err = tool
+            .search_firecrawl_with_client(
+                &firecrawl_test_client(),
+                &format!("{}/v2/search", server.uri()),
+                "rust",
+            )
+            .await
+            .expect_err("a non-JSON body must fail");
+        assert!(err.to_string().contains("transport=decode"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_firecrawl_connection_refused_error_is_query_free() {
+        let (_tmp, tool) = firecrawl_tool_with_key("firecrawl-test-key");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let query = "private-query-marker";
+        let endpoint = "http://127.0.0.1:1/v2/search";
+        let err = tool
+            .search_firecrawl_with_client(&client, endpoint, query)
+            .await
+            .expect_err("a closed port must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("firecrawl search failed (search_status="),
+            "{msg}"
+        );
+        assert!(!msg.contains(query), "{msg}");
+        assert!(!msg.contains(endpoint) && !msg.contains("http://"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_firecrawl_does_not_follow_a_cross_origin_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&target)
+            .await;
+
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/search"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/steal", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+
+        let (_tmp, tool) = firecrawl_tool_with_key("firecrawl-test-key");
+        let client = tool
+            .firecrawl_client()
+            .expect("the shipped client policy must build");
+        let err = tool
+            .search_firecrawl_with_client(&client, &format!("{}/v2/search", origin.uri()), "rust")
+            .await
+            .expect_err("a redirect must surface as a failure");
+        assert!(err.to_string().contains("http=307"), "{err}");
+        // `expect(0)` on the target fails the test on drop if the POST was
+        // replayed there.
     }
 }
