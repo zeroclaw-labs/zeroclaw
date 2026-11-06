@@ -653,9 +653,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_heartbeat_file_creates_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_heartbeat");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         HeartbeatEngine::ensure_heartbeat_file(&dir).await.unwrap();
 
@@ -664,15 +663,12 @@ mod tests {
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(content.contains("Periodic Tasks"));
         assert!(content.contains("[high]"));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn ensure_heartbeat_file_does_not_overwrite() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_heartbeat_no_overwrite");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let path = dir.join("HEARTBEAT.md");
         tokio::fs::write(&path, "- My custom task").await.unwrap();
@@ -681,15 +677,12 @@ mod tests {
 
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(content, "- My custom task");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn tick_returns_zero_when_no_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_tick_no_file");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
         let engine = HeartbeatEngine::new(
@@ -703,15 +696,12 @@ mod tests {
         );
         let count = engine.tick().await.unwrap();
         assert_eq!(count, 0);
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn tick_counts_tasks_from_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_tick_count");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         tokio::fs::write(dir.join("HEARTBEAT.md"), "- A\n- B\n- C")
             .await
@@ -729,8 +719,6 @@ mod tests {
         );
         let count = engine.tick().await.unwrap();
         assert_eq!(count, 3);
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
@@ -752,9 +740,8 @@ mod tests {
 
     #[tokio::test]
     async fn collect_runnable_tasks_sorts_by_priority() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_runnable_sort");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
 
         tokio::fs::write(
             dir.join("HEARTBEAT.md"),
@@ -779,8 +766,6 @@ mod tests {
         assert_eq!(tasks[0].priority, TaskPriority::High);
         assert_eq!(tasks[1].priority, TaskPriority::Medium);
         assert_eq!(tasks[2].priority, TaskPriority::Low);
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     // ── HeartbeatMetrics tests ───────────────────────────────────
