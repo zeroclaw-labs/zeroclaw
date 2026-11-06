@@ -4,10 +4,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AsrApiPatch, AsrOptionsPatch, Capability, ChatApiPatch, ChatOptionsPatch, PresetId,
-    ProviderConnection, ProviderId, TtsOptionsPatch,
+    AsrApiPatch, AsrOptionsPatch, ChatApiPatch, ChatOptionsPatch, PresetId, ProviderConnection,
+    ProviderId, TtsOptionsPatch,
 };
 use crate::schema::{ModelCostRates, TranscriptionCostRates, TtsCostRates};
+use zeroclaw_api::capability::Capability;
 
 macro_rules! metadata {
     ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {

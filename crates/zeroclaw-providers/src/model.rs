@@ -280,7 +280,7 @@ fn build_provider(
 ) -> anyhow::Result<crate::ResolvedModelProviderRef> {
     let selection_ref = selection_ref.trim();
 
-    // Canonical V5 model references are exact registry keys. They must be
+    // Canonical model references are exact registry keys. They must be
     // admitted before the V4 family/alias parser, which intentionally treats
     // dots as legacy profile boundaries. The initial migration boundary uses
     // the new resolver for both transport construction and the exact-key
@@ -298,14 +298,24 @@ fn build_provider(
         let mut reliable_candidates = Vec::new();
         let mut raw_candidates = Vec::new();
         let mut refs = vec![canonical_ref.clone()];
-        refs.extend(registry.fallback_targets(&canonical_ref)?.iter().cloned());
+        refs.extend(registry.fallback_chain(&canonical_ref)?);
         for candidate_ref in refs {
             let provider = crate::factory::dispatch_model_ref(config, &candidate_ref, &options)?;
-            let upstream_model = registry
+            let configured_model = registry
                 .resolve_chat(&candidate_ref)?
                 .upstream_model()
                 .unwrap_or(candidate_ref.as_str())
                 .to_owned();
+            let pinned_model = if candidate_ref == canonical_ref {
+                overrides
+                    .model
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or(configured_model)
+            } else {
+                configured_model
+            };
             if reliable {
                 let provider: std::sync::Arc<dyn ModelProvider> = provider.into();
                 reliable_candidates.push(
@@ -313,13 +323,13 @@ fn build_provider(
                         candidate_ref.as_str(),
                         candidate_ref.as_str(),
                         candidate_ref.as_str(),
-                        &upstream_model,
+                        &pinned_model,
                         Box::new(provider),
                     )
                     .with_selection_ref(candidate_ref.as_str()),
                 );
             } else {
-                raw_candidates.push((upstream_model, provider));
+                raw_candidates.push((pinned_model, provider));
             }
         }
         let provider: Box<dyn ModelProvider> = if reliable {
@@ -418,34 +428,52 @@ fn build_provider(
 /// Construct a canonical model with the caller's admitted runtime options.
 /// This is kept separate from the legacy family parser so the exact ModelRef
 /// remains intact through provider construction and fallback pinning.
-fn build_canonical_provider_with_options(
+pub(crate) fn build_canonical_provider_with_options(
     config: &Config,
     model_ref: &zeroclaw_config::provider_registry::ModelRef,
     overrides: ProviderOverrides<'_>,
     options: &crate::ModelProviderRuntimeOptions,
+    pin_primary_model: bool,
 ) -> anyhow::Result<crate::ResolvedModelProviderRef> {
     let registry = config.provider_registry()?;
     let mut candidates = Vec::new();
     let mut refs = vec![model_ref.clone()];
-    refs.extend(registry.fallback_targets(model_ref)?.iter().cloned());
+    refs.extend(registry.fallback_chain(model_ref)?);
     for candidate_ref in refs {
         let provider = crate::factory::dispatch_model_ref(config, &candidate_ref, options)?;
-        let upstream_model = registry
+        let configured_model = registry
             .resolve_chat(&candidate_ref)?
             .upstream_model()
             .unwrap_or(candidate_ref.as_str())
             .to_owned();
+        let pinned_model = if candidate_ref == *model_ref {
+            overrides
+                .model
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+                .unwrap_or(configured_model)
+        } else {
+            configured_model
+        };
         let provider: std::sync::Arc<dyn ModelProvider> = provider.into();
-        candidates.push(
+        let candidate = if candidate_ref == *model_ref && !pin_primary_model {
+            crate::reliable::ReliableModelProviderEntry::new_with_candidate(
+                candidate_ref.as_str(),
+                candidate_ref.as_str(),
+                candidate_ref.as_str(),
+                Box::new(provider),
+            )
+        } else {
             crate::reliable::ReliableModelProviderEntry::new_pinned(
                 candidate_ref.as_str(),
                 candidate_ref.as_str(),
                 candidate_ref.as_str(),
-                &upstream_model,
+                &pinned_model,
                 Box::new(provider),
             )
-            .with_selection_ref(candidate_ref.as_str()),
-        );
+        };
+        candidates.push(candidate.with_selection_ref(candidate_ref.as_str()));
     }
     let provider = crate::reliable::ReliableModelProvider::new_with_entries(
         model_ref.as_str(),
@@ -604,6 +632,7 @@ pub fn build_model(
                 api_key: None,
             },
             &options,
+            true,
         )?;
         let model_id = built.model.ok_or_else(|| {
             anyhow::Error::msg(format!(

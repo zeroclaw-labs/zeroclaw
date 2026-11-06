@@ -2668,8 +2668,8 @@ fn all_tools_with_runtime_on_thread(
     // Preserves family + alias identity so alias-specific typed config
     // (e.g. requires_openai_auth) survives into llm_task execution.
     if root_config
-        .resolved_model_provider_for_agent(agent_alias)
-        .is_some()
+        .agent(agent_alias)
+        .is_some_and(|agent| root_config.is_configured_model_ref(agent.model_provider.trim()))
         && select_tool!("llm_task")
     {
         register_tool!(

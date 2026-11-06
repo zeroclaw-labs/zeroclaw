@@ -52,28 +52,3 @@ macro_rules! registry_id {
 registry_id!(ProviderId);
 registry_id!(ModelRef);
 registry_id!(PresetId);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum Capability {
-    Chat,
-    Embedding,
-    Tts,
-    Asr,
-    Decision,
-}
-
-impl Capability {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Chat => "chat",
-            Self::Embedding => "embedding",
-            Self::Tts => "tts",
-            Self::Asr => "asr",
-            Self::Decision => "decision",
-        }
-    }
-}
-
-pub type CapabilitySet = std::collections::BTreeSet<Capability>;

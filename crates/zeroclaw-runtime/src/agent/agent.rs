@@ -3444,8 +3444,9 @@ impl Agent {
                 if construction == crate::composition::RegistryConstruction::NativeCompat
                     && config.sop.runtime_enabled() =>
             {
-                let (engine, audit) = crate::sop::build_sop_engine_with_capability(
+                let (engine, audit) = crate::sop::build_sop_engine_with_provider_registry(
                     config.sop.clone(),
+                    config,
                     &config.decision_models,
                     &config.data_dir,
                     &config.install_root_dir(),
@@ -4057,16 +4058,22 @@ impl Agent {
         // running — however the ref spells it — leaves the runtime untouched.
         // The request is owned by the completed tool-loop scope, so there is
         // no persistent slot to clear.
-        let next_identity = full_config
-            .resolve_model_selection(&new_model_provider)
-            .map(|s| s.identity(Some(&new_model)));
+        let next_identity = zeroclaw_providers::model::resolve_model_identity(
+            &full_config,
+            &self.agent_alias,
+            &new_model_provider,
+            Some(&new_model),
+        );
         if let Some(current) = &self.model_identity
             && Some(current) == next_identity.as_ref()
         {
             let route = self.model_route_resolver.resolve(current_effective_model);
-            let route_identity = full_config
-                .resolve_model_selection(&route.provider_name)
-                .map(|selection| selection.identity(Some(&route.model)));
+            let route_identity = zeroclaw_providers::model::resolve_model_identity(
+                &full_config,
+                &self.agent_alias,
+                &route.provider_name,
+                Some(&route.model),
+            );
             return Ok(if route_identity == next_identity {
                 ModelSwitchOutcome::Unchanged
             } else {

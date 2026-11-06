@@ -668,16 +668,11 @@ impl AcpServer {
         // install-wide first configured model when no default agent can be
         // inferred (e.g. agent-less onboarding configs).
         let default_model = match self.default_session_agent_alias(&config) {
-            Some(alias) => Self::alias_if_dispatchable(&config, &alias)
-                .and_then(|alias| config.resolved_model_provider_for_agent(&alias))
-                .and_then(|(_, _, entry)| {
-                    entry
-                        .model
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|model| !model.is_empty())
-                        .map(ToString::to_string)
-                }),
+            Some(alias) => Self::alias_if_dispatchable(&config, &alias).and_then(|alias| {
+                config
+                    .agent(&alias)
+                    .and_then(|agent| config.resolve_model_id(&agent.model_provider))
+            }),
             None => config.resolve_default_model(),
         };
 

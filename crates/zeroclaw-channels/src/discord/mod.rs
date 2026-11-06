@@ -97,7 +97,8 @@ pub struct DiscordChannel {
     /// Voice transcription config — when set, audio attachments are
     /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
-    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager:
+        Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     /// Workspace directory for saving downloaded inbound media attachments.
     workspace_dir: Option<PathBuf>,
     /// Streaming mode: Off, Partial (draft edits), or MultiMessage (paragraph splits).
@@ -281,9 +282,12 @@ impl DiscordChannel {
     /// config and the owning agent's resolved provider; this path can only see
     /// the legacy section, so it binds a lone registered provider and
     /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
+    /// `transcription::build_transcription_manager_from_legacy_config`).
     pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
+        let manager =
+            zeroclaw_providers::transcription::build_transcription_manager_from_legacy_config(
+                &config,
+            );
         self.with_transcription_manager(config, manager)
     }
 
@@ -293,7 +297,7 @@ impl DiscordChannel {
     pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);
@@ -1208,7 +1212,7 @@ async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
     workspace_dir: Option<&Path>,
-    transcription_manager: Option<&super::transcription::TranscriptionManager>,
+    transcription_manager: Option<&zeroclaw_providers::transcription::TranscriptionManager>,
 ) -> (String, Vec<MediaAttachment>) {
     let mut text_parts: Vec<String> = Vec::new();
     let mut media: Vec<MediaAttachment> = Vec::new();
@@ -7078,9 +7082,9 @@ mod tests {
 
     #[tokio::test]
     async fn process_attachments_preserves_audio_when_transcription_fails() {
-        use crate::transcription::TranscriptionManager;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_providers::transcription::TranscriptionManager;
 
         let media_server = MockServer::start().await;
         let whisper_server = MockServer::start().await;
@@ -7128,9 +7132,9 @@ mod tests {
 
     #[tokio::test]
     async fn process_attachments_preserves_audio_when_transcription_is_empty() {
-        use crate::transcription::TranscriptionManager;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_providers::transcription::TranscriptionManager;
 
         let media_server = MockServer::start().await;
         let whisper_server = MockServer::start().await;

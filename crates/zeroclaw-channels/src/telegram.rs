@@ -1134,11 +1134,12 @@ pub struct TelegramChannel {
     /// Override for local Bot API servers or testing.
     api_base: String,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
-    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager:
+        Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
-    tts_manager: Option<Arc<super::tts::TtsManager>>,
+    tts_manager: Option<Arc<zeroclaw_providers::tts::TtsManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Resolves voice peers from canonical config at call-time.
     /// See AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH" — no cache.
@@ -3364,9 +3365,12 @@ impl TelegramChannel {
     /// config and the owning agent's resolved provider; this path can only see
     /// the legacy section, so it binds a lone registered provider and
     /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
+    /// `transcription::build_transcription_manager_from_legacy_config`).
     pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
+        let manager =
+            zeroclaw_providers::transcription::build_transcription_manager_from_legacy_config(
+                &config,
+            );
         self.with_transcription_manager(config, manager)
     }
 
@@ -3376,7 +3380,7 @@ impl TelegramChannel {
     pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);
@@ -3388,7 +3392,7 @@ impl TelegramChannel {
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
             let owner = config.agent_for_channel(&format!("telegram.{}", self.alias));
-            match super::tts::TtsManager::from_config_for_agent(config, owner) {
+            match zeroclaw_providers::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
@@ -4363,7 +4367,7 @@ impl TelegramChannel {
         chat_id: &str,
         thread_id: Option<&str>,
         text: &str,
-        tts_manager: &crate::tts::TtsManager,
+        tts_manager: &zeroclaw_providers::tts::TtsManager,
     ) -> anyhow::Result<()> {
         let audio_bytes = tts_manager.synthesize_opus(text).await?;
         let audio_len = audio_bytes.len();
@@ -21320,7 +21324,7 @@ mod tests {
             api_key: Some(api_key),
             ..Default::default()
         };
-        let manager = crate::transcription::TranscriptionManager::new(&config)
+        let manager = zeroclaw_providers::transcription::TranscriptionManager::new(&config)
             .expect("TranscriptionManager::new should succeed with valid GROQ_API_KEY");
         let transcript: String = manager
             .transcribe(&audio_data, "hello.mp3")

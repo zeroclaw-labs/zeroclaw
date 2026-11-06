@@ -8,7 +8,9 @@ pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
 pub mod copilot;
+pub mod decision;
 pub mod dispatch;
+pub mod embedding;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
@@ -35,6 +37,8 @@ pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod temperature;
 pub mod traits;
+pub mod transcription;
+pub mod tts;
 pub mod vision_override;
 
 pub use anthropic::AnthropicRefusalError;
@@ -1770,6 +1774,32 @@ fn create_resilient_model_provider_for_alias_with_model_override(
     primary_model_override: Option<&str>,
     selection_ref: &str,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_resilient_model_provider_for_alias_with_model_override_and_pin(
+        config,
+        family,
+        alias,
+        api_key,
+        api_url,
+        reliability,
+        options,
+        primary_model_override,
+        selection_ref,
+        true,
+    )
+}
+
+fn create_resilient_model_provider_for_alias_with_model_override_and_pin(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+    primary_model_override: Option<&str>,
+    selection_ref: &str,
+    pin_primary_model: bool,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
 
@@ -1782,6 +1812,7 @@ fn create_resilient_model_provider_for_alias_with_model_override(
         primary_model_provider,
         primary_model_override,
         selection_ref,
+        pin_primary_model,
     );
 
     let mut visited: Vec<String> = vec![format!("{family}.{alias}")];
@@ -1814,6 +1845,7 @@ fn push_pinned_entries(
     built: Box<dyn ModelProvider>,
     primary_model_override: Option<&str>,
     selection_ref: &str,
+    pin_primary_model: bool,
 ) {
     let entry = config.providers.models.find(family, alias);
     let primary_model = primary_model_override
@@ -1839,7 +1871,7 @@ fn push_pinned_entries(
     };
 
     let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
-    out.push(
+    let primary = if pin_primary_model {
         ReliableModelProviderEntry::new_pinned(
             family,
             cooldown_key.clone(),
@@ -1847,8 +1879,15 @@ fn push_pinned_entries(
             primary_model,
             Box::new(std::sync::Arc::clone(&built)),
         )
-        .with_selection_ref(selection_ref),
-    );
+    } else {
+        ReliableModelProviderEntry::new_with_candidate(
+            family,
+            cooldown_key.clone(),
+            cooldown_key.clone(),
+            Box::new(std::sync::Arc::clone(&built)),
+        )
+    };
+    out.push(primary.with_selection_ref(selection_ref));
     for model in extra_models {
         if model.trim().is_empty() || model == primary_model {
             continue;
@@ -1970,6 +2009,7 @@ fn append_fallback_chain(
                 built,
                 model_override.as_deref(),
                 selection_ref,
+                true,
             ),
             Err(e) => {
                 let profile = format!("[providers.models.{family}.{alias}]");
@@ -2116,6 +2156,73 @@ fn create_resilient_model_provider_from_ref_with_model_override(
                 &options,
                 primary_model_override.or(selected_model),
                 name,
+            )
+        }
+        _ => create_resilient_model_provider_with_options(
+            name,
+            api_key,
+            api_url,
+            reliability,
+            &options,
+        ),
+    }
+}
+
+/// Build a routed entry without pinning its primary model. Route hints carry
+/// the model argument at dispatch time, so one provider profile can serve
+/// several model IDs without reconstructing a provider for every hint.
+fn create_resilient_model_provider_from_ref_for_route(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+    route_model: Option<&str>,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    let name = name.trim();
+    ensure_known_model_entry_ref(config, name)?;
+    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(name);
+    if config
+        .providers
+        .models
+        .canonical_model(&canonical_ref)
+        .is_some()
+    {
+        return Ok(crate::model::build_canonical_provider_with_options(
+            config,
+            &canonical_ref,
+            crate::model::ProviderOverrides {
+                model: route_model,
+                api_key,
+            },
+            options,
+            false,
+        )?
+        .provider);
+    }
+
+    let selection = config.resolve_model_selection(name);
+    let mut options = options.clone();
+    apply_model_entry_options(
+        &mut options,
+        selection.as_ref().and_then(|selected| selected.model_entry),
+    );
+    match config.providers.models.profile_ref(name) {
+        Some((family, alias))
+            if !family.contains(':') && config.providers.models.find(family, alias).is_some() =>
+        {
+            create_resilient_model_provider_for_alias_with_model_override_and_pin(
+                config,
+                family,
+                alias,
+                api_key,
+                api_url,
+                reliability,
+                &options,
+                None,
+                name,
+                false,
             )
         }
         _ => create_resilient_model_provider_with_options(
@@ -2279,6 +2386,11 @@ pub fn create_routed_model_provider_with_options_and_resolver(
     let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
     for name in &needed {
         let is_primary = name == primary_name;
+        let routed_model = materialized_routes
+            .iter()
+            .find(|route| &route.model_provider == name)
+            .map(|route| route.effective_model(config));
+        let is_routed = routed_model.is_some();
         let routed_credential = materialized_routes
             .iter()
             .find(|r| &r.model_provider == name)
@@ -2313,21 +2425,42 @@ pub fn create_routed_model_provider_with_options_and_resolver(
         } else {
             options_for_provider_ref(config, name, options)
         };
-        let model_override = if is_primary {
+        // A route may point back to the primary provider with a different
+        // model. Pinning the primary to the agent's default would make the
+        // route hint resolve correctly but still send the default upstream
+        // model. Leave that entry unpinned so the router's route model wins.
+        let primary_is_routed = materialized_routes
+            .iter()
+            .any(|route| route.model_provider == *primary_name);
+        let model_override = if is_primary && !primary_is_routed {
             Some(default_model)
         } else {
             None
         };
 
-        match create_resilient_model_provider_from_ref_with_model_override(
-            config,
-            name,
-            key,
-            url,
-            reliability,
-            &entry_options,
-            model_override,
-        ) {
+        let built = if is_routed {
+            create_resilient_model_provider_from_ref_for_route(
+                config,
+                name,
+                key,
+                url,
+                reliability,
+                &entry_options,
+                routed_model.as_deref(),
+            )
+        } else {
+            create_resilient_model_provider_from_ref_with_model_override(
+                config,
+                name,
+                key,
+                url,
+                reliability,
+                &entry_options,
+                model_override,
+            )
+        };
+
+        match built {
             Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
             Err(e) => {
                 anyhow::bail!("Routed model_provider `{name}` failed to initialize: {e}");

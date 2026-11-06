@@ -3719,11 +3719,11 @@ mod tests {
 
     mod decision_gating {
         use super::*;
-        use crate::sop::decision::{
-            Answer, Answers, DecisionModel, GateOnError, Question, SopDecisionSpec, SystemOneClient,
-        };
+        use crate::sop::decision::{GateOnError, SopDecisionSpec};
         use std::collections::BTreeMap;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question};
+        use zeroclaw_providers::decision::build_decision_provider;
 
         /// Returns a fixed answer set (or an outage) and counts calls.
         struct Scripted {
@@ -4101,7 +4101,7 @@ mod tests {
             let model_id = std::env::var("SYSTEMONE_MODEL").unwrap_or_else(|_| "jev-latest".into());
             let key = std::env::var("TYPESAFE_API_KEY").ok();
             let client: Arc<dyn DecisionModel> =
-                Arc::new(SystemOneClient::new(&base, &model_id, key).unwrap());
+                Arc::from(build_decision_provider(&base, &model_id, key).unwrap());
 
             let mut refunds = spec();
             refunds.gate = Some(

@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use zeroclaw_macros::Configurable;
 
+use crate::secrets::SecretStore;
+use crate::traits::SecretFieldInfo;
+
 use super::provider_registry::{
-    Capability, ModelDefinition, ModelPreset, ModelRef, ProviderConnection, ProviderId,
-    ProviderRegistry,
+    ModelDefinition, ModelPreset, ModelRef, ProviderConnection, ProviderId, ProviderRegistry,
 };
 use super::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
@@ -44,6 +46,7 @@ use super::schema::{
     EdgeTtsProviderConfig, ElevenLabsTtsProviderConfig, GoogleTtsProviderConfig,
     OpenAITtsProviderConfig, PiperTtsProviderConfig, TtsProviderConfig as TtsBaseConfig,
 };
+use zeroclaw_api::capability::Capability;
 
 #[macro_export]
 macro_rules! define_provider_ref {
@@ -244,22 +247,38 @@ macro_rules! emit_model_providers_struct {
                 #[nested]
                 pub $field: HashMap<String, $cfg_ty>,
             )+
-            /// Canonical V5 model definitions. This is an in-memory bridge
-            /// while the old typed family consumers are migrated; it is the
-            /// only map written for the new `[providers.models]` shape.
+            /// Canonical model definitions. This is an in-memory bridge
+            /// while the old typed family consumers are migrated. Canonical
+            /// and legacy entries may coexist during that migration; each
+            /// top-level row keeps its own exact TOML key.
             #[serde(skip)]
             pub(crate) canonical_models: BTreeMap<ModelRef, ModelDefinition<serde_json::Value>>,
         }
 
         impl serde::Serialize for ModelProviders {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                use serde::ser::SerializeMap;
-                if !self.canonical_models.is_empty() {
-                    return self.canonical_models.serialize(serializer);
+                let mut entries = BTreeMap::<String, serde_json::Value>::new();
+                $(
+                    if !self.$field.is_empty() {
+                        entries.insert(
+                            $type_str.to_owned(),
+                            serde_json::to_value(&self.$field)
+                                .map_err(serde::ser::Error::custom)?,
+                        );
+                    }
+                )+
+                for (key, model) in &self.canonical_models {
+                    if entries.contains_key(key.as_str()) {
+                        return Err(serde::ser::Error::custom(format!(
+                            "canonical model `{key}` conflicts with a legacy provider family"
+                        )));
+                    }
+                    entries.insert(
+                        key.to_string(),
+                        serde_json::to_value(model).map_err(serde::ser::Error::custom)?,
+                    );
                 }
-                let mut map = serializer.serialize_map(None)?;
-                $(if !self.$field.is_empty() { map.serialize_entry($type_str, &self.$field)?; })+
-                map.end()
+                entries.serialize(serializer)
             }
         }
 
@@ -267,28 +286,40 @@ macro_rules! emit_model_providers_struct {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 let raw = serde_json::Value::deserialize(deserializer)?;
                 let object = raw.as_object().ok_or_else(|| serde::de::Error::custom("providers.models must be a TOML table"))?;
-                // Legacy family maps may contain an unknown family; those
-                // entries must remain parseable so the startup detector can
-                // report the typo instead of turning it into a malformed
-                // canonical model. Canonical rows are identified by their
-                // required capability field, while exact dotted keys remain
-                // untouched once admitted through this branch.
-                let canonical = object.values().any(|value| {
-                    value
+                let mut canonical_models = BTreeMap::new();
+                $(let mut $field: HashMap<String, $cfg_ty> = HashMap::new();)+
+                for (key, value) in object {
+                    if value
                         .as_object()
                         .is_some_and(|entry| entry.contains_key("capability"))
-                });
-                if canonical {
-                    let mut models = BTreeMap::new();
-                    for (key, value) in object {
-                        let model = serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?;
-                        models.insert(ModelRef::from(key.clone()), model);
+                    {
+                        let model = serde_json::from_value(value.clone())
+                            .map_err(serde::de::Error::custom)?;
+                        canonical_models.insert(ModelRef::from(key.clone()), model);
+                        continue;
                     }
-                    return Ok(Self { $($field: HashMap::new(),)+ canonical_models: models });
+                    match key.as_str() {
+                        $(
+                            $type_str => {
+                                $field = serde_json::from_value(value.clone())
+                                    .map_err(serde::de::Error::custom)?;
+                            }
+                        )+
+                        _ if key.contains('.') => {
+                            return Err(serde::de::Error::custom(format!(
+                                "canonical model `{key}` must declare `capability`"
+                            )));
+                        }
+                        _ => {
+                            // Unknown legacy families remain parseable so the
+                            // startup validator can report them instead of
+                            // turning them into malformed canonical models.
+                        }
+                    }
                 }
                 Ok(Self {
-                    $($field: object.get($type_str).cloned().map(serde_json::from_value).transpose().map_err(serde::de::Error::custom)?.unwrap_or_default(),)+
-                    canonical_models: BTreeMap::new(),
+                    $($field,)+
+                    canonical_models,
                 })
             }
         }
@@ -297,7 +328,7 @@ macro_rules! emit_model_providers_struct {
 for_each_model_provider_slot!(emit_model_providers_struct);
 
 impl ModelProviders {
-    /// Exact V5 model lookup. The key is never split on `.`.
+    /// Exact canonical model lookup. The key is never split on `.`.
     pub fn canonical_model(
         &self,
         model_ref: &ModelRef,
@@ -307,6 +338,22 @@ impl ModelProviders {
 
     pub fn has_canonical_models(&self) -> bool {
         !self.canonical_models.is_empty()
+    }
+
+    /// Iterate canonical model references without exposing the backing map.
+    /// Consumers that scope a cloned config must retain exact keys; splitting
+    /// these references on `.` would turn a TOML key into a legacy profile.
+    pub fn canonical_model_refs(&self) -> impl Iterator<Item = &ModelRef> {
+        self.canonical_models.keys()
+    }
+
+    /// Retain canonical models by their exact TOML key.
+    pub fn retain_canonical_models(
+        &mut self,
+        mut keep: impl FnMut(&ModelRef, &ModelDefinition<serde_json::Value>) -> bool,
+    ) {
+        self.canonical_models
+            .retain(|model_ref, model| keep(model_ref, model));
     }
 
     /// Whether the canonical exact-key map contains at least one model for a
@@ -932,6 +979,7 @@ mod tests {
 #[derive(Debug, Clone, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers"]
+#[secret_hook = "crate::providers::canonical_connection_secrets"]
 pub struct Providers {
     /// Model providers — `[providers.models.<type>.<alias>]`.
     #[serde(default)]
@@ -948,7 +996,7 @@ pub struct Providers {
     #[nested]
     pub transcription: TranscriptionProviders,
 
-    /// Canonical V5 connections. They are parsed at the provider root and are
+    /// Canonical connections. They are parsed at the provider root and are
     /// intentionally excluded from the legacy configurable property surface;
     /// edits use the registry boundary instead of synthesizing dotted paths.
     #[serde(skip)]
@@ -957,6 +1005,53 @@ pub struct Providers {
     pub model_presets: std::collections::BTreeMap<super::provider_registry::PresetId, ModelPreset>,
     #[serde(skip)]
     pub fallback: std::collections::BTreeMap<ModelRef, Vec<ModelRef>>,
+}
+
+/// Secret traversal for canonical connection authentication. Connections are
+/// intentionally outside the configurable property surface, but their auth
+/// values still follow the same load/save encryption lifecycle as legacy
+/// provider entries.
+pub(crate) mod canonical_connection_secrets {
+    use super::*;
+
+    pub fn secret_fields(providers: &Providers, fields: &mut Vec<SecretFieldInfo>) {
+        fields.push(SecretFieldInfo {
+            name: "providers.connections",
+            category: "providers",
+            is_set: providers
+                .connections
+                .values()
+                .any(|connection| connection.has_secrets()),
+        });
+    }
+
+    pub fn encrypt_secrets(providers: &mut Providers, store: &SecretStore) -> anyhow::Result<()> {
+        for (provider_id, connection) in &mut providers.connections {
+            connection.encrypt_secrets(store, &format!("providers.connections.{provider_id}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn decrypt_secrets(providers: &mut Providers, store: &SecretStore) -> anyhow::Result<()> {
+        for (provider_id, connection) in &mut providers.connections {
+            connection.decrypt_secrets(store, &format!("providers.connections.{provider_id}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn mask_secrets(providers: &mut Providers) {
+        for connection in providers.connections.values_mut() {
+            connection.mask_secrets();
+        }
+    }
+
+    pub fn restore_secrets_from(providers: &mut Providers, current: &Providers) {
+        for (provider_id, connection) in &mut providers.connections {
+            if let Some(current_connection) = current.connections.get(provider_id) {
+                connection.restore_secrets_from(current_connection);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1286,9 +1381,45 @@ model = "gpt-4o-mini"
             registry
                 .selection(
                     &ModelRef::from("chat.fast.us"),
-                    super::super::provider_registry::Capability::Chat
+                    zeroclaw_api::capability::Capability::Chat
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn canonical_and_legacy_model_rows_round_trip_together() {
+        let providers: Providers = toml::from_str(
+            r#"
+[connections."gateway.prod"]
+kind = "openai-compatible"
+capabilities = ["chat"]
+[connections."gateway.prod".auth]
+mode = "api_key"
+api_key = "test-key"
+
+[models.openai.work]
+model = "gpt-4o"
+
+[models."chat.fast.us"]
+capability = "chat"
+provider = "gateway.prod"
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("mixed provider rows should deserialize");
+
+        assert!(providers.models.find("openai", "work").is_some());
+        assert!(
+            providers
+                .models
+                .canonical_model(&ModelRef::from("chat.fast.us"))
+                .is_some()
+        );
+
+        let encoded = toml::to_string(&providers).expect("mixed provider rows should serialize");
+        assert!(encoded.contains("[models.openai.work]"));
+        assert!(encoded.contains("[models.\"chat.fast.us\"]"));
+        let _: Providers = toml::from_str(&encoded).expect("mixed provider rows should reload");
     }
 }

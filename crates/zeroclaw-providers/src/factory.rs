@@ -404,7 +404,12 @@ fn build_responses_provider_if_requested(
     opts: &ModelProviderRuntimeOptions,
     single_tool_rounds_supported: bool,
 ) -> Option<Box<dyn ModelProvider>> {
-    if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
+    let runtime_wire_api = match opts.wire_api.as_deref() {
+        Some("responses") => Some(zeroclaw_config::schema::WireApi::Responses),
+        Some("chat_completions") => Some(zeroclaw_config::schema::WireApi::ChatCompletions),
+        _ => None,
+    };
+    if runtime_wire_api.or(wire_api) != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
     let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias)
@@ -2188,7 +2193,10 @@ pub fn dispatch_model_ref(
     let provider_kind = resolved.selection.connection.kind();
     let supported = matches!(
         resolved.selection.connection,
-        ProviderConnection::OpenAiCompatible(_)
+        ProviderConnection::OpenAi(_)
+            | ProviderConnection::Anthropic(_)
+            | ProviderConnection::OpenRouter(_)
+            | ProviderConnection::OpenAiCompatible(_)
             | ProviderConnection::Custom(_)
             | ProviderConnection::Ollama(_)
             | ProviderConnection::Groq(_)

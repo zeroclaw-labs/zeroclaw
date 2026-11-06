@@ -58,7 +58,7 @@ pub struct LineChannel {
     /// Base URL for the LINE Content API (audio/file downloads). Overrideable in tests.
     content_api_base_url: String,
     /// Optional transcription manager for voice/audio messages.
-    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager: Option<Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
 }
 
 /// Response from `GET /v2/bot/info`.
@@ -104,7 +104,7 @@ struct LineState {
     /// Fetched icon URL from `/v2/bot/info`, shared with the channel handle.
     sender_icon: Arc<parking_lot::RwLock<Option<String>>>,
     /// Optional transcription manager — `None` when transcription is disabled.
-    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager: Option<Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
 }
 
 async fn send_loading_indicator(
@@ -930,9 +930,12 @@ impl LineChannel {
     /// config and the owning agent's resolved provider; this path can only see
     /// the legacy section, so it binds a lone registered provider and
     /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
+    /// `transcription::build_transcription_manager_from_legacy_config`).
     pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
+        let manager =
+            zeroclaw_providers::transcription::build_transcription_manager_from_legacy_config(
+                &config,
+            );
         self.with_transcription_manager(config, manager)
     }
 
@@ -942,7 +945,7 @@ impl LineChannel {
     pub(crate) fn with_transcription_manager(
         mut self,
         _config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);

@@ -2,9 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{
-    Capability, ModelDefinition, ModelPreset, ModelRef, PresetId, ProviderConnection, ProviderId,
-};
+use super::{ModelDefinition, ModelPreset, ModelRef, PresetId, ProviderConnection, ProviderId};
+use zeroclaw_api::capability::Capability;
 
 /// The only stored provider/model state. All effective plans are materialized
 /// from this registry at the existing admission boundary.

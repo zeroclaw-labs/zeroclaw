@@ -915,7 +915,7 @@ fn resolve_gateway_boot_selection(config: &Config) -> GatewayBootSelection<'_> {
     if config.providers.models.has_canonical_models()
         && let Ok(registry) = config.provider_registry()
         && let Some(model_ref) = registry.models.iter().find_map(|(model_ref, model)| {
-            (model.capability() == zeroclaw_config::provider_registry::Capability::Chat)
+            (model.capability() == zeroclaw_api::capability::Capability::Chat)
                 .then_some((model_ref, model))
         })
     {

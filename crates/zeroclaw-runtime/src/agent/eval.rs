@@ -91,16 +91,39 @@ impl ResolvedEffortRoute<'_> {
         &self,
         config: &zeroclaw_config::schema::Config,
     ) -> HashSet<String> {
-        self.allowed_provider_refs
-            .iter()
-            .filter_map(|reference| {
-                config
-                    .providers
-                    .models
-                    .profile_ref(reference)
-                    .map(|(family, alias)| format!("{family}.{alias}"))
-            })
-            .collect()
+        let mut allowed = HashSet::new();
+        let registry = config.provider_registry().ok();
+        for reference in &self.allowed_provider_refs {
+            let trimmed = reference.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let canonical = zeroclaw_config::provider_registry::ModelRef::from(trimmed);
+            if config
+                .providers
+                .models
+                .canonical_model(&canonical)
+                .is_some()
+            {
+                // Canonical model names are exact TOML keys. Include their
+                // reachable fallback chain under the same exact spelling.
+                allowed.insert(trimmed.to_owned());
+                if let Some(registry) = registry.as_ref()
+                    && let Ok(fallbacks) = registry.fallback_chain(&canonical)
+                {
+                    allowed.extend(fallbacks.into_iter().map(|item| item.to_string()));
+                }
+                continue;
+            }
+
+            // Preserve the raw nested legacy reference for attempt filtering,
+            // and its owning two-segment profile for legacy map scoping.
+            allowed.insert(trimmed.to_owned());
+            if let Some((family, alias)) = config.providers.models.profile_ref(trimmed) {
+                allowed.insert(format!("{family}.{alias}"));
+            }
+        }
+        allowed
     }
 }
 

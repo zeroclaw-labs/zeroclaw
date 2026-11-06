@@ -2,10 +2,14 @@
 
 pub mod a2a_wire;
 pub mod agent;
+pub mod asr;
 pub mod attribution;
+pub mod capability;
 pub mod channel;
 pub mod conversation_binding;
+pub mod decision;
 pub mod elicitation;
+pub mod embedding;
 pub mod grants;
 pub mod hook;
 pub mod ingress;
@@ -28,6 +32,7 @@ pub mod schema;
 pub mod session_keys;
 pub mod tool;
 pub mod tool_carrier;
+pub mod tts;
 pub mod turn_stop;
 pub mod vad;
 pub mod webhook;

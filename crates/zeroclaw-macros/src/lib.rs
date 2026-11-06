@@ -156,7 +156,8 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
         tab,
         group,
         multiline,
-        field_metadata
+        field_metadata,
+        secret_hook
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -179,6 +180,26 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         Ok(None) => quote! {},
         Err(err) => return err.to_compile_error().into(),
     };
+    let secret_hook = match extract_secret_hook(&input.attrs) {
+        Ok(Some(path)) => path,
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error().into(),
+    };
+    let secret_fields_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::secret_fields(self, &mut fields); }
+    });
+    let encrypt_secrets_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::encrypt_secrets(self, store)?; }
+    });
+    let decrypt_secrets_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::decrypt_secrets(self, store)?; }
+    });
+    let mask_secrets_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::mask_secrets(self); }
+    });
+    let restore_secrets_hook = secret_hook.as_ref().map(|path| {
+        quote! { #path::restore_secrets_from(self, current); }
+    });
     let integration_descriptor_method = match build_integration_descriptor_method(&input.attrs) {
         Ok(method) => method,
         Err(err) => return err.to_compile_error().into(),
@@ -2343,6 +2364,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             pub fn secret_fields(&self) -> Vec<crate::config::SecretFieldInfo> {
                 let mut fields = vec![#(#secret_field_entries),*];
                 #(#nested_collect)*
+                #secret_fields_hook
                 fields
             }
 
@@ -2357,6 +2379,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             pub fn encrypt_secrets(&mut self, store: &crate::security::SecretStore) -> anyhow::Result<()> {
                 #(#encrypt_ops)*
                 #(#nested_encrypt)*
+                #encrypt_secrets_hook
                 Ok(())
             }
 
@@ -2364,6 +2387,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             pub fn decrypt_secrets(&mut self, store: &crate::security::SecretStore) -> anyhow::Result<()> {
                 #(#decrypt_ops)*
                 #(#nested_decrypt)*
+                #decrypt_secrets_hook
                 Ok(())
             }
 
@@ -2538,9 +2562,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         impl crate::traits::MaskSecrets for #struct_name {
             fn mask_secrets(&mut self) {
                 #(#mask_ops)*
+                #mask_secrets_hook
             }
             fn restore_secrets_from(&mut self, current: &Self) {
                 #(#restore_ops)*
+                #restore_secrets_hook
             }
         }
     };
@@ -2857,6 +2883,32 @@ fn extract_field_metadata_hook(attrs: &[syn::Attribute]) -> syn::Result<Option<s
             return Err(syn::Error::new_spanned(
                 attr,
                 "expected field_metadata = \"path\"",
+            ));
+        };
+        let syn::Expr::Lit(expr_lit) = &nv.value else {
+            return Err(syn::Error::new_spanned(&nv.value, "expected a path string"));
+        };
+        let Lit::Str(path) = &expr_lit.lit else {
+            return Err(syn::Error::new_spanned(&nv.value, "expected a path string"));
+        };
+        hook = Some(path.parse::<syn::Path>()?);
+    }
+    Ok(hook)
+}
+
+fn extract_secret_hook(attrs: &[syn::Attribute]) -> syn::Result<Option<syn::Path>> {
+    let mut hook = None;
+    for attr in attrs {
+        if !attr.path().is_ident("secret_hook") {
+            continue;
+        }
+        if hook.is_some() {
+            return Err(syn::Error::new_spanned(attr, "duplicate secret_hook"));
+        }
+        let Meta::NameValue(nv) = &attr.meta else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected secret_hook = \"path\"",
             ));
         };
         let syn::Expr::Lit(expr_lit) = &nv.value else {

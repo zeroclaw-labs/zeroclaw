@@ -1,14 +1,17 @@
 //! Closed connection variants; shared access never broadens driver support.
 
-use super::{
-    AsrOptionsPatch, Capability, CapabilitySet, ChatOptionsPatch, PresetId, TtsOptionsPatch, api::*,
-};
+use super::{AsrOptionsPatch, ChatOptionsPatch, PresetId, TtsOptionsPatch, api::*};
 use crate::schema::{
     GlmEndpoint, KiloEndpoint, MinimaxEndpoint, MoonshotEndpoint, QwenEndpoint, StepfunEndpoint,
     ZaiEndpoint,
 };
+use crate::security::SecretStore;
+use crate::traits::{MASKED_SECRET, SecretField};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
+use zeroclaw_api::capability::{Capability, CapabilitySet};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -169,6 +172,7 @@ macro_rules! connection_struct {
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[serde(deny_unknown_fields)]
         pub struct $name {
+            #[serde(default)]
             pub capabilities: CapabilitySet,
             $(#[serde(default)] pub $field: $type,)*
         }
@@ -327,12 +331,51 @@ connection_struct!(SystemOneConnection {
 
 macro_rules! provider_connections {
     ($( $variant:ident($type:ty) = $kind:literal [$($capability:ident),*] ),* $(,)?) => {
-        #[derive(Debug, Clone, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Serialize)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[serde(tag = "kind")]
         pub enum ProviderConnection {
             $(#[serde(rename = $kind)] $variant($type),)*
         }
+
+        // Keep the wire enum separate from the public enum so deserialization
+        // can inject the kind's documented capability defaults only when the
+        // field is omitted. An explicit `capabilities = []` remains an
+        // intentional override and is not mistaken for a missing value.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind")]
+        enum ProviderConnectionWire {
+            $(#[serde(rename = $kind)] $variant($type),)*
+        }
+
+        impl<'de> Deserialize<'de> for ProviderConnection {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let mut value = Value::deserialize(deserializer)?;
+                let object = value.as_object_mut().ok_or_else(|| {
+                    serde::de::Error::custom("provider connection must be a TOML table")
+                })?;
+                if !object.contains_key("capabilities") {
+                    let kind = object
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| serde::de::Error::custom("provider connection kind is missing"))?;
+                    let defaults: CapabilitySet = match kind {
+                        $( $kind => [$(Capability::$capability),*].into_iter().collect(), )*
+                        _ => CapabilitySet::new(),
+                    };
+                    object.insert(
+                        "capabilities".to_owned(),
+                        serde_json::to_value(defaults).map_err(serde::de::Error::custom)?,
+                    );
+                }
+                let wire: ProviderConnectionWire =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                match wire {
+                    $(ProviderConnectionWire::$variant(connection) => Ok(Self::$variant(connection)),)*
+                }
+            }
+        }
+
         impl ProviderConnection {
             pub const fn kind(&self) -> &'static str { match self { $(Self::$variant(_) => $kind,)* } }
             pub fn capabilities(&self) -> &CapabilitySet { match self { $(Self::$variant(c) => &c.capabilities,)* } }
@@ -359,6 +402,150 @@ macro_rules! provider_connections {
 
         }
     };
+}
+
+const CONNECTION_SECRET_KEYS: &[&str] = &["api_key", "refresh_token", "client_secret"];
+
+fn is_connection_secret_key(key: &str) -> bool {
+    CONNECTION_SECRET_KEYS.contains(&key)
+}
+
+fn visit_connection_secrets(
+    value: &mut Value,
+    path: &str,
+    visit: &mut impl FnMut(&mut String, &str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}.{key}");
+                if is_connection_secret_key(key) {
+                    if let Value::String(secret) = child {
+                        visit(secret, &child_path)?;
+                    }
+                } else {
+                    visit_connection_secrets(child, &child_path, visit)?;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter_mut().enumerate() {
+                visit_connection_secrets(child, &format!("{path}[{index}]"), visit)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn mask_connection_secrets(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                if is_connection_secret_key(key) {
+                    if let Value::String(secret) = child {
+                        if !secret.is_empty() {
+                            *secret = MASKED_SECRET.to_owned();
+                        }
+                    }
+                } else {
+                    mask_connection_secrets(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                mask_connection_secrets(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn restore_connection_secrets(value: &mut Value, current: &Value) {
+    match (value, current) {
+        (Value::Object(object), Value::Object(current_object)) => {
+            for (key, child) in object {
+                let Some(current_child) = current_object.get(key) else {
+                    continue;
+                };
+                if is_connection_secret_key(key) {
+                    if let (Value::String(secret), Value::String(current_secret)) =
+                        (child, current_child)
+                        && secret == MASKED_SECRET
+                    {
+                        *secret = current_secret.clone();
+                    }
+                } else {
+                    restore_connection_secrets(child, current_child);
+                }
+            }
+        }
+        (Value::Array(items), Value::Array(current_items)) => {
+            for (child, current_child) in items.iter_mut().zip(current_items) {
+                restore_connection_secrets(child, current_child);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl ProviderConnection {
+    fn with_secret_json(
+        &mut self,
+        mut visit: impl FnMut(&mut String, &str) -> anyhow::Result<()>,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        let mut value = serde_json::to_value(&*self).context("serialize provider connection")?;
+        visit_connection_secrets(&mut value, field, &mut visit)?;
+        *self = serde_json::from_value(value).context("deserialize provider connection")?;
+        Ok(())
+    }
+
+    pub fn encrypt_secrets(&mut self, store: &SecretStore, field: &str) -> anyhow::Result<()> {
+        self.with_secret_json(|secret, path| secret.encrypt_in_place(store, path), field)
+    }
+
+    pub fn decrypt_secrets(&mut self, store: &SecretStore, field: &str) -> anyhow::Result<()> {
+        self.with_secret_json(|secret, path| secret.decrypt_in_place(store, path), field)
+    }
+
+    pub fn mask_secrets(&mut self) {
+        let Ok(mut value) = serde_json::to_value(&*self) else {
+            return;
+        };
+        mask_connection_secrets(&mut value);
+        if let Ok(updated) = serde_json::from_value(value) {
+            *self = updated;
+        }
+    }
+
+    pub fn restore_secrets_from(&mut self, current: &Self) {
+        let (Ok(mut value), Ok(current_value)) =
+            (serde_json::to_value(&*self), serde_json::to_value(current))
+        else {
+            return;
+        };
+        restore_connection_secrets(&mut value, &current_value);
+        if let Ok(updated) = serde_json::from_value(value) {
+            *self = updated;
+        }
+    }
+
+    pub fn has_secrets(&self) -> bool {
+        fn contains(value: &Value) -> bool {
+            match value {
+                Value::Object(object) => object.iter().any(|(key, child)| {
+                    (is_connection_secret_key(key)
+                        && child.as_str().is_some_and(|secret| !secret.is_empty()))
+                        || (!is_connection_secret_key(key) && contains(child))
+                }),
+                Value::Array(items) => items.iter().any(contains),
+                _ => false,
+            }
+        }
+        serde_json::to_value(self).is_ok_and(|value| contains(&value))
+    }
 }
 provider_connections! {
     OpenAi(OpenAiConnection) = "openai" [Chat, Embedding, Tts, Asr],
@@ -1146,5 +1333,67 @@ impl ConnectionSettings for SystemOneConnection {
     }
     fn api_key(&self) -> Option<&str> {
         self.auth.as_ref().and_then(|auth| auth.api_key())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_capabilities_use_kind_defaults_and_explicit_values_win() {
+        let custom: ProviderConnection = toml::from_str(
+            r#"
+kind = "custom"
+uri = "https://gateway.example/v1"
+"#,
+        )
+        .expect("custom connection should use its default capabilities");
+        assert_eq!(
+            custom.capabilities(),
+            &[
+                Capability::Chat,
+                Capability::Embedding,
+                Capability::Tts,
+                Capability::Asr,
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let narrowed: ProviderConnection = toml::from_str(
+            r#"
+kind = "custom"
+capabilities = ["chat"]
+"#,
+        )
+        .expect("explicit capability overrides should be preserved");
+        assert_eq!(
+            narrowed.capabilities(),
+            &[Capability::Chat].into_iter().collect()
+        );
+
+        let openai: ProviderConnection = toml::from_str(r#"kind = "openai""#)
+            .expect("openai connection should use its documented capability defaults");
+        assert_eq!(
+            openai.capabilities(),
+            &[
+                Capability::Chat,
+                Capability::Embedding,
+                Capability::Tts,
+                Capability::Asr,
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let disabled: ProviderConnection = toml::from_str(
+            r#"
+kind = "openai"
+capabilities = []
+"#,
+        )
+        .expect("an explicit empty capability list should be accepted");
+        assert!(disabled.capabilities().is_empty());
     }
 }

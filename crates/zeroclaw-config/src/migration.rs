@@ -627,6 +627,38 @@ const LEGACY_LAYOUT_PATHS: &[&[&str]] = &[
 ///
 /// A V4 file has the V3 shape, so an unversioned V4 file is read as V3 too;
 /// its V3 -> V4 step changes nothing it has not already done.
+/// Return evidence that the file uses the canonical provider registry. This
+/// registry is part of schema V4; it must be recognized as V3-shaped for an
+/// omitted version so the V3→V4 step stamps the file without sending it
+/// through the destructive V1/V2 reshapers.
+fn canonical_registry_evidence(table: &toml::Table) -> Option<String> {
+    let providers = table.get("providers").and_then(toml::Value::as_table)?;
+    for section in ["connections", "model_presets", "fallback"] {
+        if providers
+            .get(section)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            return Some(format!(
+                "`[providers.{section}]` is in the canonical V4 layout"
+            ));
+        }
+    }
+    providers
+        .get("models")
+        .and_then(toml::Value::as_table)
+        .and_then(|models| {
+            models.iter().find_map(|(model_ref, value)| {
+                value
+                    .as_table()
+                    .and_then(|entry| entry.contains_key("capability").then_some(model_ref))
+            })
+        })
+        .map(|model_ref| {
+            format!("`[providers.models.{model_ref}]` declares a canonical V4 capability model")
+        })
+}
+
 fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
     let provider_families = table
         .get("providers")
@@ -665,7 +697,7 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
                 })
         });
 
-    let mut current = None;
+    let mut current = canonical_registry_evidence(table);
     let mut legacy = legacy_layout_evidence(table);
     let mut ambiguous = None;
     for (entry_kind, root, name, section) in provider_families.chain(channel_types) {
@@ -673,6 +705,12 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
             continue;
         };
         if section.is_empty() {
+            continue;
+        }
+        // A canonical model row also sits directly below `providers.models`,
+        // but its `capability` discriminator makes it a model definition, not
+        // a V2 family field or V3 alias map.
+        if section.contains_key("capability") {
             continue;
         }
         let path = format!("{root}.{name}");
@@ -6003,6 +6041,35 @@ mention_only = false
         assert_ne!(
             INFERRED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION,
             "read as the current version, the file would skip the V3 -> V4 step"
+        );
+    }
+
+    #[test]
+    fn an_unversioned_canonical_registry_is_carried_to_v4_without_v1_reshaping() {
+        let raw = r#"
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "https://gateway.example/v1"
+
+[providers.models."chat.fast.prod"]
+capability = "chat"
+provider = "gateway.prod"
+model = "fast-model"
+"#;
+        let value: toml::Value = toml::from_str(raw).unwrap();
+        assert_eq!(detect_version(&value).unwrap(), INFERRED_SCHEMA_VERSION);
+
+        let (migrated, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert_eq!(notices, vec![MigrationNotice::InferredV3]);
+        let migrated: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(migrated["schema_version"].as_integer(), Some(4));
+        assert_eq!(
+            migrated["providers"]["connections"]["gateway.prod"]["uri"].as_str(),
+            Some("https://gateway.example/v1")
+        );
+        assert_eq!(
+            migrated["providers"]["models"]["chat.fast.prod"]["model"].as_str(),
+            Some("fast-model")
         );
     }
 

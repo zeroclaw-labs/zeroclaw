@@ -14,7 +14,7 @@ mod resolve;
 
 pub use api::*;
 pub use connection::*;
-pub use ids::{Capability, CapabilitySet, ModelRef, PresetId, ProviderId};
+pub use ids::{ModelRef, PresetId, ProviderId};
 pub use model::*;
 pub use options::{AsrOptionsPatch, ChatOptionsPatch, ModelPreset, Preset, TtsOptionsPatch};
 pub use override_value::Override;

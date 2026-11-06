@@ -4708,7 +4708,7 @@ impl Config {
                         .models
                         .iter()
                         .filter(|(_, model)| {
-                            model.capability() == crate::provider_registry::Capability::Chat
+                            model.capability() == zeroclaw_api::capability::Capability::Chat
                         })
                         .map(|(model_ref, _)| model_ref.to_string()),
                 );
@@ -4782,7 +4782,7 @@ impl Config {
         if self.providers.models.has_canonical_models()
             && let Ok(registry) = self.provider_registry()
             && let Some(model) = registry.models.values().find(|model| {
-                model.capability() == crate::provider_registry::Capability::Chat
+                model.capability() == zeroclaw_api::capability::Capability::Chat
                     && model
                         .upstream_model()
                         .is_some_and(|value| !value.trim().is_empty())
@@ -5590,14 +5590,14 @@ impl Config {
     ) -> Vec<ConfiguredModelEntry> {
         let filter = provider_override.map(str::trim).filter(|p| !p.is_empty());
         let mut entries = Vec::new();
-        // Canonical V5 models are already complete model references.  List
+        // Canonical models are already complete model references.  List
         // them before the legacy family maps and compare filters against the
         // exact key or its referenced connection; never split a dotted key.
         if self.providers.models.has_canonical_models()
             && let Ok(registry) = self.provider_registry()
         {
             for (model_ref, model) in &registry.models {
-                if model.capability() != crate::provider_registry::Capability::Chat {
+                if model.capability() != zeroclaw_api::capability::Capability::Chat {
                     continue;
                 }
                 let provider_ref = model_ref.to_string();
@@ -16109,6 +16109,13 @@ impl ModelRouteConfig {
         if !explicit.is_empty() {
             return explicit.to_string();
         }
+        // Canonical model references are exact TOML keys. Resolve them before
+        // the legacy family/alias parser, which intentionally treats dots as
+        // profile separators and therefore cannot identify a dotted key.
+        let canonical_ref = crate::provider_registry::ModelRef::from(self.model_provider.trim());
+        if let Some(model) = config.providers.models.canonical_model(&canonical_ref) {
+            return model.upstream_model().unwrap_or_default().to_owned();
+        }
         config
             .resolve_model_selection(&self.model_provider)
             .and_then(|selection| selection.model_id)
@@ -26430,7 +26437,7 @@ impl Config {
                 .models
                 .canonical_model(&crate::provider_registry::ModelRef::from(value))
             {
-                if model.capability() != crate::provider_registry::Capability::Chat {
+                if model.capability() != zeroclaw_api::capability::Capability::Chat {
                     validation_bail!(
                         InvalidFormat,
                         format!("runtime_profiles.{palias}.context_compression.summary_provider"),
@@ -26509,60 +26516,60 @@ impl Config {
                 .models
                 .canonical_model(&crate::provider_registry::ModelRef::from(mp))
             {
-                if model.capability() != crate::provider_registry::Capability::Chat {
+                if model.capability() != zeroclaw_api::capability::Capability::Chat {
                     validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.model_provider"),
                         "agents.{alias}.model_provider = {mp:?} must reference a chat model",
                     );
                 }
-                continue;
-            }
-            match self.providers.models.profile_ref(mp) {
-                Some((ty, inner)) => {
-                    let profile_ref = format!("{ty}.{inner}");
-                    let model_seg = mp
-                        .strip_prefix(&profile_ref)
-                        .and_then(|tail| tail.strip_prefix('.'));
-                    if !crate::providers::ModelProviders::slot_names().contains(&ty) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
-                        );
-                    }
-                    let exists = self
-                        .get_map_keys(&format!("providers.models.{ty}"))
-                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                    if !exists {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
-                        );
-                    }
-                    // Three-segment ref: the named model entry must exist under
-                    // the profile's `models` subtable.
-                    if let Some(model_alias) = model_seg {
-                        let model_exists = self
-                            .providers
-                            .models
-                            .find_model(ty, inner, model_alias)
-                            .is_some();
-                        if !model_exists {
+            } else {
+                match self.providers.models.profile_ref(mp) {
+                    Some((ty, inner)) => {
+                        let profile_ref = format!("{ty}.{inner}");
+                        let model_seg = mp
+                            .strip_prefix(&profile_ref)
+                            .and_then(|tail| tail.strip_prefix('.'));
+                        if !crate::providers::ModelProviders::slot_names().contains(&ty) {
                             validation_bail!(
                                 DanglingReference,
                                 format!("agents.{alias}.model_provider"),
-                                "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                                "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
                             );
                         }
+                        let exists = self
+                            .get_map_keys(&format!("providers.models.{ty}"))
+                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                        if !exists {
+                            validation_bail!(
+                                DanglingReference,
+                                format!("agents.{alias}.model_provider"),
+                                "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
+                            );
+                        }
+                        // Three-segment ref: the named model entry must exist under
+                        // the profile's `models` subtable.
+                        if let Some(model_alias) = model_seg {
+                            let model_exists = self
+                                .providers
+                                .models
+                                .find_model(ty, inner, model_alias)
+                                .is_some();
+                            if !model_exists {
+                                validation_bail!(
+                                    DanglingReference,
+                                    format!("agents.{alias}.model_provider"),
+                                    "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}.models.{model_alias}] is not configured",
+                                );
+                            }
+                        }
                     }
+                    _ => validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.model_provider"),
+                        "agents.{alias}.model_provider must be dotted form `<type>.<alias>` or `<type>.<alias>.<model>` (got {mp:?})",
+                    ),
                 }
-                _ => validation_bail!(
-                    InvalidFormat,
-                    format!("agents.{alias}.model_provider"),
-                    "agents.{alias}.model_provider must be dotted form `<type>.<alias>` or `<type>.<alias>.<model>` (got {mp:?})",
-                ),
             }
 
             // channels: each entry is a dotted `<type>.<inner>` ref into
@@ -26627,16 +26634,16 @@ impl Config {
                 if value.is_empty() {
                     continue;
                 }
-                // V5 capability models are exact registry keys.  A key may
+                // Canonical capability models are exact registry keys.  A key may
                 // contain dots, so resolve it before entering the legacy
                 // family/alias parser.  The consumer field still constrains
                 // the capability; a chat model cannot silently become an
                 // ASR or TTS backend merely because its name exists.
                 let expected_capability = match *field {
-                    "tts_provider" => Some(crate::provider_registry::Capability::Tts),
-                    "transcription_provider" => Some(crate::provider_registry::Capability::Asr),
+                    "tts_provider" => Some(zeroclaw_api::capability::Capability::Tts),
+                    "transcription_provider" => Some(zeroclaw_api::capability::Capability::Asr),
                     "classifier_provider" | "summary_provider" => {
-                        Some(crate::provider_registry::Capability::Chat)
+                        Some(zeroclaw_api::capability::Capability::Chat)
                     }
                     _ => None,
                 };
@@ -51045,7 +51052,7 @@ allowed_users = []
     ///
     /// Mirrors the production boundary of
     /// `local_whisper_config_init_preserves_transcription_section`
-    /// (crates/zeroclaw-channels/src/transcription.rs) but drives a bare
+    /// (crates/zeroclaw-providers/src/transcription.rs) but drives a bare
     /// full init instead of an exact-prefix one.
     #[test]
     async fn config_init_full_produces_strict_roundtrippable_config() {

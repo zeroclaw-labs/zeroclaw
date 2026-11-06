@@ -282,36 +282,40 @@ fn effort_scoped_provider_config(
     allowed_provider_refs: &HashSet<String>,
 ) -> Box<Config> {
     let mut scoped = Box::new(config.clone());
-    for (_, _, profile) in scoped.providers.models.iter_entries_mut() {
-        profile.fallback.retain(|candidate| {
-            config
+    let is_allowed = |reference: &str| {
+        let reference = reference.trim();
+        allowed_provider_refs.contains(reference)
+            || config
                 .providers
                 .models
-                .profile_ref(candidate)
+                .profile_ref(reference)
                 .is_some_and(|(family, alias)| {
                     allowed_provider_refs.contains(&format!("{family}.{alias}"))
                 })
-        });
+    };
+    for (_, _, profile) in scoped.providers.models.iter_entries_mut() {
+        profile.fallback.retain(|candidate| is_allowed(candidate));
     }
     let excluded_profiles: Vec<(String, String)> = scoped
         .providers
         .models
         .iter_entries()
-        .filter(|(family, alias, _)| !allowed_provider_refs.contains(&format!("{family}.{alias}")))
+        .filter(|(family, alias, _)| !is_allowed(&format!("{family}.{alias}")))
         .map(|(family, alias, _)| (family.to_string(), alias.to_string()))
         .collect();
     for (family, alias) in excluded_profiles {
         scoped.providers.models.remove_alias(&family, &alias);
     }
-    scoped.model_routes.retain(|route| {
-        config
-            .providers
-            .models
-            .profile_ref(&route.model_provider)
-            .is_some_and(|(family, alias)| {
-                allowed_provider_refs.contains(&format!("{family}.{alias}"))
-            })
+    scoped
+        .providers
+        .models
+        .retain_canonical_models(|model_ref, _| is_allowed(model_ref.as_str()));
+    scoped.providers.fallback.retain(|source, targets| {
+        is_allowed(source.as_str()) && targets.iter().all(|target| is_allowed(target.as_str()))
     });
+    scoped
+        .model_routes
+        .retain(|route| is_allowed(&route.model_provider));
     scoped
 }
 
@@ -1480,6 +1484,13 @@ fn agent_provider_composite(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> Option<String> {
+    if let Some(model_provider) = config
+        .agent(agent_alias)
+        .map(|agent| agent.model_provider.trim())
+        .filter(|reference| config.is_canonical_model_ref(reference))
+    {
+        return Some(model_provider.to_owned());
+    }
     config
         .resolved_model_provider_for_agent(agent_alias)
         .map(|(ty, alias, _)| format!("{ty}.{alias}"))
@@ -1849,8 +1860,9 @@ async fn run_inner(
             == crate::composition::RegistryConstruction::NativeCompat
             && config.sop.runtime_enabled()
         {
-            let (engine, audit) = crate::sop::build_sop_engine_with_capability(
+            let (engine, audit) = crate::sop::build_sop_engine_with_provider_registry(
                 config.sop.clone(),
+                config,
                 &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
@@ -3960,8 +3972,9 @@ async fn process_message_inner(
             == crate::composition::RegistryConstruction::NativeCompat
             && config.sop.runtime_enabled()
         {
-            let (engine, audit) = crate::sop::build_sop_engine_with_capability(
+            let (engine, audit) = crate::sop::build_sop_engine_with_provider_registry(
                 config.sop.clone(),
+                config,
                 &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),

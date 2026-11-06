@@ -17,7 +17,6 @@ pub mod conflict;
 pub mod consolidation;
 pub mod decay;
 pub mod dedup;
-pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
@@ -55,7 +54,6 @@ pub use backend::{
     memory_backend_profile, selectable_memory_backends,
 };
 #[allow(unused_imports)]
-pub use embeddings::EmbeddingIdentity;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -845,15 +843,15 @@ fn build_memory_with_storage(
 
     fn create_embedder(
         resolved_embedding: Option<&ResolvedEmbeddingConfig>,
-    ) -> Arc<dyn embeddings::EmbeddingProvider> {
+    ) -> Arc<dyn zeroclaw_api::embedding::EmbeddingProvider> {
         match resolved_embedding {
-            Some(resolved) => Arc::from(embeddings::create_embedding_provider(
+            Some(resolved) => Arc::from(zeroclaw_providers::embedding::create_embedding_provider(
                 &resolved.model_provider,
                 resolved.api_key.as_deref(),
                 &resolved.model,
                 resolved.dimensions,
             )),
-            None => Arc::new(embeddings::NoopEmbedding),
+            None => Arc::new(zeroclaw_providers::embedding::NoopEmbedding),
         }
     }
 
@@ -883,7 +881,7 @@ fn build_memory_with_storage(
         {
             reconcile_embedding_identity(
                 &mem,
-                &embeddings::EmbeddingIdentity {
+                &zeroclaw_api::embedding::EmbeddingIdentity {
                     provider: resolved_embedding.model_provider.clone(),
                     model: resolved_embedding.model.clone(),
                     dimensions: resolved_embedding.dimensions,
@@ -1007,7 +1005,7 @@ enum EmbeddingIdentityOutcome {
 
 fn reconcile_embedding_identity(
     mem: &SqliteMemory,
-    current: &embeddings::EmbeddingIdentity,
+    current: &zeroclaw_api::embedding::EmbeddingIdentity,
     auto_reindex: bool,
 ) -> EmbeddingIdentityOutcome {
     let stored = match mem.stored_embedding_identity() {
@@ -1518,7 +1516,7 @@ mod tests {
     struct StaticEmbedding(usize);
 
     #[async_trait::async_trait]
-    impl embeddings::EmbeddingProvider for StaticEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for StaticEmbedding {
         fn name(&self) -> &str {
             "static"
         }
@@ -1544,8 +1542,12 @@ mod tests {
         .unwrap()
     }
 
-    fn ident(provider: &str, model: &str, dimensions: usize) -> embeddings::EmbeddingIdentity {
-        embeddings::EmbeddingIdentity {
+    fn ident(
+        provider: &str,
+        model: &str,
+        dimensions: usize,
+    ) -> zeroclaw_api::embedding::EmbeddingIdentity {
+        zeroclaw_api::embedding::EmbeddingIdentity {
             provider: provider.into(),
             model: model.into(),
             dimensions,
@@ -2855,7 +2857,7 @@ url = "http://localhost:6333"
 
         // End-to-end: the resolved profile builds a real OpenAI-compatible
         // embedder, not the keyword-only Noop fallback.
-        let embedder = embeddings::create_embedding_provider(
+        let embedder = zeroclaw_providers::embedding::create_embedding_provider(
             &resolved.model_provider,
             resolved.api_key.as_deref(),
             &resolved.model,
@@ -2889,7 +2891,7 @@ url = "http://localhost:6333"
         assert_eq!(resolved.api_key.as_deref(), Some("sk-provider"));
         assert_eq!(resolved.dimensions, 1536);
 
-        let embedder = embeddings::create_embedding_provider(
+        let embedder = zeroclaw_providers::embedding::create_embedding_provider(
             &resolved.model_provider,
             resolved.api_key.as_deref(),
             &resolved.model,
@@ -3011,7 +3013,7 @@ url = "http://localhost:6333"
         // Noop); it is left unresolved and logged loudly. The end-to-end
         // embedder is the keyword-only Noop, surfaced rather than hidden.
         assert_eq!(resolved.model_provider, "custom.myembed");
-        let embedder = embeddings::create_embedding_provider(
+        let embedder = zeroclaw_providers::embedding::create_embedding_provider(
             &resolved.model_provider,
             resolved.api_key.as_deref(),
             &resolved.model,
@@ -3048,7 +3050,7 @@ url = "http://localhost:6333"
 
         assert_eq!(resolved.model_provider, "custom:https://embed.local/v1");
         assert_eq!(resolved.api_key.as_deref(), Some("sk-local"));
-        let embedder = embeddings::create_embedding_provider(
+        let embedder = zeroclaw_providers::embedding::create_embedding_provider(
             &resolved.model_provider,
             resolved.api_key.as_deref(),
             &resolved.model,

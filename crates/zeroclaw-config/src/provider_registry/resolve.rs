@@ -3,10 +3,11 @@
 use std::num::NonZeroU64;
 
 use crate::schema::WireApi;
+use zeroclaw_api::capability::Capability;
 
 use super::{
-    AsrModelConfig, Capability, ChatModelConfig, ChatOptionsPatch, ModelDefinition, ModelPreset,
-    ModelRef, Override, Preset, PresetId, ProviderConnection, ProviderRegistry, RegistryError,
+    AsrModelConfig, ChatModelConfig, ChatOptionsPatch, ModelDefinition, ModelPreset, ModelRef,
+    Override, Preset, PresetId, ProviderConnection, ProviderRegistry, RegistryError,
     TtsModelConfig,
 };
 
@@ -347,6 +348,34 @@ impl ProviderRegistry {
             self.selection(target, Capability::Chat)?;
         }
         Ok(targets)
+    }
+
+    /// Return every reachable fallback in declaration order. The source is
+    /// excluded; callers prepend it when constructing the primary attempt.
+    /// Duplicate edges are skipped while the graph's validation still rejects
+    /// duplicate targets and cycles in persisted configuration.
+    pub fn fallback_chain(&self, source: &ModelRef) -> Result<Vec<ModelRef>, RegistryError> {
+        self.fallback_targets(source)?;
+        let mut chain = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending: Vec<ModelRef> = self
+            .fallback
+            .get(source)
+            .into_iter()
+            .flat_map(|targets| targets.iter().rev().cloned())
+            .collect();
+
+        while let Some(candidate) = pending.pop() {
+            if !seen.insert(candidate.clone()) {
+                continue;
+            }
+            self.selection(&candidate, Capability::Chat)?;
+            chain.push(candidate.clone());
+            if let Some(targets) = self.fallback.get(&candidate) {
+                pending.extend(targets.iter().rev().cloned());
+            }
+        }
+        Ok(chain)
     }
 }
 

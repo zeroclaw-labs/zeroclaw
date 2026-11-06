@@ -13,6 +13,16 @@ capability; each model still declares its own capability and upstream model ID.
 Presets and fallback routes are independent registries and use the same exact
 model references.
 
+`capabilities` is optional. When omitted, it defaults to the compiled adapter
+surface for `kind`; an explicit list narrows that surface and `[]` disables it
+for this connection. The defaults are: `openai`, `custom`, and
+`openai-compatible` support chat, embedding, TTS, and ASR; `openrouter`
+supports chat and embedding; `groq` supports chat and ASR; `google` supports
+TTS and ASR; `elevenlabs`, `piper`, and `edge` support TTS; `deepgram`,
+`assemblyai`, and `local_whisper` support ASR; `system-one` supports decision;
+all other registered connection kinds support chat. A model still has to use a
+capability enabled by both the connection and its adapter implementation.
+
 ```toml
 [providers.connections."gateway.prod"]
 kind = "openai-compatible"
