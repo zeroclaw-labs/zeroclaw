@@ -3524,6 +3524,7 @@ async fn run_tool_call_loop_inner<'a>(
             &ctx,
             tools_registry,
             activated_tools,
+            excluded_tools,
             &tool_calls,
             &mut seen_tool_signatures,
             &mut prompt_approval_tool_signatures,

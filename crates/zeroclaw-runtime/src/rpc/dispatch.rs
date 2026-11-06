@@ -22346,6 +22346,165 @@ mod tests {
         dispatcher.ctx.config_authority.publish_for_test(config);
     }
 
+    /// Model that asks for `cron_list` once, then answers in text.
+    #[derive(Default)]
+    struct UnheldToolResponder(std::sync::atomic::AtomicUsize);
+
+    impl wiremock::Respond for UnheldToolResponder {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let first = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let (message, finish_reason) = if first {
+                (
+                    json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "unheld-call",
+                            "type": "function",
+                            "function": {"name": "cron_list", "arguments": "{}"},
+                        }],
+                    }),
+                    "tool_calls",
+                )
+            } else {
+                (
+                    json!({"role": "assistant", "content": "done", "tool_calls": []}),
+                    "stop",
+                )
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-unheld-tool",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "test-model",
+                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }))
+        }
+    }
+
+    /// A non-administrator's supervised session whose model names a tool
+    /// the session doesn't hold is answered `Unknown tool` with no
+    /// `approval_request`: approving it could run nothing. `cron_list` is
+    /// outside this principal's tools, and it is one of the tools a
+    /// non-administrator's session never holds.
+    #[tokio::test]
+    async fn a_supervised_principal_session_is_not_asked_to_approve_a_tool_it_does_not_hold() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+        use zeroclaw_config::schema::WireApi;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(UnheldToolResponder::default())
+            .mount(&server)
+            .await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = principal_test_config(&tmp, &["calculator"], &["*"]);
+        // Approval prompts reach the client through the ask-user channel
+        // handles, which exist only when `ask_user` is selected.
+        config.tools.optional.push("ask_user".into());
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .unwrap();
+        provider.uri = Some(server.uri());
+        provider.wire_api = Some(WireApi::ChatCompletions);
+        assert_eq!(
+            config.risk_profiles["test-profile"].level,
+            zeroclaw_config::autonomy::AutonomyLevel::Supervised
+        );
+        let data_dir = config.data_dir.clone();
+        let (operator, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+        let (mut caller, mut rx) = roster_peer(&operator.ctx, 4242).await;
+        let sid = "unheld-tool";
+        let response = rpc(
+            &mut caller,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": sid, "chat_mode": "acp"}),
+        )
+        .await;
+        assert!(response.get("error").is_none(), "{response}");
+        {
+            let agent = sessions.get_agent(sid).await.unwrap();
+            let agent = agent.lock().await;
+            assert!(
+                !agent.tool_names().contains(&"cron_list"),
+                "the session must not hold cron_list: {:?}",
+                agent.tool_names()
+            );
+            assert!(
+                agent
+                    .channel_handles()
+                    .ask_user
+                    .as_ref()
+                    .is_some_and(|handle| handle.read().contains_key("rpc")),
+                "an approval prompt must be able to reach this client"
+            );
+        }
+
+        let line = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+            "params": {"session_id": sid, "prompt": "list my cron jobs"},
+        })
+        .to_string();
+        // The turn may outlive `process_line`, so read until its reply: an
+        // approval request on the way fails at once instead of waiting for
+        // the prompt's timeout.
+        let mut frames = Vec::new();
+        {
+            let prompt = caller.process_line(&line);
+            tokio::pin!(prompt);
+            let mut handed_off = false;
+            let deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    () = &mut prompt, if !handed_off => handed_off = true,
+                    Some(frame) = rx.recv() => {
+                        let value: Value = serde_json::from_str(&frame).unwrap();
+                        assert_ne!(
+                            value["params"]["type"], "approval_request",
+                            "asked to approve a tool the session does not hold: {value}"
+                        );
+                        let reply = value.get("id") == Some(&json!(2));
+                        frames.push(value);
+                        if reply {
+                            break;
+                        }
+                    }
+                    () = &mut deadline => panic!("the prompt did not answer: {frames:?}"),
+                }
+            }
+        }
+        let reply = frames.last().expect("the loop ends on the reply");
+        assert!(reply.get("error").is_none(), "{reply}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the model is asked again after the answer"
+        );
+        let second: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let tool_message = second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap_or_else(|| panic!("the tool answer is sent back: {second}"));
+        assert!(
+            tool_message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Unknown tool: cron_list")),
+            "{tool_message}"
+        );
+    }
+
     /// A prompt that queued while its principal was still unrestricted must
     /// execute under the ceiling in force when it is ADMITTED, not the one it
     /// was admitted-behind. The principal is seeded unrestricted (so the
