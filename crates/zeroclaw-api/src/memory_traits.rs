@@ -21,7 +21,7 @@ pub struct ExportFilter {
 /// principal permitted only a non-default agent stores and reads under that
 /// agent. `None` for a dimension means the backend's default for it (the
 /// default agent, the default namespace, no tenant), not "any".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalScope {
     /// The durable owner identity (the canonical principal id).
     pub principal_id: String,

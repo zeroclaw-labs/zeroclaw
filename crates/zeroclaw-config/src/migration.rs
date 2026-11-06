@@ -29,6 +29,9 @@ pub enum MigrationNotice {
     InferredV3,
     /// A retired key was removed.
     Removed { path: String, reason: &'static str },
+    /// A key held more than the schema honours, so it was lowered to its
+    /// maximum (see [`CAPPED_KEYS`]). The reason names the maximum.
+    Lowered { path: String, reason: &'static str },
     /// A `ZEROCLAW_*` environment variable names a retired key, so it was
     /// ignored instead of failing startup.
     IgnoredEnvOverride {
@@ -64,6 +67,9 @@ impl MigrationNotice {
                 .to_string(),
             Self::Removed { path, reason } => {
                 format!("removed retired config key `{path}`: {reason}")
+            }
+            Self::Lowered { path, reason } => {
+                format!("lowered config key `{path}` to its maximum: {reason}")
             }
             Self::IgnoredEnvOverride { variable, reason } => {
                 format!("ignored `{variable}`, which sets a retired config key: {reason}")
@@ -280,6 +286,52 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         reason: "identity is set per agent; move it to `[agents.<alias>.identity]`",
         reason_id: "cli-config-retired-reason-identity",
     },
+    // Accepted but never read. The gateway holds one pending pairing code,
+    // and issuing a new one cancels the previous code, so a cap on pending
+    // codes has nothing to limit.
+    RetiredKey {
+        retired_in: 4,
+        path: &["gateway", "pairing_dashboard", "max_pending_codes"],
+        reason: "the gateway keeps one pending pairing code at a time, and issuing a new \
+                 code cancels the previous one",
+        reason_id: "cli-config-retired-reason-pairing-max-pending",
+    },
+];
+
+/// One key whose stored value the schema honours only up to a maximum.
+#[derive(Debug, Clone, Copy)]
+pub struct CappedKey {
+    /// Path from the config root, one segment per table key, as in
+    /// [`RetiredKey::path`] (every accepted spelling is covered).
+    pub path: &'static [&'static str],
+    /// The largest value honoured.
+    pub max: u64,
+    /// Why, naming the maximum, in English: logs and `--json` output carry
+    /// it as is.
+    pub reason: &'static str,
+    /// The Fluent id of [`Self::reason`] in the CLI catalogue
+    /// (`cli-config-capped-reason-*`).
+    pub reason_id: &'static str,
+}
+
+/// Every key lowered to a maximum on load. A stored value above `max` is
+/// lowered to `max` with a [`MigrationNotice::Lowered`], by the migration
+/// chain and again on every load of a current config, the way
+/// [`RETIRED_KEYS`] drops a retired key: a file written before the maximum
+/// existed keeps loading, and its value changes in the open instead of
+/// failing validation. Values at or below `max`, and values that are not
+/// integers, are left for deserialization and validation to judge.
+pub const CAPPED_KEYS: &[CappedKey] = &[
+    // Codes lived ten minutes while the shipped default said 3600, and every
+    // full save wrote that default out, so most files hold 3600 without
+    // anyone having chosen it. Honouring it would stretch every code to an
+    // hour on upgrade.
+    CappedKey {
+        path: &["gateway", "pairing_dashboard", "code_ttl_secs"],
+        max: crate::pairing::PAIRING_CODE_TTL_MAX_SECS,
+        reason: "a pairing code stays redeemable for at most 600 seconds (10 minutes)",
+        reason_id: "cli-config-capped-reason-pairing-code-ttl",
+    },
 ];
 
 /// The retired key a config path lies at or under, matching [`ANY_KEY`]
@@ -305,6 +357,16 @@ pub fn retired_key_covering(path: &[&str]) -> Option<&'static RetiredKey> {
 #[must_use]
 pub fn retirement_reason_id(reason: &str) -> Option<&'static str> {
     RETIRED_KEYS
+        .iter()
+        .find(|key| key.reason == reason)
+        .map(|key| key.reason_id)
+}
+
+/// The Fluent id of a [`CAPPED_KEYS`] reason, as [`retirement_reason_id`]
+/// is for retirements; `None` for any other text.
+#[must_use]
+pub fn capped_reason_id(reason: &str) -> Option<&'static str> {
+    CAPPED_KEYS
         .iter()
         .find(|key| key.reason == reason)
         .map(|key| key.reason_id)
@@ -1305,6 +1367,7 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
         for version in 2..=CURRENT_SCHEMA_VERSION {
             apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut notices);
         }
+        lower_capped_keys(&mut value, &mut notices);
         if notices.is_empty() && !selector_omitted {
             return Ok(None);
         }
@@ -1374,6 +1437,7 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
         let mut notices: Vec<MigrationNotice> =
             unversioned_notice(&value, from).into_iter().collect();
         notices.extend(apply_retired_keys_to_doc(doc.as_table_mut()));
+        notices.extend(lower_capped_keys_in_doc(doc.as_table_mut()));
         if from == CURRENT_SCHEMA_VERSION
             && !selector_omitted
             && !notices.iter().any(MigrationNotice::changes_file)
@@ -2500,6 +2564,12 @@ fn run_chain_until(
             apply_retired_keys(&mut cur, version, RETIRED_KEYS, notices);
         }
     }
+    // Caps belong to the current schema: a chain that stops at a historical
+    // version produces what that version wrote, while every route to the
+    // current one (load, migrate, `config generate`) gets the caps applied.
+    if target == CURRENT_SCHEMA_VERSION {
+        lower_capped_keys(&mut cur, notices);
+    }
     Ok(cur)
 }
 
@@ -2618,6 +2688,73 @@ fn keep_empty_table_rendered(item: &mut toml_edit::Item) {
         toml_edit::Item::Value(toml_edit::Value::InlineTable(table)) => table.set_dotted(false),
         _ => {}
     }
+}
+
+/// Lower every [`CAPPED_KEYS`] value above its maximum in a parsed config,
+/// recording a [`MigrationNotice::Lowered`] for each.
+fn lower_capped_keys(value: &mut toml::Value, notices: &mut Vec<MigrationNotice>) {
+    let Some(root) = value.as_table_mut() else {
+        return;
+    };
+    for key in CAPPED_KEYS {
+        let Ok(max) = i64::try_from(key.max) else {
+            continue;
+        };
+        for pattern in spellings_of(key.path) {
+            for concrete in expand_path(root, &pattern) {
+                let Some((last, parents)) = concrete.split_last() else {
+                    continue;
+                };
+                let Some(table) = parents.iter().try_fold(&mut *root, |table, segment| {
+                    table.get_mut(segment.as_str())?.as_table_mut()
+                }) else {
+                    continue;
+                };
+                let Some(stored) = table.get_mut(last.as_str()) else {
+                    continue;
+                };
+                if stored.as_integer().is_some_and(|stored| stored > max) {
+                    *stored = toml::Value::Integer(max);
+                    notices.push(MigrationNotice::Lowered {
+                        path: concrete.join("."),
+                        reason: key.reason,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// `lower_capped_keys` over an on-disk document, for the paths that edit a
+/// file in place, the way [`apply_retired_keys_to_doc`] retires keys there.
+/// Only the lowered value changes; its comments and every other byte stay.
+/// Returns what changed, for the caller to report once the file is written.
+pub fn lower_capped_keys_in_doc(root: &mut toml_edit::Table) -> Vec<MigrationNotice> {
+    let mut notices = Vec::new();
+    for key in CAPPED_KEYS {
+        let Ok(max) = i64::try_from(key.max) else {
+            continue;
+        };
+        for pattern in spellings_of(key.path) {
+            for concrete in expand_doc_path(root, &pattern) {
+                let Some(stored) = item_at(root, &concrete).and_then(toml_edit::Item::as_value_mut)
+                else {
+                    continue;
+                };
+                if stored.as_integer().is_some_and(|stored| stored > max) {
+                    let decor = stored.decor().clone();
+                    let mut lowered = toml_edit::Value::from(max);
+                    *lowered.decor_mut() = decor;
+                    *stored = lowered;
+                    notices.push(MigrationNotice::Lowered {
+                        path: concrete.join("."),
+                        reason: key.reason,
+                    });
+                }
+            }
+        }
+    }
+    notices
 }
 
 fn stamp_schema_version(mut value: toml::Value, version: u32) -> Result<toml::Value> {
@@ -7506,6 +7643,10 @@ mention_only = false
         ("twitter", "[twitter]\nbearer_token = \"x\"\n"),
         ("reddit", "[reddit]\nclient_id = \"x\"\n"),
         ("channels.notion", "[channels.notion]\ntoken = \"x\"\n"),
+        (
+            "gateway.pairing_dashboard.max_pending_codes",
+            "[gateway.pairing_dashboard]\nmax_pending_codes = 3\n",
+        ),
     ];
 
     /// A key retired at V4, in a file with nothing else to decide by, means
@@ -8675,7 +8816,7 @@ summary_model = "opus"
     const RETIRED_CODE_LENGTH_BODY: &str = "locale = \"en\"\n\n\
          [gateway.pairing_dashboard]\n\
          code_length = 8\n\
-         code_ttl_secs = 3600\n\n\
+         code_ttl_secs = 300\n\n\
          [gateway.pairing_code]\n\
          length = 20\n\
          charset = \"unambiguous\"\n\n\
@@ -8714,8 +8855,173 @@ summary_model = "opus"
                 expected,
                 "V{version} document cleanup"
             );
-            assert!(!out.contains("code_length") && out.contains("code_ttl_secs = 3600"));
+            assert!(!out.contains("code_length") && out.contains("code_ttl_secs = 300"));
         }
+    }
+
+    // ── The pairing-dashboard limits ──
+
+    /// `[gateway.pairing_dashboard]` as every full save of the old defaults
+    /// wrote it: an hour-long lifetime nobody chose, and the unread cap on
+    /// pending codes.
+    const PAIRING_DASHBOARD_BODY: &str = "locale = \"en\"\n\n\
+         [gateway.pairing_dashboard]\n\
+         code_ttl_secs = 3600 # one hour\n\
+         lockout_secs = 300\n\
+         max_failed_attempts = 5\n\
+         max_pending_codes = 3\n\n\
+         [tools]\n\
+         optional = [\"*\"]\n";
+
+    /// The paths of the notices of one kind, sorted.
+    fn notice_paths(notices: &[MigrationNotice], lowered: bool) -> Vec<&str> {
+        let mut paths: Vec<&str> = notices
+            .iter()
+            .filter_map(|notice| match notice {
+                MigrationNotice::Lowered { path, .. } if lowered => Some(path.as_str()),
+                MigrationNotice::Removed { path, .. } if !lowered => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    /// A saved lifetime above ten minutes still loads, lowered to 600 with a
+    /// notice, on every path that reads or rewrites the file, and
+    /// `max_pending_codes` is retired with a notice. `config migrate` rewrites
+    /// a current file too, so a build that already wrote V4 is covered.
+    #[test]
+    fn a_saved_pairing_lifetime_above_the_cap_is_lowered_on_every_path() {
+        let lowered = ["gateway.pairing_dashboard.code_ttl_secs"];
+        let retired = ["gateway.pairing_dashboard.max_pending_codes"];
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw = format!("schema_version = {version}\n{PAIRING_DASHBOARD_BODY}");
+
+            let (migrated, notices) = migrate_file_with_notices(&raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("V{version}: the file must be rewritten"));
+            assert_eq!(notice_paths(&notices, true), lowered, "V{version}");
+            assert_eq!(notice_paths(&notices, false), retired, "V{version}");
+            assert_eq!(
+                migrated,
+                format!(
+                    "schema_version = {CURRENT_SCHEMA_VERSION}\n{}",
+                    PAIRING_DASHBOARD_BODY
+                        .replace("code_ttl_secs = 3600", "code_ttl_secs = 600")
+                        .replace("max_pending_codes = 3\n", "")
+                ),
+                "V{version}: only the lifetime, the retired key and the version change"
+            );
+
+            let load = migrate_to_current_salvaged(&raw);
+            assert_eq!(
+                notice_paths(&load.notices, true),
+                lowered,
+                "V{version} load"
+            );
+            assert_eq!(
+                notice_paths(&load.notices, false),
+                retired,
+                "V{version} load"
+            );
+            assert_eq!(load.config.gateway.pairing_dashboard.code_ttl_secs, 600);
+            load.config
+                .validate()
+                .expect("a legacy lifetime must load as a valid config");
+            assert_eq!(
+                migrate_to_current(&raw)
+                    .unwrap()
+                    .gateway
+                    .pairing_dashboard
+                    .code_ttl_secs,
+                600,
+                "V{version}: the strict load lowers it too"
+            );
+
+            let mut doc: toml_edit::DocumentMut = raw.parse().unwrap();
+            let notices = lower_capped_keys_in_doc(doc.as_table_mut());
+            assert_eq!(notice_paths(&notices, true), lowered, "V{version} document");
+            assert!(doc.to_string().contains("code_ttl_secs = 600 # one hour\n"));
+        }
+    }
+
+    /// The lowering covers every spelling of the table, as retirements do.
+    #[test]
+    fn a_saved_pairing_lifetime_is_lowered_in_every_toml_spelling() {
+        for body in [
+            "gateway.pairing_dashboard.code_ttl_secs = 3600\n",
+            "[gateway]\npairing_dashboard = { code_ttl_secs = 3600 }\n",
+            "[gateway]\npairing_dashboard.code_ttl_secs = 3600\n",
+        ] {
+            let raw = format!(
+                "schema_version = {CURRENT_SCHEMA_VERSION}\n{body}[tools]\noptional = [\"*\"]\n"
+            );
+            let (migrated, notices) = migrate_file_with_notices(&raw)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{body}: the file must be rewritten"));
+            assert_eq!(
+                notice_paths(&notices, true),
+                ["gateway.pairing_dashboard.code_ttl_secs"],
+                "{body}"
+            );
+            assert_eq!(migrated, raw.replace("3600", "600"), "{body}");
+        }
+    }
+
+    /// Older files reach V4 through the structural chain and get the same
+    /// lifetime.
+    #[test]
+    fn an_older_file_reaches_v4_with_the_pairing_lifetime_lowered() {
+        let raw = "schema_version = 2\n\n[gateway.pairing_dashboard]\ncode_ttl_secs = 3600\n\
+                   max_pending_codes = 3\n";
+        let load = migrate_to_current_salvaged(raw);
+        assert_eq!(
+            notice_paths(&load.notices, true),
+            ["gateway.pairing_dashboard.code_ttl_secs"]
+        );
+        assert_eq!(load.config.gateway.pairing_dashboard.code_ttl_secs, 600);
+        let (migrated, _) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert!(
+            migrated.contains("code_ttl_secs = 600") && !migrated.contains("max_pending_codes"),
+            "{migrated}"
+        );
+    }
+
+    /// A lifetime inside the cap, and a file without one, are left alone: no
+    /// notice, and nothing for `config migrate` to rewrite.
+    #[test]
+    fn a_pairing_lifetime_within_the_cap_is_left_alone() {
+        for ttl in [30, 300, 600] {
+            let raw = format!(
+                "schema_version = {CURRENT_SCHEMA_VERSION}\nlocale = \"en\"\n\n\
+                 [gateway.pairing_dashboard]\ncode_ttl_secs = {ttl}\n\n[tools]\noptional = [\"*\"]\n"
+            );
+            assert!(migrate_file_with_notices(&raw).unwrap().is_none(), "{ttl}");
+            let load = migrate_to_current_salvaged(&raw);
+            assert!(load.notices.is_empty(), "{ttl}: {:?}", load.notices);
+            assert_eq!(load.config.gateway.pairing_dashboard.code_ttl_secs, ttl);
+        }
+    }
+
+    /// Each cap's reason names its maximum and has its own Fluent id, so the
+    /// CLI can show it in the operator's locale. The lifetime cap is the
+    /// guard's own maximum.
+    #[test]
+    fn capped_reasons_name_their_maximum_and_have_ids() {
+        for key in CAPPED_KEYS {
+            assert!(
+                key.reason_id.starts_with("cli-config-capped-reason-"),
+                "{key:?}"
+            );
+            assert!(key.reason.contains(&key.max.to_string()), "{key:?}");
+            assert_eq!(capped_reason_id(key.reason), Some(key.reason_id));
+        }
+        assert_eq!(capped_reason_id("not a cap reason"), None);
+        assert_eq!(
+            CAPPED_KEYS[0].max,
+            crate::pairing::PAIRING_CODE_TTL.as_secs()
+        );
     }
 
     /// Every other key the V2 -> V3 step drops, as found in a V3 or V4 file
