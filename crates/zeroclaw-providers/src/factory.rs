@@ -2265,9 +2265,9 @@ pub(crate) fn dispatch_model_ref_with_registry(
         let provider_config = zeroclaw_config::schema::OpenAIModelProviderConfig {
             base: zeroclaw_config::schema::ModelProviderConfig {
                 requires_openai_auth: true,
+                wire_api: Some(zeroclaw_config::schema::WireApi::Responses),
                 ..Default::default()
             },
-            ..Default::default()
         };
         return provider_config.create_provider(
             model_ref.as_str(),
