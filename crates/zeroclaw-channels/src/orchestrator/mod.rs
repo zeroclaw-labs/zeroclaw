@@ -9346,8 +9346,10 @@ fn stamp_session_routing_context(
             // with storage admission held is bounded and cannot deadlock.
             let config = live.read();
             effect(&zeroclaw_infra::session_backend::SessionClaimGrant {
+                // Bare keys too: an adapter without aliases stamps its
+                // sessions with one, and the router resolves it the same way.
                 channels: config
-                    .channel_refs_owned_by_agent(&alias)
+                    .session_channel_keys_owned_by_agent(&alias)
                     .into_iter()
                     .collect(),
                 // A transcript written before ownership stamping existed has
@@ -24069,6 +24071,96 @@ temperature = 0.3
             assert_eq!(metadata.channel_id.as_deref(), case.expected_channel);
             assert_eq!(metadata.room_id.as_deref(), case.expected_room);
             assert_eq!(metadata.sender_id.as_deref(), case.expected_sender);
+        }
+    }
+
+    /// An adapter without aliases (Reddit here) stamps its sessions with the
+    /// bare platform key. Once the agent that wrote one is removed and its
+    /// attribution cleared, the agent the router now sends that platform to
+    /// must be able to claim it, as startup restoration already resolves it.
+    /// Explicit attribution still wins, and an agent that does not serve the
+    /// platform is still refused.
+    #[test]
+    fn a_bare_platform_session_is_claimable_by_the_platforms_owner() {
+        for backend_name in ["sqlite", "jsonl"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+            let mut config = Config::default();
+            config.agents.clear();
+            config.agents.insert(
+                "agent-b".into(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    channels: vec!["reddit.main".into()],
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "agent-c".into(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            config.channels.reddit.insert(
+                "main".into(),
+                zeroclaw_config::schema::RedditConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            let live_config = zeroclaw_config::live::LiveConfig::new(config);
+            let ctx_for = |alias: &str| ChannelRuntimeContext {
+                session_store: Some(Arc::clone(&store)),
+                agent_alias: Arc::new(alias.into()),
+                live_config: live_config.handle(),
+                ..(*router_test_ctx()).clone()
+            };
+            let msg = ChannelMessage {
+                id: "reddit-1".into(),
+                sender: "redditor".into(),
+                reply_target: "t1_thread".into(),
+                content: "follow-up".into(),
+                channel: "reddit".into(),
+                channel_alias: None,
+                ..Default::default()
+            };
+            let key = "reddit_redditor";
+            store
+                .append(key, &ChatMessage::user("earlier reddit turn"))
+                .unwrap();
+            store.set_session_agent_alias(key, "agent-a").unwrap();
+            store
+                .set_session_context(
+                    key,
+                    zeroclaw_infra::session_backend::SessionContext {
+                        channel_id: Some("reddit"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            assert!(
+                !stamp_session_routing_context(&ctx_for("agent-b"), &msg, key),
+                "{backend_name}: explicit attribution wins over the bare key"
+            );
+            // Removing agent A clears its attribution.
+            assert_eq!(store.clear_agent_attribution("agent-a").unwrap(), 1);
+            assert!(
+                !stamp_session_routing_context(&ctx_for("agent-c"), &msg, key),
+                "{backend_name}: an agent that does not serve the platform is refused"
+            );
+            assert_eq!(store.get_session_agent_alias(key).unwrap(), None);
+            assert!(
+                stamp_session_routing_context(&ctx_for("agent-b"), &msg, key),
+                "{backend_name}: the platform's owner claims the bare-key session"
+            );
+            assert_eq!(
+                store.get_session_agent_alias(key).unwrap().as_deref(),
+                Some("agent-b"),
+                "{backend_name}"
+            );
+            assert_eq!(store.load(key).len(), 1, "{backend_name}");
         }
     }
 

@@ -4523,6 +4523,23 @@ impl ActiveAgentChannelBindings {
         refs
     }
 
+    /// Channel keys whose sessions `agent_alias` owns: its active
+    /// `<type>.<alias>` refs, and the bare `<type>` of each platform whose
+    /// active aliases all route to it. An adapter that sends no alias stamps
+    /// its sessions with the bare key, which the router and startup
+    /// restoration resolve through the same map.
+    #[must_use]
+    pub fn session_channel_keys_owned_by_agent(&self, agent_alias: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .owner_by_channel_key
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == agent_alias)
+            .map(|(channel_key, _)| channel_key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// Resolve one active channel key to its canonical owner.
     #[must_use]
     pub fn owner_for(&self, channel_ref: &str) -> Option<&str> {
@@ -5266,6 +5283,15 @@ impl Config {
     pub fn channel_refs_owned_by_agent(&self, agent_alias: &str) -> Vec<String> {
         self.active_agent_channel_bindings()
             .refs_owned_by_agent(agent_alias)
+    }
+
+    /// Channel keys whose sessions `agent_alias` may claim, bare platform
+    /// keys included; see
+    /// [`ActiveAgentChannelBindings::session_channel_keys_owned_by_agent`].
+    #[must_use]
+    pub fn session_channel_keys_owned_by_agent(&self, agent_alias: &str) -> Vec<String> {
+        self.active_agent_channel_bindings()
+            .session_channel_keys_owned_by_agent(agent_alias)
     }
 
     /// Whether `agent_alias` is the only enabled agent in this config.
