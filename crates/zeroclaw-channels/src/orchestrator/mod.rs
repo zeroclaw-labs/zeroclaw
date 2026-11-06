@@ -10545,6 +10545,7 @@ async fn process_channel_message_body(
                     // it binds capabilities once it moves onto the contract.
                     capabilities: None,
                     live_config: Some(ctx.live_config.clone()),
+                    memory_owner: ctx.memory.principal_scope(),
                 }),
             }));
             // Scope this turn's routing handle so concurrent same-agent turns,
@@ -23958,7 +23959,7 @@ temperature = 0.3
         tokio::fs::write(
             &config_path,
             r#"
-schema_version = 3
+schema_version = 4
 
 [agents.agent_a]
 model_provider = "openrouter.hot"

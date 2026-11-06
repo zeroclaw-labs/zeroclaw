@@ -134,6 +134,7 @@ export function parseOidcSession(value: unknown): OidcSession | null {
     features: {
       chat: flags.chat === true,
       operator_pages: flags.operator_pages === true,
+      config: flags.config === true,
     },
   };
 }
