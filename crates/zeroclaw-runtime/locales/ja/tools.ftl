@@ -13,6 +13,7 @@ tool-channel-room-param-encryption = create_room 中にルーム暗号化を要�
 tool-channel-room-param-room-id = invite_user 用の既存のルームID。
 tool-channel-room-param-user-id = invite_user で招待するユーザーID。
 tool-channel-room-error-security = アクションがブロックされました: { $err }
+tool-channel-room-error-approval-required = このチャネルは、各呼び出しをオペレーターが承認しない限りルームの作成やユーザーの招待を行いません。エージェントのリスクプロファイルの always_ask に "channel_room" を追加してください。
 tool-channel-room-error-invalid-action = 無効なアクション '{ $action }': 'create_room' または 'invite_user' である必要があります。
 tool-channel-room-error-not-initialized = 利用可能なチャンネルがまだありません(チャンネルが初期化されていません)。
 tool-channel-room-error-channel-not-found = チャンネル '{ $channel }' が見つかりません。利用可能なチャンネル: { $available }

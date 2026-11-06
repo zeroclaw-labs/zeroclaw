@@ -151,6 +151,14 @@ impl Tool for ChannelRoomTool {
             }
         };
 
+        if let Err(error) = Self::enforce_channel_approval(channel.as_ref(), &self.security) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
         match action {
             ChannelRoomAction::CreateRoom => create_room(&args, channel_name, channel).await,
             ChannelRoomAction::InviteUser => invite_user(&args, channel_name, channel).await,
@@ -159,6 +167,31 @@ impl Tool for ChannelRoomTool {
 }
 
 impl ChannelRoomTool {
+    /// A channel may refuse room management that nobody has to approve.
+    /// Creating a group and adding people to it is visible to third parties
+    /// and cannot be undone from here, so the operator has to have put this
+    /// tool behind an approval prompt (`always_ask`), which survives even Full
+    /// autonomy. Refusing here, rather than at the channel, keeps the reason
+    /// in the tool result the caller reads.
+    fn enforce_channel_approval(
+        channel: &dyn Channel,
+        security: &SecurityPolicy,
+    ) -> Result<(), String> {
+        if !channel.room_management_requires_approval() {
+            return Ok(());
+        }
+        // `always_ask = ["*"]` is a valid policy that already prompts for every
+        // tool at the runtime gate, so it satisfies this too.
+        if security
+            .always_ask
+            .iter()
+            .any(|tool| matches!(tool.trim(), "channel_room" | "*"))
+        {
+            return Ok(());
+        }
+        Err(tool_msg("tool-channel-room-error-approval-required"))
+    }
+
     fn lookup_channel(&self, channel_name: &str) -> Result<Arc<dyn Channel>, String> {
         let map = self.channels.read();
         if map.is_empty() {
@@ -341,6 +374,7 @@ mod tests {
         last_options: Mutex<Option<RoomCreationOptions>>,
         last_invite: Mutex<Option<(String, String)>>,
         fail_create: bool,
+        requires_approval: bool,
     }
 
     impl MockChannel {
@@ -351,6 +385,16 @@ mod tests {
                 last_options: Mutex::new(None),
                 last_invite: Mutex::new(None),
                 fail_create: false,
+                requires_approval: false,
+            }
+        }
+
+        /// A channel like WhatsApp Web, which will not create rooms that
+        /// nobody has to approve.
+        fn demanding_approval() -> Self {
+            Self {
+                requires_approval: true,
+                ..Self::new()
             }
         }
 
@@ -377,6 +421,10 @@ mod tests {
     impl Channel for MockChannel {
         fn name(&self) -> &str {
             "matrix"
+        }
+
+        fn room_management_requires_approval(&self) -> bool {
+            self.requires_approval
         }
 
         async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
@@ -415,6 +463,109 @@ mod tests {
             }
         }
         ChannelRoomTool::new(Arc::new(SecurityPolicy::default()), handle)
+    }
+
+    fn tool_with_policy(security: SecurityPolicy, channel: Arc<MockChannel>) -> ChannelRoomTool {
+        let handle = Arc::new(RwLock::new(HashMap::new()));
+        handle
+            .write()
+            .insert("matrix".to_string(), channel as Arc<dyn Channel>);
+        ChannelRoomTool::new(Arc::new(security), handle)
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_demands_approval_refuses_an_unguarded_risk_profile() {
+        let channel = Arc::new(MockChannel::demanding_approval());
+        let tool = tool_with_policy(SecurityPolicy::default(), channel.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "create_room",
+                "channel": "matrix",
+                "name": "ops",
+            }))
+            .await
+            .expect("tool runs");
+
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("always_ask")),
+            "the error must say what the operator has to change: {result:?}"
+        );
+        assert_eq!(
+            channel.created.load(Ordering::SeqCst),
+            0,
+            "nothing may be created while the call is unguarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_channel_proceeds_once_the_call_is_behind_approval() {
+        let channel = Arc::new(MockChannel::demanding_approval());
+        let tool = tool_with_policy(
+            SecurityPolicy {
+                always_ask: vec!["channel_room".to_string()],
+                ..SecurityPolicy::default()
+            },
+            channel.clone(),
+        );
+
+        let result = tool
+            .execute(json!({
+                "action": "create_room",
+                "channel": "matrix",
+                "name": "ops",
+            }))
+            .await
+            .expect("tool runs");
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(channel.created.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_always_ask_satisfies_the_gate() {
+        let channel = Arc::new(MockChannel::demanding_approval());
+        let tool = tool_with_policy(
+            SecurityPolicy {
+                always_ask: vec!["*".to_string()],
+                ..SecurityPolicy::default()
+            },
+            channel.clone(),
+        );
+
+        let result = tool
+            .execute(json!({
+                "action": "create_room",
+                "channel": "matrix",
+                "name": "ops",
+            }))
+            .await
+            .expect("tool runs");
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(channel.created.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_does_not_demand_approval_is_unaffected() {
+        let channel = Arc::new(MockChannel::new());
+        let tool = tool_with_policy(SecurityPolicy::default(), channel.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "create_room",
+                "channel": "matrix",
+                "name": "ops",
+            }))
+            .await
+            .expect("tool runs");
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(channel.created.load(Ordering::SeqCst), 1);
     }
 
     #[test]
