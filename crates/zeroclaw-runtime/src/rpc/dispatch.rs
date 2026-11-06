@@ -1908,6 +1908,14 @@ impl RpcHistoryAuthority {
     }
 }
 impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryAuthority {
+    fn session_agent_scope(&self) -> Option<&str> {
+        Some(
+            self.target_agent
+                .as_deref()
+                .unwrap_or(&self.admission.agent_alias),
+        )
+    }
+
     fn authorize_reasoning(
         &self,
         actor: &zeroclaw_api::session_events::EventActor,
@@ -31146,7 +31154,7 @@ mod tests {
             execute_session_tool_as(&dispatcher, current, "sessions_list", json!({})).await;
         assert!(listed.success);
         assert!(listed.output.contains(current));
-        assert!(!listed.output.contains(previous));
+        assert!(listed.output.contains(previous));
         assert!(!listed.output.contains(foreign));
 
         let history = execute_session_tool_as(
@@ -31158,6 +31166,16 @@ mod tests {
         .await;
         assert!(history.success, "{:?}", history.error);
         assert!(history.output.contains("current RPC answer"));
+
+        let previous_history = execute_session_tool_as(
+            &dispatcher,
+            current,
+            "sessions_history",
+            json!({"session_id": previous}),
+        )
+        .await;
+        assert!(previous_history.success);
+        assert!(previous_history.output.contains("durable prior RPC answer"));
 
         let foreign_history = execute_session_tool_as(
             &dispatcher,
@@ -31203,7 +31221,7 @@ mod tests {
             execute_session_tool_as(&dispatcher, current, "sessions_list", json!({})).await;
         assert!(rehydrated_list.success);
         assert!(rehydrated_list.output.contains(current));
-        assert!(!rehydrated_list.output.contains(previous));
+        assert!(rehydrated_list.output.contains(previous));
         assert!(!rehydrated_list.output.contains(foreign));
         let rehydrated_history = execute_session_tool_as(
             &dispatcher,
@@ -31231,8 +31249,8 @@ mod tests {
         let chat_list =
             execute_session_tool_as(&dispatcher, chat_id, "sessions_list", json!({})).await;
         assert!(chat_list.success);
-        assert!(!chat_list.output.contains(current));
-        assert!(!chat_list.output.contains(previous));
+        assert!(chat_list.output.contains(current));
+        assert!(chat_list.output.contains(previous));
         assert!(!chat_list.output.contains(foreign));
     }
 

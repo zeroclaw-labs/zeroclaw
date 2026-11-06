@@ -18,6 +18,11 @@ pub enum SessionAccess {
 /// Implementations resolve current policy on every call. Holding this resolver
 /// never holds a historical permission snapshot or a bearer credential.
 pub trait SessionAccessPolicy: Send + Sync {
+    /// Optional owning-agent filter for an execution-bound history reader.
+    /// This narrows discovery; it never replaces authorization checks.
+    fn session_agent_scope(&self) -> Option<&str> {
+        None
+    }
     /// Reading ordinary history does not disclose model reasoning or opaque
     /// continuation bytes. Hosts opt in using their current trusted authority.
     fn authorize_reasoning(

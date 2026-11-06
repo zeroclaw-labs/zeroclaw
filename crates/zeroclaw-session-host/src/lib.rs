@@ -303,7 +303,11 @@ impl EngineSessionSource for NativeSessionHub {
                 .ok_or_else(|| anyhow::Error::msg("native session storage is unavailable"))?;
             let mut visible = Vec::new();
             for (_, summary) in catalog.query().indexed_summaries()? {
-                if summary.closed {
+                if summary.closed
+                    || policy
+                        .session_agent_scope()
+                        .is_some_and(|alias| summary.owning_agent.as_deref() != Some(alias))
+                {
                     continue;
                 }
                 match policy.authorize_actor(&actor, &summary.head.session_id, SessionAccess::Read)
@@ -472,7 +476,13 @@ impl EngineSessionSource for NativeSessionHub {
         let Some(owner) = self.read_owner(directory, session_id).await? else {
             return Ok(None);
         };
-        let query = owner.query(principal, policy);
+        let query = owner.query(principal, policy.clone());
+        if let Some(alias) = policy.session_agent_scope() {
+            let summary = query.summary(stream.clone()).await?;
+            if summary.owning_agent.as_deref() != Some(alias) {
+                return Ok(None);
+            }
+        }
         Ok(Some(zeroclaw_kernel::session::engine::SessionReadHandle {
             stream,
             query,
