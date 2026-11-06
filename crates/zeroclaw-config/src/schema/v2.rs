@@ -71,6 +71,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "discord",
     "slack",
     "mattermost",
+    "zulip",
     "webhook",
     "imessage",
     "matrix",

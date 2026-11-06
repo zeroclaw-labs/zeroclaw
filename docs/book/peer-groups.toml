@@ -32,6 +32,11 @@ sender_desc = "the Mattermost user UUID (not a username)"
 sender_example = "9c8f...userUUID"
 
 [[channel]]
+key = "zulip"
+sender_desc = "the numeric Zulip user ID (not an email)"
+sender_example = "10"
+
+[[channel]]
 key = "line"
 sender_desc = "the LINE user ID"
 sender_example = "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"

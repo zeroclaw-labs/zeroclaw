@@ -77,6 +77,8 @@ pub use crate::wecom_ws::WeComWsChannel;
 use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
+#[cfg(feature = "channel-zulip")]
+pub use crate::zulip::ZulipChannel;
 pub use zeroclaw_api::channel::{
     Channel, ChannelMessage, DraftProgress, DraftProgressKind, ListenerHealth, SendMessage,
 };
@@ -13376,6 +13378,39 @@ fn build_channel_by_id(
         "mattermost" => {
             anyhow::bail!("Mattermost channel requires the `channel-mattermost` feature");
         }
+        #[cfg(feature = "channel-zulip")]
+        "zulip" => {
+            let zc = config
+                .channels
+                .zulip
+                .get("default")
+                .context("Zulip channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("zulip", &alias))
+            };
+            Ok(Arc::new(
+                ZulipChannel::new(
+                    zc.site.clone(),
+                    zc.email.clone(),
+                    zc.api_key.clone(),
+                    alias,
+                    peer_resolver,
+                    zc.mention_only.unwrap_or(false),
+                )
+                .with_stream_ids(&zc.stream_ids)?
+                .with_proxy_url(zc.proxy_url.clone())
+                .with_dm_enabled(zc.dm_enabled.unwrap_or(true))
+                .with_tls_ca_cert_path(zc.tls_ca_cert_path.as_deref())?
+                .with_approval_timeout_secs(zc.approval_timeout_secs),
+            ))
+        }
+        #[cfg(not(feature = "channel-zulip"))]
+        "zulip" => {
+            anyhow::bail!("Zulip channel requires the `channel-zulip` feature");
+        }
         #[cfg(feature = "channel-signal")]
         "signal" => {
             let sg = config
@@ -15019,6 +15054,66 @@ fn collect_configured_channels_with_authority(
                 mm,
             ),
         });
+    }
+
+    #[cfg(feature = "channel-zulip")]
+    for (alias, zc) in &config.channels.zulip {
+        if !active_channel_aliases.contains(&format!("zulip.{alias}")) {
+            continue;
+        }
+        if !zc.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("zulip", &alias))
+        };
+        let built = ZulipChannel::new(
+            zc.site.clone(),
+            zc.email.clone(),
+            zc.api_key.clone(),
+            alias.clone(),
+            peer_resolver,
+            zc.mention_only.unwrap_or(false),
+        )
+        .with_stream_ids(&zc.stream_ids)
+        .map(|c| {
+            c.with_proxy_url(zc.proxy_url.clone())
+                .with_dm_enabled(zc.dm_enabled.unwrap_or(true))
+        })
+        .and_then(|c| c.with_tls_ca_cert_path(zc.tls_ca_cert_path.as_deref()));
+        let channel = match built {
+            Ok(channel) => channel.with_approval_timeout_secs(zc.approval_timeout_secs),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"alias": alias, "error": format!("{error:#}")})
+                        ),
+                    "Zulip channel skipped: "
+                );
+                continue;
+            }
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "Zulip",
+            alias: Some(alias.clone()),
+            channel: crate::paced_channel::PacedChannel::wrap(Arc::new(channel), zc),
+        });
+    }
+
+    #[cfg(not(feature = "channel-zulip"))]
+    if !config.channels.zulip.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Zulip channel is configured but this build was compiled without \
+             `channel-zulip`; skipping Zulip."
+        );
     }
 
     #[cfg(not(feature = "channel-mattermost"))]
