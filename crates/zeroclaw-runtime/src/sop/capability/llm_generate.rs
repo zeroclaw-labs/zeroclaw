@@ -266,11 +266,13 @@ impl ProviderLlmAdapter {
                 // capability boundary so an adapter implementation that
                 // returns raw text cannot turn a reasoning-only completion
                 // into visible SOP output or bypass the empty check.
-                Ok(if config.model_text_extraction(&identity.model_id).reasoning {
-                    zeroclaw_api::model_provider::strip_think_tags(&text)
-                } else {
-                    text
-                })
+                Ok(
+                    if config.model_text_extraction(&identity.model_id).reasoning {
+                        zeroclaw_api::model_provider::strip_think_tags(&text)
+                    } else {
+                        text
+                    },
+                )
             },
             GENERATE_TIMEOUT,
             "model call",
