@@ -5152,10 +5152,12 @@ impl Config {
         }
     }
 
-    /// One warning per agent whose explicit `delegates` roster can never fire
-    /// because the resolved risk profile forbids delegation, or because a
-    /// closed `allowed_tools` list omits `delegate`. The configuration is
-    /// coherent but inert — operators only discover it at first call today.
+    /// One warning per agent whose explicit `delegates` roster can never fire:
+    /// the resolved risk profile forbids delegation, or its tool policy
+    /// blocks `delegate` (a closed `allowed_tools` list without it,
+    /// `deny_all_tools = true`, or `excluded_tools` naming it). The
+    /// configuration is coherent but inert, and operators otherwise only
+    /// discover that at the first delegation attempt.
     fn collect_dead_delegate_grant_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
@@ -5170,27 +5172,40 @@ impl Config {
             let profile_alias = agent.risk_profile.trim();
             let grant_count = agent.delegates.len();
             let policy_blocks = !profile.delegation_policy.permits();
-            let tools_block = !profile.allowed_tools.is_empty()
-                && !profile.allowed_tools.iter().any(|name| name == "delegate");
+            // `effective_allowed_tools()` folds in `deny_all_tools` and the
+            // legacy deny-all sentinel: `Some([])` denies every tool, `None`
+            // is unrestricted.
+            let allowlist_blocks = profile
+                .effective_allowed_tools()
+                .is_some_and(|allowed| !allowed.iter().any(|name| name == "delegate"));
+            let excluded = profile.excluded_tools.iter().any(|name| name == "delegate");
+            let tools_block = allowlist_blocks || excluded;
             if !policy_blocks && !tools_block {
                 continue;
             }
+            let tool_reason = if profile.deny_all_tools {
+                "sets deny_all_tools"
+            } else if excluded {
+                "lists `delegate` in excluded_tools"
+            } else {
+                "has an allowed_tools list that omits `delegate`"
+            };
             let reason = match (policy_blocks, tools_block) {
                 (true, true) => format!(
-                    "risk profile `{profile_alias}` has delegation_policy.mode that does not                      permit delegation and its non-empty allowed_tools omits `delegate`"
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation and {tool_reason}"
                 ),
                 (true, false) => format!(
-                    "risk profile `{profile_alias}` delegation_policy.mode does not permit                      delegation"
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation"
                 ),
-                (false, true) => format!(
-                    "risk profile `{profile_alias}` has a non-empty allowed_tools list that                      omits `delegate`"
-                ),
-                (false, false) => unreachable!(),
+                (false, _) => format!("risk profile `{profile_alias}` {tool_reason}"),
             };
             warnings.push(crate::validation_warnings::ValidationWarning::new(
                 crate::validation_warnings::DEAD_DELEGATE_GRANTS,
                 format!(
-                    "agents.{alias} has {grant_count} delegate grant(s) but {reason}, so the                      grants are unreachable at runtime"
+                    "agents.{alias} has {grant_count} delegate grant(s) but {reason}, so the \
+                     grants are unreachable at runtime"
                 ),
                 format!("agents.{alias}.delegates"),
             ));
@@ -42610,9 +42625,6 @@ group_policy = "disabled"
         assert!(config.security.audit.enabled);
     }
 
-    // Disabling the section silently stops the certificate trail:
-    // `AuditLogger::log` returns `Ok(())` without writing, so the caller sees
-    // a success it did not get. The warning is the only place that says so.
     #[test]
     async fn collect_warnings_flags_dead_delegate_grants_under_forbidden_policy() {
         let mut config: Config = toml::from_str(
@@ -42686,11 +42698,93 @@ model = "gpt-4o-mini"
         suppress_semantic_memory_warning(&mut config);
 
         assert!(
-            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS,)
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
                 .is_empty()
         );
     }
 
+    fn dead_grant_fixture(profile_body: &str) -> Config {
+        let mut config: Config = toml::from_str(&format!(
+            r#"
+[risk_profiles.worker_project]
+{profile_body}
+[risk_profiles.worker_project.delegation_policy]
+mode = "allow"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#
+        ))
+        .expect("dead-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+        config
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_under_deny_all_tools() {
+        let config = dead_grant_fixture("deny_all_tools = true");
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("deny_all_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_delegate_excluded() {
+        let config = dead_grant_fixture(r#"excluded_tools = ["delegate"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("excluded_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_allowlist_omits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("allowed_tools") && !warnings[0].message.contains("  "),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_when_allowlist_admits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell", "delegate"]"#);
+        assert!(
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
+                .is_empty()
+        );
+    }
+
+    // Disabling the section silently stops the certificate trail:
+    // `AuditLogger::log` returns `Ok(())` without writing, so the caller sees
+    // a success it did not get. The warning is the only place that says so.
     #[test]
     async fn collect_warnings_flags_disabled_audit_dropping_certificate_record() {
         let mut config: Config = toml::from_str(
