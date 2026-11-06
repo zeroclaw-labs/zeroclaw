@@ -9926,6 +9926,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eof_after_done_with_incomplete_utf8_is_still_truncated() {
+        let body: &'static [u8] = b"data: [DONE]\xe2\x82";
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::OK)
+                .body(reqwest::Body::from(body))
+                .expect("test response should build"),
+        );
+        let events: Vec<_> = sse_bytes_to_events(response, false).collect().await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Final))),
+            "incomplete UTF-8 must not emit Final: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Err(StreamError::Http(message))) if message.contains("truncated")),
+            "expected truncation error: {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn eof_with_partial_terminal_data_is_still_truncated() {
         for body in [
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DON",
