@@ -50,6 +50,7 @@ enum SlashCommandId {
     LoadSession,
     Model,
     ModelProvider,
+    ReloadContext,
     RestartSession,
     ToggleThinking,
 }
@@ -103,6 +104,11 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
     LocalCommandDescriptor {
         id: SlashCommandId::ModelProvider,
         name: "model-provider",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::ReloadContext,
+        name: "reload-context",
         aliases: &[],
     },
     LocalCommandDescriptor {
@@ -196,6 +202,7 @@ impl SlashCommandRegistry {
             // non-command instead of silently ignoring the text the user typed.
             (SlashCommandId::ChangeDirectory, Some(_)) => SlashCommand::NotACommand,
             (SlashCommandId::RestartSession, None) => SlashCommand::RestartSession,
+            (SlashCommandId::ReloadContext, None) => SlashCommand::ReloadContext,
             (SlashCommandId::ToggleThinking, None) => SlashCommand::ToggleThinking,
             (SlashCommandId::Browse, None) => SlashCommand::EnterBrowseMode,
             (SlashCommandId::Help, None) => SlashCommand::OpenHelp,
@@ -248,6 +255,11 @@ pub(crate) enum InputBarAction {
     /// User typed `/restart-session`, `/new-session`, or `/new` — parent should close
     /// the current session and open a fresh one for the same agent/workspace.
     RestartSession,
+    /// User typed `/reload-context` — parent asks the daemon to re-read the
+    /// agent's personality files (`AGENTS.md`, `SOUL.md`, ...) for this
+    /// session. Sessions otherwise keep the text from their first turn so an
+    /// edit doesn't invalidate the prompt cache.
+    ReloadContext,
     /// User typed `/change-directory` — parent should open a directory picker
     /// and start a new session in the selected directory. Takes no argument:
     /// the root is always chosen interactively.
@@ -304,6 +316,8 @@ enum SlashCommand<'a> {
     /// `/model-provider` (no arg) — open the two-stage model_provider picker.
     ModelProviderPicker,
     RestartSession,
+    /// `/reload-context` — re-read the agent's personality files.
+    ReloadContext,
     /// `/change-directory` — open the directory picker for a new session.
     ChangeDirectory,
     EnterBrowseMode,
@@ -2030,6 +2044,7 @@ impl InputBarState {
                 }
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
+                SlashCommand::ReloadContext => InputBarAction::ReloadContext,
                 SlashCommand::ChangeDirectory => InputBarAction::ChangeDirectory,
                 SlashCommand::LoadSession(query) => InputBarAction::LoadSession(query.to_string()),
                 SlashCommand::LoadSessionPicker => InputBarAction::OpenSessionPicker,
@@ -3853,6 +3868,14 @@ mod tests {
             SlashCommand::RestartSession
         ));
         assert!(matches!(
+            parse_slash_command("/reload-context"),
+            SlashCommand::ReloadContext
+        ));
+        assert!(matches!(
+            parse_slash_command("/reload-context now"),
+            SlashCommand::NotACommand
+        ));
+        assert!(matches!(
             parse_slash_command("/new-session"),
             SlashCommand::RestartSession
         ));
@@ -3930,6 +3953,7 @@ mod tests {
             "/model-provider",
             "/new",
             "/new-session",
+            "/reload-context",
             "/restart-session",
             "/toggle-thinking",
         ];

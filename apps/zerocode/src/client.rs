@@ -119,6 +119,7 @@ pub mod method {
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_STATE: &str = "session/state";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
+    pub const SESSION_RELOAD_CONTEXT: &str = "session/reload_context";
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_CLOSE: &str = "session/close";
     pub const SESSION_KILL: &str = "session/kill";
@@ -2896,6 +2897,17 @@ impl RpcClient {
         .await
     }
 
+    pub async fn session_reload_context(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionReloadContextResult> {
+        self.call(
+            method::SESSION_RELOAD_CONTEXT,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
     pub async fn session_git_branch(&self, session_id: &str) -> Result<SessionGitBranchResult> {
         self.call(
             method::SESSION_GIT_BRANCH,
@@ -4502,6 +4514,15 @@ pub struct SessionOverrides {
 pub struct SessionConfigureResult {
     #[serde(default)]
     pub overrides: SessionOverrides,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionReloadContextResult {
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default)]
+    pub changed: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -15,6 +15,23 @@ Throughout this walkthrough the existing single agent is called `primary` (subst
 
 Add another agent through the gateway dashboard, zerocode, or `zeroclaw config set`. The runtime creates `<install>/agents/<alias>/workspace/` on first agent-loop entry. On every start the agent loop injects the workspace identity files that exist into the system prompt: `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md`, `USER.md`, then `BOOTSTRAP.md` (first run only) and `MEMORY.md` (main session only). `HEARTBEAT.md` is also a workspace personality file but it is read by the heartbeat engine, not injected into the prompt. The dashboard's personality editor exposes `SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`, `TOOLS.md`, `HEARTBEAT.md`, and `MEMORY.md` for editing. Create and edit those files to give the agent its persona. (`BOOTSTRAP.md` is a first-run scaffold the agent reads once and removes; the editor does not expose it.)
 
+In ZeroCode's native Code sessions, personality text stays fixed after the first
+prompt build that loads personality files or a valid AIEOS identity. Edits and
+deletions, including removal of `BOOTSTRAP.md` after the first-run ritual, take
+effect after `/reload-context` or in a new live agent. After the ritual finishes,
+run `/reload-context` while no turn is running to remove the bootstrap
+instructions from the current prompt. This explicit reload preserves the
+provider's cache prefix until you choose to change it. A changed prompt may
+reduce cache reuse on the next request.
+
+A failed personality-file read or a reload that loses all previously captured
+personality files reports an error and keeps the previous context. An initial
+build with neither personality files nor a valid AIEOS identity does not cache
+that empty result, so the next build tries again. The snapshot lives only in the
+`Agent` instance and is not saved with session history. Resuming a session in a
+fresh agent, such as after a daemon restart, reads the files again. The CLI loop
+and channel prompt paths keep their existing file-loading behavior.
+
 {{#config-where agents}}
 
 ## Bind a channel
