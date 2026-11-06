@@ -9125,7 +9125,8 @@ mod tests {
     /// `A`, so the decoder reads `ANMF` there, with a size whose low byte is
     /// `0` and whose second byte is 0x21. The scan, one byte later, reads an
     /// unknown chunk `NMF0` of size 0x21 and steps over the whole hidden frame,
-    /// so it never sees the `VP8 ` chunk declaring 16383x16383 inside it. A
+    /// so it never sees the `VP8 ` chunk declaring 64x64 inside it (a size the
+    /// header could inflate to 16383x16383 at no cost to the file). A
     /// genuine `ANMF` after it keeps the frame count at two.
     fn animation_hiding_a_frame_behind_an_odd_anmf() -> Vec<u8> {
         let mut frame_one = vec![0u8; 16];
@@ -9146,10 +9147,12 @@ mod tests {
         body.extend_from_slice(b"NMF");
         body.extend_from_slice(&[0x30, 0x21, 0, 0]);
         // Frame two: a 16-byte frame header for a 16x16 rectangle, then a `VP8 `
-        // chunk declaring 16383x16383. Its first byte also closes the size the
-        // scan reads for `NMF0`, so it must be zero.
+        // chunk declaring 64x64, which differs from the 16x16 rectangle. A larger
+        // size would make the decode in the test reserve the planes the gate
+        // exists to avoid (384 MiB at 16383x16383). Its first byte also closes
+        // the size the scan reads for `NMF0`, so it must be zero.
         body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 15, 0, 0, 15, 0, 0, 0, 0, 0, 0]);
-        append_webp_chunk(&mut body, b"VP8 ", &vp8_header_payload(16383, 16383));
+        append_webp_chunk(&mut body, b"VP8 ", &vp8_header_payload(64, 64));
         // The pad byte the scan steps over after `NMF0`.
         body.push(0);
         // A genuine `ANMF` so the scan counts two frames. The scan rejects an
