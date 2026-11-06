@@ -42,6 +42,8 @@ use crate::theme;
 use crate::turn_status::TurnStatus;
 
 mod context_menu;
+#[cfg(all(test, not(windows)))]
+use context_menu::PATH_CONTEXT_ACTIONS;
 #[cfg(test)]
 use context_menu::{
     CHARACTER_SELECTION_CONTEXT_ACTIONS, QUEUE_CONTEXT_ACTIONS, TRANSCRIPT_CONTEXT_ACTIONS,
@@ -525,6 +527,14 @@ pub(crate) struct Chat {
     git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
     /// In-flight git_branch refresh; gates repeat fetches until result arrives.
     git_branch_inflight: bool,
+    /// Last `path_open::path_links_generation` seen; a change means a path's
+    /// link status resolved in the background and the transcript must restyle.
+    path_links_generation: u64,
+    /// Outcomes of path opens/reveals. Their filesystem checks run off the
+    /// event loop (a slow mount must not freeze input), so any notice they
+    /// raise comes back here for the session that asked.
+    path_open_tx: mpsc::Sender<PathOpenNotice>,
+    path_open_rx: mpsc::Receiver<PathOpenNotice>,
     /// Background model-catalog fetch result, routed back so the Loading
     /// picker can swap to the populated list without blocking the draw loop.
     model_fetch_tx: mpsc::Sender<ModelFetchResult>,
@@ -897,6 +907,7 @@ impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
+        let (path_open_tx, path_open_rx) = mpsc::channel(4);
         let (session_reattach_tx, session_reattach_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         let (session_resync_tx, session_resync_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
@@ -909,6 +920,9 @@ impl Chat {
             git_branch_tx,
             git_branch_rx,
             git_branch_inflight: false,
+            path_links_generation: crate::path_open::path_links_generation(),
+            path_open_tx,
+            path_open_rx,
             model_fetch_tx,
             model_fetch_rx,
             session_reattach_tx,
@@ -3446,6 +3460,19 @@ impl Chat {
     }
 
     async fn execute_context_menu_request(&mut self, request: ChatContextMenuRequest) {
+        if self.rpc.transport() != crate::client::Transport::Local
+            && match &request {
+                ChatContextMenuRequest::OpenUrl(target)
+                | ChatContextMenuRequest::CopyUrl(target) => {
+                    crate::path_open::is_path_target(target)
+                }
+                ChatContextMenuRequest::RevealPath(_)
+                | ChatContextMenuRequest::AddPathToChat(_) => true,
+                _ => false,
+            }
+        {
+            return;
+        }
         match request {
             ChatContextMenuRequest::AddToChat(target) => {
                 let ChatPhase::Active(ref mut state) = self.phase else {
@@ -3478,14 +3505,36 @@ impl Chat {
                 }
             }
             ChatContextMenuRequest::OpenUrl(url) => {
-                let result = crate::url_open::open(&url).await;
+                let session_id = self.active_session_id_for_notice();
+                let notice = open_link_target(
+                    &url,
+                    self.rpc.transport() == crate::client::Transport::Local,
+                    &session_id,
+                    &self.path_open_tx,
+                )
+                .await;
                 if let ChatPhase::Active(ref mut state) = self.phase
-                    && let Err(error) = result
+                    && let Some(notice) = notice
                 {
-                    state.set_info_notice(crate::i18n::t_args(
-                        "zc-chat-open-link-failed",
-                        &[("error", &error.to_string())],
-                    ));
+                    state.set_info_notice(notice);
+                }
+            }
+            ChatContextMenuRequest::RevealPath(path) => {
+                let session_id = self.active_session_id_for_notice();
+                spawn_path_action(
+                    PathAction::Reveal,
+                    path,
+                    session_id,
+                    self.path_open_tx.clone(),
+                );
+            }
+            ChatContextMenuRequest::AddPathToChat(path) => {
+                let ChatPhase::Active(ref mut state) = self.phase else {
+                    return;
+                };
+                let span = crate::path_open::markdown_code_span(&path);
+                if state.input_bar.append_text_at_end(&span) {
+                    state.mark_dirty_full();
                 }
             }
             ChatContextMenuRequest::CopyUrl(url) => {
@@ -3539,7 +3588,12 @@ impl Chat {
                         state.delete_queued_by_id(id);
                     }
                 }
-                ChatContextMenuAction::OpenLink | ChatContextMenuAction::CopyLink => {}
+                ChatContextMenuAction::OpenLink
+                | ChatContextMenuAction::CopyLink
+                | ChatContextMenuAction::OpenPath
+                | ChatContextMenuAction::RevealPath
+                | ChatContextMenuAction::CopyPath
+                | ChatContextMenuAction::AddPathToChat => {}
             },
         }
     }
@@ -3856,6 +3910,42 @@ impl Chat {
         self.drain_session_reattach_results();
         self.answer_withdrawn_elicitations();
         self.maybe_refresh_git_branch();
+        self.refresh_resolved_path_links();
+        self.drain_path_open_notices();
+    }
+
+    fn refresh_resolved_path_links(&mut self) {
+        let generation = crate::path_open::path_links_generation();
+        if generation == self.path_links_generation {
+            return;
+        }
+        self.path_links_generation = generation;
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            // Only link styling and hit regions change; the text does not,
+            // so a selection, open menu or half-finished click survives.
+            state.mark_path_links_restyle();
+        }
+        // Mark parked sessions too: a path check finishing while another
+        // session is active leaves them with stale cached lines, and
+        // switching back restores that cache without marking dirty.
+        for state in &mut self.background {
+            state.mark_path_links_restyle();
+        }
+    }
+
+    fn drain_path_open_notices(&mut self) {
+        while let Ok(result) = self.path_open_rx.try_recv() {
+            if let Some(state) = self.state_for_session_mut(&result.session_id) {
+                state.set_info_notice(result.notice);
+            }
+        }
+    }
+
+    fn active_session_id_for_notice(&self) -> String {
+        match &self.phase {
+            ChatPhase::Active(state) => state.session_id.clone(),
+            _ => String::new(),
+        }
     }
 
     /// Send the `cancel` every withdrawn elicitation still owes the daemon,
@@ -3903,6 +3993,7 @@ impl Chat {
             || !self.prompt_completion_rx.is_empty()
             || !self.session_resync_rx.is_empty()
             || !self.session_reattach_rx.is_empty()
+            || !self.path_open_rx.is_empty()
     }
 
     #[cfg(test)]
@@ -3993,7 +4084,14 @@ impl Chat {
                 explorer.render(frame, area);
             }
             ChatPhase::Active(state) => {
-                render_with_plan_placement(frame, state, area, self.pane_kind, plan_placement);
+                render_with_plan_placement(
+                    frame,
+                    state,
+                    area,
+                    self.pane_kind,
+                    plan_placement,
+                    self.rpc.transport() == crate::client::Transport::Local,
+                );
             }
             ChatPhase::Error(msg) => {
                 draw_error(frame, area, msg, &self.pane_kind.name());
@@ -5668,12 +5766,16 @@ impl Chat {
             if state.in_browse_mode() {
                 match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
                     UrlPointerAction::Open(url) => {
-                        match crate::url_open::open(&url).await {
-                            Ok(()) => {}
-                            Err(error) => state.set_info_notice(crate::i18n::t_args(
-                                "zc-chat-open-link-failed",
-                                &[("error", &error.to_string())],
-                            )),
+                        let session_id = state.session_id.clone();
+                        if let Some(notice) = open_link_target(
+                            &url,
+                            self.rpc.transport() == crate::client::Transport::Local,
+                            &session_id,
+                            &self.path_open_tx,
+                        )
+                        .await
+                        {
+                            state.set_info_notice(notice);
                         }
                         return;
                     }
@@ -5752,12 +5854,16 @@ impl Chat {
                     MouseEventKind::Up(MouseButton::Left) => {
                         match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
                             UrlPointerAction::Open(url) => {
-                                match crate::url_open::open(&url).await {
-                                    Ok(()) => {}
-                                    Err(error) => state.set_info_notice(crate::i18n::t_args(
-                                        "zc-chat-open-link-failed",
-                                        &[("error", &error.to_string())],
-                                    )),
+                                let session_id = state.session_id.clone();
+                                if let Some(notice) = open_link_target(
+                                    &url,
+                                    self.rpc.transport() == crate::client::Transport::Local,
+                                    &session_id,
+                                    &self.path_open_tx,
+                                )
+                                .await
+                                {
+                                    state.set_info_notice(notice);
                                 }
                             }
                             UrlPointerAction::Consumed => {}
@@ -6517,7 +6623,7 @@ enum PlanPlacement {
 
 #[cfg(test)]
 fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind) {
-    render_with_plan_placement(f, state, area, pane_kind, PlanPlacement::Legacy);
+    render_with_plan_placement(f, state, area, pane_kind, PlanPlacement::Legacy, false);
 }
 
 fn render_with_plan_placement(
@@ -6526,6 +6632,7 @@ fn render_with_plan_placement(
     area: Rect,
     pane_kind: PaneKind,
     plan_placement: PlanPlacement,
+    path_links: bool,
 ) {
     // The shell owns the dock split in production. Keep the old in-pane carve
     // only for narrow widget tests that exercise the tracker in isolation.
@@ -6635,7 +6742,7 @@ fn render_with_plan_placement(
         conv_area
     };
 
-    render_conversation(f, state, actual_conv);
+    render_conversation_with_path_links(f, state, actual_conv, path_links);
     #[cfg(test)]
     if matches!(plan_placement, PlanPlacement::Legacy) {
         render_context_menu(f, state);
@@ -7741,6 +7848,13 @@ fn context_menu_action_label(
         ChatContextMenuAction::AddToChat => "zc-chat-context-menu-add-to-chat",
         ChatContextMenuAction::OpenLink => "zc-chat-context-menu-open-link",
         ChatContextMenuAction::CopyLink => "zc-chat-context-menu-copy-link",
+        ChatContextMenuAction::OpenPath => "zc-chat-context-menu-open-path",
+        ChatContextMenuAction::RevealPath if cfg!(target_os = "macos") => {
+            "zc-chat-context-menu-reveal-path-finder"
+        }
+        ChatContextMenuAction::RevealPath => "zc-chat-context-menu-reveal-path",
+        ChatContextMenuAction::CopyPath => "zc-chat-context-menu-copy-path",
+        ChatContextMenuAction::AddPathToChat => "zc-chat-context-menu-add-path-to-chat",
         ChatContextMenuAction::Edit => "zc-chat-context-menu-edit",
         ChatContextMenuAction::Delete => "zc-chat-context-menu-delete",
     };
@@ -7836,7 +7950,16 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
+#[cfg(test)]
 fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLineRegion> {
+    url_line_regions_with_path_links(lines, width, true)
+}
+
+fn url_line_regions_with_path_links(
+    lines: &[Line<'static>],
+    width: u16,
+    path_links: bool,
+) -> Vec<UrlLineRegion> {
     use ratatui::style::Color;
 
     if width == 0 {
@@ -7846,7 +7969,7 @@ fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLin
     let mut screen_row = 0u16;
     for line in lines {
         let rows = wrapped_rows(line, width);
-        let (text, urls) = actionable_url_ranges(line);
+        let (text, urls) = actionable_url_ranges(line, path_links);
         if !urls.is_empty() {
             // Private color tags carry occurrence identity through Paragraph's
             // actual wrapping and alignment; these colors are never displayed.
@@ -7877,8 +8000,13 @@ fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLin
     regions
 }
 
-fn finalize_url_line_regions(lines: &mut [Line<'static>], width: u16) -> Vec<UrlLineRegion> {
-    let regions = url_line_regions_for_lines(lines, width);
+fn finalize_url_line_regions(
+    lines: &mut [Line<'static>],
+    width: u16,
+    path_links: bool,
+) -> Vec<UrlLineRegion> {
+    style_recognized_links(lines, path_links);
+    let regions = url_line_regions_with_path_links(lines, width, path_links);
     for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
         if disables_url_actions(span) {
             span.style.underline_color = None;
@@ -8191,10 +8319,20 @@ type ConversationRenderResult = ConversationRenderWork;
 #[cfg(not(test))]
 type ConversationRenderResult = ();
 
+#[cfg(test)]
 fn render_conversation(
     f: &mut Frame,
     state: &mut ChatState,
     area: Rect,
+) -> ConversationRenderResult {
+    render_conversation_with_path_links(f, state, area, false)
+}
+
+fn render_conversation_with_path_links(
+    f: &mut Frame,
+    state: &mut ChatState,
+    area: Rect,
+    path_links: bool,
 ) -> ConversationRenderResult {
     state.refresh_title_hit_rects(area);
     state.expire_copy_feedback();
@@ -8204,13 +8342,23 @@ fn render_conversation(
     let inner_width = area.width.saturating_sub(2);
 
     // ── Rebuild cached lines only when entries changed ────────
+    let width_changed = state.transcript_layout.view().cached_render_width != inner_width;
+    let path_links_changed = state.transcript_layout.view().cached_path_links != path_links;
     if state.transcript_layout.view().dirty != LinesDirty::Clean
-        || state.transcript_layout.view().cached_render_width != inner_width
+        || width_changed
+        || path_links_changed
     {
         // Selection endpoints belong to one stable rendered-content geometry.
-        // Viewport movement preserves them, but a cache rebuild does not.
-        state.clear_transcript_selection_for_render_change();
-        state.rebuild_lines(inner_width);
+        // Viewport movement preserves them, but a cache rebuild does not. A
+        // link restyle keeps text and geometry, so it keeps them too; the
+        // snapshot comparison below still clears them if the text moved.
+        let restyle_only = state.transcript_layout.view().dirty == LinesDirty::Restyle
+            && !width_changed
+            && !path_links_changed;
+        if !restyle_only {
+            state.clear_transcript_selection_for_render_change();
+        }
+        state.rebuild_lines_with_path_links(inner_width, path_links);
     }
 
     // Determine transient overlays (live streaming / approval) up front from
@@ -8273,7 +8421,7 @@ fn render_conversation(
         Vec::new()
     };
     let transient_url_regions = if transient {
-        let mut regions = finalize_url_line_regions(&mut overlay_lines, inner_width);
+        let mut regions = finalize_url_line_regions(&mut overlay_lines, inner_width, path_links);
         offset_url_line_regions(
             &mut regions,
             state.transcript_layout.view().cached_total_rows,
@@ -9378,9 +9526,97 @@ fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
     ranges
 }
 
+/// A path open/reveal outcome to show on the session that asked for it.
+#[derive(Debug)]
+struct PathOpenNotice {
+    session_id: String,
+    notice: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathAction {
+    Open,
+    Reveal,
+}
+
+/// Run a path open/reveal in the background. Its canonicalize, metadata and
+/// bundle checks can block on a slow or disconnected mount, so the event
+/// loop never waits on them; a notice, if any, comes back on `notices`.
+fn spawn_path_action(
+    action: PathAction,
+    path: String,
+    session_id: String,
+    notices: mpsc::Sender<PathOpenNotice>,
+) {
+    tokio::spawn(async move {
+        let failed = |error: anyhow::Error| {
+            crate::i18n::t_args("zc-chat-open-path-failed", &[("error", &error.to_string())])
+        };
+        let notice = match action {
+            PathAction::Open => match crate::path_open::open(&path).await {
+                Ok(crate::path_open::OpenOutcome::Opened) => None,
+                Ok(crate::path_open::OpenOutcome::Revealed) => {
+                    Some(crate::i18n::t("zc-chat-path-revealed-instead"))
+                }
+                Err(error) => Some(failed(error)),
+            },
+            PathAction::Reveal => crate::path_open::reveal(&path).await.err().map(failed),
+        };
+        if let Some(notice) = notice {
+            let _ = notices.send(PathOpenNotice { session_id, notice }).await;
+        }
+    });
+}
+
+/// Open a transcript link target and return the notice to show, if any.
+/// Paths that could run code when opened are revealed instead. Paths are
+/// handled in the background (see [`spawn_path_action`]), so their notice
+/// arrives later on `path_notices` rather than in the return value.
+async fn open_link_target(
+    target: &str,
+    path_links: bool,
+    session_id: &str,
+    path_notices: &mpsc::Sender<PathOpenNotice>,
+) -> Option<String> {
+    if crate::path_open::is_path_target(target) {
+        if path_links {
+            spawn_path_action(
+                PathAction::Open,
+                target.to_string(),
+                session_id.to_string(),
+                path_notices.clone(),
+            );
+        }
+        None
+    } else {
+        crate::url_open::open(target).await.err().map(|error| {
+            crate::i18n::t_args("zc-chat-open-link-failed", &[("error", &error.to_string())])
+        })
+    }
+}
+
+/// HTTP(S) URLs plus existing local file paths, ordered by start. Both kinds
+/// share one hit map; path targets are absolute and start with `/`, URL
+/// targets carry their scheme, so consumers can tell them apart.
+fn recognized_link_ranges(text: &str, path_links: bool) -> Vec<(usize, usize, String)> {
+    let mut ranges = recognized_url_ranges(text);
+    if path_links && text.contains('/') {
+        let paths = crate::path_open::recognized_path_ranges(text, &ranges);
+        if !paths.is_empty() {
+            ranges.extend(paths);
+            ranges.sort_by_key(|(start, _, _)| *start);
+        }
+    }
+    ranges
+}
+
 fn style_recognized_urls(lines: &mut [Line<'static>]) {
+    style_recognized_links(lines, false);
+}
+
+fn style_recognized_links(lines: &mut [Line<'static>], path_links: bool) {
     for line in lines {
-        let (_, ranges) = actionable_url_ranges(line);
+        let (_, ranges) = actionable_url_ranges(line, path_links);
         if ranges.is_empty() {
             continue;
         }
@@ -9436,7 +9672,10 @@ fn disabled_url_actions_style() -> Style {
     }
 }
 
-fn actionable_url_ranges(line: &Line<'static>) -> (String, Vec<(usize, usize, String)>) {
+fn actionable_url_ranges(
+    line: &Line<'static>,
+    path_links: bool,
+) -> (String, Vec<(usize, usize, String)>) {
     let text = line
         .spans
         .iter()
@@ -9451,7 +9690,7 @@ fn actionable_url_ranges(line: &Line<'static>) -> (String, Vec<(usize, usize, St
         }
         offset = end;
     }
-    let urls = recognized_url_ranges(&text)
+    let urls = recognized_link_ranges(&text, path_links)
         .into_iter()
         .filter(|(start, end, _)| {
             !disabled_ranges
@@ -10004,6 +10243,7 @@ struct UrlLineRegion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UrlHitRegion {
     rect: Rect,
+    /// An HTTP(S) URL, or an absolute local path (see `path_open`).
     url: String,
     occurrence: UrlOccurrenceId,
 }
@@ -10384,6 +10624,13 @@ impl ChatState {
     fn mark_dirty_full(&mut self) {
         self.invalidate_url_interactions();
         self.transcript_layout.invalidate_full();
+    }
+
+    /// A background path check changed which transcript paths are links.
+    /// Rebuild the cached lines for the new styling and hit regions, but keep
+    /// the selection, menu and pending click: the rendered text is unchanged.
+    fn mark_path_links_restyle(&mut self) {
+        self.transcript_layout.invalidate_restyle();
     }
 
     fn clear_transcript_selection(&mut self) {
@@ -11123,7 +11370,14 @@ impl ChatState {
     }
 
     fn rebuild_lines(&mut self, width: u16) {
-        if self.transcript_layout.view().cached_render_width != width {
+        // Geometry-only callers have no transport context and must not probe files.
+        self.rebuild_lines_with_path_links(width, false);
+    }
+
+    fn rebuild_lines_with_path_links(&mut self, width: u16, path_links: bool) {
+        if self.transcript_layout.view().cached_render_width != width
+            || self.transcript_layout.view().cached_path_links != path_links
+        {
             self.pending_url_activation = None;
         }
         let range = self.transcript_layout.render_range(
@@ -11164,8 +11418,13 @@ impl ChatState {
                         disclosure,
                     }
                 });
-        self.transcript_layout
-            .rebuild(width, range.clone(), self.show_thoughts, inputs);
+        self.transcript_layout.rebuild(
+            width,
+            range.clone(),
+            self.show_thoughts,
+            path_links,
+            inputs,
+        );
     }
 
     /// Resolve the ordered cached-entry indices whose screen rows overlap the
@@ -13382,6 +13641,308 @@ mod tests {
                 assert_eq!(incremental, full);
             }
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn wrapped_path_with_space_is_one_link_on_every_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let folder = dir.path().join("Work SSD").join("worktree");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        let file = folder.join("pr-11622-01-transcript-times.png");
+        std::fs::write(&file, b"png").expect("write");
+        let path = file.to_str().expect("utf8 path").to_string();
+
+        let lines = vec![Line::from(format!("Image: {path}. It's committed."))];
+        let width = 24;
+        // Existence is checked off the draw path; the first render schedules it.
+        let _ = url_line_regions_for_lines(&lines, width);
+        crate::path_open::wait_for_path_checks();
+        let regions = url_line_regions_for_lines(&lines, width);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].urls.len(), 1);
+        assert_eq!(regions[0].urls[0].2, path, "the full path, space included");
+
+        let rows = wrapped_rows(&lines[0], width);
+        let body = Rect::new(0, 0, width, rows);
+        let hits = project_url_hit_regions(&regions, 0, body);
+        let hit_rows: std::collections::BTreeSet<u16> = hits.iter().map(|hit| hit.rect.y).collect();
+        assert!(
+            hit_rows.len() >= 3,
+            "path wraps over several rows: {hits:?}"
+        );
+        assert!(hits.iter().all(|hit| hit.url == path));
+        let occurrence = hits[0].occurrence;
+        assert!(hits.iter().all(|hit| hit.occurrence == occurrence));
+
+        let mut state = state();
+        state.url_hit_regions = hits.clone();
+        let last = hits.last().expect("hit");
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Down(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                last.rect.x,
+                last.rect.y,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Up(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                last.rect.x,
+                last.rect.y,
+            ),
+            UrlPointerAction::Open(path.clone()),
+            "a click on the continuation row opens the whole path"
+        );
+
+        let target = ChatContextMenuTarget::Url(last.clone());
+        assert_eq!(target.actions(), PATH_CONTEXT_ACTIONS);
+        for (step, expected) in [
+            (0, ChatContextMenuRequest::OpenUrl(path.clone())),
+            (1, ChatContextMenuRequest::RevealPath(path.clone())),
+            (2, ChatContextMenuRequest::CopyUrl(path.clone())),
+            (3, ChatContextMenuRequest::AddPathToChat(path.clone())),
+        ] {
+            let menu = ChatContextMenu {
+                rect: Rect::new(0, 0, 30, 6),
+                target: target.clone(),
+                selected: step,
+            };
+            assert_eq!(menu.into_request(), Some(expected));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn remote_transcripts_keep_local_paths_plain_and_urls_actionable() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("remote-document.md");
+        std::fs::write(&file, "document").unwrap();
+        let path = file.to_str().unwrap().to_string();
+        let url = "https://example.com/docs";
+        let text = format!("{path} {url}");
+        // Warm the shared existence cache as a preceding local pane could.
+        let lines = vec![Line::from(text.clone())];
+        let _ = url_line_regions_for_lines(&lines, 100);
+        crate::path_open::wait_for_path_checks();
+
+        for transport in [
+            crate::client::Transport::Local,
+            crate::client::Transport::Wss,
+        ] {
+            let (mut chat, _rx) = test_chat_with_transport(transport);
+            let mut active = state();
+            active.push_user_message(Some(text.clone()), Vec::new());
+            active.streaming_text = text.clone();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    chat.draw(frame, area);
+                })
+                .unwrap();
+            let ChatPhase::Active(active) = &chat.phase else {
+                panic!("active");
+            };
+            assert!(active.url_hit_regions.iter().any(|hit| hit.url == url));
+            assert_eq!(
+                active.url_hit_regions.iter().any(|hit| hit.url == path),
+                transport == crate::client::Transport::Local,
+                "path actions must follow the pane's live transport",
+            );
+            assert!(
+                active
+                    .transcript_layout
+                    .view()
+                    .cached_url_regions
+                    .iter()
+                    .flat_map(|region| &region.urls)
+                    .all(
+                        |(_, _, target)| transport == crate::client::Transport::Local
+                            || target == url
+                    )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_context_menu_rejects_local_path_actions() {
+        let (mut chat, _rx) = test_chat_with_transport(crate::client::Transport::Wss);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.execute_context_menu_request(ChatContextMenuRequest::AddPathToChat(
+            "/tmp/document.md".to_string(),
+        ))
+        .await;
+        let ChatPhase::Active(active) = &chat.phase else {
+            panic!("active");
+        };
+        assert!(active.input_bar.input().is_empty());
+        assert_eq!(
+            open_link_target("/tmp/document.md", false, "sess-1", &chat.path_open_tx).await,
+            None
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), chat.path_open_rx.recv())
+                .await
+                .is_err(),
+            "a remote pane must not touch the local path at all"
+        );
+    }
+
+    /// A path click returns at once; the filesystem checks and any failure
+    /// notice finish in the background and land on the session that asked.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn path_open_failures_arrive_off_the_event_loop() {
+        let (mut chat, _rx) = test_chat_with_transport(crate::client::Transport::Local);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let missing = "/definitely/not/a/real/zc-path-open";
+        assert_eq!(
+            open_link_target(missing, true, "sess-1", &chat.path_open_tx).await,
+            None,
+            "the click handler does not wait for the filesystem"
+        );
+        chat.execute_context_menu_request(ChatContextMenuRequest::RevealPath(missing.to_string()))
+            .await;
+        for _ in 0..2 {
+            let result = tokio::time::timeout(Duration::from_secs(5), chat.path_open_rx.recv())
+                .await
+                .expect("the background check reports back")
+                .expect("channel open");
+            assert_eq!(result.session_id, "sess-1");
+            let ChatPhase::Active(state) = &mut chat.phase else {
+                panic!("active");
+            };
+            state.set_info_notice(result.notice);
+            let notice = state.info_message.as_ref().map(|n| n.text.clone());
+            assert!(notice.is_some_and(|text| !text.is_empty()));
+        }
+        // A notice for a session this pane no longer has is dropped.
+        chat.path_open_tx
+            .send(PathOpenNotice {
+                session_id: "gone".to_string(),
+                notice: "stale".to_string(),
+            })
+            .await
+            .unwrap();
+        chat.drain_path_open_notices();
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("active");
+        };
+        assert_ne!(
+            state.info_message.as_ref().map(|n| n.text.as_str()),
+            Some("stale")
+        );
+    }
+
+    /// A background path check finishing must not wipe the user's
+    /// selection: only link styling changed, not the text.
+    #[tokio::test]
+    async fn path_link_restyle_keeps_the_transcript_selection() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat_with_transport(crate::client::Transport::Local);
+        let mut active = state();
+        active.push_user_message(Some("Quokkaword stays selected".to_string()), Vec::new());
+        chat.phase = ChatPhase::Active(Box::new(active));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let draw = |terminal: &mut Terminal<TestBackend>, chat: &mut Chat| {
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    chat.draw(frame, area);
+                })
+                .unwrap();
+        };
+        draw(&mut terminal, &mut chat);
+        let buffer = terminal.backend().buffer().clone();
+        let body = {
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("active");
+            };
+            state.transcript_snapshot.as_ref().expect("captured").area
+        };
+        // The header also shows the first message; pick the transcript copy.
+        let (col, row) = (body.y..body.bottom())
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                x + 5 <= buffer.area.width
+                    && (0..5)
+                        .map(|i| buffer[(x + i, y)].symbol())
+                        .collect::<String>()
+                        == "Quokk"
+            })
+            .expect("the message is drawn");
+        {
+            let ChatPhase::Active(state) = &mut chat.phase else {
+                panic!("active");
+            };
+            assert!(state.select_transcript_word(col, row));
+        }
+
+        crate::path_open::increment_path_links_generation();
+        chat.refresh_resolved_path_links();
+        {
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("active");
+            };
+            assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Restyle);
+        }
+        draw(&mut terminal, &mut chat);
+        {
+            let ChatPhase::Active(state) = &mut chat.phase else {
+                panic!("active");
+            };
+            assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
+            assert!(
+                state.transcript_selection.is_some(),
+                "a link restyle keeps the selection"
+            );
+            // Control: a real content invalidation still clears it.
+            state.mark_dirty_full();
+        }
+        draw(&mut terminal, &mut chat);
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("active");
+        };
+        assert!(state.transcript_selection.is_none());
+    }
+
+    #[test]
+    fn missing_paths_stay_plain_text() {
+        let lines = vec![Line::from(
+            "See /definitely/not/a/real/zc-path and and/or prose.",
+        )];
+        assert!(url_line_regions_for_lines(&lines, 80).is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_path_to_chat_appends_a_code_span() {
+        let mut chat = active_chat();
+        chat.execute_context_menu_request(ChatContextMenuRequest::AddPathToChat(
+            "/Volumes/Work SSD/a.png".to_string(),
+        ))
+        .await;
+        let ChatPhase::Active(ref state) = chat.phase else {
+            panic!("active");
+        };
+        assert_eq!(state.input_bar.input(), "`/Volumes/Work SSD/a.png`");
+
+        let mut chat = active_chat();
+        chat.execute_context_menu_request(ChatContextMenuRequest::AddPathToChat(
+            "/tmp/a`b.txt".to_string(),
+        ))
+        .await;
+        let ChatPhase::Active(ref state) = chat.phase else {
+            panic!("active");
+        };
+        assert_eq!(state.input_bar.input(), "``/tmp/a`b.txt``");
     }
 
     #[test]
@@ -34162,6 +34723,55 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "the pane must not answer requests behind the app router"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_resolved_path_links_marks_parked_sessions_for_restyle() {
+        use crate::chat::transcript_layout::LinesDirty;
+
+        let (mut chat, _rx) = test_chat();
+
+        // Set up active session
+        let mut active_state = state();
+        active_state.session_id = "active-session".to_string();
+        active_state.transcript_layout.fixture_mut().dirty = LinesDirty::Clean;
+
+        // Set up parked session in background
+        let mut parked_state = state();
+        parked_state.session_id = "parked-session".to_string();
+        parked_state.transcript_layout.fixture_mut().dirty = LinesDirty::Clean;
+
+        chat.phase = ChatPhase::Active(Box::new(active_state));
+        chat.background.push(parked_state);
+
+        // Record initial generation
+        let initial_gen = crate::path_open::path_links_generation();
+        chat.path_links_generation = initial_gen;
+
+        // Simulate a path check completing (increments generation)
+        crate::path_open::increment_path_links_generation();
+
+        // Refresh should mark both active and parked sessions
+        chat.refresh_resolved_path_links();
+
+        // Verify active session was marked
+        if let ChatPhase::Active(state) = &chat.phase {
+            assert_ne!(
+                state.transcript_layout.view().dirty,
+                LinesDirty::Clean,
+                "active session must be marked for restyle after path check"
+            );
+        } else {
+            panic!("expected Active phase");
+        }
+
+        // Verify parked session was also marked
+        assert_eq!(chat.background.len(), 1, "parked session must still exist");
+        assert_ne!(
+            chat.background[0].transcript_layout.view().dirty,
+            LinesDirty::Clean,
+            "parked session must be marked for restyle so switching back shows clickable paths"
         );
     }
 }
