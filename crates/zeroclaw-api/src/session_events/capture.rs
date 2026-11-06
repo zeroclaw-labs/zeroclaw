@@ -254,6 +254,10 @@ pub type ContextSummaryExecutor<'a> = Box<
 /// identity, ownership or permissions.
 #[derive(Clone, Debug)]
 pub enum SessionMetadataObservation {
+    /// The workspace already authorized by the entrance for this session.
+    Workspace {
+        directory: String,
+    },
     ContextUsage {
         input_tokens: Option<u64>,
     },

@@ -1954,6 +1954,21 @@ impl zeroclaw_kernel::session::query::SessionAccessPolicy for RpcHistoryAuthorit
                 "RPC history identity or access mismatch".into(),
             ));
         }
+        // History inspection may cross sessions for a current operator. Keep
+        // writes, child execution and narrowed principals bound to their own
+        // session; never turn this read permission into execution authority.
+        if stream != &self.stream
+            && self.target_agent.is_none()
+            && matches!(access, zeroclaw_kernel::session::query::SessionAccess::Read)
+        {
+            let lease = self.admission.dispatcher.ctx.auth.hold_authority();
+            let grants = self.current_under(&lease)?;
+            if self.admission.dispatcher.access_policy == RpcAccessPolicy::TrustedLocal
+                || grants.as_ref().is_some_and(|grants| grants.admin)
+            {
+                return Ok(());
+            }
+        }
         self.check_scope(stream)
     }
 }
@@ -5936,6 +5951,19 @@ impl RpcDispatcher {
         } else {
             None
         };
+
+        // Persist the authorized cwd before the first turn. An idle session
+        // can be reaped or restarted without ever producing TurnAccepted.
+        if let Some(native) = &native_restore {
+            native
+                .observe_metadata(
+                    zeroclaw_api::session_events::capture::SessionMetadataObservation::Workspace {
+                        directory: cwd.clone(),
+                    },
+                )
+                .await
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        }
 
         let restored_overrides = match &native_restore {
             Some(native) => match native
@@ -29526,6 +29554,15 @@ mod tests {
         config: zeroclaw_config::schema::Config,
     ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
         let data_dir = config.data_dir.clone();
+        zeroclaw_infra::session_events::upgrade::upgrade_installation(
+            &data_dir,
+            zeroclaw_infra::session_events::installation::NativeBackend::parse(
+                &config.channels.session_backend,
+            )
+            .unwrap(),
+            |_| "test-agent".into(),
+        )
+        .unwrap();
         let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
         let ctx = Arc::get_mut(&mut dispatcher.ctx).expect("unshared fixture context");
         ctx.session_repository = Some(Arc::new(
@@ -32340,8 +32377,6 @@ mod tests {
 
     #[test]
     fn agent_delete_rpc_persists_on_default_worker_stack() {
-        use zeroclaw_infra::session_queue::SessionActorQueue;
-
         // Deliberately the DEFAULT 2 MiB worker stack: this regression pins
         // the delete-RPC path to the stack every Tokio worker gets on Windows
         // CI, where the production default applies.
@@ -32360,9 +32395,8 @@ mod tests {
                     .create_map_key("agents", "delete_me")
                     .expect("create disposable agent");
                 config.save().await.expect("seed persisted agent config");
-                let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
-                let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-                let ctx = RpcContext::minimal(config, sessions);
+                let (fixture, _) = make_native_test_dispatcher(config);
+                let ctx = fixture.ctx;
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
                 let mut dispatcher =
                     RpcDispatcher::new(ctx, tx, "test-peer-agent-delete-stack:pid=1".into());
@@ -32504,7 +32538,7 @@ mod tests {
             .create_map_key("agents", "preserve")
             .expect("create disposable agent");
         config.agents.get_mut("preserve").unwrap().workspace.path = Some(workspace.clone());
-        let dispatcher = make_config_set_test_dispatcher(config);
+        let (dispatcher, _) = make_native_test_dispatcher(config);
         let generation = dispatcher.ctx.agent_lifecycle.alias_generation("preserve");
 
         dispatcher

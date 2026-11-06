@@ -306,7 +306,6 @@ const STEER_TEXT: &str = "please also check the second file";
 struct RecordingTurnProvider {
     started: tokio::sync::mpsc::UnboundedSender<()>,
     release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-    calls: Arc<tokio::sync::Mutex<Vec<(String, Vec<String>)>>>,
 }
 
 #[async_trait]
@@ -327,23 +326,10 @@ impl zeroclaw_api::model_provider::ModelProvider for RecordingTurnProvider {
 
     async fn chat(
         &self,
-        request: zeroclaw_providers::ChatRequest<'_>,
+        _request: zeroclaw_providers::ChatRequest<'_>,
         _model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
-        let text = request
-            .messages
-            .iter()
-            .map(|m| m.content.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let tools = request
-            .tools
-            .unwrap_or_default()
-            .iter()
-            .map(|spec| spec.name.clone())
-            .collect();
-        self.calls.lock().await.push((text, tools));
         let _ = self.started.send(());
         let gate = self.release.lock().await.take();
         if let Some(gate) = gate {
@@ -393,12 +379,10 @@ impl RecordingHandles {
 fn recording_provider(gated: bool) -> (RecordingTurnProvider, RecordingHandles) {
     let (started_tx, started) = tokio::sync::mpsc::unbounded_channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     (
         RecordingTurnProvider {
             started: started_tx,
             release: tokio::sync::Mutex::new(gated.then_some(release_rx)),
-            calls: Arc::clone(&calls),
         },
         RecordingHandles {
             started,

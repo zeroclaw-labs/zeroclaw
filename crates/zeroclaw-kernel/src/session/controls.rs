@@ -547,6 +547,11 @@ impl EngineSession {
         value: SessionMetadataObservation,
     ) -> anyhow::Result<()> {
         let (field, codec, value) = match value {
+            SessionMetadataObservation::Workspace { directory } => (
+                "workspace_dir",
+                "session.bytes/v1",
+                serde_json::json!(directory),
+            ),
             SessionMetadataObservation::ContextUsage { input_tokens } => (
                 "latest_context_input_tokens",
                 "session.authority/v1",

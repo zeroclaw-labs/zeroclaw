@@ -200,6 +200,12 @@ async fn execution_metadata_serializes_with_commands_and_rechecks_live_authority
             .await
             .expect("clear unknown context count");
         session
+            .observe_metadata(SessionMetadataObservation::Workspace {
+                directory: directory.path().to_string_lossy().into_owned(),
+            })
+            .await
+            .expect("workspace observation");
+        session
             .observe_metadata(SessionMetadataObservation::Plan {
                 entries: serde_json::from_value(serde_json::json!([
                     {"content":"review token=sk-plan-fixture-secret", "status":"in_progress"}
@@ -220,6 +226,7 @@ async fn execution_metadata_serializes_with_commands_and_rechecks_live_authority
             .expect("events");
         let mut counts = Vec::new();
         let mut plan = None;
+        let mut workspace = None;
         for event in &page.events {
             if let EventData::SessionMetadataChanged {
                 field,
@@ -238,6 +245,8 @@ async fn execution_metadata_serializes_with_commands_and_rechecks_live_authority
                     counts.push(serde_json::from_slice::<u64>(&value.body).expect("count"));
                 } else if field == "plan" {
                     plan = Some(String::from_utf8(value.body).expect("plan bytes"));
+                } else if field == "workspace_dir" {
+                    workspace = Some(serde_json::from_slice::<String>(&value.body).expect("cwd"));
                 }
             }
         }
@@ -246,6 +255,7 @@ async fn execution_metadata_serializes_with_commands_and_rechecks_live_authority
         let plan = plan.expect("durable plan");
         assert!(plan.contains("review"));
         assert!(plan.contains("sk-plan-fixture-secret"));
+        assert_eq!(workspace.as_deref(), directory.path().to_str());
         let before = session.owner.head(&session.stream).expect("head");
         authority.0.store(false, Ordering::SeqCst);
         assert!(
