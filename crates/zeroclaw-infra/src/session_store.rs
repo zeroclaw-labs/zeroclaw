@@ -534,16 +534,23 @@ impl SessionStore {
             return Ok(existed);
         }
         let existed = path.exists() || metadata_path.exists() || crumb_path.exists();
-        if metadata_path.exists() {
-            // Remove attribution first. If deleting the message file then
-            // fails, the surviving conversation is unattributed and scoped
-            // access fails closed rather than inheriting stale ownership.
-            std::fs::remove_file(&metadata_path)?;
-        }
+        // Remove the transcript before its attribution. A transcript without
+        // a sidecar reads as unattributed, and a sole enabled agent adopts
+        // unattributed transcripts, so a transcript that survives a failed
+        // unlink must keep its sidecar and stay its owner's.
         if path.exists() {
-            std::fs::remove_file(&path)?;
+            remove_session_file(&path)?;
         }
-        let _ = std::fs::remove_file(&crumb_path);
+        // The breadcrumb describes the transcript just removed. Drop it before
+        // the sidecar, so a sidecar left by a failed unlink below carries no
+        // stale trim flag into a later conversation on this key.
+        let _ = remove_session_file(&crumb_path);
+        if metadata_path.exists() {
+            // If this unlink fails, the sidecar alone reads as its owner's
+            // claim on an empty session: `list_sessions` doesn't list it,
+            // another agent's claim is refused, and a later delete removes it.
+            remove_session_file(&metadata_path)?;
+        }
         Ok(existed)
     }
 
@@ -611,6 +618,28 @@ fn create_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     options.mode(0o600);
     options.open(path)
+}
+
+#[cfg(test)]
+type UnlinkHook = Box<dyn FnMut(&Path) -> std::io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Consulted on this thread before each unlink in a session delete. An
+    /// `Err` stands in for a file the platform refuses to delete.
+    static BEFORE_SESSION_UNLINK: std::cell::RefCell<Option<UnlinkHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Remove one of a session's files: `std::fs::remove_file`, which tests can
+/// make fail for a chosen path.
+fn remove_session_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    BEFORE_SESSION_UNLINK.with(|hook| match hook.borrow_mut().as_mut() {
+        Some(hook) => hook(path),
+        None => Ok(()),
+    })?;
+    std::fs::remove_file(path)
 }
 
 fn is_regular_jsonl_session_file(path: &Path) -> bool {
@@ -2038,6 +2067,138 @@ mod tests {
         assert!(backend.delete_session("owned").unwrap());
         assert!(!metadata_path.exists());
         assert!(!backend.session_exists("owned"));
+    }
+
+    /// While alive, the platform refuses to unlink `refused`, the way an
+    /// immutable file or a Windows sharing restriction refuses a delete.
+    struct UnlinkRefusal;
+
+    impl UnlinkRefusal {
+        fn of(refused: PathBuf) -> Self {
+            BEFORE_SESSION_UNLINK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |path| {
+                    if path == refused {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "unlink refused by the test",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }));
+            });
+            Self
+        }
+    }
+
+    impl Drop for UnlinkRefusal {
+        fn drop(&mut self) {
+            BEFORE_SESSION_UNLINK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    /// Agent A's transcript on `discord.ops`, explicitly owned.
+    fn session_owned_by_a(store: &SessionStore) {
+        use crate::session_backend::SessionContext;
+        store
+            .append("owned", &ChatMessage::user("agent A's private history"))
+            .unwrap();
+        store.set_session_agent_alias("owned", "agent-a").unwrap();
+        store
+            .set_session_context(
+                "owned",
+                SessionContext {
+                    channel_id: Some("discord.ops"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    /// Agent B's inbound turn after A is disabled: B is the sole enabled agent
+    /// and owns `discord.ops`, so it adopts unattributed transcripts. It must
+    /// neither claim the key nor read anything through it.
+    fn assert_sole_agent_b_is_refused(store: &SessionStore) {
+        use crate::session_backend::{
+            SessionClaimGrant, SessionOwnerClaim, SessionOwnershipDenial,
+        };
+        let foreign = SessionOwnershipDenial::ForeignAgent("agent-a".into());
+        let channels = BTreeSet::from(["discord.ops".to_string()]);
+        let grant = SessionClaimGrant {
+            channels: channels.clone(),
+            adopt_unattributed: true,
+        };
+        let claim = store
+            .claim_session_with_authority("owned", "agent-b", &move |effect| effect(&grant))
+            .unwrap();
+        assert_eq!(claim, SessionOwnerClaim::Foreign(foreign.clone()));
+        match store
+            .load_with_authority("owned", "agent-b", &move |effect| effect(&channels))
+            .unwrap()
+        {
+            ScopedSessionAccess::Denied(denial) => assert_eq!(denial, foreign),
+            ScopedSessionAccess::Granted(history) => {
+                panic!("agent B hydrated the key: {history:?}")
+            }
+            ScopedSessionAccess::Missing => panic!("the key lost its owner's claim"),
+        }
+        assert_eq!(
+            store.get_session_agent_alias("owned").unwrap().as_deref(),
+            Some("agent-a"),
+            "the refused claim must not rewrite the owner"
+        );
+    }
+
+    #[test]
+    fn a_transcript_that_survives_a_failed_delete_keeps_its_owner() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        session_owned_by_a(&store);
+
+        {
+            let _refusal = UnlinkRefusal::of(store.session_path("owned"));
+            assert!(store.delete_session("owned").is_err());
+        }
+
+        // The refusal has cleared. The transcript survived, and so did its owner.
+        assert_eq!(store.load("owned")[0].content, "agent A's private history");
+        assert_eq!(
+            store.get_session_agent_alias("owned").unwrap().as_deref(),
+            Some("agent-a")
+        );
+        assert_sole_agent_b_is_refused(&store);
+
+        // A retried delete removes the pair.
+        assert!(store.delete_session("owned").unwrap());
+        assert!(!store.session_exists("owned"));
+    }
+
+    #[test]
+    fn a_sidecar_that_survives_a_failed_delete_stays_an_unlisted_claim() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        session_owned_by_a(&store);
+        store.set_trim_breadcrumb("owned", true).unwrap();
+
+        {
+            let _refusal = UnlinkRefusal::of(store.metadata_path("owned"));
+            assert!(store.delete_session("owned").is_err());
+        }
+
+        // The transcript and its breadcrumb are gone; only A's sidecar is left.
+        assert!(!store.session_path("owned").exists());
+        assert!(!store.trim_breadcrumb_path("owned").exists());
+        assert!(!store.list_sessions().contains(&"owned".to_string()));
+        assert!(store.list_sessions_with_metadata().is_empty());
+        assert_sole_agent_b_is_refused(&store);
+        assert!(
+            !store.session_path("owned").exists(),
+            "the refused claim must not materialize a transcript"
+        );
+
+        // A retried delete removes the sidecar.
+        assert!(store.delete_session("owned").unwrap());
+        assert!(!store.session_exists("owned"));
     }
 
     #[test]
