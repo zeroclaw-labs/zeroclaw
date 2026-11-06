@@ -33,10 +33,9 @@ importantly, what changes for existing remote connections.
      live session held under such an alias is refused. The other
      session methods do not check the agent yet, as described under
      [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
-   - running or approving an SOP requires every agent it runs as, with the
-     same tool-selector rule as a session, and creating, saving, or deleting
-     one requires the agents it runs as. A step that names no agent, on the
-     step or on the procedure, counts as the first configured agent alias in
+   - running or approving an SOP requires administrator grants. Creating,
+     saving, or deleting one requires the agents it runs as. A step that names
+     no agent, on the step or on the procedure, counts as the first configured agent alias in
      sort order, which is the agent the headless executor falls back to.
      Every step counts, including the steps of a deterministic procedure;
    - attachments, personality files, cost queries that name an agent, and
@@ -272,9 +271,10 @@ the opening window via `postMessage` (same-origin only) with a manual
 copy fallback. The gateway also sends
 `Cross-Origin-Opener-Policy: same-origin`, which severs `window.opener`
 once the popup has navigated through the identity provider, so in
-current browsers the manual copy on that page is the handoff that works
-today and the `postMessage` contract is in place for the dashboard
-follow-up. These routes are unauthenticated by necessity
+current browsers the manual copy on that page is the handoff that works.
+The dashboard itself does not use that page: its sign-in keeps the token
+in the gateway behind a session cookie (see
+[Dashboard sign-in](#dashboard-sign-in)). These routes are unauthenticated by necessity
 (enrollment precedes authentication), rate limited, and grant nothing:
 they only relay what the IdP grants after the user approves. Design
 rationale and failure-mode table:
@@ -387,8 +387,76 @@ If either the principal's tool selector or agent selector is constrained,
 `delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
 are unavailable, including skill aliases wrapping those tools. These nested
 paths do not yet carry both current principal ceilings; the ordinary parent
-turn remains usable. Admin principals and principals with both selectors set
-to `"*"` keep their agent's configured nested capabilities.
+turn remains usable.
+
+Some tools do work that does not carry the caller's principal, so no
+principal without `admin` holds them in its sessions, whatever its selectors
+name, `"*"` included:
+
+- `sessions_list`, `sessions_history`, and `sessions_send` list, read, and
+  append to other sessions without checking who owns them, and so would
+  `sessions_reset` and `sessions_delete` if an agent registered them.
+  `sessions_current`, which reports only the caller's own session, stays.
+- `cron_add`, `cron_update`, `cron_run`, `cron_list`, `cron_runs`,
+  `cron_remove`, and `schedule`: scheduled turns do not carry the caller's
+  restrictions, and cron rows and run output are shared by agent rather than
+  owned by the calling principal.
+- `send_message_to_peer`, whose turns run on another agent.
+- `sop_execute`, `sop_advance`, `sop_approve`, and `sop_workshop`: SOP steps
+  run headlessly as the procedure's agents, and an applied workshop proposal
+  becomes a shared procedure that later runs the same way. Read-only SOP
+  tools follow the ordinary tool selector.
+- `model_routing_config` and `proxy_config`, which save daemon config that
+  every agent's later runs use. Over RPC the same change needs
+  `config:update`.
+- `spawn_subagent` and `execute_pipeline`, whose nested runs would hold the
+  tools above again.
+
+Each of these tools reports `requires_unrestricted_principal`, so a skill
+alias of one goes with it. The direct `delegate` tool stays when both
+selectors are `"*"`, because the session holds its handle: every bounded,
+independent, background, parallel, and nested child it builds withholds the
+same tools. It also resolves the originating credential's current authority
+when it builds each child, so a child built after that credential loses
+`admin` withholds them too. Its skill aliases are withheld, because their
+captured targets cannot be identified as the bound handle.
+
+The withholding is applied at session creation, at rehydration, before every
+prompt, and when accepted steering is consumed, including its recheck after
+memory writes. An administrator demoted mid-session loses the tools at the
+next prompt or accepted steering. Like selector narrowing, it never gives
+them back to a live session. Admin principals and the shared operator keep
+their agent's configured tools, and existing cron jobs keep running.
+
+A queued prompt resolves authority again on the exact Agent that will execute
+the turn, after provider reconciliation and Agent/task waits. The same admission
+applies withholding and protects prompt checkpoint or running-state writes
+after storage contention. A refused admission does not call the provider or
+persist a terminal turn. This is a turn-admission boundary, not continuous
+revocation of a turn that is already running.
+
+RPC `cron/patch` and `cron/trigger` also refuse agent jobs for non-admins,
+including wildcard selectors. These jobs cannot carry the caller's session
+restrictions; the check uses current authority after looking up the job.
+Shell jobs retain their existing grant and command-policy checks. Cron reads,
+deletion, and jobs already scheduled by an operator are unchanged.
+
+RPC `sops/run` and `sops/decide` require administrator grants, including
+when a non-admin has wildcard tool and agent selectors. Headless steps do
+not carry the caller's principal restrictions. This includes deny, amend,
+and revise decisions. After decision-model and engine waits, the RPC holds
+current authority through its synchronous store effects. A busy SOP store
+refuses the request immediately; retry once contention clears. Background
+SOP processing keeps its normal storage timeout. SOP authoring retains its
+separate agent-selector checks.
+
+Until the session-data tools check ownership, scheduled agent jobs, SOP runs,
+and peer turns started by an administrator or a trigger can still call them.
+To remove them from those runs too, list `sessions_list`, `sessions_history`,
+and `sessions_send`, plus any skill tool that targets them, in
+`excluded_tools` of the risk profile of each agent those runs use. That
+removes them from every run of those agents, administrators' sessions
+included.
 
 The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
 constructor remains available. RPC uses the additive
@@ -397,10 +465,20 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, or give an
-existing agent job a new prompt and trigger it, and one holding SOP create
-or update grants can save a procedure whose trigger runs it later. Treat
-cron and SOP authoring grants as grants of the agent's tools.
+holding cron grants can create a shell job for its agent, though agent jobs
+are refused to it as described above, and one holding SOP create or update
+grants can save a procedure whose trigger runs it later. Treat cron and SOP
+authoring grants as grants of the agent's tools.
+
+Principal-owned sessions may use synchronous and parallel delegation when
+their grants allow it. Background delegation and its `check_result`,
+`list_results`, `cancel_task`, and `await_sessions` actions are refused,
+including calls through skill aliases and nested delegates. Those task rows
+and result files currently use agent-alias visibility, which cannot protect
+one principal's private output from another principal using the same agent.
+This refusal includes administrator-owned sessions; their private memory is
+still private. Shared operator delegation remains available. Existing shared
+result artifacts are not migrated or removed by this restriction.
 
 ## Breaking change: remote WSS requires authentication
 
@@ -514,7 +592,148 @@ settings, a roster or a profile takes effect on the next request. The
 daemon's own RPC surface holds a separate live configuration and
 reaches the same state through the reload the gateway write flags.
 Other gateway surfaces keep the pairing check per handler and adopt the
-layer in follow-ups.
+layer in follow-ups; a [dashboard sign-in](#dashboard-sign-in) session
+also satisfies that check when its account is an administrator.
+
+## Dashboard sign-in
+
+The web dashboard can offer sign-in through a configured OIDC provider
+instead of, or alongside, a pairing code. It is off by default: an
+install without `[gateway.dashboard_sign_in]` shows the pairing dialog
+exactly as before, and a session cookie sent to it is ignored.
+
+```toml
+[gateway]
+require_pairing = true
+
+[gateway.dashboard_sign_in]
+oidc = ["corp"]                # [oidc.<alias>] entries offered on the sign-in screen
+session_lifetime_secs = 28800  # optional cap on one session (300..=604800, default 8 h)
+```
+
+Turning it on needs:
+
+- `gateway.require_pairing = true`. With pairing off every dashboard
+  route is open to whoever reaches the gateway, so the config is refused.
+  The official Docker image writes `require_pairing = false` into its
+  default config; set it to `true` there, or with
+  `ZEROCLAW_gateway__require_pairing=true`.
+- HTTPS (`[gateway.tls]`, or a reverse proxy with
+  `trust_forwarded_headers`). Sign-in is refused over plain HTTP unless
+  the browser runs on the gateway's own machine.
+- Behind a reverse proxy, the browser's `Host` passed through unchanged
+  (for example `proxy_set_header Host $host;` in nginx). The callback URI
+  and the dashboard's own origin are both taken from it, so a proxy that
+  rewrites `Host` to an internal name breaks sign-in and gets every
+  signed-in change refused as coming from another origin.
+- An identity provider client that uses Authorization Code with PKCE
+  (S256), with `<dashboard origin><path_prefix>/oidc/callback` as a
+  redirect URI (the same URI as the browser enrollment relay above).
+  Register that exact URI, with no wildcard or prefix pattern: until the
+  gateway checks the URI against a configured dashboard origin (#12048),
+  it builds it from the request's `Host`, and the identity provider's
+  exact match is what keeps a sign-in code from going to another address.
+  Its client must be listed in `interactive_clients` (or classified by
+  `actor_claim`), and its access tokens must carry the configured
+  `audience`.
+- An access-token lifetime that suits a working session, such as one to
+  eight hours. The dashboard does not use refresh tokens: when the token
+  expires the user signs in again.
+
+When a user picks a provider, the gateway runs the browser flow and
+binds it to that browser with a short-lived cookie, so a sign-in started
+elsewhere cannot be finished there. The ID token is required and
+validated as evidence of the sign-in (issuer, audience, authorized
+party, expiry, nonce) and then discarded. The access token is verified by
+the provider exactly as an RPC bearer is, and the account is the one it
+resolves to; the ID token's subject is not compared with it, since both
+come from the same back-channel exchange. A service client is never
+given a dashboard session. The token then stays in the gateway's memory:
+the browser holds only an opaque `HttpOnly`, `SameSite=Strict` session
+cookie (`Secure` over HTTPS), and no token reaches browser storage or
+script.
+
+Every request carrying the cookie is checked again against the same
+authority RPC uses: the token's expiry, the introspection revalidation
+deadline, and the grants the account holds under the policy in force
+now. A changed profile mapping, a removed provider, or an alias taken off
+`gateway.dashboard_sign_in.oidc` takes effect on the next request. A
+request that changes state must also send the session's CSRF token in
+`X-ZeroClaw-CSRF`, and requests and WebSocket upgrades that carry the
+cookie must come from the dashboard's own origin. A request with an
+`Authorization` header is judged by that header alone.
+
+What a signed-in account can do follows its permission profile:
+
+- An account whose profile has `admin = true` is operator-equivalent and
+  reaches every dashboard page, as a paired browser does. Each sign-in is
+  logged with the principal it resolved to. Conversations it starts in
+  the dashboard chat belong to the shared operator, as paired browsers'
+  do.
+- Any other account reaches the configuration pages its `Config` grants
+  allow. Other pages answer 403 with `"reason": "operator_required"`, and
+  the dashboard hides them. Use zerocode for that account's own chat
+  sessions.
+
+Sign-out ends the session in this ZeroClaw and drops its cookie, also
+when the session had already ended; it does not sign the user out of the
+identity provider. When a session ends (sign-out, expiry, or a
+check it fails) or loses the access a page needs, that page's sockets and
+event streams close at once. Signing in again in the same browser ends
+the session it held before, whichever account that was, so a later
+sign-out leaves nothing of that browser signed in. That holds when two
+tabs sign in at once too: browser marker cookies (`zc_browser_<tag>`, or
+`__Host-zc_browser_<tag>` over HTTPS at the root; random, `HttpOnly`,
+`SameSite=Lax`, and never a credential) tie the browser's sessions
+together. Each marker has a name of its own, so a sign-in whose start
+is answered late adds a marker rather than replacing one. The sign-in
+that finishes later ends the other, and sign-out ends every session
+that shares a marker with the browser. A request admitted
+before its session ended that has not yet taken effect, such as a
+configuration change whose body is still arriving, is refused. A chat
+turn already running finishes unattended, as when a viewer leaves, and a
+tool approval it was waiting on is refused; nothing the closed socket
+sent afterwards is acted on. A
+reload also closes the sockets a session opened, and the dashboard
+reconnects them under the new configuration. A request that still reaches
+the gateway generation being replaced, over a connection that stayed
+open, is answered `503` with `"reason": "gateway_restarting"`, and the
+dashboard retries it.
+
+Sessions are held in memory, and a session's token is wiped when the
+session ends. Expired sessions are swept every minute even when no
+request arrives. A daemon restart signs everyone out, while a reload
+keeps sessions and verifies each one again against the new configuration
+before its next use. At most 256 sessions
+are held at once, eight per account; at the cap a new sign-in is refused
+rather than signing somebody else out.
+
+Things to know before turning it on:
+
+- Pairing keeps working alongside sign-in, and stays the way back in if
+  the identity provider is unreachable. The desktop app keeps pairing.
+- An administrator can pair devices from the dashboard like any operator.
+  Removing their access at the identity provider does not revoke devices
+  they paired; revoke those on the pairing page.
+- Conversations and memory created before sign-in belong to the shared
+  operator. Accounts without `admin` never see them.
+- Over plain HTTP on the gateway's own machine, browsers do not keep
+  cookies apart by port, so any other local web server the browser visits
+  is sent the session cookie. Use HTTPS, or sign in only from a browser
+  you don't use for other local development servers.
+- Taking a provider off `gateway.dashboard_sign_in.oidc`, or emptying it,
+  ends the sessions it issued: at the next request, and within a minute
+  if none arrives (at once when a reload applies the change). Offering it
+  again does not bring them back, except when it is offered again within
+  that minute with no request in between. If the `[oidc.<alias>]` entry is pointed at another issuer or
+  client, its sessions end as well, without their tokens being sent to
+  the new provider.
+- `session_lifetime_secs` caps sessions that start after it is set;
+  sessions already signed in keep the cap they started with. To end them
+  sooner, take the provider off `gateway.dashboard_sign_in.oidc`.
+- With introspection, an identity provider that cannot be reached when a
+  session is due for revalidation ends that session (it fails closed);
+  users sign in again once the provider is back.
 
 ## Credential lifecycle
 
@@ -585,22 +804,31 @@ means its memory tools refuse.
 
 The Nevis IAM integration was removed. It was never wired into any
 authentication path, so enabling it never authenticated anyone; retiring
-it changes no live behavior. Its config table is still accepted so an old
-`config.toml` keeps loading: the daemon discards every value in the table
-at load, logs one warning naming the replacement, and removes the table
-from `config.toml` on the next save, whether a full save or the
-incremental save the CLI, dashboard and RPC use for a single edit. The
-removal touches only that table; comments and other sections keep their
-bytes. Nothing is converted automatically: the replacement stack needs
-values (an audience, profile grants) the old table never held.
+it changes no live behavior. `[security.nevis]` is no longer a config key:
+schema V4 retires it. While a config still holds the table, every command
+prints a warning naming it, and none of its values are loaded. The table is
+removed from `config.toml` by `zeroclaw config migrate`, and by the next
+save that follows an edit, whether a full save or the incremental save the
+CLI, dashboard and RPC use for a single edit. An incremental save runs only
+when something was edited, so an untouched config keeps the table until one
+of those happens. The removal touches only that table; comments and other
+sections keep their bytes. Nothing is converted automatically: the
+replacement stack needs values (an audience, profile grants) the old table
+never held.
 
-**Before you upgrade**, copy `config.toml` somewhere protected. Every save
-after the upgrade writes `config.toml.bak` next to the file for the
-duration of the write and removes it once the write is durable, so a
-`.bak` is not a lasting backup. Any copy you keep yourself still carries
-the retired table, including a plaintext `client_secret` if one was
-configured, so treat those copies as secret material and revoke the
-Nevis client credential at the IdP once you no longer need it.
+**ZeroClaw keeps two copies of the original.** The first time anything
+rewrites a V3 file (`zeroclaw config migrate`, or the first save from the
+CLI, dashboard, RPC or Quickstart), it copies the file to
+`config.toml.v3.backup`. That copy is created readable only by you, is
+never replaced, and is the way back to an older ZeroClaw. `config migrate`
+also writes `config.toml.backup`, which the next migration replaces. Both
+copies keep the retired table, including any plaintext `client_secret`.
+Every save also writes `config.toml.bak` for the duration of the write and
+removes it once the write is durable, so a `.bak` is not a backup.
+
+**After you upgrade**, treat `config.toml.v3.backup`, `config.toml.backup`
+and any copy you kept yourself as secret material. Delete them once you no
+longer need to downgrade, and revoke the Nevis client credential at the IdP.
 
 Field by field:
 
@@ -657,10 +885,17 @@ the restored file without a migration step.
 Consolidation and governance derive shared-plane rows and do not run for
 private sessions, and administrative access into another principal's
 private memory has no surfaced pathway yet (deny-by-default).
+The session-data tools have no principal-aware view yet, so they are
+withheld from principals without `admin` (see
+[Permission profiles](#permission-profiles)) instead of being scoped to the
+caller's own sessions, and scheduled agent jobs, SOP runs, and peer turns can
+still call them unless the agent's risk profile excludes them.
 `sops/runs` and `sops/run-detail` return the run history of every
 procedure to a principal holding `Sops:Read`, whichever agents it ran as,
-unlike cron history. Gateway HTTP routes keep their existing pairing
-checks, and channel identities do not resolve into this principal model.
+unlike cron history. Gateway HTTP routes outside the configuration
+group keep their existing pairing checks, which a dashboard sign-in
+satisfies only for an administrator, and channel identities do not
+resolve into this principal model.
 
 While `security.trust_daemon_uid = true` (the default) and the policy
 compiles, the daemon's own uid on a Unix socket keeps full access, so a

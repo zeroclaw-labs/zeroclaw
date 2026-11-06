@@ -52,6 +52,7 @@ use context_menu::{
 };
 
 mod message_queue;
+mod session_lookup;
 mod transcript_layout;
 use message_queue::{AdmissionError, MessageQueue, QueuePauseReason};
 pub(crate) use message_queue::{QueueItemStatus, QueuedMessage};
@@ -482,6 +483,19 @@ enum SessionError {
     /// Notification recovery exhausted its bounded retries. Queued input is
     /// retained and an explicit focus/enqueue action retries reconciliation.
     ResyncFailed,
+}
+
+/// The fallback outcome line, naming the question it settles. A blank
+/// question leaves the outcome alone.
+fn elicitation_outcome_note(question: &str, outcome: &str) -> String {
+    let question = question.trim();
+    if question.is_empty() {
+        return outcome.to_string();
+    }
+    crate::i18n::t_args(
+        "zc-chat-elicitation-outcome-note",
+        &[("outcome", outcome), ("question", question)],
+    )
 }
 
 /// Classify a failed turn's daemon error text for `SessionError`. Single
@@ -2970,7 +2984,6 @@ impl Chat {
         let tx = self.session_resync_tx.clone();
         if let Some(state) = self.state_for_session_mut(&session_id) {
             let approval = state.pending_approval.take();
-            let elicitation = state.pending_elicitation.take();
             match mode {
                 // Cancel is on its way to the daemon: the visible turn is
                 // abandoned now, before the terminal confirmation.
@@ -2988,10 +3001,8 @@ impl Chat {
             if let Some(approval) = approval {
                 Self::reject_stale_approval(&rpc, session_id.clone(), approval.request_id);
             }
-            if let Some(elicitation) = elicitation {
-                Self::answer_cancel(&rpc, elicitation.request_id);
-            }
         }
+        self.answer_withdrawn_elicitations();
 
         tokio::spawn(async move {
             let result = Self::confirm_and_reload_with_retry(&rpc, &session_id, mode).await;
@@ -3843,7 +3854,42 @@ impl Chat {
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
         self.drain_session_reattach_results();
+        self.answer_withdrawn_elicitations();
         self.maybe_refresh_git_branch();
+    }
+
+    /// Send the `cancel` every withdrawn elicitation still owes the daemon,
+    /// and note each one in its transcript. Runs after the resync drain, so
+    /// a note for a prompt dropped by a reload lands after the reloaded
+    /// history rather than being wiped by it.
+    fn answer_withdrawn_elicitations(&mut self) {
+        let rpc = self.rpc.clone();
+        let resyncs = &self.session_resync_in_flight;
+        let answer = |state: &mut ChatState| {
+            for mut withdrawn in state.take_withdrawn_elicitations() {
+                if let Some(request_id) = withdrawn.request_id.take() {
+                    Self::answer_cancel(&rpc, request_id);
+                }
+                if withdrawn.note {
+                    if resyncs.contains_key(&state.session_id) {
+                        // Reply immediately, but retain the note until the reload
+                        // can no longer replace the transcript containing it.
+                        state.withdrawn_elicitations.push(withdrawn);
+                        continue;
+                    }
+                    state.record_elicitation_outcome(
+                        &withdrawn.question,
+                        crate::i18n::t("zc-chat-elicitation-withdrawn"),
+                    );
+                }
+            }
+        };
+        if let ChatPhase::Active(state) = &mut self.phase {
+            answer(state);
+        }
+        for state in self.background.iter_mut() {
+            answer(state);
+        }
     }
 
     /// Whether live transport state is waiting for `tick_transport_events`.
@@ -4246,12 +4292,20 @@ impl Chat {
                     // Build the response without holding the modal borrow,
                     // then answer the daemon. For an invalid multi-select
                     // (bounds unmet) keep the modal open.
-                    let payload = state
-                        .pending_elicitation
-                        .as_ref()
-                        .and_then(|e| e.accept_content().map(|c| (e.request_id.clone(), c)));
-                    if let Some((id, content)) = payload {
-                        state.pending_elicitation = None;
+                    let payload = state.pending_elicitation.as_ref().and_then(|e| {
+                        e.accept_content()
+                            .map(|c| (e.request_id.clone(), c, e.answer_summary()))
+                    });
+                    if let Some((id, content, answer)) = payload
+                        && let Some(e) = state.pending_elicitation.take()
+                    {
+                        state.record_elicitation_outcome(
+                            &e.message,
+                            crate::i18n::t_args(
+                                "zc-chat-elicitation-answered",
+                                &[("answer", &answer)],
+                            ),
+                        );
                         state.mark_dirty_full();
                         self.rpc.respond_to_inbound_request(
                             id,
@@ -4266,6 +4320,10 @@ impl Chat {
                 }
                 Some(ModalAction::Cancel) => {
                     if let Some(e) = state.pending_elicitation.take() {
+                        state.record_elicitation_outcome(
+                            &e.message,
+                            crate::i18n::t("zc-chat-elicitation-cancelled"),
+                        );
                         state.mark_dirty_full();
                         let id = e.request_id;
                         self.rpc.respond_to_inbound_request(
@@ -4529,6 +4587,15 @@ impl Chat {
                     self.begin_change_directory();
                     return false;
                 }
+                InputBarAction::OpenSessionPicker => {
+                    // Same picker and listing as `Ctrl+S`.
+                    Self::open_pane_session_picker(&self.rpc, self.pane_kind, state).await;
+                    return false;
+                }
+                InputBarAction::LoadSession(query) => {
+                    self.load_session_by_query(&query).await;
+                    return false;
+                }
                 InputBarAction::ResumeQueue => {
                     state.clear_info_notice();
                     if state.resume_queue() {
@@ -4686,35 +4753,8 @@ impl Chat {
                 self.add_session_requested = true;
             }
             Some(ChatTabAction::SwitchSession) => {
-                // ACP and Chat live in separate stores and must not cross-pick:
-                //  • Chat → unified session_backend (filter out channel-backed
-                //    sessions; those are owned by the channels pane).
-                //  • ACP  → dedicated acp-sessions.db, listed by a separate RPC.
-                let picker_sessions = if self.pane_kind == PaneKind::Acp {
-                    self.rpc
-                        .acp_session_list()
-                        .await
-                        .map(|list| list.sessions)
-                        .unwrap_or_default()
-                } else {
-                    match self.rpc.session_list(None).await {
-                        Ok(list) => list
-                            .sessions
-                            .into_iter()
-                            .filter(|s| s.channel_id.is_none())
-                            .collect(),
-                        Err(_) => Vec::new(),
-                    }
-                };
-
-                let mut ls = ListState::default();
-                if !picker_sessions.is_empty() {
-                    ls.select(Some(0));
-                }
-                state.session_overlay = SessionOverlay::List {
-                    sessions: picker_sessions,
-                    list_state: ls,
-                };
+                // A listing failure shows an empty picker, as before.
+                Self::open_pane_session_picker(&self.rpc, self.pane_kind, state).await;
             }
             Some(ChatTabAction::ToggleThoughts)
                 if state.input_bar.input().is_empty()
@@ -4849,6 +4889,78 @@ impl Chat {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The persisted sessions this pane may load, from the pane's own store.
+    ///
+    /// ACP and Chat live in separate stores and must not cross-pick:
+    ///  • Chat → unified session_backend (filter out channel-backed
+    ///    sessions; those are owned by the channels pane).
+    ///  • ACP  → dedicated acp-sessions.db, listed by a separate RPC.
+    async fn list_pane_sessions(
+        rpc: &RpcClient,
+        pane_kind: PaneKind,
+    ) -> Result<Vec<SessionEntry>, String> {
+        if pane_kind == PaneKind::Acp {
+            rpc.acp_session_list()
+                .await
+                .map(|list| list.sessions)
+                .map_err(|e| e.to_string())
+        } else {
+            rpc.session_list(None)
+                .await
+                .map(|list| {
+                    list.sessions
+                        .into_iter()
+                        .filter(|s| s.channel_id.is_none())
+                        .collect()
+                })
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// Open the session picker over this pane's saved sessions (Ctrl+S and
+    /// bare `/load-session`). A listing failure shows an empty picker.
+    async fn open_pane_session_picker(rpc: &RpcClient, pane_kind: PaneKind, state: &mut ChatState) {
+        let sessions = Self::list_pane_sessions(rpc, pane_kind)
+            .await
+            .unwrap_or_default();
+        state.open_session_list(sessions);
+    }
+
+    /// `/load-session <query>`: resolve `query` against this pane's store and
+    /// resume the match. Never starts a new session; never closes the
+    /// previously focused one (it stays live in `background`).
+    async fn load_session_by_query(&mut self, query: &str) {
+        use session_lookup::{SessionMatch, resolve_session};
+
+        let rpc = Arc::clone(&self.rpc);
+        let listed = Self::list_pane_sessions(&rpc, self.pane_kind).await;
+        let ChatPhase::Active(state) = &mut self.phase else {
+            return;
+        };
+        let sessions = match listed {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-load-session-list-error",
+                    &[("error", &error)],
+                ));
+                return;
+            }
+        };
+        let active_sid = state.session_id.clone();
+        match resolve_session(&sessions, query) {
+            SessionMatch::One(entry) if entry.session_id == active_sid => {
+                state.set_info_notice(crate::i18n::t("zc-chat-load-session-already-active"));
+            }
+            SessionMatch::One(entry) => self.switch_to_session_entry(entry).await,
+            SessionMatch::Many(entries) => state.open_session_list(entries),
+            SessionMatch::NoMatch => state.set_info_notice(crate::i18n::t_args(
+                "zc-chat-load-session-not-found",
+                &[("query", query)],
+            )),
         }
     }
 
@@ -6202,6 +6314,7 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                 ];
                 pane_entries.extend(queue_sidebar_help_entries());
+                pane_entries.push(E::desc(crate::i18n::t("zc-chat-help-load-session")));
                 // Code owns a session root the user can re-select; Chat
                 // sessions keep the root they started with, so the hint is
                 // scoped to this pane.
@@ -7262,6 +7375,105 @@ fn render_tool_entry(
                 }
             }
         }
+        "ask_user" | "poll" => {
+            // The card is the durable record of a question (the daemon
+            // persists the tool call), so it leads with the question and
+            // lists the choices, in every disclosure. The generic preview
+            // showed the first bytes of key-sorted JSON, which put `channel`
+            // and `choices` ahead of the question and cut it off.
+            let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+            let question = parsed
+                .as_ref()
+                .and_then(|input| input.get("question"))
+                .and_then(serde_json::Value::as_str);
+            if let (Some(input), Some(question)) = (parsed.as_ref(), question) {
+                let (question, limited) = terminal_safe_tool_text_limited(
+                    question,
+                    TOOL_EXPANDED_MAX_BYTES,
+                    TOOL_EXPANDED_MAX_LINES,
+                );
+                display_limited |= limited;
+                push_text(lines, &crate::i18n::t("zc-chat-tool-question"), &question);
+                let choices = input
+                    .get(if name == "poll" { "options" } else { "choices" })
+                    .and_then(serde_json::Value::as_array);
+                let choices = choices.map(Vec::as_slice).unwrap_or_default();
+                let count = choices.len();
+                let full = matches!(disclosure, ToolDisclosure::Full);
+                let limit = if full {
+                    TOOL_EXPANDED_MAX_LINES
+                } else {
+                    FILE_TOOL_PREVIEW_LINES
+                };
+                let mut remaining_bytes = TOOL_EXPANDED_MAX_BYTES;
+                let mut remaining_lines = limit;
+                let mut shown = 0;
+                for (i, choice) in choices.iter().enumerate() {
+                    if remaining_lines == 0 {
+                        break;
+                    }
+                    let Some(choice) = choice.as_str() else {
+                        continue;
+                    };
+                    let prefix = format!("    {}. ", i + 1);
+                    if !full {
+                        let row = format!("{prefix}{}", preview(choice, 200));
+                        if row.len() > remaining_bytes {
+                            break;
+                        }
+                        remaining_bytes -= row.len();
+                        remaining_lines -= 1;
+                        lines.push(Line::from(Span::styled(
+                            row,
+                            theme::dim_style().add_modifier(sel_mod),
+                        )));
+                        shown += 1;
+                        continue;
+                    }
+                    // Expanded cards are the only place a closed question's
+                    // choices can be read in full, so each choice gets the
+                    // shared expanded byte and line limits rather than the
+                    // one-line preview, with continuation lines indented
+                    // under the choice's first line.
+                    let (text, cut) = terminal_safe_tool_text_limited(
+                        choice,
+                        remaining_bytes.saturating_sub(prefix.len()),
+                        remaining_lines,
+                    );
+                    if cut && text.is_empty() {
+                        break;
+                    }
+                    let indent = " ".repeat(prefix.len());
+                    for (row_index, row) in text.split('\n').enumerate() {
+                        let lead = if row_index == 0 { &prefix } else { &indent };
+                        lines.push(Line::from(Span::styled(
+                            format!("{lead}{row}"),
+                            theme::dim_style().add_modifier(sel_mod),
+                        )));
+                        remaining_lines = remaining_lines.saturating_sub(1);
+                    }
+                    remaining_bytes = remaining_bytes.saturating_sub(prefix.len() + text.len());
+                    shown += 1;
+                    if cut {
+                        display_limited = true;
+                        break;
+                    }
+                }
+                if shown < count {
+                    footer = Some(count - shown);
+                    display_limited |= full;
+                }
+                if full {
+                    let metadata =
+                        semantic_tool_metadata(input, &["question", "choices", "options"]);
+                    if metadata != "{}" {
+                        display_limited |= render_field(lines, "input", &metadata, 120);
+                    }
+                }
+            } else {
+                display_limited |= render_generic_input(lines);
+            }
+        }
         _ => display_limited |= render_generic_input(lines),
     }
 
@@ -7314,6 +7526,31 @@ fn render_tool_entry(
         {
             display_limited |=
                 render_field(lines, &crate::i18n::t("zc-chat-tool-details"), details, 120);
+        }
+    } else if let Some(res) = result
+        && matches!(name, "ask_user" | "poll")
+        && !res.starts_with("Error")
+    {
+        // The outcome of a question stands out like the answer line it
+        // replaced: the pick in yellow, or only the DISMISSED marker.
+        let (res, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(res, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
+        } else {
+            (preview(res, 200), false)
+        };
+        display_limited |= limited;
+        let answer = theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod);
+        let dim = theme::dim_style().add_modifier(sel_mod);
+        for (i, line) in res.split('\n').enumerate() {
+            let (marked, rest) = match line.strip_prefix("DISMISSED").filter(|_| i == 0) {
+                Some(rest) => ("DISMISSED", rest),
+                None => (line, ""),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if i == 0 { "  result: " } else { "    " }, dim),
+                Span::styled(marked.to_string(), answer),
+                Span::styled(rest.to_string(), dim),
+            ]));
         }
     } else if let Some(res) = result {
         display_limited |= render_field(lines, "result", res, 200);
@@ -9572,7 +9809,34 @@ pub struct PendingElicitation {
     pub selected: Vec<bool>,
 }
 
+/// A pending elicitation cleared without an answer, awaiting its `cancel`.
+#[derive(Debug, Clone)]
+struct WithdrawnElicitation {
+    /// Taken once the cancel is sent; a deferred transcript note may remain.
+    request_id: Option<serde_json::Value>,
+    /// Whether to note the withdrawal in this state's transcript. False when
+    /// the state has already moved to a different session.
+    note: bool,
+    /// The question, to place the note after its tool card.
+    question: String,
+}
+
 impl PendingElicitation {
+    /// The chosen choice titles, comma-joined, for the transcript record.
+    fn answer_summary(&self) -> String {
+        if self.multi {
+            self.choices
+                .iter()
+                .zip(&self.selected)
+                .filter(|(_, on)| **on)
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            self.choices.get(self.cursor).cloned().unwrap_or_default()
+        }
+    }
+
     /// Number of currently-checked rows (multi-select only).
     pub fn selected_count(&self) -> usize {
         self.selected.iter().filter(|&&b| b).count()
@@ -9821,6 +10085,12 @@ pub struct ChatState {
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
+    /// Elicitations this state cleared without the user's answer (a reload,
+    /// a session reset, a newer prompt). The daemon is still waiting on each
+    /// one, so `Chat::answer_withdrawn_elicitations` sends it a `cancel` and
+    /// notes it in the transcript. Without this the tool call blocks until
+    /// its own timeout (600 s for `ask_user`) with nothing on screen.
+    withdrawn_elicitations: Vec<WithdrawnElicitation>,
     /// Why the sidebar shows this session red. Set when a turn ends
     /// `Failed`; cleared by the next prompt, a completed turn, a session
     /// reset, or a successful re-attach.
@@ -9994,6 +10264,7 @@ impl ChatState {
             streaming_thought: String::new(),
             pending_approval: None,
             pending_elicitation: None,
+            withdrawn_elicitations: Vec::new(),
             last_error: None,
             turn_in_flight: false,
             turn_generation: 0,
@@ -11421,8 +11692,82 @@ impl ChatState {
     /// before the first is answered is a protocol anomaly we resolve by
     /// keeping the newest).
     pub fn set_pending_elicitation(&mut self, e: PendingElicitation) {
+        self.withdraw_pending_elicitation(true);
         self.pending_elicitation = Some(e);
         self.mark_dirty_full();
+    }
+
+    /// Clear the pending elicitation without an answer, queueing the
+    /// `cancel` the daemon is waiting for. Every path that drops the modal
+    /// for a reason other than the user's answer goes through here.
+    fn withdraw_pending_elicitation(&mut self, note: bool) {
+        if let Some(e) = self.pending_elicitation.take() {
+            self.withdrawn_elicitations.push(WithdrawnElicitation {
+                request_id: Some(e.request_id),
+                note,
+                question: e.message,
+            });
+            self.mark_dirty_full();
+        }
+    }
+
+    fn take_withdrawn_elicitations(&mut self) -> Vec<WithdrawnElicitation> {
+        std::mem::take(&mut self.withdrawn_elicitations)
+    }
+
+    /// Note how a question ended (answered, dismissed, withdrawn, expired),
+    /// but only when no unanswered `ask_user` / `poll` card in the latest
+    /// user turn asked it. The
+    /// card is the record: it shows the question and choices in the agent's
+    /// turn, and its `result:` line shows the outcome once the tool returns,
+    /// so a line here would repeat both. The `elicitation/create` request
+    /// can reach the pane before the `ToolCall` update that draws the card
+    /// (the router drains inbound requests before notifications), which is
+    /// why nothing is written on arrival. With no matching card (an older
+    /// history, a card that never arrived) the line is appended so the
+    /// outcome is still on record, and it names the question because no
+    /// card shows it.
+    fn record_elicitation_outcome(&mut self, question: &str, text: String) {
+        if self.elicitation_card_index(question).is_some() {
+            return;
+        }
+        self.entries.push(ChatEntry::SystemMessage(Arc::<str>::from(
+            elicitation_outcome_note(question, &text),
+        )));
+        self.mark_dirty_append();
+    }
+
+    /// Match an unanswered card in the latest user turn. Completed cards
+    /// from earlier questions cannot stand in for a new request after a reload.
+    fn elicitation_card_index(&self, question: &str) -> Option<usize> {
+        let question = question.trim();
+        let turn_start = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, ChatEntry::UserMessage { .. }))
+            .unwrap_or(0);
+        self.entries[turn_start..]
+            .iter()
+            .rposition(|entry| {
+                let ChatEntry::Tool {
+                    name,
+                    input_json,
+                    result,
+                    ..
+                } = entry
+                else {
+                    return false;
+                };
+                result.is_none()
+                    && matches!(name.as_ref(), "ask_user" | "poll")
+                    && serde_json::from_str::<serde_json::Value>(input_json)
+                        .ok()
+                        .as_ref()
+                        .and_then(|input| input.get("question"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|q| q.trim() == question)
+            })
+            .map(|index| turn_start + index)
     }
 
     /// Commit any accumulated streaming thought as an entry. Called at the two
@@ -11778,6 +12123,16 @@ impl ChatState {
                 if let Some(message_count) = message_count {
                     self.message_count = message_count;
                 }
+                // Close the stale modal and still reply: an uncorrelated
+                // completion may race with a newer inbound elicitation.
+                if let Some(e) = self.pending_elicitation.take() {
+                    self.record_elicitation_outcome(
+                        &e.message,
+                        crate::i18n::t("zc-chat-elicitation-expired"),
+                    );
+                    self.pending_elicitation = Some(e);
+                    self.withdraw_pending_elicitation(false);
+                }
                 match outcome {
                     TurnEndOutcome::Completed => {
                         self.last_error = None;
@@ -12123,6 +12478,18 @@ impl ChatState {
         self.info_message = Some(crate::widgets::InfoMessage::note(msg));
     }
 
+    /// Open the session picker over `sessions`, selecting the first row.
+    fn open_session_list(&mut self, sessions: Vec<SessionEntry>) {
+        let mut list_state = ListState::default();
+        if !sessions.is_empty() {
+            list_state.select(Some(0));
+        }
+        self.session_overlay = SessionOverlay::List {
+            sessions,
+            list_state,
+        };
+    }
+
     fn surface_cleanup_report(&mut self, report: CleanupReport) {
         if let Some(message) = report.notice() {
             self.set_info_notice(message);
@@ -12336,7 +12703,7 @@ impl ChatState {
     fn prepare_for_reattach_resync(&mut self, mode: SessionResyncMode) {
         self.freeze_prompt_settled_stream();
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        self.withdraw_pending_elicitation(true);
         if mode == SessionResyncMode::Reattach {
             self.lag_reattach = None;
         }
@@ -12350,7 +12717,10 @@ impl ChatState {
     fn reset_turn_for_resync_reload(&mut self) {
         self.freeze_prompt_settled_stream();
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        // A prompt that arrived while the reload ran is still awaited by the
+        // daemon; dropping it silently left the tool call hanging until its
+        // timeout. Withdraw it so it is answered.
+        self.withdraw_pending_elicitation(true);
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.turn_in_flight = false;
@@ -12604,7 +12974,10 @@ impl ChatState {
         self.context_menu = None;
         self.copy_feedback = None;
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        self.withdraw_pending_elicitation(false);
+        for withdrawn in &mut self.withdrawn_elicitations {
+            withdrawn.note = false;
+        }
         self.last_error = None;
         self.turn_in_flight = false;
         self.message_count = 0;
@@ -15975,23 +16348,10 @@ mod tests {
         serde_json::from_str(&line).expect("RPC request should be JSON")
     }
 
-    /// Answer every follow-up request a transition emits (session/close,
-    /// model identity refresh, history load) with a permissive empty result,
-    /// until the pane goes quiet. Keeps transition tests focused on the
-    /// behavior under test rather than on exact RPC choreography.
+    /// Answer every follow-up request permissively; see
+    /// [`drain_and_record_methods`] for the drain behavior.
     async fn drain_pending_requests(rx: &mut mpsc::Receiver<String>, rpc: &RpcOutbound) {
-        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-        {
-            let request: serde_json::Value =
-                serde_json::from_str(&line).expect("RPC request should be JSON");
-            if let Some(id) = request["id"].as_str() {
-                rpc.dispatch_response(
-                    id,
-                    Some(serde_json::json!({ "messages": [], "sessions": [] })),
-                    None,
-                );
-            }
-        }
+        drain_and_record_methods(rx, rpc).await;
     }
 
     fn respond_ok(rpc: &RpcOutbound, request: &serde_json::Value, result: serde_json::Value) {
@@ -21608,6 +21968,484 @@ mod tests {
         chat.session_order.push(session_id.to_string());
         chat.phase = ChatPhase::Active(Box::new(state));
         chat
+    }
+
+    fn listed_session(id: &str, name: Option<&str>, channel: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": id,
+            "session_key": id,
+            "created_at": "2026-10-27T00:00:00Z",
+            "last_activity": "2026-10-27T00:05:00Z",
+            "message_count": 2,
+            "agent_alias": "alpha",
+            "channel_id": channel,
+            "name": name,
+        })
+    }
+
+    #[tokio::test]
+    async fn list_pane_sessions_uses_the_acp_store_for_code_panes() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let task =
+            tokio::spawn(async move { Chat::list_pane_sessions(&client, PaneKind::Acp).await });
+        let request = next_rpc_request(&mut rx, "Code panes list the ACP store").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "sessions": [listed_session("acp-1", None, None)] }),
+        );
+        let ids: Vec<String> = task
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(ids, ["acp-1"]);
+    }
+
+    #[tokio::test]
+    async fn list_pane_sessions_hides_channel_sessions_in_chat_panes() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let task =
+            tokio::spawn(async move { Chat::list_pane_sessions(&client, PaneKind::Chat).await });
+        let request = next_rpc_request(&mut rx, "Chat panes list the unified store").await;
+        assert_eq!(request["method"], method::SESSION_LIST);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "sessions": [
+                listed_session("chan-1", None, Some("telegram")),
+                listed_session("web-1", None, None),
+            ] }),
+        );
+        let ids: Vec<String> = task
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(ids, ["web-1"]);
+    }
+
+    #[tokio::test]
+    async fn list_pane_sessions_reports_store_errors() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let task =
+            tokio::spawn(async move { Chat::list_pane_sessions(&client, PaneKind::Acp).await });
+        let request = next_rpc_request(&mut rx, "listing should reach the daemon").await;
+        respond_err(&rpc, &request, -32000, "store unavailable");
+        let error = task.await.unwrap().expect_err("an RPC error must surface");
+        assert!(error.contains("store unavailable"), "got: {error}");
+    }
+
+    #[test]
+    fn open_session_list_selects_the_first_row_or_none() {
+        let mut state = state_for("sess-1", "alpha");
+        state.open_session_list(Vec::new());
+        let SessionOverlay::List {
+            sessions,
+            list_state,
+        } = &state.session_overlay
+        else {
+            panic!("the picker must open even when empty");
+        };
+        assert!(sessions.is_empty());
+        assert_eq!(list_state.selected(), None);
+
+        let entries = vec![
+            serde_json::from_value::<crate::client::SessionEntry>(listed_session("a", None, None))
+                .unwrap(),
+            serde_json::from_value::<crate::client::SessionEntry>(listed_session("b", None, None))
+                .unwrap(),
+        ];
+        state.open_session_list(entries);
+        let SessionOverlay::List {
+            sessions,
+            list_state,
+        } = &state.session_overlay
+        else {
+            panic!("the picker must open with entries");
+        };
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(list_state.selected(), Some(0));
+    }
+
+    /// Answer every follow-up request a transition emits (session/close,
+    /// model identity refresh, history load) with a permissive empty result,
+    /// until the pane goes quiet, and return the methods seen in order. Keeps
+    /// transition tests focused on the behavior under test rather than on
+    /// exact RPC choreography, while still letting a test assert that a
+    /// given request (e.g. `session/new`) was never sent.
+    async fn drain_and_record_methods(
+        rx: &mut mpsc::Receiver<String>,
+        rpc: &RpcOutbound,
+    ) -> Vec<String> {
+        let mut methods = Vec::new();
+        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        {
+            let request: serde_json::Value =
+                serde_json::from_str(&line).expect("RPC request should be JSON");
+            methods.push(request["method"].as_str().unwrap_or_default().to_string());
+            if let Some(id) = request["id"].as_str() {
+                rpc.dispatch_response(
+                    id,
+                    Some(serde_json::json!({ "messages": [], "sessions": [] })),
+                    None,
+                );
+            }
+        }
+        methods
+    }
+
+    #[tokio::test]
+    async fn load_session_by_uuid_attaches_from_the_acp_store() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-target").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        assert_eq!(list["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [
+                listed_session("sess-other", None, None),
+                listed_session("sess-target", None, None),
+            ] }),
+        );
+        let attach = next_rpc_request(&mut rx, "a unique match should attach").await;
+        assert_eq!(attach["method"], method::SESSION_NEW);
+        assert_eq!(attach["params"]["session_id"], "sess-target");
+        respond_ok(
+            &rpc,
+            &attach,
+            serde_json::json!({ "session_id": "sess-target", "workspace_dir": "/w" }),
+        );
+        drain_pending_requests(&mut rx, &rpc).await;
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-target"));
+        assert!(
+            chat.background.iter().any(|s| s.session_id == "sess-old"),
+            "the previously focused session stays live in the background"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_session_by_name_in_a_chat_pane_ignores_channel_sessions() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.session_order.push("sess-1".to_string());
+        chat.phase = ChatPhase::Active(Box::new(state_for("sess-1", "alpha")));
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("release notes").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the chat store").await;
+        assert_eq!(list["method"], method::SESSION_LIST);
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [
+                listed_session("sess-chan", Some("Release notes"), Some("telegram")),
+                listed_session("sess-web", Some("Release notes"), None),
+            ] }),
+        );
+        let attach = next_rpc_request(&mut rx, "the single non-channel match should attach").await;
+        assert_eq!(attach["method"], method::SESSION_NEW);
+        assert_eq!(attach["params"]["session_id"], "sess-web");
+        respond_ok(
+            &rpc,
+            &attach,
+            serde_json::json!({ "session_id": "sess-web", "workspace_dir": null }),
+        );
+        drain_pending_requests(&mut rx, &rpc).await;
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-web"));
+    }
+
+    #[tokio::test]
+    async fn load_session_focuses_a_background_session_without_attaching() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-bg".to_string());
+        chat.background.push(state_for("sess-bg", "alpha"));
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-bg").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [
+                listed_session("sess-old", None, None),
+                listed_session("sess-bg", None, None),
+            ] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert_eq!(chat.current_session_id(), Some("sess-bg"));
+        assert!(
+            !methods.iter().any(|m| m == method::SESSION_NEW),
+            "a tracked session must not be attached twice: {methods:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_session_on_the_focused_session_shows_a_notice() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-old").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [listed_session("sess-old", None, None)] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(methods.is_empty(), "no RPC beyond the listing: {methods:?}");
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t("zc-chat-load-session-already-active")
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_load_session_opens_a_filtered_picker() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-dup").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [
+                listed_session("sess-dup-1", None, None),
+                listed_session("sess-other", None, None),
+                listed_session("sess-dup-2", None, None),
+            ] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(!methods.iter().any(|m| m == method::SESSION_NEW));
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        let SessionOverlay::List {
+            sessions,
+            list_state,
+        } = &active_state(&mut chat).session_overlay
+        else {
+            panic!("an ambiguous query must open the session picker");
+        };
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["sess-dup-1", "sess-dup-2"]);
+        assert_eq!(list_state.selected(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn load_session_with_no_match_shows_a_notice_and_starts_nothing() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("nope").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [listed_session("sess-old", None, None)] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(!methods.iter().any(|m| m == method::SESSION_NEW));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t_args("zc-chat-load-session-not-found", &[("query", "nope")])
+        );
+    }
+
+    #[tokio::test]
+    async fn load_session_listing_failure_shows_a_notice_and_starts_nothing() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-target").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_err(&rpc, &list, -32000, "store unavailable");
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(!methods.iter().any(|m| m == method::SESSION_NEW));
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        let notice = active_info_notice(&chat);
+        assert!(notice.contains("store unavailable"), "got: {notice}");
+    }
+
+    #[tokio::test]
+    async fn load_session_respects_the_session_cap() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        for idx in 2..=MAX_TRACKED_SESSIONS_PER_PANE {
+            let session_id = format!("sess-{idx}");
+            chat.session_order.push(session_id.clone());
+            chat.background.push(state_for(&session_id, "alpha"));
+        }
+
+        let task = tokio::spawn(async move {
+            chat.load_session_by_query("sess-target").await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "load-session should list the ACP store").await;
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [listed_session("sess-target", None, None)] }),
+        );
+        let methods = drain_and_record_methods(&mut rx, &rpc).await;
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+
+        assert!(!methods.iter().any(|m| m == method::SESSION_NEW));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t_args(
+                "zc-chat-session-cap",
+                &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn load_session_command_reaches_the_handler_mid_turn() {
+        use crossterm::event::KeyCode;
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.input_bar.insert_text("/load-session sess-target");
+
+        let task = tokio::spawn(async move {
+            let mut term = headless_term();
+            chat.handle_key(KeyEvent::from(KeyCode::Enter), &mut term)
+                .await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "Enter on /load-session should list the store").await;
+        assert_eq!(list["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [listed_session("sess-target", None, None)] }),
+        );
+        let attach = next_rpc_request(&mut rx, "a unique match should attach mid-turn").await;
+        assert_eq!(attach["method"], method::SESSION_NEW);
+        assert_eq!(attach["params"]["session_id"], "sess-target");
+        respond_ok(
+            &rpc,
+            &attach,
+            serde_json::json!({ "session_id": "sess-target", "workspace_dir": "/w" }),
+        );
+        drain_pending_requests(&mut rx, &rpc).await;
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-target"));
     }
 
     fn headless_term() -> crate::config_manager::Term {
@@ -31251,6 +32089,505 @@ mod tests {
         assert!(
             s.pending_elicitation().is_none(),
             "a session switch must drop any stale elicitation modal"
+        );
+    }
+
+    #[test]
+    fn replacing_an_elicitation_queues_only_the_older_request() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        let mut newer = single_elicitation();
+        newer.request_id = serde_json::json!("newer");
+        s.set_pending_elicitation(newer);
+        let withdrawn = s.take_withdrawn_elicitations();
+        assert_eq!(withdrawn.len(), 1);
+        assert_eq!(withdrawn[0].request_id, Some(serde_json::json!("elicit-1")));
+        assert_eq!(
+            s.pending_elicitation().unwrap().request_id,
+            serde_json::json!("newer")
+        );
+    }
+
+    #[test]
+    fn older_elicitation_cards_do_not_hide_new_outcomes() {
+        let mut s = state();
+        stream_ask_user_turn(&mut s);
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-ask".to_string(),
+            raw_output: "Yes".to_string(),
+        });
+        s.record_elicitation_outcome("Pick one", "new withdrawal".to_string());
+        assert!(system_texts(&s).contains(&elicitation_outcome_note("Pick one", "new withdrawal")));
+
+        // An unanswered card from a prior user turn cannot match either.
+        let mut s = state();
+        stream_ask_user_turn(&mut s);
+        s.push_user_message(Some("Next turn".to_string()), Vec::new());
+        s.record_elicitation_outcome("Pick one", "new expiry".to_string());
+        assert!(system_texts(&s).contains(&elicitation_outcome_note("Pick one", "new expiry")));
+    }
+
+    #[tokio::test]
+    async fn withdrawn_elicitation_note_waits_for_resync_without_resending_cancel() {
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        chat.session_resync_in_flight.insert(
+            "sess-1".to_string(),
+            ResyncInFlight {
+                mode: SessionResyncMode::Reattach,
+                owned_turn: None,
+            },
+        );
+        let s = active_state(&mut chat);
+        s.set_pending_elicitation(single_elicitation());
+        s.withdraw_pending_elicitation(true);
+        chat.answer_withdrawn_elicitations();
+        let frame = next_rpc_request(&mut writer_rx, "cancel must not wait for reload").await;
+        assert_eq!(frame["result"]["action"], "cancel");
+        assert!(system_texts(active_state(&mut chat)).is_empty());
+        chat.answer_withdrawn_elicitations();
+        assert!(writer_rx.try_recv().is_err(), "cancel is sent only once");
+        chat.apply_session_resync_result(SessionResyncResult {
+            session_id: "sess-1".to_string(),
+            result: Ok(SessionResyncSnapshot {
+                messages: Vec::new(),
+                message_count: 0,
+                plan: None,
+                turn_running: false,
+            }),
+        });
+        chat.answer_withdrawn_elicitations();
+        assert!(
+            system_texts(active_state(&mut chat)).contains(&elicitation_outcome_note(
+                "Pick a fruit",
+                &crate::i18n::t("zc-chat-elicitation-withdrawn")
+            ))
+        );
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "recording the note sends no second cancel"
+        );
+    }
+
+    #[test]
+    fn elicitation_cards_bound_choices_and_preserve_expanded_results() {
+        for name in ["ask_user", "poll"] {
+            let choices: Vec<_> = (0..150).map(|i| format!("option-{i}")).collect();
+            let input = if name == "poll" {
+                serde_json::json!({"question": "Pick", "options": choices})
+            } else {
+                serde_json::json!({"question": "Pick", "choices": choices})
+            }
+            .to_string();
+            let result = format!("{}\nlast answer", "a".repeat(250));
+            let mut lines = Vec::new();
+            assert!(
+                render_tool_entry(
+                    &mut lines,
+                    name,
+                    &input,
+                    Some(&result),
+                    false,
+                    ToolDisclosure::Collapsed
+                )
+                .is_some()
+            );
+            let text = rendered_text(&lines);
+            assert!(text.contains("option-5"));
+            assert!(!text.contains("option-6"));
+            assert!(text.contains("144 more lines"));
+            assert!(!text.contains("last answer"));
+            lines.clear();
+            render_tool_entry(
+                &mut lines,
+                name,
+                &input,
+                Some(&result),
+                false,
+                ToolDisclosure::Full,
+            );
+            let text = rendered_text(&lines);
+            assert!(text.contains(&"a".repeat(250)));
+            assert!(text.contains("last answer"));
+            assert_eq!(text.matches("question:").count(), 1);
+            assert!(!text.contains("option-100"));
+            assert!(text.contains(&crate::i18n::t("zc-chat-tool-display-limited")));
+            assert!(lines.len() < 2 * TOOL_EXPANDED_MAX_LINES + 10);
+        }
+    }
+
+    #[test]
+    fn reset_for_session_queues_a_cancel_for_the_dropped_elicitation() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        let withdrawn = s.take_withdrawn_elicitations();
+        assert_eq!(withdrawn.len(), 1, "the daemon is still waiting on it");
+        assert_eq!(withdrawn[0].request_id, Some(serde_json::json!("elicit-1")));
+        assert!(
+            !withdrawn[0].note,
+            "the old session's note does not belong in the new one"
+        );
+    }
+
+    fn system_texts(state: &ChatState) -> Vec<String> {
+        state
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::SystemMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression (2026-10-09): a prompt that arrives while a reattach reload
+    /// is in flight was installed, then wiped by the reload's turn reset with
+    /// no reply. The daemon's `ask_user` waited out its 600 s timeout and the
+    /// user never saw the question. It must be answered `cancel` and noted.
+    #[tokio::test]
+    async fn elicitation_installed_during_reload_is_answered_not_dropped() {
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        chat.session_resync_in_flight.insert(
+            "sess-1".to_string(),
+            ResyncInFlight {
+                mode: SessionResyncMode::Reattach,
+                owned_turn: None,
+            },
+        );
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-mid", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+
+        chat.apply_session_resync_result(SessionResyncResult {
+            session_id: "sess-1".to_string(),
+            result: Ok(SessionResyncSnapshot {
+                messages: Vec::new(),
+                message_count: 0,
+                plan: None,
+                turn_running: false,
+            }),
+        });
+        chat.answer_withdrawn_elicitations();
+
+        let frame = next_rpc_request(&mut writer_rx, "the dropped prompt must be answered").await;
+        assert_eq!(frame["id"], "e-mid");
+        assert_eq!(frame["result"]["action"], "cancel");
+        let state = active_state(&mut chat);
+        assert!(state.pending_elicitation.is_none());
+        let withdrawn =
+            elicitation_outcome_note("Pick one", &crate::i18n::t("zc-chat-elicitation-withdrawn"));
+        assert!(
+            withdrawn.contains("Pick one"),
+            "the note names the dropped question"
+        );
+        assert_eq!(
+            system_texts(state).last(),
+            Some(&withdrawn),
+            "the note lands after the reloaded history"
+        );
+    }
+
+    /// The agent's turn as the daemon streams it before an `ask_user`: some
+    /// text, then the tool call whose card carries the question.
+    fn stream_ask_user_turn(state: &mut ChatState) {
+        state.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "Answer this one:".to_string(),
+        });
+        state.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-ask".to_string(),
+            name: "ask_user".to_string(),
+            raw_input: serde_json::json!({
+                "channel": "rpc",
+                "choices": ["Yes", "No"],
+                "question": "Pick one"
+            }),
+        });
+    }
+
+    fn rendered_transcript(state: &mut ChatState) -> String {
+        state.rebuild_lines(200);
+        rendered_text(&state.transcript_layout.view().cached_lines)
+    }
+
+    fn test_term() -> crate::config_manager::Term {
+        ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap()
+    }
+
+    // Keymap overrides are process-global; hold the test lock across the
+    // key dispatch so another test cannot remap Enter mid-test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn elicitation_question_choices_and_answer_are_recorded() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crossterm::event::{KeyCode, KeyModifiers};
+        crate::keymap::overrides::reset();
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        stream_ask_user_turn(active_state(&mut chat));
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-rec", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+        assert!(
+            system_texts(active_state(&mut chat)).is_empty(),
+            "the tool card is the record of the question; arrival adds no line"
+        );
+
+        let mut term = test_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+            .await;
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await;
+
+        let frame = next_rpc_request(&mut writer_rx, "the answer must be sent").await;
+        assert_eq!(frame["id"], "e-rec");
+        assert_eq!(frame["result"]["content"]["choice"], "choice-1");
+        let state = active_state(&mut chat);
+        state.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-ask".to_string(),
+            raw_output: "No".to_string(),
+        });
+        assert!(
+            system_texts(state).is_empty(),
+            "the card's result is the record of the answer; no extra line"
+        );
+        let text = rendered_transcript(state);
+        assert_eq!(
+            text.matches("Pick one").count(),
+            1,
+            "the question is shown once, on the card: {text}"
+        );
+        assert!(text.contains("  question: Pick one"), "{text}");
+        assert!(
+            text.contains("    2. No"),
+            "the choices stay on record: {text}"
+        );
+    }
+
+    /// Regression (dogfood, 2026-10-13 and 2026-10-17): the "asked" line was
+    /// written when `elicitation/create` arrived, which can be before the
+    /// agent's text and the `ask_user` `ToolCall` are drained, so it sat
+    /// above the agent label and repeated the card. The outcome line then
+    /// repeated the card's `result:`. Here the request lands first, the turn
+    /// streams in after it, a parallel tool call finishes, and the user
+    /// presses Esc. The question appears once, inside the agent's turn, and
+    /// no outcome line is added next to the card.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn elicitation_with_a_card_adds_no_outcome_line() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crossterm::event::{KeyCode, KeyModifiers};
+        crate::keymap::overrides::reset();
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-ord", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+        let state = active_state(&mut chat);
+        stream_ask_user_turn(state);
+        state.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-shell".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "ls"}),
+        });
+        state.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-shell".to_string(),
+            raw_output: "file.txt".to_string(),
+        });
+        state.browse_cursor = Some(2);
+
+        let mut term = test_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await;
+        let frame = next_rpc_request(&mut writer_rx, "the dismissal must be sent").await;
+        assert_eq!(frame["id"], "e-ord");
+        assert_eq!(frame["result"]["action"], "cancel");
+
+        let state = active_state(&mut chat);
+        let kinds: Vec<String> = state
+            .entries()
+            .iter()
+            .map(|entry| match entry {
+                ChatEntry::AgentMessage(_) => "agent".to_string(),
+                ChatEntry::Tool { name, .. } => format!("tool:{name}"),
+                ChatEntry::SystemMessage(text) => format!("system:{text}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "agent".to_string(),
+                "tool:ask_user".to_string(),
+                "tool:shell".to_string(),
+            ]
+        );
+        assert_eq!(
+            state.browse_cursor,
+            Some(2),
+            "the browse cursor is untouched"
+        );
+        let text = rendered_transcript(state);
+        assert_eq!(text.matches("Pick one").count(), 1, "{text}");
+        let label = text
+            .find(&crate::i18n::t("zc-chat-label-agent"))
+            .expect("agent label");
+        let question = text.find("question: Pick one").expect("card question");
+        assert!(
+            label < question,
+            "the card sits inside the agent turn: {text}"
+        );
+    }
+
+    #[test]
+    fn turn_complete_closes_a_stale_elicitation_and_records_it() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
+        assert!(
+            s.pending_elicitation().is_none(),
+            "nobody is waiting on a prompt once its turn ends"
+        );
+        assert!(
+            system_texts(&s).contains(&elicitation_outcome_note(
+                "Pick a fruit",
+                &crate::i18n::t("zc-chat-elicitation-expired")
+            )),
+            "the unanswered outcome is recorded"
+        );
+        let withdrawn = s.take_withdrawn_elicitations();
+        assert_eq!(withdrawn.len(), 1);
+        assert_eq!(withdrawn[0].request_id, Some(serde_json::json!("elicit-1")));
+        assert!(!withdrawn[0].note, "the expiry was already recorded");
+    }
+
+    #[test]
+    fn ask_user_card_leads_with_the_question_and_lists_choices() {
+        // Key-sorted, as the daemon serializes tool input.
+        let input = serde_json::json!({
+            "channel": "rpc",
+            "choices": [
+                "A+B+C as proposed, filing all three upstream tonight",
+                "Only A and C now, B waits for the dogfood rebase",
+                "Something else (I'll type)"
+            ],
+            "question": "Which plan should I follow for the three bugs?",
+            "timeout_secs": 600
+        })
+        .to_string();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "ask_user",
+            &input,
+            Some("Only A and C now, B waits for the dogfood rebase"),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let text = rendered_text(&lines);
+        assert!(
+            text.contains("  question: Which plan should I follow for the three bugs?"),
+            "{text}"
+        );
+        assert!(text.contains("    1. A+B+C as proposed"), "{text}");
+        assert!(text.contains("    3. Something else (I'll type)"), "{text}");
+        assert!(
+            text.find("question:") < text.find("result:"),
+            "question before the outcome: {text}"
+        );
+    }
+
+    #[test]
+    fn expanded_ask_user_card_shows_whole_choices_within_shared_limits() {
+        let long = format!("{} end-of-long-choice", "word ".repeat(60));
+        let input = serde_json::json!({
+            "choices": [long, "first line\nsecond line of the choice", "short"],
+            "question": "Which one?"
+        })
+        .to_string();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "ask_user",
+            &input,
+            None,
+            false,
+            ToolDisclosure::Full,
+        );
+        let text = rendered_text(&lines);
+        assert!(text.contains("end-of-long-choice"), "{text}");
+        assert!(text.contains("    2. first line"), "{text}");
+        assert!(text.contains("       second line of the choice"), "{text}");
+        assert!(text.contains("    3. short"), "{text}");
+
+        let mut collapsed = Vec::new();
+        render_tool_entry(
+            &mut collapsed,
+            "ask_user",
+            &input,
+            None,
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed = rendered_text(&collapsed);
+        assert!(!collapsed.contains("end-of-long-choice"), "{collapsed}");
+        assert!(
+            !collapsed.contains("second line of the choice"),
+            "{collapsed}"
+        );
+    }
+
+    #[test]
+    fn expanded_ask_user_choices_stop_at_the_shared_line_limit() {
+        let choices: Vec<String> = (0..TOOL_EXPANDED_MAX_LINES)
+            .map(|i| format!("choice {i}\nmore {i}"))
+            .collect();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "poll",
+            &serde_json::json!({ "options": choices, "question": "Pick" }).to_string(),
+            None,
+            false,
+            ToolDisclosure::Full,
+        );
+        let choice_rows = rendered_text(&lines)
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.trim_start().is_empty())
+            .filter(|line| line.contains("choice ") || line.contains("more "))
+            .count();
+        assert_eq!(choice_rows, TOOL_EXPANDED_MAX_LINES);
+        assert!(
+            rendered_text(&lines).contains(&crate::i18n::t("zc-chat-tool-show-less")),
+            "the cut-off list keeps its footer"
         );
     }
 
