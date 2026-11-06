@@ -98,3 +98,33 @@ and `structuredClone()`.
 - Edge 111+
 - Firefox 113+
 - Safari 16.2+
+
+## Browser voice controls
+
+Paired browsers can open **Config → Voice and audio** to enable microphone and
+speaker controls in chat. Preferences live in the gateway's `devices.db`, on the
+existing paired-device record, and survive page reloads and gateway restarts.
+`GET` and `PUT /api/devices/me/voice` resolve that record from the authenticated
+paired bearer token; the client cannot choose a different device ID. Revoking
+or rotating a device removes its preferences along with the existing device
+record. Cookie-only OIDC sessions and unpaired access do not have a paired-device
+identity and cannot use this preference API.
+
+Dictation defaults to on-device recognition. It requires HTTPS (or localhost),
+a compatible browser, microphone permission, and an available language pack.
+Downloading a pack requires an explicit action. An unavailable local recognizer
+never silently falls back to a network service. Users can explicitly choose the
+browser-service mode, which may send microphone audio to the browser provider.
+The gateway does not receive microphone audio; final transcriptions enter the
+message draft and are sent only when the user submits it.
+
+Reading uses a voice reported by the browser. The selector identifies local and
+online voices; availability can change with the OS or browser. No particular
+voice or gender is guaranteed. Click the speaker to read the latest assistant
+reply or stop active reading. Hold it to enable continuous reading; click again
+to disable it. Shift+Enter on the focused speaker toggles continuous reading.
+This chat-scoped override does not alter the saved automatic-reading default.
+Automatic reading excludes historical hydration, tool output, and reasoning.
+Capture and playback stop when their chat closes, changes session, or becomes
+hidden. Permissions Policy allows microphone and on-device speech recognition
+only for the gateway origin; user microphone consent remains required.

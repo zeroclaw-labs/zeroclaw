@@ -29,6 +29,8 @@ const storage = new MemoryStorage();
 const fakeWindow = {
   location: { protocol: 'http:', host: 'localhost' },
   dispatchEvent: () => true,
+  addEventListener: () => {},
+  removeEventListener: () => {},
 };
 const fakeDocument = {
   addEventListener: () => {},

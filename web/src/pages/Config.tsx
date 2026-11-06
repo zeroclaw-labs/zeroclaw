@@ -1,3 +1,4 @@
+import BrowserVoiceSettings from '@/components/BrowserVoiceSettings';
 // Schema-driven config editor (#6175). Curated section explorer
 // but lands on a per-section overview: pick a section in the sidebar, see
 // what's currently configured under it, click an item to edit, click +Add
@@ -584,7 +585,9 @@ export default function Config() {
   const hasSelection = Boolean(sectionParam);
 
   return (
-    <div className="flex h-full overflow-hidden">
+    <div className="flex flex-col h-full overflow-hidden">
+      <BrowserVoiceSettings />
+      <div className="flex flex-1 min-h-0 overflow-hidden">
       {!lockedSection && (
         // Master navigator: searchable section → entity tree. Selecting an
         // entity navigates to its existing form URL so the detail pane's
@@ -714,6 +717,7 @@ export default function Config() {
           )
         )}
       </main>
+      </div>
     </div>
   );
 }
