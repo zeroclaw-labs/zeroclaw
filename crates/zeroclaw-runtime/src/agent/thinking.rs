@@ -15,6 +15,9 @@ pub struct ThinkingParams {
     /// Native extended thinking parameters, populated when the config enables
     /// native thinking and the level has a `budget_tokens` value.
     pub native_thinking: Option<zeroclaw_config::scattered_types::NativeThinkingParams>,
+    /// Opted-in neutral level, including levels without a token budget.
+    /// Provider leaves map this against the model selected for each request.
+    pub native_level: Option<ThinkingLevel>,
 }
 
 pub fn parse_thinking_directive(message: &str) -> Option<(ThinkingLevel, String)> {
@@ -55,6 +58,7 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                     .into(),
             ),
             native_thinking: None,
+            native_level: None,
         },
         ThinkingLevel::Minimal => ThinkingParams {
             temperature_adjustment: -0.1,
@@ -65,18 +69,21 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                     .into(),
             ),
             native_thinking: None,
+            native_level: None,
         },
         ThinkingLevel::Low => ThinkingParams {
             temperature_adjustment: -0.05,
             max_tokens_adjustment: 0,
             system_prompt_prefix: Some("Keep reasoning light. Explain only when helpful.".into()),
             native_thinking: None,
+            native_level: None,
         },
         ThinkingLevel::Medium => ThinkingParams {
             temperature_adjustment: 0.0,
             max_tokens_adjustment: 0,
             system_prompt_prefix: None,
             native_thinking: None,
+            native_level: None,
         },
         ThinkingLevel::High => ThinkingParams {
             temperature_adjustment: 0.05,
@@ -87,6 +94,7 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                     .into(),
             ),
             native_thinking: None,
+            native_level: None,
         },
         ThinkingLevel::Max => ThinkingParams {
             temperature_adjustment: 0.1,
@@ -98,6 +106,7 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                     .into(),
             ),
             native_thinking: None,
+            native_level: None,
         },
     }
 }
@@ -110,6 +119,7 @@ pub fn apply_thinking_level_with_config(
 ) -> ThinkingParams {
     use zeroclaw_config::scattered_types::{MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS};
     let mut params = apply_thinking_level(level);
+    params.native_level = config.native_thinking.then_some(level);
     if config.native_thinking
         && let Some(budget) = config.budget_tokens_for(level)
     {
@@ -134,6 +144,18 @@ pub fn apply_thinking_level_with_config(
         });
     }
     params
+}
+
+/// Bind budget and neutral level from one resolved selection to a turn.
+/// Separate carriers preserve budget-provider behavior for budgetless levels.
+pub fn scope_native_thinking<F: std::future::Future>(
+    params: &ThinkingParams,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> + use<F> {
+    zeroclaw_api::NATIVE_THINKING_OVERRIDE.scope(
+        params.native_thinking,
+        zeroclaw_api::NATIVE_THINKING_LEVEL.scope(params.native_level, future),
+    )
 }
 
 pub fn resolve_thinking_level(
@@ -194,6 +216,82 @@ pub fn resolve_thinking_from_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_level_is_independent_of_the_existing_budget_policy() {
+        let config = ThinkingConfig {
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ] {
+            let params = apply_thinking_level_with_config(level, &config);
+            assert_eq!(params.native_level, Some(level));
+            assert_eq!(
+                params
+                    .native_thinking
+                    .map(|thinking| thinking.budget_tokens),
+                config.budget_tokens_for(level),
+            );
+            assert_eq!(
+                apply_thinking_level_with_config(level, &ThinkingConfig::default()).native_level,
+                None,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_native_scopes_keep_budgetless_levels_isolated_and_restore_parent() {
+        let config = ThinkingConfig {
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let parent = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        let low = apply_thinking_level_with_config(ThinkingLevel::Low, &config);
+        let off = apply_thinking_level_with_config(ThinkingLevel::Off, &config);
+        scope_native_thinking(&parent, async {
+            tokio::join!(
+                scope_native_thinking(&low, async {
+                    tokio::task::yield_now().await;
+                    assert_eq!(
+                        zeroclaw_api::current_native_thinking_level(),
+                        Some(ThinkingLevel::Low)
+                    );
+                    assert_eq!(
+                        zeroclaw_api::NATIVE_THINKING_OVERRIDE.with(|value| *value),
+                        None
+                    );
+                }),
+                scope_native_thinking(&off, async {
+                    tokio::task::yield_now().await;
+                    assert_eq!(
+                        zeroclaw_api::current_native_thinking_level(),
+                        Some(ThinkingLevel::Off)
+                    );
+                    assert_eq!(
+                        zeroclaw_api::NATIVE_THINKING_OVERRIDE.with(|value| *value),
+                        None
+                    );
+                }),
+            );
+            assert_eq!(
+                zeroclaw_api::current_native_thinking_level(),
+                Some(ThinkingLevel::High)
+            );
+            assert_eq!(
+                zeroclaw_api::NATIVE_THINKING_OVERRIDE.with(|value| *value),
+                parent.native_thinking
+            );
+        })
+        .await;
+        assert_eq!(zeroclaw_api::current_native_thinking_level(), None);
+    }
 
     // ── ThinkingLevel parsing ────────────────────────────────────
 

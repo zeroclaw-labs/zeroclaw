@@ -95,6 +95,7 @@ impl ResolvedModelAccess<'_> {
         let ChatRequest {
             messages,
             tools,
+            thinking_level,
             thinking,
         } = request;
         let sanitized = multimodal::sanitize_audio_markers(messages);
@@ -102,6 +103,7 @@ impl ResolvedModelAccess<'_> {
         let request = ChatRequest {
             messages: &sanitized,
             tools,
+            thinking_level,
             thinking,
         };
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
@@ -497,6 +499,76 @@ mod run_model_query_tests {
         }
     }
 
+    #[tokio::test]
+    async fn run_model_query_preserves_native_thinking_while_sanitizing_messages() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingLevel};
+        struct NativeQueryProbe;
+        impl Attributable for NativeQueryProbe {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "native-query-probe"
+            }
+        }
+        #[async_trait]
+        impl ModelProvider for NativeQueryProbe {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("query must use ChatRequest")
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                assert_eq!(request.thinking_level, Some(ThinkingLevel::Low));
+                assert_eq!(
+                    request.thinking.map(|thinking| thinking.budget_tokens),
+                    Some(2_048)
+                );
+                assert!(!request.messages[0].content.contains("[IMAGE:"));
+                Ok(ChatResponse {
+                    text: Some("native query complete".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        let messages = [ChatMessage::user(
+            "inspect [IMAGE:https://example.test/frame.png]",
+        )];
+        let result = ResolvedModelAccess {
+            model_provider: &NativeQueryProbe,
+            provider_name: "custom",
+            model: "test-model",
+            dispatch_model: "test-model",
+            temperature: None,
+        }
+        .run_model_query(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: Some(NativeThinkingParams {
+                    budget_tokens: 2_048,
+                    display: None,
+                }),
+                thinking_level: Some(ThinkingLevel::Low),
+            },
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.text.as_deref(), Some("native query complete"));
+    }
+
     // Unscoped: no cost-tracking context on the task. Budget-gate allows (no-op),
     // usage recording is skipped, and the call still returns the provider's
     // response. This is the tests / CLI-without-cost shape.
@@ -509,6 +581,7 @@ mod run_model_query_tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 &mut Vec::new(),
@@ -535,6 +608,7 @@ mod run_model_query_tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         &mut Vec::new(),
@@ -583,6 +657,7 @@ mod run_model_query_tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     &mut summaries,
@@ -644,6 +719,7 @@ mod run_model_query_tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     &mut summaries,
@@ -714,6 +790,7 @@ mod run_model_query_tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         &mut summaries,
@@ -780,6 +857,7 @@ mod run_model_query_tests {
                             ChatRequest {
                                 messages: &messages,
                                 tools: None,
+                                thinking_level: None,
                                 thinking: None,
                             },
                             &mut Vec::new(),
@@ -832,6 +910,7 @@ mod run_model_query_tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         &mut Vec::new(),

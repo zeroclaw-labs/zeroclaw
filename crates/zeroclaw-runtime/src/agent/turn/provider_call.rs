@@ -494,6 +494,7 @@ pub(crate) async fn call_provider(
                                 let request = ChatRequest {
                                     messages: recovery_messages,
                                     tools: request_tools,
+                                    thinking_level: original_request.thinking_level,
                                     thinking: original_request.thinking,
                                 };
                                 let recovery = with_exact_dispatch_route(
@@ -621,6 +622,7 @@ pub(crate) async fn call_provider(
                                         messages: image_recovery_messages
                                             .unwrap_or(prepared_messages),
                                         tools: request_tools,
+                                        thinking_level: original_request.thinking_level,
                                         thinking: original_request.thinking,
                                     },
                                     active_dispatch_model,
@@ -1257,6 +1259,149 @@ mod streaming_fallback_tests {
             serving_model: None,
         }
     }
+    struct NativeLevelRecoveryProvider {
+        requests: std::sync::Mutex<
+            Vec<(
+                Option<zeroclaw_api::model_provider::ThinkingLevel>,
+                Option<u32>,
+            )>,
+        >,
+        reject_image: bool,
+    }
+    impl Attributable for NativeLevelRecoveryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "native-level-recovery"
+        }
+    }
+    impl NativeLevelRecoveryProvider {
+        fn record(&self, request: ChatRequest<'_>) {
+            self.requests.lock().unwrap().push((
+                request.thinking_level,
+                request.thinking.map(|thinking| thinking.budget_tokens),
+            ));
+        }
+    }
+    #[async_trait]
+    impl ModelProvider for NativeLevelRecoveryProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("recovery must use ChatRequest")
+        }
+        fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
+            true
+        }
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.record(request);
+            let event = if self.reject_image {
+                Err(StreamError::HttpStatus {
+                    status: 400,
+                    message: "image request rejected".into(),
+                })
+            } else {
+                Ok(StreamEvent::Final)
+            };
+            Box::pin(futures_util::stream::iter([event]))
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.record(request);
+            if self.reject_image
+                && request
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("[IMAGE:"))
+            {
+                return Err(StreamError::HttpStatus {
+                    status: 400,
+                    message: "rejected request".into(),
+                }
+                .into());
+            }
+            Ok(ChatResponse {
+                text: Some("recovered native context".into()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn native_thinking_request_survives_stream_and_image_reconstruction_over_ambient_scope() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingLevel};
+        for (streaming, image_rejection) in [(true, false), (false, true), (true, true)] {
+            let provider = NativeLevelRecoveryProvider {
+                requests: Default::default(),
+                reject_image: image_rejection,
+            };
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let ctx = recovery_test_ctx(&observer, &pacing);
+            let original = [ChatMessage::user("[IMAGE:data:image/png;base64,aGVsbG8=]")];
+            let recovery = [ChatMessage::user("image omitted")];
+            let outcome = zeroclaw_api::NATIVE_THINKING_LEVEL
+                .scope(
+                    Some(ThinkingLevel::High),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-provider",
+                        "test-model",
+                        "test-model",
+                        ChatRequest {
+                            messages: &original,
+                            tools: None,
+                            thinking: Some(NativeThinkingParams {
+                                budget_tokens: 2_048,
+                                display: None,
+                            }),
+                            thinking_level: Some(ThinkingLevel::Low),
+                        },
+                        image_rejection.then_some(recovery.as_slice()),
+                        streaming,
+                        ToolRoundPolicy::Batch,
+                        0,
+                        None,
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.chat_result.unwrap().text.as_deref(),
+                Some("recovered native context")
+            );
+            assert_eq!(outcome.image_recovery_succeeded, image_rejection);
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| *request == (Some(ThinkingLevel::Low), Some(2_048)))
+            );
+        }
+    }
+
     struct RejectedImageThenPendingProvider {
         calls: AtomicUsize,
         recovery_started: tokio::sync::Notify,
@@ -1332,6 +1477,7 @@ mod streaming_fallback_tests {
                 ChatRequest {
                     messages: &original,
                     tools: None,
+                    thinking_level: zeroclaw_api::current_native_thinking_level(),
                     thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .try_with(Clone::clone)
                         .ok()
@@ -1385,6 +1531,7 @@ mod streaming_fallback_tests {
                 ChatRequest {
                     messages: &original,
                     tools: None,
+                    thinking_level: zeroclaw_api::current_native_thinking_level(),
                     thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .try_with(Clone::clone)
                         .ok()
@@ -1956,6 +2103,7 @@ mod streaming_fallback_tests {
                         ChatRequest {
                             messages: &[ChatMessage::user("go")],
                             tools: None,
+                            thinking_level: zeroclaw_api::current_native_thinking_level(),
                             thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                                 .try_with(Clone::clone)
                                 .ok()
@@ -2067,6 +2215,7 @@ mod streaming_fallback_tests {
             ChatRequest {
                 messages: &[ChatMessage::user("go")],
                 tools: None,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
@@ -2130,6 +2279,7 @@ mod streaming_fallback_tests {
             ChatRequest {
                 messages: &[ChatMessage::user("go")],
                 tools: None,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
@@ -2274,6 +2424,7 @@ mod streaming_fallback_tests {
                 ChatRequest {
                     messages: &[ChatMessage::user("go")],
                     tools: None,
+                    thinking_level: zeroclaw_api::current_native_thinking_level(),
                     thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .try_with(Clone::clone)
                         .ok()
@@ -2405,6 +2556,7 @@ mod streaming_fallback_tests {
             ChatRequest {
                 messages: &original,
                 tools: None,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
@@ -2495,6 +2647,7 @@ mod streaming_fallback_tests {
                 ChatRequest {
                     messages: &[ChatMessage::user("go")],
                     tools: None,
+                    thinking_level: zeroclaw_api::current_native_thinking_level(),
                     thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .try_with(Clone::clone)
                         .ok()
@@ -2607,6 +2760,7 @@ mod streaming_fallback_tests {
             ChatRequest {
                 messages: &[ChatMessage::user("go")],
                 tools: None,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
@@ -2686,6 +2840,7 @@ mod streaming_fallback_tests {
             ChatRequest {
                 messages: &[ChatMessage::user("go")],
                 tools: None,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
@@ -2766,6 +2921,7 @@ mod streaming_fallback_tests {
             ChatRequest {
                 messages: &[ChatMessage::user("go")],
                 tools: None,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
@@ -2903,6 +3059,7 @@ mod streaming_fallback_tests {
                     ChatRequest {
                         messages: &original,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     Some(&recovery),
@@ -3105,6 +3262,7 @@ mod streaming_fallback_tests {
             ChatRequest {
                 messages: &original,
                 tools: None,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
@@ -3164,6 +3322,7 @@ mod streaming_fallback_tests {
             ChatRequest {
                 messages: &original,
                 tools: None,
+                thinking_level: zeroclaw_api::current_native_thinking_level(),
                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .try_with(Clone::clone)
                     .ok()
@@ -3218,6 +3377,7 @@ mod streaming_fallback_tests {
                 ChatRequest {
                     messages: &original,
                     tools: None,
+                    thinking_level: zeroclaw_api::current_native_thinking_level(),
                     thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .try_with(Clone::clone)
                         .ok()
@@ -3339,6 +3499,7 @@ mod streaming_fallback_tests {
                 ChatRequest {
                     messages: &original,
                     tools: None,
+                    thinking_level: zeroclaw_api::current_native_thinking_level(),
                     thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .try_with(Clone::clone)
                         .ok()
@@ -3397,6 +3558,7 @@ mod streaming_fallback_tests {
                 ChatRequest {
                     messages: &original,
                     tools: None,
+                    thinking_level: zeroclaw_api::current_native_thinking_level(),
                     thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .try_with(Clone::clone)
                         .ok()
@@ -3562,6 +3724,7 @@ mod streaming_fallback_tests {
                         ChatRequest {
                             messages: &[ChatMessage::user("go")],
                             tools: None,
+                            thinking_level: zeroclaw_api::current_native_thinking_level(),
                             thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                                 .try_with(Clone::clone)
                                 .ok()
@@ -3676,6 +3839,7 @@ mod streaming_fallback_tests {
                         ChatRequest {
                             messages: &[ChatMessage::user("go")],
                             tools: None,
+                            thinking_level: zeroclaw_api::current_native_thinking_level(),
                             thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                                 .try_with(Clone::clone)
                                 .ok()
@@ -3943,6 +4107,7 @@ mod streaming_fallback_tests {
                         ChatRequest {
                             messages: &[ChatMessage::user("go")],
                             tools: None,
+                            thinking_level: zeroclaw_api::current_native_thinking_level(),
                             thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                                 .try_with(Clone::clone)
                                 .ok()
@@ -4028,6 +4193,7 @@ mod streaming_fallback_tests {
                         ChatRequest {
                             messages: &[ChatMessage::user("go")],
                             tools: None,
+                            thinking_level: zeroclaw_api::current_native_thinking_level(),
                             thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                                 .try_with(Clone::clone)
                                 .ok()

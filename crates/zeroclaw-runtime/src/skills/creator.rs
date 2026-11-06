@@ -215,6 +215,7 @@ impl SkillCreator {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 &mut Vec::new(),

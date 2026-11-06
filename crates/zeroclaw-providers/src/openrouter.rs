@@ -1172,6 +1172,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -1213,6 +1214,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -1293,6 +1295,7 @@ data: [DONE]
         let request = crate::traits::ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let mut stream = provider.stream_chat(
@@ -1506,6 +1509,7 @@ data: [DONE]
         let request = ProviderChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = model_provider
@@ -2483,6 +2487,7 @@ data: [DONE]
             ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "anthropic/claude-haiku-4-5",
