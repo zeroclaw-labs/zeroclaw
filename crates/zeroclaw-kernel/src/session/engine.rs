@@ -32,6 +32,16 @@ pub trait EngineSessionSource: Send + Sync {
     /// must authorize before disclosing this descriptor to a caller.
     async fn describe(&self, session_id: String) -> anyhow::Result<Option<SessionDescriptor>>;
     async fn sessions(&self) -> anyhow::Result<Vec<String>>;
+    /// Discovery uses the rebuildable metadata index, never one history replay
+    /// per session. Filter with current authority before applying the limit.
+    async fn list(
+        &self,
+        _actor: EventActor,
+        _policy: Arc<dyn SessionAccessPolicy>,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<views::SessionSummary>> {
+        anyhow::bail!("session_index_query_unsupported")
+    }
     /// Trusted host retention command. Closing retains the append-only audit
     /// trail; it never erases payloads or expires a running execution.
     async fn archive_stale(
@@ -95,68 +105,25 @@ impl views::SessionHistoryReadPort for EngineSession {
     }
 
     async fn list(&self, limit: usize) -> anyhow::Result<Vec<views::SessionSummary>> {
+        if let Some(source) = &self.source {
+            return source
+                .list(self.actor.clone(), self.authority.clone(), limit)
+                .await;
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let current = self.query().summary(self.stream.clone()).await?;
-        let current_id = self.stream.as_str().to_owned();
-        let visible = if let Some(source) = &self.source {
-            Some(source.sessions().await?)
-        } else {
-            None
-        };
-        let current_visible = visible.as_ref().map_or_else(
-            || {
-                current
-                    .fields
-                    .get("session_kind")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("temporary")
-            },
-            |sessions| sessions.contains(&current_id),
-        );
-        let mut summaries = Vec::new();
-        if current_visible {
-            summaries.push(current);
-        }
-        if let (Some(source), EventActor::Principal { principal_id }) = (&self.source, &self.actor)
+        if current.closed
+            || current
+                .fields
+                .get("session_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("temporary")
         {
-            for session_id in visible.into_iter().flatten() {
-                if session_id == current_id {
-                    continue;
-                }
-                let stream = zeroclaw_api::session_events::SessionId::parse(session_id.to_owned())?;
-                match SessionAccessPolicy::authorize_actor(
-                    self.authority.as_ref(),
-                    &self.actor,
-                    &stream,
-                    SessionAccess::Read,
-                ) {
-                    Ok(()) => {}
-                    Err(SessionError::PermissionDenied(_)) => continue,
-                    Err(error) => return Err(error.into()),
-                }
-                if let Some(native) = source
-                    .query(
-                        session_id,
-                        PrincipalId(principal_id.clone()),
-                        self.authority.clone(),
-                    )
-                    .await?
-                {
-                    summaries.push(native.query.summary(native.stream).await?);
-                }
-            }
+            return Ok(Vec::new());
         }
-        summaries.retain(|summary| !summary.closed);
-        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-        summaries.truncate(limit);
-        for summary in &summaries {
-            SessionAccessPolicy::authorize_actor(
-                self.authority.as_ref(),
-                &self.actor,
-                &summary.head.session_id,
-                SessionAccess::Read,
-            )?;
-        }
-        Ok(summaries)
+        Ok(vec![current])
     }
 
     async fn history(
