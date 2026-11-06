@@ -394,7 +394,8 @@ impl Drop for StartupReadinessAttempt {
 mod registry;
 pub use registry::{DaemonInboundAuthority, DaemonRegistry, GatewayReloadControls};
 
-const STATUS_FLUSH_SECONDS: u64 = 5;
+/// Interval between writes to the daemon state file.
+pub const STATUS_FLUSH_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonExit {
