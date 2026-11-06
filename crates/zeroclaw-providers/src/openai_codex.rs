@@ -358,6 +358,31 @@ pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
     })
 }
 
+fn responses_tool_output(value: &Value) -> Value {
+    let Some(text) = value.get("content").and_then(Value::as_str) else {
+        return Value::String(String::new());
+    };
+    let mut images: Vec<Value> =
+        zeroclaw_api::tool_carrier::native_attachments(value.get("attachments"))
+            .into_iter()
+            .flatten()
+            .filter(|marker| marker.kind == zeroclaw_api::media::MarkerKind::Image)
+            .map(|marker| {
+                serde_json::json!({
+                    "type": "input_image",
+                    "image_url": marker.target,
+                })
+            })
+            .collect();
+    if images.is_empty() {
+        return Value::String(text.to_string());
+    }
+    if !text.is_empty() {
+        images.insert(0, serde_json::json!({"type": "input_text", "text": text}));
+    }
+    Value::Array(images)
+}
+
 pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
@@ -462,14 +487,10 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                         .and_then(Value::as_str)
                         .and_then(|id| first_nonempty(Some(id)))
                     {
-                        let output = value
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
                         input.push(serde_json::json!({
                             "type": "function_call_output",
                             "call_id": call_id,
-                            "output": output,
+                            "output": responses_tool_output(&value),
                         }));
                     } else if !msg.content.trim().is_empty() {
                         input.push(legacy_tool_output_message(&msg.content));
@@ -1700,6 +1721,11 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiCodexModelProvider {
 mod tests {
     use super::*;
 
+    const TOOL_IMAGE: &str = concat!(
+        "data:image/png;base64,",
+        "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC"
+    );
+
     enum MockCodexReply {
         Sse(&'static str),
         Json(serde_json::Value),
@@ -2575,6 +2601,299 @@ data: [DONE]
         let (instructions, input) = build_responses_input(&messages);
         assert_eq!(instructions, DEFAULT_CODEX_INSTRUCTIONS);
         assert_eq!(input.len(), 1);
+    }
+
+    #[test]
+    fn build_responses_input_preserves_declared_tool_images() {
+        let image = TOOL_IMAGE;
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_image",
+                "content": "Tool caption",
+                "attachments": [{"kind": "image", "target": image}],
+            })
+            .to_string(),
+        )];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(
+            input,
+            vec![serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_image",
+                "output": [
+                    {"type": "input_text", "text": "Tool caption"},
+                    {"type": "input_image", "image_url": image},
+                ],
+            })]
+        );
+    }
+
+    #[test]
+    fn tool_image_output_preserves_text_and_attachment_order() {
+        for text in ["", " \ncaption [IMAGE:quoted.png]\n "] {
+            let output = responses_tool_output(&serde_json::json!({
+                "content": text,
+                "attachments": [
+                    {"kind": "image", "target": TOOL_IMAGE},
+                    {"kind": "document", "target": "notes.txt"},
+                    {"kind": "image", "target": "data:image/jpeg;base64,c2Vjb25k"},
+                ],
+            }));
+            let blocks = output.as_array().unwrap();
+            let image_start = usize::from(!text.is_empty());
+            assert_eq!(blocks.len(), image_start + 2);
+            if !text.is_empty() {
+                assert_eq!(
+                    blocks[0],
+                    serde_json::json!({"type": "input_text", "text": text})
+                );
+            }
+            assert_eq!(blocks[image_start]["image_url"], TOOL_IMAGE);
+            assert_eq!(
+                blocks[image_start + 1]["image_url"],
+                "data:image/jpeg;base64,c2Vjb25k"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_image_output_keeps_legacy_and_malformed_carriers_as_text() {
+        let text = format!("literal [IMAGE:{TOOL_IMAGE}]");
+        for attachments in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!({"kind": "image", "target": TOOL_IMAGE}),
+            serde_json::json!([{"kind": "image"}, {"kind": "unknown", "target": TOOL_IMAGE}]),
+            serde_json::json!([{"kind": "document", "target": TOOL_IMAGE}]),
+        ] {
+            assert_eq!(
+                responses_tool_output(&serde_json::json!({
+                    "content": text,
+                    "attachments": attachments,
+                })),
+                Value::String(text.clone())
+            );
+        }
+        assert_eq!(
+            responses_tool_output(&serde_json::json!({"content": text})),
+            text
+        );
+        for content in [Value::Null, serde_json::json!(42), serde_json::json!({})] {
+            assert_eq!(
+                responses_tool_output(&serde_json::json!({
+                    "content": content,
+                    "attachments": [{"kind": "image", "target": TOOL_IMAGE}],
+                })),
+                ""
+            );
+        }
+    }
+
+    fn image_tool_history(target: &str) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("Inspect the tool image."),
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"id":"call_image","name":"snapshot","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_image",
+                    "content": "Tool caption [IMAGE:quoted.png]",
+                    "attachments": [{"kind": "image", "target": target}],
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn tool_images_reach_both_responses_adapters_and_streaming() {
+        use base64::Engine as _;
+        for codex in [true, false] {
+            for streaming in [false, true] {
+                for stale in [false, true] {
+                    let reply = if codex || streaming {
+                        MockCodexReply::Sse(concat!(
+                            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[",
+                            "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[",
+                            "{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"
+                        ))
+                    } else {
+                        MockCodexReply::Json(serde_json::json!({
+                            "output": [{"type": "message", "role": "assistant", "content": [
+                                {"type": "output_text", "text": "ok"},
+                            ]}],
+                        }))
+                    };
+                    let (codex_provider, captured, server, dir, _proxy_guard) =
+                        mock_codex_provider(vec![reply]).await;
+                    let _server = scopeguard::guard(server, |server| server.abort());
+                    let path = dir.path().join("image.png");
+                    std::fs::write(
+                        &path,
+                        base64::engine::general_purpose::STANDARD
+                            .decode(TOOL_IMAGE.split_once(',').unwrap().1)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let mut messages = image_tool_history(path.to_str().unwrap());
+                    messages.push(ChatMessage::assistant(
+                        r#"{"tool_calls":[{"id":"call_text","name":"echo","arguments":"{}"}]}"#,
+                    ));
+                    messages.push(ChatMessage::tool(
+                        r#"{"tool_call_id":"call_text","content":"later text","attachments":[]}"#,
+                    ));
+                    if stale {
+                        messages.push(ChatMessage::user("Next turn."));
+                    }
+                    let provider: Box<dyn ModelProvider> = if codex {
+                        Box::new(codex_provider)
+                    } else {
+                        // The runtime prepares images before the API-key Responses boundary.
+                        messages = multimodal::prepare_messages_for_provider(
+                            &messages,
+                            &Default::default(),
+                        )
+                        .await
+                        .unwrap()
+                        .messages;
+                        Box::new(
+                            crate::openai::OpenAiResponsesModelProvider::builder("test")
+                                .api_url(&codex_provider.responses_url)
+                                .credential(Some("test-key"))
+                                .build(),
+                        )
+                    };
+                    let request = ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    };
+                    if streaming {
+                        let mut events = provider.stream_chat(
+                            request,
+                            "test-model",
+                            None,
+                            StreamOptions::new(true),
+                        );
+                        let mut final_seen = false;
+                        while let Some(event) = events.next().await {
+                            final_seen |= matches!(event.unwrap(), StreamEvent::Final);
+                        }
+                        assert!(final_seen);
+                    } else {
+                        assert_eq!(
+                            provider
+                                .chat(request, "test-model", None)
+                                .await
+                                .unwrap()
+                                .text
+                                .as_deref(),
+                            Some("ok")
+                        );
+                    }
+                    let bodies = captured.lock().unwrap();
+                    assert_eq!(bodies.len(), 1);
+                    let input = bodies[0]["input"].as_array().unwrap();
+                    assert_eq!(input.len(), if stale { 6 } else { 5 });
+                    assert_eq!(input[2]["call_id"], "call_image");
+                    assert_eq!(input[4]["output"], "later text");
+                    if stale {
+                        assert_eq!(input[2]["output"], "Tool caption [IMAGE:quoted.png]");
+                        continue;
+                    }
+                    assert_eq!(
+                        input[2]["output"][0],
+                        serde_json::json!({
+                            "type": "input_text", "text": "Tool caption [IMAGE:quoted.png]",
+                        })
+                    );
+                    let image = &input[2]["output"][1];
+                    assert_eq!(image["type"], "input_image");
+                    let data_uri = image["image_url"].as_str().unwrap();
+                    assert!(data_uri.starts_with("data:image/png;base64,"));
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data_uri.split_once(',').unwrap().1)
+                        .unwrap();
+                    let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+                    assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0]);
+                    assert_eq!(input[2]["output"].as_array().unwrap().len(), 2);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_images_respect_preparation_omissions_and_turn_lifetime() {
+        for (target, stale) in [(TOOL_IMAGE, true), ("data:image/png;base64,invalid", false)] {
+            let mut messages = image_tool_history(target);
+            if stale {
+                messages.push(ChatMessage::user("Next turn."));
+            }
+            let prepared =
+                multimodal::prepare_messages_for_provider(&messages, &Default::default())
+                    .await
+                    .unwrap();
+            let (_, input) = build_responses_input(&prepared.messages);
+            assert!(!prepared.contains_images);
+            assert_eq!(input[2]["call_id"], "call_image");
+            let output = input[2]["output"]
+                .as_str()
+                .expect("omitted images leave a string result");
+            assert!(output.starts_with("Tool caption [IMAGE:quoted.png]"));
+            if !stale {
+                assert_ne!(
+                    output, "Tool caption [IMAGE:quoted.png]",
+                    "normalization reports the rejected image"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_image_rejection_is_not_retried_as_text() {
+        for codex in [true, false] {
+            for streaming in [false, true] {
+                let (codex_provider, captured, server, _dir, _proxy_guard) =
+                    mock_codex_provider(vec![MockCodexReply::Status(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        r#"{"error":{"message":"image input rejected"}}"#,
+                    )])
+                    .await;
+                let _server = scopeguard::guard(server, |server| server.abort());
+                let provider: Box<dyn ModelProvider> = if codex {
+                    Box::new(codex_provider)
+                } else {
+                    Box::new(
+                        crate::openai::OpenAiResponsesModelProvider::builder("test")
+                            .api_url(&codex_provider.responses_url)
+                            .credential(Some("test-key"))
+                            .build(),
+                    )
+                };
+                let messages = image_tool_history(TOOL_IMAGE);
+                let request = ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                };
+                let error = if streaming {
+                    let mut events =
+                        provider.stream_chat(request, "test-model", None, StreamOptions::new(true));
+                    events.next().await.unwrap().unwrap_err().to_string()
+                } else {
+                    provider
+                        .chat(request, "test-model", None)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                };
+                assert!(error.contains("image input rejected"), "{error}");
+                assert_eq!(captured.lock().unwrap().len(), 1);
+            }
+        }
     }
 
     #[test]
