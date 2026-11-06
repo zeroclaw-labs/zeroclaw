@@ -596,7 +596,7 @@ impl Chat {
                         Ok(_) => {
                             turn.fail(
                                 sender,
-                                "the turn finished, but its result was not received; reload the session to see it",
+                                "the turn finished, but its result was not received",
                                 "TURN_RESULT_LOST",
                             )
                             .await;

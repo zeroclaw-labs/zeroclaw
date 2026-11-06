@@ -807,7 +807,9 @@ export function AgentProvider({
         // The limit line says it, and its Retry sends the waiting message; a
         // chat bubble would say it twice.
         if (perSocket && msg.code === 'CONVERSATION_LIMIT') break;
-        const friendlyMessage = friendlyAgentError(msg.message);
+        const friendlyMessage = msg.code === 'TURN_RESULT_LOST'
+          ? t('agent.turn_result_lost')
+          : friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,

@@ -1701,6 +1701,23 @@ async function answer(socket: FakeSocket, text: string): Promise<void> {
 const endedNotice = (mounted: MountedChat) =>
   mounted.context().messages.filter((m) => m.notice && m.content.includes('This conversation has ended'));
 
+test('a lost turn result leaves the scoped conversation available', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime, true);
+    const socket = await startConversation(mounted, runtime, 'hello', 'chat-1');
+    await act(async () => {
+      socket.emitMessage({ type: 'error', code: 'TURN_RESULT_LOST', message: 'upstream text' } as WsMessage);
+    });
+    assert.ok(mounted.context().messages.some((msg) =>
+      msg.content.includes('You can continue this conversation.')));
+    await act(async () => { mounted.context().sendMessage('follow up'); });
+    assert.equal(runtime.sockets.length, 1);
+    assert.deepEqual(runtime.messageCalls, []);
+    await unmount(mounted.renderer);
+  });
+});
+
 for (const [label, session] of [['a scoped account', scopedSession], ['an administrator on the core path', coreAdminSession]] as const) {
   test(`${label}: no socket, history or conversation list until the first message`, async () => {
     await withSession(session, async () => {
