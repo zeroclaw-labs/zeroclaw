@@ -213,7 +213,7 @@ async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool 
     #[cfg(not(test))]
     {
         let _ = session;
-        return false;
+        false
     }
 
     #[cfg(test)]

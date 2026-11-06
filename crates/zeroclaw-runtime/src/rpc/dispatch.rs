@@ -3968,11 +3968,15 @@ impl RpcDispatcher {
         {
             return Ok(true);
         }
-        let repository = self
-            .ctx
-            .session_repository
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("session repository was not supplied"))?;
+        let repository = self.ctx.session_repository.clone().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Session repository was not supplied"
+            );
+            anyhow::Error::msg("session repository was not supplied")
+        })?;
         let session_owner = from.to_owned();
         if tokio::task::spawn_blocking(move || {
             repository
@@ -6157,32 +6161,30 @@ impl RpcDispatcher {
                     }
                 }
                 crate::rpc::types::ChatMode::Chat => {
-                    if let Some(native) = &native_restore {
-                        if let Some(context) = native
+                    if let Some(native) = &native_restore
+                        && let Some(context) = native
                             .restore_context()
                             .await
                             .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
-                        {
-                            agent.set_history_has_trim_breadcrumb(
-                                context.history_has_trim_breadcrumb.unwrap_or(false),
-                            );
-                            message_count = context.messages.len();
-                            seed_event =
-                                agent.seed_conversation_history_with_event(context.messages);
-                            if seed_event.is_some() {
-                                native
-                                    .replace_context(
-                                        zeroclaw_api::session_events::capture::ContextSnapshot {
-                                            messages: (agent.history()).to_vec(),
-                                            history_has_trim_breadcrumb: Some(
-                                                agent.history_has_trim_breadcrumb(),
-                                            ),
-                                        },
-                                        "session_restore_trim",
-                                    )
-                                    .await
-                                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-                            }
+                    {
+                        agent.set_history_has_trim_breadcrumb(
+                            context.history_has_trim_breadcrumb.unwrap_or(false),
+                        );
+                        message_count = context.messages.len();
+                        seed_event = agent.seed_conversation_history_with_event(context.messages);
+                        if seed_event.is_some() {
+                            native
+                                .replace_context(
+                                    zeroclaw_api::session_events::capture::ContextSnapshot {
+                                        messages: (agent.history()).to_vec(),
+                                        history_has_trim_breadcrumb: Some(
+                                            agent.history_has_trim_breadcrumb(),
+                                        ),
+                                    },
+                                    "session_restore_trim",
+                                )
+                                .await
+                                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
                         }
                     }
                 }

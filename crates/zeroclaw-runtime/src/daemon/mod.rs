@@ -822,7 +822,13 @@ pub async fn run_with_authority(
     // One generation-scoped history source is shared by every entrance. Its
     // physical backend connection is reusable; authorization remains per call.
     let source = registry.take_session_source().ok_or_else(|| {
-        anyhow::anyhow!("session source must be supplied by application composition")
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "Session source was not supplied by application composition"
+        );
+        anyhow::Error::msg("session source must be supplied by application composition")
     })?(live_config_authority.live_handle());
     source.sessions().await?;
     let native_sessions = Some(source);
