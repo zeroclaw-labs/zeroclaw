@@ -7179,6 +7179,7 @@ mod tests {
         zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
             local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                model: None,
                 url: format!("{}/v1/transcribe", server.uri()),
                 bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
