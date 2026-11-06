@@ -497,6 +497,12 @@ rpc_type! {
         pub tool_input: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tool_output: Option<String>,
+        /// RFC 3339 time the store recorded the row this entry came from.
+        /// Absent when the store has none. In ACP history every entry of one
+        /// turn carries the turn's finalization time, except the prompt,
+        /// which carries the time the turn began.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_at: Option<String>,
     }
 }
 
