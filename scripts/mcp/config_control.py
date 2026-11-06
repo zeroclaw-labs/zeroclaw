@@ -20,6 +20,8 @@ import uuid
 
 MAX_MESSAGE = 1_048_576
 MAX_RESPONSE = 8_388_608
+COMPLETED_JOB_LIMIT = 100
+COMPLETED_JOB_MAX_AGE = 7 * 24 * 3600
 SUPPORTED_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 
 
@@ -91,7 +93,7 @@ class Gateway:
             except (ValueError, AttributeError, OSError, http.client.HTTPException):
                 pass
             raise BridgeError("gateway_rejected_request", status=error.code, code=code,
-                              outcome_unknown=method != "GET" and error.code >= 500) from None
+                              outcome_unknown=method != "GET" and (error.code == 408 or error.code >= 500)) from None
         except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, json.JSONDecodeError):
             # Do not replay mutations: a lost response is not proof of refusal.
             raise BridgeError("gateway_request_failed", outcome_unknown=method != "GET") from None
@@ -134,20 +136,49 @@ def write_job(path, body):
             target.flush()
             os.fsync(target.fileno())
         os.replace(temporary, path)
+        if body.get("state") not in ("waiting_for_idle", "applying"):
+            prune_completed_jobs(path.parent)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
 
 def sessions_busy(gateway):
     running = gateway.request("GET", "/api/sessions/running")
-    if not isinstance(running.get("sessions"), list) or "message" in running:
+    # Missing on older daemons: their session list only covers WebSocket
+    # persistence and cannot establish idle for channel or RPC callers.
+    if not isinstance(running, dict) or type(running.get("busy")) is not bool:
         raise BridgeError("native_session_idle_detection_unavailable")
-    return bool(running["sessions"])
+    return running["busy"]
+
+
+def job_records(directory):
+    records = []
+    for pattern in ("write-*.json", "reload-*.json"):
+        for path in Path(directory).glob(pattern):
+            try:
+                records.append((path, json.loads(path.read_text())))
+            except FileNotFoundError:
+                continue  # A concurrent worker may prune completed records.
+    return records
+
+
+def prune_completed_jobs(directory):
+    records = [(path, job) for path, job in job_records(directory)
+               if job.get("state") not in ("waiting_for_idle", "applying")]
+    records.sort(key=lambda entry: entry[1].get("completed_at", entry[1].get("requested_at", 0)),
+                 reverse=True)
+    cutoff = time.time() - COMPLETED_JOB_MAX_AGE
+    for index, (path, job) in enumerate(records):
+        if (index >= COMPLETED_JOB_LIMIT
+                or job.get("completed_at", job.get("requested_at", 0)) < cutoff):
+            path.unlink(missing_ok=True)
 
 
 def pending_writes(directory, before=None):
-    for path in Path(directory).glob("write-*.json"):
-        job = json.loads(path.read_text())
+    prune_completed_jobs(directory)
+    for path, job in job_records(directory):
+        if not path.name.startswith("write-"):
+            continue
         if (job.get("state") in ("waiting_for_idle", "applying")
                 and time.time() - job["requested_at"] < 360
                 and (before is None or (job["requested_at"], job["id"]) < before)):
@@ -302,10 +333,11 @@ class Control:
                 result["application_status_unavailable"] = True
             return result
         if name == "status":
-            jobs = sorted([*self.state_dir.glob("reload-*.json"), *self.state_dir.glob("write-*.json")],
-                          key=lambda path: path.stat().st_mtime, reverse=True)[:20]
+            prune_completed_jobs(self.state_dir)
+            jobs = sorted((job for _, job in job_records(self.state_dir)),
+                          key=lambda job: job.get("requested_at", 0), reverse=True)[:20]
             return {"application": self.gateway.request("GET", "/api/config/reload-status"),
-                    "requests": [json.loads(path.read_text()) for path in jobs]}
+                    "requests": jobs}
         if name == "reload":
             self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             job = {"id": uuid.uuid4().hex, "state": "waiting_for_idle", "requested_at": time.time()}

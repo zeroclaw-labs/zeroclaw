@@ -112,14 +112,19 @@ one atomic patch, with `test` operations to guard against intervening edits.
 Saving and applying are separate. `status` reports the gateway's canonical
 application/reload status and recent write/reload requests. `reload` starts a
 local worker outside the MCP call, waits for pending writes and 15 seconds of
-idle, then requests `POST /admin/reload`. Idle detection requires native
-persistent sessions, is a point-in-time check rather than an admission lock,
+idle, then requests `POST /admin/reload`. Idle detection reads the runtime admission coordinator across channel, web and
+RPC callers, including admission in progress. It is a point-in-time check rather
+than an admission lock,
 and does not prove that every outbound voice delivery has completed. Clients
 can still reconnect during reload. Requests fail after five minutes without
-an idle window. Request records in `--state-dir` contain metadata only; queued
+an idle window. Older daemons without the runtime busy signal are refused;
+upgrade the daemon before using this bridge. Request records in `--state-dir` contain metadata only; queued
 values pass through an anonymous pipe and remain in worker memory. A `saved`
 record means the gateway acknowledged the write, not that every subsystem
-applied it. Workers are not resumed automatically after a process or machine
+applied it. Completed request metadata is retained for at most seven days and
+100 records; active requests are never removed by retention. HTTP 408 or lost
+mutation responses have an unknown outcome: read back before resubmitting.
+Workers are not resumed automatically after a process or machine
 restart; inspect status and read back before resubmitting uncertain changes.
 
 After installing the bridge, reload the daemon and reconnect the affected

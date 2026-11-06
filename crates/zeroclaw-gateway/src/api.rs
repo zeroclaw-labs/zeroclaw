@@ -2153,8 +2153,12 @@ pub async fn handle_api_sessions_running(
         return e.into_response();
     }
 
+    // Runtime admission owns activity for every transport; persisted session
+    // metadata alone only covers a subset of active callers.
+    let busy = state.agent_lifecycle.has_active_work();
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
+            "busy": busy,
             "sessions": [],
             "message": "Session persistence is disabled"
         }))
@@ -2175,7 +2179,7 @@ pub async fn handle_api_sessions_running(
         })
         .collect();
 
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+    Json(serde_json::json!({ "busy": busy, "sessions": sessions })).into_response()
 }
 
 /// GET /api/sessions/{id}/state — get session state
@@ -3258,6 +3262,40 @@ pub(crate) mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_sessions_running_reports_runtime_work_without_persisted_sessions() {
+        let state = test_state(config_with_telegram("default"));
+        assert!(state.session_backend.is_none());
+        // These leases are the same source used by web, RPC and channel turns.
+        let lease = state.agent_lifecycle.reserve_turn("channel-agent").unwrap();
+        let response = handle_api_sessions_running(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["busy"], true);
+        assert_eq!(body["sessions"], serde_json::json!([]));
+        drop(lease);
+        let response = handle_api_sessions_running(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["busy"], false);
+        let reservation = state
+            .agent_lifecycle
+            .reserve_admission("rpc-agent")
+            .unwrap();
+        assert!(state.agent_lifecycle.has_active_work());
+        drop(reservation);
+        state.agent_lifecycle.close_generation();
+        assert!(state.agent_lifecycle.has_active_work());
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
