@@ -996,11 +996,14 @@ mod tests {
             });
             let (turn, turn_done) = spawn_turn(&store, "agent-b", true, None);
             // Give the turn time to land inside the gap if nothing holds it.
-            let _ = turn_done.recv_timeout(StdDuration::from_secs(1));
+            let ran_in_gap = turn_done.recv_timeout(StdDuration::from_secs(1)).is_ok();
             resume.send(()).unwrap();
             assert_eq!(cleanup.join().unwrap().unwrap(), 2);
             let (claim, history) = turn.join().unwrap();
 
+            // Transcript-first ordering alone would refuse a claim in the gap,
+            // so this is what pins the lock: B's turn waits out the move.
+            assert!(!ran_in_gap, "agent B's turn ran inside the pair move");
             let history = history.unwrap();
             assert!(
                 history
@@ -1008,15 +1011,8 @@ mod tests {
                     .all(|message| !message.content.contains("agent A")),
                 "agent B hydrated agent A's history: {history:?}"
             );
-            // Either B waited and started a new conversation on the freed key,
-            // or it was refused. It never took A's.
-            match claim.unwrap() {
-                SessionOwnerClaim::Claimed => {}
-                SessionOwnerClaim::Foreign(SessionOwnershipDenial::ForeignAgent(owner)) => {
-                    assert_eq!(owner, "agent-a");
-                }
-                other => panic!("unexpected claim outcome {other:?}"),
-            }
+            // Having waited, B starts a new conversation on the freed key.
+            assert_eq!(claim.unwrap(), SessionOwnerClaim::Claimed);
             assert_eq!(archived_owner(&workspace), "agent-a");
             assert!(archived_history(&workspace).contains("agent A's private history"));
         }
