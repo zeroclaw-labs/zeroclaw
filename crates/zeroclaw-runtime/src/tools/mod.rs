@@ -324,7 +324,8 @@ pub fn composio_tool_available(config: &Config) -> bool {
     feature = "tool-claude-code-runner",
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
-    feature = "tool-opencode-cli"
+    feature = "tool-opencode-cli",
+    feature = "tools-external"
 )))]
 fn warn_tool_compiled_out(root_config: &Config, tool: zeroclaw_config::opt_in_tools::OptInTool) {
     if tool.enabled_in(root_config) {
@@ -2947,6 +2948,11 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Web search requires explicit selection and provider configuration
+    #[cfg(not(feature = "tools-external"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::WebSearch,
+    );
     #[cfg(feature = "tools-external")]
     if root_config.web_search.enabled && select_tool!("web_search_tool") {
         // Rate-limited like every other outbound-network tool (see web_fetch
