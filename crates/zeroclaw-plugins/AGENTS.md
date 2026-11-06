@@ -48,6 +48,12 @@ schemas. This crate knows how to run plugins, not what they do.
 - Config schema definitions (those go in `zeroclaw-config`)
 - Plugin registry client or distribution (future separate crate)
 
+## Exceptions
+
+| Scope | Destination | Approved by | Expires or reviewed |
+| --- | --- | --- | --- |
+| #12216 multi-registry selection, metadata caching, source-set validation and publisher-bound lookup/command suggestions in `src/registry.rs` and focused tests, including `tests/registry_literal_compat.rs`; no expansion of fetching, installation or execution authority | Registry owner in the planned separate crate | @Audacity88, [approved in #12234 on 2026-11-05](https://github.com/zeroclaw-labs/zeroclaw/pull/12234#pullrequestreview-5793805251) | Review at registry/skills extraction design or before expanding scope |
+
 ## Related ADRs
 
 - ADR-003: historical Extism plugin bootstrap, superseded by ADR-009
