@@ -131,7 +131,7 @@ fn resolve_audio_format(file_name: &str) -> Result<(String, &'static str)> {
 
 /// Validate audio data and resolve MIME type from file name.
 /// Enforces the 25 MB cloud API cap. Returns `(normalized_filename, mime_type)` on success.
-fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'static str)> {
+pub(crate) fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'static str)> {
     if audio_data.len() > MAX_AUDIO_BYTES {
         bail!(
             "Audio file too large ({} bytes, max {MAX_AUDIO_BYTES})",

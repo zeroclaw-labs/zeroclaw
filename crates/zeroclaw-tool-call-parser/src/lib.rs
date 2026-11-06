@@ -45,8 +45,8 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
 /// stripped from final response text. This is the single source of truth for
 /// the marker vocabulary, shared by the non-streaming
 /// [`strip_trailing_terminal_markers`] helper and the streaming state machine
-/// (`zeroclaw-runtime`'s `StreamTerminalMarkerStripper`) so a vocabulary or
-/// matching-rule change cannot drift one path.
+/// (`StreamTerminalMarkerStripper`) so a vocabulary or matching-rule change
+/// cannot drift one path.
 ///
 /// Order matters: longer spellings must precede shorter ones so a suffix check
 /// matches the most specific marker first.

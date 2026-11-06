@@ -39,6 +39,9 @@ pub mod webhook;
 
 use std::sync::Arc;
 
+/// Resolver for per-model text extraction policy.
+pub type TextExtractionResolver = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
     /// Set by the agent loop, read by SecurityPolicy.
@@ -66,11 +69,11 @@ tokio::task_local! {
     /// selected Config generation; provider/reliability code reads it while
     /// classifying a response and never stores a config snapshot.
     pub static TEXT_EXTRACTION_RESOLVER:
-        Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>;
+        Option<TextExtractionResolver>;
 }
 
 pub async fn scope_text_extraction<F>(
-    resolver: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    resolver: Option<TextExtractionResolver>,
     future: F,
 ) -> F::Output
 where

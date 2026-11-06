@@ -15,6 +15,91 @@ use crate::{
 };
 use std::collections::HashSet;
 
+/// Streaming-safe terminal marker stripper.
+///
+/// Strips trailing terminal markers (`TERMINAL_MARKERS`) from streaming text
+/// chunks. Handles markers split across multiple chunks, stacked markers, and
+/// markers with arbitrary whitespace between them.
+#[derive(Debug, Default)]
+pub struct StreamTerminalMarkerStripper {
+    pending: String,
+}
+
+/// Return the longest terminal-marker prefix that `text` ends with. This lets
+/// the state machine hold a marker split across chunk boundaries until the
+/// next chunk determines whether it is protocol metadata or inline text.
+fn longest_terminal_marker_prefix(text: &str) -> Option<usize> {
+    TERMINAL_MARKERS
+        .iter()
+        .flat_map(|marker| (1..marker.len()).map(move |len| &marker[..len]))
+        .filter(|prefix| text.ends_with(prefix))
+        .map(str::len)
+        .max()
+}
+
+impl StreamTerminalMarkerStripper {
+    pub fn new() -> Self {
+        Self {
+            pending: String::new(),
+        }
+    }
+
+    /// Push a chunk and return visible text with terminal markers stripped.
+    pub fn push(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+
+        self.pending.push_str(chunk);
+
+        let mut hold_start = self.pending.len();
+        loop {
+            let before = hold_start;
+            let ws_trimmed = self.pending[..hold_start].trim_end().len();
+
+            let mut stripped = false;
+            for marker in TERMINAL_MARKERS {
+                if self.pending[..ws_trimmed].ends_with(marker) {
+                    hold_start = ws_trimmed - marker.len();
+                    stripped = true;
+                    break;
+                }
+            }
+            if !stripped
+                && let Some(prefix_len) =
+                    longest_terminal_marker_prefix(&self.pending[..ws_trimmed])
+            {
+                hold_start = ws_trimmed - prefix_len;
+                stripped = true;
+            }
+            if !stripped {
+                hold_start = before;
+                break;
+            }
+            if hold_start == 0 {
+                return String::new();
+            }
+        }
+
+        if hold_start == self.pending.len() {
+            return std::mem::take(&mut self.pending);
+        }
+
+        let result = self.pending[..hold_start].to_string();
+        self.pending.drain(..hold_start);
+        result
+    }
+
+    /// Finish the stream and return any remaining visible text.
+    pub fn finish(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+
+        strip_trailing_terminal_markers(&self.pending)
+    }
+}
+
 /// Which guard detector suppressed a candidate and where the candidate
 /// began, so a suppression can be diagnosed from the trace log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
