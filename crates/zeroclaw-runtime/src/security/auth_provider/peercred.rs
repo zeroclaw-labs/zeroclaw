@@ -154,6 +154,7 @@ mod tests {
                 UserConfig {
                     principal_id: None,
                     uid: Some(*uid),
+                    password_hash: None,
                     permission_profiles: vec!["operator".into()],
                 },
             );
@@ -228,6 +229,7 @@ mod tests {
             UserConfig {
                 principal_id: Some("bob".into()),
                 uid: Some(2222),
+                password_hash: None,
                 permission_profiles: vec!["operator".into()],
             },
         );
@@ -285,6 +287,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4444),
+                password_hash: None,
                 permission_profiles: vec!["operator".into()],
             },
         );
