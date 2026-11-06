@@ -300,7 +300,13 @@ mod tests {
     }
 
     #[async_trait]
-    impl SessionExecutionPort for RejectionRecorder {
+    impl zeroclaw_api::session_events::capture::SessionContextPort for RejectionRecorder {}
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::session_events::capture::SessionControlPort for RejectionRecorder {}
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::session_events::capture::SessionExecutionPort for RejectionRecorder {
         async fn execute(
             &self,
             _input: EngineTurnInput,

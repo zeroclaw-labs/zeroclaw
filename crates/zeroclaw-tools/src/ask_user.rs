@@ -1049,6 +1049,12 @@ mod tests {
         }
     }
     #[async_trait]
+    impl zeroclaw_api::session_events::capture::SessionContextPort for ElicitationCapture {}
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::session_events::capture::SessionControlPort for ElicitationCapture {}
+
+    #[async_trait::async_trait]
     impl zeroclaw_api::session_events::capture::SessionExecutionPort for ElicitationCapture {
         async fn execute(
             &self,

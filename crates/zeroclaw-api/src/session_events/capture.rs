@@ -550,27 +550,49 @@ pub struct DeliveryIntent {
     pub completion_boundary: String,
 }
 
+/// Maintenance of the provider-facing working context.
 #[async_trait::async_trait]
-pub trait SessionExecutionPort: Send + Sync {
-    fn history_reader(&self) -> Option<Arc<dyn super::views::SessionHistoryReadPort>> {
-        None
-    }
-    /// Inputs requeued after verified owner loss, ordered by their original
-    /// acceptance. The host supplies the currently resolved provider route and
-    /// rebuilds the engine from each returned input before admitting new work.
-    /// Legally erased inputs are cancelled under current write authority.
-    async fn pending_inputs(
+pub trait SessionContextPort: Send + Sync {
+    /// Admit input that updates context without starting an engine or effect,
+    /// such as an observed group message. Retry preserves the original message.
+    async fn record_context_input(
         &self,
-        _provider_ref: String,
-        _model: String,
-    ) -> anyhow::Result<Vec<EngineTurnInput>> {
-        Ok(Vec::new())
+        _input: EngineTurnInput,
+        _context_text: &str,
+        _reason_key: &str,
+    ) -> anyhow::Result<MessageId> {
+        anyhow::bail!("session_context_input_capture_unsupported")
     }
-    /// Settle a verified, effect-free recovered input that the host cannot
-    /// readmit. Requires current session write authority; never stops live work.
-    async fn reject_pending_input(&self, _turn_id: &str, _reason_key: &str) -> anyhow::Result<()> {
-        anyhow::bail!("session_pending_rejection_unsupported")
+    async fn restore_model_override(&self) -> anyhow::Result<Option<ModelOverrideSelection>> {
+        Ok(None)
     }
+    /// A native reader restores the committed context. None means that this
+    /// embedding has no persisted context; corruption must propagate as Err.
+    async fn restore_context(&self) -> anyhow::Result<Option<ContextSnapshot>> {
+        Ok(None)
+    }
+    /// Freeze input under the foreground lane, capture one maintenance provider
+    /// call, and return the committed projection before releasing the lane.
+    async fn summarize_context(
+        &self,
+        _purpose: ProviderPurpose,
+        _summary: ContextSummaryExecutor<'_>,
+    ) -> anyhow::Result<ContextSnapshot> {
+        anyhow::bail!("session_summary_capture_unsupported")
+    }
+    /// Clear/restore replaces a derived context through a recorded transform.
+    async fn replace_context(
+        &self,
+        _context: ContextSnapshot,
+        _reason_key: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("session_context_replacement_unsupported")
+    }
+}
+
+/// Session lifecycle, branches, metadata and content commands.
+#[async_trait::async_trait]
+pub trait SessionControlPort: Send + Sync {
     /// Create a new branch at a frozen point in this session.
     async fn fork_branch(
         &self,
@@ -597,57 +619,10 @@ pub trait SessionExecutionPort: Send + Sync {
     async fn replace_content(&self, _target: EventId, _replacement: EventId) -> anyhow::Result<()> {
         anyhow::bail!("session_content_control_unsupported")
     }
-    async fn record_file(&self, _file: EngineFileInput, _operation: &str) -> anyhow::Result<()> {
-        anyhow::bail!("session_file_capture_unsupported")
-    }
-    async fn request_elicitation(
-        &self,
-        _request_id: &str,
-        _prompt: &str,
-        _response_schema: &Value,
-        _expires_at: Timestamp,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("session_elicitation_capture_unsupported")
-    }
-    async fn resolve_elicitation(
-        &self,
-        _request_id: &str,
-        _resolution: &Value,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("session_elicitation_capture_unsupported")
-    }
-    async fn deliver(
-        &self,
-        _intent: DeliveryIntent,
-        _send: DeliveryFuture<'_>,
-    ) -> anyhow::Result<Value> {
-        anyhow::bail!("session_delivery_capture_unsupported")
-    }
-    /// Admit input that updates context without starting an engine or effect,
-    /// such as an observed group message. Retry preserves the original message.
-    async fn record_context_input(
-        &self,
-        _input: EngineTurnInput,
-        _context_text: &str,
-        _reason_key: &str,
-    ) -> anyhow::Result<MessageId> {
-        anyhow::bail!("session_context_input_capture_unsupported")
-    }
     /// Host control evidence, preserved as observed. This never grants
     /// permission or authorizes an external effect.
     async fn record_control(&self, _value: Value) -> anyhow::Result<()> {
         anyhow::bail!("session_control_capture_unsupported")
-    }
-    /// Record an authenticated transport's approval reply that was rejected
-    /// before it could affect the approval state. This is audit-only and never
-    /// grants or consumes an approval.
-    async fn record_approval_reply_rejected(
-        &self,
-        _request_id: Option<String>,
-        _classification: String,
-        _evidence: Value,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("session_approval_rejection_capture_unsupported")
     }
     /// Close execution while preserving historical facts. Payload erasure is
     /// a separately authorized operation, not implied by closing.
@@ -678,30 +653,66 @@ pub trait SessionExecutionPort: Send + Sync {
     ) -> anyhow::Result<()> {
         anyhow::bail!("session_cancellation_command_unsupported")
     }
-    async fn restore_model_override(&self) -> anyhow::Result<Option<ModelOverrideSelection>> {
-        Ok(None)
+}
+
+/// Turn admission and observations. Native execution also exposes context and control capabilities.
+#[async_trait::async_trait]
+pub trait SessionExecutionPort: SessionContextPort + SessionControlPort {
+    fn history_reader(&self) -> Option<Arc<dyn super::views::SessionHistoryReadPort>> {
+        None
     }
-    /// A native reader restores the committed context. None means that this
-    /// embedding has no persisted context; corruption must propagate as Err.
-    async fn restore_context(&self) -> anyhow::Result<Option<ContextSnapshot>> {
-        Ok(None)
-    }
-    /// Freeze input under the foreground lane, capture one maintenance provider
-    /// call, and return the committed projection before releasing the lane.
-    async fn summarize_context(
+    /// Inputs requeued after verified owner loss, ordered by their original
+    /// acceptance. The host supplies the currently resolved provider route and
+    /// rebuilds the engine from each returned input before admitting new work.
+    /// Legally erased inputs are cancelled under current write authority.
+    async fn pending_inputs(
         &self,
-        _purpose: ProviderPurpose,
-        _summary: ContextSummaryExecutor<'_>,
-    ) -> anyhow::Result<ContextSnapshot> {
-        anyhow::bail!("session_summary_capture_unsupported")
+        _provider_ref: String,
+        _model: String,
+    ) -> anyhow::Result<Vec<EngineTurnInput>> {
+        Ok(Vec::new())
     }
-    /// Clear/restore replaces a derived context through a recorded transform.
-    async fn replace_context(
+    /// Settle a verified, effect-free recovered input that the host cannot
+    /// readmit. Requires current session write authority; never stops live work.
+    async fn reject_pending_input(&self, _turn_id: &str, _reason_key: &str) -> anyhow::Result<()> {
+        anyhow::bail!("session_pending_rejection_unsupported")
+    }
+    async fn record_file(&self, _file: EngineFileInput, _operation: &str) -> anyhow::Result<()> {
+        anyhow::bail!("session_file_capture_unsupported")
+    }
+    async fn request_elicitation(
         &self,
-        _context: ContextSnapshot,
-        _reason_key: &str,
+        _request_id: &str,
+        _prompt: &str,
+        _response_schema: &Value,
+        _expires_at: Timestamp,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("session_context_replacement_unsupported")
+        anyhow::bail!("session_elicitation_capture_unsupported")
+    }
+    async fn resolve_elicitation(
+        &self,
+        _request_id: &str,
+        _resolution: &Value,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("session_elicitation_capture_unsupported")
+    }
+    async fn deliver(
+        &self,
+        _intent: DeliveryIntent,
+        _send: DeliveryFuture<'_>,
+    ) -> anyhow::Result<Value> {
+        anyhow::bail!("session_delivery_capture_unsupported")
+    }
+    /// Record an authenticated transport's approval reply that was rejected
+    /// before it could affect the approval state. This is audit-only and never
+    /// grants or consumes an approval.
+    async fn record_approval_reply_rejected(
+        &self,
+        _request_id: Option<String>,
+        _classification: String,
+        _evidence: Value,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("session_approval_rejection_capture_unsupported")
     }
     /// Own admission and terminal recording around the one existing engine
     /// future. A duplicate command must return its projection without polling

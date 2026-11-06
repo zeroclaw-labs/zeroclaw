@@ -16,6 +16,20 @@ their presentation copies do not replace canonical session content.
 | Infrastructure | Atomic append, receipts, payloads, integrity and installation upgrades | `zeroclaw-infra::session_events` |
 | Kernel | Admission, current authorization, execution sequencing and recovery | `zeroclaw-kernel::session` |
 | Application | Backend selection and the existing engine bridge | `zeroclaw-session-host` and `zeroclaw::session_events` |
+
+The application composition root supplies the session source to the daemon;
+runtime does not construct a native host or choose a physical backend. Pure
+execution-context evidence is materialized in kernel rather than in the host.
+Agent lifecycle consumers receive the narrow API `AgentSessionPort`, which
+exposes discovery, closure and agent attribution updates without exposing a
+database handle. Application adapters initialize the configured repository on
+a blocking worker when invoked from an async entrance.
+
+The execution bridge separates `SessionContextPort` (restore and context
+maintenance), `SessionControlPort` (lifecycle, branches and recorded controls)
+and `SessionExecutionPort` (turn admission and observations). An admitted
+execution handle implements all three, while consumers can borrow a narrower
+capability. Ordinary history reads use the separate `SessionHistoryReadPort`.
 | Provider adapter | Protocol content, termination evidence and diagnostics | `zeroclaw-providers::dispatch::capture` |
 
 Live configuration and permissions remain owned by `LiveConfigAuthority` and
@@ -541,6 +555,11 @@ observations share the execution stream's commit lock and recheck current
 authorization; they cannot change identity, ownership or permissions. A failed
 observation cancels execution and propagates after the owned task settles.
 Protocol adapters do not write a competing projection during execution.
+Administrative catalog commands are a separate host capability for admission,
+ownership and offline lifecycle maintenance. They hold the installation
+publication lock through their conditional commit; they do not admit model or
+tool execution or carry an end-user authorization grant. Online turn usage,
+plan and user control commands use the admitted coordinator instead.
 Source resolution reads canonical events on a blocking worker, including any
 wait for the installation lock, without blocking the async reactor.
 
@@ -563,6 +582,12 @@ count and the projected event head. The event stream remains canonical; the
 index is refreshed when the catalog opens or is queried, and a missing or
 stale row is rebuilt from committed events. Full message bodies are resolved
 from payloads rather than copied into the index.
+History discovery reads those indexed summaries directly, filters with current
+authorization before applying its result limit, and validates the selected
+records again before disclosure. A reader bound to a session also checks that
+session's current authorization. Discovery no longer replays every session's
+history to construct its list. Index synchronization still checks installation
+session heads, so enumeration is not constant-time in the session count.
 `title` is the only session title field in native events, projections and
 backend metadata. The upgrader translates the old SQLite `name` column to
 `title`; native reads do not recognize `name` as an alias. Existing RPC `name`

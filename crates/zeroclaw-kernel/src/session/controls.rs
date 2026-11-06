@@ -3,7 +3,7 @@ use super::engine::EngineSession;
 use super::query::{SessionAccess, SessionAccessPolicy};
 use super::*;
 use zeroclaw_api::model_provider::ChatMessage;
-use zeroclaw_api::session_events::capture::{SessionExecutionPort, SessionMetadataObservation};
+use zeroclaw_api::session_events::capture::{SessionContextPort, SessionMetadataObservation};
 use zeroclaw_api::session_events::*;
 
 #[cfg(test)]

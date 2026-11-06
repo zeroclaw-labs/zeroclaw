@@ -7,6 +7,69 @@ use zeroclaw_kernel::session::{EffectIntent, PermissionResolver, SessionError};
 struct Authority(AtomicBool);
 
 #[tokio::test]
+async fn index_listing_filters_authority_before_limit_and_preserves_source_metadata() {
+    struct OnlyVisible;
+    impl SessionAccessPolicy for OnlyVisible {
+        fn authorize(
+            &self,
+            _: &PrincipalId,
+            id: &SessionId,
+            _: SessionAccess,
+        ) -> Result<(), SessionError> {
+            if id.as_str() == "visible" {
+                Ok(())
+            } else {
+                Err(SessionError::PermissionDenied("fixture_scope".into()))
+            }
+        }
+    }
+    for backend in ["sqlite", "jsonl"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: directory.path().into(),
+            ..Default::default()
+        };
+        config.channels.session_backend = backend.into();
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let hub = NativeSessionHub::new(live.handle());
+        let authority = Arc::new(Authority(AtomicBool::new(true)));
+        for id in ["visible", "hidden"] {
+            hub.open(
+                id.into(),
+                "rpc",
+                "fixture".into(),
+                PrincipalId::shared_operator(),
+                authority.clone(),
+                ContextSnapshot {
+                    messages: vec![],
+                    history_has_trim_breadcrumb: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let actor = EventActor::Principal {
+            principal_id: PrincipalId::shared_operator().0,
+        };
+        let found = hub
+            .list(actor.clone(), Arc::new(OnlyVisible), 1)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].head.session_id.as_str(), "visible");
+        assert_eq!(found[0].creation_source(), Some("rpc"));
+        assert!(
+            hub.list(actor.clone(), authority.clone(), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        authority.0.store(false, Ordering::SeqCst);
+        assert!(hub.list(actor, authority, 10).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn temporary_copy_restores_shared_context_hides_children_and_disappears_on_close() {
     use zeroclaw_api::session_events::capture::{
         ChildDispatchIntent, EngineInputPart, EngineTurnInput, current_provider_admission,
@@ -629,7 +692,7 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
         let authority = Arc::new(Authority(AtomicBool::new(true)));
         let query = hub
             .query(
-                "gw_expired".into(),
+                "expired".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
             )
@@ -647,12 +710,12 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
             original.last_activity.timestamp_millis()
         );
         assert_eq!(
-            hub.archive_stale("legacy", summary.last_activity + 1)
+            hub.archive_stale("gateway", summary.last_activity + 1)
                 .await
                 .expect("retention"),
             1
         );
-        let successor = "gw_expired".to_owned();
+        let successor = "expired".to_owned();
         let continuation = hub
             .open(
                 successor.clone(),
@@ -670,7 +733,7 @@ async fn upgrade_is_read_visible_and_retention_preserves_history_and_imported_ac
         drop(continuation);
         let query = hub
             .query(
-                "gw_expired".into(),
+                "expired".into(),
                 PrincipalId::shared_operator(),
                 authority.clone(),
             )

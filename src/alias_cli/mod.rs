@@ -711,7 +711,8 @@ fn build_owned_state_handles(_config: &Config) -> Result<OwnedStateHandles> {
 fn agent_delete_precheck(config: &Config, alias: &str) -> Result<()> {
     // Fail closed: refuse if live ACP sessions exist, or if the store can't be
     // read to verify (mirrors the gateway delete gate).
-    let live = zeroclaw_runtime::agent_lifecycle::live_acp_session_count(config, alias)
+    let live = zeroclaw_session_host::open_repository(config)?
+        .count_live_sessions_by_agent(alias)
         .context("could not verify live ACP sessions")?;
     if live > 0 {
         let count = live.to_string();
@@ -752,9 +753,21 @@ async fn agent_delete_owned_state(
         );
     }
     let archive_dir = archive.archive_dir;
-    let report =
-        zeroclaw_runtime::agent_lifecycle::cascade_owned_state(config, &mem, alias, &archive_dir)
-            .await;
+    let report = zeroclaw_runtime::agent_lifecycle::cascade_owned_state(
+        config,
+        &mem,
+        alias,
+        &archive_dir,
+        zeroclaw_session_host::open_repository(config)
+            .map(|store| {
+                std::sync::Arc::new(store)
+                    as std::sync::Arc<
+                        dyn zeroclaw_api::session_events::management::AgentSessionPort,
+                    >
+            })
+            .map_err(|error| error.to_string()),
+    )
+    .await;
     let memory = report.memory_purged.to_string();
     let cron = report.cron_removed.to_string();
     let acp = report.acp_removed.to_string();
@@ -825,8 +838,21 @@ async fn agent_rename_owned_state(
         }
     }
     let mem = build_owned_state_handles(config)?;
-    let report =
-        zeroclaw_runtime::agent_lifecycle::cascade_rename_agent(config, Some(&mem), from, to).await;
+    let report = zeroclaw_runtime::agent_lifecycle::cascade_rename_agent(
+        config,
+        Some(&mem),
+        from,
+        to,
+        zeroclaw_session_host::open_repository(config)
+            .map(|store| {
+                std::sync::Arc::new(store)
+                    as std::sync::Arc<
+                        dyn zeroclaw_api::session_events::management::AgentSessionPort,
+                    >
+            })
+            .map_err(|error| error.to_string()),
+    )
+    .await;
     let memory = report.memory_rows.to_string();
     let cron = report.cron_jobs.to_string();
     let acp = report.acp_sessions.to_string();

@@ -10786,7 +10786,13 @@ data: [DONE]\n\n";
             completed: Mutex<Vec<(String, String)>>,
         }
         #[async_trait]
-        impl SessionExecutionPort for RecoveryQueue {
+        impl zeroclaw_api::session_events::capture::SessionContextPort for RecoveryQueue {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionControlPort for RecoveryQueue {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionExecutionPort for RecoveryQueue {
             async fn pending_inputs(
                 &self,
                 _: String,

@@ -20,9 +20,7 @@ use zeroclaw_kernel::session::{
     SessionCoordinator,
     engine::{EngineSession, EngineSessionAuthority, EngineSessionSource},
 };
-mod execution_context;
 mod seed;
-pub use execution_context::execution_context_evidence;
 
 type SessionOwner = Arc<tokio::sync::Mutex<Option<Arc<SessionCoordinator>>>>;
 type SessionOwners = HashMap<(std::path::PathBuf, String), SessionOwner>;

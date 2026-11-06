@@ -1806,7 +1806,7 @@ impl RpcHistoryAuthority {
         } else {
             None
         };
-        let context = zeroclaw_session_host::execution_context_evidence(
+        let context = zeroclaw_kernel::session::execution_context::execution_context_evidence(
             &config,
             self.target_agent
                 .as_deref()
@@ -3968,10 +3968,14 @@ impl RpcDispatcher {
         {
             return Ok(true);
         }
-        let session_config = config.clone();
+        let repository = self
+            .ctx
+            .session_repository
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session repository was not supplied"))?;
         let session_owner = from.to_owned();
         if tokio::task::spawn_blocking(move || {
-            zeroclaw_session_host::open_repository(&session_config)?
+            repository
                 .list_sessions_by_agent(&session_owner)
                 .map(|sessions| !sessions.is_empty())
         })
@@ -13445,6 +13449,14 @@ impl RpcDispatcher {
                 let from = req.from.clone();
                 let to = req.to.clone();
                 let memory = self.ctx.memory.clone();
+                let managed_sessions = self
+                    .ctx
+                    .session_repository
+                    .clone()
+                    .map(|store| {
+                        store as Arc<dyn zeroclaw_api::session_events::management::AgentSessionPort>
+                    })
+                    .ok_or_else(|| "session repository was not supplied".to_owned());
                 // Same ownership-boundary boxing as the delete transaction:
                 // the rename future carries the same capture shape (prepared
                 // config, channel maps, commit, both leases) and is
@@ -13503,6 +13515,7 @@ impl RpcDispatcher {
                             memory.as_ref(),
                             &from,
                             &to,
+                            managed_sessions,
                         )
                         .await;
                         warnings.extend(owned.warnings);
@@ -13650,9 +13663,7 @@ impl RpcDispatcher {
                 Some(store) => store
                     .count_live_sessions_by_agent(&alias)
                     .map_err(|error| error.to_string()),
-                None => zeroclaw_session_host::open_repository(&config)
-                    .and_then(|store| store.count_live_sessions_by_agent(&alias))
-                    .map_err(|error| error.to_string()),
+                None => Err("session repository was not supplied".into()),
             };
             crate::agent_lifecycle::plan_agent_delete_with_acp_count(&config, &alias, live_acp)
         })
@@ -13684,16 +13695,13 @@ impl RpcDispatcher {
             .agent_lifecycle
             .begin_delete(alias.clone())
             .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let session_config = self.ctx.config.read().clone();
         let store = self.ctx.session_repository.clone();
         let preflight_alias = alias.clone();
         let live_acp = tokio::task::spawn_blocking(move || match store {
             Some(store) => store
                 .count_live_sessions_by_agent(&preflight_alias)
                 .map_err(|error| error.to_string()),
-            None => zeroclaw_session_host::open_repository(&session_config)
-                .and_then(|store| store.count_live_sessions_by_agent(&preflight_alias))
-                .map_err(|error| error.to_string()),
+            None => Err("session repository was not supplied".into()),
         })
         .await
         .map_err(|error| {
@@ -13746,6 +13754,14 @@ impl RpcDispatcher {
             .unwrap_or_else(|| Arc::new(zeroclaw_memory::NoneMemory::new("none")));
         let memory_unavailable = self.ctx.memory.is_none();
         let cleanup_alias = alias.clone();
+        let managed_sessions = self
+            .ctx
+            .session_repository
+            .clone()
+            .map(|store| {
+                store as Arc<dyn zeroclaw_api::session_events::management::AgentSessionPort>
+            })
+            .ok_or_else(|| "session repository was not supplied".to_owned());
         let cleanup_sessions = Arc::clone(&self.ctx.sessions);
         let cleanup_reload_tx = self.ctx.reload_tx.clone();
         let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
@@ -13809,6 +13825,7 @@ impl RpcDispatcher {
                     &memory,
                     &cleanup_alias,
                     &archive.archive_dir,
+                    managed_sessions,
                 )
                 .await;
                 warnings.extend(owned.warnings);

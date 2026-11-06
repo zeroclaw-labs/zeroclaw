@@ -1,8 +1,8 @@
 //! Historical execution facts resolved from the current admission configuration.
 //! This materializer owns no policy state and grants no authority on replay.
+use super::SessionError;
 use std::path::Path;
 use zeroclaw_config::schema::Config;
-use zeroclaw_kernel::session::SessionError;
 
 pub fn execution_context_evidence(
     config: &Config,

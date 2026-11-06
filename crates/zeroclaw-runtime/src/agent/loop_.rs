@@ -25101,7 +25101,13 @@ Let me check the result."#;
             inputs: Mutex<Vec<EngineTurnInput>>,
         }
         #[async_trait::async_trait]
-        impl SessionExecutionPort for RecoveryQueue {
+        impl zeroclaw_api::session_events::capture::SessionContextPort for RecoveryQueue {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionControlPort for RecoveryQueue {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionExecutionPort for RecoveryQueue {
             async fn pending_inputs(&self, _: String, _: String) -> Result<Vec<EngineTurnInput>> {
                 Ok(vec![self.pending.clone()])
             }

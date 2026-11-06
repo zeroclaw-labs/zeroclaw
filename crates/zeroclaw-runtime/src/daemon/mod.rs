@@ -821,15 +821,9 @@ pub async fn run_with_authority(
 
     // One generation-scoped history source is shared by every entrance. Its
     // physical backend connection is reusable; authorization remains per call.
-    let source = registry.take_session_source().map_or_else(
-        || {
-            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(
-                live_config_authority.live_handle(),
-            ))
-                as std::sync::Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>
-        },
-        |build| build(live_config_authority.live_handle()),
-    );
+    let source = registry.take_session_source().ok_or_else(|| {
+        anyhow::anyhow!("session source must be supplied by application composition")
+    })?(live_config_authority.live_handle());
     source.sessions().await?;
     let native_sessions = Some(source);
 
@@ -1051,8 +1045,8 @@ pub async fn run_with_authority(
             }
         };
 
-        // Bind the ACP family namespace to the standard repository. The shared
-        // source has already upgraded storage; no ACP database is created.
+        // Bind protocol metadata queries to the standard session repository.
+        // The application-supplied source has already upgraded storage.
         let session_repository: Option<
             std::sync::Arc<zeroclaw_infra::session_repository::SessionRepository>,
         > = match zeroclaw_infra::session_repository::SessionRepository::new(&config.data_dir) {
@@ -1063,7 +1057,7 @@ pub async fn run_with_authority(
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                    "Failed to open ACP session store at daemon boot"
+                    "Failed to open session repository at daemon boot"
                 );
                 None
             }
@@ -1076,7 +1070,7 @@ pub async fn run_with_authority(
         // siblings and races them into duplicate sequence numbers, which makes
         // `verify_chain` reject a file no single writer got wrong.
         //
-        // Best-effort, like the ACP store above: a logger that cannot be
+        // Best-effort, like the session repository above: a logger that cannot be
         // constructed (e.g. `sign_events` with no usable signing key) leaves
         // `cert_audit` unset, and the certificate paths then refuse to issue
         // rather than issue untraceably.
@@ -3265,6 +3259,9 @@ mod tests {
         let reload_rx = std::sync::Arc::new(parking_lot::Mutex::new(Some(reload_rx)));
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_channels(Box::new(move |authority, cancel, _native_sessions| {
             let attempt_tx = attempt_tx.clone();
             let attempt = attempts_for_channels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4541,6 +4538,9 @@ mod tests {
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_gateway(Box::new(
             move |host,
                   port,
@@ -4626,6 +4626,9 @@ mod tests {
         let (signalled_tx, mut signalled_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_gateway(Box::new(
             move |_host,
                   _port,
@@ -4684,6 +4687,9 @@ mod tests {
             let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
 
             let mut registry = DaemonRegistry::new();
+            registry.register_session_source(Box::new(|config| {
+                std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+            }));
             registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
                 let started_tx = started_tx.clone();
                 Box::pin(async move {
@@ -4768,6 +4774,9 @@ mod tests {
         let attempts_for_socket = attempts.clone();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
             let attempts = attempts_for_socket.clone();
             Box::pin(async move {
@@ -4821,6 +4830,9 @@ mod tests {
         let attempts_for_socket = attempts.clone();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_socket(Box::new(move |_ctx, _cancel, client_count, readiness| {
             let attempts = attempts_for_socket.clone();
             Box::pin(async move {
@@ -4890,6 +4902,9 @@ mod tests {
         let socket_session_ready = session_ready.clone();
         let (sessions_tx, mut sessions_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_socket(Box::new(move |ctx, cancel, _count, readiness| {
             let session_ready = socket_session_ready.clone();
             let sessions_tx = sessions_tx.clone();
@@ -5053,6 +5068,9 @@ mod tests {
         reset_scheduler_clean_shutdown_observed();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_gateway(Box::new(
             move |_host,
                   _port,
@@ -7293,6 +7311,9 @@ mod tests {
         let drained_for_socket = drained.clone();
 
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         registry.register_socket(Box::new(move |_ctx, cancel, client_count, readiness| {
             let accepted = accepted_for_socket.clone();
             let drained = drained_for_socket.clone();
@@ -7389,7 +7410,10 @@ mod tests {
             },
         );
         // No gateway is registered: the daemon runs with the gateway disabled.
-        let registry = DaemonRegistry::new();
+        let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
         tokio::pin!(daemon);
 
@@ -7542,6 +7566,9 @@ mod tests {
             // 0 = not started, 1 = started without a reporter, 2 = with one.
             let received = Arc::new(AtomicU8::new(0));
             let mut registry = DaemonRegistry::new();
+            registry.register_session_source(Box::new(|config| {
+                std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+            }));
             {
                 let received = received.clone();
                 registry.register_gateway(Box::new(
@@ -7608,6 +7635,9 @@ mod tests {
         // The gateway starter captures the live configuration the daemon hands it.
         let handed = Arc::new(std::sync::Mutex::new(None));
         let mut registry = DaemonRegistry::new();
+        registry.register_session_source(Box::new(|config| {
+            std::sync::Arc::new(zeroclaw_session_host::NativeSessionHub::new(config))
+        }));
         {
             let handed = handed.clone();
             registry.register_gateway(Box::new(

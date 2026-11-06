@@ -23,7 +23,6 @@ use super::session::OwnedSession;
 
 /// How long retirement waits for a session's agent before leaving the session
 /// for a later check.
-#[cfg(test)]
 const AGENT_WAIT: Duration = Duration::from_secs(5);
 
 /// Close every orphaned remote session that is due at `now` and return the
@@ -168,23 +167,47 @@ async fn retire(
 /// Whether the live history of `session` is already held by its durable
 /// store. Nothing is written here.
 ///
-/// An ACP session's turns each commit through its checkpoint, and a turn whose
-/// checkpoint fails removes its live session, so a live ACP session's history
-/// is already in the ACP store.
-///
-/// A chat session's post-turn write can fail, a daemon can run without a chat
-/// store, and other writers (the gateway's message and delete routes) change
-/// the stored transcript without the live session. So the stored transcript is
-/// compared with the live one by role and content. Retirement goes ahead only
-/// when the store holds everything live, alone or followed by messages another
-/// writer added. A store that lacks part of the live history, differs from it,
-/// or can't be read keeps the session live. Retirement writes nothing, so it
-/// can't recreate a deleted session or reorder another writer's messages.
+/// Native entrances share the same retained-context projection. Compare its
+/// typed messages and trim state with the live agent before retiring it. A
+/// missing, unreadable or different projection keeps the session live. This
+/// check never writes, so it cannot recreate deleted history. The old chat
+/// transcript path below is confined to migration-era test fixtures.
 async fn transcript_is_stored(ctx: &RpcContext, session: &OwnedSession) -> bool {
-    // Native sessions commit their terminal projection through the shared
-    // event store. There is no second transcript to compare against.
+    // Verify the committed retained context, including typed tool/reasoning
+    // fields. Merely having a source does not prove that this turn persisted.
     if ctx.native_sessions.is_some() {
-        return true;
+        let Some(agent) = ctx.sessions.get_agent(&session.id).await else {
+            return false;
+        };
+        let Ok(agent) = tokio::time::timeout(AGENT_WAIT, agent.lock()).await else {
+            return false;
+        };
+        let messages: Vec<_> = agent
+            .history()
+            .iter()
+            .flat_map(zeroclaw_api::model_provider::ConversationMessage::chat_messages)
+            .collect();
+        let live = match zeroclaw_api::session_events::canonical_json(&messages) {
+            Ok(live) => live,
+            Err(_) => return false,
+        };
+        let trim_breadcrumb = agent.history_has_trim_breadcrumb();
+        drop(agent);
+        let Some(repository) = ctx.session_repository.clone() else {
+            return false;
+        };
+        let session_id = session.id.clone();
+        return matches!(
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let Some(stored) = repository.load_session(&session_id)? else {
+                    return Ok(false);
+                };
+                Ok(stored.trim_breadcrumb == trim_breadcrumb
+                    && zeroclaw_api::session_events::canonical_json(&stored.messages)? == live)
+            })
+            .await,
+            Ok(Ok(true))
+        );
     }
 
     #[cfg(not(test))]

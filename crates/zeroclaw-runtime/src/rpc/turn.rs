@@ -986,7 +986,13 @@ mod tests {
             }
         }
         #[async_trait]
-        impl SessionExecutionPort for ReplayPort {
+        impl zeroclaw_api::session_events::capture::SessionContextPort for ReplayPort {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionControlPort for ReplayPort {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionExecutionPort for ReplayPort {
             async fn pending_inputs(
                 &self,
                 provider: String,

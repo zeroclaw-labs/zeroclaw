@@ -1598,7 +1598,7 @@ impl AgentHistoryAuthority {
         self.check_history()?;
         let handle = self.admission.capability().config_handle();
         let config = handle.read();
-        let context = zeroclaw_session_host::execution_context_evidence(
+        let context = zeroclaw_kernel::session::execution_context::execution_context_evidence(
             &config,
             self.admission.alias(),
             workspace,

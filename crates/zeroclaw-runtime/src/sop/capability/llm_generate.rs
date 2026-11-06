@@ -428,7 +428,13 @@ mod tests {
             reject_fails: bool,
         }
         #[async_trait::async_trait]
-        impl SessionExecutionPort for Port {
+        impl zeroclaw_api::session_events::capture::SessionContextPort for Port {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionControlPort for Port {}
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::session_events::capture::SessionExecutionPort for Port {
             async fn pending_inputs(&self, _: String, _: String) -> Result<Vec<EngineTurnInput>> {
                 Ok(self.pending.clone())
             }

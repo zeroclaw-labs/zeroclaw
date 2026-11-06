@@ -4,7 +4,7 @@ use super::engine::{EngineSession, decode_context_messages};
 use super::query::{PayloadSelector, SessionAccess, SessionAccessPolicy};
 use super::*;
 use futures_util::FutureExt;
-use zeroclaw_api::session_events::capture::SessionExecutionPort;
+use zeroclaw_api::session_events::capture::SessionContextPort;
 
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::session_events::capture::{

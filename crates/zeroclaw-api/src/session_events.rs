@@ -14,6 +14,7 @@ pub mod codec;
 pub mod context_read;
 mod index;
 pub mod lineage;
+pub mod management;
 pub mod payloads;
 pub mod projection;
 mod provider_observation;

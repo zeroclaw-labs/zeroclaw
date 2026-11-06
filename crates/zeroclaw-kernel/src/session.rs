@@ -21,6 +21,7 @@ mod delivery;
 pub mod engine;
 mod erasure;
 pub mod execution;
+pub mod execution_context;
 pub mod model_selection;
 mod provider_cancellation;
 pub mod query;

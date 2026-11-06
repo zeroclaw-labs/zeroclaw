@@ -13,6 +13,31 @@ mod models;
 mod view;
 pub use models::*;
 
+impl zeroclaw_api::session_events::management::AgentSessionPort for SessionRepository {
+    fn count_live(&self, agent: &str) -> Result<usize> {
+        self.count_live_sessions_by_agent(agent)
+    }
+    fn list_by_agent(
+        &self,
+        agent: &str,
+    ) -> Result<Vec<zeroclaw_api::session_events::catalog::Session>> {
+        Ok(self
+            .catalog()?
+            .query()
+            .indexed_summaries()?
+            .into_iter()
+            .map(|(_, session)| session)
+            .filter(|session| session.owning_agent.as_deref() == Some(agent))
+            .collect())
+    }
+    fn close_by_agent(&self, agent: &str) -> Result<usize> {
+        self.delete_sessions_by_agent(agent)
+    }
+    fn rename_agent(&self, from: &str, to: &str) -> Result<usize> {
+        self.rename_sessions_by_agent(from, to)
+    }
+}
+
 macro_rules! legacy_fixture {
     ($repository:expr, $method:ident($($argument:expr),* $(,)?)) => {
         #[cfg(any(test, feature = "test-util"))]

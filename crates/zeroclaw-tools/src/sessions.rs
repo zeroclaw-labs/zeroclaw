@@ -526,6 +526,12 @@ mod tests {
     }
     struct NativePort(Arc<NativeReader>);
     #[async_trait]
+    impl zeroclaw_api::session_events::capture::SessionContextPort for NativePort {}
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::session_events::capture::SessionControlPort for NativePort {}
+
+    #[async_trait::async_trait]
     impl zeroclaw_api::session_events::capture::SessionExecutionPort for NativePort {
         fn history_reader(
             &self,
