@@ -10,7 +10,7 @@ use crate::policy_gate;
 use crate::traits::{
     Memory, MemoryCategory, MemoryEntry, MemoryKind, SemanticSubtype, StoreOptions,
 };
-use zeroclaw_api::model_provider::{CallSampling, ModelProvider};
+use zeroclaw_api::model_provider::{CallSampling, ModelProvider, strip_think_tags};
 use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
 use zeroclaw_providers::multimodal::strip_media_markers;
@@ -463,7 +463,11 @@ fn fact_overlaps_primary_update(
 /// Parse the LLM's consolidation response, with fallback for malformed JSON.
 fn parse_consolidation_response(raw: &str, fallback_text: &str) -> ConsolidationResult {
     // Try to extract JSON from the response (LLM may wrap in markdown code blocks).
-    let cleaned = raw
+    // Consolidation is a structured-output consumer. Remove a provider's
+    // inline reasoning envelope before decoding, even though ordinary text
+    // responses keep that decision with the selected model policy.
+    let cleaned_text = strip_think_tags(raw);
+    let cleaned = cleaned_text
         .trim()
         .trim_start_matches("```json")
         .trim_start_matches("```")
@@ -507,6 +511,15 @@ mod tests {
             result.memory_update.as_deref(),
             Some("User prefers Rust over Go.")
         );
+    }
+
+    #[test]
+    fn parse_think_wrapped_json_response() {
+        let raw = r#"<think>plan the memory update</think>
+{"history_entry":"User prefers Rust.","memory_update":"User prefers Rust."}"#;
+        let result = parse_consolidation_response(raw, "fallback");
+        assert_eq!(result.history_entry, "User prefers Rust.");
+        assert_eq!(result.memory_update.as_deref(), Some("User prefers Rust."));
     }
 
     #[test]
