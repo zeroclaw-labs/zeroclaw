@@ -279,6 +279,21 @@ fn method_floor(method: &Method) -> Option<&'static [Verb]> {
     }
 }
 
+/// Whether `grants` clear `floor`: some verb in it is permitted on the
+/// Config resource.
+fn clears_floor(floor: &[Verb], grants: &ResolvedGrants) -> bool {
+    floor
+        .iter()
+        .any(|verb| grants.permits(Resource::Config, *verb))
+}
+
+/// Whether `grants` may read configuration: the floor the config routes
+/// apply to a `GET`. The dashboard's session response reports it, so the
+/// dashboard offers the config pages only to an account these routes admit.
+pub(crate) fn may_read_config(grants: &ResolvedGrants) -> bool {
+    method_floor(&Method::GET).is_some_and(|floor| clears_floor(floor, grants))
+}
+
 /// What the route layer hands every admitted request, for the handlers
 /// that mutate configuration: the principal the request was authenticated
 /// as (`None` in the open posture, where the transport is trusted exactly
@@ -580,10 +595,7 @@ pub async fn config_route_auth(
         let Some(floor) = method_floor(request.method()) else {
             return forbidden("Unsupported method for the config surface");
         };
-        if !floor
-            .iter()
-            .any(|verb| session.grants.permits(Resource::Config, *verb))
-        {
+        if !clears_floor(floor, &session.grants) {
             return forbidden("Principal lacks the config grant required for this method");
         }
         let mut conn = session.connection.clone();
@@ -648,10 +660,7 @@ pub async fn config_route_auth(
     let Some(floor) = method_floor(request.method()) else {
         return forbidden("Unsupported method for the config surface");
     };
-    if !floor
-        .iter()
-        .any(|verb| conn.grants.permits(Resource::Config, *verb))
-    {
+    if !clears_floor(floor, &conn.grants) {
         return forbidden("Principal lacks the config grant required for this method");
     }
 

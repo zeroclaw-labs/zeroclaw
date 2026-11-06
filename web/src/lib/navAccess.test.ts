@@ -56,7 +56,7 @@ test("an administrator reaches every page except the pairing-only ACP console", 
 });
 
 test("a scoped account without chat: config only", () => {
-  const access = navAccessFor(session({ chat: false, operator_pages: false }));
+  const access = navAccessFor(session({ chat: false, operator_pages: false, config: true }));
   for (const path of ["/config", "/config/providers", "/config/agents/main", "/setup/workspace"]) {
     assert.equal(pathAccess(path, access), "allowed", path);
   }
@@ -77,7 +77,7 @@ test("a scoped account without chat: config only", () => {
 });
 
 test("a scoped account with chat: chat and config, not an agent's workspace", () => {
-  const access = navAccessFor(session({ chat: true, operator_pages: false }));
+  const access = navAccessFor(session({ chat: true, operator_pages: false, config: true }));
   for (const path of ["/agents", "/agent", "/agent/main", "/AGENT/Main/", "/config"]) {
     assert.equal(pathAccess(path, access), "allowed", path);
   }
@@ -87,8 +87,31 @@ test("a scoped account with chat: chat and config, not an agent's workspace", ()
   assert.equal(homePathFor(access), "/agents");
 });
 
+test("a scoped account with chat but no config grant: chat, and no config pages", () => {
+  const access = navAccessFor(session({ chat: true, operator_pages: false, config: false }));
+  assert.equal(access.config, false);
+  for (const path of ["/agents", "/agent/main"]) {
+    assert.equal(pathAccess(path, access), "allowed", path);
+  }
+  for (const path of ["/config", "/config/providers", "/config/agents/main", "/setup", "/setup/workspace"]) {
+    assert.equal(pathAccess(path, access), "not-available", path);
+  }
+  assert.equal(homePathFor(access), "/agents");
+});
+
+test("a scoped account with neither chat nor config: no page and no home", () => {
+  const access = navAccessFor(session({ chat: false, operator_pages: false, config: false }));
+  for (const path of ["/", "/agents", "/agent/main", "/config", "/setup/workspace", "/tools"]) {
+    assert.equal(pathAccess(path, access), "not-available", path);
+  }
+  assert.equal(homePathFor(access), null);
+});
+
 test("missing feature flags deny rather than allow", () => {
-  // parseOidcSession maps absent flags to false; an all-false session sees config only.
+  // parseOidcSession maps absent flags to false; a session without them sees nothing.
   const access = navAccessFor(session({ chat: false, operator_pages: false }, true));
+  assert.equal(access.config, false);
   assert.equal(pathAccess("/tools", access), "not-available");
+  assert.equal(pathAccess("/config", access), "not-available");
+  assert.equal(homePathFor(access), null);
 });
