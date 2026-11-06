@@ -13886,7 +13886,7 @@ mod tests {
             assert!(state.select_transcript_word(col, row));
         }
 
-        chat.path_links_generation = chat.path_links_generation.wrapping_add(1);
+        crate::path_open::increment_path_links_generation();
         chat.refresh_resolved_path_links();
         {
             let ChatPhase::Active(state) = &chat.phase else {
