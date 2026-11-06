@@ -2297,14 +2297,16 @@ mod inbound {
         let room_allowed = allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id);
 
         if let Some((token, response)) = approval::parse_reply(&body)
-            && crate::util::resolve_pending_approval(
+            && crate::util::resolve_pending_approval_attributed_with_tool(
                 &ctx.pending_approvals,
                 &token,
-                response,
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+                    .with_user(Some(sender.to_string())),
                 sender_allowed && room_allowed,
                 room_id,
             )
             .await
+            .0
             .suppresses_message()
         {
             return Ok(());
@@ -5509,9 +5511,7 @@ impl Channel for MatrixChannel {
         match result {
             Ok(Ok(resp)) => {
                 guard.disarm();
-                Ok(Some(
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
-                ))
+                Ok(Some(resp))
             }
             Ok(Err(_)) => {
                 guard.remove().await;
@@ -7787,7 +7787,8 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), approved_rx)
                     .await
                     .expect("sync ingress should resolve the authorized approval")
-                    .expect("sync ingress should resolve the authorized approval"),
+                    .expect("sync ingress should resolve the authorized approval")
+                    .response,
                 ChannelApprovalResponse::Approve
             );
             assert!(
@@ -7964,7 +7965,10 @@ mod tests {
                 .await,
                 crate::util::PendingApprovalResolution::Resolved,
             );
-            assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+            assert_eq!(
+                rx.await.unwrap().response,
+                ChannelApprovalResponse::AlwaysApprove
+            );
 
             let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
             pending.lock().await.insert(
@@ -7989,7 +7993,10 @@ mod tests {
                 .await,
                 crate::util::PendingApprovalResolution::Resolved,
             );
-            assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+            assert_eq!(
+                approve_rx.await.unwrap().response,
+                ChannelApprovalResponse::Approve
+            );
         }
 
         #[test]

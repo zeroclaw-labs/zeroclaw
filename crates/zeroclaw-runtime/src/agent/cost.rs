@@ -1,5 +1,5 @@
-use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use crate::cost::{CostTracker, OverrideGrant, OverrideOffer};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -647,6 +647,34 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
             ctx.tracker
                 .map(|tracker| tracker.check_budget(0.0).unwrap_or(BudgetCheck::Allowed))
         })
+}
+
+/// The scoped tracker for this turn, when cost tracking is scoped.
+fn scoped_tool_loop_tracker() -> Option<Arc<CostTracker>> {
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .and_then(|ctx| ctx.tracker)
+}
+
+/// The scoped tracker, for a turn that waits on an override granted by
+/// another session's prompt.
+pub fn tool_loop_budget_tracker() -> Option<Arc<CostTracker>> {
+    scoped_tool_loop_tracker()
+}
+
+/// The exceeded shared limit the operator could override for this turn, or
+/// `None` when unscoped, not allowed, or when only a per-hop or per-agent
+/// ceiling is binding.
+pub fn tool_loop_budget_override_offer() -> Option<OverrideOffer> {
+    scoped_tool_loop_tracker().and_then(|tracker| tracker.override_offer())
+}
+
+/// Record the operator's approval of `offer` on the scoped tracker.
+/// `Refused` when unscoped.
+pub fn grant_tool_loop_budget_offer(offer: &OverrideOffer) -> OverrideGrant {
+    scoped_tool_loop_tracker().map_or(OverrideGrant::Refused, |tracker| tracker.grant_offer(offer))
 }
 
 #[cfg(test)]

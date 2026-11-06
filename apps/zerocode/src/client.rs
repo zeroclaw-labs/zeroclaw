@@ -282,6 +282,12 @@ pub enum SessionUpdate {
         arguments_summary: String,
         timeout_secs: u64,
     },
+    /// The daemon no longer waits on this approval (it timed out, or the
+    /// same decision was made in another session); take the prompt down.
+    ApprovalWithdrawn {
+        session_id: String,
+        request_id: String,
+    },
     /// Emitted once per LLM call with current context size and configured limit.
     /// `max_context_tokens` is the preemptive-trim budget the bar fills toward;
     /// `model_context_window` is the model's full capacity, used as the bar
@@ -357,6 +363,7 @@ impl SessionUpdate {
             | SessionUpdate::ToolCall { session_id, .. }
             | SessionUpdate::ToolResult { session_id, .. }
             | SessionUpdate::ApprovalRequest { session_id, .. }
+            | SessionUpdate::ApprovalWithdrawn { session_id, .. }
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
@@ -414,6 +421,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             tool_name: params.get("tool_name")?.as_str()?.to_string(),
             arguments_summary: params.get("arguments_summary")?.as_str()?.to_string(),
             timeout_secs: params.get("timeout_secs")?.as_u64().unwrap_or(30),
+        }),
+        "approval_withdrawn" => Some(SessionUpdate::ApprovalWithdrawn {
+            session_id: sid,
+            request_id: params.get("request_id")?.as_str()?.to_string(),
         }),
         "context_usage" => Some(SessionUpdate::ContextUsage {
             session_id: sid,
@@ -6412,6 +6423,20 @@ mod notification_tests {
         });
         let update = parse_session_update(&params).unwrap();
         assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn parse_approval_withdrawn() {
+        let update = parse_session_update(&serde_json::json!({
+            "type": "approval_withdrawn",
+            "session_id": "s1",
+            "request_id": "r1",
+        }));
+        assert!(matches!(
+            update,
+            Some(SessionUpdate::ApprovalWithdrawn { ref session_id, ref request_id })
+                if session_id == "s1" && request_id == "r1"
+        ));
     }
 
     #[test]
