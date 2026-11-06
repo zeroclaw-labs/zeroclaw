@@ -3293,12 +3293,26 @@ async fn handle_pair(
 
 pub(crate) async fn persist_pairing_tokens(state: &AppState) -> Result<()> {
     // Self-contained: no caller pre-reads config for modify, so this
-    // admits its own commit rather than taking one as a param. The
-    // admitted commit (writer guard + config-work lease) is held across
-    // the whole read-modify-save-publish below and runs the irreversible
-    // phase retained, so a cancelled request cannot strand a committed
-    // token write without its publication.
+    // admits its own commit rather than taking one as a param.
     let commit = state.begin_config_commit().await?;
+    persist_pairing_tokens_under(state, commit).await.map(drop)
+}
+
+/// [`persist_pairing_tokens`] for a caller that already holds an admitted
+/// commit: a revocation that removed a live token under it, through
+/// [`PairingGuard::revoke_under_config_write_lock`], persists under the same
+/// commit.
+///
+/// The commit (writer guard + config-work lease) is held across the whole
+/// read-modify-save-publish below and runs the irreversible phase retained,
+/// so a cancelled request cannot strand a committed token write without its
+/// publication. It is handed back once the publication lands, so a caller
+/// that must stay serialized past the persist (a rotation issuing its new
+/// pairing code) keeps the writer gate until it is done.
+pub(crate) async fn persist_pairing_tokens_under(
+    state: &AppState,
+    commit: ConfigWriteGuard,
+) -> Result<ConfigWriteGuard> {
     let paired_tokens = state.pairing.tokens();
     let mut updated_cfg = commit.current_config();
     updated_cfg.gateway.paired_tokens = paired_tokens;
@@ -3318,11 +3332,9 @@ pub(crate) async fn persist_pairing_tokens(state: &AppState) -> Result<()> {
             commit
                 .publish(revision, config)
                 .context("Failed to publish paired tokens to the live config")?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<ConfigWriteGuard, anyhow::Error>(commit)
         }));
-    task.await
-        .context("Paired-token persistence task failed")??;
-    Ok(())
+    task.await.context("Paired-token persistence task failed")?
 }
 
 /// Result of a gateway chat turn.
@@ -5412,6 +5424,20 @@ pub(crate) fn live_pairing_code_policy(state: &AppState) -> PairingCodePolicy {
     state.config.read().gateway.pairing_code
 }
 
+/// The admin rotate response when its config commit is refused before
+/// anything changed: the daemon generation is closing.
+fn admin_revocation_not_admitted(
+    error: zeroclaw_runtime::live_config_authority::ConfigCommitError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let body = serde_json::json!({
+        "success": false,
+        "pairing_required": true,
+        "pairing_code": null,
+        "message": format!("Revocation refused without any change: {error}"),
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+}
+
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct AdminPaircodeQuery {
     #[serde(default)]
@@ -5445,19 +5471,33 @@ async fn handle_admin_paircode_new(
 
     let revocation_message = match rotate {
         Some("all") => {
-            let revoked = state.pairing.revoke_all_tokens();
-            if let Some(registry) = state.device_registry.as_ref() {
-                if let Err(e) = registry.clear() {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
-                    });
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-                }
+            // Every live token and every device row go in one step under
+            // the lock, so a dropped request leaves neither half behind.
+            let ((revoked, cleared), config_write_guard) = match state
+                .pairing
+                .revoke_under_config_write_lock(state.begin_config_commit(), |pairing| {
+                    let revoked = pairing.revoke_all_tokens();
+                    let cleared = state
+                        .device_registry
+                        .as_ref()
+                        .map(|registry| registry.clear());
+                    (revoked, cleared)
+                })
+                .await
+            {
+                Ok(revoked) => revoked,
+                Err(e) => return Ok(admin_revocation_not_admitted(e)),
+            };
+            if let Some(Err(e)) = cleared {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
             }
-            if let Err(e) = persist_pairing_tokens(&state).await {
+            if let Err(e) = persist_pairing_tokens_under(&state, config_write_guard).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -5486,9 +5526,20 @@ async fn handle_admin_paircode_new(
                 });
                 return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
             };
-            let token_hash = match registry.revoke(device_id) {
-                Ok(Some(hash)) => hash,
-                Ok(None) => {
+            let config_write_guard = match state.begin_config_commit().await {
+                Ok(commit) => commit,
+                Err(e) => return Ok(admin_revocation_not_admitted(e)),
+            };
+            let revoked = api_pairing::revoke_device_credential(
+                &state,
+                registry,
+                device_id,
+                &config_write_guard,
+                || require_gateway_admin_token(&state, &headers),
+            )?;
+            match revoked {
+                Ok(true) => {}
+                Ok(false) => {
                     let body = serde_json::json!({
                         "success": false,
                         "pairing_required": true,
@@ -5506,9 +5557,8 @@ async fn handle_admin_paircode_new(
                     });
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
-            };
-            state.pairing.revoke_token_hash(&token_hash);
-            if let Err(e) = persist_pairing_tokens(&state).await {
+            }
+            if let Err(e) = persist_pairing_tokens_under(&state, config_write_guard).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -6539,6 +6589,67 @@ path = "{trigger_path}"
                 .is_empty(),
             "rotate=all must clear the device registry"
         );
+    }
+
+    /// The admin rotate paths dropped while they wait for the config write
+    /// lock, as the gateway's request timeout drops them, must leave every
+    /// device row and token in place, and the retried request revokes them.
+    #[tokio::test]
+    async fn admin_paircode_rotate_dropped_while_waiting_can_be_retried() {
+        for target in ["dev-a", "all"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = admin_paircode_state(&tmp, true, true);
+            let token_a = pair_device(&state, "dev-a").await;
+            let token_b = pair_device(&state, "dev-b").await;
+            let listed = |state: &AppState| -> Vec<String> {
+                let mut ids: Vec<String> = state
+                    .device_registry
+                    .as_ref()
+                    .unwrap()
+                    .list()
+                    .expect("test device registry list")
+                    .into_iter()
+                    .map(|device| device.id)
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let call = |state: AppState| {
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    admin_headers(&state),
+                    Query(AdminPaircodeQuery {
+                        rotate: Some(target.into()),
+                    }),
+                )
+            };
+
+            let in_flight = state.config_authority.lock_config_writer().await;
+            let mut waiting = Box::pin(call(state.clone()));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending(),
+                "{target}: the rotation must wait for the config write lock"
+            );
+            drop(waiting);
+            drop(in_flight);
+
+            assert_eq!(listed(&state), vec!["dev-a", "dev-b"], "{target}");
+            assert!(state.pairing.is_authenticated(&token_a), "{target}");
+            assert!(state.pairing.is_authenticated(&token_b), "{target}");
+
+            let (status, _) = admin_paircode_response_json(call(state.clone()).await).await;
+            assert_eq!(status, StatusCode::OK, "{target}: the retry");
+            assert!(!state.pairing.is_authenticated(&token_a), "{target}");
+            if target == "all" {
+                assert!(listed(&state).is_empty());
+                assert!(!state.pairing.is_authenticated(&token_b));
+            } else {
+                assert_eq!(listed(&state), vec!["dev-b"]);
+                assert!(state.pairing.is_authenticated(&token_b));
+            }
+        }
     }
 
     #[tokio::test]
