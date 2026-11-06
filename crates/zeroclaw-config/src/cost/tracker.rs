@@ -2489,7 +2489,11 @@ mod tests {
                 matches!(agent.check_budget(0.0).unwrap(), BudgetCheck::Exceeded { current_usd, agent_alias: Some(alias), .. } if current_usd == 12.0 && alias == "test-agent")
             );
             let summary = after.get_summary().unwrap();
-            assert_eq!(summary.request_count, 2);
+            // Reusing the tracker preserves its process-local counters; the
+            // migrated ledger and budget aggregates include both backends.
+            assert_eq!(summary.request_count, 1);
+            assert_eq!(summary.session_cost_usd, 3.0);
+            assert_eq!(after.lock_storage().ledger.read_records().unwrap().len(), 2);
             assert_eq!(summary.daily_cost_usd, 12.0);
             assert_eq!(summary.monthly_cost_usd, 12.0);
         }
