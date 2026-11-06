@@ -443,7 +443,12 @@ impl zeroclaw_api::model_provider::ModelProvider for SopWorkshopApplyProbe {
                 .messages
                 .iter()
                 .filter(|message| message.role == "tool")
-                .map(|message| serde_json::from_str(&message.content).unwrap())
+                .map(|message| {
+                    json!({
+                        "tool_call_id": message.tool_result.as_ref().unwrap().tool_call_id,
+                        "content": message.content,
+                    })
+                })
                 .collect();
         }
         Ok(zeroclaw_providers::ChatResponse {
