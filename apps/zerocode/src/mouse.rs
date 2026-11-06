@@ -1,8 +1,7 @@
 //! Reusable mouse interaction helpers for the TUI.
 //! Pure geometry + timing utilities. No pane-specific logic lives here.
 
-#[cfg(not(test))]
-use std::io::Write;
+use std::io::{self, Write};
 use std::time::Instant;
 
 use ratatui::layout::Rect;
@@ -140,22 +139,23 @@ impl DoubleClickTracker {
 
 // ── Clipboard (OSC 52) ──────────────────────────────────────────
 
-/// Copy `text` to the system clipboard via OSC 52.
+/// Request clipboard delivery of `text` via OSC 52.
 ///
 /// Works in most modern terminals (iTerm2, kitty, alacritty, WezTerm,
 /// foot, tmux with `set-clipboard on`). Terminals that don't support
 /// OSC 52 silently ignore the sequence.
 #[cfg(not(test))]
-pub(crate) fn copy_osc52(text: &str) {
-    let encoded = base64_encode(text.as_bytes());
-    // OSC 52 ; c ; <base64> ST
-    let seq = format!("\x1b]52;c;{encoded}\x07");
-    let _ = std::io::stdout().write_all(seq.as_bytes());
-    let _ = std::io::stdout().flush();
+pub(crate) fn copy_osc52(text: &str) -> io::Result<()> {
+    let mut output = std::io::stdout().lock();
+    write_osc52(&mut output, text)
 }
 
-#[cfg(test)]
-pub(crate) fn copy_osc52(_text: &str) {}
+pub(crate) fn write_osc52(output: &mut impl Write, text: &str) -> io::Result<()> {
+    let encoded = base64_encode(text.as_bytes());
+    // OSC 52 ; c ; <base64> BEL
+    write!(output, "\x1b]52;c;{encoded}\x07")?;
+    output.flush()
+}
 
 /// Minimal base64 encoder. Standard alphabet, with padding.
 pub(crate) fn base64_encode(input: &[u8]) -> String {
@@ -186,8 +186,50 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{help_hint_click, tab_click_index};
+    use super::{help_hint_click, tab_click_index, write_osc52};
     use ratatui::layout::Rect;
+    use std::io::{self, Write};
+
+    #[test]
+    fn osc52_encodes_text_for_terminal_clipboard_request() {
+        let mut output = Vec::new();
+        write_osc52(&mut output, "hello").unwrap();
+        assert_eq!(output, b"\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_propagates_write_and_flush_failures() {
+        struct FailingWriter {
+            fail_on_flush: bool,
+        }
+
+        impl Write for FailingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.fail_on_flush {
+                    Ok(buf.len())
+                } else {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "write fixture"))
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush fixture"))
+            }
+        }
+
+        for fail_on_flush in [false, true] {
+            let error = write_osc52(&mut FailingWriter { fail_on_flush }, "sample").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                error.to_string(),
+                if fail_on_flush {
+                    "flush fixture"
+                } else {
+                    "write fixture"
+                }
+            );
+        }
+    }
 
     fn bar(width: u16) -> Rect {
         Rect {

@@ -62,11 +62,21 @@ impl LogsCopyMenu {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LogsCopyFeedback {
     rect: Rect,
     surface: LogsTextSurface,
+    outcome: Result<crate::clipboard::CopyOutcome, String>,
     shown_at: Instant,
+}
+
+impl LogsCopyFeedback {
+    fn label(&self) -> String {
+        match &self.outcome {
+            Ok(outcome) => outcome.label(),
+            Err(notice) => notice.clone(),
+        }
+    }
 }
 
 fn copy_menu_rect(column: u16, row: u16, bounds: Rect) -> Option<Rect> {
@@ -1166,6 +1176,7 @@ impl Logs {
         }
         if self
             .copy_feedback
+            .as_ref()
             .is_some_and(|feedback| feedback.surface == surface)
         {
             self.copy_feedback = None;
@@ -1285,14 +1296,22 @@ impl Logs {
         if target.text.is_empty() {
             return false;
         }
-        crate::mouse::copy_osc52(&target.text);
-        self.text_selection = None;
+        let outcome = crate::clipboard::copy_text(&target.text)
+            .map_err(|error| crate::clipboard::copy_failure_notice(&error));
+        if outcome.is_ok() {
+            self.text_selection = None;
+        }
         self.copy_menu = None;
+        let label = match &outcome {
+            Ok(outcome) => outcome.label(),
+            Err(notice) => notice.clone(),
+        };
         self.copy_feedback = self
-            .feedback_rect(target.anchor, target.surface)
+            .feedback_rect(target.anchor, target.surface, &label)
             .map(|rect| LogsCopyFeedback {
                 rect,
                 surface: target.surface,
+                outcome,
                 shown_at: Instant::now(),
             });
         true
@@ -1419,12 +1438,11 @@ impl Logs {
         false
     }
 
-    fn feedback_rect(&self, anchor: Rect, surface: LogsTextSurface) -> Option<Rect> {
+    fn feedback_rect(&self, anchor: Rect, surface: LogsTextSurface, label: &str) -> Option<Rect> {
         use unicode_width::UnicodeWidthStr;
 
         let bounds = self.snapshot(surface)?.area;
-        let label = crate::i18n::t("zc-logs-copied");
-        let width = (UnicodeWidthStr::width(label.as_str()) as u16).min(bounds.width);
+        let width = (UnicodeWidthStr::width(label) as u16).min(bounds.width);
         if width == 0 || bounds.height == 0 {
             return None;
         }
@@ -1438,6 +1456,7 @@ impl Logs {
     fn expire_copy_feedback(&mut self) {
         if self
             .copy_feedback
+            .as_ref()
             .is_some_and(|feedback| feedback.shown_at.elapsed() >= COPY_FEEDBACK_TTL)
         {
             self.copy_feedback = None;
@@ -1457,14 +1476,19 @@ impl Logs {
     }
 
     fn render_copy_feedback(&self, frame: &mut ratatui::Frame) {
-        let Some(feedback) = self.copy_feedback else {
+        let Some(feedback) = &self.copy_feedback else {
             return;
         };
         frame.render_widget(Clear, feedback.rect);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                crate::i18n::t("zc-logs-copied"),
-                theme::success_style().add_modifier(Modifier::BOLD),
+                feedback.label(),
+                if feedback.outcome.is_ok() {
+                    theme::success_style()
+                } else {
+                    theme::error_style()
+                }
+                .add_modifier(Modifier::BOLD),
             )))
             .alignment(Alignment::Center),
             feedback.rect,
@@ -2377,6 +2401,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_requested_copy_renders_log_outcome_label() {
+        use unicode_width::UnicodeWidthStr;
+
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        logs.list_state.select(Some(0));
+        draw(&mut logs, 100, 12);
+        let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+        crate::clipboard::with_copy_result(Ok(outcome), || {
+            assert!(logs.copy_current_selection_or_row());
+        });
+        let feedback = logs.copy_feedback.as_ref().expect("requested feedback");
+        assert_eq!(feedback.outcome, Ok(outcome));
+        assert_eq!(
+            usize::from(feedback.rect.width),
+            UnicodeWidthStr::width(outcome.label().as_str())
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains(&outcome.label()),
+            "rendered: {rendered:?}"
+        );
+        assert!(!rendered.contains(&crate::clipboard::CopyOutcome::Copied.label()));
+    }
+
+    #[tokio::test]
+    async fn failed_log_copy_keeps_selection_and_renders_error() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        draw(&mut logs, 120, 12);
+        let area = logs.list_snapshot.as_ref().expect("list snapshot").area;
+        assert!(logs.begin_text_drag(area.x, area.y));
+        assert!(logs.update_text_drag(area.x + 5, area.y));
+        logs.finish_text_drag();
+        let selection = logs.text_selection;
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer rejected copy");
+        let expected = crate::clipboard::copy_failure_notice(&error);
+        crate::clipboard::with_copy_result(Err(error), || {
+            assert!(
+                logs.copy_current_selection_or_row(),
+                "an attempted copy owns its key"
+            );
+        });
+        assert_eq!(logs.text_selection, selection);
+        assert_eq!(
+            logs.copy_feedback.as_ref().unwrap().outcome,
+            Err(expected.clone())
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains(&expected), "rendered: {rendered:?}");
+        assert!(!rendered.contains(&crate::clipboard::CopyOutcome::Copied.label()));
+        assert_eq!(logs.text_selection, selection);
+    }
+
+    #[tokio::test]
     async fn copy_shortcut_prefers_selection_and_whole_detail_y_still_works() {
         let mut logs = test_logs();
         let entry = sample_entry();
@@ -2394,7 +2493,10 @@ mod tests {
             .await;
         assert!(logs.text_selection.is_none());
         assert_eq!(
-            logs.copy_feedback.expect("selection feedback").surface,
+            logs.copy_feedback
+                .as_ref()
+                .expect("selection feedback")
+                .surface,
             LogsTextSurface::Detail,
         );
 
@@ -2426,7 +2528,7 @@ mod tests {
         logs.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER))
             .await;
         assert_eq!(
-            logs.copy_feedback.expect("row feedback").surface,
+            logs.copy_feedback.as_ref().expect("row feedback").surface,
             LogsTextSurface::List,
         );
     }
