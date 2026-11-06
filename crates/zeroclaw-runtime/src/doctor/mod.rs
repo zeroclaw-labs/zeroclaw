@@ -2494,7 +2494,8 @@ mod tests {
     #[test]
     fn diagnose_surfaces_codex_cli_warnings_for_the_build() {
         use zeroclaw_config::opt_in_tools::OptInTool;
-        let mut config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
         config.codex_cli.enabled = true;
         config.codex_cli.extra_args =
             vec!["--sandbox".to_string(), "danger-full-access".to_string()];
@@ -2639,7 +2640,8 @@ mod tests {
 
     #[tokio::test]
     async fn structured_run_includes_model_probe_results() {
-        let mut config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
         let profile = config
             .providers
             .models
@@ -2878,7 +2880,8 @@ mod tests {
     async fn run_structured_with_timeout_preserves_prior_diagnostics() {
         use std::time::Duration;
 
-        let config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
 
         // A never-completing probe forces the timeout branch on every run.
         let (results, timed_out_phase) = run_structured_with_probe(
@@ -2946,7 +2949,8 @@ mod tests {
     async fn run_structured_with_timeout_under_deadline() {
         use std::time::Duration;
 
-        let config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
 
         // A probe that completes immediately with a real result — this proves
         // completed probe rows survive to the output, which the old
@@ -3743,7 +3747,8 @@ mod tests {
         // Asserts the localized Fluent message resolves and inlines the path +
         // the tilde reason — the diagnostic now goes through Fluent per
         // AGENTS.mdRound 3).
-        let mut config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
         config.gateway.web_dist_dir = Some("~/web-dist".to_string());
 
         let expected_reason = crate::i18n::get_required_cli_string("cli-web-dist-dir-reason-tilde");
@@ -3766,7 +3771,8 @@ mod tests {
 
     #[test]
     fn diagnose_flags_web_dist_dir_with_env_var() {
-        let mut config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
         config.gateway.web_dist_dir = Some("$HOME/web-dist".to_string());
 
         let expected_reason =
@@ -3789,7 +3795,8 @@ mod tests {
 
     #[test]
     fn diagnose_accepts_literal_web_dist_dir() {
-        let mut config = Config::default();
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
         config.gateway.web_dist_dir = Some("/srv/zeroclaw/web-dist".to_string());
 
         let results = diagnose(&config);

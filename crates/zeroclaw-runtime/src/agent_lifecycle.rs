@@ -477,7 +477,12 @@ mod tests {
 
     #[test]
     fn preflight_refuses_reserved_and_missing_aliases() {
-        let config = Config::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: temp.path().join("data"),
+            config_path: temp.path().join("config.toml"),
+            ..Config::default()
+        };
         let reserved = plan_agent_delete(&config, "default");
         assert!(!reserved.allowed);
         assert!(reserved.blockers[0].contains("reserved"));
