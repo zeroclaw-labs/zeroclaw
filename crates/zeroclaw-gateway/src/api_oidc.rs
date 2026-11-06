@@ -68,6 +68,7 @@ use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment, P
 use crate::dashboard_session::{
     self, CookieScope, DashboardAuth, DashboardCaller, ProviderPin, SessionRejection, SignInRefusal,
 };
+use crate::relay_ingress::ViaRelay;
 use crate::{AppState, SlidingWindowRateLimiter};
 
 const FLOW_TTL: Duration = Duration::from_secs(600);
@@ -589,11 +590,20 @@ async fn handle_device_poll(
     }
 }
 
-/// The scheme the browser used to reach this gateway: a forwarded proto
-/// only where the deployment trusts its proxy, else the listener's own. The
-/// forwarded value counts only as `http` or `https` (the first of a chained
-/// list); anything else is ignored rather than pasted into a URL.
-fn request_scheme(state: &AppState, headers: &HeaderMap) -> &'static str {
+/// The scheme the browser used to reach this gateway: HTTPS for a request
+/// a relay-served dashboard forwarded (the browser's TLS ended at the
+/// relay), else a forwarded proto only where the deployment trusts its
+/// proxy, else the listener's own. The forwarded value counts only as
+/// `http` or `https` (the first of a chained list); anything else is
+/// ignored rather than pasted into a URL.
+fn request_scheme(
+    state: &AppState,
+    headers: &HeaderMap,
+    via_relay: Option<&ViaRelay>,
+) -> &'static str {
+    if via_relay.is_some() {
+        return "https";
+    }
     let forwarded_proto = state
         .trust_forwarded_headers
         .then(|| headers.get("x-forwarded-proto"))
@@ -633,8 +643,12 @@ fn request_scheme(state: &AppState, headers: &HeaderMap) -> &'static str {
 /// Whether the browser reached this gateway over HTTPS, by the same rule
 /// the callback URI uses. Decides `Secure` cookies and the dashboard's
 /// own origin.
-pub(crate) fn request_is_https(state: &AppState, headers: &HeaderMap) -> bool {
-    request_scheme(state, headers) == "https"
+pub(crate) fn request_is_https(
+    state: &AppState,
+    headers: &HeaderMap,
+    via_relay: Option<&ViaRelay>,
+) -> bool {
+    request_scheme(state, headers, via_relay) == "https"
 }
 
 /// The authority a request named in `Host`, if it is a plain one: a host
@@ -688,13 +702,30 @@ fn is_host_name(name: &str) -> bool {
         })
 }
 
-/// The callback URI this deployment's browser flow lands on, derived
-/// from the request the user's browser just made. Only a plain `Host`
-/// authority is used, so the URI can't name another site; past that, the
-/// IdP accepts only registered redirect URIs, and the exchange later uses
-/// the exact URI stored at flow start.
-fn callback_uri(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Response>> {
-    let scheme = request_scheme(state, headers);
+/// The callback URI this deployment's browser flow lands on.
+///
+/// Through a relay-served dashboard it is that dashboard's fixed origin,
+/// never the request's `Host`: the relay routes by the TLS server name, so a
+/// request can name another host than the one it was routed for, and a
+/// callback built from it would send the sign-in code there.
+///
+/// Otherwise it is derived from the request the user's browser just made.
+/// Only a plain `Host` authority is used, so the URI can't name another
+/// site; past that, the IdP accepts only registered redirect URIs, and the
+/// exchange later uses the exact URI stored at flow start.
+fn callback_uri(
+    state: &AppState,
+    headers: &HeaderMap,
+    via_relay: Option<&ViaRelay>,
+) -> Result<String, Box<Response>> {
+    if let Some(via_relay) = via_relay {
+        return Ok(format!(
+            "{}{}/oidc/callback",
+            via_relay.origin(),
+            state.path_prefix
+        ));
+    }
+    let scheme = request_scheme(state, headers, None);
     let host = request_authority(headers).ok_or_else(|| {
         Box::new(error_json(
             StatusCode::BAD_REQUEST,
@@ -711,9 +742,11 @@ async fn handle_pkce_login(
     State(state): State<AppState>,
     Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    via_relay: Option<Extension<ViaRelay>>,
     Path(alias): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let via_relay = via_relay.as_deref();
     let key = client_key(&state, peer, &headers);
     if let Err(denied) = auth_gate(&relay, &key, false) {
         return *denied;
@@ -728,7 +761,7 @@ async fn handle_pkce_login(
         Ok(enrollment) => enrollment,
         Err(response) => return *response,
     };
-    let redirect_uri = match callback_uri(&state, &headers) {
+    let redirect_uri = match callback_uri(&state, &headers, via_relay) {
         Ok(uri) => uri,
         Err(response) => return *response,
     };
@@ -848,10 +881,12 @@ async fn handle_dashboard_sign_in(
     Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     Extension(dashboard): Extension<Arc<DashboardAuth>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    via_relay: Option<Extension<ViaRelay>>,
     Path(alias): Path<String>,
     Query(query): Query<SignInQuery>,
     headers: HeaderMap,
 ) -> Response {
+    let via_relay = via_relay.as_deref();
     let key = client_key(&state, peer, &headers);
     if let Err(denied) = auth_gate(&relay, &key, false) {
         return *denied;
@@ -880,7 +915,7 @@ async fn handle_dashboard_sign_in(
              build the address to come back to. Open the dashboard at its usual address.",
         );
     }
-    let https = request_is_https(&state, &headers);
+    let https = request_is_https(&state, &headers, via_relay);
     if !https && !is_loopback_request(peer, &headers) {
         return sign_in_unavailable_page(
             StatusCode::BAD_REQUEST,
@@ -902,7 +937,7 @@ async fn handle_dashboard_sign_in(
         Ok(enrollment) => enrollment,
         Err(response) => return *response,
     };
-    let redirect_uri = match callback_uri(&state, &headers) {
+    let redirect_uri = match callback_uri(&state, &headers, via_relay) {
         Ok(uri) => uri,
         Err(response) => return *response,
     };
@@ -1057,10 +1092,11 @@ async fn handle_sign_out(
     State(state): State<AppState>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     caller: Option<Extension<DashboardCaller>>,
+    via_relay: Option<Extension<ViaRelay>>,
     headers: HeaderMap,
 ) -> Response {
     let scope = CookieScope {
-        https: request_is_https(&state, &headers),
+        https: request_is_https(&state, &headers, via_relay.as_deref()),
         path_prefix: &state.path_prefix,
     };
     let (Some(Extension(dashboard)), Some(Extension(caller))) = (dashboard, caller) else {
@@ -1206,9 +1242,11 @@ async fn handle_pkce_callback(
     Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     dashboard_ext: Option<Extension<Arc<DashboardAuth>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    via_relay: Option<Extension<ViaRelay>>,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
+    let via_relay = via_relay.as_deref();
     let key = client_key(&state, peer, &headers);
     // Counted by outcome, not on arrival: the callback that finishes a
     // browser sign-in is the successful end of a flow this gateway itself
@@ -1268,7 +1306,7 @@ async fn handle_pkce_callback(
         None => None,
         Some(binding_hash) => {
             let scope = CookieScope {
-                https: request_is_https(&state, &headers),
+                https: request_is_https(&state, &headers, via_relay),
                 path_prefix: &state.path_prefix,
             };
             let bound = scope
@@ -1393,8 +1431,15 @@ async fn handle_pkce_callback(
                 popup,
                 replaces,
             };
-            finish_dashboard_sign_in(&state, &dashboard, &headers, landing, token.access_token)
-                .await
+            finish_dashboard_sign_in(
+                &state,
+                &dashboard,
+                &headers,
+                via_relay,
+                landing,
+                token.access_token,
+            )
+            .await
         }
         // A dashboard flow always has its session state by now (it returned
         // above otherwise); never fall through to the token page.
@@ -1426,6 +1471,7 @@ async fn finish_dashboard_sign_in(
     state: &AppState,
     dashboard: &DashboardAuth,
     headers: &HeaderMap,
+    via_relay: Option<&ViaRelay>,
     landing: DashboardLanding,
     access_token: String,
 ) -> Response {
@@ -1440,7 +1486,7 @@ async fn finish_dashboard_sign_in(
         replaces,
     } = landing;
     let scope = CookieScope {
-        https: request_is_https(state, headers),
+        https: request_is_https(state, headers, via_relay),
         path_prefix: &state.path_prefix,
     };
     // The callback is a navigation from the identity provider's site, so the
@@ -1982,6 +2028,46 @@ mod tests {
             login_redirect_uri(base, false, &forwarded).await,
             http_uri,
             "untrusted X-Forwarded-Proto is ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_forwarded_login_calls_back_to_the_dashboard_origin_never_the_host() {
+        let server = idp().await;
+        let mut state = crate::api::tests::test_state(config_with_alias(&server.uri(), "corp"));
+        // A proxy in front of the listener is trusted; the relay path must
+        // not be steered by what that trust would otherwise accept.
+        state.trust_forwarded_headers = true;
+        let router = routes().with_state(state);
+        let relay = crate::relay_ingress::RelayConnection::new(
+            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new("abc.relay.example", 443)
+                .unwrap(),
+        );
+        let mut request = build_request(
+            "GET",
+            "/oidc/login/corp",
+            "abc.relay.example",
+            None,
+            remote(),
+            &[],
+        );
+        relay.admit(&mut request).unwrap();
+        // Whatever Host and scheme the request then claims, the callback is
+        // the dashboard's origin: the relay routes by the TLS server name,
+        // so the Host is not what decided where this request went.
+        let headers = request.headers_mut();
+        headers.insert(header::HOST, HeaderValue::from_static("evil.example"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let redirect_uri = header_value(&response, "location")
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("redirect_uri="))
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            redirect_uri,
+            query_escape("https://abc.relay.example/oidc/callback")
         );
     }
 
