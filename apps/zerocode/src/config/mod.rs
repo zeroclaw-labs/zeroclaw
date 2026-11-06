@@ -379,6 +379,10 @@ pub(crate) struct SidebarSection {
     /// visible. Clamped at the shell boundary.
     #[serde(default = "default_sidebar_queue_percent")]
     pub queue_percent: u16,
+    /// Reopen the sessions that were open when zerocode last quit. On by
+    /// default; `--fresh` skips it for one launch.
+    #[serde(default = "default_true")]
+    pub restore_sessions: bool,
 }
 
 impl Default for SidebarSection {
@@ -391,6 +395,7 @@ impl Default for SidebarSection {
             side: None,
             sessions_percent: default_sidebar_sessions_percent(),
             queue_percent: default_sidebar_queue_percent(),
+            restore_sessions: true,
         }
     }
 }
@@ -2129,6 +2134,25 @@ mod tests {
             body.contains("[sidebar]") && body.contains("visible = true"),
             "the default document must materialize [sidebar] so schema-mirror env overrides resolve; got:\n{body}"
         );
+    }
+
+    #[test]
+    fn restore_sessions_defaults_on_and_is_env_overridable() {
+        let _guard = env_test_lock();
+        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        assert!(
+            body.contains("restore_sessions = true"),
+            "the default document must carry restore_sessions so the env override resolves; got:\n{body}"
+        );
+        let legacy: SidebarSection = toml::from_str("visible = true").unwrap();
+        assert!(
+            legacy.restore_sessions,
+            "a file written before the setting existed restores"
+        );
+
+        let mut config = ZerocodeConfig::default();
+        set_prop(&mut config, "sidebar.restore_sessions", "false").unwrap();
+        assert!(!config.sidebar.restore_sessions);
     }
 
     #[test]

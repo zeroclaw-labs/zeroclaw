@@ -915,6 +915,41 @@ mod tests {
     }
 
     #[test]
+    fn restore_sessions_messages_format_in_all_builtin_catalogues() {
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+        for (locale, source) in catalogues {
+            let bundle = build_ftl_bundle(source, locale);
+            let dropped = format_ftl_message(
+                &bundle,
+                "zc-app-restore-sessions-dropped",
+                &[("count", "3")],
+            )
+            .unwrap_or_else(|| panic!("dropped message must format for {locale}"));
+            assert!(dropped.contains('3'), "{locale}: {dropped}");
+            let failed = format_ftl_message(
+                &bundle,
+                "zc-app-restore-sessions-save-failed",
+                &[("error", "disk full")],
+            )
+            .unwrap_or_else(|| panic!("save-failed message must format for {locale}"));
+            assert!(failed.contains("disk full"), "{locale}: {failed}");
+            let other = format_ftl_message(
+                &bundle,
+                "zc-app-restore-sessions-other-window",
+                &[("count", "2")],
+            )
+            .unwrap_or_else(|| panic!("other-window message must format for {locale}"));
+            assert!(other.contains('2'), "{locale}: {other}");
+        }
+    }
+
+    #[test]
     fn missing_key_returns_brace_form() {
         let value = t("zc-definitely-not-a-real-key");
         assert_eq!(value, "{zc-definitely-not-a-real-key}");

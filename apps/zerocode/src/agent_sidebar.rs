@@ -86,7 +86,7 @@ impl SidebarPicker {
 pub(crate) struct AgentSidebar {
     /// Scroll offset into the session rows.
     scroll: u16,
-    /// User-selected display order across both panes, retained until UI exit.
+    /// User-selected display order across both panes.
     row_order: Vec<(PaneKind, String)>,
     /// Session identity captured by a row-body press, never a close control.
     drag: Option<(PaneKind, String)>,
@@ -124,6 +124,24 @@ impl AgentSidebar {
 
     pub(crate) fn picker_open(&self) -> bool {
         self.picker.is_some()
+    }
+
+    /// Seed the saved cross-pane order before the first draw. Draw reconciles
+    /// it with the panes' actual membership, including failed resume rows.
+    pub(crate) fn restore_order(&mut self, order: Vec<(PaneKind, String)>) {
+        self.row_order = order;
+    }
+
+    /// Preserve the displayed slot when its pane explicitly replaces an ID.
+    pub(crate) fn replace_session_id(&mut self, pane: PaneKind, old: &str, new: String) {
+        if let Some((_, sid)) = self
+            .row_order
+            .iter_mut()
+            .find(|(kind, sid)| *kind == pane && sid.as_str() == old)
+        {
+            *sid = new;
+        }
+        self.cancel_drag();
     }
 
     pub(crate) fn close_picker(&mut self) {
