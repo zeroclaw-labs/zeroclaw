@@ -1,14 +1,16 @@
 //! Thin CLI adapter for the read-only plugin package catalog.
 
-use zeroclaw::plugins::catalog::{PluginCatalogEntry, package_catalog};
+use zeroclaw::plugins::catalog::{
+    OriginCatalogEntry as PluginCatalogEntry, origin_package_catalog as package_catalog,
+};
 use zeroclaw::plugins::host::PluginHost;
-use zeroclaw::plugins::registry::read_cached_registry_index;
+use zeroclaw::plugins::registry::read_cached_registry_collection;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 pub(crate) fn print(config: &crate::config::schema::Config, host: &PluginHost) {
     let installed = host.list_plugins();
-    let cached_registry = match read_cached_registry_index(&config.data_dir) {
-        Ok(index) => index,
+    let cached_registry = match read_cached_registry_collection(&config.data_dir) {
+        Ok(index) => index.filter(zeroclaw::plugins::registry::cache_matches_environment),
         Err(error) => {
             let error = error.to_string();
             eprintln!(
@@ -22,10 +24,10 @@ pub(crate) fn print(config: &crate::config::schema::Config, host: &PluginHost) {
         }
     };
     let entries = package_catalog(&installed, cached_registry.as_ref());
-    render(&entries);
+    render(&entries, crate::egress_command_config_dir(config));
 }
 
-fn render(entries: &[PluginCatalogEntry<'_>]) {
+fn render(entries: &[PluginCatalogEntry<'_>], config_dir: &std::path::Path) {
     if entries.is_empty() {
         println!("{}", get_required_cli_string("cli-plugin-catalog-empty"));
         return;
@@ -83,5 +85,22 @@ fn render(entries: &[PluginCatalogEntry<'_>]) {
             (None, None) => continue,
         };
         println!("{line}");
+        if let Some(available) = entry.available() {
+            let command = zeroclaw::plugins::registry::registry_install_command_for(
+                zeroclaw::plugins::registry::ShellDialect::host(),
+                available,
+                entry.origin,
+                Some(config_dir),
+                false,
+            );
+            let hint = match command {
+                Some(command) => get_required_cli_string_with_args(
+                    "cli-plugin-registry-command",
+                    &[("command", &command)],
+                ),
+                None => get_required_cli_string("cli-plugin-registry-command-unavailable"),
+            };
+            println!("{hint}");
+        }
     }
 }

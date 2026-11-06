@@ -47,3 +47,6 @@ mod whatsapp_webhook_security;
 mod plugin_info_cli;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_update_cli;
+
+#[cfg(all(windows, feature = "plugins-wasm"))]
+mod plugin_registry_windows_cli;

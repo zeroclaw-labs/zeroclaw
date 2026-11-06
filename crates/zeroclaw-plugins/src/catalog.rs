@@ -213,3 +213,52 @@ mod tests {
         );
     }
 }
+
+/// Additive source-bound view; legacy catalog entries/accessors remain unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct OriginCatalogEntry<'a> {
+    pub metadata: PluginCatalogEntry<'a>,
+    pub origin: Option<&'a str>,
+}
+impl<'a> std::ops::Deref for OriginCatalogEntry<'a> {
+    type Target = PluginCatalogEntry<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+pub fn origin_package_catalog<'a>(
+    installed: &'a [PluginInfo],
+    registry: Option<&'a crate::registry::RegistryCollection>,
+) -> Vec<OriginCatalogEntry<'a>> {
+    let mut rows = BTreeMap::new();
+    for metadata in package_catalog(installed, None) {
+        rows.insert(
+            (metadata.name(), None),
+            OriginCatalogEntry {
+                metadata,
+                origin: None,
+            },
+        );
+    }
+    if let Some(registry) = registry {
+        for index in &registry.registries {
+            let origin = Some(
+                index
+                    .registry_url
+                    .as_deref()
+                    .unwrap_or(crate::registry::DEFAULT_REGISTRY_URL),
+            );
+            for metadata in package_catalog(installed, Some(index)) {
+                if metadata.available().is_none() {
+                    continue;
+                }
+                rows.remove(&(metadata.name(), None));
+                rows.insert(
+                    (metadata.name(), origin),
+                    OriginCatalogEntry { metadata, origin },
+                );
+            }
+        }
+    }
+    rows.into_values().collect()
+}

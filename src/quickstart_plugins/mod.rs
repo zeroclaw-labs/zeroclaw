@@ -227,7 +227,7 @@ pub(crate) enum RowExit {
 /// so before the registry is contacted and offers nothing to pick.
 pub(crate) async fn open_row(config: &Config, row: &mut PluginsRow) -> anyhow::Result<RowExit> {
     let registry = RegistryClient::new(RegistryTimeouts::default())?;
-    let registry_url = crate::plugin_registry::registry_url(None);
+    let registry_url = crate::plugin_registry::registry_url(None)?;
     Box::pin(open_row_with(
         config,
         row,
@@ -278,11 +278,9 @@ async fn open_row_with<P: QuickstartPrompter>(
             }
         }
     };
-    if let Err(error) = zeroclaw::plugins::registry::write_cached_registry_index(
-        &config.data_dir,
-        registry_url,
-        &index,
-    ) {
+    if let Err(error) =
+        zeroclaw::plugins::registry::write_cached_registry_collection(&config.data_dir, &index)
+    {
         // The cache only speeds up later listings; a failure to refresh it
         // must not block the choice.
         ::zeroclaw_log::record!(
@@ -308,8 +306,8 @@ async fn open_row_with<P: QuickstartPrompter>(
         }
     };
     let installed = host.list_plugins();
-    let catalog = zeroclaw::plugins::catalog::package_catalog(&installed, Some(&index));
-    let choices = plugin_choices(&catalog);
+    let catalog = zeroclaw::plugins::catalog::origin_package_catalog(&installed, Some(&index));
+    let choices = model::origin_plugin_choices(&catalog);
     if choices.is_empty() {
         prompter.say(&qta("cli-quickstart-plugins-none-available", &[]));
         row.visited = true;
@@ -320,7 +318,12 @@ async fn open_row_with<P: QuickstartPrompter>(
     let labels: Vec<String> = choices.iter().map(choice_label).collect();
     let checked: Vec<bool> = choices
         .iter()
-        .map(|choice| row.selected.iter().any(|kept| kept.name == choice.name))
+        .map(|choice| {
+            row.selected.iter().any(|kept| {
+                kept.name == choice.name
+                    && kept.registry_origin.as_deref() == choice.registry_origin.as_deref()
+            })
+        })
         .collect();
     match prompter.multi_select(
         &qta("cli-quickstart-plugins-select-prompt", &[]),
@@ -328,6 +331,15 @@ async fn open_row_with<P: QuickstartPrompter>(
         &checked,
     ) {
         Ok(Some(picked)) => {
+            let mut names = std::collections::HashSet::new();
+            for index in &picked {
+                if let Some(choice) = choices.get(*index)
+                    && !names.insert(choice.name.as_str())
+                {
+                    prompter.say(&qta("cli-plugin-registry-selection-conflict", &[]));
+                    return Ok(RowExit::Done);
+                }
+            }
             row.selected = picked
                 .into_iter()
                 .filter_map(|index| choices.get(index).cloned())
@@ -379,7 +391,23 @@ fn registry_unavailable_line(error: &anyhow::Error) -> String {
 }
 
 fn choice_label(choice: &PluginChoice) -> String {
-    let name = terminal_safe(&choice.name);
+    let name = match choice
+        .registry_entry
+        .as_ref()
+        .and_then(|_| choice.registry_origin.as_deref())
+    {
+        Some(origin) => qta(
+            "cli-plugin-registry-origin",
+            &[
+                ("name", &terminal_safe(&choice.name)),
+                (
+                    "origin",
+                    &zeroclaw::plugins::registry::registry_origin_label(origin),
+                ),
+            ],
+        ),
+        None => terminal_safe(&choice.name),
+    };
     let version = terminal_safe(&choice.version);
     let description = choice
         .description
@@ -1467,18 +1495,38 @@ async fn install_one<P: QuickstartPrompter>(
     {
         // An admitted package name is lowercase letters, digits, `.`, `-`
         // and `_`, which every supported shell passes as written.
-        let command = zeroclaw_command(
-            config,
-            &format!("plugin install {} --no-verify", admitted.manifest().name),
-        );
-        prompter.say(&indented(&qta(
-            "cli-quickstart-plugins-load-check-failed",
-            &[
-                ("name", &display_name),
-                ("error", &terminal_safe_detail(&format!("{error:#}"))),
-                ("command", &command),
-            ],
-        )));
+        let command = if let Some(origin) = choice.registry_origin.as_deref() {
+            zeroclaw::plugins::registry::registry_install_command_for(
+                crate::plugins::egress_ceremony::ShellDialect::host(),
+                entry,
+                Some(origin),
+                Some(crate::egress_command_config_dir(config)),
+                true,
+            )
+        } else {
+            Some(zeroclaw_command(
+                config,
+                &format!("plugin install {} --no-verify", admitted.manifest().name),
+            ))
+        };
+        if let Some(command) = command {
+            prompter.say(&indented(&qta(
+                "cli-quickstart-plugins-load-check-failed",
+                &[
+                    ("name", &display_name),
+                    ("error", &terminal_safe_detail(&format!("{error:#}"))),
+                    ("command", &command),
+                ],
+            )));
+        } else {
+            prompter.say(&indented(&qta(
+                "cli-quickstart-plugins-load-check-command-unavailable",
+                &[
+                    ("name", &display_name),
+                    ("error", &terminal_safe_detail(&format!("{error:#}"))),
+                ],
+            )));
+        }
         return Ok(PackageOutcome::Failed {
             name,
             stage: FailureStage::LoadCheck,
@@ -4006,6 +4054,101 @@ permissions = ["http_client"]
     }
 
     #[tokio::test]
+    async fn selected_origin_load_failure_retry_keeps_raw_origin_and_version() {
+        let server = MockServer::start().await;
+        serve_valid_archive(&server, 1).await;
+        let mut workspace = Workspace::new();
+        workspace.config.plugins.limits.max_instances = 1;
+        let mut picked = selection(fixture_entry(&server, Some(archive_digest())));
+        let origin = format!("{}{INDEX_PATH}?channel=stable&team=one", server.uri());
+        picked[0].registry_origin = Some(origin.clone());
+        let mut prompter = ScriptedPrompter::new([]);
+        let phase = run(&mut workspace, &picked, &mut prompter).await.unwrap();
+        assert!(matches!(
+            phase.outcomes[0],
+            PackageOutcome::Failed {
+                stage: FailureStage::LoadCheck,
+                ..
+            }
+        ));
+        let expected = zeroclaw::plugins::registry::registry_install_command_for(
+            crate::plugins::egress_ceremony::ShellDialect::host(),
+            picked[0].registry_entry.as_ref().unwrap(),
+            Some(&origin),
+            Some(crate::egress_command_config_dir(&workspace.config)),
+            true,
+        )
+        .expect("ordinary registry retry is copy-ready");
+        assert!(prompter.output().contains(&expected));
+        assert!(expected.contains(&format!("{FIXTURE_NAME}@{FIXTURE_VERSION}")));
+        assert!(expected.contains("--registry") && expected.contains("--no-verify"));
+        assert!(workspace.installed_packages().is_empty());
+        server.verify().await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_load_failure_retains_failure_without_unsafe_registry_retry() {
+        let server = MockServer::start().await;
+        serve_valid_archive(&server, 1).await;
+        let mut workspace = Workspace::new();
+        workspace.config.plugins.limits.max_instances = 1;
+        let mut picked = selection(fixture_entry(&server, Some(archive_digest())));
+        picked[0].registry_origin =
+            Some("https://registry.invalid/100%20team&echo=ZC_REGISTRY_MARKER".into());
+        let mut prompter = ScriptedPrompter::new([]);
+        let phase = run(&mut workspace, &picked, &mut prompter).await.unwrap();
+        assert!(matches!(
+            phase.outcomes[0],
+            PackageOutcome::Failed {
+                stage: FailureStage::LoadCheck,
+                ..
+            }
+        ));
+        let output = prompter.output();
+        assert!(!output.contains("ZC_REGISTRY_MARKER"));
+        assert!(!output.contains("--no-verify"));
+        assert!(!output.contains("# PowerShell only"));
+        assert!(workspace.installed_packages().is_empty());
+        server.verify().await;
+    }
+
+    #[test]
+    fn successful_choice_labels_do_not_disclose_credentials_or_collapse_publishers() {
+        let mut choices = selection(PluginRegistryEntry {
+            name: "calendar".into(),
+            version: "1".into(),
+            description: None,
+            author: None,
+            capabilities: vec!["tool".into()],
+            url: "https://download.invalid/p.zip".into(),
+            sha256: None,
+        });
+        let mut a = choices.remove(0);
+        let mut b = a.clone();
+        a.registry_origin =
+            Some("https://alice:password-a@same.invalid/index?token=secret-a#private-a".into());
+        b.registry_origin =
+            Some("https://alice:password-b@same.invalid/index?token=secret-b#private-b".into());
+        let a_label = choice_label(&a);
+        let b_label = choice_label(&b);
+        assert_ne!(a_label, b_label);
+        for label in [a_label, b_label] {
+            assert!(label.contains("calendar") && label.contains("registry:"));
+            for secret in [
+                "alice",
+                "password",
+                "token",
+                "secret",
+                "private",
+                "same.invalid",
+            ] {
+                assert!(!label.contains(secret));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn a_package_that_does_not_load_names_the_install_that_accepts_it() {
         let server = MockServer::start().await;
         serve_valid_archive(&server, 1).await;
@@ -4683,6 +4826,7 @@ type = "string"
             description: None,
             state,
             registry_entry: None,
+            registry_origin: None,
         };
         // The selection as the Plugins row recorded it: one pick listed as
         // installed when it was made, one as available. Neither package is
@@ -6771,6 +6915,108 @@ enum = ["", "auto"]
     }
 
     #[tokio::test]
+    async fn multiple_origins_remain_visible_and_create_downloads_only_the_selected_origin() {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        for server in [&a, &b] {
+            let entry = fixture_entry(server, Some(archive_digest()));
+            serve_index(
+                server,
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "plugins": [entry] })),
+                1,
+            )
+            .await;
+        }
+        serve_valid_archive(&a, 0).await;
+        serve_valid_archive(&b, 1).await;
+        let origins = [
+            format!("{}{INDEX_PATH}", a.uri()),
+            format!("{}{INDEX_PATH}", b.uri()),
+        ];
+        let selected = serde_json::to_string(&origins).unwrap();
+        let mut workspace = Workspace::new();
+        let registry = RegistryClient::new(RegistryTimeouts::default()).unwrap();
+        let mut row = PluginsRow::default();
+        // Catalog ordering is deterministic by (name, origin).
+        let chosen = usize::from(origins[1] > origins[0]);
+        let mut prompter = ScriptedPrompter::new([Answer::MultiSelect(Some(vec![chosen]))]);
+        open_row_with(
+            &workspace.config,
+            &mut row,
+            &registry,
+            &selected,
+            &mut prompter,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prompter.choice_lists[0].len(), 2);
+        for origin in &origins {
+            assert!(prompter.choice_lists[0].iter().any(|line| {
+                line.contains(&zeroclaw::plugins::registry::registry_origin_label(origin))
+            }));
+        }
+        assert_eq!(row.selected.len(), 1);
+        assert_eq!(
+            row.selected[0].registry_origin.as_deref(),
+            Some(origins[1].as_str())
+        );
+        let mut answers = install_answers(WITHHOLD);
+        answers.push(Answer::Confirm(Some(false)));
+        let mut create = ScriptedPrompter::new(answers);
+        let phase = run(&mut workspace, &row.selected, &mut create)
+            .await
+            .unwrap();
+        create.assert_done();
+        assert_eq!(
+            phase.outcomes,
+            vec![PackageOutcome::Installed {
+                name: FIXTURE_NAME.to_string()
+            }]
+        );
+        a.verify().await;
+        b.verify().await;
+    }
+
+    #[tokio::test]
+    async fn selecting_two_publishers_of_one_name_is_refused_before_create() {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        for server in [&a, &b] {
+            let entry = fixture_entry(server, Some(archive_digest()));
+            serve_index(
+                server,
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "plugins": [entry] })),
+                1,
+            )
+            .await;
+            serve_valid_archive(server, 0).await;
+        }
+        let selected = serde_json::to_string(&[
+            format!("{}{INDEX_PATH}", a.uri()),
+            format!("{}{INDEX_PATH}", b.uri()),
+        ])
+        .unwrap();
+        let workspace = Workspace::new();
+        let registry = RegistryClient::new(RegistryTimeouts::default()).unwrap();
+        let mut row = PluginsRow::default();
+        let mut prompter = ScriptedPrompter::new([Answer::MultiSelect(Some(vec![0, 1]))]);
+        open_row_with(
+            &workspace.config,
+            &mut row,
+            &registry,
+            &selected,
+            &mut prompter,
+        )
+        .await
+        .unwrap();
+        assert!(row.selected.is_empty());
+        assert!(prompter.output().contains("only one registry"));
+        assert!(workspace.installed_packages().is_empty());
+        a.verify().await;
+        b.verify().await;
+    }
+
+    #[tokio::test]
     async fn the_plugins_row_offers_registry_tools_and_keeps_the_pick() {
         let server = MockServer::start().await;
         let entry = fixture_entry(&server, Some(archive_digest()));
@@ -6888,6 +7134,7 @@ enum = ["", "auto"]
             description: None,
             state,
             registry_entry: None,
+            registry_origin: None,
         };
         row.selected = vec![
             choice("fresh", ChoiceState::Available),

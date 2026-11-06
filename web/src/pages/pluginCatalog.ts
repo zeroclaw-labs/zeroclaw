@@ -1,5 +1,10 @@
 import type { PluginCatalogEntry } from "../lib/api.ts";
 
+/** Name-only keys would collapse two publishers in React reconciliation. */
+export function catalogIdentity(entry: PluginCatalogEntry): string {
+  return JSON.stringify([entry.name, entry.available?.registry_id ?? null]);
+}
+
 export type PluginCatalogFilter = "all" | "installed" | "available";
 
 /** Sort capabilities within the source record that declared them. */
