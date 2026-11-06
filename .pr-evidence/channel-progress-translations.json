@@ -1,0 +1,31 @@
+{
+  "generator": "official xtask fluent fill/check",
+  "generator_source_commit": "2bd707655028062d349e4f4b5264f21a84fa241b",
+  "scope": {
+    "catalog": "runtime",
+    "keys": [
+      "channel-runtime-task-deadline",
+      "channel-runtime-still-working"
+    ],
+    "locales": [
+      "es",
+      "fr",
+      "ja",
+      "zh-CN"
+    ],
+    "batch": 2
+  },
+  "commands": [
+    "fluent fill --catalog runtime --locale <locale> --model-provider <configured-alias> --config-dir <existing-dir> --batch 2",
+    "fluent check --catalog runtime"
+  ],
+  "credentials": "Existing runtime SecretStore; no credentials exported or included in evidence",
+  "generated_ftl_sha256": {
+    "es": "697eedc134ba0b1c724cca0de61176e3ae7df75f3700a979fb7ba206edf2a228",
+    "fr": "d2a0039b650769d20b00368ff5f02d5039c113900d23f0d94a491a9ccb3de58f",
+    "ja": "16a897288f49b02c2352f9d55162bfc33de9b5c5728db31e2c5ad85d87b2b347",
+    "zh-CN": "5a790780fb0421805298fab3357327a973688efc1ed55fa96500773fdbcc8460"
+  },
+  "syntax_check": "passed; official generator",
+  "runtime_tests": "recorded in PR description after validation"
+}

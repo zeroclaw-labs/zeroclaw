@@ -15,6 +15,14 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
+// Only ephemeral progress sends expire when their caller is dropped. Ordinary
+// messages retain their existing delivery contract even if their caller leaves.
+tokio::task_local! { static EPHEMERAL_PROGRESS: (); }
+
+pub(crate) async fn scope_progress_send<F: std::future::Future>(future: F) -> F::Output {
+    EPHEMERAL_PROGRESS.scope((), future).await
+}
+
 enum PacedOp {
     /// An ordinary outbound message. Dispatches to `inner.send`.
     Send(SendMessage),
@@ -73,6 +81,7 @@ struct PendingSend {
     /// the caller. The caller awaits this so a paced `send()` still
     /// returns the inner channel's result rather than swallowing it.
     reply: oneshot::Sender<Result<()>>,
+    expires_with_caller: bool,
 }
 
 /// Per-recipient pacing state.
@@ -175,6 +184,7 @@ impl PacedChannel {
 
     async fn paced_dispatch(&self, op: PacedOp) -> Result<()> {
         let recipient_key = op.recipient().to_string();
+        let expires_with_caller = EPHEMERAL_PROGRESS.try_with(|_| ()).is_ok();
 
         let decision: (Option<PacedOp>, Option<oneshot::Receiver<Result<()>>>, bool) = {
             let mut map = self.recipients.lock().await;
@@ -193,7 +203,13 @@ impl PacedChannel {
                 });
             state.last_touched = touch;
 
-            if state.queue.is_empty()
+            state
+                .queue
+                .retain(|pending| !(pending.expires_with_caller && pending.reply.is_closed()));
+            // Progress always belongs to the worker, including its first send:
+            // dropping a slow direct send must not strand in_flight=true.
+            if !expires_with_caller
+                && state.queue.is_empty()
                 && !state.worker_running
                 && !state.in_flight
                 && now >= state.next_allowed_at
@@ -218,7 +234,11 @@ impl PacedChannel {
                 (None, None, false)
             } else {
                 let (tx, rx) = oneshot::channel();
-                state.queue.push_back(PendingSend { op, reply: tx });
+                state.queue.push_back(PendingSend {
+                    op,
+                    reply: tx,
+                    expires_with_caller,
+                });
                 let spawn = !state.worker_running;
                 if spawn {
                     state.worker_running = true;
@@ -295,6 +315,9 @@ impl PacedChannel {
                     let Some(state) = map.inner.get_mut(&recipient) else {
                         return;
                     };
+                    state.queue.retain(|pending| {
+                        !(pending.expires_with_caller && pending.reply.is_closed())
+                    });
                     if state.queue.is_empty() {
                         state.worker_running = false;
                         return;
@@ -302,9 +325,22 @@ impl PacedChannel {
                     state.next_allowed_at = Instant::now() + min_interval;
                     state.queue.pop_front()
                 };
-                if let Some(PendingSend { op, reply }) = pending {
-                    let result = op.dispatch(&inner).await;
-                    let _ = reply.send(result);
+                if let Some(PendingSend {
+                    op,
+                    mut reply,
+                    expires_with_caller,
+                }) = pending
+                {
+                    if expires_with_caller {
+                        tokio::select! {
+                            biased;
+                            _ = reply.closed() => {},
+                            result = op.dispatch(&inner) => { let _ = reply.send(result); }
+                        }
+                    } else {
+                        let result = op.dispatch(&inner).await;
+                        let _ = reply.send(result);
+                    }
                 }
             }
         });
@@ -784,6 +820,104 @@ mod tests {
             self.polls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn expired_progress_does_not_send_or_delay_final_reply() {
+        let inner = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = Arc::new(PacedChannel {
+            inner: inner.clone(),
+            min_interval: Duration::from_millis(80),
+            queue_depth: 8,
+            recipients: Arc::new(Mutex::new(RecipientMap::new())),
+        });
+        paced
+            .send(&SendMessage::new("initial", "peer"))
+            .await
+            .unwrap();
+        let notice_channel = paced.clone();
+        let notice = zeroclaw_spawn::spawn!(async move {
+            scope_progress_send(notice_channel.send(&SendMessage::new("progress", "peer"))).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !paced.recipients.lock().await.inner["peer"].queue.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("send was not queued");
+        notice.abort();
+        let _ = notice.await;
+        paced
+            .send_final(&SendMessage::new("final", "peer"))
+            .await
+            .unwrap();
+        assert_eq!(inner.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.final_sends.load(Ordering::SeqCst), 1);
+        // A discarded notice must not reserve another pacing interval.
+        assert!(paced.recipients.lock().await.inner["peer"].queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_progress_expires_but_cancelled_ordinary_send_still_delivers() {
+        let inner = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = Arc::new(PacedChannel {
+            inner: inner.clone(),
+            min_interval: Duration::from_millis(80),
+            queue_depth: 8,
+            recipients: Arc::new(Mutex::new(RecipientMap::new())),
+        });
+        paced
+            .send(&SendMessage::new("initial", "peer"))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                scope_progress_send(paced.send(&SendMessage::new("progress", "peer")))
+            )
+            .await
+            .is_err()
+        );
+        let ordinary_channel = paced.clone();
+        let ordinary = zeroclaw_spawn::spawn!(async move {
+            ordinary_channel
+                .send(&SendMessage::new("ordinary", "peer"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if paced.recipients.lock().await.inner["peer"]
+                    .queue
+                    .iter()
+                    .any(|p| !p.expires_with_caller)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("send was not queued");
+        ordinary.abort();
+        let _ = ordinary.await;
+        paced
+            .send_final(&SendMessage::new("final", "peer"))
+            .await
+            .unwrap();
+        assert_eq!(inner.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(inner.final_sends.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
