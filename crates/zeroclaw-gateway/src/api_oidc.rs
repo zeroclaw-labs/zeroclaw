@@ -1035,6 +1035,9 @@ async fn handle_auth_session(
                     // Chat for other accounts needs the core session path.
                     "chat": admin,
                     "operator_pages": admin,
+                    // The config routes' own read rule; an administrator's
+                    // grants permit everything, so it covers them too.
+                    "config": crate::principal_gate::may_read_config(&session.grants),
                 },
             }))
             .into_response()

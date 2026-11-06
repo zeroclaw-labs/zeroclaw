@@ -517,6 +517,13 @@ pub fn default_tools_with_runtime(
     ]
 }
 
+/// The registered session-data tools that address other sessions. Each
+/// requires an unrestricted principal; tests use the names to check that a
+/// non-admin registry holds none of them.
+#[cfg(test)]
+pub(crate) const SESSION_DATA_TOOL_NAMES: &[&str] =
+    &["sessions_list", "sessions_history", "sessions_send"];
+
 #[cfg(test)]
 pub(crate) fn register_skill_tools(
     tools_registry: &mut Vec<Box<dyn Tool>>,
@@ -779,7 +786,9 @@ pub struct AllToolsResult {
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
     /// Retained so an owned session can bind its principal to the exact
-    /// registered delegate before any child memory tools are built.
+    /// registered delegate before any child memory tools are built, and so
+    /// callers can bind its child registries to their live RPC authority
+    /// resolver.
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
