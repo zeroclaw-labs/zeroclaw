@@ -1002,6 +1002,7 @@ async fn handle_auth_methods(
     State(state): State<AppState>,
     Extension(relay): Extension<Arc<OidcEnrollmentState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    via_relay: Option<Extension<ViaRelay>>,
     headers: HeaderMap,
 ) -> Response {
     let key = client_key(&state, peer, &headers);
@@ -1022,11 +1023,16 @@ async fn handle_auth_methods(
             .map(|alias| serde_json::json!({"alias": alias, "provider": format!("oidc.{alias}")}))
             .collect()
     };
-    Json(serde_json::json!({
+    let mut methods = serde_json::json!({
         "pairing_required": state.pairing.require_pairing(),
         "oidc": oidc,
-    }))
-    .into_response()
+    });
+    // The sign-in screen tells the user that a relay can read this
+    // session. Only present when true, so other answers are unchanged.
+    if via_relay.is_some() {
+        methods["via_relay"] = serde_json::Value::Bool(true);
+    }
+    Json(methods).into_response()
 }
 
 /// The pairing prompt, unchanged from the gateway's existing denial.
@@ -1201,7 +1207,12 @@ fn failure_page(status: StatusCode) -> Response {
 /// token to `window.opener` via `postMessage` with this page's own
 /// origin as the target, plus a manual copy fallback. The token reaches
 /// the page only as a JSON string literal inside the inline script.
-fn success_page(provider: &str, access_token: &str, expires_in: Option<u64>) -> Response {
+fn success_page(
+    provider: &str,
+    access_token: &str,
+    expires_in: Option<u64>,
+    via_relay: bool,
+) -> Response {
     // `</` cannot appear inside the script element, whatever the IdP
     // returned; JSON string escaping handles the rest.
     let token_json = serde_json::to_string(access_token)
@@ -1213,12 +1224,19 @@ fn success_page(provider: &str, access_token: &str, expires_in: Option<u64>) -> 
     let expires_note = expires_in
         .map(|secs| format!("<p>The token expires in {secs} seconds.</p>"))
         .unwrap_or_default();
+    let relay_note = if via_relay {
+        "<p><strong>This page reached you through a relay.</strong> The relay's \
+         operator can read this token. Use it only if you trust that relay; \
+         zerocode connects end-to-end.</p>"
+    } else {
+        ""
+    };
     Html(format!(
         "<!doctype html><meta charset=\"utf-8\"><title>Signed in</title>\
          <body style=\"font-family:system-ui;margin:3rem\">\
          <h1>Signed in</h1>\
          <p>Enrollment is complete. If the application does not pick the token up \
-         automatically, copy it below and close this tab.</p>{expires_note}\
+         automatically, copy it below and close this tab.</p>{relay_note}{expires_note}\
          <p><code id=\"token\" style=\"word-break:break-all\"></code></p>\
          <script>(function () {{\
            var token = {token_json};\
@@ -1408,6 +1426,7 @@ async fn handle_pkce_callback(
             &format!("oidc.{alias}"),
             &token.access_token,
             token.expires_in,
+            via_relay.is_some(),
         ),
         (
             FlowMode::Dashboard {
@@ -2069,6 +2088,43 @@ mod tests {
             redirect_uri,
             query_escape("https://abc.relay.example/oidc/callback")
         );
+    }
+
+    #[tokio::test]
+    async fn the_sign_in_methods_say_when_a_relay_carries_the_dashboard() {
+        let router = router_for(config_with_alias("https://idp.example", "corp"));
+        let direct = send(&router, "GET", "/api/auth/methods", "gw.local", None).await;
+        assert_eq!(direct.status(), StatusCode::OK);
+        assert!(
+            body_json(direct).await.get("via_relay").is_none(),
+            "a direct answer is unchanged"
+        );
+
+        let mut request = build_request(
+            "GET",
+            "/api/auth/methods",
+            "abc.relay.example",
+            None,
+            remote(),
+            &[],
+        );
+        crate::relay_ingress::RelayConnection::new(
+            zeroclaw_runtime::relay_dashboard::DashboardOrigin::new("abc.relay.example", 443)
+                .unwrap(),
+        )
+        .admit(&mut request)
+        .unwrap();
+        let relayed = router.oneshot(request).await.unwrap();
+        assert_eq!(relayed.status(), StatusCode::OK);
+        assert_eq!(body_json(relayed).await["via_relay"], true);
+    }
+
+    #[tokio::test]
+    async fn the_token_page_says_when_a_relay_could_read_the_token() {
+        let direct = body_text(success_page("oidc.corp", "tok", None, false)).await;
+        assert!(!direct.contains("through a relay"), "{direct}");
+        let relayed = body_text(success_page("oidc.corp", "tok", None, true)).await;
+        assert!(relayed.contains("reached you through a relay"), "{relayed}");
     }
 
     #[tokio::test]

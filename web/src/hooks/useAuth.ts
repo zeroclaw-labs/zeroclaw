@@ -75,6 +75,8 @@ export interface AuthState {
   session: OidcSession | null;
   /** Sign-in providers to offer. Empty when sign-in is off and in the desktop app. */
   providers: OidcMethod[];
+  /** The dashboard is reached through a relay that can read this session. */
+  viaRelay: boolean;
   /** The session expires within two minutes. */
   expiryWarning: boolean;
   /** The session expired; the page stays until the user signs in again. */
@@ -116,6 +118,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [session, setSession] = useState<OidcSession | null>(getOidcSession);
   const [providers, setProviders] = useState<OidcMethod[]>([]);
   const [providersKnown, setProvidersKnown] = useState(false);
+  const [viaRelay, setViaRelay] = useState(false);
   const [expiryWarning, setExpiryWarning] = useState(false);
   const [reauthRequired, setReauthRequired] = useState(false);
   const [reauthPending, setReauthPending] = useState(false);
@@ -164,7 +167,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
       hasToken: false,
       desktop: isTauri(),
       getHealth: getPublicHealth,
-      getMethods: () => fetchAuthMethods(),
+      getMethods: () =>
+        fetchAuthMethods().then((methods) => {
+          if (methods?.via_relay) setViaRelay(true);
+          return methods;
+        }),
       getSession: () => fetchAuthSession(),
     })
       .then((initial) => {
@@ -206,6 +213,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       .then((methods) => {
         if (cancelled) return;
         if (methods) setProviders(methods.oidc);
+        if (methods?.via_relay) setViaRelay(true);
         setProvidersKnown(true);
       })
       .catch(() => {
@@ -445,6 +453,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     mode: session ? 'oidc' : 'pairing',
     session,
     providers,
+    viaRelay,
     expiryWarning,
     reauthRequired,
     reauthPending,

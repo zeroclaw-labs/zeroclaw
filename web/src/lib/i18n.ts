@@ -1915,6 +1915,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'auth.signin.or_pair': 'or pair this browser',
     'auth.signin.signed_out_note': "You're signed out of ZeroClaw. You may still be signed in at {provider}.",
     'auth.signin.session_ended': 'Your session has ended. Sign in again to continue.',
+    'auth.relay.notice': 'You are connected through a relay that ends this connection\'s encryption, so its operator can read and change this session. Use zerocode for an end-to-end connection.',
     'auth.sign_out': 'Sign out',
     'auth.sign_out_failed': "Couldn't sign out. Check your connection and try again.",
     'auth.account.menu': 'Account',

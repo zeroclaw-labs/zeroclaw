@@ -4,6 +4,7 @@ import type { OidcMethod } from "../../lib/authSession";
 import { basePath } from "../../lib/basePath";
 import { t } from "../../lib/i18n";
 import type { SignOutNotice } from "../../hooks/useAuth";
+import { RelayNotice } from "./RelayNotice";
 
 // Pairing dialog: the sign-in screen when no sign-in providers are configured,
 // unchanged from before dashboard sign-in existed.
@@ -262,6 +263,8 @@ export interface SignInScreenProps {
   onSignIn: (alias: string) => void;
   /** Why a signed-in session ended, if one did. */
   notice: SignOutNotice | null;
+  /** The dashboard is reached through a relay that can read the session. */
+  viaRelay?: boolean;
 }
 
 /**
@@ -269,12 +272,19 @@ export interface SignInScreenProps {
  * then the pairing form. With no providers and no notice it is exactly the
  * pairing dialog, so installs without sign-in see no change.
  */
-export function SignInScreen({ onPair, providers, onSignIn, notice }: SignInScreenProps) {
-  if (providers.length === 0 && !notice) {
+export function SignInScreen({
+  onPair,
+  providers,
+  onSignIn,
+  notice,
+  viaRelay = false,
+}: SignInScreenProps) {
+  if (providers.length === 0 && !notice && !viaRelay) {
     return <PairingDialog onPair={onPair} />;
   }
   return (
     <PairingDialog onPair={onPair}>
+      {viaRelay && <RelayNotice />}
       {notice && <SignOutNoticeMessage notice={notice} />}
       {providers.length > 0 && (
         <ProviderButtons providers={providers} onSignIn={onSignIn} />

@@ -31,6 +31,11 @@ export interface OidcMethod {
 export interface AuthMethods {
   pairing_required: boolean;
   oidc: OidcMethod[];
+  /**
+   * Present (true) when this dashboard is reached through a relay that ends
+   * the browser's TLS, so the relay's operator can read the session.
+   */
+  via_relay?: true;
 }
 
 /** The `reason` of a 401/403 body from a cookie-authenticated request. */
@@ -78,7 +83,7 @@ export function failureReason(body: string): AuthFailureReason | null {
 
 export function parseAuthMethods(value: unknown): AuthMethods | null {
   if (!value || typeof value !== 'object') return null;
-  const raw = value as { pairing_required?: unknown; oidc?: unknown };
+  const raw = value as { pairing_required?: unknown; oidc?: unknown; via_relay?: unknown };
   const oidc = Array.isArray(raw.oidc)
     ? raw.oidc.flatMap((entry: unknown): OidcMethod[] => {
         if (!entry || typeof entry !== 'object') return [];
@@ -91,6 +96,7 @@ export function parseAuthMethods(value: unknown): AuthMethods | null {
   return {
     pairing_required: raw.pairing_required !== false,
     oidc,
+    ...(raw.via_relay === true ? { via_relay: true as const } : {}),
   };
 }
 

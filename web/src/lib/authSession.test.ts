@@ -171,6 +171,18 @@ test("parseAuthMethods drops malformed providers", () => {
   assert.equal(authSession.parseAuthMethods(null), null);
 });
 
+test("parseAuthMethods keeps the relay notice only when the gateway says so", () => {
+  assert.equal(
+    authSession.parseAuthMethods({ pairing_required: true, oidc: [], via_relay: true })?.via_relay,
+    true,
+  );
+  for (const via_relay of [false, "true", 1, null, undefined]) {
+    const parsed = authSession.parseAuthMethods({ pairing_required: true, oidc: [], via_relay });
+    assert.equal(parsed?.via_relay, undefined, String(via_relay));
+    assert.ok(parsed && !("via_relay" in parsed));
+  }
+});
+
 test("parseOidcSession requires the credential fields and denies missing features", () => {
   const raw = {
     kind: "oidc",

@@ -71,6 +71,20 @@ test("after sign-out the screen says the provider session may remain", () => {
   assert.ok(ended.includes("Your session has ended."));
 });
 
+test("through a relay the screen says the relay can read the session", () => {
+  const relayed = (providers: OidcMethod[]) =>
+    renderToStaticMarkup(
+      createElement(SignInScreen, { onPair, providers, onSignIn: () => {}, notice: null, viaRelay: true }),
+    );
+  for (const providers of [[corp], []]) {
+    const html = relayed(providers);
+    assert.equal(count(html, "data-relay-notice"), 1);
+    assert.ok(html.includes("its operator can read and change this session"));
+  }
+  assert.equal(count(render([corp]), "data-relay-notice"), 0);
+  assert.equal(count(render([]), "data-relay-notice"), 0);
+});
+
 test("the notice shows even if sign-in was turned off meanwhile", () => {
   const html = render([], { kind: "session-ended" });
   assert.ok(html.includes("Your session has ended."));
