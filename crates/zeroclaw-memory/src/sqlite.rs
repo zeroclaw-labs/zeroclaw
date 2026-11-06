@@ -10,7 +10,7 @@ use chrono::Local;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, params};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::sync::{Mutex as StdMutex, MutexGuard};
@@ -56,9 +56,21 @@ impl SqliteMemory {
         )
     }
 
+    /// Path of the memory database, `brain.db`, that [`Self::new`] and
+    /// [`Self::with_embedder`] open under `workspace_dir`. Resolving it
+    /// creates nothing.
+    pub fn db_path(workspace_dir: &Path) -> PathBuf {
+        Self::named_db_path(workspace_dir, "brain")
+    }
+
+    /// Path of the `{db_name}.db` memory database under `workspace_dir`.
+    fn named_db_path(workspace_dir: &Path, db_name: &str) -> PathBuf {
+        workspace_dir.join("memory").join(format!("{db_name}.db"))
+    }
+
     /// Like `new`, but stores data in `{db_name}.db` instead of `brain.db`.
     pub fn new_named(alias: &str, workspace_dir: &Path, db_name: &str) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("memory").join(format!("{db_name}.db"));
+        let db_path = Self::named_db_path(workspace_dir, db_name);
         let conn = Self::open_and_initialize(&db_path, None)?;
         Ok(Self {
             alias: alias.to_string(),
@@ -81,8 +93,31 @@ impl SqliteMemory {
         open_timeout_secs: Option<u64>,
         search_mode: SearchMode,
     ) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("memory").join("brain.db");
-        let conn = Self::open_and_initialize(&db_path, open_timeout_secs)?;
+        Self::with_embedder_at(
+            alias,
+            &Self::db_path(workspace_dir),
+            embedder,
+            vector_weight,
+            keyword_weight,
+            cache_max,
+            open_timeout_secs,
+            search_mode,
+        )
+    }
+
+    /// Like [`Self::with_embedder`], but opens the database at `db_path`
+    /// rather than the default one under a workspace.
+    pub(crate) fn with_embedder_at(
+        alias: &str,
+        db_path: &Path,
+        embedder: Arc<dyn EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        search_mode: SearchMode,
+    ) -> anyhow::Result<Self> {
+        let conn = Self::open_and_initialize(db_path, open_timeout_secs)?;
 
         Ok(Self {
             alias: alias.to_string(),
@@ -2346,24 +2381,30 @@ impl Memory for SqliteMemory {
             // won't silently merge), otherwise drop the orphan `to` row and
             // proceed. (`COUNT(*)` over a NULL subselect when no `to` row exists
             // is 0, so the common no-collision path falls straight through.)
-            let to_rows: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1)",
-                params![to],
-                |row| row.get(0),
-            )?;
-            if to_rows > 0 {
-                anyhow::bail!(
-                    "cannot rename agent memory to `{to}`: an existing memory store under that alias has {to_rows} row(s); refusing to merge"
-                );
-            }
-            // Drop any orphan `to` agents row (verified above to own no memories).
-            conn.execute("DELETE FROM agents WHERE alias = ?1", params![to])?;
-            let affected = conn.execute(
-                "UPDATE agents SET alias = ?2 WHERE alias = ?1",
-                params![from, to],
-            )?;
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            Ok(affected)
+            //
+            // The writes commit with full sync: an agent rename clears its
+            // recovery record right after this move, so the move must survive
+            // a power loss by then.
+            with_full_sync(&conn, |conn| {
+                let to_rows: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1)",
+                    params![to],
+                    |row| row.get(0),
+                )?;
+                if to_rows > 0 {
+                    anyhow::bail!(
+                        "cannot rename agent memory to `{to}`: an existing memory store under that alias has {to_rows} row(s); refusing to merge"
+                    );
+                }
+                // Drop any orphan `to` agents row (verified above to own no memories).
+                conn.execute("DELETE FROM agents WHERE alias = ?1", params![to])?;
+                let affected = conn.execute(
+                    "UPDATE agents SET alias = ?2 WHERE alias = ?1",
+                    params![from, to],
+                )?;
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                Ok(affected)
+            })
         })
         .await?
     }
@@ -2800,6 +2841,35 @@ impl ::zeroclaw_api::attribution::Attributable for SqliteMemory {
     }
 }
 
+/// Run `write` on `conn` with `PRAGMA synchronous = FULL`, then put back the
+/// level the connection had before, whether `write` succeeded or not.
+///
+/// The store runs WAL with `synchronous = NORMAL`, under which a committed
+/// transaction can still roll back on power loss. `FULL` syncs the log on
+/// every commit, so whatever `write` committed is durable once it returns.
+fn with_full_sync<T>(
+    conn: &Connection,
+    write: impl FnOnce(&Connection) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let previous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .context("failed to read the SQLite synchronous level")?;
+    conn.execute_batch("PRAGMA synchronous = FULL;")
+        .context("failed to enable full SQLite synchronization")?;
+    let written = write(conn);
+    let restored = conn.execute_batch(&format!("PRAGMA synchronous = {previous};"));
+    match (written, restored) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(e)) => Err(anyhow::Error::new(e).context(
+            "the write committed, but the previous SQLite synchronous level could not be restored",
+        )),
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(restore)) => Err(e.context(format!(
+            "the previous SQLite synchronous level could not be restored either: {restore}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2809,6 +2879,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    #[test]
+    fn db_path_names_the_database_new_opens_without_creating_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = SqliteMemory::db_path(tmp.path());
+        assert_eq!(path, tmp.path().join("memory").join("brain.db"));
+        assert!(
+            !path.exists(),
+            "resolving the path must not create the database"
+        );
+
+        let _mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert!(path.is_file(), "new must open the database db_path names");
     }
 
     #[tokio::test]
@@ -3503,6 +3587,65 @@ mod tests {
         // Nothing changed: both still resolve under their own aliases.
         assert_eq!(mem.export_agent("beta").await.unwrap().len(), 1);
         assert_eq!(mem.export_agent("gamma").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rename_agent_syncs_fully_and_restores_the_synchronous_level() {
+        let (_tmp, mem) = temp_sqlite();
+        let synchronous = |mem: &SqliteMemory| -> i64 {
+            mem.conn
+                .lock()
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(synchronous(&mem), 1, "the store runs NORMAL");
+        let in_write = with_full_sync(&mem.conn.lock(), |conn| {
+            Ok(conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))?)
+        })
+        .unwrap();
+        assert_eq!(in_write, 2, "the write runs under FULL");
+        assert_eq!(synchronous(&mem), 1);
+
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        mem.store_with_agent(
+            "a-0",
+            "alpha row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&alpha),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mem.rename_agent("alpha", "beta").await.unwrap(), 1);
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 1);
+        assert_eq!(mem.export_agent("alpha").await.unwrap().len(), 0);
+        assert_eq!(synchronous(&mem), 1, "NORMAL is back after the rename");
+
+        // Whatever level the connection had comes back, after a refused
+        // rename as well.
+        mem.conn
+            .lock()
+            .execute_batch("PRAGMA synchronous = EXTRA;")
+            .unwrap();
+        let gamma = mem.ensure_agent_uuid("gamma").await.unwrap();
+        mem.store_with_agent(
+            "g-0",
+            "gamma row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&gamma),
+        )
+        .await
+        .unwrap();
+        assert!(mem.rename_agent("gamma", "beta").await.is_err());
+        assert_eq!(synchronous(&mem), 3);
+        assert_eq!(mem.rename_agent("beta", "delta").await.unwrap(), 1);
+        assert_eq!(mem.export_agent("delta").await.unwrap().len(), 1);
+        assert_eq!(synchronous(&mem), 3);
     }
 
     #[tokio::test]
