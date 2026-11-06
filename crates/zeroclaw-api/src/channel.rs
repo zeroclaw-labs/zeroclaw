@@ -474,6 +474,11 @@ pub struct SendMessage {
     /// a voice note even if the peer's default modality is text.
     /// Ignored when `suppress_voice` is also `true`.
     pub force_voice: bool,
+    /// Explicit mention restriction for channels whose message content can
+    /// ping users. `None` keeps the channel's default handling. `Some(users)`
+    /// lets the message ping exactly these user IDs and nothing else, so an
+    /// empty list pings nobody. Channels without such pings ignore it.
+    pub allowed_mentions: Option<Vec<String>>,
 }
 
 /// A native poll to post in a chat.
@@ -630,6 +635,7 @@ impl SendMessage {
             references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
+            allowed_mentions: None,
         }
     }
 
@@ -662,6 +668,7 @@ impl SendMessage {
             references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
+            allowed_mentions: None,
         }
     }
 
@@ -692,6 +699,13 @@ impl SendMessage {
     /// Attach files to this message.
     pub fn with_attachments(mut self, attachments: Vec<MediaAttachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    /// Restrict which users this message may ping; see
+    /// [`SendMessage::allowed_mentions`].
+    pub fn with_allowed_mentions(mut self, users: Option<Vec<String>>) -> Self {
+        self.allowed_mentions = users;
         self
     }
 }

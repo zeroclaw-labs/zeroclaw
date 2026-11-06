@@ -15,6 +15,10 @@ pub(crate) struct DiscordOutgoing {
     pub(crate) embeds: Vec<DiscordEmbed>,
     pub(crate) components: Vec<DiscordActionRow>,
     pub(crate) flags: DiscordMessageFlags,
+    /// When set, the payload carries an explicit `allowed_mentions` policy:
+    /// nothing parsed from the content pings anyone, and only these user IDs
+    /// may be pinged. `None` omits the key and keeps Discord's defaults.
+    pub(crate) allowed_mentions: Option<Vec<String>>,
 }
 
 /// Message flags (e.g. ephemeral, components-v2). Zero by default and omitted
@@ -82,6 +86,14 @@ impl DiscordOutgoing {
             obj.insert(
                 "flags".to_string(),
                 serde_json::Value::Number(self.flags.0.into()),
+            );
+        }
+        // Mentions: omitted unless a sender set a policy, so a default
+        // payload stays byte-identical.
+        if let Some(users) = &self.allowed_mentions {
+            obj.insert(
+                "allowed_mentions".to_string(),
+                serde_json::json!({ "parse": [], "users": users }),
             );
         }
         serde_json::Value::Object(obj)
