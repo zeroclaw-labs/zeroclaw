@@ -506,7 +506,7 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.help_limits": "Speech recognition requires HTTPS (or localhost), browser support and microphone permission. Available voices, including male voices, depend on what the system/browser provides; use Test voice to choose. Capture and chat reading stop when you switch conversation or hide the chat/tab.",
     "voice.help_identity": "Preferences are stored in ZeroClaw by paired-device ID, without browser preference storage. One browser may use one voice, another a different voice, and another may have voice disabled. Reloading preserves each device’s choices. A new pairing creates a new device identity with its own defaults.",
 
-    "voice.settings": "Voice and audio",
+    "voice.settings": "Browser Voice and Audio",
     "voice.device_note": "Preferences are saved in ZeroClaw for the selected device. Chat controls in this browser always use the record marked “this browser”.",
     "voice.dictation": "Show microphone / enable dictation",
     "voice.language": "Language",
@@ -10996,7 +10996,7 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.help_limits": "O ditado exige HTTPS (ou localhost), navegador compatível e permissão para usar o microfone. As vozes disponíveis, inclusive masculinas, dependem do sistema/navegador; use Testar voz para escolher. O ditado e a leitura do chat param ao trocar de conversa ou ocultar o chat/a aba.",
     "voice.help_identity": "As preferências ficam no ZeroClaw por ID do dispositivo pareado, sem armazenamento de preferências no navegador. Um navegador pode usar uma voz, outro uma voz diferente e outro ficar com a voz desativada. Recarregar preserva as escolhas de cada dispositivo. Um novo pareamento cria outra identidade, com seus próprios padrões.",
 
-    "voice.settings": "Voz e áudio",
+    "voice.settings": "Voz e áudio do navegador",
     "voice.device_note": "As preferências são salvas no ZeroClaw para o dispositivo selecionado. Os botões de fala deste navegador sempre usam o registro identificado como “este navegador”.",
     "voice.dictation": "Mostrar microfone / habilitar ditado",
     "voice.language": "Idioma",

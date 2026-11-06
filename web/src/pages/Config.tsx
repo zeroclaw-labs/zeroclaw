@@ -129,19 +129,18 @@ export default function Config() {
         // This editor uses the paired-device API instead of the daemon schema.
         const available = [...resp.sections];
         if (!location.pathname.startsWith("/setup/")) {
-          const browserIndex = available.findIndex((section) => section.key === "browser");
           const voiceSection: SectionInfo = {
             key: VOICE_SECTION,
             label: t("voice.settings"),
             help: t("voice.help_intro"),
-            group: available[browserIndex]?.group ?? "Tools",
+            group: "Other",
             has_picker: false,
             completed: false,
             ready: true,
             is_quickstart: false,
             cost_category: "",
           };
-          available.splice(browserIndex < 0 ? available.length : browserIndex + 1, 0, voiceSection);
+          available.push(voiceSection);
         }
         setSections(available);
         const initialKey =
