@@ -84,6 +84,8 @@ pub mod signal;
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
+#[cfg(feature = "channel-telegram")]
+pub(crate) mod telegram_rate_limit;
 #[cfg(feature = "channel-twitch")]
 pub mod twitch;
 #[cfg(feature = "channel-twitter")]
