@@ -167,7 +167,7 @@ use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{
-    GATEWAY_ADMIN_TOKEN_HEADER, PairingCodePolicy, PairingGuard, constant_time_eq,
+    GATEWAY_ADMIN_TOKEN_HEADER, PairingCodePolicy, PairingGuard, PairingLimits, constant_time_eq,
     gateway_admin_token_path, is_public_bind,
 };
 use zeroclaw_runtime::tools;
@@ -766,8 +766,6 @@ pub struct AppState {
     pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
-    /// Pending pairing request store
-    pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
     /// Shared canvas store for Live Canvas (A2UI) system
     pub canvas_store: CanvasStore,
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
@@ -2021,13 +2019,16 @@ pub async fn run_gateway_with_plugin_webhooks(
     // own from config exactly as before. Either way the pairing-code policy
     // is resolved from config in exactly one guard: startup pairing,
     // `gateway get-paircode --new`, the dashboard pairing flow, and
-    // rotate-device all issue through it.
+    // rotate-device all issue through it. Its code lifetime and brute-force
+    // limits are read from `[gateway.pairing_dashboard]` in live config on
+    // every use, in the daemon's guard as in this one.
     let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
         PairingGuard::new(
             config.gateway.require_pairing,
             &config.gateway.paired_tokens,
             config.gateway.pairing_code,
         )
+        .with_live_limits(PairingLimits::live(config_state.clone()))
     }));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
@@ -2355,11 +2356,6 @@ pub async fn run_gateway_with_plugin_webhooks(
     } else {
         None
     };
-    let pending_pairings = if config.gateway.require_pairing {
-        Some(Arc::new(api_pairing::PairingStore::new()))
-    } else {
-        None
-    };
 
     // The gateway's inbound-auth authority. Supervised runs share the
     // daemon's accepted policy with the RPC context, so a revocation
@@ -2414,7 +2410,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
-        pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
@@ -6180,7 +6175,6 @@ mod tests {
                 8, 30, 600,
             )),
             device_registry: registry,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -9287,7 +9281,6 @@ path = "{trigger_path}"
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -9376,7 +9369,6 @@ path = "{trigger_path}"
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10056,7 +10048,6 @@ path = "{trigger_path}"
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -11644,7 +11635,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -12566,7 +12556,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -12690,7 +12679,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -12793,7 +12781,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13002,7 +12989,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13092,7 +13078,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13187,7 +13172,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13287,7 +13271,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13382,7 +13365,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13485,7 +13467,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13639,7 +13620,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
@@ -14527,7 +14507,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -14615,7 +14594,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -15230,7 +15208,6 @@ data: [DONE]\n\n";
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),

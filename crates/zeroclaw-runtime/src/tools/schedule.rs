@@ -53,11 +53,8 @@ impl ScheduleTool {
 
 #[async_trait]
 impl Tool for ScheduleTool {
-    /// A shell job it creates, pauses or resumes runs later under the agent's
-    /// shell policy, not under the calling principal's ceiling. A constrained
-    /// RPC session must not reach it until a job can carry and re-check that
-    /// principal's authority.
     fn requires_unrestricted_principal(&self) -> bool {
+        // This path uses agent authority without carrying the session owner.
         true
     }
 

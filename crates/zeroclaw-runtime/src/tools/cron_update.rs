@@ -79,11 +79,8 @@ impl CronUpdateTool {
 
 #[async_trait]
 impl Tool for CronUpdateTool {
-    /// A job it changes keeps its stored tool list and runs later under the
-    /// agent's own policy, not under the calling principal's ceiling. A
-    /// constrained RPC session must not reach it until a job can carry and
-    /// re-check that principal's authority.
     fn requires_unrestricted_principal(&self) -> bool {
+        // This path uses agent authority without carrying the session owner.
         true
     }
 

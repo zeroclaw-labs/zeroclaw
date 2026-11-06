@@ -301,33 +301,6 @@ impl DeviceRegistry {
     }
 }
 
-/// Store for pending pairing requests.
-#[derive(Debug, Default)]
-pub struct PairingStore {
-    pending: Mutex<Vec<PendingPairing>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PendingPairing {
-    code: String,
-    created_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    client_ip: Option<String>,
-    attempts: u32,
-}
-
-impl PairingStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn pending_count(&self) -> usize {
-        let mut pending = self.pending.lock();
-        pending.retain(|p| p.expires_at > Utc::now());
-        pending.len()
-    }
-}
-
 use crate::api::{extract_bearer_token, require_auth};
 
 /// POST /api/pairing/initiate — initiate a new pairing session
