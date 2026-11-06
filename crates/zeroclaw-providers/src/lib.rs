@@ -5899,25 +5899,25 @@ mod tests {
         let mut config = Config::default();
         let n = zeroclaw_config::providers::MAX_FALLBACK_DEPTH + 50;
         for i in 0..n {
-            let fallback = if i + 1 < n {
-                vec![zeroclaw_config::providers::ModelProviderRef::new(format!(
-                    "openai.a{}",
-                    i + 1
-                ))]
-            } else {
-                vec![]
-            };
             config.providers.models.openai.insert(
                 format!("a{i}"),
                 OpenAIModelProviderConfig {
                     base: ModelProviderConfig {
                         model: Some("gpt-4o".to_string()),
                         api_key: Some(format!("a{i}-key")),
-                        fallback,
                         ..Default::default()
                     },
                 },
             );
+            if i + 1 < n {
+                config.providers.fallback.insert(
+                    zeroclaw_config::providers::ModelProviderRef::new(format!("openai.a{i}")),
+                    vec![zeroclaw_config::providers::ModelProviderRef::new(format!(
+                        "openai.a{}",
+                        i + 1
+                    ))],
+                );
+            }
         }
 
         let result = create_resilient_model_provider_for_alias(

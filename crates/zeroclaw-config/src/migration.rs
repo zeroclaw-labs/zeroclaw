@@ -9239,19 +9239,17 @@ model = "backup"
             .unwrap()
             .expect("retired profile fallback fields must trigger a rewrite");
         let paths = removed_paths(&notices);
-        assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback".to_string()));
-        assert!(
-            paths.contains(&"providers.models.custom.gateway.prod.fallback_models".to_string())
-        );
+        assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback"));
+        assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback_models"));
         let value: toml::Value = toml::from_str(&migrated).unwrap();
         let profile = &value["providers"]["models"]["custom"]["gateway.prod"];
         assert!(profile.get("fallback").is_none());
         assert!(profile.get("fallback_models").is_none());
-        assert!(
-            notices
-                .iter()
-                .all(|notice| notice.reason_id.contains("profile-fallback"))
-        );
+        assert!(notices.iter().all(|notice| matches!(
+            notice,
+            MigrationNotice::Removed { reason, .. }
+                if reason.contains("profile-level fallback")
+        )));
     }
 
     #[test]
