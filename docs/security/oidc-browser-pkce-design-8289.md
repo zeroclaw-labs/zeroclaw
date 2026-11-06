@@ -247,4 +247,10 @@ One caveat on decision 4's handoff. The gateway's
 the popup has navigated through the IdP, so the `postMessage` leg does not
 reach an opener in current browsers: the manual copy on the callback page is
 the handoff that works today, and the `postMessage` contract stays in place
-for the dashboard follow-up that will own the sign-in surface.
+for clients that open the relay themselves.
+
+The dashboard no longer needs that handoff. Its opt-in sign-in
+(`[gateway.dashboard_sign_in]`, documented under "Dashboard sign-in" in
+`docs/book/src/security/authentication.md`) reuses this flow store, these
+limits and this callback, but ends the flow in a gateway-held session
+behind an `HttpOnly` cookie, so the token never reaches the browser.
