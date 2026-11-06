@@ -1,4 +1,3 @@
-import BrowserVoiceSettings from '@/components/BrowserVoiceSettings';
 // Schema-driven config editor (#6175). Curated section explorer
 // but lands on a per-section overview: pick a section in the sidebar, see
 // what's currently configured under it, click an item to edit, click +Add
@@ -37,6 +36,7 @@ import {
 import FieldForm, {
   clearFieldFormCatalogCaches,
 } from "../components/sections/FieldForm";
+import BrowserVoiceSettings from "../components/BrowserVoiceSettings";
 import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import BindChannelForm from "../components/sections/BindChannelForm";
@@ -83,6 +83,8 @@ const GROUP_ORDER = [
 // (single canonical source). The dashboard preserves response order for
 // the Foundation group instead of carrying its own copy of the list.
 
+const VOICE_SECTION = "voice-and-audio";
+
 export default function Config() {
   // URL params drive the view. No internal mode state for picker/form —
   // the address bar is the source of truth.
@@ -124,11 +126,28 @@ export default function Config() {
     getSections()
       .then((resp) => {
         if (cancelled) return;
-        setSections(resp.sections);
+        // This editor uses the paired-device API instead of the daemon schema.
+        const available = [...resp.sections];
+        if (!location.pathname.startsWith("/setup/")) {
+          const browserIndex = available.findIndex((section) => section.key === "browser");
+          const voiceSection: SectionInfo = {
+            key: VOICE_SECTION,
+            label: t("voice.settings"),
+            help: t("voice.help_intro"),
+            group: available[browserIndex]?.group ?? "Tools",
+            has_picker: false,
+            completed: false,
+            ready: true,
+            is_quickstart: false,
+            cost_category: "",
+          };
+          available.splice(browserIndex < 0 ? available.length : browserIndex + 1, 0, voiceSection);
+        }
+        setSections(available);
         const initialKey =
-          sectionParam && resp.sections.find((s) => s.key === sectionParam)
+          sectionParam && available.find((s) => s.key === sectionParam)
             ? sectionParam
-            : (resp.sections[0]?.key ?? null);
+            : (available[0]?.key ?? null);
         setActiveKey(initialKey);
       })
       .catch((e) => {
@@ -228,6 +247,7 @@ export default function Config() {
 
   const mainContent = (() => {
     if (!activeSection) return null;
+    if (activeSection.key === VOICE_SECTION) return <BrowserVoiceSettings />;
 
     if (!activeSection.has_picker) {
       return (
@@ -585,9 +605,7 @@ export default function Config() {
   const hasSelection = Boolean(sectionParam);
 
   return (
-    <div className="flex flex-col h-full overflow-hidden">
-      <BrowserVoiceSettings />
-      <div className="flex flex-1 min-h-0 overflow-hidden">
+    <div className="flex h-full overflow-hidden">
       {!lockedSection && (
         // Master navigator: searchable section → entity tree. Selecting an
         // entity navigates to its existing form URL so the detail pane's
@@ -689,7 +707,7 @@ export default function Config() {
                   ))}
                 </span>
               }
-              actions={
+              actions={activeSection.key !== VOICE_SECTION && (
                 <>
                   <Button
                     variant="ghost"
@@ -709,7 +727,7 @@ export default function Config() {
                     }}
                   />
                 </>
-              }
+              )}
             />
 
             <div className="flex-1 min-h-0 flex flex-col">{mainContent}</div>
@@ -717,7 +735,6 @@ export default function Config() {
           )
         )}
       </main>
-      </div>
     </div>
   );
 }

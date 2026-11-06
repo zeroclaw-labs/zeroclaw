@@ -73,8 +73,7 @@ export default function BrowserVoiceSettings() {
     finally { setInstalling(false); }
   };
   return (
-    <details className="shrink-0 max-h-[70vh] overflow-y-auto border-b border-pc-border p-3 text-pc-text bg-pc-surface">
-      <summary className="cursor-pointer font-medium">{t('voice.settings')}</summary>
+    <div className="text-pc-text">
       <p className="mt-3 max-w-2xl text-sm text-pc-text-muted">{t('voice.help_intro')}</p>
       <label className="grid gap-1 mt-3 max-w-2xl text-sm">{t('voice.device')}
         <select aria-label={t('voice.device')} size={Math.min(5, Math.max(2, inventory.devices.length))}
@@ -145,6 +144,6 @@ export default function BrowserVoiceSettings() {
         {error && <p role="alert" className="text-status-error">{error}</p>}
       </fieldset>
       {loadError && <p role="alert">{t(selectedDeviceId ? 'voice.device_load_error' : 'voice.pair_required')}</p>}
-    </details>
+    </div>
   );
 }
