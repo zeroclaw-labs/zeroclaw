@@ -5,6 +5,10 @@
       "owner": "crates/zeroclaw-runtime/src/composition.rs",
       "reason": "Composition ports, model/tool/channel/memory traits, principal identity and observer events; this is the capability contract owner."
     },
+    "zeroclaw-kernel": {
+      "owner": "crates/zeroclaw-runtime/src/rpc/dispatch.rs",
+      "reason": "RPC and agent adapters supply live authorization and provider execution to the kernel-owned session coordinator, context transforms and model selection. Backend construction remains in application composition; this edge does not select a storage adapter."
+    },
     "zeroclaw-config": {
       "owner": "crates/zeroclaw-runtime/src/live_config_authority.rs",
       "reason": "Authoritative schema3 config generation, policy resolution and admitted agent identity; the runtime keeps enforcement and resolves live state at use time."
