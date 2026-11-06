@@ -5,7 +5,10 @@
 use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
-use super::events::{ProgressEvent, StreamDelta, emit_tool_call_pair, send_progress};
+use super::events::{
+    ProgressEvent, StreamDelta, emit_tool_call_pair, emit_tool_call_pending, emit_tool_result,
+    send_progress,
+};
 use super::outcome::ToolLoopCancelled;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
@@ -98,6 +101,41 @@ async fn record_duplicate_tool_call(
     }
 }
 
+/// Record, as post-execution would, the answer a call gets when this turn
+/// cannot dispatch its tool, and show it on the draft stream.
+async fn record_undispatchable_tool_call(
+    ctx: &TurnCtx<'_>,
+    tool_name: &str,
+    outcome: &ToolExecutionOutcome,
+    iteration: usize,
+) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+            .with_category(::zeroclaw_log::EventCategory::Tool)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_duration(u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX))
+            .with_attrs(::serde_json::json!({
+                "model": ctx.model,
+                "iteration": iteration + 1,
+                "tool": tool_name,
+                "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
+                "output": scrub_credentials(&outcome.output),
+                "trace_id": ctx.turn_id,
+            })),
+        "tool_call_result"
+    );
+    if let Some(tx) = ctx.on_delta {
+        let _ = tx
+            .send(StreamDelta::Status(format!(
+                "\u{274c} {}: {}\n",
+                tool_name,
+                truncate_with_ellipsis(&scrub_credentials(&outcome.output), 200)
+            )))
+            .await;
+    }
+}
+
 /// Fire the abandonment callback for one call whose before phase ran but that
 /// can no longer reach its after phase (hook-cancelled, denied/replaced, or
 /// duplicate-suppressed during preparation). Abandonment is this call's single
@@ -153,6 +191,7 @@ pub(crate) async fn prepare_tool_calls(
     ctx: &TurnCtx<'_>,
     tools_registry: &[Box<dyn crate::tools::Tool>],
     activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    excluded_tools: &[String],
     tool_calls: &[ParsedToolCall],
     seen_tool_signatures: &mut HashSet<(String, String)>,
     prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
@@ -269,6 +308,51 @@ pub(crate) async fn prepare_tool_calls(
             .approval
             .map(|mgr| mgr.needs_approval(&tool_name))
             .unwrap_or(false);
+
+        // A call that would prompt but names a tool this turn cannot dispatch
+        // gets the executor's own answer now: approving it would run nothing.
+        // Execution resolves the same way and prompt-gated batches run
+        // sequentially, so the answer is the one approval would have led to.
+        // A `tool_search` earlier in the batch can activate a deferred tool
+        // before this call runs, so after one the call keeps today's order.
+        if requires_prompt
+            && !executable_calls
+                .iter()
+                .any(|prepared| prepared.name == crate::tools::ToolSearchTool::NAME)
+        {
+            let dispatch = crate::agent::tool_execution::ToolDispatchContext {
+                tools_registry,
+                activated_tools,
+                excluded_tools,
+                model_switch_callback: None,
+            };
+            // One id for the observer events and the stream pair, as the
+            // executor uses for an id-less text-protocol call.
+            let call_id = super::events::resolve_tool_call_id(call);
+            if let Some(outcome) = crate::agent::tool_execution::undispatchable_tool_outcome(
+                &tool_name,
+                &tool_args,
+                Some(&call_id),
+                dispatch,
+                &ctx.meta(),
+                ctx.observer,
+            ) {
+                record_undispatchable_tool_call(ctx, &tool_name, &outcome, iteration).await;
+                // The before phase ran but this call will never execute: its
+                // only terminal lifecycle operation is abandonment.
+                if let Some(hook_context) = hook_context.as_ref() {
+                    abandon_prepared_context(ctx, hook_context, &tool_name).await;
+                }
+                if !sensitive_session_prompt && let Some(tx) = ctx.event_tx {
+                    emit_tool_call_pending(tx, &call_id, call).await;
+                    emit_tool_result(tx, &call_id, &call.name, &outcome).await;
+                }
+                ordered_results[idx] =
+                    Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                continue;
+            }
+        }
+
         let reentrant_agent_tool =
             crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
         // Signature this call holds in the turn-scoped guard while its
@@ -542,6 +626,18 @@ mod tests {
         }
     }
 
+    fn stub_tools(names: &[&str]) -> Vec<Box<dyn Tool>> {
+        names
+            .iter()
+            .map(|name| {
+                Box::new(AttributedTool {
+                    name: (*name).to_string(),
+                    provenance: ToolProvenance::Native,
+                }) as Box<dyn Tool>
+            })
+            .collect()
+    }
+
     fn test_ctx<'a>(
         observer: &'a NoopObserver,
         pacing: &'a PacingConfig,
@@ -593,6 +689,7 @@ mod tests {
             &ctx,
             &tools_registry,
             None,
+            &[],
             &tool_calls,
             &mut seen,
             &mut prompt_seen,
@@ -847,6 +944,7 @@ mod tests {
             &ctx,
             &[],
             None,
+            &[],
             &tool_calls,
             &mut seen,
             &mut prompt_seen,
@@ -921,6 +1019,7 @@ mod tests {
                     &ctx,
                     &[],
                     None,
+                    &[],
                     &calls,
                     &mut HashSet::new(),
                     &mut HashSet::new(),
@@ -1029,6 +1128,7 @@ mod tests {
                     &ctx,
                     &[],
                     None,
+                    &[],
                     &calls,
                     &mut seen,
                     &mut prompt_seen,
@@ -1076,6 +1176,7 @@ mod tests {
                     &ctx,
                     &[],
                     None,
+                    &[],
                     &calls,
                     &mut seen,
                     &mut prompt_seen,
@@ -1148,6 +1249,7 @@ mod tests {
                         &ctx,
                         &[],
                         None,
+                        &[],
                         &calls,
                         &mut HashSet::new(),
                         &mut HashSet::new(),
@@ -1241,6 +1343,7 @@ mod tests {
             &ctx,
             &[],
             None,
+            &[],
             &tool_calls,
             &mut seen,
             &mut prompt_seen,
@@ -1328,6 +1431,9 @@ mod tests {
             on_delta: None,
             ..lifecycle_ctx(&observer, &pacing, &tx, Some(&approval), Some(&runner))
         };
+        // Registered under the names they call, so these calls resolve and
+        // reach the approval gate.
+        let registry = stub_tools(&["normal_tool", "guarded_tool", "unvisited_tool"]);
         let calls = [
             parsed_call("normal_tool", serde_json::json!({"n": 1}), "call-1"),
             parsed_call("guarded_tool", serde_json::json!({"n": 2}), "call-2"),
@@ -1337,8 +1443,9 @@ mod tests {
         let mut prompt_seen = HashSet::new();
         let preparation = prepare_tool_calls(
             &ctx,
-            &[],
+            &registry,
             None,
+            &[],
             &calls,
             &mut seen,
             &mut prompt_seen,
@@ -1393,6 +1500,9 @@ mod tests {
         let approval = crate::approval::ApprovalManager::for_non_interactive(&risk_profile);
         let ctx = lifecycle_ctx(&observer, &pacing, &tx, Some(&approval), Some(&runner));
 
+        // Registered under the names they call, so these calls resolve and
+        // reach the approval gate.
+        let registry = stub_tools(&["guarded_tool"]);
         let tool_calls = [parsed_call(
             "guarded_tool",
             serde_json::json!({"action": "run"}),
@@ -1402,8 +1512,9 @@ mod tests {
         let mut prompt_seen = HashSet::new();
         let prepared = prepare_tool_calls(
             &ctx,
-            &[],
+            &registry,
             None,
+            &[],
             &tool_calls,
             &mut seen,
             &mut prompt_seen,
@@ -1460,6 +1571,7 @@ mod tests {
                     &ctx,
                     &[],
                     None,
+                    &[],
                     &tool_calls,
                     &mut seen,
                     &mut prompt_seen,
@@ -1551,6 +1663,9 @@ mod tests {
             ..test_ctx(&observer, &pacing, &tx)
         };
 
+        // Registered under the names they call, so these calls resolve and
+        // reach the approval gate.
+        let registry = stub_tools(&["guarded_tool"]);
         let tool_calls = [parsed_call(
             "guarded_tool",
             serde_json::json!({"action": "run"}),
@@ -1560,8 +1675,9 @@ mod tests {
         let mut prompt_seen = HashSet::new();
         let prepared = prepare_tool_calls(
             &ctx,
-            &[],
+            &registry,
             None,
+            &[],
             &tool_calls,
             &mut seen,
             &mut prompt_seen,
@@ -1608,6 +1724,9 @@ mod tests {
         let approval = crate::approval::ApprovalManager::for_non_interactive(&risk_profile);
         let ctx = lifecycle_ctx(&observer, &pacing, &tx, Some(&approval), Some(&runner));
 
+        // Registered under the names they call, so these calls resolve and
+        // reach the approval gate.
+        let registry = stub_tools(&["normal_tool", "shell"]);
         let mut seen = HashSet::new();
         let mut prompt_seen = HashSet::new();
 
@@ -1620,8 +1739,9 @@ mod tests {
         ];
         let prepared0 = prepare_tool_calls(
             &ctx,
-            &[],
+            &registry,
             None,
+            &[],
             &round0,
             &mut seen,
             &mut prompt_seen,
@@ -1640,8 +1760,9 @@ mod tests {
         ];
         let Err(error) = prepare_tool_calls(
             &ctx,
-            &[],
+            &registry,
             None,
+            &[],
             &round1,
             &mut seen,
             &mut prompt_seen,
@@ -1750,6 +1871,359 @@ mod tests {
                 "abandoned:second:test-turn:3:1".to_string(),
             ],
             "a fully aborted execution batch abandons every executable context"
+        );
+    }
+
+    // ── Calls that cannot run are not put to the operator ────────────────
+
+    /// Channel that counts approval requests and answers each with an
+    /// operator's denial.
+    struct CountingDenyChannel(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl zeroclaw_api::attribution::Attributable for CountingDenyChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(
+                zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "counting-deny-test"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::channel::Channel for CountingDenyChannel {
+        fn name(&self) -> &str {
+            "counting-deny-test"
+        }
+
+        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            Ok(())
+        }
+
+        async fn request_approval_attributed(
+            &self,
+            _recipient: &str,
+            _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                    zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                )
+                .with_decider("tester"),
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(std::sync::Mutex<Vec<String>>);
+
+    impl crate::observability::Observer for RecordingObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            use crate::observability::ObserverEvent;
+            // Durations are wall-clock; everything else must match.
+            let line = match event {
+                ObserverEvent::ToolCallStart {
+                    tool,
+                    tool_call_id,
+                    arguments,
+                    channel,
+                    turn_id,
+                    ..
+                } => format!("start {tool} {tool_call_id:?} {arguments:?} {channel:?} {turn_id:?}"),
+                ObserverEvent::ToolCall {
+                    tool,
+                    tool_call_id,
+                    success,
+                    arguments,
+                    result,
+                    channel,
+                    turn_id,
+                    ..
+                } => format!(
+                    "call {tool} {tool_call_id:?} {success} {arguments:?} {result:?} {channel:?} {turn_id:?}"
+                ),
+                other => format!("{other:?}"),
+            };
+            self.0.lock().unwrap().push(line);
+        }
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+        fn name(&self) -> &str {
+            "recording-test"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct SupervisedPreparation {
+        prepared: PreparedToolCalls,
+        approval_requests: usize,
+        hook_events: Vec<String>,
+        observer_events: Vec<String>,
+        turn_events: Vec<zeroclaw_api::agent::TurnEvent>,
+    }
+
+    /// Prepare `calls` as a supervised session would: default risk profile,
+    /// an approval back-channel that denies, hooks and both event streams.
+    async fn prepare_supervised(
+        registry: &[Box<dyn Tool>],
+        excluded: &[String],
+        calls: &[ParsedToolCall],
+    ) -> SupervisedPreparation {
+        let noop = NoopObserver;
+        let observer = RecordingObserver::default();
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(64);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(LifecycleRecorder {
+            events: Arc::clone(&events),
+            cancel_before_for: Vec::new(),
+        }));
+        let approval = crate::approval::ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let channel = CountingDenyChannel(Arc::clone(&requests));
+        let ctx = TurnCtx {
+            observer: &observer,
+            channel: Some(&channel),
+            channel_reply_target: Some("operator"),
+            event_tx: Some(&event_tx),
+            ..lifecycle_ctx(&noop, &pacing, &tx, Some(&approval), Some(&runner))
+        };
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+        let prepared = prepare_tool_calls(
+            &ctx,
+            registry,
+            None,
+            excluded,
+            calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        )
+        .await
+        .expect("preparation completes");
+        drop(ctx);
+        drop(event_tx);
+        let mut turn_events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            turn_events.push(event);
+        }
+        SupervisedPreparation {
+            prepared,
+            approval_requests: requests.load(std::sync::atomic::Ordering::SeqCst),
+            hook_events: events.lock().unwrap().clone(),
+            observer_events: observer.0.lock().unwrap().clone(),
+            turn_events,
+        }
+    }
+
+    /// The observer events sequential execution records for one call.
+    async fn executor_observer_events(
+        registry: &[Box<dyn Tool>],
+        excluded: &[String],
+        call: &ParsedToolCall,
+    ) -> Vec<String> {
+        let observer = RecordingObserver::default();
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn",
+            channel_name: "test",
+        };
+        crate::agent::tool_execution::execute_one_tool(
+            &call.name,
+            call.arguments.clone(),
+            call.tool_call_id.as_deref(),
+            crate::agent::tool_execution::ToolDispatchContext {
+                tools_registry: registry,
+                activated_tools: None,
+                excluded_tools: excluded,
+                model_switch_callback: None,
+            },
+            &meta,
+            &observer,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execution answers");
+        observer.0.lock().unwrap().clone()
+    }
+
+    fn outcome_at(prepared: &PreparedToolCalls, idx: usize) -> &ToolExecutionOutcome {
+        &prepared.ordered_results[idx]
+            .as_ref()
+            .expect("the call has an outcome")
+            .2
+    }
+
+    fn stream_pair(events: &[zeroclaw_api::agent::TurnEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                zeroclaw_api::agent::TurnEvent::ToolCall { id, name, .. } => {
+                    format!("call {id} {name}")
+                }
+                zeroclaw_api::agent::TurnEvent::ToolResult {
+                    id, name, output, ..
+                } => format!("result {id} {name} {output}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn undispatchable_prompt_call_keeps_arguments_out_of_events() {
+        let registry = stub_tools(&["session_prompt_set"]);
+        let excluded = vec!["session_prompt_set".to_string()];
+        let call = parsed_call(
+            "session_prompt_set",
+            serde_json::json!({"id": "task", "content": "PRIVATE_MARKER"}),
+            "call-1",
+        );
+        let run = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(true, prepare_supervised(&registry, &excluded, &[call]))
+            .await;
+
+        assert_eq!(run.approval_requests, 0);
+        assert!(!outcome_at(&run.prepared, 0).success);
+        assert!(run.prepared.executable_calls.is_empty());
+        assert!(run.hook_events.is_empty());
+        assert!(run.turn_events.is_empty());
+        assert_eq!(run.observer_events.len(), 2);
+        assert!(
+            run.observer_events
+                .iter()
+                .all(|event| !event.contains("PRIVATE_MARKER"))
+        );
+    }
+
+    /// A supervised call naming a tool the turn doesn't have is answered as
+    /// execution would answer it, and nobody is asked to approve it.
+    #[tokio::test]
+    async fn a_prompted_call_for_an_unregistered_tool_is_answered_without_asking() {
+        let registry = stub_tools(&["calculator"]);
+        let call = parsed_call("cron_list", serde_json::json!({"n": 1}), "call-1");
+        let run = prepare_supervised(&registry, &[], std::slice::from_ref(&call)).await;
+
+        assert_eq!(run.approval_requests, 0, "no approval request is sent");
+        let outcome = outcome_at(&run.prepared, 0);
+        assert!(!outcome.success);
+        assert_eq!(outcome.output, "Unknown tool: cron_list");
+        assert!(run.prepared.executable_indices.is_empty());
+        assert_eq!(
+            run.hook_events,
+            vec![
+                "before:cron_list:test-turn:0:0".to_string(),
+                "abandoned:cron_list:test-turn:0:0".to_string(),
+            ],
+            "the context is abandoned once and gets no after hook"
+        );
+        assert_eq!(
+            run.observer_events,
+            executor_observer_events(&registry, &[], &call).await,
+            "the observer sees what execution records for the same call"
+        );
+        assert_eq!(
+            stream_pair(&run.turn_events),
+            vec![
+                "call call-1 cron_list".to_string(),
+                "result call-1 cron_list Unknown tool: cron_list".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompted_call_for_an_excluded_tool_is_answered_without_asking() {
+        let registry = stub_tools(&["cron_list"]);
+        let excluded = vec!["cron_list".to_string()];
+        let call = parsed_call("cron_list", serde_json::json!({"n": 1}), "call-1");
+        let run = prepare_supervised(&registry, &excluded, std::slice::from_ref(&call)).await;
+
+        assert_eq!(run.approval_requests, 0, "no approval request is sent");
+        let outcome = outcome_at(&run.prepared, 0);
+        assert!(!outcome.success);
+        assert_eq!(outcome.output, "Tool not available in this turn: cron_list");
+        assert!(run.prepared.executable_indices.is_empty());
+        assert_eq!(
+            run.observer_events,
+            executor_observer_events(&registry, &excluded, &call).await,
+            "the observer sees what execution records for the same call"
+        );
+    }
+
+    /// Control for the two tests above: the same call, once the turn holds
+    /// the tool, is still put to the operator.
+    #[tokio::test]
+    async fn a_prompted_call_for_a_registered_tool_still_asks() {
+        let registry = stub_tools(&["cron_list"]);
+        let call = parsed_call("cron_list", serde_json::json!({"n": 1}), "call-1");
+        let run = prepare_supervised(&registry, &[], std::slice::from_ref(&call)).await;
+
+        assert_eq!(run.approval_requests, 1, "the operator is asked");
+        let outcome = outcome_at(&run.prepared, 0);
+        assert!(
+            outcome.output.starts_with("Denied by user."),
+            "{}",
+            outcome.output
+        );
+        assert!(
+            run.observer_events.is_empty(),
+            "a denied call never reaches the executor's events: {:?}",
+            run.observer_events
+        );
+    }
+
+    /// `tool_search` can activate a deferred tool before a later call in the
+    /// same batch runs, so that later call still goes through the gate. A
+    /// call before the `tool_search` is answered at once.
+    #[tokio::test]
+    async fn a_call_after_tool_search_in_the_same_batch_still_goes_through_the_gate() {
+        let registry = stub_tools(&["tool_search"]);
+        let calls = [
+            parsed_call("cron_list", serde_json::json!({"n": 1}), "call-1"),
+            parsed_call(
+                "tool_search",
+                serde_json::json!({"query": "cron"}),
+                "call-2",
+            ),
+            parsed_call("cron_list", serde_json::json!({"n": 2}), "call-3"),
+        ];
+        let run = prepare_supervised(&registry, &[], &calls).await;
+
+        assert_eq!(
+            outcome_at(&run.prepared, 0).output,
+            "Unknown tool: cron_list",
+            "a call before tool_search cannot be activated by it"
+        );
+        assert_eq!(run.prepared.executable_indices, vec![1]);
+        assert_eq!(
+            run.approval_requests, 1,
+            "only the call after tool_search is put to the operator"
+        );
+        assert!(
+            outcome_at(&run.prepared, 2)
+                .output
+                .starts_with("Denied by user."),
+            "{}",
+            outcome_at(&run.prepared, 2).output
         );
     }
 }

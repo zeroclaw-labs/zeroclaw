@@ -35,10 +35,12 @@ export default function Layout() {
   const { open: paletteOpen, openPalette, closePalette } = useCommandPalette();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   // A signed-in account without the operator dashboard lands on chat or
-  // config, and a deep link to another page says it isn't available.
+  // config, and a deep link to another page says it isn't available. An
+  // account with neither sees that at `/` too.
   const { session } = useAuth();
   const access = navAccessFor(session);
   const routeAccess = pathAccess(pathname, access);
+  const home = homePathFor(access);
 
   // Close the mobile drawer on route change.
   useEffect(() => {
@@ -84,8 +86,8 @@ export default function Layout() {
             on every section click and reset scroll/state. */}
         <main className="flex-1 overflow-y-auto min-h-0">
           <ErrorBoundary key={pathname.split('/')[1] ?? ''}>
-            {pathname === '/' && !access.operatorPages ? (
-              <Navigate to={homePathFor(access)} replace />
+            {pathname === '/' && !access.operatorPages && home ? (
+              <Navigate to={home} replace />
             ) : routeAccess === 'allowed' ? (
               <Outlet />
             ) : (
