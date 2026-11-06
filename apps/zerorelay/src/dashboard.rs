@@ -22,8 +22,8 @@
 //! and it does not change when the node-id rotates. A rotation's grace window
 //! briefly registers two node-ids for one key; the newest registration wins.
 
-use crate::Inner;
 use crate::enroll_route::{DaemonLink, OpenError, open_route_on};
+use crate::{Inner, REFUSAL_WRITE_BUDGET};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -281,12 +281,15 @@ pub(crate) async fn serve<S>(
 }
 
 /// Copy both ways until either side ends, nothing has moved either way for
-/// `idle`, or one side has not taken a write for `idle`.
+/// `idle`, or one side has not taken a write for `idle`; then close both,
+/// giving each close [`REFUSAL_WRITE_BUDGET`].
 ///
 /// The write is bounded on its own because the idle timer is not polled while
 /// a write waits: without it, a browser that asks for a page and then stops
 /// reading would hold its dashboard and route slots past `idle`, and enough of
-/// them would make the dashboard busy for everyone else.
+/// them would make the dashboard busy for everyone else. The close is bounded
+/// for the same browser: closing a TLS stream sends `close_notify`, which has
+/// to get past whatever the browser left unread.
 async fn splice<A, B>(a: A, b: B, idle: Duration)
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -320,8 +323,8 @@ where
             },
         }
     }
-    let _ = a_write.shutdown().await;
-    let _ = b_write.shutdown().await;
+    let _ = tokio::time::timeout(REFUSAL_WRITE_BUDGET, a_write.shutdown()).await;
+    let _ = tokio::time::timeout(REFUSAL_WRITE_BUDGET, b_write.shutdown()).await;
 }
 
 /// Whether `write` finished, successfully, within `idle`.
@@ -334,7 +337,8 @@ async fn wrote_within(
 
 /// Answer a connection the relay will not route: read what the browser sent
 /// (so closing does not reset the connection before it reads the answer), send
-/// a fixed page and close.
+/// a fixed page and close. Sending and closing share [`REFUSAL_WRITE_BUDGET`],
+/// so a browser that never reads gives up its slots with the rest.
 async fn refuse<S>(browser: &mut S, status: u16, message: &str)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -370,13 +374,51 @@ where
          connection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = browser.write_all(response.as_bytes()).await;
-    let _ = browser.shutdown().await;
+    let _ = tokio::time::timeout(REFUSAL_WRITE_BUDGET, async {
+        let _ = browser.write_all(response.as_bytes()).await;
+        let _ = browser.shutdown().await;
+    })
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    /// A stream whose close never completes, as a TLS stream's doesn't when
+    /// its `close_notify` cannot get past what the browser left unread.
+    struct NeverCloses<S>(S);
+
+    impl<S: AsyncRead + Unpin> AsyncRead for NeverCloses<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for NeverCloses<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
 
     fn cfg() -> DashboardConfig {
         DashboardConfig {
@@ -497,5 +539,43 @@ mod tests {
         assert!(started.elapsed() >= idle);
         drop(browser);
         answering.abort();
+    }
+
+    // The two tests below run on a paused clock: tokio moves it on whenever
+    // every task is parked, so the budgets pass instantly, and an unbounded
+    // close leaves only the test's own guard to fire.
+
+    #[tokio::test(start_paused = true)]
+    async fn a_browser_that_stops_reading_cannot_hold_the_close_either() {
+        let (browser, relay_browser_side) = tokio::io::duplex(1024);
+        let (relay_daemon_side, mut daemon) = tokio::io::duplex(64 * 1024);
+        let answering = tokio::spawn(async move {
+            let chunk = vec![b'x'; 16 * 1024];
+            while daemon.write_all(&chunk).await.is_ok() {}
+        });
+        let idle = Duration::from_secs(30);
+        tokio::time::timeout(
+            idle + REFUSAL_WRITE_BUDGET * 4,
+            splice(NeverCloses(relay_browser_side), relay_daemon_side, idle),
+        )
+        .await
+        .expect("closing a browser that never reads must not hold its slots");
+        drop(browser);
+        answering.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_to_a_browser_that_never_reads_gives_up() {
+        // Far too small a link for the page, and a browser that sends nothing
+        // and reads nothing: `browser` is held to keep the link open.
+        let (browser, relay) = tokio::io::duplex(16);
+        let mut relay = NeverCloses(relay);
+        tokio::time::timeout(
+            REFUSAL_READ_BUDGET + REFUSAL_WRITE_BUDGET * 4,
+            refuse(&mut relay, 404, "There is no dashboard at this address."),
+        )
+        .await
+        .expect("a refusal must not hold its slots for a browser that never reads");
+        drop(browser);
     }
 }
