@@ -508,11 +508,12 @@ pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> 
 
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
-    /// True when this tool starts nested execution without carrying the RPC
-    /// principal's current tool and agent ceilings. Constrained RPC sessions
-    /// must omit it. Wrappers forward the target's value so a renamed skill
-    /// cannot bypass that restriction. This describes implementation support,
-    /// not a stored authorization decision.
+    /// True when this tool does work that does not carry the RPC principal's
+    /// current authority: nested, scheduled or headless runs, turns on another
+    /// agent, shared procedures, or other principals' sessions. Non-admin RPC
+    /// sessions omit it whatever their selectors admit. Wrappers forward the
+    /// target's value so a renamed skill cannot bypass that restriction. This
+    /// describes implementation support, not a stored authorization decision.
     fn requires_unrestricted_principal(&self) -> bool {
         false
     }
