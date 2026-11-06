@@ -1296,11 +1296,14 @@ impl TranscriptionManager {
 ///    key. This is the compatibility fallback one channel used to apply on
 ///    its own; it now applies everywhere, and only when needed.
 /// 3. No preference: a configured `[transcription].default_provider` wins
-///    over the lone-provider convenience binding. It binds the registered
-///    name the default resolves to (exact key, else family). A default that
-///    names an unavailable provider stays unbound, so `transcribe` resolves
-///    the default and fails loud on the selected provider instead of
-///    silently routing audio to another vendor.
+///    over the lone-provider convenience binding. With one registered
+///    provider it binds the default's exact key, or the key's `type`
+///    family when the default names a `type.alias`; with several providers
+///    no family fallback applies here — the default must name its exact
+///    registered key, which `transcribe` then resolves literally. A default
+///    that names an unavailable provider stays unbound, so `transcribe`
+///    fails loud on the selected provider instead of silently routing audio
+///    to another vendor.
 /// 4. No preference and no default and exactly one registered provider: bind
 ///    it. A lone provider is unambiguous, and the alternative is a hard
 ///    failure for every single-provider deployment.
