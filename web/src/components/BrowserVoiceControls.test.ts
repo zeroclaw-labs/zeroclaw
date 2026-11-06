@@ -53,7 +53,16 @@ globalThis.fetch = async (input, init) => {
   const deviceId = path === '/api/devices/me/voice' ? 'synthetic-device' : decodeURIComponent(path.split('/')[3] ?? '');
   const selected = perDevice.get(deviceId);
   if (!selected) return new Response('', { status: 404 });
-  if (init?.method === 'PUT') Object.assign(selected, JSON.parse(String(init.body)));
+  if (init?.method === 'PUT') {
+    const incoming = JSON.parse(String(init.body)) as typeof preferences;
+    selected.dictation = incoming.dictation;
+    selected.reading = incoming.reading;
+    selected.automatic = incoming.automatic;
+    selected.language = incoming.language;
+    selected.recognition = incoming.recognition;
+    selected.voice = incoming.voice;
+    selected.rate = incoming.rate;
+  }
   return new Response(JSON.stringify({ device_id: deviceId, preferences: selected }), { headers: { 'Content-Type': 'application/json' } });
 };
 const { default: Controls } = await import('./BrowserVoiceControls.tsx');
