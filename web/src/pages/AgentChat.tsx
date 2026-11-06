@@ -309,6 +309,9 @@ export function AgentChatInner({
   }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading]);
 
   const handleSend = () => {
+    // The input stays focusable (read-only) during a turn, and an image upload
+    // can still change the draft, so nothing is sent until the turn ends.
+    if (typing) return;
     const trimmed = input.trim();
     if (!trimmed) return;
 
@@ -464,6 +467,10 @@ export function AgentChatInner({
   // in-flight turn, the WS handler sends an `error` frame which our
   // onMessage handler already maps to typing=false.
   const handleAbort = useCallback(async () => {
+    // The Stop button unmounts when the turn ends, taking focus with it, so
+    // hand focus to the input now. Waiting for the abort request would take
+    // focus back from any control the user moves to while it is pending.
+    inputRef.current?.focus();
     try {
       await abortSession();
     } catch {
@@ -785,6 +792,8 @@ export function AgentChatInner({
               ? <Loader2 className="h-4 w-4 animate-spin" />
               : <ImagePlus className="h-4 w-4" />}
           </Button>
+          {/* Read-only rather than disabled during a turn: disabling drops
+              focus, so each follow-up message needed a click first. */}
           <textarea
             ref={inputRef}
             rows={1}
@@ -800,8 +809,9 @@ export function AgentChatInner({
                 : typing
                   ? t('agent.running')
                   : t('agent.type_message')}
-            disabled={!connected || typing || !hydrated}
-            className="flex-1 px-4 text-sm resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-muted transition-colors focus:outline-none focus:border-pc-accent focus:ring-2 focus:ring-pc-accent/30 disabled:opacity-40"
+            disabled={!connected || !hydrated}
+            readOnly={typing}
+            className="flex-1 px-4 text-sm resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-muted transition-colors focus:outline-none focus:border-pc-accent focus:ring-2 focus:ring-pc-accent/30 disabled:opacity-40 read-only:opacity-40"
             style={{ minHeight: '40px', maxHeight: '200px', paddingTop: '9px', paddingBottom: '9px' }}
           />
           {typing ? (
