@@ -1845,7 +1845,20 @@ fn parse_function_style_kwargs(
                 while let Some((i, ch)) = chars.next() {
                     if ch == '\\' {
                         match chars.next() {
-                            Some((_, escaped)) => out.push(escaped),
+                            Some((_, '"')) => out.push('"'),
+                            Some((_, '\'')) => out.push('\''),
+                            Some((_, '\\')) => out.push('\\'),
+                            Some((_, '/')) => out.push('/'),
+                            Some((_, 'b')) => out.push('\u{0008}'),
+                            Some((_, 'f')) => out.push('\u{000c}'),
+                            Some((_, 'n')) => out.push('\n'),
+                            Some((_, 'r')) => out.push('\r'),
+                            Some((_, 't')) => out.push('\t'),
+                            Some((_, other)) => {
+                                // Preserve unknown escapes instead of dropping the slash.
+                                out.push('\\');
+                                out.push(other);
+                            }
                             None => return None, // dangling backslash
                         }
                         continue;
@@ -1951,16 +1964,18 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
 
     let tool_name = map_tool_name_alias(tool_raw);
 
-    // Try attribute / kwargs style: key="value", key='value', or key=bare
-    if allow_kwargs
-        && value_part.contains('=')
-        && let Some(args) = parse_function_style_kwargs(value_part)
-    {
-        return Some(ParsedToolCall {
-            name: tool_name.to_string(),
-            arguments: serde_json::Value::Object(args),
-            tool_call_id: None,
-        });
+    // Try attribute / kwargs style: key="value", key='value', or key=bare.
+    // When the call looks like named arguments, a parse failure must reject the
+    // whole call — do not reinterpret broken kwargs as a raw single value.
+    if allow_kwargs && value_part.contains('=') {
+        return match parse_function_style_kwargs(value_part) {
+            Some(args) => Some(ParsedToolCall {
+                name: tool_name.to_string(),
+                arguments: serde_json::Value::Object(args),
+                tool_call_id: None,
+            }),
+            None => None,
+        };
     }
 
     // Try YAML-style multi-line: each line is `key: value`
@@ -3820,6 +3835,28 @@ I will now call the tool with this payload:
     }
 
     #[test]
+    fn parse_function_style_kwargs_decodes_common_escapes_and_keeps_unknown() {
+        let args = parse_function_style_kwargs(r"path='a.txt', content='first\nsecond\qtail'")
+            .expect("escapes");
+        assert_eq!(
+            args.get("content").and_then(|v| v.as_str()),
+            Some("first\nsecond\\qtail")
+        );
+    }
+
+    #[test]
+    fn parse_glm_shortened_body_rejects_broken_named_arguments() {
+        assert!(
+            parse_glm_shortened_body("file_read(path='a', limit=)").is_none(),
+            "empty bare value after = must not fall through to raw path"
+        );
+        assert!(
+            parse_glm_shortened_body("shell(command='echo hi', broken)").is_none(),
+            "trailing junk must not become the shell command string"
+        );
+    }
+
+    #[test]
     fn parse_tool_calls_preserves_shell_env_assignment_on_single_value_path() {
         // Regression: value containing `=` must stay on the single-value path.
         let response = "<tool_call>shell>FOO=bar env</tool_call>";
@@ -3835,14 +3872,21 @@ I will now call the tool with this payload:
 
     #[test]
     fn parse_tool_calls_handles_lfm_special_token_call_list() {
-        let response = "<|tool_call_start|>[file_read(path='a'), file_read(path='b')]<|tool_call_end|>";
+        let response =
+            "<|tool_call_start|>[file_read(path='a'), file_read(path='b')]<|tool_call_end|>";
         let (text, calls) = parse_tool_calls(response);
         assert!(text.is_empty(), "{text:?}");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "file_read");
-        assert_eq!(calls[0].arguments.get("path").and_then(|v| v.as_str()), Some("a"));
+        assert_eq!(
+            calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            Some("a")
+        );
         assert_eq!(calls[1].name, "file_read");
-        assert_eq!(calls[1].arguments.get("path").and_then(|v| v.as_str()), Some("b"));
+        assert_eq!(
+            calls[1].arguments.get("path").and_then(|v| v.as_str()),
+            Some("b")
+        );
     }
 
     #[test]
