@@ -255,7 +255,7 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
     : `${t('agent.session_untitled')} ${sessionId.slice(0, 8)}`;
 
   return (
-    <div className="relative" ref={containerRef}>
+    <div className="relative min-w-0" ref={containerRef}>
       <button
         ref={triggerRef}
         type="button"
@@ -270,19 +270,24 @@ export function SessionPicker({ agentAlias }: { agentAlias: string }) {
         aria-expanded={open}
         aria-controls={open ? panelId : undefined}
         title={t('agent.sessions')}
-        className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+        className="flex items-center gap-2 px-3 h-7 max-w-full rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
       >
-        <MessagesSquare className="h-3.5 w-3.5" />
+        <MessagesSquare className="h-3.5 w-3.5 shrink-0" />
         <span className="max-w-[160px] truncate">{activeLabel}</span>
-        <ChevronDown className="h-3 w-3" />
+        <ChevronDown className="h-3 w-3 shrink-0" />
       </button>
 
+      {/* `@xl` and `100cqw` resolve against the AgentChat header's
+          `@container`. Below 36rem of header content width the trigger starts
+          its own line at the inline start, so the panel opens from there; the
+          model panel stays end-anchored because that picker is always last in
+          the row. */}
       {open && (
         <div
           id={panelId}
           role="group"
           aria-label={t('agent.sessions')}
-          className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[300px] max-h-80 overflow-y-auto"
+          className="absolute start-0 @xl:start-auto @xl:end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 w-[300px] max-w-[100cqw] max-h-80 overflow-y-auto"
         >
           {storesConversations ? (
             <button
