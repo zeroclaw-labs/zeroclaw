@@ -878,16 +878,18 @@ Examples:
 Update one or more fields of an existing scheduled task.
 
 Only the fields you specify are changed; others remain unchanged.
+`--agent` sets the job's owning agent (and gates shell-command risk checks).
 
 Examples:
-  zeroclaw cron update TASK_ID --expression '0 8 * * *'
-  zeroclaw cron update TASK_ID --tz Europe/London --name 'Morning check'
-  zeroclaw cron update TASK_ID --command 'Updated message'")]
+  zeroclaw cron update TASK_ID --agent sentinel --expression '0 8 * * *'
+  zeroclaw cron update TASK_ID --agent sentinel --tz Europe/London --name 'Morning check'
+  zeroclaw cron update TASK_ID --agent secretary --command 'Updated message'
+  zeroclaw cron update TASK_ID --agent secretary")]
     Update {
         /// Task ID
         id: String,
-        /// Configured agent alias. Required. The alias risk profile
-        /// gates shell commands for shell jobs.
+        /// Configured agent alias the job should run as. Required.
+        /// Reassigns the stored owner and gates shell-command risk checks.
         #[arg(short = 'a', long = "agent")]
         agent_alias: String,
         /// New cron expression

@@ -23,7 +23,7 @@ pub use store::{
     record_last_run_with_status, record_run, release_job, release_job_for_token, remove_job,
     remove_job_for_agent, remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
     reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
-    sync_declarative_jobs, update_job, update_job_for_agent,
+    sync_declarative_jobs, update_job, update_job_for_agent, update_job_reassigning_owner,
 };
 pub(crate) use store::{finish_agent_claim, update_job_authorized};
 #[cfg(test)]
@@ -264,27 +264,47 @@ pub fn update_shell_job_with_approval(
     patch: CronJobPatch,
     approved: bool,
 ) -> Result<CronJob> {
-    let patch = remap_agent_command_patch(config, job_id, patch)?;
-    if patch.command.is_none() {
-        return update_job(config, job_id, patch);
-    }
+    update_shell_job_with_approval_inner(config, agent_alias, job_id, patch, approved, false)
+}
 
-    let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
+/// Operator entry point for `zeroclaw cron update --agent`: like
+/// [`update_shell_job_with_approval`], and additionally makes `agent_alias`
+/// the job's owning agent (see [`update_job_reassigning_owner`]). Agent-facing
+/// tools must not call this; `cron_update` cannot change ownership.
+pub fn update_shell_job_with_approval_reassigning(
+    config: &Config,
+    agent_alias: &str,
+    job_id: &str,
+    patch: CronJobPatch,
+    approved: bool,
+) -> Result<CronJob> {
+    update_shell_job_with_approval_inner(config, agent_alias, job_id, patch, approved, true)
+}
+
+fn update_shell_job_with_approval_inner(
+    config: &Config,
+    agent_alias: &str,
+    job_id: &str,
+    patch: CronJobPatch,
+    approved: bool,
+    reassign: bool,
+) -> Result<CronJob> {
+    let patch = remap_agent_command_patch(config, job_id, patch)?;
+    if let Some(command) = patch.command.as_deref() {
+        let security = SecurityPolicy::for_agent(config, agent_alias)?;
+        let runtime = crate::platform::create_runtime(&config.runtime)?;
+        validate_shell_command_with_security(runtime.as_ref(), &security, command, approved)?;
+    }
     // `owner: None` — this is the OPERATOR entry point, used by the gateway API
     // and the CLI. Its `agent_alias` names whose risk profile validates the
     // command, which is not necessarily the job's owner: patching an agent-type
     // job's prompt is not agent-gated at all and may omit the agent entirely.
     // Scoping here would stop an operator patching a job.
-    update_shell_job_with_runtime(
-        config,
-        runtime.as_ref(),
-        &security,
-        None,
-        job_id,
-        patch,
-        approved,
-    )
+    if reassign {
+        update_job_reassigning_owner(config, job_id, patch, agent_alias)
+    } else {
+        update_job(config, job_id, patch)
+    }
 }
 
 pub(crate) fn update_shell_job_with_runtime(
