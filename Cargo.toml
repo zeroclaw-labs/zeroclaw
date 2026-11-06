@@ -12,6 +12,7 @@ homepage = "https://www.zeroclaw.com"
 rust-version = "1.96.0"
 
 [workspace.dependencies]
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.7" }
 zeroclaw-buildinfo = { path = "crates/zeroclaw-buildinfo", version = "0.8.7" }
 zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.7" }

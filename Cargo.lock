@@ -14044,7 +14044,7 @@ version = "0.8.7"
 dependencies = [
  "anyhow",
  "async-trait",
- "chacha20poly1305 0.10.1",
+ "chacha20poly1305 0.11.0",
  "chrono",
  "clap",
  "directories",
@@ -14380,7 +14380,6 @@ dependencies = [
  "base64 0.22.1",
  "cap-fs-ext",
  "cap-std",
- "chacha20poly1305 0.10.1",
  "chrono",
  "directories",
  "futures-util",
@@ -14432,7 +14431,6 @@ dependencies = [
  "base64 0.22.1",
  "cap-fs-ext",
  "cap-std",
- "chacha20poly1305 0.10.1",
  "chardetng",
  "chrono",
  "chrono-tz",
@@ -14543,7 +14541,7 @@ name = "zeroclaw-tls"
 version = "0.8.7"
 dependencies = [
  "anyhow",
- "chacha20poly1305 0.10.1",
+ "chacha20poly1305 0.11.0",
  "filetime",
  "getrandom 0.2.17",
  "hex",
