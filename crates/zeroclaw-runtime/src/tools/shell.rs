@@ -324,6 +324,12 @@ impl Tool for ShellTool {
             }
         }
 
+        // Local task transport is injected after the safe/TUI environment.
+        if let Some(task) = zeroclaw_tools::task_ssh::current() {
+            cmd.env("ZEROCLAW_SSH_TASK", task.id);
+            cmd.env("ZEROCLAW_SSH_STATE_DIR", task.state_dir);
+        }
+
         // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
         // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
         // may omit them, leaving the shell unable to resolve any platform tool.
