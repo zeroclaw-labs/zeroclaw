@@ -2453,6 +2453,61 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "Config:Read only");
     }
 
+    /// The session tells the dashboard whether the account may read config,
+    /// and that answer is the config routes' own: an administrator and a
+    /// config reader get the pages, an account with other grants does not.
+    #[tokio::test]
+    async fn the_session_reports_config_access_as_the_config_routes_decide() {
+        for (groups, may_read) in [
+            (&["admins"][..], true),
+            (&["ops"][..], true),
+            (&["memory"][..], false),
+        ] {
+            let server = idp(groups, "gw").await;
+            let mut config = sign_in_config(&server.uri());
+            config
+                .oidc
+                .get_mut("corp")
+                .unwrap()
+                .profile_map
+                .insert("memory".into(), "memory-reader".into());
+            config.permission_profiles.insert(
+                "memory-reader".into(),
+                zeroclaw_config::schema::PermissionProfileConfig {
+                    grants: std::collections::HashMap::from([(
+                        zeroclaw_api::grants::Resource::Memory,
+                        vec![zeroclaw_api::grants::Verb::Read],
+                    )]),
+                    ..Default::default()
+                },
+            );
+            let fixture = fixture(config);
+            let signed_in = sign_in(&fixture, &server).await;
+            assert_eq!(
+                signed_in.session["features"]["config"], may_read,
+                "{groups:?}"
+            );
+
+            let cookie = signed_in.cookie_header();
+            let response = send(
+                &fixture.router,
+                request(
+                    "GET",
+                    "/api/quickstart/state",
+                    loopback(),
+                    &[("cookie", &cookie), ("sec-fetch-site", "same-origin")],
+                ),
+            )
+            .await;
+            let expected = if may_read {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(response.status(), expected, "{groups:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_sign_in_without_an_id_token_is_refused() {
         let server = idp(&["admins"], "gw").await;
