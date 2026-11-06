@@ -2798,7 +2798,9 @@ mod tests {
             .nest(
                 "/gw",
                 Router::new()
-                    .merge(crate::config_admin_router(&inbound_auth))
+                    .merge(crate::config_admin_router(
+                        crate::principal_gate::ConfigRouteAuth::new(&inbound_auth, &state.config),
+                    ))
                     .merge(routes())
                     .with_state(state)
                     .layer(tower_http::limit::RequestBodyLimitLayer::new(
