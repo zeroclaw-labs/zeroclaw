@@ -34726,8 +34726,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refresh_resolved_path_links_marks_parked_sessions_for_restyle() {
+    #[tokio::test]
+    async fn refresh_resolved_path_links_marks_parked_sessions_for_restyle() {
         use crate::chat::transcript_layout::LinesDirty;
 
         let (mut chat, _rx) = test_chat();
