@@ -91,7 +91,9 @@ const MIB: u64 = 1024 * 1024;
 const PER_IMAGE_CAP: u64 = 64 * MIB;
 /// What the decoder allocates regardless of size (tables, buffers, the input
 /// reader); the gate charges per pixel only, so a 1x1 file is charged 8 bytes
-/// and measures about 5 KiB. Far below anything the cap is meant to catch.
+/// and measures about 5 KiB. It is added to the charge when comparing, so tiny
+/// files do not fail on a cost the per-pixel charge never claimed to cover; it
+/// is 0.1% of the cap.
 const FIXED_DECODER_OVERHEAD: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -103,14 +105,16 @@ enum Shape {
 
 impl Shape {
     /// Output bytes per pixel plus the scratch the gate charges per pixel
-    /// (`WEBP_STILL_SCRATCH_BYTES_PER_PIXEL` = 5, `WEBP_STILL_ALPHA_...` = 7,
+    /// (`WEBP_STILL_SCRATCH_BYTES_PER_PIXEL` = 5, `WEBP_STILL_ALPHA_...` = 8,
     /// `WEBP_ANIMATED_...` = 17).
-    /// Mirrored here, so a retuned constant makes this file fail and prompts a
-    /// look at the numbers instead of passing silently.
+    /// Mirrored here because the constants are private. Nothing ties the copy
+    /// to the source: if a constant is retuned, the sanity asserts and boundary
+    /// cases in `multimodal.rs` follow it, but this table does not, and the
+    /// differential comparisons below would then use stale figures.
     fn charged_bytes_per_pixel(self) -> u64 {
         match self {
             Shape::Still => 3 + 5,
-            Shape::Alpha => 4 + 7,
+            Shape::Alpha => 4 + 8,
             Shape::Animated => 4 + 17,
         }
     }
@@ -350,7 +354,7 @@ impl XorShift {
 /// 16-pixel macroblocks, the dimension ceiling, and the sides at which a still
 /// with and without alpha crosses the 64 MiB cap.
 const SIDES: [u32; 24] = [
-    0, 1, 2, 15, 16, 17, 255, 256, 1023, 1024, 2047, 2048, 2469, 2470, 2729, 2730, 2896, 2897,
+    0, 1, 2, 15, 16, 17, 255, 256, 1023, 1024, 2047, 2048, 2364, 2365, 2729, 2730, 2896, 2897,
     4095, 4096, 8191, 8192, 16382, 16383,
 ];
 
@@ -421,10 +425,13 @@ fn mutate(fixture: &Fixture, rng: &mut XorShift) -> (Vec<u8>, String) {
 }
 
 /// A seeded sweep over hostile and mismatched headers on every fixture. The
-/// property is the whole invariant: if the gate admits a file, decoding it
-/// never holds more than the per-image cap, whatever the file claims and
-/// whether or not its pixel data is any good. The seed is fixed, so a failure
-/// reproduces; the message carries the iteration and the mutation.
+/// property: if the gate admits a file whose dimensions the sweep mutated,
+/// decoding it never holds more than the per-image cap. It covers the
+/// dimension mechanism only (VP8 header, VP8X canvas, ANMF rectangle, scale
+/// bits) over the 16 fixtures; it does not cover allocations that grow with the
+/// bitstream's content (VP8L Huffman groups, transform data), which the
+/// per-pixel charge does not model. The seed is fixed, so a failure reproduces;
+/// the message carries the iteration and the mutation.
 #[test]
 fn nothing_the_gate_admits_decodes_above_the_cap_across_a_seeded_sweep() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -432,11 +439,16 @@ fn nothing_the_gate_admits_decodes_above_the_cap_across_a_seeded_sweep() {
     const ITERATIONS: usize = 400;
     let mut rng = XorShift(SEED);
     let fixtures = fixtures();
-    let (mut admitted, mut refused, mut sizeable) = (0usize, 0usize, 0usize);
+    let (mut admitted, mut refused, mut sizeable, mut unchanged) = (0usize, 0usize, 0usize, 0usize);
     let mut largest = 0u64;
     for iteration in 0..ITERATIONS {
         let fixture = &fixtures[rng.below(fixtures.len())];
         let (bytes, what) = mutate(fixture, &mut rng);
+        if bytes == fixture.bytes {
+            // The draw landed on the fixture's own values: not a mutation.
+            unchanged += 1;
+            continue;
+        }
         if gate("sweep.webp", &bytes).is_err() {
             refused += 1;
             continue;
@@ -457,8 +469,8 @@ fn nothing_the_gate_admits_decodes_above_the_cap_across_a_seeded_sweep() {
         );
     }
     eprintln!(
-        "sweep: {admitted} admitted, {refused} refused, {sizeable} admitted above 1 MiB, \
-         largest admitted decode {} KiB",
+        "sweep: {admitted} admitted, {refused} refused, {unchanged} unchanged (skipped), \
+         {sizeable} admitted above 1 MiB, largest admitted decode {} KiB",
         largest / 1024
     );
     // Without these the sweep could pass by never reaching the gate's edge.
@@ -492,5 +504,28 @@ fn an_alpha_still_that_really_decodes_above_the_cap_is_refused() {
             peak / MIB
         )
     });
+    assert!(error.to_string().contains("per-image limit"), "{error}");
+}
+
+/// A lossy still whose ALPH plane is lossless with predictor and colour
+/// transforms (2469 x 2469; a crafted file, not a camera or encoder default).
+/// Its transform data is held on top of the 10.5 B/px of a plain alpha plane:
+/// measured about 11.02 B/px, 67,144,965 B in a build of this tree before the
+/// charge went from 4 + 7 to 4 + 8. At 4 + 7 it was charged 67,055,571 B, under
+/// the cap, and decoded above it. Predicted before the first run.
+#[test]
+fn an_alpha_still_with_transforms_that_decodes_above_the_cap_is_refused() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = include_bytes!("testdata/alpha_xforms_2469x2469.webp");
+
+    let (decoded, peak) = peak_of(|| ingest_like_webp_to_png(bytes));
+    decoded.expect("the file decodes");
+    assert!(
+        peak > PER_IMAGE_CAP,
+        "the premise of this test is gone: the decode peaked at {peak} bytes, under the cap"
+    );
+    let error = gate("alpha-xforms.webp", bytes)
+        .err()
+        .unwrap_or_else(|| panic!("the gate admitted a file that decodes at {peak} bytes"));
     assert!(error.to_string().contains("per-image limit"), "{error}");
 }

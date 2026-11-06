@@ -3061,10 +3061,16 @@ const WEBP_STILL_SCRATCH_BYTES_PER_PIXEL: u64 = 5;
 /// - `read_alpha_chunk`'s lossless branch, a 4 B/px RGBA buffer plus a 1 B/px
 ///   green plane.
 ///
-/// 1.5 + 4 + 1 = 6.5, rounded up to 7. Measured on real files at 10.5 B/px in
-/// total (`tests/webp_alloc_budget.rs`), which the earlier 5 (derived for the
-/// lossless branch alone, 9 B/px in total) did not cover.
-const WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL: u64 = 7;
+/// 1.5 + 4 + 1 = 6.5 for those buffers alone. The alpha plane may also carry
+/// lossless transforms (predictor, colour), whose data the buffers above do not
+/// include, and the planes are rounded up to whole macroblocks. Measured on
+/// real and crafted files (`tests/webp_alloc_budget.rs`): 10.5 B/px in total
+/// for a plain alpha plane and 11.02 B/px for one with predictor and colour
+/// transforms (2469 px per side). 8 leaves 12 B/px charged, about 9% above the
+/// worst measured. That is a measured margin, not a proven bound: the earlier 5
+/// was derived for the lossless branch alone (9 B/px in total) and 7 (11 in
+/// total) was exceeded by the transforms case.
+const WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL: u64 = 8;
 
 /// Extra bytes per pixel an **animated** WebP decode holds on top of its
 /// output buffer, covering the worst case across alpha and non-alpha shapes.
@@ -8860,8 +8866,8 @@ mod tests {
     #[tokio::test]
     async fn ensure_decode_within_per_image_cap_flips_where_the_validator_does() {
         // A still WebP projects to output + scratch per pixel: 3 + 5 without
-        // alpha (cap crossed between 2896 and 2897 px per side) and 4 + 7 with
-        // the VP8X alpha flag (between 2469 and 2470). The sanity asserts tie
+        // alpha (cap crossed between 2896 and 2897 px per side) and 4 + 8 with
+        // the VP8X alpha flag (between 2364 and 2365). The sanity asserts tie
         // those sides to the constants, so a change to either fails here
         // rather than silently moving the boundary under the cases below.
         let projected = |side: u32, per_pixel: u64| u64::from(side) * u64::from(side) * per_pixel;
@@ -8869,16 +8875,16 @@ mod tests {
         let with_alpha = 4 + WEBP_STILL_ALPHA_SCRATCH_BYTES_PER_PIXEL;
         assert!(projected(2896, plain) < MAX_DECODED_IMAGE_ALLOC_BYTES);
         assert!(projected(2897, plain) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
-        assert!(projected(2469, with_alpha) < MAX_DECODED_IMAGE_ALLOC_BYTES);
-        assert!(projected(2470, with_alpha) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2364, with_alpha) < MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(projected(2365, with_alpha) >= MAX_DECODED_IMAGE_ALLOC_BYTES);
 
         let cases = [
             (1000, false, false),
             (2896, false, false),
             (2897, false, true),
             (4000, false, true),
-            (2469, true, false),
-            (2470, true, true),
+            (2364, true, false),
+            (2365, true, true),
             (2730, true, true),
         ];
         for (side, alpha, over_cap) in cases {
