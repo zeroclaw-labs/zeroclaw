@@ -956,6 +956,7 @@ cli-config-capped-reason-pairing-code-ttl = un code d’appairage reste utilisab
 cli-config-retired-reason-nevis = l’intégration Nevis IAM a été supprimée ; configurez plutôt `[oidc.<alias>]` avec `[users]` et `[permission_profiles]`
 cli-config-retired-reason-agent-tunable = les réglages d’exécution définis dans l’agent ne sont plus lus ; les profils d’exécution font foi, définissez donc cette clé dans le `[runtime_profiles.<profile>]` de l’agent
 cli-config-retired-reason-text-tool-parsing = l’analyse des appels d’outils dans le texte se configure par modèle de chat ; utilisez `options.extract_text_tool_calls = false` à la place de `strict_tool_parsing = true`
+cli-config-retired-reason-profile-fallback = les listes de repli au niveau des profils ont été supprimées en V4 ; utilisez le graphe à clés exactes `[providers.fallback]` et définissez-y chaque cible comme une référence de modèle complète
 cli-config-retired-reason-summary-model = l’ancien identifiant de modèle seul n’avait pas de fournisseur et n’était jamais lu ; `summary_provider` l’a remplacé (la compression du contexte elle-même n’est pas encore implémentée dans le runtime)
 cli-config-retired-reason-node-transport = l’ancien transport de nœuds HMAC a été supprimé
 cli-config-retired-reason-wati = la prise en charge de WATI a été supprimée ; passez à `[channels.whatsapp.<alias>]` avec la Cloud API ou WhatsApp Web, puis révoquez le jeton d’API WATI inutilisé

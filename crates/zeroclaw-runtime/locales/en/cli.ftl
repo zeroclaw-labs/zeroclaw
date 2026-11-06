@@ -1119,6 +1119,7 @@ cli-config-capped-reason-pairing-code-ttl = a pairing code stays redeemable for 
 cli-config-retired-reason-nevis = the Nevis IAM integration was removed; configure `[oidc.<alias>]` with `[users]` and `[permission_profiles]` instead
 cli-config-retired-reason-agent-tunable = agent-inline runtime tunables are no longer read; runtime profiles are authoritative, so set this key on the agent's `[runtime_profiles.<profile>]` instead
 cli-config-retired-reason-text-tool-parsing = text tool parsing is configured per chat model; use `options.extract_text_tool_calls = false` instead of `strict_tool_parsing = true`
+cli-config-retired-reason-profile-fallback = profile-level fallback lists were removed in V4; use the exact-key `[providers.fallback]` graph and define each target as a complete model reference
 cli-config-retired-reason-summary-model = the deprecated bare model id had no provider identity and was never read; `summary_provider` replaced it (context compression itself is not currently implemented in the runtime)
 cli-config-retired-reason-node-transport = the legacy HMAC node transport was removed
 cli-config-retired-reason-wati = WATI support was removed; migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token

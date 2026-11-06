@@ -611,7 +611,7 @@ fn provider_exhausted(err: anyhow::Error) -> anyhow::Error {
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     if crate::model_refusal_from_error(err).is_some() {
         return Some(
-            "The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.",
+            "The model's safety system declined this request. Rephrase it, or configure a target in [providers.fallback] to auto-switch models.",
         );
     }
     let msg = err.to_string();
@@ -2161,7 +2161,7 @@ impl ReliableModelProvider {
 
     /// Build a provider whose entries mirror `push_pinned_entries`: every entry
     /// shares ONE `cooldown_key` (the `<family>.<alias>` reference) and differs
-    /// only in its pinned model, exactly as a `fallback_models` list produces.
+    /// only in its pinned model, exactly as a canonical `[providers.fallback]` edge produces.
     ///
     /// Exposed for cross-crate regressions that need the same-alias
     /// pinned-model failover shape; the production builder reaches
@@ -5420,7 +5420,7 @@ mod tests {
         assert!(!model_provider.has_stable_request_identity("requested-model"));
     }
 
-    /// A `fallback_models` downgrade uses model-PINNED entries on one
+    /// A canonical `[providers.fallback]` downgrade uses model-PINNED entries on one
     /// provider: the model swap happens inside `ModelPinnedProvider`, so the
     /// failover loop must read the entry's pinned model to record the
     /// downgrade. Regression test for the case where the requested model's

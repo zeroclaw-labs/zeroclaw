@@ -6,7 +6,6 @@ test('catalog paths preserve dotted TOML profile and model keys', () => {
   const aliases = ['gw', 'gw.v2', 'gw.models.v2'];
   assert.deepEqual(modelCatalogTarget('providers.models.custom.gw.v2.model', aliases), { family: 'custom', alias: 'gw.v2', array: false });
   assert.deepEqual(modelCatalogTarget('providers.models.custom.gw.models.v2.models.fast.v1.id', aliases), { family: 'custom', alias: 'gw.models.v2', array: false });
-  assert.deepEqual(modelCatalogTarget('providers.models.custom.gw.v2.fallback_models', aliases), { family: 'custom', alias: 'gw.v2', array: true });
   assert.equal(modelCatalogTarget('providers.models.custom.gw.v2.api_key', aliases), undefined);
 });
 

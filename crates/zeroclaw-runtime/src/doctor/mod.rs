@@ -3403,40 +3403,6 @@ mod tests {
     }
 
     #[test]
-    fn config_validation_surfaces_dangling_fallback_ref() {
-        use zeroclaw_config::schema::{ModelProviderConfig, NvidiaModelProviderConfig};
-
-        let mut config = Config::default();
-        config.providers.models.nvidia.insert(
-            "nvidia".to_string(),
-            NvidiaModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("stepfun-ai/step-3.5-flash".into()),
-                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
-                        "deepseek-ai/deepseek-v4-flash",
-                    )],
-                    ..Default::default()
-                },
-            },
-        );
-
-        let mut items = Vec::new();
-        check_config_semantics(&config, &mut items);
-        let fallback_item = items.iter().find(|item| {
-            item.message
-                .contains("does not resolve to a configured providers.models entry")
-                && item
-                    .message
-                    .contains("providers.models.nvidia.nvidia.fallback[0]")
-        });
-        assert!(
-            fallback_item.is_some(),
-            "doctor should surface dangling fallback refs"
-        );
-        assert_eq!(fallback_item.unwrap().severity, Severity::Warn);
-    }
-
-    #[test]
     fn config_validation_warns_enabled_tokenless_bot_channels() {
         // A partial (tokenless) alias survives the resilient load and
         // never reaches degraded_sections, so doctor must flag the unset

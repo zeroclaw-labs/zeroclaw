@@ -44,9 +44,9 @@ export function modelCatalogTarget(path: string, aliases: readonly string[]): { 
   const profile = modelProfileRef(reference, aliases);
   if (!profile) return undefined;
   const field = reference.slice(profile.length);
-  if (field !== '.model' && field !== '.fallback_models' && !/^\.models\..+\.id$/.test(field)) return undefined;
+  if (field !== '.model' && !/^\.models\..+\.id$/.test(field)) return undefined;
   const dot = profile.indexOf('.');
-  return { family: profile.slice(0, dot), alias: profile.slice(dot + 1), array: field === '.fallback_models' };
+  return { family: profile.slice(0, dot), alias: profile.slice(dot + 1), array: false };
 }
 
 export function entityConfigPath(kind: EntityKind, id: string, modelAliases: readonly string[] = []): string {

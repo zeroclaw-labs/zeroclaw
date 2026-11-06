@@ -106,6 +106,9 @@ pub struct RetiredKey {
 const RETIRED_TEXT_TOOL_PARSING: &str = "text tool parsing is configured per chat model; use \
     `options.extract_text_tool_calls = false` instead of `strict_tool_parsing = true`";
 
+const RETIRED_PROFILE_FALLBACK: &str = "profile-level fallback lists were replaced by the exact-key \
+    `[providers.fallback]` graph; define each target as a complete model reference there";
+
 /// Every retired key, applied by the migration chain when it reaches
 /// `retired_in`, and again on every load of a current config so a key that
 /// reappears is dropped with a notice rather than silently ignored. Retiring
@@ -175,6 +178,18 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         path: &["runtime_profiles", ANY_KEY, "strict_tool_parsing"],
         reason: RETIRED_TEXT_TOOL_PARSING,
         reason_id: "cli-config-retired-reason-text-tool-parsing",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["providers", "models", ANY_KEY, ANY_KEY, "fallback"],
+        reason: RETIRED_PROFILE_FALLBACK,
+        reason_id: "cli-config-retired-reason-profile-fallback",
+    },
+    RetiredKey {
+        retired_in: 4,
+        path: &["providers", "models", ANY_KEY, ANY_KEY, "fallback_models"],
+        reason: RETIRED_PROFILE_FALLBACK,
+        reason_id: "cli-config-retired-reason-profile-fallback",
     },
     RetiredKey {
         retired_in: 4,
@@ -9206,6 +9221,37 @@ summary_model = "opus"
             );
             assert!(out.contains("provider_retries = 3"), "{out}");
         }
+    }
+
+    #[test]
+    fn v3_profile_fallback_fields_are_retired_into_the_canonical_graph() {
+        let raw = r#"schema_version = 3
+
+[providers.models.custom."gateway.prod"]
+model = "primary"
+fallback = ["custom.backup"]
+fallback_models = ["backup"]
+
+[providers.models.custom.backup]
+model = "backup"
+"#;
+        let (migrated, notices) = migrate_file_with_notices(raw)
+            .unwrap()
+            .expect("retired profile fallback fields must trigger a rewrite");
+        let paths = removed_paths(&notices);
+        assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback".to_string()));
+        assert!(
+            paths.contains(&"providers.models.custom.gateway.prod.fallback_models".to_string())
+        );
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        let profile = &value["providers"]["models"]["custom"]["gateway.prod"];
+        assert!(profile.get("fallback").is_none());
+        assert!(profile.get("fallback_models").is_none());
+        assert!(
+            notices
+                .iter()
+                .all(|notice| notice.reason_id.contains("profile-fallback"))
+        );
     }
 
     #[test]

@@ -8,9 +8,9 @@ Use this page when a change touches `model_routes`, session or in-turn model sel
 
 | Concern | Current owner | Contract |
 | --- | --- | --- |
-| Provider profiles and fallback graph | `zeroclaw-config` provider schema and validation | A dotted `<family>.<alias>` identifies the endpoint, credentials, optional primary model, capabilities, and ordered fallback declarations for one profile. |
-| Provider construction | `zeroclaw-providers` factory functions | `zeroclaw-providers::model::build_model` derives the selected model, tuning, connection and identity from config; runtime adds its tool dispatcher. Materialize each profile with its own settings, flatten configured fallback entries in order, and compose routing around reliability. |
-| Hint-based selection | `RouterModelProvider` | Resolve `hint:<name>` to a configured provider target and route model. The primary target is pinned to the active/default model. A non-primary target is pinned when its resolved selection supplies a model, including a default or sole nested entry; otherwise its reliable entry remains unpinned and receives the route model. |
+| Provider profiles and fallback graph | `zeroclaw-config` provider schema and validation | An exact model key identifies a capability model; its `provider` points to a reusable connection, and `[providers.fallback]` stores ordered exact-key edges. |
+| Provider construction | `zeroclaw-providers` factory functions | `zeroclaw-providers::model::build_model` derives the selected model, tuning, connection and identity from config; runtime adds its tool dispatcher. Reuse the immutable registry during one build, while materializing each fallback candidate with its complete model settings before composing routing around reliability. |
+| Hint-based selection | `RouterModelProvider` | Resolve `hint:<name>` to a configured exact model target. The target key is authoritative; route metadata cannot replace its model options or connection policy. |
 | Effort-based selection | Resolved runtime profile plus agent/channel turn entrypoints | Deterministically classify an opted-in turn, select one of two existing route hints, preserve explicit model choices, and constrain eligible provider attempts for the turn. |
 | Retry and failover | `ReliableModelProvider` | Classify failures, retry with bounded backoff, honor rate-limit cooldowns, and advance through the materialized entries. |
 | Provider stream termination | Concrete providers and `zeroclaw-providers/src/stream_guard.rs` | Translate each provider protocol's completion semantics into `StreamEvent::Final` or a truncation error. |
@@ -23,13 +23,13 @@ Use this page when a change touches `model_routes`, session or in-turn model sel
 
 The runtime starts with an active provider reference and model from the selected agent, a session override, or an in-turn `model_switch`. Provider construction then composes two wrappers:
 
-1. The factory builds a `ReliableModelProvider` for the active provider profile. An effective primary model comes from an explicit construction override or the resolved model selection, including an implicit `models.default` or sole nested entry. The same selection supplies the model-option overlay and the model pin. When a model exists, it and the profile's `fallback_models` become pinned entries. Without one, the profile contributes one unpinned entry and its `fallback_models` are not materialized. Recursively referenced `fallback` profiles are still walked. Each referenced profile keeps its own credentials, endpoint, headers, model, and capability overrides.
+1. The factory builds a `ReliableModelProvider` for the active exact-key model. The selected model and every `[providers.fallback]` target are resolved from complete model definitions. The immutable connection registry is reused during this construction transaction, while each candidate gets a fresh adapter with its own model options, metadata, and pin.
 2. When `model_routes` are configured, the factory builds a separate reliable provider for the primary route and each unique route target, then wraps them in `RouterModelProvider`.
 3. A recognized `hint:<name>` selects its configured target before the call enters that target's reliability policy. A normal model value uses the default route. An unknown hint logs a warning, stays in the default reliability domain, and preserves the literal `hint:<name>` as the requested model. A pinned default entry still serves its pin; an unpinned default entry forwards the literal value and the provider may reject it before normal fallback or error handling continues.
 
 There are two current construction constraints:
 
-- Route pinning is conditional. The primary target is pinned to the active/default model passed into provider construction, including when a recognized hint points back to the active primary profile; that hint's `model_routes[].model` value does not override the primary pin. A non-primary target is pinned to its resolved selection's model, including an implicit default or sole nested entry, so its route model does not override that pin either. A non-primary target whose resolved selection has no effective model is valid and remains unpinned; the route model reaches that provider, and that profile's `fallback_models` are not materialized even though its referenced fallback profiles are still walked. Keep each route model aligned with the target pin when one exists. An omitted profile `model` alone does not imply unpinned behavior when a nested entry supplies the model.
+- Route pinning is exact-key based. A recognized hint selects its configured model reference; `model_routes[].model` cannot replace that model definition. A fallback or model switch resolves a new exact key and rematerializes its complete policy, so route construction never inherits the primary model's options by accident.
 - Route targets are deduplicated by `model_provider`. If a route supplies `api_key`, the first matching route credential takes precedence when the shared target is constructed. Prefer credentials on the provider profile when several hints share one target.
 
 This ordering matters: routing chooses a reliability domain; it does not bypass reliability. An external routing service such as OpenRouter can still perform server-side selection behind one ZeroClaw profile, but it is optional and does not replace ZeroClaw's first-party route and fallback contracts.
@@ -44,19 +44,19 @@ The operator-facing schema and examples live in [Provider configuration](../prov
 
 For a production alias, the factory flattens the configured graph depth-first. The effective order is:
 
-1. The profile's effective primary model, or one unpinned entry when no effective primary model exists.
-2. That profile's `fallback_models`, in order, only when an effective primary model exists.
-3. Each `fallback` profile, in order, including that profile's own primary or unpinned entry, eligible fallback models, and nested fallback profiles.
+1. The selected exact-key model reference.
+2. Each target in `[providers.fallback]` for that reference, in depth-first order.
+3. Every target is resolved from its complete model definition; only the immutable connection registry is reused within the construction transaction.
 
 For each materialized entry, `ReliableModelProvider` attempts the request up to `provider_retries + 1` times. A retryable error normally stays on the entry and applies bounded backoff. A retryable rate limit places that provider profile on an in-memory cooldown and advances when another entry exists. Most non-retryable errors advance immediately; context-window errors have method-specific handling and can return early for runtime recovery. A successful response ends the walk; if every entry fails, the wrapper returns an aggregated error with the attempt failures.
 
-Materialization order and effective execution order can differ after a rate limit. A profile's primary and `fallback_models` entries share one cooldown key, so a `429` on the primary can cause the remaining same-profile models to be skipped while the cooldown is active.
+Materialization order and effective execution order can differ after a rate limit. Each exact-key candidate has its own materialized model identity and policy. Cooldown state is attached to the admitted candidate domain, so a model switch or fallback cannot accidentally reuse the primary model's options.
 
-The global `reliability.api_keys` pool is not a working failover mechanism today. The wrapper selects and logs an alternate key after a retryable rate limit, but the `ModelProvider` trait cannot apply that key to the constructed provider, so the retry still uses the original credential. [Issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) tracks the repair. Use distinct fallback profiles or an external routing service when credential-level failover is required.
+The global `reliability.api_keys` pool is not a working failover mechanism today. The wrapper selects and logs an alternate key after a retryable rate limit, but the `ModelProvider` trait cannot apply that key to the constructed provider, so the retry still uses the original credential. [Issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) tracks the repair. Use distinct exact-key fallback models or an external routing service when credential-level failover is required.
 
 Empty completions receive the same bounded retry treatment instead of immediately becoming a blank assistant turn.
 
-Invalid fallback declarations have two different boundaries. Dangling references, cycles, over-depth edges, blank model IDs, and duplicate primary models are reported and pruned as described in [Provider configuration](../providers/configuration.md#misconfiguration). A fallback profile that resolves but cannot supply its required credential or cannot be constructed fails provider initialization rather than silently changing the route.
+Invalid fallback declarations have two boundaries. Dangling references, cycles, and over-depth edges are reported and pruned as described in [Provider configuration](../providers/configuration.md#fallback-on-failure). A target that resolves but cannot supply its required credential or cannot be constructed fails provider initialization rather than silently changing the route.
 
 ## Streaming and replay boundary
 
@@ -92,8 +92,8 @@ Content refusal and safeguard fallback is also a separate proposed contract from
 For provider-routing changes, answer these before reviewer sign-off:
 
 - Does the change affect agent dispatch, hint selection, reliability fallback, or an external router? Name exactly one owner for each decision.
-- If a hint targets any provider profile, does its model handling match the target construction? Compare the primary target with the active/default pin. For a non-primary target whose resolved selection supplies a model, including a default or sole nested entry, compare the route model with that pin. Only when that selection has no effective model should the route model flow through without materializing the profile's `fallback_models`.
-- Does every fallback profile retain its own endpoint, credentials, model, headers, and capability overrides?
+- If a hint targets a model reference, does construction preserve that exact key and rematerialize its full model policy?
+- Does every fallback target retain its own connection, credentials, model, headers, presets, options, and capability overrides?
 - What is retryable, what advances immediately, and what error is returned after exhaustion?
 - Can a request be replayed after any output that a user or immutable consumer already observed?
 - What exact signal does each provider parser accept as completion? Does EOF before that signal fail as truncated?
@@ -114,7 +114,7 @@ For provider-routing changes, answer these before reviewer sign-off:
 
 ### Named selections and capacity
 
-A runtime keeps the existing `ModelIdentity` as the selected entry identity. Capacity lookups use its full reference, so entries sharing the same provider-local model ID can still have different context windows. Hint routes retain their configured references. Reliable dispatch may attribute the accepted primary to the shared profile for billing; that normalization does not replace the selected entry's capacity. A fallback to another profile or model resolves its own capacity. Accepted-call reports carry the construction selection separately from the physical billing identity, including on streams, so a cross-profile fallback does not infer an entry from a shared wire model ID. Capacity is resolved from the admitted Config generation at consumption time.
+A runtime keeps the existing `ModelIdentity` as the selected entry identity. Capacity lookups use its full reference, so entries sharing the same provider-local model ID can still have different context windows. Hint routes retain their configured references. Reliable dispatch may attribute the accepted primary to the shared connection for billing; that normalization does not replace the selected entry's capacity. A fallback to another profile or model resolves its own capacity. Accepted-call reports carry the construction selection separately from the physical billing identity, including on streams, so a cross-profile fallback does not infer an entry from a shared wire model ID. Capacity is resolved from the admitted Config generation at consumption time.
 
 The kernel-only CLI also constructs through `zeroclaw_providers::model::build_model`; provider and model arguments are invocation inputs and do not mutate profile or nested-entry configuration. Dotted aliases use the same resolver as the full runtime. The legacy bare-family CLI override inherits the agent's configured model (including a selected nested entry), key and endpoint; an explicit model argument replaces only the model ID. Agent-aware capacity lookups resolve the inherited selection from Config when its model ID matches the served model, preserving the bare family's billing identity. A different explicit model ID uses the compatibility capacity. A dotted profile override instead resolves its own connection. Unknown named model entries fail construction rather than silently using a profile model; dangling fallback entries are pruned under the existing fallback contract. Delegated requests derive model and temperature together from the target's selected entry for both ordinary and agentic execution.
 

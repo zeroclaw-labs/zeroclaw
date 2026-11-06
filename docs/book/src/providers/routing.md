@@ -3,9 +3,9 @@
 ZeroClaw uses routing for two different decisions:
 
 1. **Agent dispatch** selects which agent owns a channel or request. Each agent has its own provider profile and runtime policy.
-2. **Provider and model routing** selects a configured provider profile and model for a call, then applies that profile's retry and fallback policy.
+2. **Provider and model routing** selects an exact-key model for a call, then applies its retry policy and the `[providers.fallback]` graph.
 
-An external routing service such as OpenRouter can still perform vendor selection behind one provider profile. It is optional: ZeroClaw also supports first-party hint routes, same-profile model fallback, and fallback across provider profiles.
+An external routing service such as OpenRouter can still perform vendor selection behind one provider connection. It is optional: ZeroClaw also supports first-party hint routes and the exact-key `[providers.fallback]` graph.
 
 ## Per-agent dispatch
 
@@ -25,7 +25,7 @@ An unknown `hint:<name>` logs a warning and stays in the default reliability dom
 
 `model_provider` is a provider profile reference in dotted form. The common shape is two-segment `<type>.<alias>`, such as `anthropic.sonnet` or `openai.default`: the profile carries the endpoint, credential reference, compatibility flavor, fallback chain, and configured default model, and the `model` field is provider-local state under that profile. When a profile hosts several models under a `[providers.models.<type>.<alias>.models.<model_alias>]` subtable (see [Configuration → multiple models per profile](./configuration.md#hosting-multiple-models-on-one-provider-entry)), a three-segment `<type>.<alias>.<model_alias>` ref selects one of those models directly.
 
-> **Current limitation:** Route pinning depends on the target profile. The primary target is pinned to the active/default model used to construct the router, including when a recognized hint points back to the active primary profile; that hint's `model_routes[].model` value does not override the primary pin. A non-primary target with a configured profile model is pinned to that model, so its route model does not override the profile model either. A non-primary target without a configured model remains unpinned and receives the route model; its `fallback_models` are not materialized, although referenced fallback profiles are still walked. Keep the route model aligned with the target pin when one exists.
+> **Current limitation:** Route pinning depends on the target profile. The primary target is pinned to the active/default model used to construct the router, including when a recognized hint points back to the active primary profile; that hint's `model_routes[].model` value does not override the primary pin. A non-primary target with a configured profile model is pinned to that model, so its route model does not override the profile model either. A non-primary target without a configured model remains unpinned and receives the route model; its own model definition is always materialized independently, although referenced fallback targets are still walked. Keep the route model aligned with the target pin when one exists.
 
 ## Effort-based local/cloud routing
 
@@ -68,9 +68,9 @@ Effort routing has a deliberately narrow relationship to adjacent work:
 
 ## Reliability fallback
 
-A provider profile can declare `fallback_models` for alternate models on the same endpoint and `fallback` for other dotted provider profiles. ZeroClaw materializes `fallback_models` only when the profile has an effective primary model; otherwise that profile contributes one unpinned entry. It then walks fallback profiles depth-first. Each fallback profile keeps its own endpoint, credentials, headers, optional model, and nested fallback declarations.
+Fallbacks are declared once in `[providers.fallback]` as an exact-key graph, for example `"chat.primary" = ["chat.backup"]`. Each target is resolved and fully materialized from its own model definition, connection, presets, options, metadata, credentials, and capability policy. The immutable connection registry may be reused during one build, while every candidate receives a fresh model-aware adapter. The graph is walked depth-first with cycle and depth protection.
 
-Effective execution can differ after a rate limit: entries from one profile share a cooldown key, so a `429` on the primary can skip that profile's remaining fallback models while the cooldown is active.
+Effective execution can differ after a rate limit: each exact-key candidate is materialized independently, while cooldown state remains attached to the admitted reliability domain.
 
 Configure the chain through the ZeroCode Config editor, the dashboard, or `zeroclaw config set`; see [Provider configuration](./configuration.md#fallback-on-failure). The [Provider routing lifecycle](../architecture/provider-routing-lifecycle.md) documents construction, retry classification, streaming recovery, no-replay boundaries, and attribution ownership.
 

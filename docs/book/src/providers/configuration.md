@@ -117,8 +117,6 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `timeout_secs`: HTTP request timeout in seconds. Setting it above 300 also raises the provider's streaming idle bound (the default 300-second cap on the gap between stream reads) for OpenAI Responses and OpenAI-compatible providers.
 - `max_tokens`: optional response length cap.
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
-- `fallback_models`: alternate model IDs on the same provider alias.
-- `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
 - `wire_api`, `native_tools`, `provider_extra`, `think`, `thinking_passthrough`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on. Without a configured vision provider, a non-vision turn proceeds with media markers replaced by a placeholder when none of the latest user message's image references pass the existence, data-URI-structure, or remote-fetch-policy checks (a missing file, a malformed data URI, or a remote URL while `multimodal.allow_remote_fetch` is off). A local path counts only when it is absolute, allowed by the agent's filesystem policy (the same check the file tools apply), and exists as a file; paths the policy rejects are never probed. If any reference does pass, the turn still fails with the vision capability error. The resolvability check evaluates at most 16 absolute local-path markers per turn; for those, the policy check and the existence probe run together on a blocking thread, off the async executor. A message with more such markers treats the rest as resolvable without any check, so an oversized message fails toward the capability error instead of a silent degrade.
 - `tool_result_image_policy`: handling for images attached to native `role = "tool"` results sent to compatible chat-completions providers. A tool result's images are declared in an `attachments` array beside the result text in the tool-result carrier, never recovered from the result text itself, so literal marker syntax in a tool's output is just text. Defaults to `"image_url"` (send declared images as `image_url` parts); set to `"omit"` to drop them and append a fixed notice. The policy reads the `attachments` array of native carriers only; a legacy tool result (no array key) passes verbatim under both settings, because it declares nothing and its body is text. This does not change direct user images or OpenAI Responses providers.
@@ -830,79 +828,38 @@ Responses and Anthropic send the control in streaming and non-streaming requests
 
 ## Fallback on failure
 
-When a request to a provider fails after exhausting its retries (provider down,
-key rate-limited, model unavailable), the alias can fall over to alternatives
-you declare on the alias entry. Two independent, ordered axes:
+When a request fails after its retries are exhausted, ZeroClaw follows the
+explicit exact-key graph under `[providers.fallback]`. Each source and target is
+a complete model reference, so every candidate resolves its own connection,
+model identifier, presets, options, metadata, credentials, and capability
+policy. Connection descriptors may be reused during one construction pass, but
+a candidate never inherits another model's resolved policy.
 
-- **`fallback_models`**: alternate model IDs tried on *this* provider, using the
-  same endpoint, key, and headers. Only the model identifier changes. Use it when
-  a provider serves a backup model (a smaller or older variant) that should be
-  tried before leaving the provider entirely.
-- **`fallback`**: an ordered list of *other* provider aliases (dotted
-  `<type>.<alias>` references into `[providers.models]`). Each fallback alias
-  resolves with **its own** credentials, endpoint, and model, a fallback never
-  inherits the failing alias's key.
-
-### Order of attempts
-
-The walk is depth-first: an alias's entire model list is exhausted before leaving
-it, then each `fallback` alias is descended in turn, applying that alias's own
-`fallback_models` and `fallback` recursively. Suppose `anthropic.prod` serves
-`claude-sonnet-4-5`, lists `claude-haiku-4-5` in its `fallback_models`, and
-names `openai.backup` (serving `gpt-4.1`) in its `fallback`. The attempt order
-is then:
-
-```
-anthropic.prod/claude-sonnet-4-5
-  -> anthropic.prod/claude-haiku-4-5
-  -> openai.backup/gpt-4.1
-  -> (request fails)
+```toml
+[providers.fallback]
+"chat.primary" = ["chat.backup", "chat.last"]
+"chat.backup" = ["chat.last"]
 ```
 
-Fallback aliases can themselves declare `fallback`, so the chain is as long as
-your config makes it, up to a maximum depth of **3 aliases**. A chain that loops
-back on itself (`a` -> `b` -> `a`) is detected and the cycle edge is pruned, and
-an acyclic chain deeper than the limit has its remaining links pruned; neither
-ever loops, hangs, or overflows the stack.
-
-### Misconfiguration
-
-A `fallback` entry that names an alias which is not configured, one that closes a
-cycle, or a chain that exceeds the maximum depth is **non-fatal**:
-`Config::validate()` still succeeds, the offending edge is skipped at runtime, and
-the issue is surfaced as a validation warning (`dangling_fallback_ref` /
-`fallback_cycle` / `max_fallback_depth_exceeded`) on the CLI and in the dashboard.
-A `fallback_models` entry that is blank or duplicates the alias's primary `model`
-is likewise skipped at runtime and surfaced (`empty_fallback_model` /
-`fallback_model_duplicates_primary`). A bad fallback link degrades gracefully, it
-never prevents the agent from running.
+The graph is traversed depth-first. Missing targets, duplicate edges, cycles,
+and paths beyond the configured depth are reported during validation and
+pruned at admission; they never cause an unbounded walk. Model switching uses
+the same exact-key construction path, so changing a model rematerializes its
+complete definition instead of mutating only the wire model string.
 
 ### Anthropic refusals and fallback
 
 Native Anthropic requests can come back as a *refusal*: an HTTP 200 whose
-`stop_reason` is `"refusal"`, emitted by Fable's safety classifiers rather than
-a normal completion. ZeroClaw treats a refusal as a typed error so fallback can
-recover it two ways:
+`stop_reason` is `"refusal"`, emitted by Fable's safety classifiers rather
+than a normal completion. ZeroClaw treats a refusal as a typed error so the
+canonical fallback graph can recover it. Anthropic's native
+`server_fallback_models` remains a separate server-side feature on the
+Anthropic connection/model adapter; it is not part of the client-side graph.
 
-- **Client-side** (`fallback_models`, above): the refusal surfaces as an error,
-  and ZeroClaw advances to the next model or alias just as it does for any other
-  provider failure, so the reply comes from a different model.
-- **Server-side** (`server_fallback_models` on
-  `[providers.models.anthropic.<alias>]`): Anthropic retries the refused request
-  against a listed model on its side, in a single non-streaming call. Entries
-  must name permitted fallback targets, for example mapping `claude-fable-5` to
-  `claude-opus-4-8`.
-
-Either way the delivered reply carries a short footer naming the requested and
-served models, so the switch is visible to the user. In the web dashboard chat
-the same switch surfaces as an inline notice just before the answer, showing
-only the requested and served model names. When an ordinary provider failure
-already moved the request to a client-side fallback before Anthropic switched
-models on its side, the reply keeps the ordinary fallback notice as well, so
-the originally requested model stays visible and the two causes are not
-conflated.
-
-Streaming has a limit: a refusal that arrives after streamed output has begun
+Either path carries a short footer naming the requested and served models, so
+the switch is visible to the user. Streaming has a limit: a refusal that
+arrives after streamed output has begun
+ a refusal that arrives after streamed output has begun
 keeps the existing interrupted-reply behavior; fallback applies only to refusals
 detected before output starts.
 

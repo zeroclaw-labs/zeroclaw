@@ -1923,11 +1923,10 @@ function FieldRow({
   );
   const catalogTarget = modelCatalogTarget(entry.path, catalogAliases);
   const isProviderModelField = catalogTarget !== undefined && !catalogTarget.array;
-  // The same alias's `fallback_models` array (profile-level) — a list of model
-  // IDs from the same provider catalog, so it gets the same dropdown per row.
-  const isProviderModelArrayField = catalogTarget?.array ?? false;
-  // Either model field needs the provider's catalog fetched.
-  const needsProviderModels = isProviderModelField || isProviderModelArrayField;
+  // Legacy family/alias model fields still use the provider catalog. Fallbacks
+  // are exact canonical model references under `[providers.fallback]` and do
+  // not use a provider-local model-id array.
+  const needsProviderModels = isProviderModelField;
   // Skill-bundle directory field — `skill-bundles.<alias>.directory` (or
   // the legacy snake form `skill_bundles.<alias>.directory`). When unset
   // the runtime falls back to `<install>/shared/skills/<alias>/`; render
@@ -2348,16 +2347,6 @@ function FieldRow({
             agent={toolAgent}
             value={parseArrayRows(value)}
             onChange={(next) => onChange(JSON.stringify(next))}
-          />
-        ) : isProviderModelArrayField ? (
-          // Fallback models: same array editor, but each row gets the known-
-          // model dropdown (falls back to free text while the catalog loads).
-          <ArrayFieldEditor
-            inputId={entry.path}
-            value={value}
-            onChange={onChange}
-            isOptional={isOptionalArray(entry.type_hint)}
-            suggestions={providerModels ?? undefined}
           />
         ) : renderer === "array" ? (
           <ArrayFieldEditor

@@ -19,7 +19,7 @@ Multi-model configuration is useful for:
 
 ## Core idea: per-agent dispatch
 
-Each `[agents.<alias>]` entry starts from one `[providers.models.<type>.<alias>]`. That provider profile can declare alternate models with `fallback_models` and other provider profiles with `fallback`. See [Routing](../providers/routing.md) for the full pattern.
+Each `[agents.<alias>]` entry references one exact-key model under `[providers.models."<model-ref>"]`. Reusable fallback edges live in `[providers.fallback]`, where every target is a complete model reference. See [Routing](../providers/routing.md) for the full pattern.
 
 To run multiple models, run multiple agents, each binding to one model provider. Each channel binds to one agent at a time. To move a channel to a different agent, edit the `channels` list on the agent that should pick it up; `Config::validate()` makes sure references resolve at startup.
 
@@ -27,13 +27,13 @@ A single provider entry can host several models that share its endpoint and cred
 
 ## Cross-provider reliability
 
-For non-streaming calls, ZeroClaw can walk an ordered fallback graph across provider profiles. Each fallback profile keeps its own endpoint, credentials, model, headers, capability overrides, and nested fallback declarations. The runtime retries or advances according to the error classification and profile cooldown state.
+For non-streaming calls, ZeroClaw walks an ordered exact-key graph under `[providers.fallback]`. Every target keeps its own connection, credentials, model, headers, presets, options, and capability policy. The runtime retries or advances according to the error classification and cooldown state.
 
 OpenRouter remains a first-class provider and can perform vendor selection behind one endpoint. It is an optional external routing layer, not a requirement for ZeroClaw's first-party fallback.
 
 ## Non-streaming retry and fallback
 
-For transient errors such as a network failure, `503`, or timeout, a non-streaming call retries with bounded exponential backoff, configurable globally under `reliability` (defaults: 2 retries, 500 ms initial backoff). After an entry is exhausted, the reliable wrapper advances through the profile's `fallback_models` and fallback profiles.
+For transient errors such as a network failure, `503`, or timeout, a non-streaming call retries with bounded exponential backoff, configurable globally under `reliability` (defaults: 2 retries, 500 ms initial backoff). After an entry is exhausted, the reliable wrapper advances through the exact-key `[providers.fallback]` graph.
 
 ## Streaming recovery boundary
 
@@ -228,8 +228,8 @@ zeroclaw doctor traces --contains "model_provider"
 ## Best practices
 
 1. **One agent per routing intent.** If two channels need different model behavior, name two agents.
-2. **Give fallback profiles explicit ownership.** Keep each endpoint, credential, model, and capability override on the profile that serves it.
-3. **Treat OpenRouter as an optional routing layer.** Use it when server-side vendor selection is useful; use ZeroClaw fallback profiles when the runtime should own the order.
+2. **Give fallback models explicit ownership.** Keep each connection, credential, model, preset, option, and capability override on the model definition that serves it.
+3. **Treat OpenRouter as an optional routing layer.** Use it when server-side vendor selection is useful; use the exact-key `[providers.fallback]` graph when the runtime should own the order.
 4. **Do not rely on `reliability.api_keys`.** Use separately constructed profiles until [issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) is fixed.
 5. **Smoke-test each agent in isolation.** `zeroclaw agent -a <alias>` runs an agent without channel plumbing in the way.
 6. **Document agent intent.** Add `# comment` lines explaining which channels each agent serves and why.

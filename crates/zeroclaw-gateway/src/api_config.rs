@@ -4967,63 +4967,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_map_key_handler_cascades_model_provider_and_persists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = temp_config(&tmp);
-        config
-            .providers
-            .models
-            .ensure("anthropic", "default")
-            .unwrap();
-        config
-            .providers
-            .models
-            .ensure("openai", "main")
-            .unwrap()
-            .fallback = vec!["anthropic.default".into()];
-        config.agents.insert(
-            "triage".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                classifier_provider: "anthropic.default".into(),
-                ..Default::default()
-            },
-        );
-        config.save().await.unwrap();
-
-        let state = test_state(config);
-        let (status, json) = response_json(
-            handle_delete_map_key(
-                axum::extract::State(state.clone()),
-                None,
-                axum::extract::Query(MapKeyQuery {
-                    path: "providers.models.anthropic".to_string(),
-                    key: "default".to_string(),
-                }),
-            )
-            .await,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["path"], "providers.models.anthropic");
-        assert_eq!(json["key"], "default");
-        let cfg = state.config.read();
-        assert!(cfg.providers.models.find("anthropic", "default").is_none());
-        assert!(cfg.agents["triage"].classifier_provider.is_empty());
-        assert!(
-            cfg.providers
-                .models
-                .find("openai", "main")
-                .unwrap()
-                .fallback
-                .is_empty()
-        );
-        drop(cfg);
-        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
-        assert!(!written.contains("anthropic.default"));
-    }
-
-    #[tokio::test]
     async fn delete_map_key_handler_refuses_model_provider_hard_ref_without_mutation() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);

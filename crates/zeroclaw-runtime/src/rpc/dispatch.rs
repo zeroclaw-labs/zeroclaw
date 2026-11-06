@@ -860,7 +860,7 @@ impl LiveSessionRefreshScope {
                         .agent(session_agent)
                         .map(|agent| agent.model_provider.as_str())
                 });
-                let depends = zeroclaw_providers::model::routed_selection_depends_on_profile(
+                let depends = zeroclaw_providers::model::routed_selection_depends_on_model_ref(
                     config,
                     session_agent,
                     effective_ref.unwrap_or_default(),
@@ -937,7 +937,7 @@ impl LiveSessionRefreshScope {
                     return Ok(Some(format!("{new_ref}{suffix}")));
                 }
                 Ok(
-                    zeroclaw_providers::model::routed_selection_depends_on_profile(
+                    zeroclaw_providers::model::routed_selection_depends_on_model_ref(
                         config,
                         session_agent,
                         effective_ref,
@@ -30538,116 +30538,6 @@ mod tests {
         );
     }
 
-    /// Blocking (note12): same-profile fallback to a different model must not
-    /// borrow the primary's capacity. Mirrors the gateway regression with the
-    /// same config: `openai.default` for model-a (200k) with
-    /// fallback_models=[model-b]. Serving model-b must omit
-    /// `model_context_window` on the RPC wire so clients use the trim budget.
-    #[test]
-    fn context_usage_omits_window_on_same_profile_model_fallback() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
-
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(800_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                model_provider: "openai.default".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        let mut providers = zeroclaw_config::providers::Providers::default();
-        let entry = providers
-            .models
-            .ensure("openai", "default")
-            .expect("ensure entry");
-        entry.model = Some("model-a".to_string());
-        entry.fallback_models = vec!["model-b".to_string()];
-        entry.context_window = Some(200_000);
-
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            providers,
-            ..Config::default()
-        };
-
-        // Shared resolution: primary matches, fallback does not.
-        assert_eq!(
-            cfg.model_provider_context_window_opt("openai.default", "model-a"),
-            Some(200_000)
-        );
-        assert_eq!(
-            cfg.model_provider_context_window_opt("openai.default", "model-b"),
-            None,
-            "fallback model must not borrow the primary's capacity"
-        );
-
-        // The serving call resolves limits for model-b, not the primary model.
-        let limits = cfg.resolved_context_limits_for_route("coder", "openai.default", "model-b");
-        let mut event = TurnEvent::Usage {
-            context_token_budget: None,
-            model_context_window: None,
-            input_tokens: Some(1000),
-            cached_input_tokens: None,
-            output_tokens: Some(500),
-            cost_usd: Some(0.01),
-            provider_ref: "openai.default".to_string(),
-            model: "model-b".to_string(),
-            accepted: true,
-            estimated_input_tokens: None,
-        };
-        let model_ctx_window = if let TurnEvent::Usage {
-            provider_ref,
-            model,
-            ..
-        } = &event
-        {
-            cfg.model_provider_context_window_opt(provider_ref, model)
-                .map(|v| v as u64)
-        } else {
-            None
-        };
-        assert!(
-            model_ctx_window.is_none(),
-            "RPC must omit window when served model differs from configured primary"
-        );
-
-        let max_ctx = limits.context_token_budget as u64;
-        if let TurnEvent::Usage {
-            context_token_budget,
-            model_context_window,
-            ..
-        } = &mut event
-        {
-            *context_token_budget = Some(max_ctx);
-            *model_context_window = model_ctx_window;
-        }
-        let json = notification_for_turn_event("s1", &event).unwrap();
-        let v = parse(&json);
-        assert_eq!(v["params"]["type"], "context_usage");
-        assert_eq!(
-            v["params"]["max_context_tokens"], 800_000,
-            "the explicit profile budget survives the same-profile fallback (#10068)"
-        );
-        assert!(
-            v["params"].get("model_context_window").is_none(),
-            "RPC wire must omit model_context_window on same-profile fallback"
-        );
-    }
-
     #[test]
     fn usage_event_emits_context_usage_notification() {
         let event = TurnEvent::Usage {
@@ -42004,71 +41894,6 @@ mod tests {
             route.kind,
             zeroclaw_providers::router::RouteResolutionKind::UnknownHintFallback
         );
-    }
-
-    #[tokio::test]
-    async fn config_set_fallback_profile_rebuilds_live_session_transport() {
-        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let primary = MockServer::start().await;
-        let old_backup = MockServer::start().await;
-        let new_backup = MockServer::start().await;
-        for server in [&primary, &old_backup, &new_backup] {
-            Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(500))
-                .mount(server)
-                .await;
-        }
-        let mut config = make_model_refresh_test_config(&tmp);
-        config.reliability.provider_retries = 0;
-        config.reliability.provider_backoff_ms = 0;
-        let profile = config
-            .providers
-            .models
-            .ensure("openai", "test-provider")
-            .unwrap();
-        profile.uri = Some(primary.uri());
-        profile.fallback = vec!["openai.backup.fast".into()];
-        let backup = config.providers.models.ensure("openai", "backup").unwrap();
-        backup.api_key = Some("backup-key".into());
-        backup.uri = Some(old_backup.uri());
-        backup.models.insert(
-            "fast".into(),
-            zeroclaw_config::schema::ModelEntryConfig {
-                id: Some("backup-model".into()),
-                ..Default::default()
-            },
-        );
-        let dispatcher = make_config_set_test_dispatcher(config);
-        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
-        dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.backup.uri",
-                "value": new_backup.uri()
-            }))
-            .await
-            .expect("fallback edits must refresh their dependent sessions");
-        let result = dispatcher
-            .handle_session_prompt(&json!({
-                "session_id": session_id,
-                "prompt": "hello"
-            }))
-            .await;
-        assert!(
-            result.is_err(),
-            "fixtures intentionally reject every attempt"
-        );
-        assert!(!primary.received_requests().await.unwrap().is_empty());
-        assert!(old_backup.received_requests().await.unwrap().is_empty());
-        let requests = new_backup.received_requests().await.unwrap();
-        assert!(
-            !requests.is_empty(),
-            "fallback must use the refreshed transport"
-        );
-        for request in requests {
-            let body: Value = serde_json::from_slice(&request.body).unwrap();
-            assert_eq!(body["model"], "backup-model");
-        }
     }
 
     #[tokio::test]

@@ -2099,11 +2099,24 @@ pub fn dispatch_model_ref(
     model_ref: &zeroclaw_config::provider_registry::ModelRef,
     options: &ModelProviderRuntimeOptions,
 ) -> Result<Box<dyn ModelProvider>> {
-    use zeroclaw_config::provider_registry::{ModelDefinition, Override, ProviderConnection};
-
     let registry = config
         .provider_registry()
         .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    dispatch_model_ref_with_registry(&registry, model_ref, options)
+}
+
+/// Construct one fresh provider adapter from an already validated immutable
+/// registry. The registry/connection descriptors are reused for all candidates
+/// in one build transaction, while model options are resolved and applied anew
+/// for every exact model reference. This prevents model-switch/fallback state
+/// from leaking between candidates.
+pub(crate) fn dispatch_model_ref_with_registry(
+    registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+    model_ref: &zeroclaw_config::provider_registry::ModelRef,
+    options: &ModelProviderRuntimeOptions,
+) -> Result<Box<dyn ModelProvider>> {
+    use zeroclaw_config::provider_registry::{ModelDefinition, Override, ProviderConnection};
+
     let resolved = registry
         .resolve_chat(model_ref)
         .map_err(|error| anyhow::Error::msg(error.to_string()))?;

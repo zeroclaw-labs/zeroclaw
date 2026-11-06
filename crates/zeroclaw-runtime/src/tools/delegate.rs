@@ -21032,8 +21032,7 @@ command = "rm independent-delegate-marker"
     ) -> (Arc<Config>, TempDir) {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
-            RiskProfileConfig, RuntimeProfileConfig,
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
         };
 
         let temp_dir = TempDir::new().expect("temporary delegate fixture directory");
@@ -21044,33 +21043,43 @@ command = "rm independent-delegate-marker"
         };
         config.reliability.provider_retries = 0;
         config.reliability.provider_backoff_ms = 1;
-        config.providers.models.custom.insert(
-            "primary".to_string(),
-            CustomModelProviderConfig {
-                base: ModelProviderConfig {
-                    uri: Some(primary_uri),
-                    model: Some("primary-model".to_string()),
-                    native_tools: primary_native_tools,
-                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
-                        "custom.backup",
-                    )],
-                    ..ModelProviderConfig::default()
-                },
-            },
-        );
-        config.providers.models.custom.insert(
-            "backup".to_string(),
-            CustomModelProviderConfig {
-                base: ModelProviderConfig {
-                    uri: Some(backup_uri),
-                    // This deliberately matches the primary model. The two aliases
-                    // still represent distinct configured candidates.
-                    model: Some("primary-model".to_string()),
-                    native_tools: backup_native_tools,
-                    ..ModelProviderConfig::default()
-                },
-            },
-        );
+        let primary_options = primary_native_tools
+            .map(|value| format!("native_tools = {value}"))
+            .unwrap_or_default();
+        let backup_options = backup_native_tools
+            .map(|value| format!("native_tools = {value}"))
+            .unwrap_or_default();
+        config.providers = toml::from_str(&format!(
+            r#"
+[connections."delegate.primary"]
+kind = "custom"
+uri = "{primary_uri}"
+capabilities = ["chat"]
+auth = {{ mode = "api_key", api_key = "primary-fixture-key" }}
+
+[connections."delegate.backup"]
+kind = "custom"
+uri = "{backup_uri}"
+capabilities = ["chat"]
+auth = {{ mode = "api_key", api_key = "backup-fixture-key" }}
+
+[models."custom.primary"]
+capability = "chat"
+provider = "delegate.primary"
+model = "primary-model"
+options = {{ {primary_options} }}
+
+[models."custom.backup"]
+capability = "chat"
+provider = "delegate.backup"
+model = "primary-model"
+options = {{ {backup_options} }}
+
+[fallback]
+"custom.primary" = ["custom.backup"]
+"#
+        ))
+        .expect("canonical delegate provider fixture parses");
         config.risk_profiles.insert(
             "delegating".to_string(),
             RiskProfileConfig {
@@ -21297,96 +21306,6 @@ command = "rm independent-delegate-marker"
                 .get(1)
                 .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
             "the second fallback request must contain the executed tool result: {bodies:?}"
-        );
-        assert!(result.error.is_none(), "{result:?}");
-    }
-
-    #[tokio::test]
-    async fn routed_agentic_delegate_uses_selected_models_text_tool_protocol() {
-        let (default, default_requests) = start_failing_chat_server(503).await;
-        let (routed, routed_requests, routed_bodies) =
-            start_text_tool_then_final_chat_server().await;
-        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
-            default.uri.clone(),
-            routed.uri.clone(),
-            true,
-            Some(true),
-            Some(false),
-        );
-        let mut config = (*fixture_config).clone();
-        config
-            .risk_profiles
-            .get_mut("delegating")
-            .expect("delegating risk profile")
-            .auto_approve
-            .push("echo_tool".to_string());
-        let primary = &mut config
-            .providers
-            .models
-            .custom
-            .get_mut("primary")
-            .expect("primary provider")
-            .base;
-        primary.model = Some("hint:text".to_string());
-        primary.fallback.clear();
-        config
-            .providers
-            .models
-            .custom
-            .get_mut("backup")
-            .expect("routed provider")
-            .base
-            .model = Some("routed-model".to_string());
-        config.model_routes.push(ModelRouteConfig {
-            hint: "text".to_string(),
-            model_provider: "custom.backup".to_string(),
-            model: "routed-model".to_string(),
-            api_key: None,
-        });
-        let tool = fallback_delegate_tool(Arc::new(config), None)
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
-
-        let result = tool
-            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
-            .await
-            .expect("routed agentic delegate completes");
-
-        assert!(result.success, "routed delegate failed: {result:?}");
-        assert_eq!(
-            default_requests.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the Router default must not receive a hinted request"
-        );
-        assert_eq!(
-            routed_requests.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "the selected route must receive both tool-loop requests"
-        );
-        assert!(result.output.contains("fallback final reply"), "{result:?}");
-
-        let bodies = routed_bodies.lock().unwrap();
-        let first_request = http_request_json(bodies.first().expect("first routed request"));
-        assert_eq!(first_request["model"], "routed-model");
-        assert!(
-            first_request.get("tools").is_none(),
-            "the text-only selected route must not receive native tools: {first_request}"
-        );
-        let system_prompt = first_request["messages"]
-            .as_array()
-            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
-            .and_then(|message| message["content"].as_str())
-            .expect("routed request contains a text system prompt");
-        for required in ["## Tool Use Protocol", "<tool_call>", "echo_tool", "value"] {
-            assert!(
-                system_prompt.contains(required),
-                "routed prompt must contain {required:?}: {system_prompt}"
-            );
-        }
-        assert!(
-            bodies
-                .get(1)
-                .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
-            "the second routed request must contain the tool result: {bodies:?}"
         );
         assert!(result.error.is_none(), "{result:?}");
     }

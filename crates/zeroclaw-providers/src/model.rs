@@ -1,5 +1,6 @@
 //! Provider/model construction from the canonical configuration selection.
 use crate::ModelProvider;
+use std::collections::HashSet;
 use std::sync::Arc;
 use zeroclaw_config::schema::{Config, ModelIdentity};
 
@@ -198,6 +199,16 @@ pub fn build_reliable_provider(
 /// Whether routed construction borrows model and connection defaults from its
 /// agent rather than resolving a named provider profile.
 pub fn inherits_agent_selection(config: &Config, selection_ref: &str) -> bool {
+    if config
+        .providers
+        .models
+        .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
+            selection_ref.trim(),
+        ))
+        .is_some()
+    {
+        return false;
+    }
     !config
         .providers
         .models
@@ -300,7 +311,14 @@ fn build_provider(
         let mut refs = vec![canonical_ref.clone()];
         refs.extend(registry.fallback_chain(&canonical_ref)?);
         for candidate_ref in refs {
-            let provider = crate::factory::dispatch_model_ref(config, &candidate_ref, &options)?;
+            // Reuse the immutable registry/connection descriptors for this
+            // construction transaction, but resolve and materialize every
+            // candidate's model policy independently.
+            let provider = crate::factory::dispatch_model_ref_with_registry(
+                &registry,
+                &candidate_ref,
+                &options,
+            )?;
             let configured_model = registry
                 .resolve_chat(&candidate_ref)?
                 .upstream_model()
@@ -440,7 +458,8 @@ pub(crate) fn build_canonical_provider_with_options(
     let mut refs = vec![model_ref.clone()];
     refs.extend(registry.fallback_chain(model_ref)?);
     for candidate_ref in refs {
-        let provider = crate::factory::dispatch_model_ref(config, &candidate_ref, options)?;
+        let provider =
+            crate::factory::dispatch_model_ref_with_registry(&registry, &candidate_ref, options)?;
         let configured_model = registry
             .resolve_chat(&candidate_ref)?
             .upstream_model()
@@ -502,97 +521,79 @@ pub(crate) fn build_canonical_provider_with_options(
 
 /// Resolve materialized fallback dependencies on demand, without retaining a
 /// parallel graph. Call against both generations when an edit removes a ref.
-pub fn selection_depends_on_profile(
+pub fn selection_depends_on_model_ref(
     config: &Config,
     selection_ref: &str,
-    changed_profile_ref: &str,
+    changed_model_ref: &str,
 ) -> bool {
+    let Ok(registry) = config.provider_registry() else {
+        return false;
+    };
+    let root = zeroclaw_config::provider_registry::ModelRef::from(selection_ref.trim());
+    let changed = zeroclaw_config::provider_registry::ModelRef::from(changed_model_ref.trim());
     fn visit(
-        config: &Config,
-        reference: &str,
-        changed: &str,
-        visited: &mut Vec<String>,
+        registry: &zeroclaw_config::provider_registry::ProviderRegistry,
+        current: &zeroclaw_config::provider_registry::ModelRef,
+        changed: &zeroclaw_config::provider_registry::ModelRef,
+        visited: &mut HashSet<zeroclaw_config::provider_registry::ModelRef>,
         depth: usize,
     ) -> bool {
-        if depth > zeroclaw_config::providers::MAX_FALLBACK_DEPTH {
-            return false;
-        }
-        let reference = reference.trim();
-        let resolved = if depth == 0 {
-            config
-                .providers
-                .models
-                .profile_ref(reference)
-                .and_then(|(family, alias)| {
-                    config
-                        .providers
-                        .models
-                        .find(family, alias)
-                        .map(|entry| (family, alias.to_string(), entry))
-                })
-        } else {
-            // Fallback materialization also accepts an unambiguous bare alias.
-            config.providers.models.find_by_name(reference)
-        };
-        let Some((family, alias, entry)) = resolved else {
-            return false;
-        };
-        if crate::ensure_known_model_entry_ref(config, reference).is_err() {
-            return false;
-        }
-        let profile = format!("{family}.{alias}");
-        if profile == changed {
+        if current == changed {
             return true;
         }
-        if visited.contains(&profile) {
+        if depth >= zeroclaw_config::providers::MAX_FALLBACK_DEPTH
+            || !visited.insert(current.clone())
+        {
             return false;
         }
-        visited.push(profile);
-        let depends = entry
-            .fallback
-            .iter()
-            .any(|fallback| visit(config, fallback, changed, visited, depth + 1));
-        visited.pop();
-        depends
+        registry.fallback.get(current).is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| visit(registry, target, changed, visited, depth + 1))
+        })
     }
-
-    let changed = config
-        .providers
-        .models
-        .profile_ref(changed_profile_ref)
-        .map(|(family, alias)| format!("{family}.{alias}"))
-        .unwrap_or_else(|| changed_profile_ref.to_string());
-    visit(config, selection_ref, &changed, &mut Vec::new(), 0)
+    visit(&registry, &root, &changed, &mut HashSet::new(), 0)
 }
 
 /// Dependencies of the routed graph built by [`build_model`], including each
 /// configured hint target's independent reliability domain and the agent
 /// selection inherited by a bare family or URL reference.
-pub fn routed_selection_depends_on_profile(
+pub fn routed_selection_depends_on_model_ref(
     config: &Config,
     agent_alias: &str,
     selection_ref: &str,
-    changed_profile_ref: &str,
+    changed_model_ref: &str,
 ) -> bool {
-    let inherited_profile = if !inherits_agent_selection(config, selection_ref) {
+    let inherited_selection = if !inherits_agent_selection(config, selection_ref) {
         false
     } else {
-        let changed_profile = config
+        let changed_owner = if config
             .providers
             .models
-            .profile_ref(changed_profile_ref)
-            .map(|(family, alias)| format!("{family}.{alias}"))
-            .unwrap_or_else(|| changed_profile_ref.trim().to_string());
+            .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
+                changed_model_ref.trim(),
+            ))
+            .is_some()
+        {
+            changed_model_ref.trim().to_string()
+        } else {
+            config
+                .providers
+                .models
+                .profile_ref(changed_model_ref)
+                .map(|(family, alias)| format!("{family}.{alias}"))
+                .unwrap_or_else(|| changed_model_ref.trim().to_string())
+        };
         configured_selection_for_construction(config, agent_alias, selection_ref).is_some_and(
-            |selection| format!("{}.{}", selection.family, selection.alias) == changed_profile,
+            |selection| format!("{}.{}", selection.family, selection.alias) == changed_owner,
         )
     };
-    inherited_profile
-        || selection_depends_on_profile(config, selection_ref, changed_profile_ref)
+    inherited_selection
+        || selection_depends_on_model_ref(config, selection_ref, changed_model_ref)
         || config.model_routes.iter().any(|route| {
             !route.hint.trim().is_empty()
                 && !route.effective_model(config).trim().is_empty()
-                && selection_depends_on_profile(config, &route.model_provider, changed_profile_ref)
+                && selection_depends_on_model_ref(config, &route.model_provider, changed_model_ref)
         })
 }
 
@@ -771,7 +772,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        primary.fallback = vec!["custom.backup".into()];
         let backup = config.providers.models.ensure("custom", "backup").unwrap();
         backup.uri = Some("http://127.0.0.1:2/v1".into());
         backup.model = Some("backup-model".into());
@@ -794,13 +794,13 @@ mod tests {
                     .identity(),
                 &identity
             );
-            assert!(routed_selection_depends_on_profile(
+            assert!(routed_selection_depends_on_model_ref(
                 &config,
                 "worker",
                 reference,
                 "custom.primary.fast"
             ));
-            assert!(!routed_selection_depends_on_profile(
+            assert!(!routed_selection_depends_on_model_ref(
                 &config,
                 "worker",
                 reference,
@@ -813,7 +813,7 @@ mod tests {
                 "explicit-model"
             );
         }
-        assert!(routed_selection_depends_on_profile(
+        assert!(routed_selection_depends_on_model_ref(
             &config,
             "worker",
             "custom.primary.fast",
@@ -824,120 +824,41 @@ mod tests {
     }
 
     #[test]
-    fn dependency_resolution_walks_nested_fallbacks_and_route_domains() {
-        let mut config = Config::default();
-        for alias in ["primary", "backup.v2", "last", "routed", "unrelated"] {
-            let profile = config.providers.models.ensure("custom", alias).unwrap();
-            profile.model = Some("model-id".into());
-        }
-        config
-            .providers
-            .models
-            .ensure("custom", "primary")
-            .unwrap()
-            .fallback = vec!["custom.backup.v2.fast".into()];
-        let backup = config
-            .providers
-            .models
-            .ensure("custom", "backup.v2")
-            .unwrap();
-        backup
-            .models
-            .insert("fast".into(), ModelEntryConfig::default());
-        backup.fallback = vec!["custom.last".into()];
-        config
-            .providers
-            .models
-            .ensure("custom", "last")
-            .unwrap()
-            .fallback = vec!["custom.primary".into()];
-        config.model_routes = vec![ModelRouteConfig {
-            hint: "fast".into(),
-            model_provider: "custom.routed".into(),
-            ..Default::default()
-        }];
-        for changed in [
-            "custom.primary",
-            "custom.backup.v2",
-            "custom.backup.v2.fast",
-            "custom.last",
-        ] {
-            assert!(
-                selection_depends_on_profile(&config, "custom.primary", changed),
-                "{changed}"
-            );
-        }
-        assert!(!selection_depends_on_profile(
-            &config,
-            "custom.primary",
-            "custom.routed"
-        ));
-        assert!(routed_selection_depends_on_profile(
-            &config,
-            "worker",
-            "custom.primary",
-            "custom.routed"
-        ));
-        assert!(!routed_selection_depends_on_profile(
-            &config,
-            "worker",
-            "custom.primary",
-            "custom.unrelated"
-        ));
+    fn canonical_fallback_dependencies_keep_dotted_model_keys_opaque() {
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 4
 
-        let old = config.clone();
-        config
-            .providers
-            .models
-            .ensure("custom", "primary")
-            .unwrap()
-            .fallback
-            .clear();
-        assert!(selection_depends_on_profile(
-            &old,
-            "custom.primary",
-            "custom.backup.v2"
-        ));
-        assert!(!selection_depends_on_profile(
-            &config,
-            "custom.primary",
-            "custom.backup.v2"
-        ));
-        config
-            .providers
-            .models
-            .ensure("custom", "primary")
-            .unwrap()
-            .fallback = vec!["custom.backup.v2.missing".into()];
-        for pruned in ["custom.backup.v2", "custom.last"] {
-            assert!(!selection_depends_on_profile(
-                &config,
-                "custom.primary",
-                pruned
-            ));
-        }
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.invalid/v1"
+capabilities = ["chat"]
 
-        config
-            .providers
-            .models
-            .ensure("custom", "primary")
-            .unwrap()
-            .fallback = vec![" last ".into()];
-        assert!(selection_depends_on_profile(
+[providers.models."chat.prod.v1"]
+capability = "chat"
+provider = "gateway.prod"
+model = "primary"
+
+[providers.models."chat.backup.v2"]
+capability = "chat"
+provider = "gateway.prod"
+model = "backup"
+
+[providers.fallback]
+"chat.prod.v1" = ["chat.backup.v2"]
+"#,
+        )
+        .expect("canonical dotted model references parse");
+
+        assert!(selection_depends_on_model_ref(
             &config,
-            "custom.primary",
-            "custom.last"
+            "chat.prod.v1",
+            "chat.backup.v2"
         ));
-        assert!(!selection_depends_on_profile(
+        assert!(!selection_depends_on_model_ref(
             &config,
-            "last",
-            "custom.last"
-        ));
-        config.providers.models.ensure("openai", "last").unwrap();
-        assert!(!selection_depends_on_profile(
-            &config,
-            "custom.primary",
-            "custom.last"
+            "chat.backup.v2",
+            "chat.prod.v1"
         ));
     }
 

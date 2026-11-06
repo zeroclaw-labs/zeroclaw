@@ -609,8 +609,8 @@ pub struct ModelRefusalError {
     pub attempted_candidate: Option<String>,
     /// Position of that candidate in the active reliability domain.
     ///
-    /// This disambiguates same-profile fallback models, which intentionally
-    /// share one configured candidate/cooldown identity.
+    /// This disambiguates exact-key fallback candidates even when they share
+    /// a wire model identifier or connection.
     pub attempted_candidate_index: Option<usize>,
 }
 

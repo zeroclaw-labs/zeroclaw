@@ -44,7 +44,7 @@ flowchart TB
 | `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, SubAgents, RPC layer for zerocode |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
 | `zeroclaw-api` | Public traits and shared capability contracts: `ModelProvider`, `AsrProvider`, `TtsProvider`, `EmbeddingProvider`, `DecisionModel`, `Channel`, `Tool`, `Memory`, `Observer`, `RuntimeAdapter`, and `Peripheral` |
-| `zeroclaw-providers` | All concrete provider implementations, including LLM, ASR, TTS, embedding, and decision providers, plus routing, retry, cooldown, and cross-profile fallback |
+| `zeroclaw-providers` | All concrete provider implementations, including LLM, ASR, TTS, embedding, and decision providers, plus routing, retry, cooldown, and exact-key model fallback |
 | `zeroclaw-channels` | 30+ messaging integrations (Discord, Slack, Telegram, Matrix, email, voice, …); consumes provider managers for speech and media |
 | `zeroclaw-gateway` | HTTP / WebSocket gateway, web dashboard, webhook ingress |
 | `zeroclaw-tools` | Callable tool implementations the agent invokes (browser, HTTP, hardware probes) |

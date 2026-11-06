@@ -293,9 +293,6 @@ fn effort_scoped_provider_config(
                     allowed_provider_refs.contains(&format!("{family}.{alias}"))
                 })
     };
-    for (_, _, profile) in scoped.providers.models.iter_entries_mut() {
-        profile.fallback.retain(|candidate| is_allowed(candidate));
-    }
     let excluded_profiles: Vec<(String, String)> = scoped
         .providers
         .models
@@ -4556,15 +4553,12 @@ mod tests {
         use zeroclaw_config::schema::{Config, ModelRouteConfig};
 
         let mut config = Config::default();
-        config
-            .providers
-            .models
-            .ensure("custom", "local")
-            .unwrap()
-            .fallback
-            .push(zeroclaw_config::providers::ModelProviderRef::new(
+        config.providers.fallback.insert(
+            zeroclaw_config::provider_registry::ModelRef::new("custom.local"),
+            vec![zeroclaw_config::provider_registry::ModelRef::new(
                 "custom.cloud",
-            ));
+            )],
+        );
         config.providers.models.ensure("custom", "cloud").unwrap();
         config.model_routes = vec![
             ModelRouteConfig {
@@ -4598,13 +4592,9 @@ mod tests {
         let local_config =
             effort_scoped_provider_config(&config, local.allowed_provider_refs.as_ref());
         assert!(
-            local_config
-                .providers
-                .models
-                .find("custom", "local")
-                .unwrap()
-                .fallback
-                .is_empty(),
+            !local_config.providers.fallback.contains_key(
+                &zeroclaw_config::provider_registry::ModelRef::new("custom.local")
+            ),
             "a local turn must prune a configured cloud reliability fallback"
         );
         assert!(
@@ -24879,9 +24869,6 @@ Let me check the result."#;
                     model: Some("local-model".to_string()),
                     timeout_secs: Some(5),
                     uri: Some(format!("http://{local_addr}")),
-                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
-                        "ollama.cloud",
-                    )],
                     ..Default::default()
                 },
                 ..Default::default()

@@ -953,6 +953,7 @@ cli-config-capped-reason-pairing-code-ttl = un código de emparejamiento se pued
 cli-config-retired-reason-nevis = se eliminó la integración de Nevis IAM; configura `[oidc.<alias>]` con `[users]` y `[permission_profiles]` en su lugar
 cli-config-retired-reason-agent-tunable = los ajustes de ejecución dentro del agente ya no se leen; los perfiles de ejecución son los que rigen, así que define esta clave en el `[runtime_profiles.<profile>]` del agente
 cli-config-retired-reason-text-tool-parsing = el análisis de herramientas en texto se configura por modelo de chat; usa `options.extract_text_tool_calls = false` en lugar de `strict_tool_parsing = true`
+cli-config-retired-reason-profile-fallback = las listas de fallback a nivel de perfil se eliminaron en V4; usa el grafo de claves exactas `[providers.fallback]` y define allí cada destino como una referencia de modelo completa
 cli-config-retired-reason-summary-model = el id de modelo suelto obsoleto no tenía identidad de proveedor y nunca se leía; `summary_provider` lo reemplazó (la compresión de contexto en sí no está implementada actualmente en el runtime)
 cli-config-retired-reason-node-transport = se eliminó el transporte de nodos HMAC heredado
 cli-config-retired-reason-wati = se eliminó la compatibilidad con WATI; migra a `[channels.whatsapp.<alias>]` con la Cloud API o WhatsApp Web y luego revoca el token de API de WATI que ya no se usa
