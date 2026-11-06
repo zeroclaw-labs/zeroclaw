@@ -266,6 +266,11 @@ struct OwnedParentTools {
     tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     origins: crate::tools::NativeMemoryOrigins,
     memory_policies: Option<Arc<BoundedMemoryPolicyChain>>,
+    /// Sticky isolation choice from an ACP / `exclude_memory` ancestor.
+    /// Once set, nested bounded hops keep withholding `MEMORY.md` even when
+    /// their inherited tool list is empty (e.g. middle agent allows only
+    /// `delegate`, so filtering drops every parent tool).
+    exclude_memory: bool,
 }
 
 /// Actual participating policy owners, root caller first. Independent
@@ -383,6 +388,7 @@ impl Default for OwnedParentTools {
             tools: Arc::new(RwLock::new(Vec::new())),
             origins: Default::default(),
             memory_policies: None,
+            exclude_memory: false,
         }
     }
 }
@@ -719,15 +725,27 @@ impl DelegateTool {
     /// treat its memory tools as unknown and keep using their stores rather
     /// than opening the target's memory. Registries built by the runtime use
     /// `with_owned_parent_tools`, which carries the provenance.
+    fn registry_signals_memory_exclusion(tools: &RwLock<Vec<Arc<dyn Tool>>>) -> bool {
+        let tools = tools.read();
+        if tools.is_empty() {
+            return false;
+        }
+        !zeroclaw_tools::MEMORY_TOOL_NAMES
+            .iter()
+            .any(|name| tools.iter().any(|tool| tool.name() == *name))
+    }
+
     #[cfg(test)]
     pub(crate) fn with_parent_tools(
         mut self,
         parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     ) -> Self {
+        let exclude_memory = Self::registry_signals_memory_exclusion(&parent_tools);
         self.parent_tools = OwnedParentTools {
             tools: parent_tools,
             origins: Default::default(),
             memory_policies: None,
+            exclude_memory,
         };
         self
     }
@@ -737,10 +755,12 @@ impl DelegateTool {
         tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
         origins: crate::tools::NativeMemoryOrigins,
     ) -> Self {
+        let exclude_memory = Self::registry_signals_memory_exclusion(&tools);
         self.parent_tools = OwnedParentTools {
             tools,
             origins,
             memory_policies: None,
+            exclude_memory,
         };
         self
     }
@@ -1629,6 +1649,9 @@ impl DelegateTool {
             tools,
             origins: self.parent_tools.origins.clone(),
             memory_policies: Some(self.memory_policies_for_target(target)),
+            // Sticky: a memory-excluded ancestor stays excluded across hops
+            // even when this hop's inherited list is empty.
+            exclude_memory: self.parent_excludes_memory(),
         }
     }
 
@@ -4917,18 +4940,15 @@ impl DelegateTool {
         self.cancellation_token.cancel();
     }
 
-
     /// True when the caller's assembled registry has already stripped memory
-    /// tools (ACP / `exclude_memory: true` sessions). Empty parent registries
-    /// from legacy test constructors are not treated as exclusion.
+    /// tools (ACP / `exclude_memory: true` sessions), or a bounded ancestor
+    /// already recorded that isolation choice. Empty parent registries from
+    /// legacy test constructors are not treated as exclusion on their own.
     fn parent_excludes_memory(&self) -> bool {
-        let tools = self.parent_tools.tools.read();
-        if tools.is_empty() {
-            return false;
+        if self.parent_tools.exclude_memory {
+            return true;
         }
-        !zeroclaw_tools::MEMORY_TOOL_NAMES
-            .iter()
-            .any(|name| tools.iter().any(|tool| tool.name() == *name))
+        Self::registry_signals_memory_exclusion(&self.parent_tools.tools)
     }
 
     /// Independent delegates own the target's full personality (including
@@ -13389,9 +13409,7 @@ target = "memory_recall"
         let config = Arc::new(config);
 
         // Parent registry after exclude_memory assembly: non-empty, no memory tools.
-        let parent_tools = Arc::new(RwLock::new(vec![
-            Arc::new(EchoTool) as Arc<dyn Tool>,
-        ]));
+        let parent_tools = Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>]));
         let tool = DelegateTool::new(config.agents.clone(), None, test_security())
             .with_root_config(Arc::clone(&config))
             .with_parent_tools(Arc::clone(&parent_tools));
@@ -13437,6 +13455,98 @@ target = "memory_recall"
         assert!(
             !prompt.contains("memory-marker-secret"),
             "MEMORY.md must be absent on a bounded child of a memory-excluded parent; got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_second_hop_keeps_memory_exclusion_when_middle_only_allows_delegate() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        // Greptile P1: middle agent allows only `delegate`, so filtering drops
+        // every inherited parent tool and leaves an empty production registry
+        // on the nested DelegateTool. Exclusion must stay sticky.
+        let tmp = TempDir::new().unwrap();
+        let grandchild_ws = tmp.path().join("grandchild-workspace");
+        std::fs::create_dir_all(&grandchild_ws).unwrap();
+        std::fs::write(grandchild_ws.join("TOOLS.md"), "tools-marker-unique").unwrap();
+        std::fs::write(grandchild_ws.join("MEMORY.md"), "memory-marker-secret").unwrap();
+        std::fs::write(grandchild_ws.join("SOUL.md"), "soul-marker").unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "grandchild".to_string(),
+            AliasedAgentConfig {
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(grandchild_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        let root_tools = Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>]));
+        let root = DelegateTool::new(config.agents.clone(), None, test_security())
+            .with_root_config(Arc::clone(&config))
+            .with_parent_tools(Arc::clone(&root_tools));
+        assert!(
+            root.parent_excludes_memory(),
+            "root exclude_memory session must signal exclusion"
+        );
+
+        // Simulate the nested DelegateTool parent_tools after a middle hop that
+        // only kept `delegate` (filtered inherited list is empty).
+        let empty_middle_registry = Arc::new(RwLock::new(Vec::<Arc<dyn Tool>>::new()));
+        let nested = DelegateTool::new(config.agents.clone(), None, test_security())
+            .with_root_config(Arc::clone(&config));
+        let nested = {
+            let mut nested = nested;
+            nested.parent_tools =
+                root.bounded_parent_tools(Arc::clone(&empty_middle_registry), &nested.security);
+            nested
+        };
+
+        assert!(
+            empty_middle_registry.read().is_empty(),
+            "fixture must use an empty inherited registry"
+        );
+        assert!(
+            nested.parent_excludes_memory(),
+            "sticky exclude_memory must survive an empty middle registry"
+        );
+        assert!(
+            !nested.inject_memory_for_target_mode(DelegateExecutionMode::Bounded),
+            "second bounded hop must still withhold MEMORY.md"
+        );
+
+        let agent_config = config.agents.get("grandchild").cloned().unwrap();
+        let prompt = nested
+            .build_enriched_system_prompt_from_config(
+                Some(config.as_ref()),
+                "grandchild",
+                &agent_config,
+                "model-test",
+                &[],
+                None,
+                tmp.path(),
+                true,
+                None,
+                None,
+                nested.inject_memory_for_target_mode(DelegateExecutionMode::Bounded),
+            )
+            .expect("prompt should render");
+
+        assert!(
+            prompt.contains("tools-marker-unique") && prompt.contains("soul-marker"),
+            "non-memory personality must remain; got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("memory-marker-secret"),
+            "MEMORY.md must stay withheld on the second bounded hop; got: {prompt}"
         );
     }
 
