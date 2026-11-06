@@ -21,7 +21,13 @@ class FakeRecognition {
   lang = ''; continuous = false; interimResults = false; processLocally = false;
   onresult: Function | null = null; onerror: Function | null = null; onend: Function | null = null;
   constructor() { capture = this; }
-  start() {} stop() {} abort() { aborted++; }
+  track?: MediaStreamTrack;
+  start(track?: MediaStreamTrack) { this.track = track; }
+  stop() {
+    this.onresult?.({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Final after stop' } }] });
+    this.onend?.();
+  }
+  abort() { aborted++; }
 }
 class FakeUtterance { constructor(public text: string) {} }
 const speech = Object.assign(new EventTarget(), {
@@ -113,6 +119,48 @@ test('short press reads once; hold enables continuous; click disables without pe
   await act(async () => { speaker().props.onClick(); });
   assert.equal(speaker().props['aria-pressed'], false);
   assert.equal(requests.filter(r => r.method === 'PUT').length, writes);
+  await act(async () => { renderer.unmount(); });
+});
+
+test('the microphone picker opens the exact input and releases its track after finalization', async () => {
+  let stopped = 0;
+  const track = { stop: () => { stopped++; } } as MediaStreamTrack;
+  const media = {
+    enumerateDevices: async () => [{ kind: 'audioinput', deviceId: 'test-mic', label: 'USB test microphone' }],
+    getUserMedia: async (constraints: MediaStreamConstraints) => {
+      assert.deepEqual(constraints, { audio: { deviceId: { exact: 'test-mic' } } });
+      return { getTracks: () => [track], getAudioTracks: () => [track] };
+    },
+  };
+  Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: media });
+  const transcripts: string[] = [];
+  const renderer = await mount(text => transcripts.push(text));
+  try {
+    const picker = renderer.root.findAllByType('button').find(button => button.props['aria-label'] === 'Choose microphone')!;
+    await act(async () => { picker.props.onClick(); });
+    await act(async () => { renderer.root.findByType('select').props.onChange({ target: { value: 'test-mic' } }); });
+    const mic = () => renderer.root.findAllByType('button')[0]!;
+    await act(async () => { await mic().props.onClick(); });
+    assert.equal(capture.track, track);
+    assert.equal(capture.processLocally, true);
+    await act(async () => { await mic().props.onClick(); });
+    assert.deepEqual(transcripts, ['Final after stop']);
+    assert.equal(stopped, 1);
+  } finally {
+    await act(async () => { renderer.unmount(); });
+    Reflect.deleteProperty(navigator, 'mediaDevices');
+  }
+});
+
+test('clicking the active microphone keeps the final transcript emitted on stop', async () => {
+  const transcripts: string[] = [];
+  const renderer = await mount(text => transcripts.push(text));
+  const mic = () => renderer.root.findAllByType('button')[0]!;
+  await act(async () => { await mic().props.onClick(); });
+  await act(async () => { await mic().props.onClick(); });
+  assert.deepEqual(transcripts, ['Final after stop']);
+  assert.equal(aborted, 0);
+  assert.equal(mic().props['aria-pressed'], false);
   await act(async () => { renderer.unmount(); });
 });
 
