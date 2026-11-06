@@ -24,6 +24,13 @@ Do **not** file an RFC merely because the work includes:
 
 Those go through an issue and a PR. A new channel, a new provider, a new tool, and a bug fix are all ordinary work, however large the diff. They need an RFC only when their substantive effect also crosses one of the four triggers above.
 
+For ordinary work, whether you start with an issue or a PR depends on how much you already know:
+
+- You know **what** to build and **how** to build it: open a PR.
+- You know **what** to build but not **how**: open an issue and settle the approach there.
+
+Needing a second opinion is not by itself a reason to file an RFC. Most proposals that need review need it on the approach, which an issue or a draft PR carries faster than a discussion period and a ballot.
+
 The test follows substantive project effect, not the issue title, the author, whether the draft was AI-assisted, or the mere presence of a migration, feature, or default change. When you are unsure, open an ordinary issue and say why you think it might cross a trigger. A maintainer can promote it; that costs far less than a stalled RFC.
 
 Security vulnerabilities are reported privately per [SECURITY.md](https://github.com/zeroclaw-labs/zeroclaw/blob/master/SECURITY.md), never as a public RFC.
