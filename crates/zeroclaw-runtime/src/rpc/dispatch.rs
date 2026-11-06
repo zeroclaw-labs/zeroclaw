@@ -9791,7 +9791,14 @@ impl RpcDispatcher {
         // supervised-autonomy gate as the CLI and the gateway, so a medium- or
         // high-risk command is refused here instead of being stored as though
         // an operator had approved it.
-        let job = crate::cron::add_shell_job_with_approval(
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            rpc_err(
+                AUTH_REQUIRED,
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            )
+        })?;
+        let mut denied = None;
+        let job = crate::cron::add_shell_job_authorized(
             &config,
             &req.agent,
             req.name,
@@ -9799,8 +9806,25 @@ impl RpcDispatcher {
             req.command.as_deref().unwrap_or(""),
             req.delivery,
             false,
-        )
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron add failed: {e}")))?;
+            Default::default(),
+            || {
+                // The config writer serializes policy changes, but a credential
+                // can expire or reach its revalidation deadline while SQLite waits.
+                let authority = self.ctx.auth.hold_authority();
+                current_authority_under(&authority, auth, Method::CronAdd)
+                    .map(|_| authority)
+                    .map_err(|error| {
+                        self.audit_auth_denial(Method::CronAdd, &error);
+                        let message = error.message.clone();
+                        denied = Some(rpc_err(error.code, error.message));
+                        anyhow::Error::msg(message)
+                    })
+            },
+        );
+        if let Some(error) = denied {
+            return Err(error);
+        }
+        let job = job.map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron add failed: {e}")))?;
         drop(config_writer_guard);
         to_result(job)
     }
@@ -17601,6 +17625,68 @@ mod tests {
             );
             assert!(!ctx.config_authority.config_write_lock_is_held());
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_add_rechecks_credential_deadlines_after_the_sqlite_writer_wait() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        for (expires, due) in [(true, false), (false, true), (false, false)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = cron_roster_config_in(&tmp, 4242);
+            seed_shell_cron_job(&config, "alpha", "existing");
+            let ctx = enforcement_ctx(config.clone());
+            let (mut caller, _rx) = roster_peer(&ctx, 4242).await;
+            let writer = rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            crate::cron::reset_write_connection_count_for_tests(&config);
+
+            let deadline = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 2;
+            let principal = &mut caller.auth.as_mut().unwrap().principal;
+            principal.expires_at = Some(if expires { deadline } else { deadline + 60 });
+            principal.revalidate_by = Some(if due { deadline } else { deadline + 60 });
+            let add = zeroclaw_spawn::spawn!(async move {
+                caller
+                    .handle_cron_add(&json!({
+                        "agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"
+                    }))
+                    .await
+            });
+            // This connection is opened only after the RPC has passed its initial
+            // authorization. The competing IMMEDIATE writer prevents insertion.
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while crate::cron::write_connection_count_for_tests(&config) == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the admitted add must reach the store");
+            if expires || due {
+                let until_deadline = (UNIX_EPOCH + Duration::from_secs(deadline))
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default();
+                tokio::time::sleep(until_deadline + Duration::from_millis(10)).await;
+            }
+            assert!(!add.is_finished());
+            writer.execute_batch("ROLLBACK").unwrap();
+            let result = add.await.unwrap();
+            let rows = crate::cron::list_jobs(&config).unwrap();
+            if expires || due {
+                assert_eq!(result.unwrap_err().code, AUTH_REQUIRED);
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "the refused insert must leave only the seed row"
+                );
+            } else {
+                let row = result.expect("a live credential may commit");
+                assert!(rows.iter().any(|job| row["id"] == job.id));
+                assert_eq!(rows.len(), 2);
+            }
+        }
     }
 
     /// The store's write is synchronous and can wait out SQLite's busy
