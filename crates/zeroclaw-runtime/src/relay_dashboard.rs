@@ -40,12 +40,12 @@ pub struct DashboardOrigin {
 impl DashboardOrigin {
     /// A dashboard origin at DNS name `host` on HTTPS port `port`.
     ///
-    /// `host` must be a DNS name of at least two labels, each 1 to 63
-    /// letters, digits or interior hyphens; it is stored in lower case, as
-    /// browsers write it in `Origin`.
+    /// `host` must be a DNS name by [`zeroclaw_config::schema::is_dns_host_name`]
+    /// once lower-cased; it is stored in lower case, as browsers write it in
+    /// `Origin`.
     pub fn new(host: &str, port: u16) -> Result<Self> {
         let host = host.trim().to_ascii_lowercase();
-        if !is_dns_name(&host) {
+        if !zeroclaw_config::schema::is_dns_host_name(&host) {
             bail!("dashboard host `{host}` is not a DNS name");
         }
         if port == 0 {
@@ -86,26 +86,6 @@ impl DashboardOrigin {
         host_header.eq_ignore_ascii_case(&self.authority())
             || (self.port == 443 && host_header.eq_ignore_ascii_case(&format!("{}:443", self.host)))
     }
-}
-
-/// Whether `name` is a DNS host name of at least two labels. A numeric last
-/// label is refused, so an IPv4 address is not taken for a name.
-fn is_dns_name(name: &str) -> bool {
-    let labels: Vec<&str> = name.split('.').collect();
-    name.len() <= 253
-        && labels.len() >= 2
-        && !labels
-            .last()
-            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
 }
 
 /// The address a dashboard connection is served under: the browser's, as

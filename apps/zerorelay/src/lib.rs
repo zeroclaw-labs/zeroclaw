@@ -817,6 +817,7 @@ where
             daemon_pubkey,
             node_id,
             relay_token,
+            ..
         }) => {
             handle_daemon(
                 inner,
@@ -1593,6 +1594,7 @@ where
                 Control::Open {
                     conn_id,
                     peer_hint: route.peer_hint().map(str::to_string),
+                    client_addr: None,
                 }
                 .to_json(),
             )),
@@ -2042,6 +2044,7 @@ mod tests {
             daemon_pubkey: "a".repeat(MAX_CONTROL_FRAME),
             node_id: "node".into(),
             relay_token: None,
+            dashboard: false,
         }
         .to_json();
 

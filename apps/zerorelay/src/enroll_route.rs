@@ -233,6 +233,7 @@ pub(crate) async fn open_enroll_route(
                 Control::Open {
                     conn_id,
                     peer_hint: Some(PEER_HINT_ENROLL.to_string()),
+                    client_addr: None,
                 }
                 .to_json(),
             )),
