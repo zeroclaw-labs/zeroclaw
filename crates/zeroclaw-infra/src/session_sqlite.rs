@@ -1039,6 +1039,52 @@ impl SqliteSessionBackend {
         .optional()
         .map_err(std::io::Error::other)
     }
+
+    /// Whether any message row exists for `session_key`, with or without its
+    /// metadata row.
+    fn has_messages(conn: &Connection, session_key: &str) -> std::io::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sessions WHERE session_key = ?1)",
+            params![session_key],
+            |row| row.get(0),
+        )
+        .map_err(std::io::Error::other)
+    }
+
+    /// Delete a session's messages, then its metadata row. Callers run this
+    /// inside one transaction, so no other connection sees one without the
+    /// other.
+    fn delete_session_rows(conn: &Connection, session_key: &str) -> std::io::Result<()> {
+        // The FTS5 trigger removes the matching `sessions_fts` rows.
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        #[cfg(test)]
+        BETWEEN_SESSION_ROW_DELETES.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        conn.execute(
+            "DELETE FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+type RowDeleteHook = Box<dyn FnMut()>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run on this thread between a session's message delete and its metadata
+    /// delete, so a test can act from another connection in that gap.
+    static BETWEEN_SESSION_ROW_DELETES: std::cell::RefCell<Option<RowDeleteHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl SessionBackend for SqliteSessionBackend {
@@ -1385,12 +1431,17 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let cutoff = (Utc::now() - Duration::hours(i64::from(ttl_hours))).to_rfc3339();
+        // One transaction for the selection and every delete, for the reason
+        // `delete_session` gives.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
 
         // Find stale sessions
         let stale_keys: Vec<String> = {
-            let mut stmt = conn
+            let mut stmt = tx
                 .prepare("SELECT session_key FROM session_metadata WHERE last_activity < ?1")
                 .map_err(std::io::Error::other)?;
             let rows = stmt
@@ -1401,12 +1452,9 @@ impl SessionBackend for SqliteSessionBackend {
 
         let count = stale_keys.len();
         for key in &stale_keys {
-            let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
-            let _ = conn.execute(
-                "DELETE FROM session_metadata WHERE session_key = ?1",
-                params![key],
-            );
+            Self::delete_session_rows(&tx, key)?;
         }
+        tx.commit().map_err(std::io::Error::other)?;
 
         Ok(count)
     }
@@ -1436,35 +1484,24 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let conn = self.conn.lock();
-
-        // Check if session exists
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
-                params![session_key],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
+        let mut conn = self.conn.lock();
+        // The existence check and both deletes are one IMMEDIATE transaction.
+        // As separate statements, another connection's append could commit
+        // between them: its message would outlive the metadata row, and a
+        // claim, which reads ownership from that row, would take the key for
+        // a new session and hand that message to its claimant.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        // Message rows count too, so a delete also clears ones an
+        // interrupted delete left without their metadata row.
+        let exists = Self::session_ownership(&tx, session_key)?.is_some()
+            || Self::has_messages(&tx, session_key)?;
         if !exists {
             return Ok(false);
         }
-
-        // Delete messages (FTS5 trigger handles sessions_fts cleanup)
-        conn.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
-
-        // Delete metadata
-        conn.execute(
-            "DELETE FROM session_metadata WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
-
+        Self::delete_session_rows(&tx, session_key)?;
+        tx.commit().map_err(std::io::Error::other)?;
         Ok(true)
     }
 
@@ -1945,6 +1982,11 @@ impl SessionBackend for SqliteSessionBackend {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(std::io::Error::other)?;
         let ownership = Self::session_ownership(&tx, session_key)?;
+        // Messages without a metadata row are not a new session: they are
+        // what a delete interrupted between its two statements leaves. No
+        // record says who wrote them, so no grant adopts them; deleting the
+        // session clears them.
+        let orphaned_messages = ownership.is_none() && Self::has_messages(&tx, session_key)?;
         let mut tx = Some(tx);
         let mut claim = SessionOwnerClaim::Foreign(SessionOwnershipDenial::AtomicCheckUnavailable);
         let mut result = Err(std::io::Error::new(
@@ -1958,6 +2000,10 @@ impl SessionBackend for SqliteSessionBackend {
                         std::io::ErrorKind::PermissionDenied,
                         "empty session owner",
                     ));
+                }
+                if orphaned_messages {
+                    claim = SessionOwnerClaim::Foreign(SessionOwnershipDenial::Unattributed);
+                    return Ok(());
                 }
                 let persisted = ownership.as_ref().map(|(owner, channel)| {
                     (
@@ -4283,6 +4329,164 @@ mod tests {
             SessionOwnerClaim::Foreign(SessionOwnershipDenial::ForeignChannel(
                 "discord.ops".into()
             ))
+        );
+    }
+
+    /// Clears the row-delete hook when a test ends, even by panicking.
+    struct RowDeletePause;
+
+    impl RowDeletePause {
+        /// Make this thread's next session delete stop between its message
+        /// delete and its metadata delete: report the pause on `paused`, then
+        /// wait for `resume`.
+        fn install(paused: mpsc::Sender<()>, resume: mpsc::Receiver<()>) -> Self {
+            BETWEEN_SESSION_ROW_DELETES.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let _ = paused.send(());
+                    let _ = resume.recv();
+                }));
+            });
+            Self
+        }
+    }
+
+    impl Drop for RowDeletePause {
+        fn drop(&mut self) {
+            BETWEEN_SESSION_ROW_DELETES.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    /// Agent A's `/new` (or the gateway's stale-session sweep) deletes A's
+    /// session while a tool A kept in another session appends to it through
+    /// another connection. The append either lands before the delete or sees
+    /// the session gone: it never commits between the message delete and the
+    /// metadata delete, where its message would outlive the metadata row and
+    /// be handed to whichever agent claims the key next.
+    #[test]
+    fn a_session_delete_leaves_no_message_for_the_next_claimant() {
+        use crate::session_backend::SessionOwnerClaim;
+        type Delete = fn(&SqliteSessionBackend) -> std::io::Result<bool>;
+        let deletes: [(&str, Delete); 2] = [
+            ("delete_session", |backend| backend.delete_session("k")),
+            ("cleanup_stale", |backend| {
+                backend.cleanup_stale(0).map(|removed| removed > 0)
+            }),
+        ];
+        for (name, delete) in deletes {
+            let tmp = TempDir::new().unwrap();
+            let deleter = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+            deleter
+                .append("k", &ChatMessage::user("agent A's private history"))
+                .unwrap();
+            deleter.set_session_agent_alias("k", "agent-a").unwrap();
+            // A separate backend is a separate connection, as a retained
+            // session tool's is.
+            let tool = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+
+            let (paused_tx, paused) = mpsc::channel();
+            let (resume, resume_rx) = mpsc::channel();
+            let deleting = std::thread::spawn({
+                let deleter = Arc::clone(&deleter);
+                move || {
+                    let _pause = RowDeletePause::install(paused_tx, resume_rx);
+                    delete(&deleter).unwrap()
+                }
+            });
+            paused.recv().unwrap();
+            let (appended_tx, appended) = mpsc::channel();
+            let appending = std::thread::spawn({
+                let tool = Arc::clone(&tool);
+                move || {
+                    let result = tool
+                        .append_if_owned(
+                            "k",
+                            &ChatMessage::user("sent while the delete ran"),
+                            "agent-a",
+                            &BTreeSet::new(),
+                        )
+                        .unwrap();
+                    let _ = appended_tx.send(());
+                    result
+                }
+            });
+            // An append that can commit in the gap does so well within this;
+            // one that has to wait for the delete is still waiting.
+            let _ = appended.recv_timeout(StdDuration::from_millis(500));
+            resume.send(()).unwrap();
+            assert!(deleting.join().unwrap(), "{name}");
+            assert_eq!(
+                appending.join().unwrap(),
+                ScopedSessionAccess::Missing,
+                "{name}: the append must wait for the delete and then find no session"
+            );
+            assert!(
+                tool.load("k").is_empty(),
+                "{name}: no message may outlive the delete"
+            );
+
+            let claimant = SqliteSessionBackend::new(tmp.path()).unwrap();
+            assert_eq!(
+                claimant.claim_session_agent_alias("k", "agent-b").unwrap(),
+                SessionOwnerClaim::Claimed,
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    claimant
+                        .load_if_owned("k", "agent-b", &BTreeSet::new())
+                        .unwrap(),
+                    ScopedSessionAccess::Granted(history) if history.is_empty()
+                ),
+                "{name}: the next claimant must start an empty session"
+            );
+        }
+    }
+
+    /// Message rows with no metadata row are what a delete interrupted
+    /// between its two statements leaves. A claim must not take them for an
+    /// absent session, and no grant adopts them, not even a sole enabled
+    /// agent's; deleting the session clears them.
+    #[test]
+    fn a_claim_refuses_messages_left_without_their_metadata_row() {
+        use crate::session_backend::{
+            SessionClaimGrant, SessionOwnerClaim, SessionOwnershipDenial,
+        };
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        store
+            .append("k", &ChatMessage::user("agent A's private history"))
+            .unwrap();
+        store.set_session_agent_alias("k", "agent-a").unwrap();
+        store
+            .conn
+            .lock()
+            .execute("DELETE FROM session_metadata WHERE session_key = 'k'", [])
+            .unwrap();
+
+        let grant = SessionClaimGrant {
+            channels: BTreeSet::from(["discord.ops".to_string()]),
+            adopt_unattributed: true,
+        };
+        let adopting = move |effect: &mut dyn FnMut(&SessionClaimGrant)| effect(&grant);
+        assert_eq!(
+            store
+                .claim_session_with_authority("k", "agent-b", &adopting)
+                .unwrap(),
+            SessionOwnerClaim::Foreign(SessionOwnershipDenial::Unattributed)
+        );
+        assert!(
+            store.get_session_metadata("k").is_none(),
+            "a refused claim writes nothing"
+        );
+        assert_eq!(store.load("k").len(), 1);
+
+        assert!(store.delete_session("k").unwrap());
+        assert!(store.load("k").is_empty());
+        assert_eq!(
+            store
+                .claim_session_with_authority("k", "agent-b", &adopting)
+                .unwrap(),
+            SessionOwnerClaim::Claimed
         );
     }
 }
