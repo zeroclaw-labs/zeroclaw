@@ -18,7 +18,19 @@ fn plugin_webhook_test_router(
     state: AppState,
     registry: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
 ) -> Router {
-    routes(registry)
+    plugin_webhook_test_router_with(
+        state,
+        registry,
+        Arc::new(WebhookReservationStore::new(Duration::from_secs(300), 1000)),
+    )
+}
+
+fn plugin_webhook_test_router_with(
+    state: AppState,
+    registry: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    reservations: Arc<WebhookReservationStore>,
+) -> Router {
+    routes(registry, reservations)
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
 }
@@ -474,72 +486,182 @@ async fn plugin_webhook_response_limit_counts_utf8_bytes_at_the_gateway() {
     worker.await.expect("response worker joins");
 }
 
-#[tokio::test]
-async fn plugin_webhook_idempotency_waits_for_owner_outcome_and_fences_stale_tokens() {
-    use zeroclaw_api::webhook::{WebhookReservation, WebhookReservationStatus};
-
-    let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 8));
-    let idempotency = plugin_webhook_idempotency(Arc::clone(&store), "fixture");
-    let first = match idempotency.begin("stable-id") {
-        WebhookReservation::Owner(token) => token,
-        _ => panic!("first request must own the reservation"),
-    };
-    let mut duplicate = match idempotency.begin("stable-id") {
-        WebhookReservation::InFlight(waiter) => waiter,
-        _ => panic!("duplicate must observe an in-flight owner"),
-    };
-
-    assert!(idempotency.rollback(&first));
-    assert_eq!(duplicate.wait().await, WebhookReservationStatus::RolledBack);
-    let replacement = match idempotency.begin("stable-id") {
-        WebhookReservation::Owner(token) => token,
-        _ => panic!("duplicate must acquire after owner rollback"),
-    };
-    assert_ne!(first.generation(), replacement.generation());
-    assert!(!idempotency.rollback(&first));
-
-    let mut committed_duplicate = match idempotency.begin("stable-id") {
-        WebhookReservation::InFlight(waiter) => waiter,
-        _ => panic!("later duplicate must wait for replacement owner"),
-    };
-    assert!(idempotency.commit(&replacement));
-    assert_eq!(
-        committed_duplicate.wait().await,
-        WebhookReservationStatus::Committed
-    );
-    assert!(matches!(
-        idempotency.begin("stable-id"),
-        WebhookReservation::Committed
-    ));
-}
-
+/// The key is `plugin-webhook:` and the hex SHA-256 of
+/// `"zeroclaw-plugin-webhook\0" ‖ path ‖ "\0" ‖ message_id`. Changing its
+/// scope is a separate decision; this pins it.
 #[test]
-fn plugin_webhook_pending_capacity_does_not_starve_existing_idempotency_callers() {
+fn plugin_webhook_keys_are_unchanged_and_scoped_by_path() {
     use zeroclaw_api::webhook::WebhookReservation;
 
-    let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1));
-    let idempotency = plugin_webhook_idempotency(Arc::clone(&store), "fixture");
-    let owner = match idempotency.begin("first") {
+    assert_eq!(
+        plugin_webhook_idempotency_key("fixture", "stable-id"),
+        "plugin-webhook:57cba1d8a17bb6d5ace7c3aed7d8d79f4ad5e6acb13a1c449d5fe4bc0c3c202e"
+    );
+    let store = Arc::new(WebhookReservationStore::new(Duration::from_secs(300), 8));
+    let fixture = plugin_webhook_idempotency(Arc::clone(&store), "fixture");
+    let other = plugin_webhook_idempotency(Arc::clone(&store), "other");
+    let owner = match fixture.begin("stable-id") {
         WebhookReservation::Owner(token) => token,
-        _ => panic!("first plugin delivery owns the pending slot"),
+        _ => panic!("the first delivery owns its key"),
+    };
+    assert!(fixture.commit(&owner));
+    assert!(matches!(
+        fixture.begin("stable-id"),
+        WebhookReservation::Committed
+    ));
+    assert!(
+        matches!(other.begin("stable-id"), WebhookReservation::Owner(_)),
+        "the same message id on another path is a different key"
+    );
+}
+
+/// In-flight plugin reservations are bounded apart from committed keys, so
+/// plugin work holding every in-flight slot cannot make the generic path
+/// report a duplicate, although both record into the run's one store.
+#[test]
+fn plugin_in_flight_pressure_does_not_block_generic_webhook_keys() {
+    use zeroclaw_api::webhook::WebhookReservation;
+
+    let reservations = Arc::new(WebhookReservationStore::new(Duration::from_secs(300), 1));
+    let generic = crate::generic_webhook_idempotency(&reservations);
+    let idempotency = plugin_webhook_idempotency(Arc::clone(&reservations), "fixture");
+    let _owner = match idempotency.begin("first") {
+        WebhookReservation::Owner(token) => token,
+        _ => panic!("first plugin delivery owns the in-flight slot"),
     };
     assert!(matches!(
         idempotency.begin("second"),
         WebhookReservation::Unavailable
     ));
-    assert!(
-        store.record_if_new("native-webhook-key"),
-        "pending plugin work must not be misreported as a duplicate on the existing webhook path"
-    );
-    assert!(idempotency.rollback(&owner));
+    assert!(generic.record_if_new("native-webhook-key"));
+}
 
-    let replacement = match idempotency.begin("second") {
-        WebhookReservation::Owner(token) => token,
-        _ => panic!("rolling back frees the bounded pending slot"),
+/// A fake plugin worker for `path`: it reserves the message id the body
+/// names, commits it, and answers `delivered`, or `duplicate` when the store
+/// already holds the id. Mirrors the real worker's begin, enqueue, commit.
+fn deduplicating_worker(
+    registry: &zeroclaw_api::webhook::PluginWebhookRegistry,
+    path: &str,
+) -> zeroclaw_api::webhook::PluginWebhookRegistryLease {
+    use zeroclaw_api::webhook::WebhookReservation;
+
+    let (sink, mut receiver) = tokio::sync::mpsc::channel::<zeroclaw_api::webhook::RawWebhook>(8);
+    let lease = registry.start_generation();
+    assert!(lease.replace(HashMap::from([(path.to_string(), sink)])));
+    zeroclaw_spawn::spawn!(async move {
+        while let Some(request) = receiver.recv().await {
+            let message_id = String::from_utf8(request.body.clone()).expect("utf-8 id");
+            let idempotency = request
+                .idempotency
+                .as_ref()
+                .expect("plugin routes deduplicate");
+            let outcome = match idempotency.begin(&message_id) {
+                WebhookReservation::Owner(token) => {
+                    assert!(idempotency.commit(&token));
+                    "delivered"
+                }
+                WebhookReservation::Committed => "duplicate",
+                _ => "unexpected",
+            };
+            let _ = request
+                .reply
+                .send(Ok(WebhookOutcome::Body(outcome.to_string())));
+        }
+    });
+    lease
+}
+
+/// Deduplication lasts exactly one gateway run, as when the gateway built
+/// its own store: re-registering a plugin's route keeps it, and the next
+/// gateway run, which gets a fresh store from the daemon, starts empty.
+#[tokio::test]
+async fn plugin_webhook_deduplication_lasts_one_gateway_run() {
+    use zeroclaw_api::webhook::PluginWebhookRegistry;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let registry = Arc::new(PluginWebhookRegistry::new());
+    let peer = SocketAddr::from(([203, 0, 113, 9], 30_400));
+    let deliver = |router: Router| async move {
+        let response = router
+            .oneshot(plugin_webhook_request("fixture", "message-1", peer, None))
+            .await
+            .expect("plugin route is infallible");
+        assert_eq!(response.status(), StatusCode::OK);
+        response_text(response).await
     };
-    assert!(idempotency.commit(&replacement));
-    let entries = store.entries.lock();
-    assert_eq!(entries.pending.len(), 0);
-    assert_eq!(entries.committed.len(), 1);
-    assert!(entries.committed.contains_key(replacement.key()));
+
+    // First gateway run.
+    let first_run = Arc::new(WebhookReservationStore::new(Duration::from_secs(300), 8));
+    let router = || {
+        plugin_webhook_test_router_with(
+            admin_paircode_state(&tmp, false, false),
+            Arc::clone(&registry),
+            Arc::clone(&first_run),
+        )
+    };
+    let _first_worker = deduplicating_worker(&registry, "fixture");
+    assert_eq!(deliver(router()).await, "delivered");
+    assert_eq!(deliver(router()).await, "duplicate");
+
+    // The channel supervisor re-registers the route (a new route generation,
+    // as on a plugin restart) while the gateway keeps running.
+    let _second_worker = deduplicating_worker(&registry, "fixture");
+    assert_eq!(
+        deliver(router()).await,
+        "duplicate",
+        "re-registering the route keeps this run's deduplication"
+    );
+
+    // The next gateway run gets a fresh store.
+    let next_run = plugin_webhook_test_router_with(
+        admin_paircode_state(&tmp, false, false),
+        Arc::clone(&registry),
+        crate::plugin_webhook_reservations(&zeroclaw_config::schema::Config::default()),
+    );
+    assert_eq!(
+        deliver(next_run).await,
+        "delivered",
+        "a new gateway run starts with empty deduplication"
+    );
+}
+
+/// The generic routes and plugin deliveries of one gateway run share one
+/// committed-key budget, as they did when the gateway owned both: with room
+/// for one key, recording either kind evicts the other, in both orders. The
+/// stores are built the way the gateway builds them for a run.
+#[test]
+fn review_committed_capacity_preserves_cross_ingress_eviction() {
+    use zeroclaw_api::webhook::WebhookReservation;
+    fn replay_after_other_kind(plugin_first: bool) -> bool {
+        let ttl = Duration::from_secs(300);
+        let reservations = Arc::new(zeroclaw_api::webhook::WebhookReservationStore::new(ttl, 1));
+        let generic = crate::generic_webhook_idempotency(&reservations);
+        let plugin = plugin_webhook_idempotency(reservations, "fixture");
+        let generic_key = crate::idempotency_storage_key(None, "review-generic");
+        let commit_plugin = || {
+            let owner = match plugin.begin("review-plugin") {
+                WebhookReservation::Owner(owner) => owner,
+                _ => panic!("first plugin delivery must be new"),
+            };
+            assert!(plugin.commit(&owner));
+        };
+        if plugin_first {
+            commit_plugin();
+            assert!(generic.record_if_new(&generic_key));
+            matches!(plugin.begin("review-plugin"), WebhookReservation::Owner(_))
+        } else {
+            assert!(generic.record_if_new(&generic_key));
+            commit_plugin();
+            generic.record_if_new(&generic_key)
+        }
+    }
+    let observed = (
+        replay_after_other_kind(true),
+        replay_after_other_kind(false),
+    );
+    assert_eq!(
+        observed,
+        (true, true),
+        "the single committed-key budget must preserve baseline eviction in both directions"
+    );
 }
