@@ -17445,7 +17445,9 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         }
         let expose_text_tool_protocol = compose_channel_mcp_prompt_sections(
             native_tools,
-            !config.model_text_extraction(&model_provider_ref).tool_calls,
+            !config
+                .model_text_extraction(agent.model_provider.as_str())
+                .tool_calls,
             &mut tool_descs,
             &mut deferred_section,
             &pinned_section,

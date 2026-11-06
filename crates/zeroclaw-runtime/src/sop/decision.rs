@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question};
+pub use zeroclaw_api::decision::{Answer, Answers, DecisionModel, Question};
 
 use super::types::{Sop, SopEvent, SopExecutionMode};
 

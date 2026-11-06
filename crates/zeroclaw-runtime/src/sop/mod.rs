@@ -32,7 +32,7 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use decision::{SopDecision, SopDecisionSpec};
+pub use decision::{Answer, Answers, DecisionModel, Question, SopDecision, SopDecisionSpec};
 pub use engine::{
     CancelOutcome, MaintenanceSummary, OrphanedRunSettlement, SopEngine,
     err_is_cancellation_persistence_retained, err_is_resume_at_capacity,

@@ -6179,7 +6179,7 @@ mod tests {
     use zeroclaw_config::schema::{
         AliasedAgentConfig, Config, CustomModelProviderConfig,
         DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS,
-        DelegateExecutionMode, DelegateTargetConfig, ModelProviderConfig, ModelRouteConfig,
+        DelegateExecutionMode, DelegateTargetConfig, ModelProviderConfig,
     };
     use zeroclaw_memory::{AgentScopedMemory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{

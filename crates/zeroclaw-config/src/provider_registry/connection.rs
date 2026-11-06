@@ -483,10 +483,10 @@ fn mask_connection_secrets(value: &mut Value) {
         Value::Object(object) => {
             for (key, child) in object {
                 if is_connection_secret_key(key) {
-                    if let Value::String(secret) = child {
-                        if !secret.is_empty() {
-                            *secret = MASKED_SECRET.to_owned();
-                        }
+                    if let Value::String(secret) = child
+                        && !secret.is_empty()
+                    {
+                        *secret = MASKED_SECRET.to_owned();
                     }
                 } else {
                     mask_connection_secrets(child);
