@@ -664,6 +664,13 @@ impl App {
 
         if self.section == ConfigSection::Zerocode {
             self.zerocode.draw(frame, body);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    self.zerocode.bottom_hint(),
+                    theme::dim_style(),
+                )),
+                chunks[3],
+            );
             return;
         }
 
@@ -1232,10 +1239,10 @@ impl App {
         }
         self.status_msg = None;
 
-        // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
-        // zerocode) from anywhere — neither is bound inside the daemon
-        // editor or the zerocode pane, so there is no shadowing.
-        if !self.editor_owns_key(&key)
+        // Section bindings cycle zeroclaw ↔ zerocode unless the active
+        // editor or literal text input owns the key.
+        if !self.binding_query_claims_key(&key)
+            && !self.editor_owns_key(&key)
             && !(self.wants_text_input()
                 && matches!(key.code, KeyCode::Char(_)) // keyguard: literal text must not trigger a list navigation binding.
                 && !key
@@ -1346,6 +1353,7 @@ impl App {
     fn cycle_section(&mut self, delta: isize) {
         self.cancel_alias_rename();
         self.deactivate_filter();
+        self.zerocode.finish_binding_query_edit();
         let i = CONFIG_SECTIONS
             .iter()
             .position(|s| *s == self.section)
@@ -1400,6 +1408,7 @@ impl App {
                     self.cancel_alias_rename();
                 }
                 self.deactivate_filter();
+                self.zerocode.finish_binding_query_edit();
                 self.section = CONFIG_SECTIONS[idx];
                 return Ok(());
             }
@@ -5974,6 +5983,14 @@ impl App {
         }
     }
 
+    pub(crate) fn binding_query_claims_key(&self, key: &KeyEvent) -> bool {
+        self.section == ConfigSection::Zerocode && self.zerocode.binding_query_claims_key(key)
+    }
+
+    pub(crate) fn finish_binding_query_edit(&mut self) {
+        self.zerocode.finish_binding_query_edit();
+    }
+
     pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
         self.section == ConfigSection::Zeroclaw
             && self.zeroclaw_pane == ZeroclawPane::Detail
@@ -6570,6 +6587,180 @@ fn edit_in_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep process-wide keymap overrides serialized through current-thread UI calls.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn client_binding_query_owns_printable_outer_keys_and_paste() {
+        use crate::keymap::{Chord, ConfigTabAction as A, RebindableActions};
+        let _g = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut manager = App::new(rpc, dir.path());
+        manager.section = ConfigSection::Zerocode;
+        // Drive the production pane API to Bindings, the fourth section.
+        for _ in 0..3 {
+            manager
+                .zerocode
+                .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        manager
+            .zerocode
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let mut term = Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap();
+        manager
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            A::SectionNext.key().split_once('.').unwrap().1,
+            vec![Chord::char('d'), Chord::key(KeyCode::Tab)],
+        );
+        assert_eq!(
+            A::from_chord(&KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(A::SectionNext)
+        );
+        manager.filter = Some("daemon filter".into());
+        manager.edit_buf = "daemon draft".into();
+        let before = std::fs::read(crate::config::config_path(dir.path())).unwrap();
+        manager
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        manager.handle_paste("qj?\n").await;
+        assert!(manager.section == ConfigSection::Zerocode);
+        assert!(manager.wants_text_input());
+        assert_eq!(manager.filter.as_deref(), Some("daemon filter"));
+        assert_eq!(manager.edit_buf, "daemon draft");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("dqj?"), "{text}");
+        assert!(
+            text.contains("browse matches"),
+            "client footer must render: {text}"
+        );
+        assert_eq!(
+            before,
+            std::fs::read(crate::config::config_path(dir.path())).unwrap()
+        );
+        manager
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.section == ConfigSection::Zeroclaw);
+        manager.cycle_section(1);
+        assert!(!manager.zerocode.wants_text_input());
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn connection_editor_hints_follow_outer_section_routing() {
+        use crate::keymap::{
+            Chord, ConfigEditorAction as E, ConfigTabAction as A, RebindableActions,
+        };
+        let _g = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut manager = App::new(rpc, dir.path());
+        manager.section = ConfigSection::Zerocode;
+        // Connection is the sixth section; its first field is the URI editor.
+        for _ in 0..5 {
+            manager
+                .zerocode
+                .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        for _ in 0..2 {
+            manager
+                .zerocode
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        assert!(manager.zerocode.wants_text_input());
+        let save = Chord::with(KeyCode::F(9), KeyModifiers::ALT);
+        crate::keymap::overrides::set_row(
+            "config_editor",
+            E::Save.key().split_once('.').unwrap().1,
+            vec![Chord::key(KeyCode::Tab), save.clone()],
+        );
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            A::SectionNext.key().split_once('.').unwrap().1,
+            vec![Chord::char('n'), Chord::key(KeyCode::Tab)],
+        );
+        let entries = manager.zerocode.help_context().entries;
+        let advertised = |key: &str, action: &str| {
+            entries
+                .iter()
+                .any(|e| e.keys.contains(&key.to_string()) && e.action == crate::i18n::t(action))
+        };
+        assert!(advertised(&save.display(), "zc-config-footer-action-save"));
+        assert!(advertised("Tab", "zc-config-footer-action-save"));
+        assert!(!advertised("Tab", "zc-zerocode-hint-section"));
+        assert!(!advertised("n", "zc-zerocode-hint-section"));
+        let mut term = Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap();
+        manager.handle_paste("ws://127.0.0.1:42617").await;
+        manager
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.section == ConfigSection::Zerocode);
+        assert!(!manager.zerocode.wants_text_input());
+        assert_eq!(
+            crate::config::ensure_and_load(dir.path())
+                .unwrap()
+                .connection
+                .wss
+                .uri
+                .as_deref(),
+            Some("ws://127.0.0.1:42617")
+        );
+        manager
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.section == ConfigSection::Zeroclaw);
+        crate::keymap::overrides::reset();
+    }
 
     #[test]
     fn mouse_shift_capture_uses_xtshiftescape_sequences() {

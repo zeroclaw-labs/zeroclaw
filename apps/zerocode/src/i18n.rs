@@ -514,7 +514,7 @@ mod tests {
             // Section tabs
             "zc-zerocode-tab-todo-tracker",
             // Todo tracker section
-            "zc-zerocode-tracker-title",
+            "zc-zerocode-tracker-panel-title",
             "zc-zerocode-tracker-enabled",
             "zc-zerocode-tracker-enabled-at-start",
             "zc-zerocode-tracker-location",
@@ -533,7 +533,7 @@ mod tests {
             "zc-zerocode-config-positive-required",
             "zc-zerocode-config-save-mismatch",
             // Help hints
-            "zc-zerocode-help-todo-tracker",
+            "zc-zerocode-hint-toggle",
         ];
         for key in KEYS {
             let value = map
@@ -826,6 +826,69 @@ mod tests {
             assert!(
                 timeout.contains("--config-dir"),
                 "`{locale}` lost the --config-dir guidance: {timeout}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_settings_hints_resolve_in_every_catalogue_without_english_fallback() {
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+        for (locale, source) in catalogues {
+            let bundle = build_ftl_bundle(source, locale);
+            for key in [
+                "zc-zerocode-bindings-title",
+                "zc-zerocode-locale-title",
+                "zc-zerocode-binding-no-results",
+                "zc-zerocode-binding-unbound",
+                "zc-zerocode-hint-browse-matches",
+                "zc-zerocode-hint-back",
+                "zc-zerocode-hint-apply-theme",
+                "zc-zerocode-hint-assign-theme",
+                "zc-zerocode-hint-pick-theme",
+                "zc-zerocode-hint-clear-theme",
+                "zc-zerocode-hint-apply-preset",
+                "zc-zerocode-hint-rebind",
+                "zc-zerocode-hint-search",
+                "zc-zerocode-hint-locale",
+                "zc-zerocode-hint-connection",
+                "zc-zerocode-hint-toggle",
+                "zc-zerocode-hint-section",
+                "zc-zerocode-connection-panel-title",
+                "zc-zerocode-tracker-panel-title",
+                "zc-zerocode-context-sections",
+                "zc-zerocode-context-detail",
+            ] {
+                let rendered = format_ftl_message(&bundle, key, &[])
+                    .unwrap_or_else(|| panic!("{locale} must define {key}"));
+                assert!(!rendered.is_empty(), "{locale}: {key}");
+            }
+            let query = format_ftl_message(
+                &bundle,
+                "zc-zerocode-binding-query",
+                &[("query", "ctrl"), ("matched", "33"), ("total", "187")],
+            )
+            .unwrap_or_else(|| panic!("{locale} must format the search query"));
+            assert!(
+                query.contains("ctrl") && query.contains("33/187"),
+                "{locale}: {query}"
+            );
+            let level = format_ftl_message(&bundle, "zc-zerocode-context-detail", &[]).unwrap();
+            let page = format_ftl_message(&bundle, "zc-zerocode-tab-bindings", &[]).unwrap();
+            let context = format_ftl_message(
+                &bundle,
+                "zc-zerocode-footer-context",
+                &[("level", &level), ("page", &page)],
+            )
+            .unwrap_or_else(|| panic!("{locale} must format the footer context"));
+            assert!(
+                context.contains(&level) && context.contains(&page),
+                "{locale}: {context}"
             );
         }
     }
