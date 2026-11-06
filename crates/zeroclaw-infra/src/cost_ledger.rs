@@ -169,28 +169,49 @@ impl CostLedger {
             let bytes = fs::read(&source)
                 .with_context(|| format!("read legacy cost ledger {}", source.display()))?;
             let mut records = Vec::new();
-            for line in bytes.split(|byte| *byte == b'\n') {
+            let mut rejected_records = 0;
+            let mut first_rejection = None;
+            for (line_number, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
                 if !line.iter().all(u8::is_ascii_whitespace) {
                     for value in
                         serde_json::Deserializer::from_slice(line).into_iter::<serde_json::Value>()
                     {
-                        let mut value = value?;
-                        // Master's session_id is a tracker UUID. Only its
-                        // conversation_id can establish actual session ownership.
-                        let fields = value
-                            .as_object_mut()
-                            .context("legacy cost record is not an object")?;
-                        fields.remove("session_id");
-                        if let Some(session) = fields.remove("conversation_id") {
-                            let session = match session {
-                                serde_json::Value::String(id) => serde_json::Value::String(
-                                    crate::session_events::upgrade::session_id(&id)?.to_string(),
-                                ),
-                                other => other,
-                            };
-                            fields.insert("session_id".into(), session);
+                        let normalized = (|| -> Result<Vec<u8>> {
+                            let mut value = value?;
+                            let fields = value
+                                .as_object_mut()
+                                .context("legacy cost record is not an object")?;
+                            fields
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .context("legacy cost record has no id")?;
+                            // Master's session_id is a tracker UUID. Only its
+                            // conversation_id establishes actual session ownership.
+                            fields.remove("session_id");
+                            if let Some(session) = fields.remove("conversation_id") {
+                                let session = match session {
+                                    serde_json::Value::String(id) => serde_json::Value::String(
+                                        crate::session_events::upgrade::session_id(&id)?
+                                            .to_string(),
+                                    ),
+                                    serde_json::Value::Null => serde_json::Value::Null,
+                                    _ => {
+                                        bail!("legacy cost conversation_id is not a string or null")
+                                    }
+                                };
+                                fields.insert("session_id".into(), session);
+                            }
+                            Ok(serde_json::to_vec(&value)?)
+                        })();
+                        match normalized {
+                            Ok(record) => records.push(record),
+                            Err(error) => {
+                                rejected_records += 1;
+                                first_rejection
+                                    .get_or_insert_with(|| (line_number + 1, error.to_string()));
+                            }
                         }
-                        records.push(serde_json::to_vec(&value)?);
                     }
                 }
             }
@@ -198,7 +219,21 @@ impl CostLedger {
             // Reuse record IDs to resume an interrupted import even when the
             // target already contains imported or newly recorded usage.
             self.import_records(&records)?;
-            archive_legacy(&source)?;
+            let backup = archive_legacy(&source)?;
+            if let Some((line, error)) = first_rejection {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(serde_json::json!({
+                            "backup": backup.display().to_string(),
+                            "rejected_records": rejected_records,
+                            "first_rejected_line": line,
+                            "error": error,
+                        })),
+                    "Migrated readable legacy cost records; rejected data remains in the original backup"
+                );
+            }
             break;
         }
         Ok(())
@@ -341,7 +376,7 @@ impl CostLedger {
     }
 }
 
-fn archive_legacy(path: &Path) -> Result<()> {
+fn archive_legacy(path: &Path) -> Result<PathBuf> {
     let mut backup = path.as_os_str().to_os_string();
     backup.push(".backup");
     let mut candidate = PathBuf::from(&backup);
@@ -350,8 +385,8 @@ fn archive_legacy(path: &Path) -> Result<()> {
         candidate = PathBuf::from(format!("{}.{}", backup.to_string_lossy(), index));
         index += 1;
     }
-    fs::rename(path, candidate)?;
-    Ok(())
+    fs::rename(path, &candidate)?;
+    Ok(candidate)
 }
 
 #[cfg(test)]
@@ -424,6 +459,58 @@ mod tests {
         assert_eq!(records.len(), 3);
         let value: serde_json::Value = serde_json::from_slice(&records[2]).unwrap();
         assert_eq!(value["session_id"], "session");
+    }
+
+    #[test]
+    fn installation_migrates_readable_costs_and_preserves_damaged_source() {
+        use crate::session_events::{installation::NativeBackend, upgrade};
+
+        for backend in
+            std::iter::once(NativeBackend::Sqlite).chain(cfg!(unix).then_some(NativeBackend::Jsonl))
+        {
+            let dir = TempDir::new().unwrap();
+            // Simulate a prior import that persisted one record before stopping.
+            let ledger = CostLedger::open_for_backend(dir.path(), backend).unwrap();
+            ledger.append(&record("a"), File::sync_all).unwrap();
+            let legacy = dir.path().join("state/costs.jsonl");
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            let mut original = legacy_record("a", Some("gw_session"));
+            original.extend_from_slice(b"\ninvalid json\nnull\n{\"id\":9}\n");
+            original.extend(legacy_record("b", Some("rpc_session")));
+            // A missing newline must not lose the complete record before a
+            // crash-truncated suffix. The following line is still recoverable.
+            original.extend_from_slice(b"{\"id\":\n");
+            original.extend(legacy_record("c", None));
+            original.extend_from_slice(b"\n{\"id\":\"truncated-\xff");
+            fs::write(&legacy, &original).unwrap();
+
+            upgrade::upgrade_installation(dir.path(), backend, |_| "test-agent".into()).unwrap();
+            let ledger = CostLedger::open_for_backend(dir.path(), backend).unwrap();
+            let values: Vec<serde_json::Value> = ledger
+                .read_records()
+                .unwrap()
+                .iter()
+                .map(|raw| serde_json::from_slice(raw).unwrap())
+                .collect();
+            assert_eq!(values.len(), 3);
+            assert_eq!(values[0]["id"], "a");
+            assert_eq!(values[1]["id"], "b");
+            assert_eq!(values[1]["session_id"], "session");
+            assert_eq!(values[2]["id"], "c");
+            assert!(values[2].get("session_id").is_none());
+            assert!(!legacy.exists());
+            assert_eq!(
+                fs::read(legacy.with_extension("jsonl.backup")).unwrap(),
+                original
+            );
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &fs::read(dir.path().join("sessions/session-format.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["phase"], "ready");
+            upgrade::upgrade_installation(dir.path(), backend, |_| "test-agent".into()).unwrap();
+            assert_eq!(ledger.read_records().unwrap().len(), 3);
+        }
     }
 
     #[test]
