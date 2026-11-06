@@ -1,6 +1,6 @@
 //! WeChat personal iLink Bot channel.
 
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit, block_padding::Pkcs7};
+use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyInit, block_padding::Pkcs7};
 use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine;
@@ -445,7 +445,7 @@ fn encrypt_aes_ecb(plaintext: &[u8], key: &[u8; 16]) -> anyhow::Result<Vec<u8>> 
     let mut buffer = vec![0u8; padded_size];
     buffer[..plaintext.len()].copy_from_slice(plaintext);
     let encrypted = Aes128EcbEnc::new(&(*key).into())
-        .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+        .encrypt_padded::<Pkcs7>(&mut buffer, plaintext.len())
         .map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -462,7 +462,7 @@ fn encrypt_aes_ecb(plaintext: &[u8], key: &[u8; 16]) -> anyhow::Result<Vec<u8>> 
 fn decrypt_aes_ecb(ciphertext: &[u8], key: &[u8; 16]) -> anyhow::Result<Vec<u8>> {
     let mut buffer = ciphertext.to_vec();
     Aes128EcbDec::new(&(*key).into())
-        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .decrypt_padded::<Pkcs7>(&mut buffer)
         .map(|decrypted| decrypted.to_vec())
         .map_err(|e| {
             ::zeroclaw_log::record!(

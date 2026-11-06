@@ -21,8 +21,8 @@
 // produce `enc2:` (ChaCha20-Poly1305).
 
 use anyhow::{Context, Result};
-use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
-use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::aead::{Aead, Generate, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::fmt::Debug;
@@ -254,10 +254,10 @@ impl SecretStore {
         }
 
         self.get_key(|key| {
-            let key = Key::from_slice(key);
-            let cipher = ChaCha20Poly1305::new(key);
+            let cipher = ChaCha20Poly1305::new_from_slice(key)
+                .context("Invalid secret encryption key length")?;
 
-            let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+            let nonce = Nonce::generate();
             let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -347,13 +347,13 @@ impl SecretStore {
         );
 
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes).context("Invalid secret nonce length")?;
 
         self.get_key(|key| {
-            let key = Key::from_slice(key);
-            let cipher = ChaCha20Poly1305::new(key);
+            let cipher = ChaCha20Poly1305::new_from_slice(key)
+                .context("Invalid secret encryption key length")?;
 
-            let plaintext_bytes = cipher.decrypt(nonce, ciphertext).map_err(|e| {
+            let plaintext_bytes = cipher.decrypt(&nonce, ciphertext).map_err(|e| {
                 let backend = self.key_source.backend_name();
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -801,10 +801,10 @@ fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
 
 /// Generate a random 256-bit key using the OS CSPRNG.
 ///
-/// Uses `OsRng` (via `getrandom`) directly, providing full 256-bit entropy
+/// Uses the operating-system RNG (via `getrandom`), providing full 256-bit entropy
 /// without the fixed version/variant bits that UUID v4 introduces.
 fn generate_random_key() -> Vec<u8> {
-    ChaCha20Poly1305::generate_key(&mut OsRng).to_vec()
+    chacha20poly1305::Key::generate().to_vec()
 }
 
 /// Hex-encode bytes to a lowercase hex string.
@@ -1003,6 +1003,50 @@ mod tests {
         let mut perms = fs::metadata(&op_path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&op_path, perms).unwrap();
+    }
+
+    #[test]
+    fn enc2_ciphertext_from_chacha20poly1305_010_remains_compatible() {
+        // Synthetic fixture generated with chacha20poly1305 0.10.1, a fixed
+        // 0x42 key and 0x24 nonce. Matching ciphertext also protects rollback.
+        const FIXTURE: &str = concat!(
+            "enc2:242424242424242424242424",
+            "8768e87e8aaa31caec07e1ff9d3a6efd9cbb2cc5eea4c87e99d1b1b1f70f25a7ccf5c5ec"
+        );
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        store.encrypt("initialize-fixture-key-file").unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        let key = [0x42u8; 32];
+        fs::write(&key_path, hex_encode(&key)).unwrap();
+        let original_key = fs::read(&key_path).unwrap();
+
+        assert_eq!(store.decrypt(FIXTURE).unwrap(), "compatibility-secret");
+        assert_eq!(fs::read(&key_path).unwrap(), original_key);
+
+        let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let nonce = Nonce::from([0x24; NONCE_LEN]);
+        let ciphertext = cipher
+            .encrypt(&nonce, b"compatibility-secret".as_ref())
+            .unwrap();
+        let old_blob = hex_decode(&FIXTURE[5..]).unwrap();
+        assert_eq!(ciphertext, old_blob[NONCE_LEN..]);
+
+        let mut tampered = old_blob.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(
+            store
+                .decrypt(&format!("enc2:{}", hex_encode(&tampered)))
+                .is_err()
+        );
+        assert!(
+            store
+                .decrypt(&format!(
+                    "enc2:{}",
+                    hex_encode(&old_blob[..old_blob.len() - 1])
+                ))
+                .is_err()
+        );
     }
 
     // ── SecretStore basics ─────────────────────────────────────

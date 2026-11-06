@@ -20,7 +20,7 @@ anyhow = "1.0"
 clap = { version = "4.5", optional = true, default-features = false, features = ["std", "derive"] }
 # OnboardUi needs dyn-compat; native AFIT isn't dyn-safe. Already built for api/channels/runtime.
 async-trait = "0.1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = { workspace = true, features = ["getrandom"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
 hex = "0.4"
