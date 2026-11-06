@@ -138,6 +138,25 @@ test('clicking the active microphone keeps the final transcript emitted on stop'
   await act(async () => { renderer.unmount(); });
 });
 
+test('sending cancels capture and discards late text for the submitted draft', async () => {
+  const captureRef = React.createRef<() => void>();
+  const transcripts: string[] = [];
+  let renderer!: ReactTestRenderer;
+  await act(async () => {
+    renderer = create(createElement(Controls, { messages: [], hydrated: true, typing: false,
+      onTranscript: text => transcripts.push(text), captureRef }), options);
+  });
+  const mic = () => renderer.root.findAllByType('button')[0]!;
+  await act(async () => { await mic().props.onClick(); });
+  assert.equal(mic().props['aria-pressed'], true);
+  const late = capture.onresult!;
+  await act(async () => { captureRef.current?.(); });
+  late({ resultIndex: 0, results: [{ isFinal: true, 0: { transcript: 'Late text' } }] });
+  assert.deepEqual(transcripts, []);
+  assert.equal(mic().props['aria-pressed'], false);
+  await act(async () => { renderer.unmount(); });
+});
+
 test('local dictation appends final text; hiding prevents stale results; unavailable local never starts capture', async () => {
   const transcripts: string[] = [];
   const renderer = await mount(text => transcripts.push(text));

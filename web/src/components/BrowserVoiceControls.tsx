@@ -1,11 +1,12 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type Ref } from 'react';
 import { Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { ChatMessage } from '@/contexts/AgentContext';
 import { t } from '@/lib/i18n';
 import { localRecognitionStatus, recognitionConstructor, shortPressAction, useBrowserVoices, useVoicePreferences, type Recognition } from '@/lib/browserVoice';
 
-export default function BrowserVoiceControls({ messages, hydrated, typing, onTranscript }: {
+export default function BrowserVoiceControls({ messages, hydrated, typing, onTranscript, captureRef }: {
   messages: ChatMessage[]; hydrated: boolean; typing: boolean; onTranscript: (text: string) => void;
+  captureRef?: Ref<() => void>;
 }) {
   const { preferences: prefs, ready } = useVoicePreferences();
   const voices = useBrowserVoices();
@@ -39,6 +40,7 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
     }
     setListening(false);
   };
+  useImperativeHandle(captureRef, () => stopCapture);
   const stopAll = () => { stopCapture(); stopSpeech(); };
   const speak = (text: string) => {
     if (!ready || !prefs.reading || !visible() || recognition.current) return false;
