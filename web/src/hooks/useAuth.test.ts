@@ -86,6 +86,7 @@ interface Recorded {
 let requests: Recorded[] = [];
 let health = { require_pairing: true, paired: true };
 let providers: string[] = [];
+let viaRelay = false;
 let sessionResponse: () => Response = () => new Response("", { status: 401 });
 // Paths whose next request meets a gateway generation that is stopping for a reload.
 let restartingOnce = new Set<string>();
@@ -113,6 +114,7 @@ globalThis.fetch = async (input, init) => {
     return json(200, {
       pairing_required: true,
       oidc: providers.map((alias) => ({ alias, provider: `oidc.${alias}` })),
+      ...(viaRelay ? { via_relay: true } : {}),
     });
   }
   if (url.endsWith("/api/auth/session")) return sessionResponse();
@@ -188,6 +190,7 @@ beforeEach(() => {
   popupBlocked = false;
   health = { require_pairing: true, paired: true };
   providers = [];
+  viaRelay = false;
   sessionResponse = () => new Response("", { status: 401 });
   restartingOnce = new Set();
   routes = new Map();
@@ -217,12 +220,27 @@ test("sign-in off: the pairing screen, no provider, no session lookup", async ()
   assert.ok(!requests.some((r) => r.url.endsWith("/api/auth/session")));
 });
 
-test("a paired browser starts authenticated without asking the gateway", async () => {
+test("a paired browser starts authenticated, asking the gateway only whether a relay carries it", async () => {
   storage.setItem("zeroclaw_token", "tok");
   await mount();
   assert.equal(state().isAuthenticated, true);
   assert.equal(state().mode, "pairing");
-  assert.equal(requests.length, 0);
+  assert.equal(state().viaRelay, false);
+  assert.deepEqual(
+    requests.map((r) => r.url.replace(/^https?:\/\/[^/]+/, "")),
+    ["/api/auth/methods"],
+  );
+  const [methods] = requests;
+  assert.ok(methods);
+  assert.equal(methods.headers.get("Authorization"), null);
+});
+
+test("a paired browser that reloads through a relay keeps the relay notice", async () => {
+  storage.setItem("zeroclaw_token", "tok");
+  viaRelay = true;
+  await mount();
+  assert.equal(state().isAuthenticated, true);
+  assert.equal(state().viaRelay, true);
 });
 
 test("a paired browser whose token is refused offers the sign-in providers", async () => {

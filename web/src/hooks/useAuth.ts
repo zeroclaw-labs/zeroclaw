@@ -161,8 +161,23 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // On mount: decide between a stored pairing token, an open gateway, a
   // signed-in session and the sign-in screen.
   useEffect(() => {
-    if (checkAuth()) return; // already have a token, no need to check
     let cancelled = false;
+    if (checkAuth()) {
+      // A stored token needs no sign-in check, but the page still has to say
+      // when a relay carries this connection, so ask only that.
+      if (!isTauri()) {
+        fetchAuthMethods()
+          .then((methods) => {
+            if (!cancelled && methods?.via_relay) setViaRelay(true);
+          })
+          .catch(() => {
+            // The notice stays off; nothing else depends on this answer.
+          });
+      }
+      return () => {
+        cancelled = true;
+      };
+    }
     resolveInitialAuth({
       hasToken: false,
       desktop: isTauri(),
