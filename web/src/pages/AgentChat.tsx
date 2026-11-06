@@ -1,3 +1,4 @@
+import BrowserVoiceControls from '@/components/BrowserVoiceControls';
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
@@ -308,18 +309,21 @@ export function AgentChatInner({
     }
   }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading]);
 
+  const cancelVoiceCapture = useRef<(() => void) | null>(null);
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed) return;
+    const command = isSlashCommand(trimmed);
+    if (!command && !connected) return;
+    cancelVoiceCapture.current?.();
 
     // Slash commands are dispatched BEFORE the connectivity check so purely
     // local commands like /help still work during transient disconnects.
     // Network-dependent commands (/clear, /model) self-recover via their own
     // reconnect paths inside the context. #7137
-    if (isSlashCommand(trimmed)) {
+    if (command) {
       runCommand(trimmed);
     } else {
-      if (!connected) return;
       // `//` is the documented escape for a literal leading slash (#7223);
       // strip one `/` so `//foo` is sent to the agent as `/foo`.
       sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
@@ -760,6 +764,7 @@ export function AgentChatInner({
           </div>
         )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
+          <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
           <input
             ref={fileInputRef}
             type="file"
