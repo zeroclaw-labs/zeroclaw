@@ -251,7 +251,7 @@ impl ProviderLlmAdapter {
                 let resolver = Arc::new(move |model: &str| {
                     policy_config.model_text_extraction(model).reasoning
                 }) as Arc<dyn Fn(&str) -> bool + Send + Sync>;
-                zeroclaw_api::scope_text_extraction(
+                let text = zeroclaw_api::scope_text_extraction(
                     Some(resolver),
                     ProviderDispatch::new(Arc::from(provider)).chat_with_system_with_sampling(
                         system.as_deref(),
@@ -260,7 +260,17 @@ impl ProviderLlmAdapter {
                         sampling,
                     ),
                 )
-                .await
+                .await?;
+                // The provider API applies the same policy while building its
+                // response. Repeat the final normalization at this typed
+                // capability boundary so an adapter implementation that
+                // returns raw text cannot turn a reasoning-only completion
+                // into visible SOP output or bypass the empty check.
+                Ok(if config.model_text_extraction(&identity.model_id).reasoning {
+                    zeroclaw_api::model_provider::strip_think_tags(&text)
+                } else {
+                    text
+                })
             },
             GENERATE_TIMEOUT,
             "model call",

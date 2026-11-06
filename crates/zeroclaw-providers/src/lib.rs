@@ -1996,6 +1996,25 @@ fn create_resilient_model_provider_from_ref_with_model_override(
             .as_ref()
             .and_then(|selection| selection.model_entry),
     );
+    let canonical_ref = zeroclaw_config::provider_registry::ModelRef::from(name);
+    if config
+        .providers
+        .models
+        .canonical_model(&canonical_ref)
+        .is_some()
+    {
+        return Ok(crate::model::build_canonical_provider_with_options(
+            config,
+            &canonical_ref,
+            crate::model::ProviderOverrides {
+                model: primary_model_override,
+                api_key,
+            },
+            &options,
+            true,
+        )?
+        .provider);
+    }
     match config.providers.models.profile_ref(name) {
         Some((family, alias))
             if !family.contains(':') && config.providers.models.find(family, alias).is_some() =>

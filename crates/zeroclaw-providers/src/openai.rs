@@ -33,6 +33,9 @@ pub struct OpenAiModelProvider {
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -250,6 +253,9 @@ pub struct OpenAiBuilder {
     single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
 }
 
 impl OpenAiBuilder {
@@ -295,6 +301,23 @@ impl OpenAiBuilder {
         self
     }
 
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
+        self
+    }
+
     pub fn build(self) -> OpenAiModelProvider {
         OpenAiModelProvider {
             alias: self.alias,
@@ -304,6 +327,9 @@ impl OpenAiBuilder {
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
         }
     }
 }
@@ -320,6 +346,9 @@ impl OpenAiModelProvider {
             single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
         }
     }
 
@@ -471,11 +500,20 @@ impl OpenAiModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.read_timeout_disabled
+            && let Some(read_timeout) = self.read_timeout_secs
+        {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.openai",
-            self.timeout_secs,
-            10,
-        )
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 }
 
@@ -1033,6 +1071,9 @@ pub struct OpenAiResponsesModelProvider {
     /// unset or lower, and a higher value raises the idle bound to match.
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
 }
 
@@ -1054,6 +1095,9 @@ pub struct OpenAiResponsesBuilder {
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     extra_headers: std::collections::HashMap<String, String>,
 }
 
@@ -1103,6 +1147,23 @@ impl OpenAiResponsesBuilder {
         self
     }
 
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
+        self
+    }
+
     /// Set extra HTTP headers to include on every request. Reserved
     /// keys (e.g. `Authorization`) are dropped at request-build time —
     /// see [`OpenAiResponsesModelProvider`] for details.
@@ -1132,6 +1193,9 @@ impl OpenAiResponsesBuilder {
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
             timeout_secs: self.timeout_secs.unwrap_or(120),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
             extra_headers: self.extra_headers,
         }
     }
@@ -1149,6 +1213,9 @@ impl OpenAiResponsesModelProvider {
             max_tokens: None,
             reasoning_effort: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
         }
     }
@@ -1250,9 +1317,15 @@ impl OpenAiResponsesModelProvider {
 
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
-        let mut builder = Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .connect_timeout(std::time::Duration::from_secs(10));
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.read_timeout_disabled
+            && let Some(read_timeout) = self.read_timeout_secs
+        {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
@@ -1280,9 +1353,13 @@ impl OpenAiResponsesModelProvider {
 
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
-        let mut builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.read_timeout_disabled {
+            builder = builder.read_timeout(self.read_timeout_secs.map_or_else(
+                || super::stream_idle_timeout(self.timeout_secs).duration(),
+                std::time::Duration::from_secs,
+            ));
+        }
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }

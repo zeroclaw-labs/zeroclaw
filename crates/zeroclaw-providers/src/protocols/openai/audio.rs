@@ -68,9 +68,17 @@ pub(crate) struct TranscriptionClient {
 impl TranscriptionClient {
     pub(crate) async fn transcribe(&self, audio: &[u8], file_name: &str) -> Result<String> {
         let (file_name, mime) = crate::transcription::validate_audio(audio, file_name)?;
+        // The multipart wire format is shared with OpenAI, but transport
+        // attribution still follows the selected vendor so request metrics
+        // and rate-limit accounting do not classify Groq traffic as OpenAI.
+        let service = if self.endpoint.contains("groq.com") {
+            "transcription.groq"
+        } else {
+            "transcription.openai"
+        };
         let client = self
             .transport
-            .client(std::time::Duration::from_secs(120), "transcription.openai")?;
+            .client(std::time::Duration::from_secs(120), service)?;
         let form = TranscriptionRequest {
             model: &self.model,
             language: self.language.as_deref(),

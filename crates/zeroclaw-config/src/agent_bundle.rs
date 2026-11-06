@@ -1329,6 +1329,22 @@ fn carry_model_provider(
                 );
             }
         }
+        // Fallback edges are part of the model's admitted closure. Carry the
+        // exact TOML key as one table entry; dotted model names are opaque and
+        // must never be expanded into nested tables.
+        if let Some(targets) = config.providers.fallback.get(&canonical) {
+            let value = lookup(masked_root, &["providers", "fallback", trimmed])
+                .cloned()
+                .unwrap_or_else(|| {
+                    toml::Value::Array(
+                        targets
+                            .iter()
+                            .map(|target| toml::Value::String(target.as_str().to_owned()))
+                            .collect(),
+                    )
+                });
+            insert_at(out, &["providers", "fallback", trimmed], value);
+        }
         visited.push(trimmed.to_string());
         if let Some(targets) = config.providers.fallback.get(&canonical) {
             for target in targets {

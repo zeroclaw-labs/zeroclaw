@@ -21,6 +21,9 @@ pub struct OpenRouterModelProvider {
     alias: String,
     credential: Option<String>,
     timeout_secs: u64,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
     #[cfg(test)]
@@ -213,6 +216,9 @@ pub struct OpenRouterBuilder {
     alias: String,
     credential: Option<String>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
     #[cfg(test)]
@@ -237,6 +243,23 @@ impl OpenRouterBuilder {
         if secs > 0 {
             self.timeout_secs = Some(secs);
         }
+        self
+    }
+
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
         self
     }
 
@@ -266,6 +289,9 @@ impl OpenRouterBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
             max_tokens: self.max_tokens,
             extra_body: self.extra_body,
             #[cfg(test)]
@@ -282,6 +308,9 @@ impl OpenRouterModelProvider {
             alias: alias.to_string(),
             credential: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
             max_tokens: None,
             extra_body: None,
             #[cfg(test)]
@@ -551,18 +580,38 @@ impl OpenRouterModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let mut builder =
+            Client::builder().connect_timeout(Duration::from_secs(OPENROUTER_CONNECT_TIMEOUT_SECS));
+        if !self.timeout_disabled {
+            builder = builder.timeout(Duration::from_secs(self.timeout_secs));
+        }
+        if let Some(read_timeout) = self.read_timeout_secs {
+            builder = builder.read_timeout(Duration::from_secs(read_timeout));
+        }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.openrouter",
-            self.timeout_secs,
-            OPENROUTER_CONNECT_TIMEOUT_SECS,
-        )
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 
     /// HTTP client for streaming SSE connections. Streaming responses can
     /// legitimately outlive the normal request timeout while still making
     /// progress, so bound only connection setup and idle body reads here.
     fn streaming_http_client(&self) -> Client {
-        self.streaming_http_client_with_idle_timeout(STREAM_IDLE_TIMEOUT)
+        if self.read_timeout_disabled {
+            let builder = Client::builder()
+                .connect_timeout(Duration::from_secs(OPENROUTER_CONNECT_TIMEOUT_SECS));
+            let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                builder,
+                "model_provider.openrouter",
+            );
+            return builder.build().unwrap_or_else(|_| Client::new());
+        }
+        self.streaming_http_client_with_idle_timeout(
+            self.read_timeout_secs
+                .map_or(STREAM_IDLE_TIMEOUT, Duration::from_secs),
+        )
     }
 
     fn streaming_http_client_with_idle_timeout(&self, idle_timeout: Duration) -> Client {

@@ -937,6 +937,32 @@ fn reconcile_embedding_identity(
             }
         },
         Some(stored) if stored == *current => EmbeddingIdentityOutcome::Match,
+        Some(stored)
+            if stored.model == current.model
+                && stored.dimensions == current.dimensions
+                && current
+                    .provider
+                    .strip_prefix(&format!("{}:", stored.provider))
+                    .is_some() =>
+        {
+            // Older stores stamped only the provider name. The current
+            // OpenAI-compatible identity also includes an endpoint/header
+            // digest, so adopt that richer identity without invalidating
+            // vectors whose model and dimensions are unchanged.
+            match mem.record_embedding_identity(current) {
+                Ok(()) => EmbeddingIdentityOutcome::Match,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "memory: failed to migrate legacy embedding identity; will retry next startup"
+                    );
+                    EmbeddingIdentityOutcome::Failed
+                }
+            }
+        }
         Some(stored) => match mem.invalidate_embeddings_for_identity_change(current) {
             Ok(invalidated) => {
                 ::zeroclaw_log::record!(

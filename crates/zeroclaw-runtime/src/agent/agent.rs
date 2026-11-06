@@ -5873,6 +5873,114 @@ mod tests {
         }
     }
 
+    fn build_test_agent(
+        initial_provider_name: &str,
+        initial_model_name: &str,
+        switch_config: Option<ProviderSwitchConfig>,
+    ) -> Agent {
+        let provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, Path::new("/tmp"), None)
+                .expect("memory creation"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut builder = Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(Path::new("/tmp").to_path_buf())
+            .model_provider_name(initial_provider_name.to_string())
+            .model_name(initial_model_name.to_string());
+        if let Some(cfg) = switch_config {
+            builder = builder.provider_switch_config(cfg);
+        }
+        builder.build().expect("agent builder")
+    }
+
+    fn generation_config(window: usize, model: &str) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.providers.models.custom.insert(
+            "large".to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1/v1".to_string()),
+                    model: Some(model.to_string()),
+                    context_window: Some(window),
+                    ..zeroclaw_config::schema::ModelProviderConfig::default()
+                },
+            },
+        );
+        cfg
+    }
+
+    fn direct_live_generation_config(
+        data_dir: &Path,
+        provider_alias: &str,
+        model: &str,
+        window: usize,
+        history_cap: usize,
+    ) -> zeroclaw_config::schema::Config {
+        let provider_ref = format!("custom.{provider_alias}");
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: data_dir.join("config.toml"),
+            data_dir: data_dir.to_path_buf(),
+            memory: zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.providers.models.custom.insert(
+            provider_alias.to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:1/v1".to_string()),
+                    model: Some(model.to_string()),
+                    context_window: Some(window),
+                    ..Default::default()
+                },
+            },
+        );
+        cfg.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        cfg.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                context_compact_ratio: Some(0.5),
+                max_history_messages: Some(history_cap),
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "direct".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: provider_ref.clone().into(),
+                risk_profile: "default".into(),
+                runtime_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        cfg.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: provider_ref,
+            model: model.to_string(),
+            api_key: None,
+        }];
+        cfg
+    }
+
     #[test]
     fn build_model_requires_a_model() {
         // No configured entry and no override → cannot resolve a model name.

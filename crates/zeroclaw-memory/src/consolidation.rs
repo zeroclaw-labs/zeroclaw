@@ -462,40 +462,43 @@ fn fact_overlaps_primary_update(
 
 /// Parse the LLM's consolidation response, with fallback for malformed JSON.
 fn parse_consolidation_response(raw: &str, fallback_text: &str) -> ConsolidationResult {
-    // Try to extract JSON from the response (LLM may wrap in markdown code blocks).
-    // Consolidation is a structured-output consumer. Remove a provider's
-    // inline reasoning envelope before decoding, even though ordinary text
-    // responses keep that decision with the selected model policy.
-    let cleaned_text = strip_think_tags(raw);
-    let cleaned = cleaned_text
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
+    fn parse_json(candidate: &str) -> Option<ConsolidationResult> {
+        let cleaned = candidate
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        serde_json::from_str(cleaned).ok()
+    }
 
-    serde_json::from_str(cleaned).unwrap_or_else(|_| {
-        // Fallback: use truncated turn text as history entry.
-        // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
-        let summary = if fallback_text.len() > 200 {
-            let end = fallback_text
-                .char_indices()
-                .map(|(i, _)| i)
-                .take_while(|&i| i <= 200)
-                .last()
-                .unwrap_or(0);
-            format!("{}…", &fallback_text[..end])
-        } else {
-            fallback_text.to_string()
-        };
-        ConsolidationResult {
-            history_entry: summary,
-            memory_update: None,
-            facts: Vec::new(),
-            trend: None,
-            kind: None,
-        }
-    })
+    // Preserve literal `<think>` tags when the provider already returned a
+    // valid JSON document. Only strip an outer reasoning envelope when the
+    // first parse fails.
+    parse_json(raw)
+        .or_else(|| parse_json(&strip_think_tags(raw)))
+        .unwrap_or_else(|| {
+            // Fallback: use truncated turn text as history entry.
+            // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
+            let summary = if fallback_text.len() > 200 {
+                let end = fallback_text
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .take_while(|&i| i <= 200)
+                    .last()
+                    .unwrap_or(0);
+                format!("{}…", &fallback_text[..end])
+            } else {
+                fallback_text.to_string()
+            };
+            ConsolidationResult {
+                history_entry: summary,
+                memory_update: None,
+                facts: Vec::new(),
+                trend: None,
+                kind: None,
+            }
+        })
 }
 
 #[cfg(test)]

@@ -526,11 +526,39 @@ pub fn selection_depends_on_model_ref(
     selection_ref: &str,
     changed_model_ref: &str,
 ) -> bool {
+    let selection_ref = selection_ref.trim();
+    let changed_model_ref = changed_model_ref.trim();
+    // V4 profile references such as `custom.gateway.fast` still resolve
+    // their connection and defaults from `custom.gateway`. Keep live-edit
+    // invalidation wired to that owner while canonical dotted model keys
+    // remain opaque TOML keys and take precedence over the legacy parser.
+    let selection_is_canonical = config
+        .providers
+        .models
+        .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
+            selection_ref,
+        ))
+        .is_some();
+    let changed_is_canonical = config
+        .providers
+        .models
+        .canonical_model(&zeroclaw_config::provider_registry::ModelRef::from(
+            changed_model_ref,
+        ))
+        .is_some();
+    if !selection_is_canonical && !changed_is_canonical {
+        if let (Some((selection_family, selection_alias)), Some((changed_family, changed_alias))) = (
+            config.providers.models.profile_ref(selection_ref),
+            config.providers.models.profile_ref(changed_model_ref),
+        ) {
+            return selection_family == changed_family && selection_alias == changed_alias;
+        }
+    }
     let Ok(registry) = config.provider_registry() else {
         return false;
     };
-    let root = zeroclaw_config::provider_registry::ModelRef::from(selection_ref.trim());
-    let changed = zeroclaw_config::provider_registry::ModelRef::from(changed_model_ref.trim());
+    let root = zeroclaw_config::provider_registry::ModelRef::from(selection_ref);
+    let changed = zeroclaw_config::provider_registry::ModelRef::from(changed_model_ref);
     fn visit(
         registry: &zeroclaw_config::provider_registry::ProviderRegistry,
         current: &zeroclaw_config::provider_registry::ModelRef,
@@ -625,37 +653,40 @@ pub fn build_model(
         let registry = config.provider_registry()?;
         registry.resolve_chat(&canonical_ref)?;
         let options = crate::provider_runtime_options_for_agent(config, agent_alias);
-        let built = build_canonical_provider_with_options(
-            config,
-            &canonical_ref,
-            ProviderOverrides {
-                model: model_override,
-                api_key: None,
-            },
-            &options,
-            true,
-        )?;
-        let model_id = built.model.ok_or_else(|| {
+        let model_id = model_override
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                registry
+                    .resolve_chat(&canonical_ref)
+                    .ok()?
+                    .upstream_model()
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
             anyhow::Error::msg(format!(
                 "model_provider `{model_provider_ref}` has no `model` configured and no model override was supplied"
             ))
-        })?;
+            })?;
         let identity = ModelIdentity {
             family: model_provider_ref.to_owned(),
             alias: String::new(),
             entry_alias: None,
             model_id: model_id.clone(),
         };
-        let resolver = crate::model_route_resolver(
+        let (provider, resolver) = crate::create_routed_model_provider_with_options_and_resolver(
             config,
             model_provider_ref,
+            None,
+            None,
+            &config.reliability,
             &config.model_routes,
             &model_id,
-        );
+            &options,
+        )?;
         return Ok(BuiltModel::from_routed_provider(
-            built.provider,
-            identity,
-            resolver,
+            provider, identity, resolver,
         ));
     }
     let (_, explicit_url) = crate::split_v2_colon_url(model_provider_ref);

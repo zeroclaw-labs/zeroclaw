@@ -92,6 +92,9 @@ pub struct AnthropicModelProvider {
     single_tool_rounds_supported: bool,
     max_tokens: u32,
     timeout_secs: u64,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     /// Opt-in Anthropic server-side fallback targets, sent as the native
     /// `fallbacks` parameter (plus the server-side-fallback beta) on
     /// non-streaming requests only. Empty means requests are byte-identical to
@@ -634,6 +637,9 @@ pub struct AnthropicBuilder {
     single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    timeout_disabled: bool,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     server_fallback_models: Vec<String>,
     cache_ttl: Option<CacheTtl>,
 }
@@ -676,6 +682,23 @@ impl AnthropicBuilder {
         self
     }
 
+    pub(crate) fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
+        self
+    }
+
+    pub(crate) fn read_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.read_timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub(crate) fn without_read_timeout(mut self) -> Self {
+        self.read_timeout_disabled = true;
+        self
+    }
+
     /// Opt-in Anthropic server-side fallback targets, threaded through to the
     /// native `fallbacks` request parameter on non-streaming calls. Defaults to
     /// an empty vec, which leaves requests byte-identical to today.
@@ -703,6 +726,9 @@ impl AnthropicBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            timeout_disabled: self.timeout_disabled,
+            read_timeout_secs: self.read_timeout_secs,
+            read_timeout_disabled: self.read_timeout_disabled,
             server_fallback_models: self.server_fallback_models,
             cache_ttl: self.cache_ttl.unwrap_or_default(),
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
@@ -721,6 +747,9 @@ impl AnthropicModelProvider {
             single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
+            timeout_disabled: false,
+            read_timeout_secs: None,
+            read_timeout_disabled: false,
             server_fallback_models: Vec::new(),
             cache_ttl: None,
         }
@@ -2400,20 +2429,32 @@ impl AnthropicModelProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        if !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if let Some(read_timeout) = self.read_timeout_secs {
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.anthropic",
-            self.timeout_secs,
-            10,
-        )
+        );
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 
     /// Streaming requests have no whole-request deadline. Header acquisition
     /// and buffered error bodies are bounded separately, while successful SSE
     /// bodies use the shared byte-idle timeout.
     fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
-        let builder = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+        let builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let builder = if self.read_timeout_disabled {
+            builder
+        } else if let Some(read_timeout) = self.read_timeout_secs {
+            builder.read_timeout(std::time::Duration::from_secs(read_timeout))
+        } else {
+            builder.read_timeout(STREAM_IDLE_TIMEOUT)
+        };
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.anthropic",

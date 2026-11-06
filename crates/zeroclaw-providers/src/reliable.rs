@@ -136,6 +136,10 @@ enum RetryDecision {
 /// rejected attempt can have been billed even when Reliable eventually fails.
 #[derive(Debug, Default)]
 pub(crate) struct ReliableCallAccounting {
+    /// The candidate selected for the stream before a terminal `Final` event
+    /// arrives. Runtime uses this to choose extraction and model policy for
+    /// the first chunk; it is never emitted as an accepted billing route.
+    provisional_route: Option<AcceptedRoute>,
     accepted_route: Option<AcceptedRoute>,
     stream_resume_after: Option<ReliableEntryId>,
     stream_recovery_semantic_empty: bool,
@@ -231,14 +235,29 @@ where
 /// A later direct/primary recovery supersedes a stream's provisional fallback
 /// candidate. Presentation still waits for runtime semantic acceptance.
 pub(crate) fn clear_provisional_provider_route() {
-    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| accounting.lock().accepted_route = None);
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        let mut accounting = accounting.lock();
+        accounting.provisional_route = None;
+        accounting.accepted_route = None;
+    });
 }
 
 pub(crate) fn current_provisional_provider_route() -> Option<AcceptedRoute> {
     RELIABLE_CALL_ACCOUNTING
-        .try_with(|accounting| accounting.lock().accepted_route.clone())
+        .try_with(|accounting| {
+            let accounting = accounting.lock();
+            accounting
+                .provisional_route
+                .clone()
+                .or_else(|| accounting.accepted_route.clone())
+        })
         .ok()
         .flatten()
+}
+
+fn record_provisional_provider_route(route: AcceptedRoute) {
+    let _ = RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().provisional_route = Some(route));
 }
 
 fn record_accepted_attempt(
@@ -532,6 +551,7 @@ where
     T: Send + 'static,
     IsFinal: Fn(&T) -> bool + Send + 'static,
 {
+    record_provisional_provider_route(accepted_route.clone());
     stream::unfold(
         (
             stream,

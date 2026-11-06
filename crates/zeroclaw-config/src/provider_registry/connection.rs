@@ -385,12 +385,20 @@ macro_rules! provider_connections {
         impl ProviderConnection {
             pub const fn kind(&self) -> &'static str { match self { $(Self::$variant(_) => $kind,)* } }
             pub fn capabilities(&self) -> &CapabilitySet { match self { $(Self::$variant(c) => &c.capabilities,)* } }
-            pub fn supports(&self, capability: Capability) -> bool {
-                if capability == Capability::Decision {
-                    return self.capabilities().contains(&Capability::Decision)
-                        && !self.decision_wire_apis().is_empty();
+            /// Capabilities implemented by the concrete adapter. The
+            /// configurable `capabilities` set can further narrow this list,
+            /// but cannot advertise a protocol the adapter does not provide.
+            pub fn implemented_capabilities(&self) -> CapabilitySet {
+                match self {
+                    $(Self::$variant(_) => [
+                        $(Capability::$capability,)*
+                        $({ let _ = DecisionWireApi::$first_wire; Capability::Decision },)?
+                    ].into_iter().collect(),)*
                 }
+            }
+            pub fn supports(&self, capability: Capability) -> bool {
                 self.capabilities().contains(&capability)
+                    && self.implemented_capabilities().contains(&capability)
             }
             /// Native decision protocols implemented by this connection kind,
             /// in default preference order. This declaration also determines
@@ -402,6 +410,16 @@ macro_rules! provider_connections {
             }
             pub fn default_decision_wire_api(&self) -> Option<DecisionWireApi> {
                 self.decision_wire_apis().first().copied()
+            }
+            /// Whether this connection selects the OpenAI Codex OAuth adapter
+            /// instead of the ordinary API-key adapter.
+            pub fn uses_openai_codex_auth(&self) -> bool {
+                match self {
+                    Self::OpenAi(connection) => {
+                        matches!(connection.auth, Some(OpenAiAuth::Codex {}))
+                    }
+                    _ => false,
+                }
             }
             pub fn accepts_connection_field(&self, name: &str) -> bool {
                 match self { $(Self::$variant(_) => <$type>::FIELDS.contains(&name),)* }

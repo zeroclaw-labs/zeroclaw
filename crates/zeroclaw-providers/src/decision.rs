@@ -228,14 +228,7 @@ impl DecisionModel for NativeDecisionClient {
             .context("decision model request failed")?;
         let status = response.status();
         if !status.is_success() {
-            bail!(
-                "decision model returned HTTP {}: {}",
-                status.as_u16(),
-                response
-                    .text()
-                    .await
-                    .context("reading decision model error response")?
-            );
+            bail!("decision model returned HTTP {}", status.as_u16());
         }
         match self.wire_api {
             DecisionWireApi::OpenAiDecisions => {

@@ -421,6 +421,15 @@ fn build_responses_provider_if_requested(
     if let Some(t) = opts.provider_timeout_secs {
         builder = builder.timeout_secs(t);
     }
+    if opts.provider_timeout_disabled {
+        builder = builder.without_timeout();
+    }
+    if let Some(t) = opts.provider_read_timeout_secs {
+        builder = builder.read_timeout_secs(t);
+    }
+    if opts.provider_read_timeout_disabled {
+        builder = builder.without_read_timeout();
+    }
     if let Some(mt) = opts.provider_max_tokens {
         builder = builder.max_tokens(Some(mt));
     }
@@ -1224,6 +1233,15 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         if let Some(t) = opts.provider_timeout_secs {
             b = b.timeout_secs(t);
         }
+        if opts.provider_timeout_disabled {
+            b = b.without_timeout();
+        }
+        if let Some(t) = opts.provider_read_timeout_secs {
+            b = b.read_timeout_secs(t);
+        }
+        if opts.provider_read_timeout_disabled {
+            b = b.without_read_timeout();
+        }
         if let Some(extra) = opts.provider_extra.clone() {
             b = b.extra_body(extra);
         }
@@ -1253,6 +1271,15 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         }
         if let Some(ts) = opts.provider_timeout_secs {
             b = b.timeout_secs(ts);
+        }
+        if opts.provider_timeout_disabled {
+            b = b.without_timeout();
+        }
+        if let Some(ts) = opts.provider_read_timeout_secs {
+            b = b.read_timeout_secs(ts);
+        }
+        if opts.provider_read_timeout_disabled {
+            b = b.without_read_timeout();
         }
         if let Some(cache_ttl) = opts.cache_ttl {
             b = b.cache_ttl(cache_ttl);
@@ -1329,6 +1356,15 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         }
         if let Some(t) = opts.provider_timeout_secs {
             b = b.timeout_secs(t);
+        }
+        if opts.provider_timeout_disabled {
+            b = b.without_timeout();
+        }
+        if let Some(t) = opts.provider_read_timeout_secs {
+            b = b.read_timeout_secs(t);
+        }
+        if opts.provider_read_timeout_disabled {
+            b = b.without_read_timeout();
         }
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(Some(mt));
@@ -2218,6 +2254,35 @@ pub(crate) fn dispatch_model_ref_with_registry(
         anyhow::bail!(
             "canonical model `{}` uses connection kind `{provider_kind}`; its factory adapter is not migrated yet",
             model_ref.as_str()
+        );
+    }
+
+    // Canonical connections carry typed authentication and model extras. The
+    // legacy family dispatcher cannot recover either fact from `api_key` or a
+    // missing config slot, so materialize those provider-specific settings at
+    // this boundary before falling back to the common dispatcher.
+    if provider_kind == "openai" && resolved.selection.connection.uses_openai_codex_auth() {
+        let mut provider_config = zeroclaw_config::schema::OpenAIModelProviderConfig::default();
+        provider_config.base.requires_openai_auth = true;
+        return provider_config.create_provider(
+            model_ref.as_str(),
+            resolved.selection.connection.api_key(),
+            resolved.selection.connection.uri(),
+            &runtime,
+        );
+    }
+    if provider_kind == "anthropic"
+        && let ModelDefinition::Chat(model) = resolved.selection.model
+        && let Some(zeroclaw_config::provider_registry::ChatModelExtra::Anthropic(extra)) =
+            model.extra.as_ref()
+    {
+        let mut provider_config = zeroclaw_config::schema::AnthropicModelProviderConfig::default();
+        provider_config.server_fallback_models = extra.server_fallback_models.clone();
+        return provider_config.create_provider(
+            model_ref.as_str(),
+            resolved.selection.connection.api_key(),
+            resolved.selection.connection.uri(),
+            &runtime,
         );
     }
     dispatch_family_factory(
