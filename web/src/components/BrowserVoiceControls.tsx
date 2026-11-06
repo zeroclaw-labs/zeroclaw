@@ -52,10 +52,11 @@ export default function BrowserVoiceControls({ messages, hydrated, typing, onTra
   const replies = messages.filter(m => m.role === 'agent' && !m.toolCall && !m.ephemeral && !m.notice && m.content.trim());
   const latest = replies[replies.length - 1];
   useEffect(() => {
-    if (!hydrated || typing) return;
+    if (!hydrated) { baseline.current = null; return; }
+    if (typing) return;
     const ids = new Set(replies.map(m => m.id));
     if (baseline.current !== null && continuous && ready && prefs.reading) {
-      const unseen = replies.filter(m => !baseline.current!.has(m.id));
+      const unseen = replies.filter(m => !m.fromHistory && !baseline.current!.has(m.id));
       const newest = unseen[unseen.length - 1];
       if (newest) speak(newest.content);
     }

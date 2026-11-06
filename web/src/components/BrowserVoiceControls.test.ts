@@ -38,10 +38,12 @@ const preferences = { dictation: true, reading: true, automatic: false, language
 const requests: { path: string; method: string; body: string | null }[] = [];
 globalThis.fetch = async (input, init) => {
   requests.push({ path: String(input), method: init?.method ?? 'GET', body: typeof init?.body === 'string' ? init.body : null });
+  if (init?.method === 'PUT') Object.assign(preferences, JSON.parse(String(init.body)));
   return new Response(JSON.stringify({ device_id: 'synthetic-device', preferences }), { headers: { 'Content-Type': 'application/json' } });
 };
 const { default: Controls } = await import('./BrowserVoiceControls.tsx');
-const { saveVoicePreferences } = await import('../lib/browserVoice.ts');
+const { saveVoicePreferences, useVoicePreferences } = await import('../lib/browserVoice.ts');
+const { mapServerMessagesToPersisted, persistedToUiMessages } = await import('../lib/chatHistoryStorage.ts');
 const reply = (id: string, content: string) => ({ id, content, role: 'agent' as const, timestamp: new Date(0) });
 const options = { createNodeMock: () => ({ getClientRects: () => [1], parentElement: null }) };
 
@@ -132,4 +134,100 @@ test('configuration includes the usage guide and server-side device persistence 
   for (const text of ['How to use dictation and reading', 'click the microphone', 'press and hold', 'Shift+Enter', 'paired-device ID', 'never switches to an online service']) {
     assert.ok(html.includes(text), `missing help: ${text}`);
   }
+});
+
+test('reloaded history with regenerated IDs is never treated as a live reply', async () => {
+  const renderer = await mount();
+  const speaker = () => renderer.root.findAllByType('button')[1]!;
+  await act(async () => { speaker().props.onKeyDown({ key: 'Enter', shiftKey: true, preventDefault() {} }); });
+  const rows = [{ role: 'assistant' as const, content: 'Historical reply', created_at: null }];
+  const restored = persistedToUiMessages(mapServerMessagesToPersisted(rows));
+  await act(async () => { renderer.update(createElement(Controls, { messages: restored, hydrated: true, typing: false, onTranscript() {} })); });
+  assert.deepEqual(spoken, []);
+  await act(async () => { renderer.update(createElement(Controls, { messages: [...restored, reply('live', 'New completed reply')], hydrated: true, typing: false, onTranscript() {} })); });
+  assert.deepEqual(spoken, ['New completed reply']);
+  const again = persistedToUiMessages(mapServerMessagesToPersisted([...rows, { role: 'assistant', content: 'New completed reply', created_at: null }]));
+  await act(async () => { renderer.update(createElement(Controls, { messages: again, hydrated: true, typing: false, onTranscript() {} })); });
+  assert.deepEqual(spoken, ['New completed reply']);
+  await act(async () => { renderer.unmount(); });
+});
+
+test('returning to a tab refetches server preferences and disables stale reading choices', async () => {
+  const original = { ...preferences };
+  const renderer = await mount();
+  try {
+    preferences.reading = false;
+    preferences.recognition = 'browser';
+    fakeDocument.visibilityState = 'hidden';
+    await act(async () => { fakeDocument.dispatchEvent(new Event('visibilitychange')); });
+    fakeDocument.visibilityState = 'visible';
+    await act(async () => { fakeDocument.dispatchEvent(new Event('visibilitychange')); });
+    assert.equal(renderer.root.findAllByType('button').length, 1);
+    await act(async () => { renderer.root.findByType('button').props.onClick(); });
+    assert.equal(capture.processLocally, false);
+    preferences.dictation = false;
+    await act(async () => { fakeWindow.dispatchEvent(new Event('focus')); });
+    assert.equal(renderer.root.findAllByType('button').length, 0);
+  } finally {
+    await act(async () => { renderer.unmount(); });
+    Object.assign(preferences, original);
+  }
+});
+
+test('an old resume fetch cannot overwrite a newer saved preference', async () => {
+  const original = { ...preferences };
+  const originalFetch = globalThis.fetch;
+  function Probe() { return createElement('output', null, JSON.stringify(useVoicePreferences())); }
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(Probe)); });
+  let resolve!: (response: Response) => void;
+  const pending = new Promise<Response>(done => { resolve = done; });
+  let delay = true;
+  globalThis.fetch = async (input, init) => {
+    if (delay && (!init?.method || init.method === 'GET')) { delay = false; return pending; }
+    return originalFetch(input, init);
+  };
+  try {
+    await act(async () => { fakeWindow.dispatchEvent(new Event('focus')); });
+    await act(async () => { await saveVoicePreferences({ ...preferences, recognition: 'local', reading: false }); });
+    await act(async () => { resolve(new Response(JSON.stringify({ device_id: 'synthetic-device', preferences: original }), { headers: { 'Content-Type': 'application/json' } })); });
+    const state = JSON.parse(String(renderer.root.findByType('output').children[0]));
+    assert.equal(state.preferences.reading, false);
+    assert.equal(state.ready, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await act(async () => { renderer.unmount(); });
+    Object.assign(preferences, original);
+  }
+});
+
+test('cross-tab messages invalidate server state without carrying preference authority', async () => {
+  const original = { ...preferences };
+  const stored = new Map(values);
+  const sent: unknown[] = [];
+  const channels: Notifications[] = [];
+  class Notifications {
+    onmessage: ((event: { data: unknown }) => void) | null = null;
+    closed = false;
+    constructor(_topic: string) { channels.push(this); }
+    postMessage(data: unknown) { sent.push(data); }
+    close() { this.closed = true; }
+  }
+  Object.assign(fakeWindow, { BroadcastChannel: Notifications });
+  function Probe() { return createElement('output', null, JSON.stringify(useVoicePreferences())); }
+  let renderer!: ReactTestRenderer;
+  try {
+    await act(async () => { renderer = create(createElement(Probe)); });
+    preferences.reading = false;
+    await act(async () => { channels[0]!.onmessage!({ data: { device_id: 'synthetic-device', preferences: { reading: true } } }); });
+    assert.equal(JSON.parse(String(renderer.root.findByType('output').children[0])).preferences.reading, false);
+    await act(async () => { await saveVoicePreferences({ ...preferences, recognition: 'local', reading: true }); });
+    assert.deepEqual(sent, [{ device_id: 'synthetic-device' }]);
+    assert.deepEqual(values, stored);
+  } finally {
+    if (renderer) await act(async () => { renderer.unmount(); });
+    Reflect.deleteProperty(fakeWindow, 'BroadcastChannel');
+    Object.assign(preferences, original);
+  }
+  assert.ok(channels.every(channel => channel.closed));
 });

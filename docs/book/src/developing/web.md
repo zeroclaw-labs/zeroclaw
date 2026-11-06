@@ -128,3 +128,12 @@ Automatic reading excludes historical hydration, tool output, and reasoning.
 Capture and playback stop when their chat closes, changes session, or becomes
 hidden. Permissions Policy allows microphone and on-device speech recognition
 only for the gateway origin; user microphone consent remains required.
+
+History materialized into chat bubbles is marked at the hydration boundary, so
+reconnection cannot make regenerated message IDs look like new live answers.
+Returning to a browser tab/window reloads voice preferences from the gateway;
+controls remain inactive until that read succeeds. Other tabs also receive an
+invalidation-only BroadcastChannel notification and fetch their own record.
+No browser preference store
+or cross-tab copy becomes an additional source of truth. Device-registry schema
+and I/O failures are returned to gateway startup with context instead of panicking.

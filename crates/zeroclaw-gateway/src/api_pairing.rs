@@ -37,9 +37,9 @@ pub struct DeviceRegistry {
 }
 
 impl DeviceRegistry {
-    pub fn new(workspace_dir: &Path) -> Self {
+    pub fn new(workspace_dir: &Path) -> Result<Self, rusqlite::Error> {
         let db_path = workspace_dir.join("devices.db");
-        let conn = Connection::open(&db_path).expect("Failed to open device registry database");
+        let conn = Connection::open(&db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -54,70 +54,65 @@ impl DeviceRegistry {
                 ip_address TEXT,
                 capabilities TEXT
             )",
-        )
-        .expect("Failed to create devices table");
+        )?;
 
-        // Additive migration for DBs created before the capabilities column existed.
-        // SQLite has no IF NOT EXISTS for columns; the duplicate-column error here is benign.
-        let _ = conn.execute("ALTER TABLE devices ADD COLUMN capabilities TEXT", []);
-
-        let has_voice_preferences = conn
-            .prepare("PRAGMA table_info(devices)")
-            .expect("Failed to inspect device registry schema")
-            .query_map([], |row| row.get::<_, String>(1))
-            .expect("Failed to read device registry schema")
-            .any(|column| column.as_deref() == Ok("voice_preferences"));
-        if !has_voice_preferences {
-            conn.execute("ALTER TABLE devices ADD COLUMN voice_preferences TEXT", [])
-                .expect("Failed to migrate device voice preferences");
+        // Additive migrations are checked explicitly; I/O/schema failures return
+        // to gateway startup rather than panicking or being treated as duplicates.
+        let columns = conn
+            .prepare("PRAGMA table_info(devices)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for column in ["capabilities", "voice_preferences"] {
+            if !columns.iter().any(|name| name == column) {
+                conn.execute(&format!("ALTER TABLE devices ADD COLUMN {column} TEXT"), [])?;
+            }
         }
 
         // Warm the in-memory cache from DB
         let mut cache = HashMap::new();
         let mut stmt = conn
             .prepare("SELECT token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities FROM devices")
-            .expect("Failed to prepare device select");
-        let rows = stmt
-            .query_map([], |row| {
-                let token_hash: String = row.get(0)?;
-                let id: String = row.get(1)?;
-                let name: Option<String> = row.get(2)?;
-                let device_type: Option<String> = row.get(3)?;
-                let paired_at_str: String = row.get(4)?;
-                let last_seen_str: String = row.get(5)?;
-                let ip_address: Option<String> = row.get(6)?;
-                let capabilities_json: Option<String> = row.get(7)?;
-                let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let capabilities = capabilities_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
-                Ok((
-                    token_hash,
-                    DeviceInfo {
-                        id,
-                        name,
-                        device_type,
-                        paired_at,
-                        last_seen,
-                        ip_address,
-                        capabilities,
-                    },
-                ))
-            })
-            .expect("Failed to query devices");
-        for (hash, info) in rows.flatten() {
+            ?;
+        let rows = stmt.query_map([], |row| {
+            let token_hash: String = row.get(0)?;
+            let id: String = row.get(1)?;
+            let name: Option<String> = row.get(2)?;
+            let device_type: Option<String> = row.get(3)?;
+            let paired_at_str: String = row.get(4)?;
+            let last_seen_str: String = row.get(5)?;
+            let ip_address: Option<String> = row.get(6)?;
+            let capabilities_json: Option<String> = row.get(7)?;
+            let paired_at = DateTime::parse_from_rfc3339(&paired_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let capabilities = capabilities_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+            Ok((
+                token_hash,
+                DeviceInfo {
+                    id,
+                    name,
+                    device_type,
+                    paired_at,
+                    last_seen,
+                    ip_address,
+                    capabilities,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (hash, info) = row?;
             cache.insert(hash, info);
         }
 
-        Self {
+        Ok(Self {
             cache: Mutex::new(cache),
             db_path,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -885,6 +880,20 @@ mod tests {
     use zeroclaw_config::pairing::PairingGuard;
     use zeroclaw_config::schema::Config;
 
+    #[test]
+    fn device_registry_startup_returns_io_and_migration_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(DeviceRegistry::new(&tmp.path().join("missing/parent")).is_err());
+        let db = Connection::open(tmp.path().join("devices.db")).unwrap();
+        db.execute_batch("CREATE TABLE devices(token_hash TEXT PRIMARY KEY, id TEXT NOT NULL, name TEXT, device_type TEXT, paired_at TEXT NOT NULL, last_seen TEXT NOT NULL, ip_address TEXT, capabilities TEXT); PRAGMA journal_mode=WAL; BEGIN IMMEDIATE;").unwrap();
+        assert!(
+            DeviceRegistry::new(tmp.path()).is_err(),
+            "a blocked schema write must return an error, not panic"
+        );
+        db.execute_batch("ROLLBACK").unwrap();
+        assert!(DeviceRegistry::new(tmp.path()).is_ok());
+    }
+
     fn voice_state() -> (tempfile::TempDir, AppState, HeaderMap, HeaderMap) {
         let dir = tempfile::tempdir().unwrap();
         let mut state = test_state(Config::default());
@@ -893,7 +902,7 @@ mod tests {
             &["voice-test-a".into(), "voice-test-b".into()],
             Default::default(),
         ));
-        let registry = Arc::new(DeviceRegistry::new(dir.path()));
+        let registry = Arc::new(DeviceRegistry::new(dir.path()).unwrap());
         registry
             .reconcile_from_token_hashes(&state.pairing.tokens())
             .unwrap();
@@ -922,7 +931,7 @@ mod tests {
         let (_, other) = response_json(device_voice_preferences(&state, &b, None)).await;
         assert_eq!(other["preferences"]["reading"], false);
         assert_ne!(body["device_id"], other["device_id"]);
-        state.device_registry = Some(Arc::new(DeviceRegistry::new(dir.path())));
+        state.device_registry = Some(Arc::new(DeviceRegistry::new(dir.path()).unwrap()));
         let (_, restored) = response_json(device_voice_preferences(&state, &a, None)).await;
         assert_eq!(restored, body);
         state

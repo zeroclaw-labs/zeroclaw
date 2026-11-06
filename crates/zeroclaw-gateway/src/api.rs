@@ -5763,7 +5763,7 @@ pub(crate) mod tests {
         let token = pairing.try_pair(&code, "test").await.unwrap().unwrap();
         let token_hash = PairingGuard::token_hash(&token);
 
-        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        let registry = Arc::new(DeviceRegistry::new(&data_dir).unwrap());
         let device_id = "dev-1".to_string();
         registry
             .register(
@@ -5798,7 +5798,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reconcile_backfills_orphan_token_hashes() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let registry = DeviceRegistry::new(tmp.path());
+        let registry = DeviceRegistry::new(tmp.path()).unwrap();
 
         // A real, already-registered device with a name.
         let known_hash = "a".repeat(64);
@@ -5862,7 +5862,7 @@ pub(crate) mod tests {
         assert!(pairing.is_authenticated(&token));
 
         // Simulate the `/pair` orphan: token is paired but never registered.
-        let registry = DeviceRegistry::new(&data_dir);
+        let registry = DeviceRegistry::new(&data_dir).unwrap();
         assert_eq!(registry.device_count(), 0);
 
         let inserted = registry
@@ -6074,7 +6074,7 @@ pub(crate) mod tests {
         let code = pairing.pairing_code().unwrap();
         let admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
 
-        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        let registry = Arc::new(DeviceRegistry::new(&data_dir).unwrap());
         for id in ["dev-a", "dev-b"] {
             // Each device needs its own paired token so revoke has a hash.
             let code = pairing

@@ -2331,7 +2331,10 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
-        let registry = Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir));
+        let registry = Arc::new(
+            api_pairing::DeviceRegistry::new(&config.data_dir)
+                .context("Initialize paired-device registry")?,
+        );
         // Reconcile the registry against the canonical paired-token set so that
         // tokens paired via the legacy `/pair` route (and any other historical
         // orphans) become visible and revocable in the management UI. The token
@@ -6071,7 +6074,8 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
+        let registry =
+            with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir).unwrap()));
         let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
             config: state_authority.live_handle(),
