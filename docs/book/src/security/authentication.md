@@ -759,8 +759,8 @@ Things to know before turning it on:
 
 ## Denial audit records
 
-When the per-operation check (credential liveness, policy re-resolution, and
-the method's grant) or one of the selectors above refuses an RPC request, the
+When the dispatcher refuses an RPC request at admission (credential liveness,
+policy re-resolution, and the method's grant) or at an audited selector, the
 daemon writes one `WARN` log record with the message `RPC authorization
 denied` and these attributes:
 
@@ -807,6 +807,15 @@ Some cases read differently:
 - An open `logs/subscribe` or `events/subscribe` stream is rechecked on every
   delivery. A refused recheck ends the stream without an error response, and
   its record names the method that opened the stream.
+- After admission, some session and SOP operations recheck a bound caller's
+  credential and method grant under an authority lease. A refusal from that
+  check returns an error without an audit record. Chunked uploads record
+  refusals at their lease check.
+- `cron/patch` records authorization refusals at admission and at its initial
+  agent and job-owner checks. Once it acquires the SQLite writer, a failed
+  check of the bound credential, method grant, requested agent, current job
+  owner, or administrator requirement for an agent job returns an error
+  without an audit record. A missing binding still records `not_initialized`.
 - Some refusals are answered but not recorded: a refused `initialize`
   handshake (so a missing or rejected credential leaves no record), the
   not-found-or-not-owned session refusal and the remote local-capability
