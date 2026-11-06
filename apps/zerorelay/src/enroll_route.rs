@@ -1,5 +1,8 @@
 //! An enrollment route the RELAY itself originates against a registered daemon.
 //!
+//! [`open_route`] is the same opener for the relay-served dashboard
+//! ([`crate::dashboard`]), with the gateway hint and the browser's address.
+//!
 //! Every other route on this relay is a splice: a client asks for a node, the
 //! relay pairs it with that daemon's link, and the relay never becomes a party to
 //! the inner exchange. This module is the one deliberate exception, and it exists
@@ -173,6 +176,17 @@ pub(crate) async fn open_enroll_route(
     inner: &Arc<Inner>,
     node_id: &str,
 ) -> Result<EnrollRoute, OpenError> {
+    open_route(inner, node_id, PEER_HINT_ENROLL, None).await
+}
+
+/// [`open_enroll_route`] with any peer hint, and the client address an `Open`
+/// for the dashboard carries. Same budgets, same caps, same teardown.
+pub(crate) async fn open_route(
+    inner: &Arc<Inner>,
+    node_id: &str,
+    peer_hint: &str,
+    client_addr: Option<String>,
+) -> Result<EnrollRoute, OpenError> {
     let handle = {
         let daemons = inner.daemons.lock().await;
         daemons.get(node_id).map(|h| {
@@ -232,8 +246,8 @@ pub(crate) async fn open_enroll_route(
             to_daemon.send(Message::text(
                 Control::Open {
                     conn_id,
-                    peer_hint: Some(PEER_HINT_ENROLL.to_string()),
-                    client_addr: None,
+                    peer_hint: Some(peer_hint.to_string()),
+                    client_addr,
                 }
                 .to_json(),
             )),
