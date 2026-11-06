@@ -3443,6 +3443,17 @@ impl DelegateTool {
                 })
             });
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let policy_config = authoritative_config
+            .map(|config| Arc::new(config.clone()))
+            .or_else(|| self.root_config.clone());
+        let resolver = policy_config
+            .as_ref()
+            .map(|config| {
+                let config = Arc::clone(config);
+                Arc::new(move |model: &str| config.model_text_extraction(model).reasoning)
+                    as Arc<dyn Fn(&str) -> bool + Send + Sync>
+            })
+            .unwrap_or_else(|| Arc::new(|_: &str| true) as Arc<dyn Fn(&str) -> bool + Send + Sync>);
         // A single-call background delegate has no tool loop to observe, so
         // its one model request and the reply are recorded here.
         if let Some(sink) = self.progress.as_deref() {
@@ -3451,15 +3462,14 @@ impl DelegateTool {
         }
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system_with_sampling(
-                system_prompt_ref,
-                &full_prompt,
-                &model,
-                zeroclaw_providers::temperature::Temperature::from(temperature).for_call(
-                    authoritative_config
-                        .map(|config| Arc::new(config.clone()))
-                        .or_else(|| self.root_config.clone()),
-                    &provider_type,
+            zeroclaw_api::scope_text_extraction(
+                Some(resolver),
+                dispatcher.chat_with_system_with_sampling(
+                    system_prompt_ref,
+                    &full_prompt,
+                    &model,
+                    zeroclaw_providers::temperature::Temperature::from(temperature)
+                        .for_call(policy_config, &provider_type),
                 ),
             ),
         )

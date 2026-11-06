@@ -242,17 +242,25 @@ impl ProviderLlmAdapter {
         super::bridge::run_bridged_anyhow(
             async move {
                 let (config, built) = zeroclaw_providers::model::build_nonblocking(resolve).await?;
-                let sampling = Temperature::default()
-                    .for_call(Some(Arc::new(config)), &built.identity().provider_ref());
+                let config = Arc::new(config);
+                let provider_ref = built.identity().provider_ref().to_owned();
+                let sampling =
+                    Temperature::default().for_call(Some(Arc::clone(&config)), &provider_ref);
                 let (provider, identity, _) = built.into_parts();
-                ProviderDispatch::new(Arc::from(provider))
-                    .chat_with_system_with_sampling(
+                let policy_config = Arc::clone(&config);
+                let resolver = Arc::new(move |model: &str| {
+                    policy_config.model_text_extraction(model).reasoning
+                }) as Arc<dyn Fn(&str) -> bool + Send + Sync>;
+                zeroclaw_api::scope_text_extraction(
+                    Some(resolver),
+                    ProviderDispatch::new(Arc::from(provider)).chat_with_system_with_sampling(
                         system.as_deref(),
                         &prompt,
                         &identity.model_id,
                         sampling,
-                    )
-                    .await
+                    ),
+                )
+                .await
             },
             GENERATE_TIMEOUT,
             "model call",

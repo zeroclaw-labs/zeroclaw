@@ -2087,6 +2087,13 @@ impl ReliableModelProviderEntry {
         ))
     }
 
+    /// Resolve model-owned response parsing against the exact configured
+    /// candidate when one exists. The upstream model ID alone is ambiguous
+    /// when two profiles serve the same wire model with different options.
+    fn text_extraction_ref<'a>(&'a self, requested_model: &'a str) -> &'a str {
+        self.selection_ref.as_deref().unwrap_or(requested_model)
+    }
+
     fn candidate_name(&self) -> &str {
         &self.candidate_name
     }
@@ -2635,8 +2642,9 @@ impl ModelProvider for ReliableModelProvider {
                     .await
                     {
                         Ok(resp) => {
-                            let resp = normalize_text_completion(resp, current_model);
-                            if is_empty_text_completion(&resp, current_model) {
+                            let policy_model = entry.text_extraction_ref(current_model);
+                            let resp = normalize_text_completion(resp, policy_model);
+                            if is_empty_text_completion(&resp, policy_model) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -2942,8 +2950,9 @@ impl ModelProvider for ReliableModelProvider {
                     .await
                     {
                         Ok(resp) => {
-                            let resp = normalize_text_completion(resp, current_model);
-                            if is_empty_text_completion(&resp, current_model) {
+                            let policy_model = entry.text_extraction_ref(current_model);
+                            let resp = normalize_text_completion(resp, policy_model);
+                            if is_empty_text_completion(&resp, policy_model) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -3400,8 +3409,9 @@ impl ModelProvider for ReliableModelProvider {
                     .await
                     {
                         Ok(mut resp) => {
-                            normalize_completion(&mut resp, current_model);
-                            if is_empty_completion(&resp, current_model) {
+                            let policy_model = entry.text_extraction_ref(current_model);
+                            normalize_completion(&mut resp, policy_model);
+                            if is_empty_completion(&resp, policy_model) {
                                 if let Some(usage) = resp.usage.clone()
                                     && !has_reliable_call_accounting()
                                 {
@@ -3804,8 +3814,9 @@ impl ModelProvider for ReliableModelProvider {
                     .await
                     {
                         Ok(mut resp) => {
-                            normalize_completion(&mut resp, current_model);
-                            if is_empty_completion(&resp, current_model) {
+                            let policy_model = entry.text_extraction_ref(current_model);
+                            normalize_completion(&mut resp, policy_model);
+                            if is_empty_completion(&resp, policy_model) {
                                 if let Some(usage) = resp.usage.clone()
                                     && !has_reliable_call_accounting()
                                 {

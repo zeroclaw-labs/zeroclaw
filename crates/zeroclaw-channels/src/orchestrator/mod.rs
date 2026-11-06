@@ -10014,14 +10014,21 @@ async fn process_channel_message_body(
                 });
 
                 let started = Instant::now();
+                let policy_config = Arc::clone(&runtime_defaults.config);
+                let resolver = Arc::new(move |model: &str| {
+                    policy_config.model_text_extraction(model).reasoning
+                }) as Arc<dyn Fn(&str) -> bool + Send + Sync>;
                 let precheck_future = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
                     attempt_allowlist.clone(),
-                    classify_channel_reply_intent(
-                    classifier_provider_arc.as_ref(),
-                    history[0].content.as_str(),
-                    &history,
-                    classifier_model_owned.as_str(),
-                    classifier_sampling,
+                    zeroclaw_api::scope_text_extraction(
+                        Some(resolver),
+                        classify_channel_reply_intent(
+                            classifier_provider_arc.as_ref(),
+                            history[0].content.as_str(),
+                            &history,
+                            classifier_model_owned.as_str(),
+                            classifier_sampling,
+                        ),
                     ),
                 );
                 match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)

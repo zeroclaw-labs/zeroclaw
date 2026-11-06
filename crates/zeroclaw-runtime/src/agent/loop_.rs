@@ -2710,17 +2710,25 @@ async fn run_inner(
                             dispatch_model: &model_name,
                             temperature: temperature_input,
                         };
+                        let policy_config = Arc::clone(&config);
+                        let resolver = Arc::new(move |model: &str| {
+                            policy_config.model_text_extraction(model).reasoning
+                        })
+                            as Arc<dyn Fn(&str) -> bool + Send + Sync>;
                         TOOL_LOOP_COST_TRACKING_CONTEXT
                             .scope(
                                 cost_tracking_context.clone(),
-                                creator.create_from_execution_reflected(
-                                    &msg,
-                                    &tool_calls,
-                                    &response,
-                                    None,
-                                    access,
-                                    temperature_input
-                                        .for_call(Some(Arc::clone(&config)), sampling_ref),
+                                zeroclaw_api::scope_text_extraction(
+                                    Some(resolver),
+                                    creator.create_from_execution_reflected(
+                                        &msg,
+                                        &tool_calls,
+                                        &response,
+                                        None,
+                                        access,
+                                        temperature_input
+                                            .for_call(Some(Arc::clone(&config)), sampling_ref),
+                                    ),
                                 ),
                             )
                             .await
