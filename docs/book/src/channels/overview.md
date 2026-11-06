@@ -149,6 +149,35 @@ The orchestrator reads the current live config when it delivers the reply, so a 
 
 These notices are added only to outbound delivery. Stored assistant history keeps the model's response without the notice, so later turns do not receive this delivery metadata as conversation content. Attribution must identify a successful fallback to a different model before a notice is added; same-family, same-model profile changes remain indistinguishable in the current attribution record.
 
+### Acknowledgement reactions
+
+`channels.ack_reactions` (default `true`) controls whether the shared channel orchestrator reacts to an inbound message while the agent works. The emoji themselves are configurable under `[channels]`:
+
+| Key | Default | What it does |
+|---|---|---|
+| `ack_reaction_in_progress` | 👀 | Added to the inbound message while the agent works. An empty string disables the in-progress acknowledgement. |
+| `ack_reaction_done` | ✅ | Replaces the in-progress acknowledgement once the turn completes. An empty string withdraws the acknowledgement and adds nothing. |
+| `ack_reaction_error` | ⚠️ | Replaces the in-progress acknowledgement when the turn fails. An empty string withdraws the acknowledgement and adds nothing. |
+
+Slack, Matrix, and Lark instances override each value per alias; an override that is left out keeps the global value.
+
+```toml
+[channels]
+ack_reaction_in_progress = "👀"
+
+[channels.slack.work]
+ack_reaction_in_progress = "⏳"
+ack_reaction_done = ""
+```
+
+With that config the Slack `work` instance shows ⏳ while the turn runs and leaves no reaction behind when it finishes.
+
+On Slack the value is either a Unicode emoji (`⏳`) or a Slack short name (`:hourglass_flowing_sand:`). Names outside the built-in Unicode-to-name map are passed to the Slack reactions API with their colons trimmed, so workspace emoji work too. Channels that translate acknowledgement emoji into their own vocabulary, such as the Git forge channels, skip a configured emoji they cannot express.
+
+Telegram is not covered by these emoji settings. It posts its own acknowledgement from the fixed set Telegram accepts (⚡️, 👌, 👀, 🔥, 👍) and honours `ack_reactions` only as an on/off switch, because a Telegram bot has one reaction slot per message and a narrower allowed emoji set than Slack or Matrix.
+
+Lark's inbound fast-ack uses the same resolved in-progress emoji, so the reaction the channel adds is the one the orchestrator later withdraws.
+
 ## Streaming capability
 
 Channels declare what kind of streaming they support: see [Providers → Streaming](../providers/streaming.md) for the capability matrix and what `supports_draft_updates` / `supports_multi_message_streaming` mean.
