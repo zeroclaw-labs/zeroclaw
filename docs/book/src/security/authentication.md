@@ -33,10 +33,9 @@ importantly, what changes for existing remote connections.
      live session held under such an alias is refused. The other
      session methods do not check the agent yet, as described under
      [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
-   - running or approving an SOP requires every agent it runs as, with the
-     same tool-selector rule as a session, and creating, saving, or deleting
-     one requires the agents it runs as. A step that names no agent, on the
-     step or on the procedure, counts as the first configured agent alias in
+   - running or approving an SOP requires administrator grants. Creating,
+     saving, or deleting one requires the agents it runs as. A step that names
+     no agent, on the step or on the procedure, counts as the first configured agent alias in
      sort order, which is the agent the headless executor falls back to.
      Every step counts, including the steps of a deterministic procedure;
    - attachments, personality files, cost queries that name an agent, and
@@ -404,8 +403,76 @@ If either the principal's tool selector or agent selector is constrained,
 `delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
 are unavailable, including skill aliases wrapping those tools. These nested
 paths do not yet carry both current principal ceilings; the ordinary parent
-turn remains usable. Admin principals and principals with both selectors set
-to `"*"` keep their agent's configured nested capabilities.
+turn remains usable.
+
+Some tools do work that does not carry the caller's principal, so no
+principal without `admin` holds them in its sessions, whatever its selectors
+name, `"*"` included:
+
+- `sessions_list`, `sessions_history`, and `sessions_send` list, read, and
+  append to other sessions without checking who owns them, and so would
+  `sessions_reset` and `sessions_delete` if an agent registered them.
+  `sessions_current`, which reports only the caller's own session, stays.
+- `cron_add`, `cron_update`, `cron_run`, `cron_list`, `cron_runs`,
+  `cron_remove`, and `schedule`: scheduled turns do not carry the caller's
+  restrictions, and cron rows and run output are shared by agent rather than
+  owned by the calling principal.
+- `send_message_to_peer`, whose turns run on another agent.
+- `sop_execute`, `sop_advance`, `sop_approve`, and `sop_workshop`: SOP steps
+  run headlessly as the procedure's agents, and an applied workshop proposal
+  becomes a shared procedure that later runs the same way. Read-only SOP
+  tools follow the ordinary tool selector.
+- `model_routing_config` and `proxy_config`, which save daemon config that
+  every agent's later runs use. Over RPC the same change needs
+  `config:update`.
+- `spawn_subagent` and `execute_pipeline`, whose nested runs would hold the
+  tools above again.
+
+Each of these tools reports `requires_unrestricted_principal`, so a skill
+alias of one goes with it. The direct `delegate` tool stays when both
+selectors are `"*"`, because the session holds its handle: every bounded,
+independent, background, parallel, and nested child it builds withholds the
+same tools. It also resolves the originating credential's current authority
+when it builds each child, so a child built after that credential loses
+`admin` withholds them too. Its skill aliases are withheld, because their
+captured targets cannot be identified as the bound handle.
+
+The withholding is applied at session creation, at rehydration, before every
+prompt, and when accepted steering is consumed, including its recheck after
+memory writes. An administrator demoted mid-session loses the tools at the
+next prompt or accepted steering. Like selector narrowing, it never gives
+them back to a live session. Admin principals and the shared operator keep
+their agent's configured tools, and existing cron jobs keep running.
+
+A queued prompt resolves authority again on the exact Agent that will execute
+the turn, after provider reconciliation and Agent/task waits. The same admission
+applies withholding and protects prompt checkpoint or running-state writes
+after storage contention. A refused admission does not call the provider or
+persist a terminal turn. This is a turn-admission boundary, not continuous
+revocation of a turn that is already running.
+
+RPC `cron/patch` and `cron/trigger` also refuse agent jobs for non-admins,
+including wildcard selectors. These jobs cannot carry the caller's session
+restrictions; the check uses current authority after looking up the job.
+Shell jobs retain their existing grant and command-policy checks. Cron reads,
+deletion, and jobs already scheduled by an operator are unchanged.
+
+RPC `sops/run` and `sops/decide` require administrator grants, including
+when a non-admin has wildcard tool and agent selectors. Headless steps do
+not carry the caller's principal restrictions. This includes deny, amend,
+and revise decisions. After decision-model and engine waits, the RPC holds
+current authority through its synchronous store effects. A busy SOP store
+refuses the request immediately; retry once contention clears. Background
+SOP processing keeps its normal storage timeout. SOP authoring retains its
+separate agent-selector checks.
+
+Until the session-data tools check ownership, scheduled agent jobs, SOP runs,
+and peer turns started by an administrator or a trigger can still call them.
+To remove them from those runs too, list `sessions_list`, `sessions_history`,
+and `sessions_send`, plus any skill tool that targets them, in
+`excluded_tools` of the risk profile of each agent those runs use. That
+removes them from every run of those agents, administrators' sessions
+included.
 
 The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
 constructor remains available. RPC uses the additive
@@ -414,10 +481,10 @@ the shared resolver's grants at prompt admission.
 
 That composition does not cover every route to an agent's tools. Cron jobs
 and SOP authoring check only the agent selector. A constrained principal
-holding cron grants can create a shell job for its agent, or give an
-existing agent job a new prompt and trigger it, and one holding SOP create
-or update grants can save a procedure whose trigger runs it later. Treat
-cron and SOP authoring grants as grants of the agent's tools.
+holding cron grants can create a shell job for its agent, though agent jobs
+are refused to it as described above, and one holding SOP create or update
+grants can save a procedure whose trigger runs it later. Treat cron and SOP
+authoring grants as grants of the agent's tools.
 
 Principal-owned sessions may use synchronous and parallel delegation when
 their grants allow it. Background delegation and its `check_result`,
@@ -834,6 +901,11 @@ the restored file without a migration step.
 Consolidation and governance derive shared-plane rows and do not run for
 private sessions, and administrative access into another principal's
 private memory has no surfaced pathway yet (deny-by-default).
+The session-data tools have no principal-aware view yet, so they are
+withheld from principals without `admin` (see
+[Permission profiles](#permission-profiles)) instead of being scoped to the
+caller's own sessions, and scheduled agent jobs, SOP runs, and peer turns can
+still call them unless the agent's risk profile excludes them.
 `sops/runs` and `sops/run-detail` return the run history of every
 procedure to a principal holding `Sops:Read`, whichever agents it ran as,
 unlike cron history. Gateway HTTP routes outside the configuration
