@@ -8510,14 +8510,7 @@ impl Channel for TelegramChannel {
             .voice_drafts
             .lock()
             .remove(&Self::multi_draft_key(recipient, message_id));
-        // Cleanup cannot veto final speech, and the job is already owned here.
-        if let Err(error) = self.cancel_draft(recipient, message_id).await {
-            ::zeroclaw_log::record!(WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string())})),
-                "Voice draft preview cleanup failed; continuing final delivery"
-            );
-        }
+        crate::util::cancel_draft_best_effort(self, recipient, message_id).await;
         self.queue_voice_reply(recipient, &strip_tool_call_tags(text), job, true);
         Ok(())
     }
