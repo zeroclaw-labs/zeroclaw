@@ -153,9 +153,11 @@ pub enum RpcDenialReason {
     /// A scoped principal requested a daemon-wide log or event stream, the
     /// event history, or persisted log records.
     GlobalStreamScoped,
-    /// A principal whose tool selector names a subset of the tools requested
-    /// a procedure.
-    SopToolSelectorConstrained,
+    /// A principal that is not an administrator asked to start, resume, or
+    /// decide a procedure. Headless steps do not carry the caller's
+    /// restrictions, so only administrators may run them, whatever their
+    /// tool and agent selectors.
+    SopPrincipalCeilingRequired,
     /// The procedure to replace or delete cannot be loaded to check which
     /// agents it runs as.
     SopDefinitionUnreadable,
@@ -164,6 +166,9 @@ pub enum RpcDenialReason {
     /// A remote caller asked to act on a session that holds local
     /// capabilities, such as a channel other than RPC.
     SessionLocalCapabilities,
+    /// A principal that is not an administrator asked to trigger an agent
+    /// cron job, which rebuilds its tools without the caller's restrictions.
+    CronAgentPrincipalRequired,
 }
 
 impl RpcDenialReason {
@@ -194,10 +199,11 @@ impl RpcDenialReason {
             Self::SessionEnvironmentRetained => "session_environment_retained",
             Self::SessionEnvironmentMismatch => "session_environment_mismatch",
             Self::GlobalStreamScoped => "global_stream_scoped",
-            Self::SopToolSelectorConstrained => "sop_tool_selector_constrained",
+            Self::SopPrincipalCeilingRequired => "sop_principal_ceiling_required",
             Self::SopDefinitionUnreadable => "sop_definition_unreadable",
             Self::SessionNotOwned => "session_not_owned",
             Self::SessionLocalCapabilities => "session_local_capabilities",
+            Self::CronAgentPrincipalRequired => "cron_agent_principal_required",
         }
     }
 
@@ -227,9 +233,10 @@ impl RpcDenialReason {
             | Self::SessionEnvironmentRetained
             | Self::SessionEnvironmentMismatch
             | Self::GlobalStreamScoped
-            | Self::SopToolSelectorConstrained
+            | Self::SopPrincipalCeilingRequired
             | Self::SopDefinitionUnreadable
-            | Self::SessionNotOwned => FORBIDDEN,
+            | Self::SessionNotOwned
+            | Self::CronAgentPrincipalRequired => FORBIDDEN,
             // The client is told the job was not found, the answer a missing
             // job gets, so the refusal does not confirm that the job exists.
             Self::CronJobAgentNotEntitled => INVALID_PARAMS,
@@ -267,10 +274,13 @@ impl RpcDenialReason {
             Self::SessionEnvironmentRetained => "rpc-auth-session-environment-retained",
             Self::SessionEnvironmentMismatch => "rpc-auth-session-environment-mismatch",
             Self::GlobalStreamScoped => "rpc-auth-global-stream-scoped",
-            Self::SopToolSelectorConstrained => "rpc-auth-sop-tool-selector-constrained",
+            // Both keys belong to the refusals that introduced them and are
+            // shared with no other message.
+            Self::SopPrincipalCeilingRequired => "sop-rpc-principal-ceiling-required",
             Self::SopDefinitionUnreadable => "rpc-auth-sop-definition-unreadable",
             Self::SessionNotOwned => "rpc-auth-session-not-owned",
             Self::SessionLocalCapabilities => "rpc-auth-session-local-capabilities",
+            Self::CronAgentPrincipalRequired => "rpc-cron-agent-principal-required",
         }
     }
 }
@@ -468,8 +478,12 @@ impl AuthDenied {
         Self::with_message(RpcDenialReason::GlobalStreamScoped)
     }
 
-    pub(crate) fn sop_tool_selector_constrained() -> Self {
-        Self::with_message(RpcDenialReason::SopToolSelectorConstrained)
+    pub(crate) fn sop_principal_ceiling_required() -> Self {
+        Self::with_message(RpcDenialReason::SopPrincipalCeilingRequired)
+    }
+
+    pub(crate) fn cron_agent_principal_required() -> Self {
+        Self::with_message(RpcDenialReason::CronAgentPrincipalRequired)
     }
 
     pub(crate) fn sop_definition_unreadable(name: &str) -> Self {
@@ -498,6 +512,10 @@ impl AuthDenied {
 /// registry, resolver, roster and flags consistent.
 pub struct AcceptedAuthState {
     registry: ProviderRegistry,
+    /// Each OIDC provider's issuer and client, by provider name, compiled
+    /// with `registry` so a bound credential is checked against the same
+    /// state that would send it.
+    oidc_bindings: std::collections::HashMap<String, OidcBinding>,
     resolver: PrincipalResolver,
     uid_roster: Arc<UidRoster>,
     local_roster_configured: bool,
@@ -507,6 +525,25 @@ pub struct AcceptedAuthState {
     /// The configuration this state was compiled from (see [`auth_inputs`]),
     /// or `None` for the deny-all state, which was compiled from nothing.
     auth_inputs: Option<serde_json::Value>,
+}
+
+/// The issuer and client an OIDC provider verifies tokens against. A token
+/// issued under one of them is bound to it: see
+/// [`RpcInboundAuth::authenticate_bound`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OidcBinding {
+    pub issuer: String,
+    pub client_id: String,
+}
+
+impl OidcBinding {
+    #[must_use]
+    pub fn of(entry: &zeroclaw_config::schema::OidcConfig) -> Self {
+        Self {
+            issuer: entry.issuer.clone(),
+            client_id: entry.effective_client_id().to_string(),
+        }
+    }
 }
 
 /// The parts of a configuration an accepted authorization state is compiled
@@ -545,8 +582,14 @@ impl AcceptedAuthState {
                 config.oidc[alias].clone(),
             )?))?;
         }
+        let oidc_bindings = config
+            .oidc
+            .iter()
+            .map(|(alias, entry)| (format!("oidc.{alias}"), OidcBinding::of(entry)))
+            .collect();
         Ok(Self {
             registry,
+            oidc_bindings,
             resolver: PrincipalResolver::with_generation(
                 ResolverPolicy::from_config(config)?,
                 generation,
@@ -579,6 +622,7 @@ impl AcceptedAuthState {
             .expect("unique peercred provider");
         Self {
             registry,
+            oidc_bindings: std::collections::HashMap::new(),
             resolver: PrincipalResolver::with_generation(ResolverPolicy::default(), generation),
             uid_roster,
             local_roster_configured: true,
@@ -1013,6 +1057,45 @@ impl RpcInboundAuth {
         auth_token: Option<&str>,
         auth_provider: Option<&str>,
     ) -> Result<ConnectionAuth, AuthDenied> {
+        self.authenticate_checked(
+            transport,
+            transport_credential,
+            auth_token,
+            auth_provider,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::authenticate`] for a bearer bound to one OIDC provider as it
+    /// was configured when the bearer was issued. Refused before the bearer
+    /// is sent anywhere when, in the accepted state this verification uses,
+    /// the provider by that name names another issuer or client, or is gone.
+    pub async fn authenticate_bound(
+        &self,
+        transport: TransportKind,
+        auth_token: &str,
+        auth_provider: &str,
+        binding: &OidcBinding,
+    ) -> Result<ConnectionAuth, AuthDenied> {
+        self.authenticate_checked(
+            transport,
+            Credential::None,
+            Some(auth_token),
+            Some(auth_provider),
+            Some(binding),
+        )
+        .await
+    }
+
+    async fn authenticate_checked(
+        &self,
+        transport: TransportKind,
+        transport_credential: Credential,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
+        binding: Option<&OidcBinding>,
+    ) -> Result<ConnectionAuth, AuthDenied> {
         #[cfg(test)]
         {
             let pause = self.authenticate_pause.lock().unwrap().take();
@@ -1022,6 +1105,14 @@ impl RpcInboundAuth {
             }
         }
         let state = self.state();
+        // Checked against the same state whose registry would send the
+        // bearer: a provider repointed or removed since it was issued never
+        // receives it.
+        if let Some(binding) = binding
+            && state.oidc_bindings.get(auth_provider.unwrap_or_default()) != Some(binding)
+        {
+            return Err(AuthDenied::from_deny_reason(DenyReason::UnknownProvider));
+        }
         // The generation the provider is about to verify against. Provider
         // verification below may await an IdP round trip; a trusted config
         // write can install a new generation during that await. Captured
@@ -2021,6 +2112,61 @@ mod tests {
         }
     }
 
+    /// A bearer bound to one OIDC provider is verified only by it: when the
+    /// accepted state's provider by that name names another issuer or
+    /// client, or there is none, the bearer is refused before it is sent
+    /// anywhere.
+    #[tokio::test]
+    async fn a_bound_bearer_never_reaches_another_provider() {
+        let corp = introspection_idp("alice", &["ops"]).await;
+        let mut config = base_config();
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .oidc
+            .insert("corp".into(), oidc_entry(&corp.uri(), "ops", "operator"));
+        let auth = auth_for(&config, &[]);
+        let bound = OidcBinding::of(&config.oidc["corp"]);
+        let introspections = || async {
+            corp.received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.url.path() == "/introspect")
+                .count()
+        };
+        auth.authenticate_bound(TransportKind::Wss, "corp-at", "oidc.corp", &bound)
+            .await
+            .expect("the provider it is bound to verifies it");
+        let sent = introspections().await;
+        let elsewhere = OidcBinding {
+            issuer: "https://elsewhere.example".into(),
+            ..bound.clone()
+        };
+        let other_client = OidcBinding {
+            client_id: "another-client".into(),
+            ..bound.clone()
+        };
+        for (case, binding, provider) in [
+            ("another issuer", &elsewhere, "oidc.corp"),
+            ("another client", &other_client, "oidc.corp"),
+            ("no such provider", &bound, "oidc.gone"),
+        ] {
+            assert!(
+                auth.authenticate_bound(TransportKind::Wss, "corp-at", provider, binding)
+                    .await
+                    .is_err(),
+                "{case}: a bound bearer was admitted"
+            );
+        }
+        assert_eq!(introspections().await, sent, "a bound bearer was sent");
+    }
+
     /// Two independent issuers verify side by side, resolve to distinct
     /// canonical principals with their own grant sets, and never accept
     /// each other's tokens. Removing one entry from config and refreshing
@@ -2384,10 +2530,11 @@ mod tests {
                 "session_environment_retained",
                 "session_environment_mismatch",
                 "global_stream_scoped",
-                "sop_tool_selector_constrained",
+                "sop_principal_ceiling_required",
                 "sop_definition_unreadable",
                 "session_not_owned",
                 "session_local_capabilities",
+                "cron_agent_principal_required",
             ]
         );
         let unique: std::collections::HashSet<&str> = identifiers.iter().copied().collect();
@@ -2518,8 +2665,11 @@ mod tests {
             RpcDenialReason::GlobalStreamScoped => {
                 (AuthDenied::global_stream_scoped(), FORBIDDEN, &[])
             }
-            RpcDenialReason::SopToolSelectorConstrained => {
-                (AuthDenied::sop_tool_selector_constrained(), FORBIDDEN, &[])
+            RpcDenialReason::SopPrincipalCeilingRequired => {
+                (AuthDenied::sop_principal_ceiling_required(), FORBIDDEN, &[])
+            }
+            RpcDenialReason::CronAgentPrincipalRequired => {
+                (AuthDenied::cron_agent_principal_required(), FORBIDDEN, &[])
             }
             RpcDenialReason::SopDefinitionUnreadable => (
                 AuthDenied::sop_definition_unreadable("nightly-report"),
@@ -2588,7 +2738,7 @@ mod tests {
         /// text the replaced literal produced for them.
         type WordingCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
 
-        let cases: [WordingCase<'_>; 14] = [
+        let cases: [WordingCase<'_>; 13] = [
             (
                 "rpc-auth-grant-missing",
                 &[
@@ -2651,12 +2801,6 @@ mod tests {
                  are not attributed to an owning principal, so the log and event streams, the \
                  event history, and the persisted log are limited to administrators and the \
                  shared operator",
-            ),
-            (
-                "rpc-auth-sop-tool-selector-constrained",
-                &[],
-                "Principal has a constrained tool selector; procedures run outside \
-                 per-session tool narrowing and are refused to it",
             ),
             (
                 "rpc-auth-sop-definition-unreadable",
