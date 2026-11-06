@@ -2345,6 +2345,102 @@ mod tests {
     // ── The flow ─────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn enrollment_and_dashboard_callbacks_preserve_each_others_cookies() {
+        let server = idp(&["ops"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let dashboard = start(&fixture, "/auth/sign-in/corp?return=/chat").await;
+        let response = send(
+            &fixture.router,
+            request("GET", "/oidc/login/corp", loopback(), &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        let enrollment_state = query_param(
+            response.headers()[header::LOCATION].to_str().unwrap(),
+            "state",
+        );
+        let enrollment_cookie = set_cookies(&response)
+            .into_iter()
+            .find(|cookie| cookie.starts_with("zc_oidc_"))
+            .expect("enrollment binding cookie")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let enrollment_name = enrollment_cookie.split_once('=').unwrap().0;
+        let cookies = format!(
+            "{enrollment_cookie}; {}={}",
+            dashboard.binding_name, dashboard.binding
+        );
+
+        Mock::given(http_method("POST"))
+            .and(http_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "synthetic-enrollment-token",
+                "token_type": "Bearer",
+                "expires_in": 600,
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                &format!("/oidc/callback?state={enrollment_state}&code=enrollment"),
+                loopback(),
+                &[("cookie", &cookies)],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cleared = set_cookies(&response);
+        assert_eq!(cleared.len(), 1);
+        assert!(cleared[0].starts_with(&format!("{enrollment_name}=;")));
+        assert!(cleared[0].contains("Max-Age=0"));
+        assert!(cookie_from(&response, SESSION_COOKIE).is_none());
+
+        mount_token(&server, &dashboard.nonce, true).await;
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                &format!("/oidc/callback?state={}&code=dashboard", dashboard.state),
+                loopback(),
+                &[("cookie", &cookies)],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/chat");
+        let set = set_cookies(&response);
+        assert!(set.iter().any(|cookie| {
+            cookie.starts_with(&format!("{}=;", dashboard.binding_name))
+                && cookie.contains("Max-Age=0")
+        }));
+        assert!(!set.iter().any(|cookie| cookie.starts_with(enrollment_name)));
+        let session_cookie = format!(
+            "{SESSION_COOKIE}={}",
+            cookie_from(&response, SESSION_COOKIE).expect("dashboard session cookie retained")
+        );
+        let response = send(
+            &fixture.router,
+            request(
+                "GET",
+                "/api/auth/session",
+                loopback(),
+                &[
+                    ("cookie", &session_cookie),
+                    ("sec-fetch-site", "same-origin"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json(response).await["kind"], "oidc");
+    }
+
+    #[tokio::test]
     async fn an_administrator_signs_in_reaches_operator_routes_and_signs_out() {
         let server = idp(&["admins"], "gw").await;
         let fixture = fixture(sign_in_config(&server.uri()));
