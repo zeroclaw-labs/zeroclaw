@@ -297,7 +297,6 @@ mod tests {
     #[test]
     fn openai_trailing_slash_stripped() {
         let p = OpenAiEmbedding::new("https://api.openai.com/", "key", "model", 1536);
-        let p = p;
         assert_eq!(p.transport.base_url, "https://api.openai.com");
     }
 
