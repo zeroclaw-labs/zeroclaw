@@ -9,6 +9,7 @@ Pushed to GitHub Container Registry (`ghcr.io`) on every stable release:
 - `ghcr.io/zeroclaw-labs/zeroclaw:latest`: latest stable
 - `ghcr.io/zeroclaw-labs/zeroclaw:v0.7.5`: pinned
 - `ghcr.io/zeroclaw-labs/zeroclaw:debian`: Debian-based image (larger, broader glibc support)
+- `ghcr.io/zeroclaw-labs/zeroclaw:dist-broad`: standard distribution plus the `channels-full` bundle (larger; includes Slack, but excludes Nostr and WeChat). It builds with thin LTO because fat LTO exceeds the arm64 runner memory.
 
 Multi-arch: `linux/amd64`, `linux/arm64`.
 
