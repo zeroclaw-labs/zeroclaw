@@ -26,8 +26,9 @@
 //! so the module is compiled only with it too, and its scenarios are not
 //! ignored: the plugin backend CI job runs them as required coverage. They
 //! start the gateway through `run_gateway_with_plugin_webhooks` with a
-//! test-owned route registry whose routes are served by scripted workers in
-//! place of channel plugins, and they also record what each worker received.
+//! test-owned plugin webhook ingress whose routes are served by scripted
+//! workers in place of channel plugins, and they also record what each worker
+//! received.
 //! To regenerate their fixtures:
 //!
 //! ```text
@@ -1154,12 +1155,12 @@ mod plugin_webhook {
 
     use tokio::sync::mpsc;
     use zeroclaw_api::webhook::{
-        MAX_WEBHOOK_RESPONSE_BODY_BYTES, PluginWebhookRegistry, PluginWebhookRegistryLease,
-        RawWebhook, WebhookCancellation, WebhookOutcome, WebhookReject, WebhookReservation,
+        MAX_WEBHOOK_RESPONSE_BODY_BYTES, PLUGIN_WEBHOOK_DEADLINE, PluginWebhookOwner,
+        PluginWebhookRegistry, PluginWebhookRegistryLease, PluginWebhookRoute, RawWebhook,
+        WebhookCancellation, WebhookOutcome, WebhookReject, WebhookReservation,
     };
+    use zeroclaw_infra::plugin_webhook::PluginWebhookIngress;
 
-    /// The gateway's deadline for a worker outcome, counted from enqueue.
-    const DEADLINE: Duration = Duration::from_secs(10);
     /// Queue depth of the worker-backed routes; none of them fills up.
     const WORKER_QUEUE: usize = 4;
     /// A capacity-1 route whose queue is filled before the gateway starts and
@@ -1300,17 +1301,22 @@ mod plugin_webhook {
     /// The route generation a channel supervisor would publish, served by
     /// scripted workers. The routes stay live while this value does.
     struct ScriptedRoutes {
-        registry: Arc<PluginWebhookRegistry>,
         _lease: PluginWebhookRegistryLease,
         _full_queue: mpsc::Receiver<RawWebhook>,
     }
 
     impl ScriptedRoutes {
-        fn publish(reports: &mpsc::UnboundedSender<Value>) -> Self {
+        fn publish(
+            registry: &PluginWebhookRegistry,
+            reports: &mpsc::UnboundedSender<Value>,
+        ) -> Self {
+            let route_for = |sink| {
+                PluginWebhookRoute::new(PluginWebhookOwner::new("golden-plugin", "golden"), sink)
+            };
             let mut routes = HashMap::new();
             for (route, worker) in ROUTES {
                 let (sink, requests) = mpsc::channel(WORKER_QUEUE);
-                routes.insert(route.to_string(), sink);
+                routes.insert(route.to_string(), route_for(sink));
                 let task = serve(route, worker, requests, reports.clone());
                 zeroclaw_spawn::spawn!(task);
             }
@@ -1328,20 +1334,18 @@ mod plugin_webhook {
                     reply: unanswered,
                 })
                 .expect("fill the full route's queue");
-            routes.insert(FULL_ROUTE.to_string(), full_sink);
+            routes.insert(FULL_ROUTE.to_string(), route_for(full_sink));
 
             let (closed_sink, closed_requests) = mpsc::channel(1);
             drop(closed_requests);
-            routes.insert(CLOSED_ROUTE.to_string(), closed_sink);
+            routes.insert(CLOSED_ROUTE.to_string(), route_for(closed_sink));
 
-            let registry = Arc::new(PluginWebhookRegistry::new());
             let lease = registry.start_generation();
             assert!(
                 lease.replace(routes),
                 "the scripted generation owns the registry"
             );
             Self {
-                registry,
                 _lease: lease,
                 _full_queue: full_queue,
             }
@@ -1461,17 +1465,25 @@ mod plugin_webhook {
             })
     }
 
+    /// Starts the gateway with an ingress built from the scenario's config,
+    /// as the daemon builds one per generation, and publishes the scripted
+    /// routes into it.
     async fn start_gateway(
         provider: &ScriptedProvider,
-        registry: Arc<PluginWebhookRegistry>,
         configure: fn(&mut Config),
-    ) -> Gateway {
+        reports: &mpsc::UnboundedSender<Value>,
+    ) -> (Gateway, ScriptedRoutes) {
         let root = tempfile::TempDir::new().expect("gateway temp root");
         let mut config = fixture_config(root.path(), &provider.base_url());
         configure(&mut config);
         let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())
             .expect("scenario config builds a live config authority");
-        Gateway::launch(root, move |port, reload_controls, readiness| {
+        let ingress = Arc::new(PluginWebhookIngress::new(
+            config.gateway.idempotency_ttl_secs,
+            config.gateway.idempotency_max_keys,
+        ));
+        let routes = ScriptedRoutes::publish(ingress.registry(), reports);
+        let gateway = Gateway::launch(root, move |port, reload_controls, readiness| {
             Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                 "127.0.0.1",
                 port,
@@ -1485,13 +1497,14 @@ mod plugin_webhook {
                 None,
                 zeroclaw_gateway::GatewaySupervision::new(
                     Some(readiness),
-                    registry,
+                    ingress,
                     authority,
                     None,
                 ),
             ))
         })
-        .await
+        .await;
+        (gateway, routes)
     }
 
     /// Runs a scenario against a supervised gateway whose plugin webhook
@@ -1505,9 +1518,8 @@ mod plugin_webhook {
         on_scenario_runtime(scenario, move || async move {
             let provider = ScriptedProvider::spawn(vec![Reply::Text("unused")]).await;
             let (report_tx, reports) = mpsc::unbounded_channel();
-            let routes = ScriptedRoutes::publish(&report_tx);
+            let (gateway, routes) = start_gateway(&provider, configure, &report_tx).await;
             drop(report_tx);
-            let gateway = start_gateway(&provider, Arc::clone(&routes.registry), configure).await;
             let client = Client {
                 addr: gateway.addr,
                 reports,
@@ -1742,7 +1754,7 @@ mod plugin_webhook {
                     )
                     .await;
                 assert!(
-                    started.elapsed() >= DEADLINE,
+                    started.elapsed() >= PLUGIN_WEBHOOK_DEADLINE,
                     "the gateway answered before its deadline"
                 );
                 // Giving up cancels the request the worker still holds.
