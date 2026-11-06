@@ -256,6 +256,10 @@ impl CostTracker {
 
     /// Hot-swap config so reloaded budget limits apply without a restart.
     pub fn update_config(&self, config: CostConfig) {
+        // A reload can return to a previously used backend path after its
+        // ledger was replaced by migration. Rebuild shared budget aggregates
+        // from that canonical ledger, including for already-derived trackers.
+        self.lock_storage().aggregates_current = false;
         *self.config.write() = config;
     }
 
@@ -2421,6 +2425,73 @@ mod tests {
                 NativeBackend::Jsonl => tmp.path().join("sessions/session-events.db"),
             };
             assert!(!unexpected.exists(), "must not open a second backend");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_round_trip_refreshes_reused_trackers_budget_aggregates() {
+        use zeroclaw_infra::session_events::{installation::NativeBackend, upgrade};
+
+        for (initial, other) in [
+            (NativeBackend::Sqlite, NativeBackend::Jsonl),
+            (NativeBackend::Jsonl, NativeBackend::Sqlite),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let trackers = RwLock::new(HashMap::new());
+            let config = CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 200.0,
+                ..Default::default()
+            };
+            upgrade::upgrade_installation(tmp.path(), initial, |_| "test-agent".into()).unwrap();
+            let first =
+                CostTracker::resolve_global(&trackers, config.clone(), tmp.path(), initial.name())
+                    .unwrap();
+            let agent = first.derived_for_agent("test-agent", 8.0);
+            first
+                .record_usage_with_agent(
+                    TokenUsage::new("test/model", 1_000_000, 0, 0, 3.0, 0.0, 0.0),
+                    Some("test-agent"),
+                )
+                .unwrap();
+            assert!(matches!(
+                first.check_budget(0.0).unwrap(),
+                BudgetCheck::Allowed
+            ));
+            assert!(matches!(
+                agent.check_budget(0.0).unwrap(),
+                BudgetCheck::Allowed
+            ));
+
+            upgrade::upgrade_installation(tmp.path(), other, |_| "test-agent".into()).unwrap();
+            let second =
+                CostTracker::resolve_global(&trackers, config.clone(), tmp.path(), other.name())
+                    .unwrap();
+            second
+                .record_usage_with_agent(
+                    TokenUsage::new("test/model", 1_000_000, 0, 0, 9.0, 0.0, 0.0),
+                    Some("test-agent"),
+                )
+                .unwrap();
+
+            upgrade::upgrade_installation(tmp.path(), initial, |_| "test-agent".into()).unwrap();
+            let after =
+                CostTracker::resolve_global(&trackers, config, tmp.path(), initial.name()).unwrap();
+            assert!(Arc::ptr_eq(&first, &after));
+            assert!(
+                matches!(after.check_budget(89.0).unwrap(), BudgetCheck::Exceeded { current_usd, .. } if current_usd == 12.0)
+            );
+            // Derived trackers must see the refreshed per-agent cache as well.
+            assert!(
+                matches!(agent.check_budget(0.0).unwrap(), BudgetCheck::Exceeded { current_usd, agent_alias: Some(alias), .. } if current_usd == 12.0 && alias == "test-agent")
+            );
+            let summary = after.get_summary().unwrap();
+            assert_eq!(summary.request_count, 2);
+            assert_eq!(summary.daily_cost_usd, 12.0);
+            assert_eq!(summary.monthly_cost_usd, 12.0);
         }
     }
 
