@@ -3786,6 +3786,33 @@ mod dashboard_route_tests {
         })
     }
 
+    /// A daemon's registry entry, with the dashboard label it would have been
+    /// given, its outbound channel and its conn map.
+    fn daemon(
+        fpr: &str,
+        epoch: u64,
+        label: Option<&str>,
+    ) -> (
+        DaemonHandle,
+        mpsc::Receiver<Message>,
+        Arc<Mutex<ConnRoutes>>,
+    ) {
+        let (to_daemon, daemon_rx) = mpsc::channel::<Message>(64);
+        let conns: Arc<Mutex<ConnRoutes>> = Arc::new(Mutex::new(HashMap::new()));
+        let handle = DaemonHandle {
+            fpr: fpr.into(),
+            epoch,
+            to_daemon,
+            conns: conns.clone(),
+            metrics: Arc::new(NodeMetrics::default()),
+            connect_bucket: Arc::new(Mutex::new(TokenBucket::new(60, 20.0))),
+            supersede: Arc::new(tokio::sync::Notify::new()),
+            dashboard_label: label.map(str::to_string),
+            dashboard_live: Arc::new(AtomicUsize::new(0)),
+        };
+        (handle, daemon_rx, conns)
+    }
+
     /// Register a daemon directly, with the dashboard label it would have been
     /// given, and hand back its outbound channel and conn map.
     async fn register(
@@ -3794,22 +3821,13 @@ mod dashboard_route_tests {
         epoch: u64,
         label: Option<&str>,
     ) -> (mpsc::Receiver<Message>, Arc<Mutex<ConnRoutes>>) {
-        let (to_daemon, daemon_rx) = mpsc::channel::<Message>(64);
-        let conns: Arc<Mutex<ConnRoutes>> = Arc::new(Mutex::new(HashMap::new()));
-        server.inner.daemons.lock().await.insert(
-            node_id.to_string(),
-            DaemonHandle {
-                fpr: "stub-fingerprint".into(),
-                epoch,
-                to_daemon,
-                conns: conns.clone(),
-                metrics: Arc::new(NodeMetrics::default()),
-                connect_bucket: Arc::new(Mutex::new(TokenBucket::new(60, 20.0))),
-                supersede: Arc::new(tokio::sync::Notify::new()),
-                dashboard_label: label.map(str::to_string),
-                dashboard_live: Arc::new(AtomicUsize::new(0)),
-            },
-        );
+        let (handle, daemon_rx, conns) = daemon("stub-fingerprint", epoch, label);
+        server
+            .inner
+            .daemons
+            .lock()
+            .await
+            .insert(node_id.to_string(), handle);
         (daemon_rx, conns)
     }
 
@@ -3867,6 +3885,53 @@ mod dashboard_route_tests {
             None,
             "a relay that serves no dashboards"
         );
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_route_stays_with_the_daemon_its_label_matched() {
+        // Matching the label and opening the route are two steps. If the
+        // daemon goes away between them and another key registers its
+        // node-id, the browser must not be routed to that key.
+        let server = server();
+        let mine = label('a');
+        let (mut daemon_rx, _conns) = register(&server, "node", 1, Some(&mine)).await;
+        let (newcomer, mut newcomer_rx, _newcomer_conns) = daemon("another-key", 2, None);
+
+        // Hold the registry so the browser's lookup, then the takeover, queue
+        // behind it in that order: tokio's mutex is fair.
+        let held = server.inner.daemons.lock().await;
+        let (_browser, relay_side) = tokio::io::duplex(64 * 1024);
+        let peer: SocketAddr = BROWSER.parse().unwrap();
+        let served = tokio::spawn(serve(
+            server.inner.clone(),
+            relay_side,
+            DashboardHost::Label(mine),
+            peer,
+        ));
+        tokio::task::yield_now().await;
+        let inner = server.inner.clone();
+        let takeover = tokio::spawn(async move {
+            inner
+                .daemons
+                .lock()
+                .await
+                .insert("node".to_string(), newcomer);
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+        takeover.await.unwrap();
+
+        assert!(matches!(
+            next_open(&mut daemon_rx).await,
+            Control::Open { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), newcomer_rx.recv())
+                .await
+                .is_err(),
+            "the key that took over the node-id was sent the browser's route"
+        );
+        served.abort();
     }
 
     #[tokio::test]

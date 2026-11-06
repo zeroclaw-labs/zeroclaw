@@ -23,7 +23,7 @@
 //! briefly registers two node-ids for one key; the newest registration wins.
 
 use crate::Inner;
-use crate::enroll_route::{OpenError, open_route};
+use crate::enroll_route::{DaemonLink, OpenError, open_route_on};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -232,16 +232,19 @@ pub(crate) async fn serve<S>(
         return;
     };
     // The newest registration under this label: during a node-id rotation's
-    // grace window the same key holds two node-ids for a while.
+    // grace window the same key holds two node-ids for a while. Its link is
+    // taken under the same lock as the match, and the route is opened on that
+    // link, not looked up again by node-id: the node-id is the daemon's own
+    // choice, and once this daemon goes away another key may register it.
     let target = {
         let daemons = inner.daemons.lock().await;
         daemons
-            .iter()
-            .filter(|(_, handle)| handle.dashboard_label.as_deref() == Some(label.as_str()))
-            .max_by_key(|(_, handle)| handle.epoch)
-            .map(|(node_id, handle)| (node_id.clone(), Arc::clone(&handle.dashboard_live)))
+            .values()
+            .filter(|handle| handle.dashboard_label.as_deref() == Some(label.as_str()))
+            .max_by_key(|handle| handle.epoch)
+            .map(|handle| (DaemonLink::of(handle), Arc::clone(&handle.dashboard_live)))
     };
-    let Some((node_id, node_live)) = target else {
+    let Some((link, node_live)) = target else {
         refuse(
             &mut browser,
             404,
@@ -259,8 +262,7 @@ pub(crate) async fn serve<S>(
         .await;
         return;
     };
-    let route = match open_route(&inner, &node_id, PEER_HINT_GATEWAY, Some(peer.to_string())).await
-    {
+    let route = match open_route_on(&inner, link, PEER_HINT_GATEWAY, Some(peer.to_string())).await {
         Ok(route) => route,
         Err(error) => {
             let (status, message) = match error {
