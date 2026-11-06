@@ -4179,7 +4179,7 @@ impl RpcDispatcher {
             if inflight.contains_key(&request_id) {
                 return Some(Err(rpc_err(
                     INVALID_PARAMS,
-                    "request_id is already in flight on this connection",
+                    crate::i18n::get_required_cli_string("rpc-plugin-webhook-request-id-in-flight"),
                 )));
             }
             let Ok(permit) = Arc::clone(&self.plugin_webhook_permits).try_acquire_owned() else {
@@ -14115,9 +14115,9 @@ fn require_plugin_webhook_request_id(request_id: &str) -> Result<(), JsonRpcErro
     } else {
         Err(rpc_err(
             INVALID_PARAMS,
-            format!(
-                "request_id must be 1 to {MAX_PLUGIN_WEBHOOK_REQUEST_ID_BYTES} bytes of printable \
-                 ASCII without spaces"
+            crate::i18n::get_required_cli_string_with_args(
+                "rpc-plugin-webhook-request-id-invalid",
+                &[("max", &MAX_PLUGIN_WEBHOOK_REQUEST_ID_BYTES.to_string())],
             ),
         ))
     }
@@ -14134,12 +14134,15 @@ fn plugin_webhook_request_from_params(
     if p.body_b64.len() > MAX_PLUGIN_WEBHOOK_BODY_B64_BYTES {
         return Err(rpc_err(
             INVALID_PARAMS,
-            "body_b64 exceeds the plugin webhook body limit",
+            crate::i18n::get_required_cli_string("rpc-plugin-webhook-body-too-large"),
         ));
     }
-    let body = STANDARD
-        .decode(&p.body_b64)
-        .map_err(|_| rpc_err(INVALID_PARAMS, "body_b64 is not standard base64"))?;
+    let body = STANDARD.decode(&p.body_b64).map_err(|_| {
+        rpc_err(
+            INVALID_PARAMS,
+            crate::i18n::get_required_cli_string("rpc-plugin-webhook-body-not-base64"),
+        )
+    })?;
     let headers = p
         .headers
         .into_iter()
@@ -14149,7 +14152,10 @@ fn plugin_webhook_request_from_params(
         PluginWebhookRequest::new(p.path, &p.method, p.query, headers, body).map_err(|error| {
             rpc_err(
                 INVALID_PARAMS,
-                format!("invalid plugin webhook request: {error}"),
+                crate::i18n::get_required_cli_string_with_args(
+                    "rpc-plugin-webhook-request-invalid",
+                    &[("error", &error.to_string())],
+                ),
             )
         })?;
     Ok((p.request_id, request))
