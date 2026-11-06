@@ -5,7 +5,7 @@ use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::model_provider::*;
 use zeroclaw_api::session_events::capture::{
-    ProviderRouteSource, SessionContextPort, scope_provider_capture, scope_provider_route_source,
+    ProviderRouteSource, scope_provider_capture, scope_provider_route_source,
 };
 use zeroclaw_api::session_events::*;
 use zeroclaw_infra::session_events::open_event_store;
