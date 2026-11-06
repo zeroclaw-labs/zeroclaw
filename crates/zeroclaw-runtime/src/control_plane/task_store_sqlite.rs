@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::authority::is_authoritative;
 use super::task_registry::{
@@ -14,7 +14,7 @@ use super::task_registry::{
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 10;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 13;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -88,6 +88,8 @@ impl SqliteTaskStore {
                  delivered       INTEGER NOT NULL DEFAULT 0,
                  idem_key        TEXT,
                  principal_id    TEXT,
+                 session_id      TEXT,
+                 execution_epoch INTEGER NOT NULL DEFAULT 0,
                  started_at      TEXT NOT NULL,
                  finished_at     TEXT,
                  output          TEXT,
@@ -120,12 +122,40 @@ impl SqliteTaskStore {
         Ok(n as u64)
     }
 
-    /// Admin enumeration — delete this agent's records (alias-delete cascade).
+    /// Delete an agent's ordinary records while retaining session-Goal history.
+    /// A nonterminal session Goal refuses the entire alias-delete cascade step.
     pub fn delete_by_agent(&self, agent: &str) -> Result<u64> {
-        let conn = self.conn.lock();
-        let n = conn
-            .execute("DELETE FROM tasks WHERE agent = ?1", params![agent])
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("begin tasks by agent deletion")?;
+        let has_session_goal: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM tasks
+                      WHERE agent = ?1 AND kind = 'goal'
+                        AND session_id IS NOT NULL AND length(trim(session_id)) > 0
+                        AND status IN ('running', 'paused')
+                 )",
+                params![agent],
+                |row| row.get(0),
+            )
+            .context("classify session-bound Goal agent deletion")?;
+        if has_session_goal {
+            anyhow::bail!(
+                "session-bound Goal tasks require guarded GoalTaskRegistry disposal; \
+                 generic agent deletion is unavailable"
+            );
+        }
+        let n = tx
+            .execute(
+                "DELETE FROM tasks WHERE agent = ?1
+                   AND NOT (kind = 'goal' AND session_id IS NOT NULL
+                            AND length(trim(session_id)) > 0)",
+                params![agent],
+            )
             .context("delete tasks by agent")?;
+        tx.commit().context("commit tasks by agent deletion")?;
         Ok(n as u64)
     }
 }
@@ -134,45 +164,60 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
-    goal::migrate_schema(conn, version)?;
-    if version < 8 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
-                 task_id          TEXT PRIMARY KEY
-                                  REFERENCES tasks(id) ON DELETE CASCADE,
-                 owner_pid        INTEGER NOT NULL,
-                 owner_boot_id    TEXT NOT NULL,
-                 desired_status   TEXT NOT NULL,
-                 artifact_path    TEXT NOT NULL,
-                 artifact_ref     TEXT,
-                 artifact_sha256  TEXT NOT NULL,
-                 terminal_error   TEXT
-             );
-             CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
-                ON terminal_settlement_intents(owner_pid, owner_boot_id);
-             PRAGMA user_version = 8;",
-        )
-        .context("apply control-plane schema v8")?;
-    }
-    if version < 9 {
+    if version < CONTROL_PLANE_SCHEMA_VERSION {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("begin control-plane schema migration")?;
         add_column_if_missing(
-            conn,
+            &tx,
+            "tasks",
+            "session_id",
+            "ALTER TABLE tasks ADD COLUMN session_id TEXT",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "tasks",
+            "execution_epoch",
+            "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &tx,
             "tasks",
             "originator_chain",
             "ALTER TABLE tasks ADD COLUMN originator_chain TEXT",
         )?;
-        conn.execute_batch("PRAGMA user_version = 9;")
-            .context("apply control-plane schema v9")?;
-    }
-    if version < 10 {
         add_column_if_missing(
-            conn,
+            &tx,
             "tasks",
             "progress",
             "ALTER TABLE tasks ADD COLUMN progress TEXT",
         )?;
-        conn.execute_batch("PRAGMA user_version = 10;")
-            .context("apply control-plane schema v10")?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
+                     task_id          TEXT PRIMARY KEY
+                                      REFERENCES tasks(id) ON DELETE CASCADE,
+                     owner_pid        INTEGER NOT NULL,
+                     owner_boot_id    TEXT NOT NULL,
+                     desired_status   TEXT NOT NULL,
+                     artifact_path    TEXT NOT NULL,
+                     artifact_ref     TEXT,
+                     artifact_sha256  TEXT NOT NULL,
+                     terminal_error   TEXT
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
+                    ON terminal_settlement_intents(owner_pid, owner_boot_id);",
+        )
+        .context("ensure terminal settlement schema")?;
+        // Version 8 existed both as upstream terminal-settlement schema and as
+        // a provisional Goal schema. Converge older databases through Goal's
+        // additive final schema; its session index replaces the superseded
+        // context uniqueness index without recreating it on legacy rows.
+        goal::converge_schema(&tx)?;
+        tx.execute_batch(&format!(
+            "PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"
+        ))
+        .context("mark final control-plane schema version")?;
+        tx.commit()
+            .context("commit control-plane schema migration")?;
     }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
@@ -199,13 +244,21 @@ fn add_column_if_missing(
         .prepare(&format!("PRAGMA table_info({table})"))
         .with_context(|| format!("inspect {table} columns"))?;
     let mut rows = stmt
-        .query_map([], |row| row.get::<_, String>(1))
+        .query([])
         .with_context(|| format!("query {table} columns"))?;
-    let exists = rows.any(|name| matches!(name, Ok(name) if name == column));
-    if !exists {
-        conn.execute_batch(alter_sql)
-            .with_context(|| format!("add {table}.{column}"))?;
+    while let Some(row) = rows
+        .next()
+        .with_context(|| format!("iterate {table} columns"))?
+    {
+        let name: String = row
+            .get(1)
+            .with_context(|| format!("decode {table} column name"))?;
+        if name == column {
+            return Ok(());
+        }
     }
+    conn.execute_batch(alter_sql)
+        .with_context(|| format!("add {table}.{column}"))?;
     Ok(())
 }
 
@@ -286,6 +339,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         delivered: row.get::<_, i64>("delivered")? != 0,
         idem_key: row.get("idem_key")?,
         principal_id: row.get("principal_id")?,
+        session_id: row.get("session_id")?,
+        execution_epoch: row.get("execution_epoch")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
     })
@@ -539,21 +594,19 @@ fn promote_settlement_record(
     Ok(changed == 1)
 }
 
-/// Collect query rows, SKIPPING (and logging) any single row that fails to convert —
-/// one unrecognised/corrupt record (e.g. a forward-incompat `kind`/`status` written by a
-/// newer binary) must not fail the whole enumeration and starve the reaper (finding #3).
-fn collect_skipping_bad_rows<I>(rows: I) -> Vec<TaskRecord>
-where
-    I: Iterator<Item = rusqlite::Result<TaskRecord>>,
-{
+/// Collect query rows, skipping and logging conversion failures while
+/// propagating operational SQLite step errors. One unrecognised/corrupt record
+/// (for example a forward-incompatible `kind` or `status`) must not starve the
+/// reaper, but a failed database operation must never become partial success.
+fn collect_skipping_bad_rows(rows: &mut rusqlite::Rows<'_>) -> rusqlite::Result<Vec<TaskRecord>> {
     let mut out = Vec::new();
-    for r in rows {
-        match r {
+    while let Some(row) = rows.next()? {
+        match row_to_record(row) {
             Ok(rec) => out.push(rec),
             Err(e) => log_unreadable_task_row(e),
         }
     }
-    out
+    Ok(out)
 }
 
 fn log_unreadable_task_row(error: rusqlite::Error) {
@@ -566,20 +619,21 @@ fn log_unreadable_task_row(error: rusqlite::Error) {
     );
 }
 
-/// Collect settlement intents while skipping a corrupt persisted row. Recovery
-/// metadata must not keep ordinary task reconciliation from running.
-fn collect_skipping_bad_settlement_intents<I>(rows: I) -> Vec<TerminalSettlementIntent>
-where
-    I: Iterator<Item = rusqlite::Result<TerminalSettlementIntent>>,
-{
+/// Collect settlement intents while skipping conversion failures and
+/// propagating operational SQLite step errors. Recovery metadata must not keep
+/// ordinary task reconciliation from running, but a failed query cannot become
+/// partial success.
+fn collect_skipping_bad_settlement_intents(
+    rows: &mut rusqlite::Rows<'_>,
+) -> rusqlite::Result<Vec<TerminalSettlementIntent>> {
     let mut out = Vec::new();
-    for row in rows {
-        match row {
+    while let Some(row) = rows.next()? {
+        match row_to_settlement_intent(row) {
             Ok(intent) => out.push(intent),
             Err(error) => log_unreadable_terminal_settlement_intent(error),
         }
     }
-    out
+    Ok(out)
 }
 
 fn log_unreadable_terminal_settlement_intent(error: rusqlite::Error) {
@@ -607,8 +661,8 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
              parent_id, originator_route, originator_chain, delivered, idem_key, principal_id,
-             started_at, finished_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             session_id, execution_epoch, started_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
          ON CONFLICT(id) DO NOTHING",
         params![
             rec.id,
@@ -625,11 +679,39 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
             rec.delivered as i64,
             rec.idem_key,
             rec.principal_id,
+            rec.session_id,
+            rec.execution_epoch,
             rec.started_at,
             rec.finished_at,
         ],
     )
     .context("insert task record")?;
+    Ok(())
+}
+
+/// Generic task lifecycle APIs predate Goal epoch fencing. They remain valid
+/// for unrelated and legacy rows but must not mutate a session-bound Goal.
+fn reject_session_bound_goal_mutation(
+    conn: &Connection,
+    task_id: &str,
+    operation: &str,
+) -> Result<()> {
+    let session_bound: bool = conn
+        .query_row(
+            "SELECT kind = 'goal' AND session_id IS NOT NULL
+               AND length(trim(session_id)) > 0
+               FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("classify generic task lifecycle mutation")?
+        .unwrap_or(false);
+    if session_bound {
+        anyhow::bail!(
+            "session-bound Goal tasks require guarded GoalTaskRegistry APIs; {operation} is unavailable"
+        );
+    }
     Ok(())
 }
 
@@ -774,6 +856,9 @@ fn claim_task_owner_record(
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
         let conn = self.conn.lock();
+        if rec.kind == TaskKind::Goal {
+            anyhow::bail!("Goal tasks require the session-bound GoalTaskRegistry admission API");
+        }
         insert_task_record(&conn, rec)?;
         Ok(())
     }
@@ -781,6 +866,7 @@ impl TaskRegistry for SqliteTaskStore {
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "heartbeat")?;
         // Only the heart-beating owner refreshes; prevents a stale boot from
         // resurrecting liveness it does not own.
         conn.execute(
@@ -801,6 +887,7 @@ impl TaskRegistry for SqliteTaskStore {
         let encoded = serde_json::to_string(progress).context("encode task progress")?;
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "progress record")?;
         let changed = conn
             .execute(
                 "UPDATE tasks SET progress = ?1, heartbeat_at = ?2
@@ -825,6 +912,7 @@ impl TaskRegistry for SqliteTaskStore {
         error: Option<String>,
     ) -> Result<()> {
         let conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "status update")?;
         update_task_status_record(&conn, id, status, output, error)?;
         Ok(())
     }
@@ -837,6 +925,7 @@ impl TaskRegistry for SqliteTaskStore {
         error: Option<String>,
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "terminal transition")?;
         Ok(transition_task_terminal_record(&mut conn, id, status, output, error)? == 1)
     }
 
@@ -850,6 +939,7 @@ impl TaskRegistry for SqliteTaskStore {
         error: Option<String>,
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "owner-checked terminal transition")?;
         Ok(transition_task_terminal_if_owner_record(
             &mut conn,
             id,
@@ -866,6 +956,7 @@ impl TaskRegistry for SqliteTaskStore {
         intent: TerminalSettlementIntent,
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, &intent.task_id, "terminal settlement intent")?;
         persist_settlement_intent_record(&mut conn, &intent)
     }
 
@@ -877,10 +968,11 @@ impl TaskRegistry for SqliteTaskStore {
                  ORDER BY task_id",
             )
             .context("prepare list terminal settlement intents")?;
-        let rows = stmt
-            .query_map([], row_to_settlement_intent)
+        let mut rows = stmt
+            .query([])
             .context("query terminal settlement intents")?;
-        Ok(collect_skipping_bad_settlement_intents(rows))
+        collect_skipping_bad_settlement_intents(&mut rows)
+            .context("decode terminal settlement intent rows")
     }
 
     async fn promote_terminal_settlement(
@@ -891,6 +983,11 @@ impl TaskRegistry for SqliteTaskStore {
         error: Option<String>,
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(
+            &conn,
+            &intent.task_id,
+            "terminal settlement promotion",
+        )?;
         promote_settlement_record(&mut conn, intent, resolved_status, output, error)
     }
 
@@ -899,11 +996,13 @@ impl TaskRegistry for SqliteTaskStore {
         intent: &TerminalSettlementIntent,
     ) -> Result<bool> {
         let conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, &intent.task_id, "terminal settlement discard")?;
         Ok(delete_settlement_intent_record(&conn, intent)? == 1)
     }
 
     async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "owner claim")?;
         let tx = conn.transaction().context("begin task owner claim")?;
         tx.execute(
             "DELETE FROM terminal_settlement_intents
@@ -946,10 +1045,8 @@ impl TaskRegistry for SqliteTaskStore {
         let mut stmt = conn
             .prepare("SELECT * FROM tasks WHERE status = 'running'")
             .context("prepare list_running")?;
-        let rows = stmt
-            .query_map([], row_to_record)
-            .context("query list_running")?;
-        Ok(collect_skipping_bad_rows(rows))
+        let mut rows = stmt.query([]).context("query list_running")?;
+        collect_skipping_bad_rows(&mut rows).context("decode list_running rows")
     }
 
     async fn list_by_agent(&self, agent: &str) -> Result<Vec<TaskRecord>> {
@@ -957,10 +1054,8 @@ impl TaskRegistry for SqliteTaskStore {
         let mut stmt = conn
             .prepare("SELECT * FROM tasks WHERE agent = ?1 ORDER BY started_at DESC")
             .context("prepare list_by_agent")?;
-        let rows = stmt
-            .query_map(params![agent], row_to_record)
-            .context("query list_by_agent")?;
-        Ok(collect_skipping_bad_rows(rows))
+        let mut rows = stmt.query(params![agent]).context("query list_by_agent")?;
+        collect_skipping_bad_rows(&mut rows).context("decode list_by_agent rows")
     }
 
     async fn reconcile_lost(&self, id: &str, _now_boot_id: &str) -> Result<bool> {
@@ -975,6 +1070,9 @@ impl TaskRegistry for SqliteTaskStore {
             .context("reconcile: load task")?
         };
         let Some(rec) = rec else { return Ok(false) };
+        if rec.kind == TaskKind::Goal {
+            return Ok(false);
+        }
         // Never reclaim a terminal record, and never one a live owner still holds.
         if rec.status.is_terminal() || !is_authoritative(&rec) {
             return Ok(false);
@@ -1017,6 +1115,7 @@ impl TaskRegistry for SqliteTaskStore {
     ) -> Result<bool> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "timeout reconciliation")?;
         let tx = conn
             .transaction()
             .context("reconcile: begin timeout transition")?;
@@ -1051,6 +1150,313 @@ impl TaskRegistry for SqliteTaskStore {
 mod tests {
     use super::*;
 
+    /// Copy the released schema independently of the candidate's migration.
+    /// DDL comes from control_plane/task_store_sqlite.rs::{init,migrate_schema}
+    /// and control_plane/task_store_sqlite/goal.rs::migrate_schema before the
+    /// session-bound Goal schema. Version 9 predates the progress column.
+    fn create_upstream_progress_fixture(conn: &Connection, version: i64) {
+        conn.execute_batch(
+            r#"CREATE TABLE IF NOT EXISTS tasks (
+                 id              TEXT PRIMARY KEY,
+                 kind            TEXT NOT NULL,
+                 agent           TEXT NOT NULL,
+                 status          TEXT NOT NULL,
+                 owner_pid       INTEGER NOT NULL DEFAULT 0,
+                 owner_boot_id   TEXT NOT NULL DEFAULT '',
+                 heartbeat_at    TEXT,
+                 depth           INTEGER NOT NULL DEFAULT 0,
+                 parent_id       TEXT,
+                 originator_route TEXT,
+                 originator_chain TEXT,
+                 delivered       INTEGER NOT NULL DEFAULT 0,
+                 idem_key        TEXT,
+                 principal_id    TEXT,
+                 started_at      TEXT NOT NULL,
+                 finished_at     TEXT,
+                 output          TEXT,
+                 error           TEXT,
+                 progress        TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+             CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);
+             CREATE INDEX IF NOT EXISTS idx_tasks_agent_kind_started
+                ON tasks(agent, kind, started_at DESC);
+CREATE TABLE IF NOT EXISTS goal_tasks (
+                 task_id        TEXT PRIMARY KEY
+                                REFERENCES tasks(id) ON DELETE CASCADE,
+                 objective      TEXT NOT NULL
+             );
+ALTER TABLE goal_tasks ADD COLUMN effective_token_limit INTEGER;
+ALTER TABLE goal_tasks ADD COLUMN effective_cost_limit_usd REAL;
+ALTER TABLE goal_tasks ADD COLUMN pause_reason TEXT;
+ALTER TABLE goal_tasks ADD COLUMN pause_description TEXT;
+ALTER TABLE goal_tasks ADD COLUMN blockers_json TEXT NOT NULL DEFAULT '[]';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_active_goal_context
+                ON tasks(
+                    agent,
+                    COALESCE(originator_route, ''),
+                    COALESCE(principal_id, '')
+                )
+                WHERE kind = 'goal'
+                  AND status NOT IN ('completed','failed','cancelled','lost','timed_out');
+CREATE TABLE IF NOT EXISTS task_continuation_contexts (
+                 task_id      TEXT PRIMARY KEY
+                              REFERENCES tasks(id) ON DELETE CASCADE,
+                 context_json TEXT NOT NULL
+             );
+CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_require_goal_kind
+                BEFORE INSERT ON goal_tasks
+                FOR EACH ROW
+                WHEN COALESCE((SELECT kind FROM tasks WHERE id = NEW.task_id), '') != 'goal'
+                BEGIN
+                    SELECT RAISE(ABORT, 'goal_tasks.task_id must reference TaskKind::Goal');
+                END;
+CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_effective_limits_insert
+                BEFORE INSERT ON goal_tasks
+                FOR EACH ROW
+                WHEN (NEW.effective_token_limit IS NOT NULL AND NEW.effective_token_limit < 0)
+                  OR (NEW.effective_cost_limit_usd IS NOT NULL
+                      AND NOT (NEW.effective_cost_limit_usd >= 0.0
+                               AND NEW.effective_cost_limit_usd <= 1.7976931348623157e308))
+                BEGIN
+                    SELECT RAISE(ABORT, 'goal effective limits must be non-negative finite values');
+                END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_effective_limits_update
+                BEFORE UPDATE OF effective_token_limit, effective_cost_limit_usd ON goal_tasks
+                FOR EACH ROW
+                WHEN (NEW.effective_token_limit IS NOT NULL AND NEW.effective_token_limit < 0)
+                  OR (NEW.effective_cost_limit_usd IS NOT NULL
+                      AND NOT (NEW.effective_cost_limit_usd >= 0.0
+                               AND NEW.effective_cost_limit_usd <= 1.7976931348623157e308))
+                BEGIN
+                    SELECT RAISE(ABORT, 'goal effective limits must be non-negative finite values');
+                END;
+             CREATE TRIGGER IF NOT EXISTS trg_task_continuation_contexts_require_goal_insert
+                BEFORE INSERT ON task_continuation_contexts
+                FOR EACH ROW
+                WHEN NOT EXISTS (
+                    SELECT 1
+                      FROM tasks
+                      JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+                     WHERE tasks.id = NEW.task_id
+                       AND tasks.kind = 'goal'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'task_continuation_contexts.task_id must reference a goal task');
+                END;
+             CREATE TRIGGER IF NOT EXISTS trg_task_continuation_contexts_require_goal_update
+                BEFORE UPDATE OF task_id ON task_continuation_contexts
+                FOR EACH ROW
+                WHEN NOT EXISTS (
+                    SELECT 1
+                      FROM tasks
+                      JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+                     WHERE tasks.id = NEW.task_id
+                       AND tasks.kind = 'goal'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'task_continuation_contexts.task_id must reference a goal task');
+                END;
+CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
+                 task_id          TEXT PRIMARY KEY
+                                  REFERENCES tasks(id) ON DELETE CASCADE,
+                 owner_pid        INTEGER NOT NULL,
+                 owner_boot_id    TEXT NOT NULL,
+                 desired_status   TEXT NOT NULL,
+                 artifact_path    TEXT NOT NULL,
+                 artifact_ref     TEXT,
+                 artifact_sha256  TEXT NOT NULL,
+                 terminal_error   TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
+                ON terminal_settlement_intents(owner_pid, owner_boot_id);"#,
+        )
+        .expect("create upstream control-plane fixture schema");
+        match version {
+            9 => conn
+                .execute_batch("ALTER TABLE tasks DROP COLUMN progress; PRAGMA user_version = 9;")
+                .expect("select upstream schema nine"),
+            10 => conn
+                .execute_batch("PRAGMA user_version = 10;")
+                .expect("select upstream schema ten"),
+            _ => panic!("unsupported upstream progress fixture version"),
+        }
+    }
+
+    fn progress_fixture_rows(conn: &Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn
+            .prepare(sql)
+            .expect("prepare progress fixture snapshot");
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .expect("query progress fixture snapshot")
+            .collect::<rusqlite::Result<_>>()
+            .expect("read progress fixture snapshot")
+    }
+
+    /// Released version-nine and version-ten databases converge without
+    /// changing ordinary data, terminal receipts, or completed legacy Goals.
+    #[tokio::test]
+    async fn upstream_progress_schemas_preserve_rows_during_goal_convergence() {
+        for version in [9, 10] {
+            let directory = tempfile::tempdir().expect("create progress migration fixture");
+            let path = directory.path().join("control_plane.db");
+            let conn = Connection::open(&path).expect("open upstream fixture");
+            create_upstream_progress_fixture(&conn, version);
+            conn.execute_batch(
+                "INSERT INTO tasks
+                    (id, kind, agent, status, owner_pid, owner_boot_id,
+                     heartbeat_at, originator_chain, started_at, finished_at,
+                     output, error)
+                 VALUES
+                    ('delegate-running', 'delegate', 'main', 'running', 1,
+                     'fixture-boot', 'fixture-heartbeat', '[]', 'fixture-start',
+                     NULL, 'running output', NULL),
+                    ('delegate-completed', 'delegate', 'main', 'completed', 1,
+                     'fixture-boot', 'fixture-heartbeat', '[]', 'fixture-start',
+                     'fixture-finish', 'retained result', NULL),
+                    ('goal-running', 'goal', 'main', 'running', 1,
+                     'fixture-boot', 'fixture-heartbeat', '[]', 'fixture-start',
+                     NULL, NULL, NULL),
+                    ('goal-completed', 'goal', 'main', 'completed', 1,
+                     'fixture-boot', 'fixture-heartbeat', '[]', 'fixture-start',
+                     'fixture-finish', 'completed legacy result', NULL);
+                 INSERT INTO goal_tasks (task_id, objective, effective_token_limit)
+                 VALUES ('goal-running', 'legacy objective', 100),
+                        ('goal-completed', 'completed legacy objective', 200);
+                 INSERT INTO terminal_settlement_intents
+                    (task_id, owner_pid, owner_boot_id, desired_status,
+                     artifact_path, artifact_ref, artifact_sha256, terminal_error)
+                 VALUES ('delegate-completed', 1, 'fixture-boot', 'completed',
+                         '/fixture/result.json', 'fixture:receipt',
+                         '0000000000000000000000000000000000000000000000000000000000000000',
+                         NULL);",
+            )
+            .expect("insert upstream fixture rows");
+            let progress = TaskProgress {
+                iterations: 7,
+                ..TaskProgress::default()
+            };
+            if version == 10 {
+                conn.execute(
+                    "UPDATE tasks SET progress = ?1 WHERE id = 'delegate-running'",
+                    params![serde_json::to_string(&progress).expect("serialize fixture progress")],
+                )
+                .expect("store valid upstream progress");
+                conn.execute(
+                    "UPDATE tasks SET progress = 'not json' WHERE id = 'delegate-completed'",
+                    [],
+                )
+                .expect("store malformed upstream progress");
+            }
+            let original_columns: Vec<String> = conn
+                .prepare("SELECT name FROM pragma_table_info('tasks') ORDER BY cid")
+                .expect("prepare original-column snapshot")
+                .query_map([], |row| row.get(0))
+                .expect("query original-column snapshot")
+                .collect::<rusqlite::Result<_>>()
+                .expect("read original-column snapshot");
+            // Names come only from the fixed fixture DDL, never from user data.
+            let retained_query = format!(
+                "SELECT {} FROM tasks WHERE id IN
+                    ('delegate-running', 'delegate-completed', 'goal-completed')
+                 ORDER BY id",
+                original_columns.join(", ")
+            );
+            let retained_rows = progress_fixture_rows(&conn, &retained_query);
+            let receipts = progress_fixture_rows(
+                &conn,
+                "SELECT * FROM terminal_settlement_intents ORDER BY task_id",
+            );
+            drop(conn);
+
+            let store = SqliteTaskStore::new(directory.path()).expect("converge upstream schema");
+            let running = store
+                .get_snapshot("delegate-running")
+                .await
+                .expect("read migrated running delegate")
+                .expect("running delegate retained");
+            assert_eq!(
+                running.progress.as_ref(),
+                (version == 10).then_some(&progress)
+            );
+            let completed = store
+                .get_snapshot("delegate-completed")
+                .await
+                .expect("read migrated completed delegate")
+                .expect("completed delegate retained");
+            assert!(completed.progress.is_none());
+            assert_eq!(completed.output.as_deref(), Some("retained result"));
+            let legacy = store
+                .get_snapshot("goal-running")
+                .await
+                .expect("read reconciled legacy Goal")
+                .expect("legacy Goal retained");
+            assert_eq!(legacy.task.status, TaskStatus::Failed);
+            assert_eq!(legacy.error.as_deref(), Some("legacy_goal_missing_session"));
+            let verify = Connection::open(&path).expect("verify migrated fixture independently");
+            let schema: i64 = verify
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("read converged schema version");
+            assert_eq!(schema, CONTROL_PLANE_SCHEMA_VERSION);
+            let has_progress: bool = verify
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'progress')",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("verify progress column");
+            assert!(has_progress);
+            assert_eq!(
+                progress_fixture_rows(&verify, &retained_query),
+                retained_rows
+            );
+            assert_eq!(
+                progress_fixture_rows(
+                    &verify,
+                    "SELECT * FROM terminal_settlement_intents ORDER BY task_id",
+                ),
+                receipts
+            );
+            drop(verify);
+            drop(store);
+
+            let reopened =
+                SqliteTaskStore::new(directory.path()).expect("reopen converged fixture");
+            let verify = Connection::open(&path).expect("verify retained rows after reopen");
+            assert_eq!(
+                progress_fixture_rows(&verify, &retained_query),
+                retained_rows
+            );
+            assert_eq!(
+                progress_fixture_rows(
+                    &verify,
+                    "SELECT * FROM terminal_settlement_intents ORDER BY task_id",
+                ),
+                receipts
+            );
+            drop(verify);
+            assert!(
+                reopened
+                    .record_progress("delegate-running", "fixture-boot", &progress)
+                    .await
+                    .expect("ordinary owner can still record progress")
+            );
+            assert_eq!(
+                reopened
+                    .get_snapshot("delegate-running")
+                    .await
+                    .expect("read newly recorded ordinary progress")
+                    .expect("running delegate retained after progress")
+                    .progress,
+                Some(progress)
+            );
+        }
+    }
+
     fn rec(id: &str, agent: &str, owner_pid: u32, boot: &str) -> TaskRecord {
         TaskRecord {
             id: id.into(),
@@ -1067,6 +1473,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
         }
