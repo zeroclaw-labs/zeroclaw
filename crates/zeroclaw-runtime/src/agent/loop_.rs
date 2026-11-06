@@ -1862,7 +1862,7 @@ async fn run_inner(
         {
             let (engine, audit) = crate::sop::build_sop_engine_with_provider_registry(
                 config.sop.clone(),
-                config,
+                &config,
                 &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
@@ -3974,7 +3974,7 @@ async fn process_message_inner(
         {
             let (engine, audit) = crate::sop::build_sop_engine_with_provider_registry(
                 config.sop.clone(),
-                config,
+                &config,
                 &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),

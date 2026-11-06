@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 
 use super::{AsrOptionsPatch, ChatOptionsPatch, Override, PresetId, TtsOptionsPatch};
-use crate::schema::WireApi;
+use crate::schema::{DecisionWireApi, WireApi};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -90,6 +90,20 @@ pub struct AsrApiPatch {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, deny_unknown_fields)]
+pub struct DecisionApiConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wire_api: Option<DecisionWireApi>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<Override<NonZeroU64>>,
+}
+
+/// Model-level decision settings have the same shape as connection defaults;
+/// the resolver applies them as a narrow override at admission time.
+pub type DecisionApiPatch = DecisionApiConfig;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(default, deny_unknown_fields)]
 pub struct CliChatApiConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
@@ -130,8 +144,9 @@ pub struct HailoChatApiConfig {
     pub options: ChatOptionsPatch,
 }
 
-// Capability tables are closed. Embedding and decision deliberately have no
-// empty API object; their connection and model define everything they consume.
+// Capability tables are closed. Embedding has no API object because its wire
+// shape is fixed. Decision has an API object because the same capability can
+// use different native protocols (OpenAI Decisions and System One).
 macro_rules! api_tables {
     ($name:ident { $($field:ident: $type:ty),* $(,)? }) => {
         #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -147,10 +162,15 @@ macro_rules! api_tables {
 api_tables!(ChatApi {
     chat: ChatApiConfig
 });
+api_tables!(ChatDecisionApi {
+    chat: ChatApiConfig,
+    decision: DecisionApiConfig
+});
 api_tables!(OpenAiApi {
     chat: ChatApiConfig,
     tts: TtsApiConfig,
-    asr: AsrApiConfig
+    asr: AsrApiConfig,
+    decision: DecisionApiConfig
 });
 api_tables!(VoiceApi { tts: TtsApiConfig });
 api_tables!(GoogleApi {
@@ -160,6 +180,9 @@ api_tables!(GoogleApi {
 api_tables!(GroqApi {
     chat: ChatApiConfig,
     asr: AsrApiConfig
+});
+api_tables!(DecisionApi {
+    decision: DecisionApiConfig
 });
 api_tables!(AsrApi { asr: AsrApiConfig });
 api_tables!(WhisperApi {

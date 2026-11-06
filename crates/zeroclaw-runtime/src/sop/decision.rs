@@ -1,8 +1,8 @@
 //! Decision-model gating for SOP dispatch.
 //!
-//! A "System One" decision model (TypeSafe Jev, or the Jev-compatible open-weights
-//! Laya served locally) answers typed questions about a state instead of
-//! generating text. An SOP opts in with a `[decision]` table in `SOP.toml`; for
+//! A native decision model answers typed questions about a state instead of
+//! generating text. Provider adapters own OpenAI Decisions and System One
+//! protocols. An SOP opts in with a `[decision]` table in `SOP.toml`; for
 //! each event that already matched one of its triggers, dispatch asks the model:
 //!
 //! - **gate** (`noul`): should this event start this SOP at all?
@@ -15,7 +15,7 @@
 //! strictest listed mode, so an outage or a low-confidence answer adds human
 //! supervision rather than removing it.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -308,9 +308,11 @@ pub fn models_from_config(
                 return None;
             };
             match zeroclaw_providers::decision::build_decision_provider(
-                &base_url,
-                &model,
-                cfg.api_key.clone(),
+                zeroclaw_providers::decision::DecisionProviderConfig::legacy_system_one(
+                    &base_url,
+                    &model,
+                    cfg.api_key.clone(),
+                ),
             ) {
                 Ok(client) => Some((alias.clone(), std::sync::Arc::from(client))),
                 Err(e) => {
@@ -331,8 +333,8 @@ pub fn models_from_config(
 }
 
 /// Build decision clients from the canonical provider registry. The registry
-/// owns connection/auth/model resolution; SOP only owns the System One wire
-/// protocol and the alias map consumed by the engine.
+/// owns connection/auth/model resolution; the provider crate owns native wire
+/// protocols. SOP only owns the alias map consumed by the engine.
 pub fn models_from_provider_registry(
     config: &zeroclaw_config::schema::Config,
 ) -> std::collections::HashMap<String, std::sync::Arc<dyn DecisionModel>> {
@@ -347,27 +349,10 @@ pub fn models_from_provider_registry(
             let Ok(resolved) = registry.resolve_decision(model_ref) else {
                 return None;
             };
-            let Some(base_url) = resolved
-                .selection
-                .connection
-                .uri()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"model": model_ref.as_str()})),
-                    "SOP canonical decision model unavailable: system-one connection has no uri"
-                );
-                return None;
-            };
-            match zeroclaw_providers::decision::build_decision_provider(
-                base_url,
-                resolved.model,
-                resolved.selection.connection.api_key().map(str::to_owned),
-            ) {
+            let client =
+                zeroclaw_providers::decision::DecisionProviderConfig::from_resolved(&resolved)
+                    .and_then(zeroclaw_providers::decision::build_decision_provider);
+            match client {
                 Ok(client) => Some((model_ref.to_string(), std::sync::Arc::from(client))),
                 Err(error) => {
                     ::zeroclaw_log::record!(

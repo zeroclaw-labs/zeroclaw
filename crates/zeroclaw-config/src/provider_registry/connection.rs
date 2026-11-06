@@ -2,8 +2,8 @@
 
 use super::{AsrOptionsPatch, ChatOptionsPatch, PresetId, TtsOptionsPatch, api::*};
 use crate::schema::{
-    GlmEndpoint, KiloEndpoint, MinimaxEndpoint, MoonshotEndpoint, QwenEndpoint, StepfunEndpoint,
-    ZaiEndpoint,
+    DecisionWireApi, GlmEndpoint, KiloEndpoint, MinimaxEndpoint, MoonshotEndpoint, QwenEndpoint,
+    StepfunEndpoint, ZaiEndpoint,
 };
 use crate::security::SecretStore;
 use crate::traits::{MASKED_SECRET, SecretField};
@@ -203,7 +203,7 @@ connection_struct!(HttpChatConnection {
     extra_headers: BTreeMap<String, String>,
     tls_ca_cert_path: Option<String>,
     auth: Option<ApiKeyAuth>,
-    api: ChatApi,
+    api: ChatDecisionApi,
 });
 connection_struct!(AnthropicConnection {
     uri: Option<String>,
@@ -212,7 +212,7 @@ connection_struct!(AnthropicConnection {
 });
 connection_struct!(FixedChatConnection {
     auth: Option<ApiKeyAuth>,
-    api: ChatApi,
+    api: ChatDecisionApi,
 });
 connection_struct!(QwenConnection {
     uri: Option<String>,
@@ -327,10 +327,13 @@ connection_struct!(HailoConnection {
 connection_struct!(SystemOneConnection {
     uri: Option<String>,
     auth: Option<ApiKeyAuth>,
+    api: DecisionApi,
 });
 
 macro_rules! provider_connections {
-    ($( $variant:ident($type:ty) = $kind:literal [$($capability:ident),*] ),* $(,)?) => {
+    ($( $variant:ident($type:ty) = $kind:literal [$($capability:ident),*]
+        $(decision [$first_wire:ident $(, $other_wire:ident)*])?
+    ),* $(,)?) => {
         #[derive(Debug, Clone, Serialize)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[serde(tag = "kind")]
@@ -360,7 +363,10 @@ macro_rules! provider_connections {
                         .and_then(Value::as_str)
                         .ok_or_else(|| serde::de::Error::custom("provider connection kind is missing"))?;
                     let defaults: CapabilitySet = match kind {
-                        $( $kind => [$(Capability::$capability),*].into_iter().collect(), )*
+                        $( $kind => [
+                            $(Capability::$capability,)*
+                            $({ let _ = DecisionWireApi::$first_wire; Capability::Decision },)?
+                        ].into_iter().collect(), )*
                         _ => CapabilitySet::new(),
                     };
                     object.insert(
@@ -380,7 +386,21 @@ macro_rules! provider_connections {
             pub const fn kind(&self) -> &'static str { match self { $(Self::$variant(_) => $kind,)* } }
             pub fn capabilities(&self) -> &CapabilitySet { match self { $(Self::$variant(c) => &c.capabilities,)* } }
             pub fn supports(&self, capability: Capability) -> bool {
+                if capability == Capability::Decision {
+                    return !self.decision_wire_apis().is_empty();
+                }
                 match self { $(Self::$variant(_) => [$(Capability::$capability),*].contains(&capability),)* }
+            }
+            /// Native decision protocols implemented by this connection kind,
+            /// in default preference order. This declaration also determines
+            /// whether `decision` is a supported/default capability.
+            pub fn decision_wire_apis(&self) -> &'static [DecisionWireApi] {
+                match self { $(Self::$variant(_) => &[
+                    $(DecisionWireApi::$first_wire, $(DecisionWireApi::$other_wire,)*)?
+                ],)* }
+            }
+            pub fn default_decision_wire_api(&self) -> Option<DecisionWireApi> {
+                self.decision_wire_apis().first().copied()
             }
             pub fn accepts_connection_field(&self, name: &str) -> bool {
                 match self { $(Self::$variant(_) => <$type>::FIELDS.contains(&name),)* }
@@ -393,6 +413,7 @@ macro_rules! provider_connections {
             pub fn chat_defaults(&self) -> Option<(Option<&PresetId>, &ChatOptionsPatch)> { match self { $(Self::$variant(c) => ConnectionSettings::chat_defaults(c),)* } }
             pub fn tts_defaults(&self) -> Option<(Option<&PresetId>, &TtsOptionsPatch)> { match self { $(Self::$variant(c) => ConnectionSettings::tts_defaults(c),)* } }
             pub fn asr_defaults(&self) -> Option<(Option<&PresetId>, &AsrOptionsPatch)> { match self { $(Self::$variant(c) => ConnectionSettings::asr_defaults(c),)* } }
+            pub fn decision_api(&self) -> Option<&DecisionApiConfig> { match self { $(Self::$variant(c) => <$type as ConnectionSettings>::decision_api(c),)* } }
             /// Command selected by a subprocess TTS connection, when the
             /// connection kind owns one.  Keeping this accessor on the
             /// tagged connection prevents consumers from reconstructing a
@@ -548,7 +569,7 @@ impl ProviderConnection {
     }
 }
 provider_connections! {
-    OpenAi(OpenAiConnection) = "openai" [Chat, Embedding, Tts, Asr],
+    OpenAi(OpenAiConnection) = "openai" [Chat, Embedding, Tts, Asr] decision [OpenAiDecisions],
     Azure(AzureConnection) = "azure" [Chat],
     Anthropic(AnthropicConnection) = "anthropic" [Chat],
     Moonshot(MoonshotConnection) = "moonshot" [Chat],
@@ -561,8 +582,8 @@ provider_connections! {
     Hunyuan(HttpChatConnection) = "hunyuan" [Chat],
     Qianfan(HttpChatConnection) = "qianfan" [Chat],
     Baichuan(HttpChatConnection) = "baichuan" [Chat],
-    OpenRouter(FixedChatConnection) = "openrouter" [Chat, Embedding],
-    Ollama(HttpChatConnection) = "ollama" [Chat],
+    OpenRouter(FixedChatConnection) = "openrouter" [Chat, Embedding] decision [SystemOne],
+    Ollama(HttpChatConnection) = "ollama" [Chat] decision [SystemOne],
     HailoOllama(HailoConnection) = "hailo_ollama" [Chat],
     Gemini(GeminiConnection) = "gemini" [Chat],
     GeminiCli(CliConnection) = "gemini_cli" [Chat],
@@ -570,7 +591,7 @@ provider_connections! {
     Bedrock(BedrockConnection) = "bedrock" [Chat],
     Telnyx(FixedChatConnection) = "telnyx" [Chat],
     Together(HttpChatConnection) = "together" [Chat],
-    Fireworks(HttpChatConnection) = "fireworks" [Chat],
+    Fireworks(HttpChatConnection) = "fireworks" [Chat] decision [OpenAiDecisions, SystemOne],
     Groq(GroqConnection) = "groq" [Chat, Asr],
     Mistral(HttpChatConnection) = "mistral" [Chat],
     Deepseek(HttpChatConnection) = "deepseek" [Chat],
@@ -606,12 +627,12 @@ provider_connections! {
     AtlasCloud(HttpChatConnection) = "atlascloud" [Chat],
     Ovh(FixedChatConnection) = "ovh" [Chat],
     Copilot(FixedChatConnection) = "copilot" [Chat],
-    Lmstudio(HttpChatConnection) = "lmstudio" [Chat],
-    Llamacpp(HttpChatConnection) = "llamacpp" [Chat],
-    Sglang(HttpChatConnection) = "sglang" [Chat],
-    Vllm(HttpChatConnection) = "vllm" [Chat],
+    Lmstudio(HttpChatConnection) = "lmstudio" [Chat] decision [OpenAiDecisions, SystemOne],
+    Llamacpp(HttpChatConnection) = "llamacpp" [Chat] decision [SystemOne],
+    Sglang(HttpChatConnection) = "sglang" [Chat] decision [SystemOne],
+    Vllm(HttpChatConnection) = "vllm" [Chat] decision [OpenAiDecisions, SystemOne],
     Osaurus(HttpChatConnection) = "osaurus" [Chat],
-    Litellm(HttpChatConnection) = "litellm" [Chat],
+    Litellm(HttpChatConnection) = "litellm" [Chat] decision [OpenAiDecisions, SystemOne],
     Lepton(HttpChatConnection) = "lepton" [Chat],
     Manifest(HttpChatConnection) = "manifest" [Chat],
     Morph(HttpChatConnection) = "morph" [Chat],
@@ -626,8 +647,8 @@ provider_connections! {
     KiloCli(CliConnection) = "kilocli" [Chat],
     Kilo(KiloConnection) = "kilo" [Chat],
     Zerorouter(HttpChatConnection) = "zerorouter" [Chat],
-    Custom(CompatibleConnection) = "custom" [Chat, Embedding, Tts, Asr],
-    OpenAiCompatible(CompatibleConnection) = "openai-compatible" [Chat, Embedding, Tts, Asr],
+    Custom(CompatibleConnection) = "custom" [Chat, Embedding, Tts, Asr] decision [OpenAiDecisions, SystemOne],
+    OpenAiCompatible(CompatibleConnection) = "openai-compatible" [Chat, Embedding, Tts, Asr] decision [OpenAiDecisions, SystemOne],
     ElevenLabs(VoiceConnection) = "elevenlabs" [Tts],
     Google(GoogleConnection) = "google" [Tts, Asr],
     Deepgram(AsrConnection) = "deepgram" [Asr],
@@ -635,7 +656,7 @@ provider_connections! {
     LocalWhisper(LocalWhisperConnection) = "local_whisper" [Asr],
     Piper(PiperConnection) = "piper" [Tts],
     Edge(EdgeConnection) = "edge" [Tts],
-    SystemOne(SystemOneConnection) = "system-one" [Decision],
+    SystemOne(SystemOneConnection) = "system-one" [] decision [SystemOne],
 }
 
 trait ConnectionSettings {
@@ -661,6 +682,9 @@ trait ConnectionSettings {
         None
     }
     fn asr_defaults(&self) -> Option<(Option<&PresetId>, &AsrOptionsPatch)> {
+        None
+    }
+    fn decision_api(&self) -> Option<&DecisionApiConfig> {
         None
     }
     fn tts_command(&self) -> Option<&str> {
@@ -704,6 +728,9 @@ impl ConnectionSettings for CompatibleConnection {
             .as_ref()
             .map(|api| (api.preset.as_ref(), &api.options))
     }
+    fn decision_api(&self) -> Option<&DecisionApiConfig> {
+        self.api.decision.as_ref()
+    }
     fn configured_apis(&self) -> Vec<Capability> {
         let mut out = Vec::new();
         if self.api.chat.is_some() {
@@ -714,6 +741,9 @@ impl ConnectionSettings for CompatibleConnection {
         }
         if self.api.asr.is_some() {
             out.push(Capability::Asr);
+        }
+        if self.api.decision.is_some() {
+            out.push(Capability::Decision);
         }
         out
     }
@@ -752,6 +782,9 @@ impl ConnectionSettings for OpenAiConnection {
             .as_ref()
             .map(|api| (api.preset.as_ref(), &api.options))
     }
+    fn decision_api(&self) -> Option<&DecisionApiConfig> {
+        self.api.decision.as_ref()
+    }
     fn configured_apis(&self) -> Vec<Capability> {
         let mut out = Vec::new();
         if self.api.chat.is_some() {
@@ -762,6 +795,9 @@ impl ConnectionSettings for OpenAiConnection {
         }
         if self.api.asr.is_some() {
             out.push(Capability::Asr);
+        }
+        if self.api.decision.is_some() {
+            out.push(Capability::Decision);
         }
         out
     }
@@ -788,10 +824,16 @@ impl ConnectionSettings for HttpChatConnection {
             .as_ref()
             .map(|api| (api.preset.as_ref(), &api.options))
     }
+    fn decision_api(&self) -> Option<&DecisionApiConfig> {
+        self.api.decision.as_ref()
+    }
     fn configured_apis(&self) -> Vec<Capability> {
         let mut out = Vec::new();
         if self.api.chat.is_some() {
             out.push(Capability::Chat);
+        }
+        if self.api.decision.is_some() {
+            out.push(Capability::Decision);
         }
         out
     }
@@ -809,12 +851,18 @@ impl ConnectionSettings for FixedChatConnection {
     fn chat_api(&self) -> Option<&ChatApiConfig> {
         self.api.chat.as_ref()
     }
+    fn decision_api(&self) -> Option<&DecisionApiConfig> {
+        self.api.decision.as_ref()
+    }
     fn configured_apis(&self) -> Vec<Capability> {
+        let mut out = Vec::new();
         if self.api.chat.is_some() {
-            vec![Capability::Chat]
-        } else {
-            Vec::new()
+            out.push(Capability::Chat);
         }
+        if self.api.decision.is_some() {
+            out.push(Capability::Decision);
+        }
+        out
     }
 }
 impl ConnectionSettings for AnthropicConnection {
@@ -1334,6 +1382,16 @@ impl ConnectionSettings for SystemOneConnection {
     fn api_key(&self) -> Option<&str> {
         self.auth.as_ref().and_then(|auth| auth.api_key())
     }
+    fn decision_api(&self) -> Option<&DecisionApiConfig> {
+        self.api.decision.as_ref()
+    }
+    fn configured_apis(&self) -> Vec<Capability> {
+        if self.api.decision.is_some() {
+            vec![Capability::Decision]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1356,6 +1414,7 @@ uri = "https://gateway.example/v1"
                 Capability::Embedding,
                 Capability::Tts,
                 Capability::Asr,
+                Capability::Decision,
             ]
             .into_iter()
             .collect()
@@ -1382,6 +1441,7 @@ capabilities = ["chat"]
                 Capability::Embedding,
                 Capability::Tts,
                 Capability::Asr,
+                Capability::Decision,
             ]
             .into_iter()
             .collect()
@@ -1395,5 +1455,26 @@ capabilities = []
         )
         .expect("an explicit empty capability list should be accepted");
         assert!(disabled.capabilities().is_empty());
+    }
+
+    #[test]
+    fn decision_defaults_are_native_protocols_per_connection_kind() {
+        let openai: ProviderConnection = toml::from_str(r#"kind = "openai""#).unwrap();
+        assert_eq!(
+            openai.decision_wire_apis(),
+            &[DecisionWireApi::OpenAiDecisions]
+        );
+
+        let vllm: ProviderConnection = toml::from_str(r#"kind = "vllm""#).unwrap();
+        assert_eq!(
+            vllm.decision_wire_apis(),
+            &[DecisionWireApi::OpenAiDecisions, DecisionWireApi::SystemOne]
+        );
+
+        let sglang: ProviderConnection = toml::from_str(r#"kind = "sglang""#).unwrap();
+        assert_eq!(sglang.decision_wire_apis(), &[DecisionWireApi::SystemOne]);
+
+        let chat_only: ProviderConnection = toml::from_str(r#"kind = "mistral""#).unwrap();
+        assert!(chat_only.decision_wire_apis().is_empty());
     }
 }

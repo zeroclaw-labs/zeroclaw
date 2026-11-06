@@ -15,25 +15,34 @@ model references.
 
 `capabilities` is optional. When omitted, it defaults to the compiled adapter
 surface for `kind`; an explicit list narrows that surface and `[]` disables it
-for this connection. The defaults are: `openai`, `custom`, and
-`openai-compatible` support chat, embedding, TTS, and ASR; `openrouter`
-supports chat and embedding; `groq` supports chat and ASR; `google` supports
-TTS and ASR; `elevenlabs`, `piper`, and `edge` support TTS; `deepgram`,
-`assemblyai`, and `local_whisper` support ASR; `system-one` supports decision;
-all other registered connection kinds support chat. A model still has to use a
-capability enabled by both the connection and its adapter implementation.
+for this connection. Decision models use native decision endpoints only:
+`openai_decisions` is OpenAI's `POST /v1/decisions` contract and
+`system_one` is the TypeSafe/Ollama-compatible `POST /v1/systemone` contract.
+Chat Completions and Responses structured outputs are chat protocols and do
+not provide the `decision` capability. The built-in native decision defaults
+are based on documented endpoint surfaces: OpenAI, vLLM, Fireworks, LM Studio,
+and LiteLLM expose OpenAI Decisions; vLLM, Fireworks, LM Studio, LiteLLM,
+OpenRouter, Ollama, llama.cpp, and SGLang expose System One. Generic `custom`
+and `openai-compatible` connections expose both protocols so an explicit
+endpoint can be used for a compatible native implementation. An explicit
+`api.decision.wire_api` selects one supported protocol. A model still has to
+use a capability enabled by both the connection and its adapter implementation.
 
 ```toml
 [providers.connections."gateway.prod"]
 kind = "openai-compatible"
 uri = "https://gateway.example.com/v1"
-capabilities = ["chat", "embedding", "tts", "asr"]
+capabilities = ["chat", "embedding", "tts", "asr", "decision"]
 auth = { mode = "api_key", api_key = "<API_KEY>" }
 
 [providers.connections."gateway.prod".api.chat]
 wire_api = "chat_completions"
 request_timeout_secs = 120
 read_timeout_secs = 300
+
+[providers.connections."gateway.prod".api.decision]
+wire_api = "openai_decisions"
+request_timeout_secs = 30
 
 [providers.model_presets."chat.balanced"]
 capability = "chat"
@@ -52,6 +61,11 @@ provider = "gateway.prod"
 model = "text-embedding-3-small"
 metadata = { dimensions = 1536 }
 
+[providers.models."decision.sop"]
+capability = "decision"
+provider = "gateway.prod"
+model = "decision-model"
+
 [providers.fallback]
 "chat.fast" = ["chat.backup"]
 
@@ -64,6 +78,14 @@ their paths and do not define a second URI. API defaults are applied first,
 then the API preset/options, model preset/options, and finally invocation
 overrides. `request_timeout_secs` is the total request bound and
 `read_timeout_secs` is the response-read idle bound; they are independent.
+An `openai` connection may omit `uri` and uses `https://api.openai.com/v1` for
+decision requests. Fireworks uses its documented
+`https://api.fireworks.ai/inference/v1` prefix, and OpenRouter uses
+`https://openrouter.ai/api/v1` for System One. The local adapters use their
+documented development defaults (Ollama `11434`, LM Studio `1234`, vLLM
+`8000`, SGLang `30000`, llama.cpp `8080`, and LiteLLM `4000`) when `uri` is
+omitted. `custom`, `openai-compatible`, and `system-one` connections must
+provide `uri`.
 For fields that support explicit clearing, the string `"null"` means clear and
 inheritance is represented by leaving the field unset. A literal string value
 `"null"` uses `{ value = "null" }` where that field supports the escape.

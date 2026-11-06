@@ -4100,8 +4100,14 @@ mod tests {
                 .unwrap_or_else(|_| "https://api.typesafe.ai".into());
             let model_id = std::env::var("SYSTEMONE_MODEL").unwrap_or_else(|_| "jev-latest".into());
             let key = std::env::var("TYPESAFE_API_KEY").ok();
-            let client: Arc<dyn DecisionModel> =
-                Arc::from(build_decision_provider(&base, &model_id, key).unwrap());
+            let client: Arc<dyn DecisionModel> = Arc::from(
+                build_decision_provider(
+                    zeroclaw_providers::decision::DecisionProviderConfig::legacy_system_one(
+                        &base, &model_id, key,
+                    ),
+                )
+                .unwrap(),
+            );
 
             let mut refunds = spec();
             refunds.gate = Some(

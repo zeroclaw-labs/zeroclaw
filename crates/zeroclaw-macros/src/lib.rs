@@ -181,7 +181,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error().into(),
     };
     let secret_hook = match extract_secret_hook(&input.attrs) {
-        Ok(Some(path)) => path,
+        Ok(Some(path)) => Some(path),
         Ok(None) => None,
         Err(err) => return err.to_compile_error().into(),
     };

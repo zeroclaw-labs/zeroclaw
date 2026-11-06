@@ -10,8 +10,13 @@ This lets one trigger (a webhook path, a channel, an MQTT topic) feed several
 SOPs, with the model deciding which of them the event is really for and how
 much human supervision each run gets.
 
-ZeroClaw speaks the "System One" typed-decision API (`POST <base_url>/v1/systemone`).
-Two models implement it:
+Canonical provider models can use either native typed-decision protocol:
+OpenAI's Decisions API (`POST <base_url>/v1/decisions`) or System One
+(`POST <base_url>/v1/systemone`). Chat Completions and Responses structured
+outputs are not substituted for either protocol. The legacy
+`[decision_models]` entries below continue to use System One.
+
+Two legacy models implement System One:
 
 | Model | Where it runs | Notes |
 |---|---|---|

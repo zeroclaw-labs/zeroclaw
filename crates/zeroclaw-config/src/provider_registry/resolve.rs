@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 
-use crate::schema::WireApi;
+use crate::schema::{DecisionWireApi, WireApi};
 use zeroclaw_api::capability::Capability;
 
 use super::{
@@ -36,6 +36,15 @@ impl ProviderRegistry {
                     "configured API is unsupported by the connection kind",
                 ));
             }
+        }
+        if let Some(wire_api) = connection.decision_api().and_then(|api| api.wire_api)
+            && !connection.decision_wire_apis().contains(&wire_api)
+        {
+            return Err(RegistryError::connection(
+                name,
+                "api.decision.wire_api",
+                "native decision protocol is unsupported by the connection kind",
+            ));
         }
         if connection.kind() == "azure" && connection.uri().is_some() {
             return Err(RegistryError::connection(
@@ -79,11 +88,20 @@ impl ProviderRegistry {
             ModelDefinition::Tts(config) => self.validate_tts(name, config, connection)?,
             ModelDefinition::Asr(config) => self.validate_asr(name, config, connection)?,
             ModelDefinition::Decision(config) => {
-                if connection.kind() != "system-one" {
+                if !connection.supports(Capability::Decision) {
                     return Err(RegistryError::model(
                         name,
                         "provider",
-                        "decision models require a system-one connection",
+                        "connection does not support decision models",
+                    ));
+                }
+                if let Some(wire_api) = config.api.as_ref().and_then(|api| api.wire_api)
+                    && !connection.decision_wire_apis().contains(&wire_api)
+                {
+                    return Err(RegistryError::model(
+                        name,
+                        "api.wire_api",
+                        "native decision protocol is unsupported by the connection kind",
                     ));
                 }
                 if config.model.trim().is_empty() {
@@ -338,6 +356,34 @@ impl ProviderRegistry {
         Ok(ResolvedDecision {
             selection,
             model: &model.model,
+            wire_api: model
+                .api
+                .as_ref()
+                .and_then(|api| api.wire_api)
+                .or_else(|| {
+                    selection
+                        .connection
+                        .decision_api()
+                        .and_then(|api| api.wire_api)
+                })
+                .or_else(|| selection.connection.default_decision_wire_api())
+                .ok_or_else(|| {
+                    RegistryError::model(
+                        name,
+                        "provider",
+                        "connection has no native decision protocol",
+                    )
+                })?,
+            request_timeout_secs: model
+                .api
+                .as_ref()
+                .and_then(|api| api.request_timeout_secs.clone())
+                .or_else(|| {
+                    selection
+                        .connection
+                        .decision_api()
+                        .and_then(|api| api.request_timeout_secs.clone())
+                }),
         })
     }
 
@@ -445,8 +491,10 @@ pub struct ResolvedEmbedding<'a> {
     pub dimensions: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ResolvedDecision<'a> {
     pub selection: super::ModelSelection<'a>,
     pub model: &'a str,
+    pub wire_api: DecisionWireApi,
+    pub request_timeout_secs: Option<Override<NonZeroU64>>,
 }

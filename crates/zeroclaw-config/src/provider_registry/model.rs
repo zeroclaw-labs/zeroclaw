@@ -4,8 +4,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AsrApiPatch, AsrOptionsPatch, ChatApiPatch, ChatOptionsPatch, PresetId, ProviderConnection,
-    ProviderId, TtsOptionsPatch,
+    AsrApiPatch, AsrOptionsPatch, ChatApiPatch, ChatOptionsPatch, DecisionApiPatch, PresetId,
+    ProviderConnection, ProviderId, TtsOptionsPatch,
 };
 use crate::schema::{ModelCostRates, TranscriptionCostRates, TtsCostRates};
 use zeroclaw_api::capability::Capability;
@@ -107,6 +107,8 @@ pub struct AsrModelConfig {
 pub struct DecisionModelConfig {
     pub provider: ProviderId,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<DecisionApiPatch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
