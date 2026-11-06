@@ -386,8 +386,20 @@ pub(crate) async fn finish_after_max_iterations(
             // recorded no cost; through the seam it now fails closed when the turn's
             // budget is exhausted and its token usage is charged like any in-loop
             // call. Metering is a no-op when the turn is unscoped.
-            access
-                .run_model_query_with_sampling(
+            let resolver: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync> = match config {
+                Some(config) => {
+                    let config = std::sync::Arc::new(config.clone());
+                    std::sync::Arc::new(move |model: &str| {
+                        config.model_text_extraction(model).reasoning
+                    })
+                }
+                // Keep the legacy config-free injected-agent behavior for
+                // graceful summaries as well as ordinary turn calls.
+                None => std::sync::Arc::new(|_: &str| true),
+            };
+            zeroclaw_api::scope_text_extraction(
+                Some(resolver),
+                access.run_model_query_with_sampling(
                     summary_request,
                     &mut summary_attempts,
                     temperature.for_call_with_fallback(
@@ -395,8 +407,9 @@ pub(crate) async fn finish_after_max_iterations(
                         provider_name,
                         fallback_temperature,
                     ),
-                )
-                .await
+                ),
+            )
+            .await
         };
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
@@ -501,10 +514,13 @@ pub(crate) async fn finish_after_max_iterations(
         .rev()
         .find(|attempt| attempt.accepted)
         .map_or(provider_name, |attempt| attempt.provider_ref.as_str());
-    let extraction: zeroclaw_config::provider_registry::TextExtraction = config
-        .map_or_else(Default::default, |config| {
-            config.model_text_extraction(served_ref)
-        });
+    let extraction: zeroclaw_config::provider_registry::TextExtraction = config.map_or_else(
+        || zeroclaw_config::provider_registry::TextExtraction {
+            reasoning: true,
+            ..Default::default()
+        },
+        |config| config.model_text_extraction(served_ref),
+    );
     let display_text = if extraction.reasoning {
         strip_think_tags(&raw_text)
     } else {

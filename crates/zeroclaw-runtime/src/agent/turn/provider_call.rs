@@ -313,13 +313,20 @@ pub(crate) async fn call_provider(
     iteration: usize,
     guard_tools: Option<&[ToolSpec]>,
 ) -> Result<ProviderCallOutcome> {
-    let resolver = config.cloned().map(|config| {
-        let config = std::sync::Arc::new(config);
-        std::sync::Arc::new(move |model: &str| config.model_text_extraction(model).reasoning)
-            as std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>
-    });
+    let resolver = match config {
+        Some(config) => {
+            let config = std::sync::Arc::new(config.clone());
+            std::sync::Arc::new(move |model: &str| config.model_text_extraction(model).reasoning)
+                as std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>
+        }
+        // `config=None` is the legacy injected-agent entry point. Keep its
+        // historical textual-reasoning behavior while config-backed turns
+        // use the model-owned policy above.
+        None => std::sync::Arc::new(|_: &str| true)
+            as std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    };
     zeroclaw_api::scope_text_extraction(
-        resolver,
+        Some(resolver),
         call_provider_inner(
             ctx,
             config,
