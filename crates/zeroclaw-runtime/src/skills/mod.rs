@@ -2066,6 +2066,12 @@ pub(crate) fn prepare_skill_tools_with_runtime<T>(
             }
             match tool.kind.as_str() {
                 "shell" | "script" => {
+                    // A runtime without a shell cannot run these; leave them
+                    // unregistered so the prompt lists them as unavailable
+                    // instead of offering a call that can only fail.
+                    if !runtime.has_shell_access() {
+                        continue;
+                    }
                     let inner = crate::skills::skill_tool::SkillShellTool::new_with_runtime(
                         &skill.name,
                         tool,
@@ -5131,7 +5137,9 @@ mod prompt_callable_name_tests {
 
     #[test]
     fn prompt_callable_predicate_matches_registration_preconditions() {
-        // shell/script/http always register -> always prompt-callable.
+        // shell/script/http register on any runtime with a shell -> prompt-callable.
+        // (A runtime without a shell skips shell/script; the prompt then filters
+        // them through the effective tool surface, not through this predicate.)
         assert!(skill_tool_is_prompt_callable(&tool("run", "shell")));
         assert!(skill_tool_is_prompt_callable(&tool("run", "script")));
         assert!(skill_tool_is_prompt_callable(&tool("fetch", "http")));
@@ -5171,7 +5179,7 @@ mod prompt_callable_name_tests {
             author: None,
             tags: Vec::new(),
             tools: vec![
-                tool("run", "shell"),  // always registers
+                tool("run", "shell"),  // registers when the runtime has a shell
                 tool("orphan", "mcp"), // no target -> skipped
                 tool("sh", "builtin"), // no target -> skipped
             ],
@@ -5228,6 +5236,58 @@ mod prompt_callable_name_tests {
         let names: Vec<&str> = registered.iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"ops__run"));
         assert!(!names.contains(&"ops__fetch"));
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn runtime_without_shell_omits_shell_and_script_skill_tools() {
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                tool("run", "shell"),
+                tool("job", "script"),
+                tool("fetch", "http"),
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let no_shell: std::sync::Arc<dyn crate::platform::RuntimeAdapter> = std::sync::Arc::from(
+            zeroclaw_config::platform::create_runtime(&zeroclaw_config::schema::RuntimeConfig {
+                shell: Some("/nonexistent-zeroclaw-shell/bin/sh".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        assert!(!no_shell.has_shell_access());
+        let names_for = |runtime| {
+            let registered = skills_to_tools_with_context_and_runtime_optional_nat64(
+                std::slice::from_ref(&skill),
+                std::sync::Arc::new(crate::security::SecurityPolicy::default()),
+                &[],
+                runtime,
+                Some(&[]),
+            );
+            registered
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let names = names_for(no_shell);
+        assert_eq!(names, vec!["ops__fetch".to_string()], "got {names:?}");
+        // Positive control: the same skill registers its shell tools with a shell.
+        let names = names_for(std::sync::Arc::new(
+            crate::platform::NativeRuntime::with_shell("sh".into()),
+        ));
+        assert!(names.contains(&"ops__run".to_string()), "got {names:?}");
+        assert!(names.contains(&"ops__job".to_string()), "got {names:?}");
     }
 
     #[test]
