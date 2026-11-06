@@ -2644,6 +2644,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
         .route("/api/devices", get(api_pairing::list_devices))
+        .route("/api/devices/{id}/voice", get(api_pairing::get_device_voice_preferences).put(api_pairing::put_device_voice_preferences))
         .route("/api/devices/me/voice", get(api_pairing::get_my_voice_preferences).put(api_pairing::put_my_voice_preferences))
         .route(
             "/api/devices/me/capabilities",

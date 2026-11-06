@@ -17,6 +17,16 @@ const defaults: VoicePreferences = {
 };
 interface DevicePreferences { device_id: string; preferences: VoicePreferences }
 const preferenceEvent = 'zeroclaw-device-voice-updated';
+interface VoicePreferenceState {
+  path: string;
+  deviceId?: string;
+  preferences: VoicePreferences;
+  ready: boolean;
+  error: string;
+}
+function preferencePath(deviceId?: string): string {
+  return deviceId ? `/api/devices/${encodeURIComponent(deviceId)}/voice` : '/api/devices/me/voice';
+}
 const notificationTopic = 'zeroclaw-device-voice-invalidated';
 function notificationChannel(): BroadcastChannel | undefined {
   if (!('BroadcastChannel' in window)) return;
@@ -24,12 +34,12 @@ function notificationChannel(): BroadcastChannel | undefined {
   catch { console.warn('Voice preference notifications unavailable; settings reload on tab return.'); }
 }
 
-export async function saveVoicePreferences(prefs: VoicePreferences): Promise<void> {
+export async function saveVoicePreferences(prefs: VoicePreferences, deviceId?: string): Promise<void> {
   const identity = getToken();
-  const result = await apiFetch<DevicePreferences>('/api/devices/me/voice', {
+  const result = await apiFetch<DevicePreferences>(preferencePath(deviceId), {
     method: 'PUT', cache: 'no-store', body: JSON.stringify(prefs),
   });
-  if (identity !== getToken()) throw new Error('Paired device changed');
+  if (identity !== getToken() || (deviceId && result.device_id !== deviceId)) throw new Error('Paired device changed');
   window.dispatchEvent(new CustomEvent(preferenceEvent, { detail: result }));
   const channel = notificationChannel();
   if (channel) {
@@ -39,8 +49,9 @@ export async function saveVoicePreferences(prefs: VoicePreferences): Promise<voi
     finally { channel.close(); }
   }
 }
-export function useVoicePreferences() {
-  const [state, setState] = useState({ preferences: { ...defaults }, ready: false, error: '' });
+export function useVoicePreferences(targetDeviceId?: string): VoicePreferenceState {
+  const path = preferencePath(targetDeviceId);
+  const [state, setState] = useState<VoicePreferenceState>({ path, preferences: { ...defaults }, ready: false, error: '' });
   useEffect(() => {
     let active = true;
     let deviceId: string | undefined;
@@ -53,16 +64,18 @@ export function useVoicePreferences() {
       const controller = new AbortController();
       pending = controller;
       // A returning tab cannot use stale microphone/reading choices while loading.
-      setState(previous => ({ ...previous, ready: false, error: '' }));
+      setState(previous => previous.path === path
+        ? { ...previous, ready: false, error: '' }
+        : { path, preferences: { ...defaults }, ready: false, error: '' });
       try {
-        const result = await apiFetch<DevicePreferences>('/api/devices/me/voice', { cache: 'no-store', signal: controller.signal });
-        if (!result?.device_id || !result.preferences) throw new Error('Invalid device preferences response');
+        const result = await apiFetch<DevicePreferences>(path, { cache: 'no-store', signal: controller.signal });
+        if (!result?.device_id || !result.preferences || (targetDeviceId && result.device_id !== targetDeviceId)) throw new Error('Invalid device preferences response');
         if (!active || controller.signal.aborted || version !== requestVersion || identity !== getToken()) return;
         deviceId = result.device_id;
-        setState({ preferences: result.preferences, ready: true, error: '' });
+        setState({ path, deviceId: result.device_id, preferences: result.preferences, ready: true, error: '' });
       } catch {
         if (active && !controller.signal.aborted && version === requestVersion) {
-          setState({ preferences: { ...defaults }, ready: false, error: 'unavailable' });
+          setState({ path, preferences: { ...defaults }, ready: false, error: 'unavailable' });
         }
       }
     };
@@ -71,7 +84,7 @@ export function useVoicePreferences() {
       if (active && identity === getToken() && result.device_id === deviceId) {
         requestVersion++;
         pending?.abort();
-        setState({ preferences: result.preferences, ready: true, error: '' });
+        setState({ path, deviceId: result.device_id, preferences: result.preferences, ready: true, error: '' });
       }
     };
     const channel = notificationChannel();
@@ -91,8 +104,8 @@ export function useVoicePreferences() {
       window.removeEventListener('focus', focused);
       document.removeEventListener('visibilitychange', visible);
     };
-  }, []);
-  return state;
+  }, [path]);
+  return state.path === path ? state : { path, preferences: { ...defaults }, ready: false, error: '' };
 }
 export interface Recognition {
   lang: string;

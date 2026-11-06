@@ -29,6 +29,21 @@ pub struct DeviceInfo {
     pub capabilities: Option<Vec<String>>,
 }
 
+#[derive(Clone, Copy)]
+enum VoiceDeviceKey<'a> {
+    TokenHash(&'a str),
+    DeviceId(&'a str),
+}
+
+impl<'a> VoiceDeviceKey<'a> {
+    fn column_and_value(self) -> (&'static str, &'a str) {
+        match self {
+            Self::TokenHash(value) => ("token_hash", value),
+            Self::DeviceId(value) => ("id", value),
+        }
+    }
+}
+
 /// Registry of paired devices backed by SQLite.
 #[derive(Debug)]
 pub struct DeviceRegistry {
@@ -135,14 +150,15 @@ impl DeviceRegistry {
 
     fn voice_preferences(
         &self,
-        token_hash: &str,
+        key: VoiceDeviceKey<'_>,
     ) -> anyhow::Result<Option<DeviceVoicePreferences>> {
         use rusqlite::OptionalExtension;
+        let (column, value) = key.column_and_value();
         let conn = self.open_db()?;
         let row: Option<(String, Option<String>)> = conn
             .query_row(
-                "SELECT id, voice_preferences FROM devices WHERE token_hash = ?1",
-                [token_hash],
+                &format!("SELECT id, voice_preferences FROM devices WHERE {column} = ?1"),
+                [value],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -160,13 +176,14 @@ impl DeviceRegistry {
 
     fn save_voice_preferences(
         &self,
-        token_hash: &str,
+        key: VoiceDeviceKey<'_>,
         preferences: &VoicePreferences,
     ) -> anyhow::Result<bool> {
+        let (column, value) = key.column_and_value();
         let conn = self.open_db()?;
         Ok(conn.execute(
-            "UPDATE devices SET voice_preferences = ?1 WHERE token_hash = ?2",
-            rusqlite::params![serde_json::to_string(preferences)?, token_hash],
+            &format!("UPDATE devices SET voice_preferences = ?1 WHERE {column} = ?2"),
+            rusqlite::params![serde_json::to_string(preferences)?, value],
         )? == 1)
     }
 
@@ -538,9 +555,20 @@ pub async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> 
         None => Vec::new(),
     };
 
+    let current_device_id = extract_bearer_token(&headers).and_then(|token| {
+        let hash = super::PairingGuard::token_hash(token);
+        state
+            .device_registry
+            .as_ref()?
+            .cache
+            .lock()
+            .get(&hash)
+            .map(|device| device.id.clone())
+    });
     let count = devices.len();
     Json(serde_json::json!({
         "devices": devices,
+        "current_device_id": current_device_id,
         "count": count
     }))
     .into_response()
@@ -804,11 +832,19 @@ fn device_voice_preferences(
         )
             .into_response();
     };
+    registry_voice_preferences(registry, VoiceDeviceKey::TokenHash(&hash), preferences)
+}
+
+fn registry_voice_preferences(
+    registry: &DeviceRegistry,
+    key: VoiceDeviceKey<'_>,
+    preferences: Option<VoicePreferences>,
+) -> axum::response::Response {
     if let Some(preferences) = preferences {
         if !preferences.valid() {
             return (StatusCode::BAD_REQUEST, "Invalid voice preferences").into_response();
         }
-        match registry.save_voice_preferences(&hash, &preferences) {
+        match registry.save_voice_preferences(key, &preferences) {
             Ok(true) => {}
             Ok(false) => {
                 return (StatusCode::NOT_FOUND, "Paired device not registered").into_response();
@@ -829,7 +865,7 @@ fn device_voice_preferences(
             }
         }
     }
-    match registry.voice_preferences(&hash) {
+    match registry.voice_preferences(key) {
         Ok(Some(preferences)) => (
             [(axum::http::header::CACHE_CONTROL, "no-store")],
             Json(preferences),
@@ -868,6 +904,57 @@ pub async fn put_my_voice_preferences(
     device_voice_preferences(&state, &headers, Some(preferences))
 }
 
+// Device management uses the same operator admission as list/revoke. A paired
+// bearer is held live through the effect; an administrator cookie may manage
+// registered devices without pretending to be one of them.
+fn managed_voice_preferences(
+    state: &AppState,
+    headers: &HeaderMap,
+    device_id: &str,
+    preferences: Option<VoicePreferences>,
+) -> axum::response::Response {
+    if let Err(error) = require_auth(state, headers) {
+        return error.into_response();
+    }
+    let caller_hash = extract_bearer_token(headers).map(super::PairingGuard::token_hash);
+    let held = state.pairing.hold_paired_tokens();
+    if caller_hash
+        .as_deref()
+        .is_some_and(|hash| !held.contains_hash(hash))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "Paired operator credential is no longer live",
+        )
+            .into_response();
+    }
+    let Some(registry) = state.device_registry.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Device registry is disabled",
+        )
+            .into_response();
+    };
+    registry_voice_preferences(registry, VoiceDeviceKey::DeviceId(device_id), preferences)
+}
+
+pub async fn get_device_voice_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    managed_voice_preferences(&state, &headers, &device_id, None)
+}
+
+pub async fn put_device_voice_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(device_id): axum::extract::Path<String>,
+    Json(preferences): Json<VoicePreferences>,
+) -> impl IntoResponse {
+    managed_voice_preferences(&state, &headers, &device_id, Some(preferences))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,6 +966,81 @@ mod tests {
     use std::sync::Arc;
     use zeroclaw_config::pairing::PairingGuard;
     use zeroclaw_config::schema::Config;
+
+    #[tokio::test]
+    async fn selected_device_voice_settings_are_isolated_from_the_calling_device() {
+        let (_dir, state, a, b) = voice_state();
+        let (_, own) = response_json(device_voice_preferences(&state, &a, None)).await;
+        let (_, other) = response_json(device_voice_preferences(&state, &b, None)).await;
+        let own_id = own["device_id"].as_str().unwrap();
+        let other_id = other["device_id"].as_str().unwrap();
+        let first = VoicePreferences {
+            reading: true,
+            voice: "first-voice".into(),
+            ..Default::default()
+        };
+        let second = VoicePreferences {
+            reading: false,
+            voice: "second-voice".into(),
+            rate: 1.4,
+            ..Default::default()
+        };
+        assert_eq!(
+            managed_voice_preferences(&state, &a, own_id, Some(first.clone())).status(),
+            StatusCode::OK
+        );
+        let (status, saved) = response_json(managed_voice_preferences(
+            &state,
+            &a,
+            other_id,
+            Some(second.clone()),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["device_id"], other_id);
+        let (_, still_own) = response_json(device_voice_preferences(&state, &a, None)).await;
+        let (_, from_other_browser) =
+            response_json(device_voice_preferences(&state, &b, None)).await;
+        assert_eq!(
+            still_own["preferences"],
+            serde_json::to_value(first).unwrap()
+        );
+        assert_eq!(
+            from_other_browser["preferences"],
+            serde_json::to_value(second).unwrap()
+        );
+        let (_, inventory) =
+            response_json(list_devices(State(state.clone()), a).await.into_response()).await;
+        assert_eq!(inventory["current_device_id"], own_id);
+        assert_eq!(inventory["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn managing_voice_preferences_requires_operator_auth_and_an_existing_device() {
+        let (_dir, state, a, _) = voice_state();
+        let (_, own) = response_json(device_voice_preferences(&state, &a, None)).await;
+        let id = own["device_id"].as_str().unwrap();
+        assert_eq!(
+            managed_voice_preferences(&state, &HeaderMap::new(), id, None).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            managed_voice_preferences(&state, &a, "missing-device", Some(Default::default()))
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            managed_voice_preferences(&state, &a, "' OR 1=1 --", None).status(),
+            StatusCode::NOT_FOUND
+        );
+        state
+            .pairing
+            .revoke_token_hash(&PairingGuard::token_hash("voice-test-a"));
+        assert_eq!(
+            managed_voice_preferences(&state, &a, id, Some(Default::default())).status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
 
     #[test]
     fn device_registry_startup_returns_io_and_migration_errors() {
@@ -947,7 +1109,9 @@ mod tests {
                 .device_registry
                 .as_ref()
                 .unwrap()
-                .voice_preferences(&PairingGuard::token_hash("voice-test-a"))
+                .voice_preferences(VoiceDeviceKey::TokenHash(&PairingGuard::token_hash(
+                    "voice-test-a"
+                )))
                 .unwrap()
                 .is_none()
         );

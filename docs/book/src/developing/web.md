@@ -105,10 +105,16 @@ Paired browsers can open **Config → Voice and audio** to enable microphone and
 speaker controls in chat. Preferences live in the gateway's `devices.db`, on the
 existing paired-device record, and survive page reloads and gateway restarts.
 `GET` and `PUT /api/devices/me/voice` resolve that record from the authenticated
-paired bearer token; the client cannot choose a different device ID. Revoking
+paired bearer token; the own-device route cannot choose a different device ID. The device selector
+uses `GET/PUT /api/devices/{id}/voice` under the same operator authorization as
+listing/revoking devices. The selected record is distinct from the calling
+browser: chat controls always load their own paired record. Revoking
 or rotating a device removes its preferences along with the existing device
 record. Cookie-only OIDC sessions and unpaired access do not have a paired-device
-identity and cannot use this preference API.
+identity and cannot use the own-device preference API. Administrator sessions
+may manage registered devices through the operator routes; non-administrators
+are refused. The selector shows each record’s saved voice; choosing/sampling
+available OS voices is performed in that device’s own browser.
 
 Dictation defaults to on-device recognition. It requires HTTPS (or localhost),
 a compatible browser, microphone permission, and an available language pack.

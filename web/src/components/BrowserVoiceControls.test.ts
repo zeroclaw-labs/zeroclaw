@@ -35,11 +35,26 @@ Object.assign(globalThis, { React, window: fakeWindow, document: fakeDocument, l
   IS_REACT_ACT_ENVIRONMENT: true,
 });
 const preferences = { dictation: true, reading: true, automatic: false, language: 'en-US', recognition: 'local', voice: 'synthetic-local-voice', rate: 1 };
+const otherPreferences = { ...preferences, dictation: false, reading: false, voice: 'other-device-voice', language: 'pt-BR', rate: 1.3 };
+const silentPreferences = { ...preferences, dictation: false, reading: false, voice: '' };
+const perDevice = new Map([['synthetic-device', preferences], ['other-device', otherPreferences], ['silent-device', silentPreferences]]);
 const requests: { path: string; method: string; body: string | null }[] = [];
 globalThis.fetch = async (input, init) => {
-  requests.push({ path: String(input), method: init?.method ?? 'GET', body: typeof init?.body === 'string' ? init.body : null });
-  if (init?.method === 'PUT') Object.assign(preferences, JSON.parse(String(init.body)));
-  return new Response(JSON.stringify({ device_id: 'synthetic-device', preferences }), { headers: { 'Content-Type': 'application/json' } });
+  const path = String(input);
+  requests.push({ path, method: init?.method ?? 'GET', body: typeof init?.body === 'string' ? init.body : null });
+  if (path === '/api/devices') return new Response(JSON.stringify({
+    current_device_id: 'synthetic-device',
+    devices: [
+      { id: 'synthetic-device', name: 'Example browser A', device_type: 'browser' },
+      { id: 'other-device', name: 'Example browser B', device_type: 'browser' },
+      { id: 'silent-device', name: 'Example silent browser', device_type: 'browser' },
+    ],
+  }), { headers: { 'Content-Type': 'application/json' } });
+  const deviceId = path === '/api/devices/me/voice' ? 'synthetic-device' : decodeURIComponent(path.split('/')[3] ?? '');
+  const selected = perDevice.get(deviceId);
+  if (!selected) return new Response('', { status: 404 });
+  if (init?.method === 'PUT') Object.assign(selected, JSON.parse(String(init.body)));
+  return new Response(JSON.stringify({ device_id: deviceId, preferences: selected }), { headers: { 'Content-Type': 'application/json' } });
 };
 const { default: Controls } = await import('./BrowserVoiceControls.tsx');
 const { saveVoicePreferences, useVoicePreferences } = await import('../lib/browserVoice.ts');
@@ -230,4 +245,55 @@ test('cross-tab messages invalidate server state without carrying preference aut
     Object.assign(preferences, original);
   }
   assert.ok(channels.every(channel => channel.closed));
+});
+
+test('device list loads and edits the selected record without changing this browser', async () => {
+  const ownBefore = { ...preferences };
+  const otherBefore = { ...otherPreferences };
+  const { default: Settings } = await import('./BrowserVoiceSettings.tsx');
+  let renderer!: ReactTestRenderer;
+  const reading = () => renderer.root.findAllByType('label').find(label => label.children.some(child => typeof child === 'string' && child.includes('Show speaker / enable reading')))!.findByType('input');
+  try {
+    await act(async () => { renderer = create(createElement(Settings)); });
+    const list = () => renderer.root.findByProps({ 'aria-label': 'Paired device' });
+    assert.equal(list().props.value, 'synthetic-device');
+    assert.equal(list().findAllByType('option').length, 3);
+    await act(async () => { list().props.onChange({ target: { value: 'other-device' } }); });
+    assert.equal(reading().props.checked, false);
+    assert.ok(JSON.stringify(renderer.toJSON()).includes('other-device-voice'));
+    await act(async () => { reading().props.onChange({ target: { checked: true } }); });
+    assert.equal(otherPreferences.reading, true);
+    assert.deepEqual(preferences, ownBefore);
+    const write = requests.filter(request => request.method === 'PUT').slice(-1)[0]!;
+    assert.equal(write.path, '/api/devices/other-device/voice');
+    await act(async () => { list().props.onChange({ target: { value: 'silent-device' } }); });
+    assert.equal(reading().props.checked, false);
+    await act(async () => { list().props.onChange({ target: { value: 'synthetic-device' } }); });
+    assert.equal(reading().props.checked, ownBefore.reading);
+  } finally {
+    if (renderer) await act(async () => { renderer.unmount(); });
+    Object.assign(preferences, ownBefore); Object.assign(otherPreferences, otherBefore);
+  }
+});
+
+test('a late selected-device response cannot repaint a different device configuration', async () => {
+  const originalFetch = globalThis.fetch;
+  let resolve!: (response: Response) => void;
+  const pending = new Promise<Response>(done => { resolve = done; });
+  globalThis.fetch = async (input, init) => String(input) === '/api/devices/other-device/voice' ? pending : originalFetch(input, init);
+  function Probe({ id }: { id: string }) { return createElement('output', null, JSON.stringify(useVoicePreferences(id))); }
+  let renderer!: ReactTestRenderer;
+  try {
+    await act(async () => { renderer = create(createElement(Probe, { id: 'synthetic-device' })); });
+    await act(async () => { renderer.update(createElement(Probe, { id: 'other-device' })); });
+    await act(async () => { renderer.update(createElement(Probe, { id: 'silent-device' })); });
+    await act(async () => { resolve(new Response(JSON.stringify({ device_id: 'other-device', preferences: otherPreferences }), { headers: { 'Content-Type': 'application/json' } })); });
+    const state = JSON.parse(String(renderer.root.findByType('output').children[0]));
+    assert.equal(state.deviceId, 'silent-device');
+    assert.equal(state.preferences.voice, '');
+    assert.equal(state.preferences.reading, false);
+  } finally {
+    if (renderer) await act(async () => { renderer.unmount(); });
+    globalThis.fetch = originalFetch;
+  }
 });
