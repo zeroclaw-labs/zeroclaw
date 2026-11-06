@@ -11207,9 +11207,6 @@ mod tests {
     /// withhold the tools too; without the handle it goes as well.
     #[tokio::test]
     async fn withholding_session_data_tools_removes_aliases_and_nested_executors() {
-        let session_dir = tempfile::TempDir::new().unwrap();
-        let sessions: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
-            Arc::new(zeroclaw_infra::session_store::SessionStore::new(session_dir.path()).unwrap());
         let history_calls = Arc::new(AtomicUsize::new(0));
         let history: Arc<dyn Tool> = Arc::new(SessionHistoryProbe {
             calls: Arc::clone(&history_calls),
@@ -11238,16 +11235,11 @@ mod tests {
             );
             let tools: Vec<Box<dyn Tool>> = vec![
                 Box::new(crate::tools::ArcToolRef(Arc::clone(&history))),
-                Box::new(zeroclaw_tools::sessions::SessionsListTool::new(Arc::clone(
-                    &sessions,
+                Box::new(zeroclaw_tools::sessions::SessionsListTool::new()),
+                Box::new(zeroclaw_tools::sessions::SessionsSendTool::new(Arc::clone(
+                    &send_security,
                 ))),
-                Box::new(zeroclaw_tools::sessions::SessionsSendTool::new(
-                    Arc::clone(&sessions),
-                    Arc::clone(&send_security),
-                )),
-                Box::new(zeroclaw_tools::sessions::SessionsCurrentTool::new(
-                    Arc::clone(&sessions),
-                )),
+                Box::new(zeroclaw_tools::sessions::SessionsCurrentTool::new()),
                 Box::new(alias),
                 Box::new(pipeline),
                 Box::new(crate::tools::ArcToolRef(registered)),

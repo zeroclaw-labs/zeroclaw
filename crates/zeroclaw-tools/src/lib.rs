@@ -221,35 +221,19 @@ mod session_tool_marker_guard {
     use std::sync::Arc;
     use zeroclaw_api::tool::Tool;
     use zeroclaw_config::policy::SecurityPolicy;
-    use zeroclaw_infra::session_backend::SessionBackend;
-    use zeroclaw_infra::session_store::SessionStore;
 
     /// Every session tool that addresses a session other than the caller's
     /// own has no ownership check, so it must require an unrestricted
     /// principal. `sessions_current` reports only the caller's own session.
     #[test]
     fn cross_session_tools_require_an_unrestricted_principal() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
         let security = Arc::new(SecurityPolicy::default());
         let cross_session: Vec<Box<dyn Tool>> = vec![
-            Box::new(crate::sessions::SessionsListTool::new(backend.clone())),
-            Box::new(crate::sessions::SessionsHistoryTool::new(
-                backend.clone(),
-                security.clone(),
-            )),
-            Box::new(crate::sessions::SessionsSendTool::new(
-                backend.clone(),
-                security.clone(),
-            )),
-            Box::new(crate::sessions::SessionResetTool::new(
-                backend.clone(),
-                security.clone(),
-            )),
-            Box::new(crate::sessions::SessionDeleteTool::new(
-                backend.clone(),
-                security,
-            )),
+            Box::new(crate::sessions::SessionsListTool::new()),
+            Box::new(crate::sessions::SessionsHistoryTool::new(security.clone())),
+            Box::new(crate::sessions::SessionsSendTool::new(security.clone())),
+            Box::new(crate::sessions::SessionResetTool::new(security.clone())),
+            Box::new(crate::sessions::SessionDeleteTool::new(security)),
         ];
         for tool in &cross_session {
             assert!(
@@ -258,7 +242,7 @@ mod session_tool_marker_guard {
                 tool.name()
             );
         }
-        let current = crate::sessions::SessionsCurrentTool::new(backend);
+        let current = crate::sessions::SessionsCurrentTool::new();
         assert!(
             !current.requires_unrestricted_principal(),
             "sessions_current addresses only the caller's own session"

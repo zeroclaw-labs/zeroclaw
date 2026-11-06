@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn sop_generation_recovers_only_the_current_step_without_duplicate_model_calls() {
         use zeroclaw_api::session_events::capture::{
-            EngineInputPart, EngineTurnFuture, EngineTurnInput, SessionExecutionPort,
+            EngineInputPart, EngineTurnFuture, EngineTurnInput,
         };
 
         struct Port {

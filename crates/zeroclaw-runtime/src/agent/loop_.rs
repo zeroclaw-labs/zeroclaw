@@ -25089,8 +25089,8 @@ Let me check the result."#;
     #[tokio::test]
     async fn run_recovers_original_inputs_before_new_cli_message() {
         use zeroclaw_api::session_events::capture::{
-            EngineInputPart, EngineTurnFuture, EngineTurnInput, SessionExecutionPort,
-            current_engine_input, scope_engine_input, scope_session_execution,
+            EngineInputPart, EngineTurnFuture, EngineTurnInput, current_engine_input,
+            scope_engine_input, scope_session_execution,
         };
         use zeroclaw_config::schema::{
             AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig,

@@ -901,8 +901,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use zeroclaw_api::session_events::capture::{
             EngineInputPart, EngineTurnFuture, EngineTurnInput, ProviderAdmissionPort,
-            ProviderDispatchIntent, ProviderObservationPort, SessionExecutionPort,
-            scope_engine_input, scope_provider_capture, scope_session_execution,
+            ProviderDispatchIntent, ProviderObservationPort, scope_engine_input,
+            scope_provider_capture, scope_session_execution,
         };
         use zeroclaw_api::session_events::{
             AppendReceipt, EventCursor, EventData, EventId, PayloadRecord, SessionId,

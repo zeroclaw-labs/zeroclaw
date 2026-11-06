@@ -195,6 +195,7 @@ impl zeroclaw_api::model_provider::ModelProvider for HeadlessToolProbe {
             vec![]
         };
         Ok(zeroclaw_providers::ChatResponse {
+            output_blocks: Vec::new(),
             text: calls.is_empty().then(|| "probe finished".into()),
             tool_calls: calls,
             usage: None,
@@ -285,8 +286,8 @@ async fn principal_sessions_refuse_headless_tools_and_captured_aliases() {
         let before = serde_json::to_value(crate::cron::list_jobs(&config).unwrap()).unwrap();
         let history =
             serde_json::to_value(crate::cron::list_runs(&config, &job.id, 10).unwrap()).unwrap();
-        let data_dir = config.data_dir.clone();
-        let (operator, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+
+        let (operator, sessions) = make_native_test_dispatcher(config);
         let (mut caller, mut rx) = roster_peer(&operator.ctx, 4242).await;
         let response = rpc(
             &mut caller,
@@ -437,8 +438,8 @@ async fn wildcard_non_admin_sessions_hold_no_unrestricted_tools() {
             .get_mut("principal-test")
             .unwrap()
             .admin = admin;
-        let data_dir = config.data_dir.clone();
-        let (operator, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+
+        let (operator, sessions) = make_native_test_dispatcher(config);
         let (mut caller, mut rx) = roster_peer(&operator.ctx, 4242).await;
         let response = rpc(
             &mut caller,
@@ -501,8 +502,8 @@ async fn wildcard_non_admin_sessions_hold_no_unrestricted_tools() {
 async fn demoted_administrator_delegate_withholds_before_the_next_prompt() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = two_user_config_with_administrator_alice(&tmp);
-    let data_dir = config.data_dir.clone();
-    let (operator, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+
+    let (operator, sessions) = make_native_test_dispatcher(config);
     let ctx = Arc::clone(&operator.ctx);
     let alice = scoped_dispatcher(&ctx, 4242).await;
     alice

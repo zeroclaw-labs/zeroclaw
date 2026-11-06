@@ -5,7 +5,7 @@ use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::model_provider::*;
 use zeroclaw_api::session_events::capture::{
-    ProviderRouteSource, scope_provider_capture, scope_provider_route_source,
+    ProviderRouteSource, SessionContextPort, scope_provider_capture, scope_provider_route_source,
 };
 use zeroclaw_api::session_events::*;
 use zeroclaw_infra::session_events::open_event_store;
@@ -1164,7 +1164,7 @@ async fn audit_request_reasoning_disclosure(backend: &str) {
 #[tokio::test]
 async fn summary_policy_retains_system_context_and_captures_the_assembled_request() {
     use zeroclaw_api::principal::PrincipalId;
-    use zeroclaw_api::session_events::capture::{ContextSnapshot, SessionExecutionPort};
+    use zeroclaw_api::session_events::capture::{ContextSnapshot, SessionContextPort};
     for backend in ["sqlite", "jsonl"] {
         let h = Harness::new(backend);
         let events = h.events();
