@@ -141,7 +141,7 @@ default trust store. Stdio servers ignore it.
 
 ## Deferred loading
 
-`mcp.deferred_loading` is `false` by default, so configured MCP tools are included in the model context eagerly. Set it to `true` to place only MCP tool **names** in the system prompt; the LLM calls the built-in `tool_search` tool to fetch a tool's full schema before invoking it. This keeps the initial context window small when a server exposes many tools.
+`mcp.deferred_loading` is `false` by default, so configured MCP tools are included in the model context eagerly. Set it to `true` to place only MCP tool **names** in the system prompt; the LLM calls the built-in `tool_search` tool to fetch a tool's full schema before invoking it. This keeps the initial context window small when a server exposes many tools. Activated tools stay in that list, so activating a tool does not change the system prompt; the list changes only when the admitted tool catalog or access policy changes.
 
 ## Security and approval
 
