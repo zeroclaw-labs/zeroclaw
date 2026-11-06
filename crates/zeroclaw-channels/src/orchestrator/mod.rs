@@ -16959,18 +16959,16 @@ fn hydrate_persisted_session_history(
     if metadata.channel_id.as_deref().is_none_or(str::is_empty) {
         return None;
     }
+    // The persisted channel ID is resolved exactly, as the router resolves an
+    // inbound message: a bare ID finds the platform's bare entry, and an
+    // alias-qualified one only its own alias. A named channel whose binding
+    // is disabled, removed or ambiguous must not fall back to whichever agent
+    // serves another alias of the same platform.
     let owner_agent = metadata.agent_alias.clone().or_else(|| {
         metadata
             .channel_id
             .as_deref()
             .and_then(|channel_id| owner_by_channel_key.get(channel_id).cloned())
-            .or_else(|| {
-                metadata
-                    .channel_id
-                    .as_deref()
-                    .and_then(|channel_id| channel_id.split_once('.').map(|(base, _)| base))
-                    .and_then(|base| owner_by_channel_key.get(base).cloned())
-            })
     });
     let target_ctx = owner_agent
         .as_ref()
@@ -24537,6 +24535,148 @@ temperature = 0.3
                 "{key} must not receive a channel closure"
             );
             assert_eq!(messages[0].role, "user");
+        }
+    }
+
+    /// Startup restores a channel-only transcript to the agent its persisted
+    /// channel ID names exactly. When A's named webhook binding is disabled,
+    /// removed or ambiguous while B serves other webhook aliases, the
+    /// registry's bare `webhook` entry is B's. A's `webhook.a` transcript must
+    /// not reach B's cache through it, nor be written to (a trailing user turn
+    /// would get a closure). A bare `webhook` row and B's own alias still
+    /// restore to B.
+    #[test]
+    fn restart_hydration_never_widens_a_named_channel_to_its_bare_platform_owner() {
+        use zeroclaw_infra::session_backend::SessionContext;
+
+        for backend_name in ["jsonl", "sqlite"] {
+            for binding in ["disabled", "removed", "ambiguous"] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                {
+                    let store =
+                        zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+                    for (key, channel_id) in [
+                        ("legacy-a", "webhook.a"),
+                        ("legacy-b", "webhook.b"),
+                        ("legacy-bare", "webhook"),
+                    ] {
+                        store
+                            .append(key, &ChatMessage::user(format!("{key} unanswered turn")))
+                            .unwrap();
+                        store
+                            .set_session_context(
+                                key,
+                                SessionContext {
+                                    channel_id: Some(channel_id),
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap();
+                    }
+                }
+
+                let mut config = Config::default();
+                config.agents.clear();
+                for alias in ["a", "b", "c"] {
+                    config.channels.webhook.insert(
+                        alias.into(),
+                        zeroclaw_config::schema::WebhookConfig {
+                            enabled: true,
+                            ..Default::default()
+                        },
+                    );
+                }
+                let agent = |enabled: bool, channels: &[&str]| {
+                    zeroclaw_config::schema::AliasedAgentConfig {
+                        enabled,
+                        channels: channels.iter().map(|channel| (*channel).into()).collect(),
+                        ..Default::default()
+                    }
+                };
+                config
+                    .agents
+                    .insert("agent-b".into(), agent(true, &["webhook.b", "webhook.c"]));
+                match binding {
+                    "disabled" => {
+                        config
+                            .agents
+                            .insert("agent-a".into(), agent(false, &["webhook.a"]));
+                    }
+                    "removed" => {}
+                    "ambiguous" => {
+                        config
+                            .agents
+                            .insert("agent-a".into(), agent(true, &["webhook.a"]));
+                        config
+                            .agents
+                            .insert("agent-c".into(), agent(true, &["webhook.a"]));
+                    }
+                    _ => unreachable!(),
+                }
+                let owner_by_channel_key = config
+                    .active_agent_channel_bindings()
+                    .owner_by_channel_key();
+                assert_eq!(
+                    owner_by_channel_key.get("webhook").map(String::as_str),
+                    Some("agent-b"),
+                    "{backend_name}/{binding}: the fixture must give B the bare entry"
+                );
+                assert!(!owner_by_channel_key.contains_key("webhook.a"));
+
+                // A restart: reopen the store and restore from what it holds.
+                let store = zeroclaw_infra::make_session_backend(tmp.path(), backend_name).unwrap();
+                let agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = config
+                    .agents
+                    .iter()
+                    .filter(|(_, agent)| agent.enabled)
+                    .map(|(alias, _)| {
+                        (
+                            alias.clone(),
+                            Arc::new(ChannelRuntimeContext {
+                                agent_alias: Arc::new(alias.clone()),
+                                conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                                    std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+                                ))),
+                                ..(*router_test_ctx()).clone()
+                            }),
+                        )
+                    })
+                    .collect();
+                for metadata in store.list_sessions_with_metadata() {
+                    hydrate_persisted_session_history(
+                        store.as_ref(),
+                        &metadata,
+                        &agent_ctxs,
+                        &owner_by_channel_key,
+                    );
+                }
+
+                let cached = |alias: &str, key: &str| {
+                    agent_ctxs[alias]
+                        .conversation_histories
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .peek(key)
+                        .is_some()
+                };
+                for alias in agent_ctxs.keys() {
+                    assert!(
+                        !cached(alias, "legacy-a"),
+                        "{backend_name}/{binding}: {alias} must not restore A's named channel"
+                    );
+                }
+                let untouched = store.load("legacy-a");
+                assert_eq!(untouched.len(), 1, "{backend_name}/{binding}");
+                assert_eq!(untouched[0].role, "user", "{backend_name}/{binding}");
+                assert!(
+                    cached("agent-b", "legacy-b"),
+                    "{backend_name}/{binding}: B's own alias still restores"
+                );
+                assert!(
+                    cached("agent-b", "legacy-bare"),
+                    "{backend_name}/{binding}: a bare row still uses the bare entry"
+                );
+            }
         }
     }
 
