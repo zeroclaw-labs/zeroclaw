@@ -30,6 +30,7 @@
 pub mod enrollment;
 pub mod native;
 pub mod oidc;
+pub mod password;
 pub mod peercred;
 
 pub use enrollment::{
@@ -37,6 +38,7 @@ pub use enrollment::{
 };
 pub use native::NativeAuthProvider;
 pub use oidc::OidcAuthProvider;
+pub use password::PasswordAuthProvider;
 pub use peercred::{PeercredAuthProvider, UidRoster};
 
 use std::collections::HashMap;
@@ -44,21 +46,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use zeroclaw_api::principal::{AuthMethod, AuthOutcome, DenyReason};
+use zeroize::Zeroizing;
 
 /// A credential presented for verification (the input to the `initialize`
 /// handshake). Secret material is **redacted** in `Debug` — never log it raw.
 ///
 /// Scoped to the accepted RFC provider set (bearer for native/OIDC, SSH
-/// signature, peer uid). Not-yet-accepted credential kinds (e.g. a local
-/// username/password) are added by their own scoped change, so this seam never
+/// signature, peer uid) plus the local roster password. Credential kinds not
+/// yet accepted are added by their own scoped change, so this seam never
 /// silently carries an unaccepted credential shape.
 ///
 /// SECURITY follow-up: the secret-bearing arms are redacted in `Debug`
-/// and never `Eq`-compared here, but the plaintext is not yet zeroized on drop.
-/// In-memory secret scrubbing is currently absent tree-wide (even the encrypted
-/// `config::secrets` store keeps plaintext un-scrubbed), so a `Zeroizing`/
-/// `SecretString` convention is a separate, repo-wide hardening tracked under the
-/// auth-provider work, not bolted onto this one type.
+/// and never `Eq`-compared here. The password arm is zeroized on drop; the
+/// bearer and signature arms are not yet, and giving them the same treatment
+/// is a separate, repo-wide hardening tracked under the auth-provider work.
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum Credential {
@@ -75,6 +76,13 @@ pub enum Credential {
     /// A local transport peer credential (Unix-socket uid). Kernel-supplied:
     /// the transport, not the client, constructs this arm.
     Peercred { uid: u32 },
+    /// A roster login name and password for the `password` provider. Both
+    /// halves are redacted in `Debug`: people type passwords into the name
+    /// field too.
+    Password {
+        username: String,
+        password: Zeroizing<String>,
+    },
 }
 
 impl Credential {
@@ -101,6 +109,11 @@ impl std::fmt::Debug for Credential {
             Self::Peercred { uid } => f
                 .debug_struct("Credential::Peercred")
                 .field("uid", uid)
+                .finish(),
+            Self::Password { .. } => f
+                .debug_struct("Credential::Password")
+                .field("username", &"<redacted>")
+                .field("password", &"<redacted>")
                 .finish(),
         }
     }
@@ -278,6 +291,7 @@ fn bind_provenance(provider: &dyn AuthProvider, outcome: AuthOutcome) -> AuthOut
         (AuthMethod::Native, IdentitySubject::SharedOperator)
             | (AuthMethod::Peercred, IdentitySubject::SharedOperator)
             | (AuthMethod::Peercred, IdentitySubject::Roster { .. })
+            | (AuthMethod::Password, IdentitySubject::Roster { .. })
             | (AuthMethod::Oidc, IdentitySubject::Oidc { .. })
             | (AuthMethod::Oidc, IdentitySubject::Service { .. })
             | (AuthMethod::SharedOperator, IdentitySubject::SharedOperator)
@@ -753,6 +767,102 @@ mod tests {
                 reason: DenyReason::Misconfigured
             }
         ));
+    }
+
+    /// A password-method provider that verifies any password credential
+    /// into a fixed subject, to test provenance binding for that method.
+    struct FixedPasswordSubject {
+        subject: IdentitySubject,
+    }
+
+    #[async_trait]
+    impl AuthProvider for FixedPasswordSubject {
+        fn name(&self) -> &str {
+            "password"
+        }
+        fn method(&self) -> AuthMethod {
+            AuthMethod::Password
+        }
+        fn accepts(&self, credential: &Credential) -> bool {
+            matches!(credential, Credential::Password { .. })
+        }
+        async fn verify(&self, _credential: &Credential) -> AuthOutcome {
+            AuthOutcome::Verified(AuthenticatedIdentity::new(
+                self.subject.clone(),
+                AuthMethod::Password,
+            ))
+        }
+    }
+
+    fn password_credential() -> Credential {
+        Credential::Password {
+            username: "zeroclaw_user".into(),
+            password: Zeroizing::new("zeroclaw-test-passphrase".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn password_provenance_admits_only_roster_subjects() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(FixedPasswordSubject {
+            subject: IdentitySubject::Roster {
+                principal_id: "zeroclaw_user".into(),
+            },
+        }))
+        .unwrap();
+        assert!(
+            reg.resolve_named("password", &password_credential())
+                .await
+                .is_allowed()
+        );
+
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(FixedPasswordSubject {
+            subject: IdentitySubject::SharedOperator,
+        }))
+        .unwrap();
+        let out = reg.resolve_named("password", &password_credential()).await;
+        assert!(
+            matches!(
+                out,
+                AuthOutcome::Denied {
+                    reason: DenyReason::Misconfigured
+                }
+            ),
+            "a password provider must never mint the shared operator"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_is_never_routed_by_transport() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(FixedPasswordSubject {
+            subject: IdentitySubject::Roster {
+                principal_id: "zeroclaw_user".into(),
+            },
+        }))
+        .unwrap();
+        let out = reg.route_transport(&password_credential()).await;
+        assert!(matches!(
+            out,
+            AuthOutcome::Denied {
+                reason: DenyReason::UnknownProvider
+            }
+        ));
+    }
+
+    #[test]
+    fn debug_redacts_both_halves_of_a_password() {
+        let dbg = format!(
+            "{:?}",
+            Credential::Password {
+                username: "zeroclaw-typed-into-name".into(),
+                password: Zeroizing::new("zeroclaw-test-passphrase".into()),
+            }
+        );
+        assert!(!dbg.contains("zeroclaw-typed-into-name"), "{dbg}");
+        assert!(!dbg.contains("zeroclaw-test-passphrase"), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
     }
 
     #[test]

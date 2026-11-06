@@ -34,6 +34,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 schemars = { version = "1.2", optional = true }
+# Roster password hashes (`password_hash`). Same crate and major version the
+# TLS crate already uses for CA-key encryption; `simple` adds the PHC string
+# format so stored hashes carry their own parameters.
+scrypt = { version = "0.11", default-features = false, features = ["simple", "std"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
