@@ -301,6 +301,11 @@ struct OwnedParentTools {
     tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     origins: crate::tools::NativeMemoryOrigins,
     memory_policies: Option<Arc<BoundedMemoryPolicyChain>>,
+    /// Sticky isolation choice from an ACP / `exclude_memory` ancestor.
+    /// Once set, nested bounded hops keep withholding `MEMORY.md` even when
+    /// their inherited tool list is empty (e.g. middle agent allows only
+    /// `delegate`, so filtering drops every parent tool).
+    exclude_memory: bool,
 }
 
 /// Actual participating policy owners, root caller first. Independent
@@ -418,6 +423,7 @@ impl Default for OwnedParentTools {
             tools: Arc::new(RwLock::new(Vec::new())),
             origins: Default::default(),
             memory_policies: None,
+            exclude_memory: false,
         }
     }
 }
@@ -759,15 +765,27 @@ impl DelegateTool {
     /// treat its memory tools as unknown and keep using their stores rather
     /// than opening the target's memory. Registries built by the runtime use
     /// `with_owned_parent_tools`, which carries the provenance.
+    fn registry_signals_memory_exclusion(tools: &RwLock<Vec<Arc<dyn Tool>>>) -> bool {
+        let tools = tools.read();
+        if tools.is_empty() {
+            return false;
+        }
+        !zeroclaw_tools::MEMORY_TOOL_NAMES
+            .iter()
+            .any(|name| tools.iter().any(|tool| tool.name() == *name))
+    }
+
     #[cfg(test)]
     pub(crate) fn with_parent_tools(
         mut self,
         parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     ) -> Self {
+        let exclude_memory = Self::registry_signals_memory_exclusion(&parent_tools);
         self.parent_tools = OwnedParentTools {
             tools: parent_tools,
             origins: Default::default(),
             memory_policies: None,
+            exclude_memory,
         };
         self
     }
@@ -777,10 +795,12 @@ impl DelegateTool {
         tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
         origins: crate::tools::NativeMemoryOrigins,
     ) -> Self {
+        let exclude_memory = Self::registry_signals_memory_exclusion(&tools);
         self.parent_tools = OwnedParentTools {
             tools,
             origins,
             memory_policies: None,
+            exclude_memory,
         };
         self
     }
@@ -1687,6 +1707,9 @@ impl DelegateTool {
             tools,
             origins: self.parent_tools.origins.clone(),
             memory_policies: Some(self.memory_policies_for_target(target)),
+            // Sticky: a memory-excluded ancestor stays excluded across hops
+            // even when this hop's inherited list is empty.
+            exclude_memory: self.parent_excludes_memory(),
         }
     }
 
@@ -3435,6 +3458,7 @@ impl DelegateTool {
             false,
             None,
             None,
+            self.inject_memory_for_target_mode(target_mode),
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
@@ -4984,6 +5008,28 @@ impl DelegateTool {
         self.cancellation_token.cancel();
     }
 
+    /// True when the caller's assembled registry has already stripped memory
+    /// tools (ACP / `exclude_memory: true` sessions), or a bounded ancestor
+    /// already recorded that isolation choice. Empty parent registries from
+    /// legacy test constructors are not treated as exclusion on their own.
+    fn parent_excludes_memory(&self) -> bool {
+        if self.parent_tools.exclude_memory {
+            return true;
+        }
+        Self::registry_signals_memory_exclusion(&self.parent_tools.tools)
+    }
+
+    /// Independent delegates own the target's full personality (including
+    /// `MEMORY.md`). Bounded children inherit the caller's isolation choice:
+    /// a memory-excluded parent must not disclose curated memory through the
+    /// child's provider-visible prompt.
+    fn inject_memory_for_target_mode(&self, mode: DelegateExecutionMode) -> bool {
+        match mode {
+            DelegateExecutionMode::Independent => true,
+            DelegateExecutionMode::Bounded => !self.parent_excludes_memory(),
+        }
+    }
+
     fn compose_independent_system_prompt(
         base: Option<String>,
         mut deferred_section: String,
@@ -5033,6 +5079,7 @@ impl DelegateTool {
             sends_native_tool_specs,
             skills_override,
             approval_policy,
+            true,
         )
     }
 
@@ -5049,6 +5096,7 @@ impl DelegateTool {
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
         approval_policy: Option<&ApprovalManager>,
+        inject_memory: bool,
     ) -> Option<String> {
         let mut resolved_agent_config = agent_config.clone();
         resolved_agent_config.resolved =
@@ -5120,7 +5168,7 @@ impl DelegateTool {
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
             security_summary: None,
             autonomy_level,
-            inject_memory: true,
+            inject_memory,
             shell_profile,
         };
 
@@ -5141,23 +5189,16 @@ impl DelegateTool {
             .map(|config| config.agent_workspace_dir(agent_alias))
             .or_else(|| self.agent_workspace(agent_alias));
         if let Some(target_workspace) = target_workspace {
-            let identity_files = [
-                "AGENTS.md",
-                "SOUL.md",
-                "IDENTITY.md",
-                "USER.md",
-                "BOOTSTRAP.md",
-            ];
-            for filename in identity_files {
-                let path = target_workspace.join(filename);
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    let trimmed = contents.trim();
-                    if !trimmed.is_empty() {
-                        enriched.push_str(trimmed);
-                        enriched.push_str("\n\n");
-                    }
-                }
-            }
+            // Match the direct-agent prompt path: same PERSONALITY_FILES set,
+            // order, and per-file MAX_FILE_CHARS truncation — or the shared
+            // memory-filtered list when the originating session excludes memory.
+            let profile = if inject_memory {
+                crate::agent::personality::load_personality(&target_workspace)
+            } else {
+                let files = crate::agent::personality::personality_files_without_memory();
+                crate::agent::personality::load_personality_files(&target_workspace, &files)
+            };
+            enriched.push_str(&profile.render());
         }
 
         let trimmed = enriched.trim().to_string();
@@ -5668,6 +5709,7 @@ impl DelegateTool {
             // Independent targets run under their own manager: state that
             // exact policy in the prompt. Bounded delegates have none here.
             approval_manager.as_ref(),
+            self.inject_memory_for_target_mode(target_mode),
         );
         // Independent delegates surface the target's deferred MCP tools the way a fresh
         // target turn does. See `compose_independent_system_prompt`: it applies the turn
@@ -13349,6 +13391,248 @@ target = "memory_recall"
             "{bg_result:?}"
         );
         assert!(bg_result.error.is_none(), "{bg_result:?}");
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_prompt_includes_tools_md_from_personality_files() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let target_ws = tmp.path().join("target-workspace");
+        std::fs::create_dir_all(&target_ws).unwrap();
+        std::fs::write(target_ws.join("SOUL.md"), "soul-marker").unwrap();
+        std::fs::write(target_ws.join("TOOLS.md"), "tools-marker-unique").unwrap();
+        std::fs::write(target_ws.join("HEARTBEAT.md"), "heartbeat-marker").unwrap();
+        std::fs::write(target_ws.join("MEMORY.md"), "memory-marker").unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let tool = DelegateTool::new(config.agents.clone(), None, test_security())
+            .with_root_config(Arc::clone(&config));
+        let agent_config = config.agents.get("target").cloned().unwrap();
+
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "target",
+                &agent_config,
+                "model-test",
+                &[],
+                tmp.path(),
+                true,
+                None,
+                None,
+            )
+            .expect("prompt should render");
+
+        assert!(
+            prompt.contains("tools-marker-unique"),
+            "delegate prompt must include TOOLS.md from PERSONALITY_FILES; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("heartbeat-marker"),
+            "delegate prompt must include HEARTBEAT.md; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("memory-marker"),
+            "delegate prompt must include MEMORY.md; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("soul-marker"),
+            "delegate prompt must still include SOUL.md; got: {prompt}"
+        );
+        let soul_pos = prompt.find("soul-marker").expect("soul");
+        let tools_pos = prompt.find("tools-marker-unique").expect("tools");
+        assert!(
+            soul_pos < tools_pos,
+            "PERSONALITY_FILES order puts SOUL.md before TOOLS.md; got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_prompt_omits_memory_md_when_parent_excludes_memory() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        // Dummy non-memory tool so the parent registry is non-empty after
+        // memory-tool stripping — the production exclude_memory assembly path
+        // leaves other tools in place on the shared parent_tools handle.
+        let tmp = TempDir::new().unwrap();
+        let target_ws = tmp.path().join("target-workspace");
+        std::fs::create_dir_all(&target_ws).unwrap();
+        std::fs::write(target_ws.join("TOOLS.md"), "tools-marker-unique").unwrap();
+        std::fs::write(target_ws.join("MEMORY.md"), "memory-marker-secret").unwrap();
+        std::fs::write(target_ws.join("SOUL.md"), "soul-marker").unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        // Parent registry after exclude_memory assembly: non-empty, no memory tools.
+        let parent_tools = Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>]));
+        let tool = DelegateTool::new(config.agents.clone(), None, test_security())
+            .with_root_config(Arc::clone(&config))
+            .with_parent_tools(Arc::clone(&parent_tools));
+        let agent_config = config.agents.get("target").cloned().unwrap();
+
+        assert!(
+            tool.parent_excludes_memory(),
+            "non-empty parent registry without memory tools must signal exclusion"
+        );
+        assert!(
+            !tool.inject_memory_for_target_mode(DelegateExecutionMode::Bounded),
+            "bounded child must inherit parent memory exclusion"
+        );
+        assert!(
+            tool.inject_memory_for_target_mode(DelegateExecutionMode::Independent),
+            "independent child keeps target-owned MEMORY.md"
+        );
+
+        let prompt = tool
+            .build_enriched_system_prompt_from_config(
+                Some(config.as_ref()),
+                "target",
+                &agent_config,
+                "model-test",
+                &[],
+                None,
+                tmp.path(),
+                true,
+                None,
+                None,
+                tool.inject_memory_for_target_mode(DelegateExecutionMode::Bounded),
+            )
+            .expect("prompt should render");
+
+        assert!(
+            prompt.contains("tools-marker-unique"),
+            "TOOLS.md must remain when memory is excluded; got: {prompt}"
+        );
+        assert!(
+            prompt.contains("soul-marker"),
+            "non-memory personality files must remain; got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("memory-marker-secret"),
+            "MEMORY.md must be absent on a bounded child of a memory-excluded parent; got: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_second_hop_keeps_memory_exclusion_when_middle_only_allows_delegate() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        // Greptile P1: middle agent allows only `delegate`, so filtering drops
+        // every inherited parent tool and leaves an empty production registry
+        // on the nested DelegateTool. Exclusion must stay sticky.
+        let tmp = TempDir::new().unwrap();
+        let grandchild_ws = tmp.path().join("grandchild-workspace");
+        std::fs::create_dir_all(&grandchild_ws).unwrap();
+        std::fs::write(grandchild_ws.join("TOOLS.md"), "tools-marker-unique").unwrap();
+        std::fs::write(grandchild_ws.join("MEMORY.md"), "memory-marker-secret").unwrap();
+        std::fs::write(grandchild_ws.join("SOUL.md"), "soul-marker").unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "grandchild".to_string(),
+            AliasedAgentConfig {
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(grandchild_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+
+        let root_tools = Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>]));
+        let root = DelegateTool::new(config.agents.clone(), None, test_security())
+            .with_root_config(Arc::clone(&config))
+            .with_parent_tools(Arc::clone(&root_tools));
+        assert!(
+            root.parent_excludes_memory(),
+            "root exclude_memory session must signal exclusion"
+        );
+
+        // Simulate the nested DelegateTool parent_tools after a middle hop that
+        // only kept `delegate` (filtered inherited list is empty).
+        let empty_middle_registry = Arc::new(RwLock::new(Vec::<Arc<dyn Tool>>::new()));
+        let nested = DelegateTool::new(config.agents.clone(), None, test_security())
+            .with_root_config(Arc::clone(&config));
+        let nested = {
+            let mut nested = nested;
+            nested.parent_tools =
+                root.bounded_parent_tools(Arc::clone(&empty_middle_registry), &nested.security);
+            nested
+        };
+
+        assert!(
+            empty_middle_registry.read().is_empty(),
+            "fixture must use an empty inherited registry"
+        );
+        assert!(
+            nested.parent_excludes_memory(),
+            "sticky exclude_memory must survive an empty middle registry"
+        );
+        assert!(
+            !nested.inject_memory_for_target_mode(DelegateExecutionMode::Bounded),
+            "second bounded hop must still withhold MEMORY.md"
+        );
+
+        let agent_config = config.agents.get("grandchild").cloned().unwrap();
+        let prompt = nested
+            .build_enriched_system_prompt_from_config(
+                Some(config.as_ref()),
+                "grandchild",
+                &agent_config,
+                "model-test",
+                &[],
+                None,
+                tmp.path(),
+                true,
+                None,
+                None,
+                nested.inject_memory_for_target_mode(DelegateExecutionMode::Bounded),
+            )
+            .expect("prompt should render");
+
+        assert!(
+            prompt.contains("tools-marker-unique") && prompt.contains("soul-marker"),
+            "non-memory personality must remain; got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("memory-marker-secret"),
+            "MEMORY.md must stay withheld on the second bounded hop; got: {prompt}"
+        );
     }
 
     #[tokio::test]
