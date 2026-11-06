@@ -56,10 +56,10 @@ fn legacy_routing_metadata_is_imported_to_the_native_catalog() {
             let records = catalog.query().index_records().expect("index");
             assert_eq!(records.len(), 1);
             let record = &records[0];
-            assert_eq!(record.session_id.as_str(), "gw_migrated");
+            assert_eq!(record.session_id.as_str(), "migrated");
             assert_eq!(record.title.as_deref(), Some("Migrated title"));
             assert_eq!(record.message_count, 1);
-            assert_eq!(record.creation_source.as_deref(), Some("legacy"));
+            assert_eq!(record.creation_source.as_deref(), Some("gateway"));
             assert_eq!(record.first_user_preview.as_deref(), Some("retained input"));
             assert_eq!(
                 record.owning_agent.as_deref(),
