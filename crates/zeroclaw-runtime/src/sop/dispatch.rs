@@ -3795,31 +3795,45 @@ mod tests {
         }
 
         impl Scripted {
-            fn answering(gate: f64, mode: &str, confidence: f64) -> Arc<Self> {
+            /// The answers to the gate (when given) and mode questions.
+            fn script(gate: Option<f64>, mode: &str, confidence: f64) -> Answers {
                 let modes = ["auto", "supervised", "step_by_step"];
                 let probabilities = modes
                     .iter()
                     .map(|m| ((*m).to_string(), if *m == mode { 0.9 } else { 0.05 }))
                     .collect();
-                let answers = BTreeMap::from([
-                    ("start_sop".to_string(), Answer::Noul { noul: gate }),
-                    (
-                        "execution_mode".to_string(),
-                        Answer::Choice {
-                            choice: mode.into(),
-                            probabilities,
-                            confidence,
-                        },
-                    ),
-                ]);
+                let mut answers = BTreeMap::from([(
+                    "execution_mode".to_string(),
+                    Answer::Choice {
+                        choice: mode.into(),
+                        probabilities,
+                        confidence,
+                    },
+                )]);
+                if let Some(gate) = gate {
+                    answers.insert("start_sop".to_string(), Answer::Noul { noul: gate });
+                }
+                Answers {
+                    model: None,
+                    answers,
+                    usage: None,
+                }
+            }
+
+            fn with(answers: Answers) -> Arc<Self> {
                 Arc::new(Self {
-                    answers: Some(Answers {
-                        model: None,
-                        answers,
-                        usage: None,
-                    }),
+                    answers: Some(answers),
                     calls: AtomicUsize::new(0),
                 })
+            }
+
+            fn answering(gate: f64, mode: &str, confidence: f64) -> Arc<Self> {
+                Self::with(Self::script(Some(gate), mode, confidence))
+            }
+
+            /// A confident answer for `mode` with no `start_sop` answer at all.
+            fn answering_mode_without_gate(mode: &str, confidence: f64) -> Arc<Self> {
+                Self::with(Self::script(None, mode, confidence))
             }
 
             fn down() -> Arc<Self> {
@@ -4004,6 +4018,27 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn unusable_gate_answer_cannot_leave_a_run_less_supervised_than_fail_closed() {
+            let engine = engine_with(
+                vec![webhook_sop(
+                    "refunds",
+                    SopExecutionMode::Supervised,
+                    Some(spec()),
+                )],
+                Some(Scripted::answering_mode_without_gate("auto", 0.9)),
+            );
+            let results = dispatch_sop_event(&engine, &test_audit(), ticket("refund $12")).await;
+            assert_eq!(
+                started(&engine, &results),
+                vec![(
+                    "refunds".into(),
+                    "WaitApproval",
+                    Some(SopExecutionMode::StepByStep)
+                )]
+            );
+        }
+
+        #[tokio::test]
         async fn auto_decision_cannot_remove_a_step_confirmation() {
             let mut sop = webhook_sop("refunds", SopExecutionMode::Supervised, Some(spec()));
             sop.steps[0].requires_confirmation = true;
@@ -4126,6 +4161,56 @@ mod tests {
             assert_eq!(run.current_step, 2, "step 1 was answered no and skipped");
             assert_eq!(run.step_results[0].status, SopStepStatus::Skipped);
             assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn unusable_gate_answer_does_not_let_a_step_answer_skip_a_step() {
+            let mut sop = part_sop();
+            sop.decision = Some(spec());
+            let mut answers = Scripted::script(None, "auto", 0.9);
+            answers
+                .answers
+                .insert("part_1".to_string(), Answer::Noul { noul: 0.1 });
+            let engine = engine_with(vec![sop], Some(Scripted::with(answers)));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert!(run.decisions.is_empty(), "{:?}", run.decisions);
+            assert_eq!(run.current_step, 1, "no usable answer: step 1 runs");
+            assert!(run.step_results.is_empty());
+            assert_eq!(run.decided_mode, Some(SopExecutionMode::StepByStep));
+        }
+
+        /// Dispatch a gated, moded SOP whose model says "no" to step 1 but whose
+        /// mode answer is unusable: step 1 must still run, under the strict mode.
+        async fn assert_unusable_mode_answer_does_not_skip_a_step(mut answers: Answers) {
+            let mut sop = part_sop();
+            sop.decision = Some(spec());
+            answers
+                .answers
+                .insert("start_sop".to_string(), Answer::Noul { noul: 0.95 });
+            answers
+                .answers
+                .insert("part_1".to_string(), Answer::Noul { noul: 0.1 });
+            let engine = engine_with(vec![sop], Some(Scripted::with(answers)));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert!(run.decisions.is_empty(), "{:?}", run.decisions);
+            assert_eq!(run.current_step, 1, "no usable mode: step 1 runs");
+            assert!(run.step_results.is_empty());
+            assert_eq!(run.decided_mode, Some(SopExecutionMode::StepByStep));
+        }
+
+        #[tokio::test]
+        async fn low_confidence_mode_answer_does_not_let_a_step_answer_skip_a_step() {
+            assert_unusable_mode_answer_does_not_skip_a_step(Scripted::script(None, "auto", 0.5))
+                .await;
+        }
+
+        #[tokio::test]
+        async fn missing_mode_answer_does_not_let_a_step_answer_skip_a_step() {
+            let mut answers = Scripted::script(None, "auto", 0.9);
+            answers.answers.remove("execution_mode");
+            assert_unusable_mode_answer_does_not_skip_a_step(answers).await;
         }
 
         #[tokio::test]
