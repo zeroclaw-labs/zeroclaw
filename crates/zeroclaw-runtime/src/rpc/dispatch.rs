@@ -3972,7 +3972,7 @@ impl RpcDispatcher {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                 "Session repository was not supplied"
             );
             anyhow::Error::msg("session repository was not supplied")
